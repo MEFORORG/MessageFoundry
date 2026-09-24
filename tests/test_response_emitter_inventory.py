@@ -21,8 +21,11 @@ site does not bypass the floor, or what covers it instead.
 | ``asgi-response-start`` | A raw ASGI response-start or ``websocket.accept`` message literal. |
 | ``ws-close`` | A ``websocket.close`` message or a ``.close(code=...)`` call: pre-accept, it is a refusal. |
 | ``status-line`` | A literal that starts an HTTP status line: a raw writer below any ASGI stack. |
-| ``protocol-override`` | A def of, or assignment to, ``send_400_response``, ``send_500_response`` or |
-| | ``write_http_response``: the server's own responses. |
+| ``protocol-override`` | A def of, or assignment to, a server response writer (see below). |
+
+The server response writers are ``send_400_response``, ``send_500_response`` and
+``write_http_response``. "Assignment" covers ``x.name = ...``, a class-level ``name = ...``, an
+annotated assignment, and ``setattr(x, "name", ...)`` with a literal name.
 
 **Its bound, stated so it is not read as more.** This pins the FIRST-PARTY emitter population, and
 only emitters of a shape listed above, in the literal spelling the table gives: an aliased import
@@ -91,16 +94,35 @@ class _Collector(ast.NodeVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
+    def _assigned(self, target: ast.expr) -> None:
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self._assigned(element)
+            return
+        name = getattr(target, "attr", None) or getattr(target, "id", None)
+        if name in _PROTOCOL_METHODS:
+            self._add("protocol-override")
+
     def visit_Assign(self, node: ast.Assign) -> None:
         # A per-instance override, `cycle.send_500_response = ...`, is as much an override as a def.
         for target in node.targets:
-            if isinstance(target, ast.Attribute) and target.attr in _PROTOCOL_METHODS:
-                self._add("protocol-override")
+            self._assigned(target)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._assigned(node.target)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
         name = callee_name(node) or ""
+        if (
+            name == "setattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in _PROTOCOL_METHODS
+        ):
+            self._add("protocol-override")
         if name in ("FastAPI", "Starlette"):
             self._add("asgi-app")
         if (
@@ -224,20 +246,20 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         1,
         "Adds the headers to uvicorn's own HTTP 500; tests/test_header_floor_wire.py.",
     ),
-    Site(_PROTOCOL, "floored_http_protocol_class._FlooredHTTPProtocol", "protocol-override"): (
+    Site(_PROTOCOL, "_build_floored_http._FlooredHTTPProtocol", "protocol-override"): (
         1,
         "Adds the headers to uvicorn's own HTTP 400; tests/test_header_floor_wire.py.",
     ),
     Site(
         _PROTOCOL,
-        "floored_ws_protocol_class._FlooredLegacyWebSocketProtocol",
+        "_build_floored_ws._FlooredLegacyWebSocketProtocol",
         "protocol-override",
     ): (
         1,
         "Adds the headers, where absent, to every handshake answer the legacy websockets server "
         "writes; tests/test_header_floor_wire.py.",
     ),
-    Site(_PROTOCOL, "floored_ws_protocol_class._FlooredWebSocketProtocol", "protocol-override"): (
+    Site(_PROTOCOL, "_build_floored_ws._FlooredWebSocketProtocol", "protocol-override"): (
         1,
         "Adds the headers to uvicorn's own WebSocket 500; tests/test_header_floor_wire.py.",
     ),
@@ -318,8 +340,12 @@ def test_a_registered_emitter_that_is_gone_is_drift() -> None:
     [
         "class P:\n    def write_http_response(self, status, headers, body=None):\n        pass\n",
         "def hook(cycle):\n    cycle.send_500_response = None\n",
+        "class P:\n    send_500_response = None\n",
+        "def hook(cycle):\n    cycle.send_400_response: object = None\n",
+        "def hook(cycle):\n    setattr(cycle, 'write_http_response', None)\n",
+        "def hook(a, b):\n    a.x, b.send_500_response = 1, None\n",
     ],
-    ids=["write_http_response-def", "send_500_response-assignment"],
+    ids=["def", "attribute", "class-level", "annotated", "setattr", "tuple"],
 )
 def test_the_other_override_forms_turn_the_gate_red(source: str) -> None:
     """Positive controls for the override forms the shape table names beyond a plain def."""

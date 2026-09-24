@@ -326,7 +326,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
         error = await _exchange(port, _GET)
     assert (first[0], first[2], second[0]) == (200, b"ok", 200)
     assert error[0] == 500
-    _one_warning(caplog, "500 hook")
+    _one_warning(caplog, "http-500: hook")
 
 
 @pytest.mark.parametrize(
@@ -345,7 +345,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
         pytest.param(
             "_HEADER_PAIRS",
             _Boom(),
-            "500 header extension",
+            "http-500: header extension",
             _raises,
             _GET,
             500,
@@ -353,9 +353,39 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             id="http-500",
         ),
         pytest.param(
+            "_after_status_line",
+            _boom,
+            "status-line header injection",
+            _raises,
+            _MALFORMED,
+            400,
+            {"http": floored_http_protocol_class(base=H11Protocol)},
+            id="h11-400",
+        ),
+        pytest.param(
+            "_after_status_line",
+            _boom,
+            "status-line header injection",
+            _raises,
+            _HANDSHAKE.format(path="/ws").encode(),
+            500,
+            {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
+            id="ws-500",
+        ),
+        pytest.param(
+            "_HeaderInjectingTransport",
+            _boom,
+            "transport swap",
+            _raises,
+            _MALFORMED,
+            400,
+            {"http": floored_http_protocol_class(base=H11Protocol)},
+            id="transport-swap",
+        ),
+        pytest.param(
             "PROTOCOL_SECURITY_HEADERS",
             _Boom(),
-            "handshake header addition",
+            "ws-handshake: header addition",
             _raises,
             _HANDSHAKE.format(path="/ws")
             .replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", "")
@@ -384,3 +414,26 @@ async def test_every_header_step_fails_open(
         response = await _exchange(port, request_bytes)
     assert response[0] == status
     _one_warning(caplog, step)
+
+
+@pytest.mark.parametrize("cycle_module", ["h11_impl", "httptools_impl"])
+def test_a_hooked_cycle_is_still_freed_by_refcount(cycle_module: str) -> None:
+    """The weakref is load-bearing: a hook that held the cycle strongly would keep each request's
+    scope and body alive until a GC pass. Measured on uvicorn's REAL cycle class, GC off."""
+    import gc
+    import importlib
+    import weakref
+
+    cls = importlib.import_module(f"uvicorn.protocols.http.{cycle_module}").RequestResponseCycle
+    cycle = cls.__new__(cls)
+    protocol_headers._floor_the_cycle_500(cycle)
+    assert "send_500_response" in vars(cycle)  # the hook is installed, so the check is not vacuous
+    ref = weakref.ref(cycle)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del cycle
+        assert ref() is None
+    finally:
+        if enabled:
+            gc.enable()

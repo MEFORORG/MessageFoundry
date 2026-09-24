@@ -86,19 +86,21 @@ _HEADER_PAIRS = [
     for name, value in PROTOCOL_SECURITY_HEADERS
 ]
 
-#: Header-path steps that have already logged a failure, so a broken step warns once, not per request.
-_WARNED: set[str] = set()
+#: (family, step) pairs that have already logged a failure. A broken step warns once per response
+#: family rather than per request, and one family's failure cannot silence another's.
+_WARNED: set[tuple[str, str]] = set()
 
 
-def _fell_open(step: str, exc: Exception) -> None:
-    """Log one header-path failure, once per step. Only the exception TYPE is logged: the message
-    could carry request bytes, and this runs on requests that may carry PHI."""
-    if step in _WARNED:
+def _fell_open(family: str, step: str, exc: BaseException) -> None:
+    """Log one header-path failure, once per (family, step). Only the exception TYPE is logged: the
+    message could carry request bytes, and this runs on requests that may carry PHI."""
+    if (family, step) in _WARNED:
         return
-    _WARNED.add(step)
+    _WARNED.add((family, step))
     _log.warning(
-        "%s failed (%s); serving the server's own response without the protocol-level security "
-        "headers (BACKLOG #1120). Re-measure uvicorn's protocol layer.",
+        "%s: %s failed (%s); serving the server's own response without the protocol-level security "
+        "headers (BACKLOG #1120). Re-measure the uvicorn/websockets protocol layer.",
+        family,
         step,
         type(exc).__name__,
     )
@@ -116,8 +118,9 @@ def _after_status_line(data: bytes) -> bytes:
 class _HeaderInjectingTransport:
     """Forwards everything to the real transport, adding the header lines to the FIRST write only."""
 
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, inner: Any, family: str) -> None:
         self._inner = inner
+        self._family = family
         self._pending = True
 
     def write(self, data: bytes | bytearray | memoryview) -> None:
@@ -126,24 +129,37 @@ class _HeaderInjectingTransport:
             try:
                 data = _after_status_line(bytes(data))
             except Exception as exc:  # fail open: write what the server meant to write
-                _fell_open("status-line header injection", exc)
+                _fell_open(self._family, "status-line header injection", exc)
         self._inner.write(data)
 
     def writelines(self, chunks: Any) -> None:
-        self.write(b"".join(bytes(chunk) for chunk in chunks))
+        chunks = list(chunks)
+        try:
+            joined = b"".join(bytes(chunk) for chunk in chunks)
+        except Exception as exc:
+            _fell_open(self._family, "writelines join", exc)
+            self._pending = False
+            self._inner.writelines(chunks)
+            return
+        self.write(joined)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
 
-def _write_with_headers(protocol: Any, emit: Callable[[], None]) -> None:
+def _write_with_headers(protocol: Any, family: str, emit: Callable[[], None]) -> None:
     """Run one synchronous protocol-level response writer with the header lines added. Errors from
-    ``emit`` itself are the server's and propagate exactly as they would without this module."""
+    ``emit`` itself are the server's and propagate as they would without this module: ``emit`` is
+    never called inside an ``except`` block, so no header-path exception is chained onto them."""
+    proxy: _HeaderInjectingTransport | None = None
     try:
         inner = protocol.transport
-        protocol.transport = _HeaderInjectingTransport(inner)
+        proxy = _HeaderInjectingTransport(inner, family)
+        protocol.transport = proxy
     except Exception as exc:
-        _fell_open("transport swap", exc)
+        _fell_open(family, "transport swap", exc)
+        proxy = None
+    if proxy is None:
         emit()
         return
     try:
@@ -151,23 +167,25 @@ def _write_with_headers(protocol: Any, emit: Callable[[], None]) -> None:
     finally:
         try:
             protocol.transport = inner
-        except Exception as exc:  # the proxy forwards everything, so leaving it in place is safe
-            _fell_open("transport restore", exc)
+        except Exception as exc:
+            # The proxy stays in place. Stop it injecting, so a later write (a 101, say) goes out
+            # exactly as the server wrote it; it forwards writes and attribute reads.
+            proxy._pending = False
+            _fell_open(family, "transport restore", exc)
 
 
-async def _send_floored_500(cycle_ref: weakref.ref[Any]) -> None:
+async def _send_floored_500(cycle_ref: weakref.ref[Any], *args: Any, **kwargs: Any) -> None:
     """A cycle's ``500`` with the headers. uvicorn prepends ``cycle.default_headers`` to every
     response start the cycle sends, so extending it only now puts the headers on this response
     alone. REBIND, never mutate: the list uvicorn passed in is the server-wide
     ``server_state.default_headers``."""
-    cycle = cycle_ref()
-    if cycle is None:
-        return
+    # uvicorn calls this through the cycle it is about to answer for, so the referent is alive.
+    cycle: Any = cycle_ref()
     try:
         cycle.default_headers = [*cycle.default_headers, *_HEADER_PAIRS]
     except Exception as exc:
-        _fell_open("500 header extension", exc)
-    await type(cycle).send_500_response(cycle)
+        _fell_open("http-500", "header extension", exc)
+    await type(cycle).send_500_response(cycle, *args, **kwargs)
 
 
 def _floor_the_cycle_500(cycle: Any) -> None:
@@ -181,7 +199,7 @@ def _floor_the_cycle_500(cycle: Any) -> None:
     try:
         cycle.send_500_response = partial(_send_floored_500, weakref.ref(cycle))
     except Exception as exc:
-        _fell_open("500 hook", exc)
+        _fell_open("http-500", "hook", exc)
 
 
 def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol]:
@@ -195,9 +213,19 @@ def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.P
 
         base = AutoHTTPProtocol
 
-    class _FlooredHTTPProtocol(base):  # type: ignore[misc,valid-type]
-        def send_400_response(self, msg: str) -> None:
-            _write_with_headers(self, partial(super().send_400_response, msg))
+    try:
+        return _build_floored_http(base)
+    except Exception as exc:  # fail open at startup too: serve uvicorn's own protocol
+        _fell_open("http", "class build", exc)
+        return base
+
+
+def _build_floored_http(base: type[Any]) -> type[asyncio.Protocol]:
+    class _FlooredHTTPProtocol(base):  # type: ignore[misc]
+        def send_400_response(self, *args: Any, **kwargs: Any) -> None:
+            _write_with_headers(
+                self, "http-400", partial(super().send_400_response, *args, **kwargs)
+            )
 
         # Both implementations create each request's cycle with `self.cycle = RequestResponseCycle(...)`,
         # pipelined ones included, and before its task first runs. A property sees every one, once.
@@ -230,9 +258,17 @@ def floored_ws_protocol_class(base: type[Any] | None = None) -> type[asyncio.Pro
             return None
         base = resolved
 
-    class _FlooredWebSocketProtocol(base):  # type: ignore[misc,valid-type]
-        def send_500_response(self) -> None:
-            _write_with_headers(self, super().send_500_response)
+    try:
+        return _build_floored_ws(base)
+    except Exception as exc:  # fail open at startup too: serve uvicorn's own protocol
+        _fell_open("ws", "class build", exc)
+        return base
+
+
+def _build_floored_ws(base: type[Any]) -> type[asyncio.Protocol]:
+    class _FlooredWebSocketProtocol(base):  # type: ignore[misc]
+        def send_500_response(self, *args: Any, **kwargs: Any) -> None:
+            _write_with_headers(self, "ws-500", partial(super().send_500_response, *args, **kwargs))
 
     if hasattr(base, "write_http_response"):
         # The legacy websockets server writes every handshake answer through this one method: the
@@ -240,14 +276,16 @@ def floored_ws_protocol_class(base: type[Any] | None = None) -> type[asyncio.Pro
         # absent, so the 101 and the denial, which the floor already covered, are not stamped twice.
 
         class _FlooredLegacyWebSocketProtocol(_FlooredWebSocketProtocol):
-            def write_http_response(self, status: Any, headers: Any, body: Any = None) -> None:
+            def write_http_response(
+                self, status: Any, headers: Any, *args: Any, **kwargs: Any
+            ) -> None:
                 try:
                     for name, value in PROTOCOL_SECURITY_HEADERS:
                         if name not in headers:
                             headers[name] = value
                 except Exception as exc:
-                    _fell_open("handshake header addition", exc)
-                super().write_http_response(status, headers, body)
+                    _fell_open("ws-handshake", "header addition", exc)
+                super().write_http_response(status, headers, *args, **kwargs)
 
         return _FlooredLegacyWebSocketProtocol
     return _FlooredWebSocketProtocol
