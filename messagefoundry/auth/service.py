@@ -71,7 +71,13 @@ from messagefoundry.config.secretprovider import SecretProvider, resolve_connect
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.base import AdminStore
-from messagefoundry.store.store import SessionRecord, UserRecord, WebAuthnCredential
+from messagefoundry.store.store import (
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
+    SessionRecord,
+    UserRecord,
+    WebAuthnCredential,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -2078,10 +2084,17 @@ class AuthService:
         self, user: UserRecord, roles: frozenset[Role], groups: Iterable[str]
     ) -> UserRecord:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
-        requests (mirrors role sync). Administrators are always all-channels. If no group mapping
-        matches, the per-user scope is left untouched — opt-in, so it never clobbers a manual scope,
-        and since BACKLOG #1152 an untouched scope is a DENY rather than the whole estate. Returns
-        the (possibly refreshed) user record.
+        requests (mirrors role sync). Administrators are always all-channels. Returns the (possibly
+        refreshed) user record.
+
+        **When no mapped group matches, the outcome depends on who wrote the stored scope (BACKLOG
+        #1927).** A scope an administrator set (``channel_scope_source == "manual"``) is left
+        untouched, so the map stays opt-in and never clobbers a hand-set scope. Any other stored
+        scope is WITHDRAWN to NULL, which denies (BACKLOG #1152). This path used to return early for
+        every no-match login, so a user removed from their last scope-mapped group kept the channels
+        the directory had granted for as long as the account existed. A scope with no recorded
+        writer is withdrawn too: every writer now records one, so only a row older than the column
+        can lack it, and withdrawing an unvouched grant is the closed direction.
 
         A wildcard group row persists the explicit ``["*"]`` grant. It used to persist SQL NULL and
         rely on NULL meaning "all"; with an absent scope now denying, that collapse would have
@@ -2089,21 +2102,28 @@ class AuthService:
         if Role.ADMINISTRATOR in roles:
             return user
         channels = await self._store.channels_for_ad_groups(groups)
-        if not channels:
-            return user
-        wildcard = ALL_CHANNELS in channels
-        specific = sorted(c for c in channels if c != ALL_CHANNELS)
-        scope_json = _json([ALL_CHANNELS]) if wildcard else _json(specific)
-        if user.channel_scope == scope_json:
-            return user
-        await self._store.set_user_channel_scope(user.id, scope_json)
-        await self._store.revoke_user_sessions(
-            user.id
-        )  # drop stale-scope tokens (new one issued after)
+        scope_json: str | None
+        granted: str | list[str] | None
+        if channels:
+            wildcard = ALL_CHANNELS in channels
+            granted = ALL_CHANNELS if wildcard else sorted(c for c in channels if c != ALL_CHANNELS)
+            scope_json = _json([ALL_CHANNELS]) if wildcard else _json(granted)
+            if user.channel_scope == scope_json and user.channel_scope_source == SCOPE_SOURCE_AD:
+                return user
+        else:
+            if user.channel_scope is None or user.channel_scope_source == SCOPE_SOURCE_MANUAL:
+                return user
+            scope_json = granted = None
+        await self._store.set_user_channel_scope(user.id, scope_json, source=SCOPE_SOURCE_AD)
+        # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
+        # moved -- the directory taking over an identical manual scope changes no decision, so
+        # there is nothing stale to drop -- but that write is still audited below.
+        if scope_json != user.channel_scope:
+            await self._store.revoke_user_sessions(user.id)
         await self._audit(
             "auth.ad_scope_resynced",
             actor=user.username,
-            detail=_json({"channels": ALL_CHANNELS if wildcard else specific}),
+            detail=_json({"channels": granted}),
         )
         return await self._store.get_user(user.id) or user
 
@@ -4445,7 +4465,7 @@ class AuthService:
         :data:`~messagefoundry.auth.identity.ALL_CHANNELS` grants the whole estate. Administrators
         are all-channels by role, so a scope set on one still has no effect."""
         scope_json = None if channels is None else _json(sorted(set(channels)))
-        await self._store.set_user_channel_scope(user_id, scope_json)
+        await self._store.set_user_channel_scope(user_id, scope_json, source=SCOPE_SOURCE_MANUAL)
         await self._store.revoke_user_sessions(user_id)
         await self._audit(
             "user.channel_scope_changed",

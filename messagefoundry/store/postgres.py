@@ -126,6 +126,7 @@ from messagefoundry.store.store import (
     AlertSummary,
     AuditHeadMovedError,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
@@ -603,7 +604,11 @@ _SCHEMA: list[str] = [
         -- Unconstrained on purpose: the resolver never writes a second row for an id it has seen,
         -- and UNIQUE(username) is what refuses a racing double-create.
         directory_object_id  TEXT,
-        password_claimed_at  DOUBLE PRECISION
+        password_claimed_at  DOUBLE PRECISION,
+        -- BACKLOG #1927: who last wrote channel_scope, 'ad' (the AD login sync) or 'manual' (an
+        -- administrator). NULL = no writer recorded; the AD login sync withdraws any scope not
+        -- marked 'manual' when no mapped group matches.
+        channel_scope_source TEXT
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
     # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
@@ -746,7 +751,9 @@ _SCHEMA: list[str] = [
 # 3 (BACKLOG #1139): the users.notify_email ADD + its one-time seed land in the same function, for the
 # same reason and with the same caveat — the users CREATE TABLE in _SCHEMA moved too, so the hash would
 # shift without this bump, and relying on that is the trap the paragraph above names.
-_MIGRATION_REV = 3
+# 4 (BACKLOG #1927): the users.channel_scope_source ADD lands in the same function. Same contract, same
+# caveat: the CREATE TABLE moved as well, and the bump is what ties the migration body to the hash.
+_MIGRATION_REV = 4
 
 
 def _schema_hash() -> str:
@@ -1252,6 +1259,9 @@ class PostgresStore:
             # window the item exists to close. No backfill exists: nothing has ever held the
             # directory's identifier.
             ("directory_object_id", "TEXT"),
+            # Scope provenance (BACKLOG #1927): NULL on existing rows = "no writer recorded", which
+            # the AD login sync withdraws when no mapped group matches. No backfill is possible.
+            ("channel_scope_source", "TEXT"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -7103,12 +7113,22 @@ class PostgresStore:
                 )
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
-        """Set a user's per-channel scope (JSON list of connection names, or ``None`` = all)."""
+        """Set a user's per-channel scope (a JSON list of connection names, ``'["*"]'`` for all, or
+        ``None``, which denies) and record who wrote it (BACKLOG #1927)."""
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET channel_scope=$1, updated_at=$2 WHERE id=$3", scope_json, now, user_id
+            "UPDATE users SET channel_scope=$1, channel_scope_source=$2, updated_at=$3 WHERE id=$4",
+            scope_json,
+            source,
+            now,
+            user_id,
         )
 
     async def set_user_federated_subject(

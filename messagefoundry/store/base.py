@@ -50,6 +50,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     AlertSummary,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
@@ -1954,8 +1955,20 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
-    ) -> None: ...
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
+    ) -> None:
+        """Set a user's per-channel scope and record who wrote it, in one statement.
+
+        ``source`` is REQUIRED, not defaulted (BACKLOG #1927). The AD login sync withdraws a scope
+        not marked ``"manual"`` when no mapped group matches, so a writer that forgot to say who it
+        was would either shield a directory grant from withdrawal or expose an administrator's scope
+        to it. A required keyword turns that omission into a type error at every call site."""
+        ...
 
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None

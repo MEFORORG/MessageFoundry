@@ -64,6 +64,7 @@ from types import MappingProxyType
 from typing import (
     Any,
     Final,
+    Literal,
     NoReturn,
     NotRequired,
     Protocol,
@@ -1209,6 +1210,15 @@ class DbStatus:
     synchronous: str | None = None
 
 
+#: Who last wrote ``users.channel_scope`` (BACKLOG #1927). The AD login sync writes
+#: :data:`SCOPE_SOURCE_AD`; an administrator's ``PUT /users/{id}/channel-scope`` writes
+#: :data:`SCOPE_SOURCE_MANUAL`. The login sync withdraws a scope it finds no mapped group for unless
+#: the scope is marked manual, so this is what lets it tell the two apart.
+ChannelScopeSource = Literal["ad", "manual"]
+SCOPE_SOURCE_AD: Final[ChannelScopeSource] = "ad"
+SCOPE_SOURCE_MANUAL: Final[ChannelScopeSource] = "manual"
+
+
 @dataclass(frozen=True)
 class UserRecord:
     """A user account (local or AD). ``password_hash`` + lockout fields are NULL for AD users."""
@@ -1296,6 +1306,11 @@ class UserRecord:
     # to meet the durability rule and is deliberately not taken: accounts may still be created without
     # an address, so the column would need a placeholder the notifier treats as absent anyway.
     notify_email: str | None = None
+    # WHO LAST WROTE ``channel_scope`` (BACKLOG #1927): ``"ad"`` for the AD login sync, ``"manual"``
+    # for an administrator. Written in the same statement as the scope, by every writer. NULL means
+    # no writer recorded one, which is a row written before the column existed; the login sync
+    # treats that like ``"ad"`` and withdraws it, so an unvouched grant fails closed.
+    channel_scope_source: str | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -1335,6 +1350,9 @@ class UserRecord:
             # silently excluded from every security notice. A loud failure on a mapping that lacks the
             # column beats a quiet, permanent loss of the notification channel.
             notify_email=d["notify_email"],
+            # A ``.get()``: a missing key decodes to NULL, which the login sync reads as "not an
+            # administrator's scope" and withdraws. The quiet direction is the closed one.
+            channel_scope_source=d.get("channel_scope_source"),
         )
 
 
@@ -3313,7 +3331,8 @@ CREATE TABLE IF NOT EXISTS users (
     oidc_issuer          TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC issuer; NULL = not federated / never federated-logged-in
     oidc_subject         TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC sub; the account's federated login is pinned to (issuer, sub), refusing a reassigned username
     directory_object_id  TEXT,                 -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID); what an AD login resolves this row by, because sAMAccountName is recyclable. NULL = no directory binding, and an unbound row is never adopted by a login presenting an id
-    password_claimed_at  REAL                  -- BACKLOG #1245: when the holder set their OWN credential via authenticated self-service rotation; NULL = never claimed. Write-once (COALESCE in set_password); an admin reset must neither set nor clear it
+    password_claimed_at  REAL,                 -- BACKLOG #1245: when the holder set their OWN credential via authenticated self-service rotation; NULL = never claimed. Write-once (COALESCE in set_password); an admin reset must neither set nor clear it
+    channel_scope_source TEXT                  -- BACKLOG #1927: who last wrote channel_scope, 'ad' (the AD login sync) or 'manual' (an administrator). NULL = no writer recorded; the AD login sync withdraws any scope not marked 'manual' when no mapped group matches
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -4899,6 +4918,10 @@ class MessageStore:
             # in since the upgrade. No backfill is possible anyway; nothing in the store has ever
             # held the directory's identifier.
             ("directory_object_id", "TEXT"),
+            # Scope provenance (BACKLOG #1927): NULL on existing rows = "no writer recorded". The
+            # AD login sync withdraws such a scope when no mapped group matches, so it fails closed.
+            # No backfill is possible: nothing has recorded which writer set a scope until now.
+            ("channel_scope_source", "TEXT"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -10347,15 +10370,21 @@ class MessageStore:
             await self._commit()
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
         """Set a user's per-channel scope. ``scope_json`` is a JSON list of granted connection names
-        (``'["*"]'`` for every channel), or ``None`` to clear it — which denies (BACKLOG #1152)."""
+        (``'["*"]'`` for every channel), or ``None`` to clear it — which denies (BACKLOG #1152).
+        ``source`` records who wrote it, in the same statement (BACKLOG #1927)."""
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(
-                "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
-                (scope_json, now, user_id),
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
+                (scope_json, source, now, user_id),
             )
             await self._commit()
 
