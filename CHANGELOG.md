@@ -21,6 +21,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   would see that partner fail to open the message after its relay has already accepted it**, so the
   failure would surface on the partner's side, not as a send error here.
   ([BACKLOG #1168](docs/BACKLOG.md))
+- **An operator resend now meets the target inbound's ingress guards.** `POST
+  /uploads/{file_id}/resend` and `POST /messages/{message_id}/edit-resend` wrote the stage row
+  directly, so the inbound's size ceiling and declared-type sniff never ran on them. An uploaded file
+  may be 25 MiB by default, so a single message larger than the 16 MiB ingress ceiling could be
+  injected into any inbound, and an HL7 message could be injected into a JSON one. Both routes now
+  run the same guards first: the ceiling (the inbound's own `max_message_bytes` for HL7, the engine
+  16 MiB otherwise), the declared-type sniff, the NUL rule, and a check that the inbound's charset
+  can hold the text. A refusal answers 413, 415 or 422, writes an `upload.resend_reject` or
+  `message_edit_resend_reject` audit row, and commits nothing. The edit-resend direct path (`to`
+  set) writes an outbound row, so it has no inbound type to sniff; only the NUL rule and the 16 MiB
+  ceiling apply there. The web console shows an uploaded-log resend refused this way as its own
+  notice. ([BACKLOG #1911](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

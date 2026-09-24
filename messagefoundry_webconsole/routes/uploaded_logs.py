@@ -119,6 +119,7 @@ _FAILED_TARGET = "/ui/uploaded-logs"
 RESEND_FAILED_CODE = "resend_failed"
 RESEND_DENIED_CODE = "resend_denied"
 RESEND_STOPPED_CODE = "resend_stopped"
+RESEND_REFUSED_CODE = "resend_refused"
 DELETE_FAILED_CODE = "delete_failed"
 
 #: The fixed text each code maps to. The 404 one names the three causes the operator can act on WITHOUT
@@ -136,6 +137,11 @@ RESEND_STOPPED_NOTICE = (
     "That resend did not run — nothing was injected. The target inbound connection is registered but "
     "not running. Start it, then try again."
 )
+RESEND_REFUSED_NOTICE = (
+    "That resend did not run — nothing was injected. The target inbound connection would refuse "
+    "that message from a sender: it is larger than the connection accepts, it does not match the "
+    "connection's declared content type, or the connection's character set cannot hold it."
+)
 DELETE_FAILED_NOTICE = (
     "That delete did not run — nothing was removed. The file was not found. It may already be gone."
 )
@@ -146,6 +152,7 @@ _LIST_NOTICES: dict[str, str] = {
     RESEND_FAILED_CODE: RESEND_FAILED_NOTICE,
     RESEND_DENIED_CODE: RESEND_DENIED_NOTICE,
     RESEND_STOPPED_CODE: RESEND_STOPPED_NOTICE,
+    RESEND_REFUSED_CODE: RESEND_REFUSED_NOTICE,
     DELETE_FAILED_CODE: DELETE_FAILED_NOTICE,
 }
 
@@ -158,6 +165,10 @@ _RESEND_CODES: dict[int, str] = {
     403: RESEND_DENIED_CODE,
     404: RESEND_FAILED_CODE,
     409: RESEND_STOPPED_CODE,
+    # BACKLOG #1911: the target inbound's ingress guards refused the message itself.
+    413: RESEND_REFUSED_CODE,
+    415: RESEND_REFUSED_CODE,
+    422: RESEND_REFUSED_CODE,
 }
 
 #: A file id is minted as ``secrets.token_hex(16)``. The path segment reaching these routes is

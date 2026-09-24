@@ -286,6 +286,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import (
     EnvRef,
+    InboundConnection,
     Registry,
     WiringError,
     accepted_cleartext_hops,
@@ -310,6 +311,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
+from messagefoundry.pipeline.ingress_guards import IngressGuardError, check_resubmitted_body
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
     NotDeployedError,
@@ -1194,6 +1196,49 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
     if backend == StoreBackend.SQLSERVER.value:
         return list(_SQLSERVER_PLAINTEXT_RESIDUAL)  # () since H4 — full parity, no residual
     return []
+
+
+#: The status a refused operator resubmission answers with, by the ingress guard that refused it
+#: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
+#: the same status the upload route gives a non-text file. A body the listener could not have decoded
+#: is 422.
+_INGRESS_GUARD_STATUS: dict[str, int] = {"size": 413, "type": 415, "decode": 422}
+
+
+async def _guard_resubmission(
+    engine: Engine,
+    identity: Identity,
+    request: Request,
+    *,
+    raw: str,
+    inbound: InboundConnection | None,
+    action: str,
+    channel_id: str | None,
+    detail: dict[str, object],
+) -> None:
+    """Refuse a resubmitted body the target inbound's listener would refuse (BACKLOG #1911).
+
+    The upload resend and the edit-resend paths write the stage row directly, so the listener's size
+    ceiling and declared-type sniff never ran on them. This runs the same guards
+    (:func:`~messagefoundry.pipeline.ingress_guards.check_resubmitted_body`) before anything is written.
+    A refusal is an HTTP 4xx, an ``action`` audit row and a log line, and nothing is committed, so
+    count-and-log holds: no body is accepted and then dropped. Off the event loop, because the body can
+    be as large as an upload.
+
+    The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
+    of the body, so neither the row nor the 4xx detail echoes PHI."""
+    try:
+        await asyncio.to_thread(check_resubmitted_body, raw, inbound)
+    except IngressGuardError as exc:
+        await engine.store.record_audit(
+            action,
+            actor=identity.username,
+            channel_id=channel_id,
+            detail=json.dumps({**detail, "phase": exc.phase, "reason": exc.reason}),
+            client=client_ip(request),
+        )
+        _log.warning("%s: refused by the ingress guards (phase=%s)", action, exc.phase)
+        raise HTTPException(_INGRESS_GUARD_STATUS.get(exc.phase, 422), exc.reason) from None
 
 
 async def _audit_channel_denied(
@@ -4312,6 +4357,18 @@ def create_app(
                     raise HTTPException(409, _outbound_down_detail(rr, body.to))
             except KeyError:
                 raise HTTPException(404, f"no such outbound connection: {body.to}") from None
+            # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+            # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
+            await _guard_resubmission(
+                engine,
+                identity,
+                request,
+                raw=body.raw,
+                inbound=None,
+                action="message_edit_resend_reject",
+                channel_id=row["channel_id"],
+                detail={"message_id": message_id, "mode": "direct", "to": body.to},
+            )
             try:
                 direct = await engine.edit_resend_direct(
                     message_id, to=body.to, raw=body.raw, idempotency_key=body.idempotency_key
@@ -4350,6 +4407,20 @@ def create_app(
                 400,
                 "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
             )
+        # BACKLOG #1911: the re-route writes an INGRESS row on the origin channel, so the origin
+        # inbound's own ceiling and declared type apply. An origin inbound that is no longer registered
+        # has no declared type, so only the engine-wide guards apply to it.
+        rr = engine.registry_runner
+        await _guard_resubmission(
+            engine,
+            identity,
+            request,
+            raw=body.raw,
+            inbound=rr.registry.inbound.get(row["channel_id"]) if rr is not None else None,
+            action="message_edit_resend_reject",
+            channel_id=row["channel_id"],
+            detail={"message_id": message_id, "mode": "reroute"},
+        )
         try:
             outcome = await engine.edit_resend_reroute(
                 message_id, raw=body.raw, idempotency_key=body.idempotency_key
@@ -4879,6 +4950,18 @@ def create_app(
             raise HTTPException(
                 404, f"no message at index {body.index} (file has {len(parts)} messages)"
             )
+        # BACKLOG #1911: the inject writes an INGRESS row directly, so run the target inbound's own
+        # ceiling and declared-type sniff first. An upload may be larger than one message may be.
+        await _guard_resubmission(
+            engine,
+            identity,
+            request,
+            raw=parts[body.index],
+            inbound=rr.registry.inbound.get(body.to),
+            action="upload.resend_reject",
+            channel_id=body.to,
+            detail={"file_id": file_id, "index": body.index, "to": body.to},
+        )
         mid = await engine.inject_message(
             channel_id=body.to,
             raw=parts[body.index],
