@@ -781,9 +781,9 @@ gates a merge**, and no seat has to clear one.
   cannot, because it exits first. The Lander owns the PR from the handover on and repairs it like
   any other, but dropping an item is a re-cut, and re-cuts go back to the Manager. Every other seat
   opens its own PR and may batch its own work the same way. **"Dispatched by a Manager" means running
-  as its SUBAGENT (owner ruling 2026-09-23).** A Builder in its own session, started from a chip or
-  spawned, has a report that reaches nobody, so it opens its own PR even though a Manager wrote its
-  brief. The steps, the PR
+  as its SUBAGENT (decided 2026-09-23 under the owner's delegation).** A Builder in its own
+  session, started from a chip or spawned, has a report that reaches nobody, so it opens its own PR
+  even though a Manager wrote its brief. The steps, the PR
   body shape and the traps are in korus `roles/MANAGER.md`, *When to cut a pull request*.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **Reading a diff before merging it is still the job; no check

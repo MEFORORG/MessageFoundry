@@ -17,11 +17,12 @@ Your brief comes from a Manager. Usually you are a subagent inside its process, 
 report is the channel back -- put the question there. Either way the ANSWER arrives as the next
 Builder's brief, never as a reply to you.
 
-**Only a Manager's SUBAGENT leaves the PR to the Manager** (owner ruling 2026-09-23). If you are in
-your own session -- a chip started you, or the Manager spawned you -- your report reaches nobody. So
-open your own one-item PR, even though a Manager wrote your brief: your report and head SHA in the
-body, your QA line as a comment, the `qa` label, and the handover to the Lander. Source of record:
-korus `roles/MANAGER.md`, *A Builder in its own session opens its own pull request*.
+**Only a Manager's SUBAGENT leaves the PR to the Manager** (decided 2026-09-23 under the owner's
+delegation). If you are in your own session -- a chip started you, or the Manager spawned you --
+your report reaches nobody. So open your own one-item PR, even though a Manager wrote your brief:
+your report and head SHA in the body, your QA line as a comment, the `qa` label, and the handover to
+the Lander. Source of record: korus `roles/MANAGER.md`, *A Builder in its own session opens its own
+pull request*.
 
 ## What it must not do
 
