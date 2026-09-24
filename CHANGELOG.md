@@ -367,9 +367,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   the engine from starting**, because both caches load at open. The opt-out,
   `[store].allow_unmarked_ciphertext`, ships off and is reported as a loosening when on.
   (`BACKLOG #1169`)
-  - At least this gap remains. A surface with no ciphertext yet at a keyed open counts as
-    unsealed, so a row planted there is sealed as if it were real. Uploaded files are not a
-    column; the next entry covers how a keyed store treats them.
+  - At least these gaps remain. The Direct S/MIME enveloped body is not covered. A surface with
+    no ciphertext yet at a keyed open counts as unsealed, so a row planted there is sealed as if it
+    were real.
+  - Uploaded files follow their own rule, in the separate BREAKING entry on plaintext uploaded
+    files. `docs/PHI.md` section 3 lists that rule's limits.
   - A store keyed under 0.4.0 can hold legitimate unmarked values in at least two cases. One is a
     first keyed open that stopped part-way through its sweep, which 0.4.0 committed in batches.
     The other is a value made only of spaces on SQL Server, which 0.4.0's sweep skipped. The new
