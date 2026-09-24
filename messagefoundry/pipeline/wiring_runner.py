@@ -124,6 +124,11 @@ from messagefoundry.parsing.sniff import (
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
+from messagefoundry.pipeline.ingress_guards import (
+    STRICT_VALIDATE_TIMEOUT_SECONDS,
+    streaming_over_threshold,
+    strict_validate_timeout,
+)
 from messagefoundry.pipeline.phase_timing import (
     # Explicit re-exports (`as`): the pre-#842 import surface — tests and the harness node-log parser
     # import these names from wiring_runner, not from phase_timing.
@@ -396,26 +401,11 @@ _BATCH_POLL_SECONDS = 0.02
 # pinning a worker thread forever; the orphaned query still completes on the loop and releases its conn.
 _LOOKUP_RESULT_TIMEOUT_SECONDS = 30.0
 
-# How long a single strict hl7apy validate may run before the message dead-letters (#89, DoS backstop).
-# Mirrors the _LOOKUP_RESULT_TIMEOUT_SECONDS rationale: a pathological body that makes hl7apy's
-# structure/cardinality parse spin can otherwise pin the listener's off-loop worker; the timeout frees
-# the listener and routes the message to ERROR/dead-letter. It CANNOT kill the to_thread worker (no
-# thread cancellation in CPython) — the orphaned validate leaks its thread until it returns, bounded by
-# the 16 MiB / segment caps enforce_size_limits fires BEFORE the slow parse (validate.py). Per-inbound
-# `validation.strict_timeout_s` overrides this; <= 0 there disables the backstop entirely. Owner-tunable.
-_STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
-
-
-def _strict_validate_timeout(ic: InboundConnection) -> float | None:
-    """The effective wall-clock (seconds) for this inbound's strict validate, or ``None`` if disabled.
-
-    Resolves the per-connection ``validation.strict_timeout_s`` against the engine default (#89):
-    ``None`` inherits ``_STRICT_VALIDATE_TIMEOUT_SECONDS``; ``<= 0`` disables the backstop (returns
-    ``None`` → the caller runs the validate un-timed, the pre-#89 behaviour). The value is trusted config,
-    not an HL7 field."""
-    configured = ic.validation.strict_timeout_s
-    effective = _STRICT_VALIDATE_TIMEOUT_SECONDS if configured is None else configured
-    return effective if effective > 0 else None
+# The strict-validate DoS backstop (#89) and its per-inbound resolution live in ingress_guards, so the
+# operator resend (BACKLOG #1911) times its strict validate by the same rule. Re-exported under the
+# names this module and the docs have always used.
+_STRICT_VALIDATE_TIMEOUT_SECONDS = STRICT_VALIDATE_TIMEOUT_SECONDS
+_strict_validate_timeout = strict_validate_timeout
 
 
 # Engine-level ingress size ceiling for NON-HL7 content types (SEC-017, CWE-770). The HL7 path already
@@ -5101,9 +5091,9 @@ class RegistryRunner:
     def _streaming_over_threshold(self, ic: InboundConnection, text: str) -> bool:
         """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at/above
         that threshold — the gate for the over-threshold detach path (#149, ADR 0105 Phase 1a). Below
-        threshold or unset ⇒ False ⇒ the byte-identical no-detach fast path (and no strict downgrade)."""
-        threshold = ic.stream_threshold_bytes
-        return threshold is not None and len(text) >= threshold
+        threshold or unset ⇒ False ⇒ the byte-identical no-detach fast path (and no strict downgrade).
+        The rule lives in ``ingress_guards`` so the operator resend reads it the same way (#1911)."""
+        return streaming_over_threshold(ic, text)
 
     async def _detach_documents(self, ic: InboundConnection, text: str) -> tuple[str, list[str]]:
         """Detach every oversized OBX-5 ED base64 document from an over-threshold HL7 body into the

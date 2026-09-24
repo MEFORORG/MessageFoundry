@@ -321,7 +321,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
+from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
     NotDeployedError,
@@ -1216,8 +1216,15 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 #: The status a refused operator resubmission answers with, by the ingress guard that refused it
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
 #: the same status the upload route gives a non-text file. A body the listener could not have decoded,
-#: or an HL7 body ``Peek.parse`` refuses, is 422.
-_INGRESS_GUARD_STATUS: dict[str, int] = {"size": 413, "type": 415, "decode": 422, "parse": 422}
+#: an HL7 body ``Peek.parse`` refuses, or one a ``validation.strict`` inbound's strict hl7apy validation
+#: refuses or times out on, is 422.
+_INGRESS_GUARD_STATUS: dict[str, int] = {
+    "size": 413,
+    "type": 415,
+    "decode": 422,
+    "parse": 422,
+    "strict": 422,
+}
 
 
 async def _guard_resubmission(
@@ -1234,17 +1241,18 @@ async def _guard_resubmission(
     """Admit a resubmitted body as the target inbound's listener would, or refuse it (BACKLOG #1911).
 
     The upload resend and the edit-resend paths write the stage row directly, so the listener's size
-    ceiling and declared-type checks never ran on them. This runs the same guards
-    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmitted_body`) before anything is written
+    ceiling, declared-type checks and strict validation never ran on them. This runs the same guards
+    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmission`) before anything is written
     and returns the form to commit, which the caller writes instead of the body it was handed. A
     refusal is an HTTP 4xx, an ``action`` audit row and a log line, and no message row is written, so
     count-and-log holds: no body is accepted and then dropped. Off the event loop, because the body can
     be as large as an upload.
 
     The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
-    of the body, so neither the row nor the 4xx detail echoes PHI."""
+    of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal counts hl7apy's
+    errors rather than quoting them, since that text can echo a field value."""
     try:
-        return await asyncio.to_thread(admit_resubmitted_body, raw, inbound)
+        return await admit_resubmission(raw, inbound)
     except IngressGuardError as exc:
         await engine.store.record_audit(
             action,
