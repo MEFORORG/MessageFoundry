@@ -8192,6 +8192,24 @@ def check_fhir_lookup_allowed(
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
+#: How the four inbound bind refusals below describe ``--allow-insecure-bind``. They name no
+#: per-connection ``tls_hop_attested``: :func:`_inbound_insecure_bind_permitted` reads it, but no
+#: supported surface sets it -- no factory parameter and no ``connections.toml`` key. Only the
+#: unsupported raw-settings escape hatch (writing ``spec.settings`` directly) reaches it, and a refusal
+#: must not steer an operator there (docs/DEPLOYMENT.md, SDS-3.7).
+_INSECURE_BIND_FLAG_CLAMP = (
+    "(an enforcing instance, which is the default, ignores the flag; "
+    "[security].enforcement = warn lets it apply)"
+)
+
+
+def _insecure_bind_cause(source: Source) -> str:
+    """What let an off-loopback cleartext bind cross, for its WARNING line.
+
+    It names ``tls_hop_attested`` only when the connection carries it, so the line reports a fact
+    rather than offering a field no supported surface sets (see :data:`_INSECURE_BIND_FLAG_CLAMP`)."""
+    return "tls_hop_attested" if source.tls_hop_attested else "--allow-insecure-bind"
+
 
 def _inbound_insecure_bind_permitted(
     *, allow_insecure_bind: bool, attested: bool, posture: HopPosture | None
@@ -8312,18 +8330,18 @@ def check_mllp_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r without TLS "
-            "(--allow-insecure-bind / tls_hop_attested); HL7 bodies cross the network in cleartext — "
+            "(%s); HL7 bodies cross the network in cleartext — "
             "set tls=true (+ tls_cert_file/tls_key_file) on it.",
             name,
             host,
+            _insecure_bind_cause(source),
         )
         return
     raise WiringError(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; HL7 bodies would "
         "cross the network in cleartext. Set tls=true (+ tls_cert_file/tls_key_file) on the MLLP "
         "connection, or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
-        "firewalled network (refused even with the flag on a production-PHI instance — set "
-        "tls_hop_attested=true if the segment is secured by other means)."
+        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
     )
 
 
@@ -8348,18 +8366,18 @@ def check_http_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r for an HTTP listener without TLS "
-            "(--allow-insecure-bind / tls_hop_attested); POSTed bodies (frequently PHI) cross the "
+            "(%s); POSTed bodies (frequently PHI) cross the "
             "network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on the Http connection.",
             name,
             host,
+            _insecure_bind_cause(source),
         )
         return
     raise WiringError(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; POSTed bodies "
         "(frequently PHI) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the Http connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network (refused even with the flag on a "
-        "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
     )
 
 
@@ -8581,18 +8599,18 @@ def check_dimse_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r without DICOM-over-TLS "
-            "(--allow-insecure-bind / tls_hop_attested); DICOM PHI (header + pixel data) crosses the "
+            "(%s); DICOM PHI (header + pixel data) crosses the "
             "network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on the DICOM connection.",
             name,
             host,
+            _insecure_bind_cause(source),
         )
         return
     raise WiringError(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; DICOM PHI (header "
         "+ pixel data) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the DICOM connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network (refused even with the flag on a "
-        "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
     )
 
 
@@ -8619,20 +8637,20 @@ def check_tcp_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r for a plaintext-only %s listener "
-            "(--allow-insecure-bind / tls_hop_attested); X12/raw-TCP payloads (frequently PHI) cross "
+            "(%s); X12/raw-TCP payloads (frequently PHI) cross "
             "the network in cleartext — these listeners have no TLS, so firewall/segment them.",
             name,
             host,
             source.type.value.upper(),
+            _insecure_bind_cause(source),
         )
         return
     raise WiringError(
         f"inbound connection {name!r} binds non-loopback host {host!r} on a plaintext-only "
         f"{source.type.value.upper()} listener; raw-TCP/X12 payloads (frequently PHI) would cross the "
         "network in cleartext. TCP/X12 listeners are plaintext-only (no TLS option) — bind loopback, "
-        "firewall/segment the port at the OS level, or pass `serve --allow-insecure-bind` to accept "
-        "the cleartext risk on a trusted, firewalled network (refused even with the flag on a "
-        "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
+        "or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
+        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
     )
 
 

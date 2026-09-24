@@ -172,10 +172,10 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = F
     if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
         raise ValueError(
             "DATABASE connection TLS is weakened (trust_server_certificate=true or encrypt=false), "
-            "which is MITM-able. Use a trusted server certificate, set tls_hop_attested=true on this "
-            "connection if the hop is secure by other means (a proxy-terminated / trusted segment), or "
-            f"set {INSECURE_TLS_ESCAPE_ENV}=1 on a NON-PRODUCTION instance to allow it for a trusted-"
-            "network dev/test bind (the escape can no longer relax a production-PHI hop)."
+            "which is MITM-able. Use a trusted server certificate with encrypt=true, or "
+            f"set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn to allow "
+            "it for a trusted-network dev/test bind (the escape has no effect while enforcing, the "
+            "default)."
         )
     if (trust or not encrypt) and attested:
         _audit_attested_weakened_tls("DATABASE connection")

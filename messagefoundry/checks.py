@@ -1987,8 +1987,8 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
             "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
-            "instance REFUSES these off-loopback at build-check unless the connection declares "
-            "tls_hop_attested or cleartext_accepted"
+            "instance REFUSES these off-loopback at build-check unless that outbound connection "
+            "declares cleartext_accepted with a cleartext_reason (an inbound DatabasePoll cannot)"
         ),
     )
 

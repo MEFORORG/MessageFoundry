@@ -181,8 +181,8 @@ class SmartBackendTokenProvider:
         except InsecureHopRefused as exc:
             raise SmartAuthError(
                 "SMART token endpoint over cleartext http would expose the client_assertion; refused "
-                "by the instance security posture (use https, attest the hop as secure via "
-                "tls_hop_attested, or declare cleartext_accepted with a cleartext_reason)"
+                "by the instance security posture (use https, or declare cleartext_accepted with a "
+                "cleartext_reason)"
             ) from exc
         if not client_id:
             raise SmartAuthError("SMART Backend Services requires a 'smart_client_id' setting")
