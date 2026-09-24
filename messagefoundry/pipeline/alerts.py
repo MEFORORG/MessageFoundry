@@ -545,16 +545,30 @@ class LoggingAlertSink:
 #: throttles and routes apart from engine attestation and the audit-chain check.
 STORE_CIPHER_SUBJECT = "store-cipher"
 
+#: The cell-AAD table name the uploaded-file store seals under (``uploads.py``). Spelled here so this
+#: module does not import the uploads store for one string; a test pins the two spellings together.
+UPLOADED_FILE_TABLE = "uploaded_file"
+
 
 def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None:
     """Raise the ``store-cipher`` alert for an unmarked value in ``table.column``.
 
     Names only the cell, which the cipher took from the AAD: never the row key and never the value,
     so it carries no PHI. Never raises: an alert failure must not change what a read or an open does."""
-    reason = (
-        f"the keyed store found an unmarked value in cipher column {table}.{column} (a stripped "
-        "marker or a planted plaintext row); every read of it is refused"
-    )
+    if table == UPLOADED_FILE_TABLE:
+        # The uploaded-file store (BACKLOG #1169, owner ruling 2026-09-23). Unlike a store column, a
+        # plaintext file here is usually legitimate: one written before the key was enabled. So the
+        # reason says what fixes it. Still the surface only: never a file id and never a filename.
+        reason = (
+            f"the keyed store refused a plaintext uploaded file ({table}.{column}): one stored before "
+            "the key was enabled, or a planted one; it stays refused until 'messagefoundry "
+            "rotate-key' seals it"
+        )
+    else:
+        reason = (
+            f"the keyed store found an unmarked value in cipher column {table}.{column} (a stripped "
+            "marker or a planted plaintext row); every read of it is refused"
+        )
     try:
         sink.integrity_drift(STORE_CIPHER_SUBJECT, reason=reason, drift_count=1)
     except Exception:  # noqa: BLE001 — an alert-sink failure must never break a read path

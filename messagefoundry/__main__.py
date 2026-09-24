@@ -5223,6 +5223,15 @@ def _rotate_key(args: argparse.Namespace) -> int:
         f"OK: re-encrypted {count} value(s) under the active key"
         f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
     )
+    if uploads.sealed_plaintext:
+        # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
+        # Sealing makes them readable, and it would seal a planted file just the same, so say how
+        # many. The operator can check this against the count `serve` logged at startup.
+        print(
+            f"note: sealed {uploads.sealed_plaintext} plaintext uploaded file(s), which are now "
+            "readable. Check that number against the count serve logged at startup; an extra one "
+            "may be a file that did not come through the engine."
+        )
     if uploads.skipped:
         # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
         # key now destroys it. This is the one outcome where "OK" alone would mislead.

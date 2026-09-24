@@ -409,8 +409,11 @@ This section is kept rather than deleted, because the claim it used to make is t
   access. Nothing in the engine detects the plant once this is on.
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
   it sealed while on stays sealed.
-- **Not covered either way:** the uploaded-file store, whose behaviour at first key-enable awaits an
-  owner ruling, and the DIRECT S/MIME connector's enveloped body.
+- **Uploads too:** on a keyed store a plaintext uploaded file is refused until `rotate-key` seals it
+  (owner ruling 2026-09-23). With this on, it is served as plaintext instead. Under
+  `cipher_provider = "vault_transit"` uploads pass through either way, because `rotate-key` cannot run
+  there ([PHI.md](PHI.md) §3).
+- **Not covered either way:** the DIRECT S/MIME connector's enveloped body.
 
 ### `[secret_rotation].enforce_store_key_expiry = false` — the store DEK's calendar expiry stops the engine no more
 - **What you lose:** the **hard stop** on a calendar-expired data-encryption key. With it on, a DEK past

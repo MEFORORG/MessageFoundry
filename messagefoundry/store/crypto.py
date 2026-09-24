@@ -246,9 +246,10 @@ class _UnmarkedPolicy:
     so ``''`` is the one unmarked value a keyed store legitimately holds. NULL never reaches here.
 
     ``allow_unmarked`` is the audited opt-out, ``[store].allow_unmarked_ciphertext``. The per-call
-    ``allow_unmarked=True`` exists for exactly one caller, the uploaded-file store, whose behaviour at
-    first key-enable is an open owner question; it keeps that surface byte-identical rather than
-    deciding it here."""
+    ``allow_unmarked=True`` belongs to the uploaded-file store (``uploads.py``). Its reseal pass, run
+    by ``rotate-key``, passes it to seal a plaintext upload, and every read passes it under a cipher
+    that pass cannot reseal. Every other upload read leaves it off, so a keyed AES-GCM store refuses a
+    plaintext upload until ``rotate-key`` seals it (owner ruling 2026-09-23)."""
 
     _allow_unmarked: bool
     _refusal_hook: UnmarkedRefusalHook | None
