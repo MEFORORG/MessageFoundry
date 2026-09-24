@@ -928,8 +928,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     ) -> None:
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is unclaimed and near its
         # deadline. `user:<username>` stands in for "connection", so the throttle and the alert
-        # instance key per account and no connection glob matches it. `reason` carries the deadline
-        # into the durable alert row. The payload is the ISO deadline and whole hours remaining only:
+        # instance key per account. Rules still match it: AlertRule.connection defaults to "*", so a
+        # catch-all rule's mute or transports=[] silences this reminder, and its control_action is
+        # dispatched at `user:<username>` unless control_target names a connection. Scope such rules
+        # to real connection names or to one event_type.
+        # `reason` carries the deadline into the durable alert row. The payload is the ISO deadline and whole hours remaining only:
         # never the password, no PHI.
         self._emit(
             {

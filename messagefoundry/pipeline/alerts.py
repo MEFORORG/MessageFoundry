@@ -170,9 +170,14 @@ class AlertSink(Protocol):
     ) -> None:
         """An **admin-issued temporary password** (a create-user or reset credential, still
         ``must_change_password``) is UNCLAIMED and near the instant the login gate stops accepting it
-        (ASVS 6.4.5, BACKLOG #1141). ``name`` is ``user:<holder's username>``, prefixed so a rule's
-        connection glob cannot mistake an account for a connection; ``expires_at`` is the ISO instant;
-        ``hours_remaining`` is the whole hours left (``0`` in the final hour).
+        (ASVS 6.4.5, BACKLOG #1141). ``name`` is ``user:<holder's username>``, so the throttle and
+        the alert instance key per account; ``expires_at`` is the ISO instant; ``hours_remaining`` is
+        the whole hours left (``0`` in the final hour).
+
+        The prefix does not hide the event from rules. ``AlertRule.connection`` defaults to ``"*"``,
+        so a catch-all rule matches it. A catch-all ``mute`` or ``transports=[]`` rule silences this
+        reminder, and a catch-all ``control_action`` is dispatched at ``user:<name>`` unless the rule
+        sets ``control_target``. Scope such rules to real connection names or to one ``event_type``.
 
         The engine cannot reach the holder of a credential it handed to an administrator, so this goes
         to the operator: tell the holder, or, if the credential lapses unclaimed, reset it again. The
