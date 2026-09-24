@@ -462,7 +462,7 @@ class StoreSettings(_Section):
     # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
     # a LOOSENING -- `security_loosenings()` names it. No effect without an encryption key. It also
     # restores the passthrough for a plaintext UPLOADED FILE, which a keyed store otherwise refuses
-    # until `rotate-key` seals it (owner ruling 2026-09-23).
+    # until `rotate-key` seals it, alerting under `upload-cipher` (owner ruling 2026-09-23).
     allow_unmarked_ciphertext: bool = False
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the

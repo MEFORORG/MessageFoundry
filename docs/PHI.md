@@ -311,12 +311,12 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    **A plaintext upload is refused until `rotate-key` seals it (owner ruling 2026-09-23, BACKLOG
    #1169).** The uploaded-file store under `[store].uploads_dir` shares the store's cipher. When a site
    first enables a key, the uploads it already holds are plaintext files. On a keyed AES-GCM store each
-   one is refused on every read that serves or authorizes it, and raises an `integrity_drift` alert
+   one is refused on every read, and raises an `integrity_drift` alert
    under its own `upload-cipher` subject, naming only the `uploaded_file` surface and never a file. The
    subject is separate from `store-cipher` so that expected upload refusals cannot throttle or mute a
-   planted store row. A refused upload drops out of the listing, and a by-id route answers **HTTP
-   409** with the fix. To bring it
-   back, stop the engine and run `messagefoundry rotate-key`, which seals it under the active key and
+   planted store row. A refused upload drops out of the listing. A by-id route answers **HTTP 423**
+   with the fix to a holder of `files:access_any`, and the same 404 as an absent id to everyone else,
+   because the owner cannot be read to check ownership. To bring it back, stop the engine and run `messagefoundry rotate-key`, which seals it under the active key and
    prints how many plaintext uploads it sealed. The engine never seals them at startup, because a
    whole-directory crypto pass is unbounded boot-time work. Instead `serve` logs one WARNING at
    startup with the **count** of plaintext uploads and that instruction, and never a filename. This is
@@ -325,10 +325,11 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    upload limits remain.** `rotate-key` seals every plaintext upload it finds, a planted one included,
    because new sealed uploads sit beside legacy ones and this surface has no "already sealed" evidence
    to tell them apart. The refusal before it, its alert, and the startup count the operator checks
-   against the sealed count are the controls. The retention prune and the per-uploader quota still
-   read a refused upload's metadata, because they only count and delete, so it still ages out and
-   still counts. It cannot be deleted through the API until it is sealed, because the ownership check
-   must read its metadata first. `rotate-key` stamps the key's rotation date only when the key
+   against the sealed count are the controls. **Until it is sealed, a refused upload is also outside
+   the retention prune and the per-uploader quota, and cannot be deleted through the API**, because
+   each of those must read its metadata first. They refuse it on purpose: a plaintext sidecar is not
+   bound to its path, so trusting it would let a planted one name another upload for the prune to
+   delete, lift a quota with a negative size, or fail every save. `rotate-key` stamps the key's rotation date only when the key
    actually changed, so running it with the same key to seal uploads does not reset the key-age
    clock.
    **Under `cipher_provider = "vault_transit"` a plaintext upload still reads back as plaintext.**

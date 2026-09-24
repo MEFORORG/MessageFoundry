@@ -5163,6 +5163,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     async def run() -> tuple[int, ResealResult]:
         import datetime
 
+        from messagefoundry.pipeline.secret_rotation import fingerprints_equal
         from messagefoundry.store.store import SecretRotationMetaStore
 
         store = await open_store(settings.store)
@@ -5195,7 +5196,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
                     # Stamp only a key that CHANGED. BACKLOG #1169 made rotate-key the fix for
                     # plaintext uploads, which an operator runs with the SAME key; stamping then
                     # would reset the key-age clock for a key that was never rotated.
-                    if prior is None or prior.fingerprint != key_id:
+                    # Compared as the rotation watcher compares this same field (ASVS 11.2.4,
+                    # BACKLOG #1167): constant-time, over its byte form, never a bare `!=`.
+                    if prior is None or not fingerprints_equal(prior.fingerprint, key_id):
                         await store.upsert_secret_rotation_meta(
                             "MEFOR_STORE_ENCRYPTION_KEY",
                             fingerprint=key_id,

@@ -410,7 +410,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
   it sealed while on stays sealed.
 - **Uploads too:** on a keyed store a plaintext uploaded file is refused until `rotate-key` seals it
-  (owner ruling 2026-09-23). With this on, it is served as plaintext instead. Under
+  (owner ruling 2026-09-23), alerting under its own subject `upload-cipher`. With this on, it is served as plaintext instead. Under
   `cipher_provider = "vault_transit"` uploads pass through either way; [PHI.md](PHI.md) §3 says why.
 - **Not covered either way:** the DIRECT S/MIME connector's enveloped body.
 

@@ -535,14 +535,11 @@ class UploadStore:
             json.dumps(asdict(meta)), aad=cell_aad("uploaded_file", "meta", meta.file_id)
         )
 
-    def _decrypt_meta(
-        self, stored: str, file_id: str, *, trust_unmarked: bool = False
-    ) -> UploadedFileMeta:
-        # trust_unmarked: see _scan_metas_sync. Never set on a path that serves or authorizes.
+    def _decrypt_meta(self, stored: str, file_id: str) -> UploadedFileMeta:
         raw = self._cipher.decrypt(
             stored,
             aad=cell_aad("uploaded_file", "meta", file_id),
-            allow_unmarked=self._passes_unmarked or trust_unmarked,
+            allow_unmarked=self._passes_unmarked,
         )
         d = json.loads(raw)
         return UploadedFileMeta(
@@ -578,7 +575,7 @@ class UploadStore:
             if _FILE_ID_RE.match(fid):
                 yield fid, entry
 
-    def _scan_metas_sync(self, *, trust_unmarked: bool = False) -> list[UploadedFileMeta]:
+    def _scan_metas_sync(self) -> list[UploadedFileMeta]:
         """Walk the uploads root and decrypt every well-formed ``.meta`` sidecar (UNSORTED). A
         bad/foreign/undecryptable sidecar is skipped **with its cause named** (never a body in the
         log), so a rotated-away key can neither sink the listing nor silently drop a quota/retention
@@ -597,14 +594,14 @@ class UploadStore:
         the cipher branch below, and is left out of the listing, the quota and the retention prune
         until ``rotate-key`` reseals it.
 
-        ``trust_unmarked`` reads a plaintext sidecar that a keyed store would refuse (BACKLOG #1169).
-        Only the quota and the retention prune pass it. They COUNT and DELETE; they never serve a
-        byte or grant access, so reading the sidecar there discloses nothing. Refusing it there
-        would do harm instead: the least-protected PHI on disk would escape the retention window, and
-        an uploader's legacy files would stop counting against their quota. A planted sidecar can
-        then be pruned or consume quota, which needs write access to the directory, and that access
-        can delete the files outright anyway. The listing, the by-id reads and the ownership check
-        never pass it.
+        **The quota and the prune deliberately do NOT read a refused sidecar either.** A plaintext
+        sidecar is not bound to its path, so its JSON can name ANOTHER upload's ``file_id`` for the
+        prune to delete, carry a negative ``size`` that lifts an uploader's byte quota, write
+        attacker-chosen names into the ``upload.prune`` audit, or hold a number that overflows the
+        coercion and fails every save. Trusting it to keep retention working would trade a bounded
+        residual for all of that. The residual is named in ``docs/PHI.md`` §3: a refused upload is
+        outside retention and the quota until ``rotate-key`` seals it, and ``serve`` logs the count
+        at startup so the operator knows to run it.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch
@@ -613,11 +610,7 @@ class UploadStore:
         out: list[UploadedFileMeta] = []
         for fid, entry in self._iter_sidecars():
             try:
-                out.append(
-                    self._decrypt_meta(
-                        entry.read_text(encoding="utf-8"), fid, trust_unmarked=trust_unmarked
-                    )
-                )
+                out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
             except CipherError as exc:
                 # The cipher declined the value: a wrong/rotated-away key, a blob relocated into
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
@@ -680,11 +673,7 @@ class UploadStore:
             # The residual the lock alone cannot cover — a sibling shard between ITS scan and ITS
             # write, invisible to this one — is covered by the ledger reservation the caller holds
             # around this whole call. See _reserve_across_shards and _on_disk_refusal.
-            mine = [
-                m
-                for m in self._scan_metas_sync(trust_unmarked=True)
-                if m.uploader_id == uploader_id
-            ]
+            mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
             refusal = self._on_disk_refusal(
                 uploader=uploader,
                 observed_files=len(mine),
@@ -839,9 +828,7 @@ class UploadStore:
     def _observed_sync(self, uploader_id: str) -> tuple[int, int]:
         """(file count, total bytes) already ON DISK for ``uploader_id`` — the fleet-visible half of
         the budget. Sync: the caller runs it off the event loop."""
-        mine = [
-            m for m in self._scan_metas_sync(trust_unmarked=True) if m.uploader_id == uploader_id
-        ]
+        mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
         return len(mine), sum(m.size for m in mine)
 
     async def list_files(self) -> list[UploadedFileMeta]:
@@ -1035,7 +1022,7 @@ class UploadStore:
         hourly retention scan already decrypts every sidecar, so this adds nothing of a new order. Runs
         off the event loop."""
         cipher = self._cipher
-        if self._passes_unmarked or not isinstance(cipher, AesGcmCipher):
+        if not isinstance(cipher, AesGcmCipher):  # the same test as _passes_unmarked
             return 0
         try:
             count = await asyncio.to_thread(self._count_unsealed_sync)
@@ -1102,8 +1089,7 @@ class UploadStore:
 
         def _prune() -> PruneResult:
             pruned: list[UploadedFileMeta] = []
-            # trust_unmarked: a plaintext upload a keyed store refuses must still age out.
-            for meta in self._scan_metas_sync(trust_unmarked=True):
+            for meta in self._scan_metas_sync():
                 if meta.uploaded_at >= cutoff:
                     continue
                 # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
@@ -1282,8 +1268,8 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
     on store classes this LEAF module may not import (see the module docstring), so the shared name
     is what keeps a grep for ``_reencrypt_value`` from missing this one. Pairing a decrypt and an
     encrypt with different AADs is the mistake the single-expression form exists to prevent."""
-    # allow_unmarked=True: this is the ONE place a plaintext upload may be read, because sealing it is
-    # the whole point. Owner ruling 2026-09-23 (BACKLOG #1169): a keyed store refuses a plaintext
+    # allow_unmarked=True: the one pass that reads a plaintext upload, because sealing it is the
+    # whole point. Owner ruling 2026-09-23 (BACKLOG #1169): a keyed store refuses a plaintext
     # upload on every read path until `rotate-key` runs this pass.
     return cipher.encrypt(cipher.decrypt(stored, aad=aad, allow_unmarked=True), aad=aad)
 

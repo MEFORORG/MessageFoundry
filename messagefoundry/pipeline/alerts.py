@@ -558,7 +558,8 @@ UPLOAD_CIPHER_SUBJECT = "upload-cipher"
 
 
 def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None:
-    """Raise the ``store-cipher`` alert for an unmarked value in ``table.column``.
+    """Raise the refusal alert for an unmarked value in ``table.column``: ``upload-cipher`` for the
+    uploaded-file store, ``store-cipher`` for everything else.
 
     Names only the cell, which the cipher took from the AAD: never the row key and never the value,
     so it carries no PHI. Never raises: an alert failure must not change what a read or an open does."""

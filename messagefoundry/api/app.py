@@ -4437,8 +4437,11 @@ def create_app(
 
     # BACKLOG #1169: the store cipher refused the file. On a keyed store that is usually a plaintext
     # upload stored before the key was enabled, which `rotate-key` seals (owner ruling 2026-09-23); it
-    # can also be a file under a key that is no longer configured. A 409 says the file exists and needs
-    # an operator, where an unhandled CipherError answered 500. No file detail is in the text.
+    # can also be a file under a key that is no longer configured. 423 Locked says the file exists and
+    # needs an operator, where an unhandled CipherError answered 500. It is not 409, which the resend
+    # route already spends on "inbound not running" and the web console maps to that text. No file
+    # detail is in the body.
+    _UPLOAD_UNREADABLE_STATUS = 423
     _UPLOAD_UNREADABLE = (
         "this uploaded file cannot be read under the configured store key; if it was stored before "
         "the key was enabled, an operator must run 'messagefoundry rotate-key' to seal it"
@@ -4466,7 +4469,12 @@ def create_app(
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnreadableError:
-            raise HTTPException(409, _UPLOAD_UNREADABLE) from None
+            # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
+            # for everyone but an override holder, who may see any file anyway and is the one who
+            # can act on it; the refused sidecar is not an existence oracle for anyone else.
+            if identity.has(Permission.FILES_ACCESS_ANY):
+                raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+            raise HTTPException(404, "no such uploaded file") from None
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
                 "upload.denied",
@@ -4741,7 +4749,7 @@ def create_app(
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnreadableError:
-            raise HTTPException(409, _UPLOAD_UNREADABLE) from None
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         result = await asyncio.to_thread(
             browse_messages,
             data,
@@ -4890,7 +4898,7 @@ def create_app(
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnreadableError:
-            raise HTTPException(409, _UPLOAD_UNREADABLE) from None
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         parts = await asyncio.to_thread(split_uploaded, data)
         if body.index >= len(parts):
             raise HTTPException(
@@ -4936,6 +4944,8 @@ def create_app(
             meta = await us.delete(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         await engine.store.record_audit(
             "upload.delete",
             actor=identity.username,

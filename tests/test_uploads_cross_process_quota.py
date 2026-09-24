@@ -74,8 +74,8 @@ def _shard_result(
             )
             real_scan = uploads._scan_metas_sync
 
-            def _slow_scan(*, trust_unmarked: bool = False) -> list[UploadedFileMeta]:
-                out = real_scan(trust_unmarked=trust_unmarked)
+            def _slow_scan() -> list[UploadedFileMeta]:
+                out = real_scan()
                 time.sleep(_SCAN_OVERLAP_SECONDS)  # widen the scan -> write window
                 return out
 

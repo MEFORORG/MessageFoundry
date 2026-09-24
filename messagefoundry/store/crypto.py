@@ -226,6 +226,12 @@ def aad_cell_name(aad: bytes | None) -> tuple[str, str]:
     return fields[1].decode("utf-8", "replace"), fields[2].decode("utf-8", "replace")
 
 
+#: The cell-AAD table name the uploaded-file store (``uploads.py``) seals under, for the refusal that
+#: special-cases it. ``uploads.py`` keeps the literal in its ``cell_aad`` calls, because the cipher
+#: registry test enumerates literal cells, and ``pipeline/alerts.py`` keeps its own copy.
+#: ``tests/test_uploads_strict_ciphertext.py`` pins all three spellings together.
+UPLOADED_FILE_AAD_TABLE = "uploaded_file"
+
 #: Called when a keyed cipher REFUSES an unmarked value, with the ``(table, column)`` from the cell
 #: AAD. Never the row key and never the value, so an implementation may forward it to an alert.
 UnmarkedRefusalHook = Callable[[str, str], None]
@@ -247,9 +253,9 @@ class _UnmarkedPolicy:
 
     ``allow_unmarked`` is the audited opt-out, ``[store].allow_unmarked_ciphertext``. The per-call
     ``allow_unmarked=True`` belongs to the uploaded-file store (``uploads.py``). Its reseal pass, run
-    by ``rotate-key``, passes it to seal a plaintext upload, and every read passes it under a cipher
-    that pass cannot reseal. Every other upload read leaves it off, so a keyed AES-GCM store refuses a
-    plaintext upload until ``rotate-key`` seals it (owner ruling 2026-09-23)."""
+    by ``rotate-key``, passes it to seal a plaintext upload, and its reads pass it under a cipher that
+    pass cannot reseal. Under an AES-GCM cipher no other upload path passes it, so a keyed store
+    refuses a plaintext upload until ``rotate-key`` seals it (owner ruling 2026-09-23)."""
 
     _allow_unmarked: bool
     _refusal_hook: UnmarkedRefusalHook | None
@@ -288,7 +294,7 @@ class _UnmarkedPolicy:
         if not stored or allow_unmarked or self._allow_unmarked:
             return stored
         table, column = aad_cell_name(aad)
-        if table == "uploaded_file":
+        if table == UPLOADED_FILE_AAD_TABLE:
             # An uploaded file (BACKLOG #1169, owner ruling 2026-09-23). Usually one stored before
             # the key was enabled, and the fix is rotate-key, never the loosening.
             cause = "a plaintext upload stored before the key was enabled, or a planted one"

@@ -8,9 +8,10 @@ at startup, because that is unbounded boot-time work. It is fail-closed, like th
 
 **What each test pins.**
 
-* On a keyed AES-GCM store, a plaintext upload is refused on every read path that serves or
-  authorizes, and the refusal reaches the ``upload-cipher`` alert naming only the upload surface. The
-  retention prune and the quota still see it, so it cannot outlive its window or dodge the quota.
+* On a keyed AES-GCM store, a plaintext upload is refused on every read path, and the refusal
+  reaches the ``upload-cipher`` alert naming only the upload surface.
+* The prune and the quota refuse it too. That is a named residual (it is outside retention until
+  sealed), and the alternative let a planted sidecar delete another upload.
 * ``rotate-key`` seals it, and it then reads normally. The CLI reports how many it sealed.
 * ``[store].allow_unmarked_ciphertext`` restores the passthrough for uploads too.
 * A keyless store is unchanged.
@@ -35,6 +36,7 @@ from messagefoundry.pipeline.alerts import (
 )
 from messagefoundry.store.crypto import (
     MARKER_PREFIX,
+    UPLOADED_FILE_AAD_TABLE,
     AesGcmCipher,
     CipherError,
     generate_key,
@@ -109,6 +111,10 @@ async def test_a_plaintext_upload_is_refused_on_a_keyed_store(tmp_path: Path) ->
     assert all(fid not in f"{t}.{c}" for t, c in cells)
 
 
+def test_the_alert_and_the_cipher_spell_the_upload_table_the_same() -> None:
+    assert UPLOADED_FILE_TABLE == UPLOADED_FILE_AAD_TABLE
+
+
 def test_the_upload_alert_names_the_surface_and_the_fix_and_nothing_else() -> None:
     sink = _Sink()
     alert_store_cipher_refusal(sink, UPLOADED_FILE_TABLE, "meta")  # type: ignore[arg-type]
@@ -123,23 +129,39 @@ def test_the_upload_alert_names_the_surface_and_the_fix_and_nothing_else() -> No
     assert "rotate-key" not in sink.events[1][1]
 
 
-async def test_a_refused_upload_still_ages_out_and_still_counts_against_quota(
-    tmp_path: Path,
-) -> None:
-    """Refusing to SERVE a plaintext upload must not let it escape retention or the quota. Those
-    passes count and delete; they never serve a byte, so they read the sidecar anyway."""
+async def test_a_refused_upload_is_outside_retention_until_sealed(tmp_path: Path) -> None:
+    """The named residual, pinned so a change to it is deliberate. The prune refuses a plaintext
+    sidecar just as a read does, so a legacy upload is not aged out until ``rotate-key`` seals it.
+    The startup count is what tells the operator to run it."""
     root = tmp_path / "uploads"
-    fid = await _plaintext_upload(root)
-    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, max_files_per_user=1)
-    # The quota sees the legacy file: the uploader is already at their one-file cap.
-    from messagefoundry.uploads import UploadQuotaError
+    legacy = await _plaintext_upload(root)
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    assert (await store.prune_expired(now=10**12)).pruned == []
+    assert (root / f"{legacy}.meta").exists() and (root / f"{legacy}.blob").exists()
+    await store.reseal_to_active()
+    assert [m.file_id for m in (await store.prune_expired(now=10**12)).pruned] == [legacy]
 
-    with pytest.raises(UploadQuotaError):
-        await store.save(data=_ADT.encode(), filename="b.hl7", uploader="op", uploader_id="u-op")
-    # And the prune removes it once it is past the window.
-    pruned = (await store.prune_expired(now=10**12)).pruned
-    assert [m.file_id for m in pruned] == [fid]
-    assert not (root / f"{fid}.meta").exists() and not (root / f"{fid}.blob").exists()
+
+async def test_the_prune_never_deletes_a_file_a_plant_names(tmp_path: Path) -> None:
+    """Why the prune refuses a plaintext sidecar rather than trusting it (review round 2).
+
+    A plaintext sidecar is not bound to its path, so its JSON ``file_id`` can name a DIFFERENT,
+    sealed upload. A prune that trusted it would delete that upload on every pass and write
+    attacker-chosen names into the audit. Here a fresh sealed upload named by a planted, aged
+    sidecar must survive."""
+    import json
+
+    root = tmp_path / "uploads"
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, retention_days=30)
+    victim = await store.save(
+        data=_ADT.encode(), filename="v.hl7", uploader="op", uploader_id="u-op"
+    )
+    (root / f"{'e' * 32}.meta").write_text(
+        json.dumps({"file_id": victim.file_id, "uploader": "x", "uploaded_at": 0.0}),
+        encoding="utf-8",
+    )
+    assert (await store.prune_expired()).pruned == []
+    assert (await store.read_bytes(victim.file_id)).decode() == _ADT
 
 
 # --- rotate-key seals it, then it reads ----------------------------------------------------------
