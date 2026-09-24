@@ -223,9 +223,17 @@ async def test_registration_rejects_wrong_origin() -> None:
         await store.close()
 
 
-async def test_a_credential_whose_curve_does_not_match_its_key_is_refused_and_audited() -> None:
+@pytest.mark.parametrize(
+    "crv", [2, True, 1.0], ids=["P-384 label on a P-256 key", "crv true", "crv 1.0"]
+)
+async def test_a_credential_whose_curve_does_not_match_its_key_is_refused_and_audited(
+    crv: int,
+) -> None:
     """BACKLOG #1166. It used to ENROL and then fail at first assertion with a raw ``ValueError``
-    from ``cryptography`` -- a 500. The refusal now happens at enrolment, on the audited path."""
+    from ``cryptography`` -- a 500. The refusal now happens at enrolment, on the audited path.
+
+    BACKLOG #1953: ``True == 1`` and ``1.0 == 1`` in Python, so a P-256 key whose curve reads
+    ``true`` or ``1.0`` used to pass the P-256 pin and ENROL. CBOR keeps both apart from 1."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
@@ -236,7 +244,7 @@ async def test_a_credential_whose_curve_does_not_match_its_key_is_refused_and_au
             )
         )
         challenge = base64url_to_bytes(opts["challenge"])
-        mislabelled = SoftAuthenticator(rp_id=RP, origin=ORIGIN, crv=2)  # a P-256 key called P-384
+        mislabelled = SoftAuthenticator(rp_id=RP, origin=ORIGIN, crv=crv)  # a P-256 key
         elevation = await service.finish_webauthn_registration(
             identity,
             mislabelled.create_response(challenge),

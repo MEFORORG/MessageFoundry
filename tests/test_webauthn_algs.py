@@ -254,7 +254,7 @@ def _okp(key: ed25519.Ed25519PrivateKey, *, alg: int = -8, crv: int = _ED25519) 
     return encode_cbor({1: 1, 3: alg, -1: crv, -2: _ed25519_raw(key)})
 
 
-def _relabelled(cose_key: bytes, **changes: int | None) -> bytes:
+def _relabelled(cose_key: bytes, **changes: object) -> bytes:
     """``cose_key`` with COSE labels changed; a ``None`` value drops the label."""
     names = {"kty": 1, "alg": 3, "crv": -1}
     fields = dict(parse_cbor(cose_key))
@@ -268,6 +268,10 @@ def _relabelled(cose_key: bytes, **changes: int | None) -> bytes:
 
 def _p256() -> bytes:
     return SoftAuthenticator(rp_id=RP, origin=ORIGIN).cose_public_key()
+
+
+def _eddsa() -> bytes:
+    return _okp(ed25519.Ed25519PrivateKey.generate())
 
 
 #: Credentials the pinned library ENROLLED before this check, measured at engine ``0076e3cec``, and
@@ -340,7 +344,7 @@ def test_the_curve_rows_use_a_well_formed_response() -> None:
     If this is refused, the builder is broken and the refusal rows prove nothing. EdDSA rides
     through ``_registration_response`` too, so the OKP arm of the check is shown to admit Ed25519.
     """
-    for cose_key in (_p256(), _okp(ed25519.Ed25519PrivateKey.generate())):
+    for cose_key in (_p256(), _eddsa()):
         _assert_registers(cose_key)
 
 
@@ -510,3 +514,74 @@ def test_a_raw_library_failure_is_logged_by_type_and_a_library_refusal_is_not(
     warnings = [r for r in caplog.records if r.name == logger]
     assert len(warnings) == 1 and "KeyError" in warnings[0].getMessage()
     assert "registration" in warnings[0].getMessage()
+
+
+# --- the pin compares CBOR integers, not values that merely equal one (BACKLOG #1953) ----------
+#
+# Python's ``bool`` is a subclass of ``int`` and ``1.0 == 1``, so a COSE key decoded with ``true`` or
+# ``1.0`` where an integer belongs compares equal to the identifier it imitates. The library looks
+# its labels up in a dict and compares its values with ``==``, and the P-256 pin used ``int()``, so
+# every row below ENROLLED at engine ``5ccff7cb3``: a real key whose one defect is a stand-in for an
+# integer, either as a parameter value or as the label that names it.
+
+
+def _rekeyed(cose_key: bytes, label: int, stand_in: object) -> bytes:
+    """``cose_key`` with the entry under ``label`` moved to the key ``stand_in``, value unchanged."""
+    fields = dict(parse_cbor(cose_key))
+    fields[stand_in] = fields.pop(label)
+    return encode_cbor(fields)
+
+
+#: Every row reaches the shape check: each passed the library's own screens at ``5ccff7cb3``.
+_NON_INTEGER_COSE_KEYS: dict[str, Callable[[], bytes]] = {
+    "ES256 with crv true": lambda: _relabelled(_p256(), crv=True),
+    "ES256 with crv 1.0": lambda: _relabelled(_p256(), crv=1.0),
+    "ES256 with alg -7.0": lambda: _relabelled(_p256(), alg=-7.0),
+    "ES256 with kty 2.0": lambda: _relabelled(_p256(), kty=2.0),
+    "EdDSA with kty true": lambda: _relabelled(_eddsa(), kty=True),
+    "EdDSA with crv 6.0": lambda: _relabelled(_eddsa(), crv=6.0),
+    "EdDSA with alg -8.0": lambda: _relabelled(_eddsa(), alg=-8.0),
+    "ES256 with the kty label written true": lambda: _rekeyed(_p256(), 1, True),
+    "ES256 with the alg label written 3.0": lambda: _rekeyed(_p256(), 3, 3.0),
+    "ES256 with the crv label written -1.0": lambda: _rekeyed(_p256(), -1, -1.0),
+    "ES256 with the x label written -2.0": lambda: _rekeyed(_p256(), -2, -2.0),
+    "EdDSA with the kty label written true": lambda: _rekeyed(_eddsa(), 1, True),
+}
+
+
+@pytest.mark.parametrize(
+    "build", _NON_INTEGER_COSE_KEYS.values(), ids=_NON_INTEGER_COSE_KEYS.keys()
+)
+def test_a_stand_in_for_a_cose_integer_is_refused_at_registration(
+    build: Callable[[], bytes], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A deliberate refusal on the audited path, like the curve pin: no WARNING is logged."""
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    logger = "messagefoundry.auth.webauthn"
+    with (
+        caplog.at_level(logging.WARNING, logger=logger),
+        pytest.raises(wa.WebAuthnVerificationError),
+    ):
+        wa.verify_registration(
+            response_json=_registration_response(challenge, build()),
+            challenge=challenge,
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+    assert not [r for r in caplog.records if r.name == logger]
+
+
+def test_the_stand_in_rows_are_otherwise_well_formed() -> None:
+    """The positive control for the table above: the same two rewrites, carrying the integer.
+
+    If these were refused, the rows would prove only that the rewrite breaks a key, not that the
+    type check refuses it. A text-string label is a legal COSE label (RFC 9052 section 7) that
+    names no parameter the checks read, so it rides along here and must not be refused.
+    """
+    _assert_registers(_relabelled(_p256(), kty=2, alg=-7, crv=_P256))
+    _assert_registers(_relabelled(_eddsa(), kty=1, alg=-8, crv=_ED25519))
+    for label in (1, 3, -1, -2):
+        _assert_registers(_rekeyed(_p256(), label, label))
+    with_text_label = dict(parse_cbor(_p256()))
+    with_text_label["note"] = "x"
+    _assert_registers(encode_cbor(with_text_label))
