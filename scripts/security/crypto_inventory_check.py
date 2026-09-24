@@ -44,6 +44,31 @@ than feeding it. Four facts, each measured, that are not obvious from the code b
   registered here and the ``pipeline/`` call sites stay ``ssl``-free. That is centralization, not
   evasion: one place decides the TLS policy for every SMTP hop in the product.
 
+**AN OPERATION ARM READS THE SAME PYTHON AT FINER GRAIN (BACKLOG #1164, ASVS 11.1.3).** Import
+discovery cannot see a new operation inside a file that is already registered, and it sees a file
+that reaches crypto through a first-party helper only if that helper is on the seam list. The
+operation arm (:func:`check_operations`, instrument in ``scripts/security/crypto_operations.py``)
+resolves every CALL to a qualified name and classifies it by what it does: encrypt/decrypt, hash,
+MAC, constant-time compare, sign/verify, KDF, CSPRNG draw, TLS-context construction or posture, key
+or certificate handling. It follows first-party helpers without a list, so a new helper is covered
+the day it is written. It diffs against :data:`OPERATION_INVENTORY` bidirectionally, and it diffs
+:data:`INVENTORY` against :data:`IMPORT_ONLY` so a file that imports crypto but performs no visible
+operation has to say why. Three properties, each pinned in ``tests/test_crypto_inventory_scanner.py``:
+
+* it prints what it read (files, and operations per class, a zero included) BEFORE the verdict;
+* a positive control (:data:`_SELF_TEST_SOURCES`) runs first on every invocation and reds the gate
+  if the planted operations are not found;
+* an operation the tree gains reds even when the file, its imports and its operation classes are
+  unchanged, because the token carries the callee: ``hashlib.md5`` planted in a file that already
+  hashes with ``hashlib.sha256`` reds here and passes the import arm. Measured on this tree.
+
+**WHAT THE PYTHON ARMS STILL CANNOT SEE, so a green reads "at least", never "all".** A second call
+to a callee a file already lists. A method on a first-party object whose name is not in the method
+vocabulary. A chain that leaves the crypto modules for more than one call. Dynamic dispatch and
+subprocesses. Crypto inside a third-party library. And a crypto DECISION with no crypto-shaped
+expression: ``transports/database.py`` writes ``Encrypt=`` and ``TrustServerCertificate=`` into a
+DSN string, which :data:`IMPORT_ONLY` records as an instrument limit rather than hiding.
+
 **A SECOND ARM COVERS THE NON-PYTHON TREE (BACKLOG #1172, ASVS 11.5.1).** Everything above is an
 ``import ast`` walk of ``*.py``, so it is Python-only *by construction* and cannot see a randomness
 draw in another language however the walk-set is spelled. :func:`check_non_python_randomness` scans
@@ -84,6 +109,11 @@ import ast
 import re
 import sys
 from pathlib import Path
+
+# The operation instrument is a sibling file rather than part of this one so its taxonomy and
+# resolver can be read (and tested) on their own. scripts/ is not a package, hence the path insert.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import crypto_operations  # noqa: E402
 
 # The five first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
@@ -660,6 +690,576 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/http_auth.py": frozenset({"messagefoundry.config.tls_policy"}),
 }
 
+# --------------------------------------------------------------------------------------------
+# The OPERATION arm (BACKLOG #1164, ASVS 11.1.3).
+# --------------------------------------------------------------------------------------------
+# The import arm above answers "which files import crypto". The operation arm answers the finer
+# question the ASVS verb asks, "where are the instances": every call that encrypts, hashes, MACs,
+# signs or verifies, derives a key, draws from a CSPRNG, builds or configures a TLS context, or
+# generates or loads a key or certificate, keyed path:line -> operation class. The instrument and its
+# taxonomy live in scripts/security/crypto_operations.py; the expected state lives here, beside the
+# import inventory it refines.
+#
+# THE TOKEN is ``class:callee`` for a direct call and ``class:via <module>`` for a call through a
+# first-party provider. The callee half is what makes this finer than a class list: a file that
+# hashes with ``hashlib.sha256`` and starts hashing with ``hashlib.md5`` changes a token, so the new
+# ALGORITHM reds here even though the file, its imports and its operation classes are all unchanged.
+# What is still not caught is a second call to a callee the file already lists; see the residual in
+# the gate's docstring.
+#
+# REGENERATING THIS TABLE IS NOT A FIX. The bidirectional diff below is the point: a token the tree
+# gains is an operation somebody should look at, and adding it here is the record that somebody did.
+
+#: Files the IMPORT inventory lists but in which the operation arm finds no operation, and why. The
+#: diff is bidirectional here too: an INVENTORY row with no operation and no entry here reds, and an
+#: entry here whose file DOES show an operation reds. Several entries are the instrument's own named
+#: limits, and they are the most useful lines in this table: each is a first-party crypto decision
+#: that no call-pattern instrument can see.
+IMPORT_ONLY: dict[str, str] = {
+    "messagefoundry/config/models.py": (
+        "imports TrustAnchorPolicy, a value type, to declare and validate the operator's setting"
+    ),
+    "messagefoundry/config/secretprovider_vault.py": (
+        "INSTRUMENT LIMIT. hvac is lazy-imported through a helper and reached as a local variable, "
+        "which the resolver cannot follow, and the Vault hop's TLS posture is resolved as DATA "
+        "(verify kwargs) handed to hvac. A real TLS decision this arm does not see"
+    ),
+    "messagefoundry/parsing/xml/_deps.py": (
+        "a lazy loader that returns the signxml module; the verification it enables is counted "
+        "where the module is used, in parsing/xml/signature.py"
+    ),
+    "messagefoundry/pipeline/gcm_invocations.py": (
+        "reads the AES-GCM invocation-bound constants and a cipher TYPE; performs no operation"
+    ),
+    "messagefoundry/pipeline/security_notify.py": (
+        "carries the trust-anchor policy through to the alert sink it constructs; the SMTP hop's "
+        "TLS context is built inside that sink, in pipeline/alert_sinks.py, which is inventoried"
+    ),
+    "messagefoundry/pipeline/wiring_runner.py": (
+        "INSTRUMENT LIMIT. Decides whether a plaintext hop is allowed (is_loopback_hop_host, "
+        "active_hop_posture): a TLS posture decision with no crypto-shaped call in it"
+    ),
+    "messagefoundry/store/base.py": (
+        "INSTRUMENT LIMIT. Builds the store cipher and key provider through factories that "
+        "construct objects rather than call a primitive; the operations run later as METHODS on "
+        "those objects, which the store backends' rows count"
+    ),
+    "messagefoundry/store/gcm_bound.py": (
+        "reads the cipher's reserve-block size and cipher TYPES; performs no operation"
+    ),
+    "messagefoundry/transports/ai_broker.py": (
+        "carries a HopPosture value to the refusal check; builds no context"
+    ),
+    "messagefoundry/transports/base.py": (
+        "hands a caller's ssl context to asyncio.open_connection and tells an SSLError from an "
+        "OSError; builds and decides nothing (its INVENTORY row says why that is the right shape)"
+    ),
+    "messagefoundry/transports/database.py": (
+        "INSTRUMENT LIMIT, named in BACKLOG #1164. Appends Encrypt= and TrustServerCertificate= "
+        "to a DSN string and refuses an insecure hop: a first-party TLS posture decision with no "
+        "crypto-shaped expression for any pattern instrument to match"
+    ),
+    "tee/mefor_api.py": (
+        "accepts an ssl context as a parameter and hands it to urlopen; tee/__main__.py builds it"
+    ),
+}
+
+#: The maintained operation inventory: repo-relative path -> the operation tokens it is documented
+#: to perform. Rationale for a file's crypto lives on its INVENTORY row above; rows for files the
+#: import arm never saw carry their own.
+OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    "harness/load/tlsmat.py": frozenset(
+        {
+            "key_cert:via messagefoundry.pki",
+            "sign_verify:via messagefoundry.pki",
+            "tls_context:ssl.create_default_context",
+        }
+    ),
+    "messagefoundry/__main__.py": frozenset(
+        {
+            "csprng:via messagefoundry.store.crypto",
+            "hash:via messagefoundry.api.tls",
+            "key_cert:via messagefoundry.api.tls",
+            "key_cert:via messagefoundry.logging_setup",
+            "key_cert:via messagefoundry.pki",
+            "sign_verify:via messagefoundry.api.tls",
+            "sign_verify:via messagefoundry.pki",
+            "tls_context:via messagefoundry.api.tls",
+            "tls_context:via messagefoundry.config.tls_probe",
+            "tls_context:via messagefoundry.logging_setup",
+        }
+    ),
+    "messagefoundry/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
+    "messagefoundry/api/app.py": frozenset({"tls_context:via messagefoundry.config.tls_policy"}),
+    "messagefoundry/api/security.py": frozenset(
+        {"key_cert:via messagefoundry.pipeline.cert_expiry"}
+    ),
+    "messagefoundry/api/tls.py": frozenset(
+        {
+            "hash:via messagefoundry.auth.trust_anchors",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.pki",
+            "sign_verify:via messagefoundry.pki",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.load_verify_locations()",
+            "tls_context:.minimum_version =",
+            "tls_context:.set_ciphers()",
+            "tls_context:.verify_mode =",
+            "tls_context:ssl.SSLContext",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/apiclient/client.py": frozenset(
+        {
+            "tls_context:.load_cert_chain()",
+            "tls_context:ssl.create_default_context",
+            "tls_context:truststore.SSLContext",
+        }
+    ),
+    "messagefoundry/auth/ldap.py": frozenset({"tls_context:via messagefoundry.config.tls_policy"}),
+    "messagefoundry/auth/oidc/claims.py": frozenset(
+        {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}
+    ),
+    "messagefoundry/auth/oidc/flow.py": frozenset(
+        {"compare:hmac.compare_digest", "csprng:secrets.token_bytes", "hash:hashlib.sha256"}
+    ),
+    "messagefoundry/auth/oidc/jwks.py": frozenset(
+        {
+            "key_cert:.public_key()",
+            "key_cert:cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePublicNumbers",
+            "key_cert:cryptography.hazmat.primitives.asymmetric.rsa.RSAPublicNumbers",
+        }
+    ),
+    "messagefoundry/auth/oidc_http.py": frozenset(
+        {
+            "hash:via messagefoundry.auth.trust_anchors",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname =",
+            "tls_context:.verify_mode =",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/auth/passwords.py": frozenset({"kdf:.verify()", "kdf:argon2.PasswordHasher"}),
+    "messagefoundry/auth/policy.py": frozenset({"hash:hashlib.sha1"}),
+    "messagefoundry/auth/service.py": frozenset(
+        {
+            "compare:via messagefoundry.auth.oidc.claims",
+            "compare:via messagefoundry.auth.oidc.flow",
+            "compare:via messagefoundry.auth.totp",
+            "csprng:secrets.token_urlsafe",
+            "csprng:via messagefoundry.auth.oidc.flow",
+            "csprng:via messagefoundry.auth.tokens",
+            "csprng:via messagefoundry.auth.totp",
+            "csprng:via messagefoundry.auth.webauthn",
+            "hash:via messagefoundry.auth.oidc.flow",
+            "hash:via messagefoundry.auth.oidc_http",
+            "hash:via messagefoundry.auth.tokens",
+            "key_cert:via messagefoundry.auth.oidc_http",
+            "mac:via messagefoundry.auth.totp",
+            "sign_verify:via messagefoundry.auth.oidc.claims",
+            "sign_verify:via messagefoundry.auth.webauthn",
+            "tls_context:via messagefoundry.auth.oidc_http",
+        }
+    ),
+    "messagefoundry/auth/tokens.py": frozenset(
+        {"csprng:secrets.token_urlsafe", "hash:hashlib.sha256"}
+    ),
+    "messagefoundry/auth/totp.py": frozenset(
+        {
+            "compare:hmac.compare_digest",
+            "csprng:secrets.choice",
+            "csprng:secrets.token_bytes",
+            "mac:hmac.new",
+        }
+    ),
+    "messagefoundry/auth/trust_anchors.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/auth/webauthn.py": frozenset(
+        {
+            "csprng:secrets.token_bytes",
+            "sign_verify:webauthn.verify_authentication_response",
+            "sign_verify:webauthn.verify_registration_response",
+        }
+    ),
+    "messagefoundry/config/fingerprint.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/config/settings.py": frozenset(
+        {"tls_context:via messagefoundry.config.tls_policy"}
+    ),
+    "messagefoundry/config/tls_policy.py": frozenset(
+        {
+            "key_cert:via messagefoundry.pki",
+            "tls_context:.check_hostname =",
+            "tls_context:.load_verify_locations()",
+            "tls_context:.minimum_version =",
+            "tls_context:.set_ciphers()",
+            "tls_context:.verify_flags =",
+            "tls_context:.verify_mode =",
+            "tls_context:ssl.SSLContext",
+            "tls_context:ssl.create_default_context",
+        }
+    ),
+    "messagefoundry/config/tls_probe.py": frozenset(
+        {
+            "tls_context:.check_hostname =",
+            "tls_context:.maximum_version =",
+            "tls_context:.minimum_version =",
+            "tls_context:.set_ciphers()",
+            "tls_context:.verify_mode =",
+            "tls_context:.wrap_socket()",
+            "tls_context:ssl.SSLContext",
+        }
+    ),
+    "messagefoundry/config/wiring.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/credential.py": frozenset(
+        {"compare:hmac.compare_digest", "hash:hashlib.sha256"}
+    ),
+    "messagefoundry/integrity.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/logging_setup.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname =",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.verify_mode =",
+            "tls_context:.wrap_socket()",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/parsing/xml/signature.py": frozenset({"sign_verify:.verify()"}),
+    "messagefoundry/pipeline/alert_sinks.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/pipeline/cert_expiry.py": frozenset(
+        {"key_cert:ssl.cert_time_to_seconds", "key_cert:via messagefoundry.pki"}
+    ),
+    "messagefoundry/pipeline/dr_backup.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:via messagefoundry.store.backup_codec",
+            "csprng:via messagefoundry.store.backup_codec",
+            "hash:hashlib.sha256",
+            "hash:via messagefoundry.config.fingerprint",
+            "hash:via messagefoundry.store.backup_codec",
+        }
+    ),
+    "messagefoundry/pipeline/engine.py": frozenset(
+        {
+            "compare:via messagefoundry.pipeline.secret_rotation",
+            "hash:via messagefoundry.config.fingerprint",
+            "mac:via messagefoundry.pipeline.secret_rotation",
+        }
+    ),
+    "messagefoundry/pipeline/sandbox.py": frozenset({"csprng:secrets.token_hex"}),
+    "messagefoundry/pipeline/secret_rotation.py": frozenset(
+        {"compare:hmac.compare_digest", "mac:hmac.new"}
+    ),
+    "messagefoundry/pipeline/sharding.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/pki.py": frozenset(
+        {
+            "key_cert:.private_bytes()",
+            "key_cert:.public_bytes()",
+            "key_cert:.public_key()",
+            "key_cert:cryptography.hazmat.primitives.asymmetric.ec.generate_private_key",
+            "key_cert:cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates",
+            "key_cert:cryptography.x509.CertificateBuilder",
+            "key_cert:cryptography.x509.load_pem_x509_certificate",
+            "key_cert:cryptography.x509.load_pem_x509_crl",
+            "key_cert:cryptography.x509.random_serial_number",
+            "sign_verify:.sign()",
+        }
+    ),
+    "messagefoundry/redaction.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/store/backup_codec.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
+            "csprng:os.urandom",
+            "hash:hashlib.sha256",
+        }
+    ),
+    "messagefoundry/store/crypto.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
+            "csprng:os.urandom",
+            "hash:hashlib.sha256",
+            "kdf:.derive()",
+            "kdf:cryptography.hazmat.primitives.kdf.hkdf.HKDF",
+        }
+    ),
+    "messagefoundry/store/crypto_transit.py": frozenset(
+        {"cipher:.decrypt_data()", "cipher:.encrypt_data()", "mac:.generate_hmac()"}
+    ),
+    "messagefoundry/store/keyprovider_vault.py": frozenset({"cipher:.decrypt_data()"}),
+    "messagefoundry/store/postgres.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
+            "compare:hmac.compare_digest",
+            "compare:via messagefoundry.store.store",
+            "hash:hashlib.sha256",
+            "hash:via messagefoundry.store.store",
+            "kdf:via messagefoundry.store.crypto",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "mac:via messagefoundry.store.store",
+            "tls_context:.check_hostname =",
+            "tls_context:.verify_mode =",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/store/sqlserver.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
+            "compare:hmac.compare_digest",
+            "compare:via messagefoundry.store.store",
+            "hash:hashlib.sha256",
+            "hash:via messagefoundry.store.store",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:via messagefoundry.store.store",
+        }
+    ),
+    "messagefoundry/store/store.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
+            "compare:hmac.compare_digest",
+            "hash:hashlib.sha256",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:hmac.new",
+        }
+    ),
+    "messagefoundry/transports/dicom.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.load_verify_locations()",
+            "tls_context:.minimum_version =",
+            "tls_context:.verify_mode =",
+            "tls_context:ssl.SSLContext",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/dicomweb.py": frozenset(
+        {
+            "csprng:secrets.token_hex",
+            "key_cert:via messagefoundry.transports.rest",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/transports/direct.py": frozenset(
+        {
+            "cipher:.encrypt()",
+            "cipher:cryptography.hazmat.primitives.serialization.pkcs7.PKCS7EnvelopeBuilder",
+            "key_cert:.public_bytes()",
+            "key_cert:.public_key()",
+            "key_cert:cryptography.hazmat.primitives.serialization.load_der_private_key",
+            "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
+            "key_cert:cryptography.x509.load_der_x509_certificate",
+            "key_cert:cryptography.x509.load_pem_x509_certificate",
+            "key_cert:cryptography.x509.load_pem_x509_certificates",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "sign_verify:.sign()",
+            "sign_verify:cryptography.hazmat.primitives.serialization.pkcs7.PKCS7SignatureBuilder",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/email.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/fhir.py": frozenset(
+        {
+            "key_cert:via messagefoundry.transports.rest",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/transports/file.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/transports/http_auth.py": frozenset(
+        {
+            "key_cert:via messagefoundry.transports.rest",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/transports/http_listener.py": frozenset(
+        {
+            "compare:via messagefoundry.credential",
+            "hash:via messagefoundry.credential",
+            "key_cert:via messagefoundry.transports.mllp",
+            "tls_context:via messagefoundry.transports.mllp",
+        }
+    ),
+    "messagefoundry/transports/mllp.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname =",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.load_verify_locations()",
+            "tls_context:.minimum_version =",
+            "tls_context:.verify_mode =",
+            "tls_context:ssl.SSLContext",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/remotefile.py": frozenset(
+        {
+            "hash:hashlib.sha256",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname =",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.minimum_version =",
+            "tls_context:.verify_mode =",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/rest.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname =",
+            "tls_context:.verify_mode =",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/signing.py": frozenset(
+        {
+            "key_cert:.public_key()",
+            "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
+            "sign_verify:.sign()",
+            "sign_verify:.verify()",
+        }
+    ),
+    "messagefoundry/transports/smart.py": frozenset(
+        {
+            "csprng:secrets.token_urlsafe",
+            "key_cert:via messagefoundry.transports.rest",
+            "sign_verify:.sign()",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/transports/soap.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.transports.rest",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.minimum_version =",
+            "tls_context:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/tray/probe.py": frozenset({"tls_context:truststore.SSLContext"}),
+    "messagefoundry/uploads.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "csprng:secrets.token_hex",
+            "hash:hashlib.sha256",
+        }
+    ),
+    "messagefoundry/verify/smoke.py": frozenset(
+        {
+            "tls_context:.check_hostname =",
+            "tls_context:.minimum_version =",
+            "tls_context:.wrap_socket()",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry_webconsole/_security.py": frozenset({"csprng:secrets.token_urlsafe"}),
+    "scripts/asvs/anchor_report.py": frozenset({"hash:hashlib.sha256"}),
+    "scripts/asvs/prove_report.py": frozenset({"hash:hashlib.sha256"}),
+    "scripts/asvs/scorecard.py": frozenset({"hash:hashlib.sha256"}),
+    "scripts/security/build_cla_action_provenance.py": frozenset(
+        {"hash:hashlib.sha1", "hash:hashlib.sha256"}
+    ),
+    "scripts/security/build_password_corpus.py": frozenset({"hash:hashlib.sha256"}),
+    "scripts/security/dast_target.py": frozenset({"csprng:secrets.token_urlsafe"}),
+    "scripts/webconsole_seam_snapshot.py": frozenset({"hash:hashlib.sha256"}),
+    "tee/__main__.py": frozenset(
+        {
+            "tls_context:.check_hostname =",
+            "tls_context:.verify_mode =",
+            "tls_context:ssl.create_default_context",
+        }
+    ),
+    "tee/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
+    # --- BACKLOG #1164: files the OPERATION arm found that the import arm could not see at all ---
+    # Each performs crypto through a first-party provider and imports no trigger, so no INVENTORY row
+    # was ever owed for it. They are the findings of operation-level discovery, listed rather than
+    # hidden, and the reason is the same for the whole group: the caller DECIDES something about the
+    # crypto it reaches. The token names the provider module, so the rationale lives there.
+    #   api/auth_routes.py, webconsole routes/account.py + routes/core.py -- hash a presented session
+    #     token (auth/tokens.hash_token) to look it up or revoke it: hashing a SECRET.
+    #   verify/federation.py -- the `verify` federation check builds the IdP opener, parses the JWKS
+    #     and validates an ID token, so it exercises the whole OIDC verification path.
+    #   verify/runner.py -- builds the live smoke's client TLS context (verify/smoke).
+    #   harness/load/* -- mint a per-run loopback certificate pair and build the pinned client TLS
+    #     context through harness/load/tlsmat (non-prod, loopback only, per that row in INVENTORY).
+    #   scripts/security/dast_auth_sweep.py -- runs the DAST target, which draws a throwaway password.
+    "harness/load/connscale/runner.py": frozenset(
+        {
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.tlsmat",
+        }
+    ),
+    "harness/load/enginepoll.py": frozenset(
+        {"key_cert:via harness.load.tlsmat", "sign_verify:via harness.load.tlsmat"}
+    ),
+    "harness/load/estate/runner.py": frozenset(
+        {
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.tlsmat",
+        }
+    ),
+    "harness/load/failover.py": frozenset(
+        {
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.tlsmat",
+        }
+    ),
+    "harness/load/shardcert.py": frozenset(
+        {
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.tlsmat",
+        }
+    ),
+    "messagefoundry/api/auth_routes.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
+    "messagefoundry/verify/federation.py": frozenset(
+        {
+            "compare:via messagefoundry.auth.oidc.claims",
+            "hash:via messagefoundry.auth.oidc_http",
+            "key_cert:via messagefoundry.auth.oidc.jwks",
+            "key_cert:via messagefoundry.auth.oidc_http",
+            "sign_verify:via messagefoundry.auth.oidc.claims",
+            "tls_context:via messagefoundry.auth.oidc_http",
+        }
+    ),
+    "messagefoundry/verify/runner.py": frozenset({"tls_context:via messagefoundry.verify.smoke"}),
+    "messagefoundry_webconsole/routes/account.py": frozenset(
+        {"hash:via messagefoundry.auth.tokens"}
+    ),
+    "messagefoundry_webconsole/routes/core.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
+    "scripts/security/dast_auth_sweep.py": frozenset({"csprng:via scripts.security.dast_target"}),
+}
+
 
 def crypto_imports_in(source: str) -> set[str]:
     """The crypto trigger tokens imported anywhere in a module (including function-local imports).
@@ -688,16 +1288,90 @@ def crypto_imports_in(source: str) -> set[str]:
     return found
 
 
+def python_sources(package: Path) -> list[Path]:
+    """Every ``.py`` file under ``package``, ``__pycache__`` pruned. Both Python arms read this list."""
+    return [path for path in sorted(package.rglob("*.py")) if "__pycache__" not in path.parts]
+
+
 def discover(package: Path) -> dict[str, frozenset[str]]:
     """Map repo-relative module path -> crypto modules it actually imports (only files that use crypto)."""
     out: dict[str, frozenset[str]] = {}
-    for path in sorted(package.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
+    for path in python_sources(package):
         mods = crypto_imports_in(path.read_text(encoding="utf-8"))
         if mods:
             out[path.relative_to(package.parent).as_posix()] = frozenset(mods)
     return out
+
+
+#: The operation arm's POSITIVE CONTROL, run on every gate invocation before the tree is read. Two
+#: fixture modules that never touch the disk: one builds a TLS context directly, the other hashes
+#: directly AND reaches the first one's context through a first-party call with no crypto import of
+#: its own, which is the BACKLOG #1164 shape. If the instrument does not report exactly this, the
+#: matcher or the provider walk is broken, and every clean result it gives about the tree is void.
+_SELF_TEST_SOURCES: dict[str, str] = {
+    "selftest/seam.py": "import ssl\n\n\ndef build():\n    return ssl.create_default_context()\n",
+    "selftest/user.py": (
+        "import hashlib\n"
+        "from selftest.seam import build\n\n\n"
+        "def go():\n"
+        "    build()\n"
+        "    return hashlib.sha256(b'').hexdigest()\n"
+    ),
+}
+_SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
+    "selftest/seam.py": frozenset({"tls_context:ssl.create_default_context"}),
+    "selftest/user.py": frozenset({"hash:hashlib.sha256", "tls_context:via selftest.seam"}),
+}
+
+
+def operations_self_test() -> list[str]:
+    """Run the operation instrument over :data:`_SELF_TEST_SOURCES`. Returns violation lines."""
+    got = crypto_operations.aggregate(crypto_operations.discover_operations_in(_SELF_TEST_SOURCES))
+    if got == _SELF_TEST_EXPECTED:
+        return []
+    return [
+        f"operation arm POSITIVE CONTROL did not fire as planted: expected {_SELF_TEST_EXPECTED}, "
+        f"got {got}. The instrument is broken, so a clean result from it would mean nothing"
+    ]
+
+
+def check_operations(
+    files: list[Path], repo: Path, *, check_stale: bool
+) -> tuple[list[str], list[crypto_operations.Operation]]:
+    """Run the operation arm (BACKLOG #1164). Returns ``(violation lines, operations found)``.
+
+    Three diffs, all bidirectional when ``check_stale``: the tree's operation tokens against
+    :data:`OPERATION_INVENTORY`, and the import inventory against :data:`IMPORT_ONLY` in both
+    directions, so an INVENTORY row whose file performs no operation has to say why."""
+    violations = operations_self_test()
+    operations = crypto_operations.discover_operations(files, repo)
+    actual = crypto_operations.aggregate(operations)
+    undocumented, stale = find_violations(
+        actual,
+        OPERATION_INVENTORY,
+        check_stale=check_stale,
+        noun="crypto operation",
+        stale_verb="performs",
+    )
+    violations += undocumented + stale
+    if check_stale:
+        for path in sorted(INVENTORY):
+            if path not in actual and path not in IMPORT_ONLY:
+                violations.append(
+                    f"{path}: INVENTORY lists crypto imports but the operation arm finds no "
+                    "operation here. Either the file stopped doing crypto (drop the INVENTORY row) "
+                    "or it does it in a shape the instrument cannot see (add an IMPORT_ONLY entry "
+                    "saying which)"
+                )
+        for path, _reason in sorted(IMPORT_ONLY.items()):
+            if path in actual:
+                violations.append(
+                    f"{path}: IMPORT_ONLY says no operation happens here, but the operation arm "
+                    f"finds {sorted(actual[path])}. Drop the IMPORT_ONLY entry"
+                )
+            if path not in INVENTORY:
+                violations.append(f"{path}: IMPORT_ONLY entry with no INVENTORY row to explain")
+    return violations, operations
 
 
 def find_violations(
@@ -865,6 +1539,25 @@ def _assert_ide_is_typescript(repo: Path) -> list[str]:
     ]
 
 
+def scanned_line(
+    python_files: int, roots: int, operations: list[crypto_operations.Operation]
+) -> str:
+    """The operation arm's corpus line: what was read and what it found, per class.
+
+    Printed BEFORE any verdict, red or green. Every class is printed, a zero included, so a matcher
+    that died for one class shows up as a zero where there used to be a count rather than as nothing.
+    """
+    counts = crypto_operations.class_counts(operations)
+    per_class = ", ".join(f"{name}={count}" for name, count in counts.items())
+    via = sum(1 for op in operations if op.via is not None)
+    files = len({op.path for op in operations})
+    return (
+        f"crypto-inventory: scanned {python_files} Python file(s) across {roots} root(s); "
+        f"{len(operations)} crypto operation(s) in {files} file(s), {via} of them through a "
+        f"first-party provider [{per_class}]"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Cryptographic-discovery gate (ASVS 11.1.3).")
     parser.add_argument(
@@ -873,6 +1566,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="single package directory to scan (default: the five real WALK_ROOTS + built-in inventory)",
     )
+    parser.add_argument(
+        "--list-operations",
+        action="store_true",
+        help="also print every operation found, one path:line -> class per line, for review",
+    )
     args = parser.parse_args(argv)
 
     scanning_default = args.package is None
@@ -880,6 +1578,7 @@ def main(argv: list[str] | None = None) -> int:
     ide_violations: list[str] = []
     randomness_violations: list[str] = []
     randomness_scanned = 0
+    files: list[Path] = []
     if scanning_default:
         repo = Path(__file__).resolve().parents[2]
         roots = [repo / name for name in WALK_ROOTS]
@@ -889,6 +1588,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         for root in roots:
             actual |= discover(root)
+            files += python_sources(root)
         ide_violations = _assert_ide_is_typescript(repo)
         randomness_violations, randomness_scanned = check_non_python_randomness(repo)
     else:
@@ -897,8 +1597,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"crypto-inventory: package not found: {package}", file=sys.stderr)
             return 2
         actual = discover(package)
+        files = python_sources(package)
+        repo = package.parent
+        roots = [package]
 
     undocumented, stale = find_violations(actual, INVENTORY, check_stale=scanning_default)
+    operation_violations, operations = check_operations(files, repo, check_stale=scanning_default)
+
+    # The corpus first, then the verdict: a red must say what was read as plainly as a green does.
+    print(scanned_line(len(files), len(roots), operations))
+    if args.list_operations:
+        for op in operations:
+            print(f"  {op.render()}")
 
     if ide_violations:
         print("crypto-inventory: ide/ TypeScript-only invariant VIOLATED:")
@@ -912,19 +1622,29 @@ def main(argv: list[str] | None = None) -> int:
         print("crypto-inventory: STALE inventory entries (remove them from INVENTORY):")
         for line in stale:
             print(f"  - {line}")
+    if operation_violations:
+        print(
+            "crypto-inventory: OPERATION arm (ASVS 11.1.3, BACKLOG #1164) FAILED "
+            "(review each operation, then update OPERATION_INVENTORY or IMPORT_ONLY):"
+        )
+        for line in operation_violations:
+            print(f"  - {line}")
     if randomness_violations:
         print("crypto-inventory: NON-PYTHON RANDOMNESS arm (ASVS 11.5.1, BACKLOG #1172) FAILED:")
         for line in randomness_violations:
             print(f"  - {line}")
-    if undocumented or stale or ide_violations or randomness_violations:
+    if undocumented or stale or ide_violations or operation_violations or randomness_violations:
         return 1
 
     # Print the corpus, not just the verdict: "clean" means nothing without what was read.
     print(
         f"crypto-inventory: OK - {len(actual)} documented crypto call site(s) across "
         f"{len(WALK_ROOTS)} Python root(s), no drift; "
+        f"{len(crypto_operations.aggregate(operations))} file(s) of documented crypto OPERATIONS, "
+        "no drift, positive control fired; "
         f"{randomness_scanned} non-Python source(s) scanned for randomness across "
-        f"{len(NON_PYTHON_WALK_ROOTS)} root(s), no weak source and no inventory drift."
+        f"{len(NON_PYTHON_WALK_ROOTS)} root(s), no weak source and no inventory drift. "
+        "Coverage is AT LEAST this: see the gate's docstring for what no arm can see."
     )
     return 0
 

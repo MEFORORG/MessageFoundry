@@ -116,6 +116,20 @@ for, not how it is protected before it gets there.
 > records what a file USES, while a seam entry is what makes that file's IMPORTERS visible, so a
 > module can be inventoried while everything reaching crypto through it stays invisible.
 >
+> **An OPERATION arm reads the same Python at a finer grain** (BACKLOG #1164). The import walk
+> cannot see a new operation inside a file it already lists. The operation arm resolves every call
+> and classifies it: encrypt or decrypt, hash, MAC, constant-time compare, sign or verify, key
+> derivation, CSPRNG draw, TLS context or posture, and key or certificate handling. It follows
+> first-party helpers without a seam list, so `pipeline/alert_sinks.py` is found through
+> `build_smtp_tls_context`. It diffs against the script's `OPERATION_INVENTORY` both ways, and each
+> token names its callee, so `hashlib.md5` planted beside an existing `hashlib.sha256` reds. It prints
+> what it read before its verdict and runs a planted positive control on every invocation. **Its
+> green still means "at least".** It does not see a second call to a callee a file already lists,
+> most methods on first-party objects, chains that leave the crypto modules, dynamic dispatch, or a
+> TLS decision written as data. `transports/database.py` builds `Encrypt=` and
+> `TrustServerCertificate=` into a connection string, and the script's `IMPORT_ONLY` table records
+> that as an instrument limit.
+>
 > **A SECOND ARM covers the non-Python tree** (BACKLOG #1172, ASVS 11.5.1) and rides the same required
 > context. The walk above is an `import ast` pass over `*.py` and is Python-only by construction, so
 > `check_non_python_randomness` scans `ide/` and `messagefoundry_webconsole/` for randomness sources

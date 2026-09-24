@@ -35,6 +35,7 @@ package (``scripts/`` has no ``__init__``), so load it standalone by file path l
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 from types import ModuleType
@@ -432,3 +433,228 @@ def test_a_weak_draw_in_the_operator_console_is_caught(tmp_path: Path) -> None:
 
     assert scanned >= 2, scanned
     assert any("WEAK randomness source" in v and "app.js" in v for v in violations), violations
+
+
+# --- BACKLOG #1164 / ASVS 11.1.3: the OPERATION arm ---------------------------------------------
+#
+# The import arm answers "which files import crypto". These pin the finer instrument that answers
+# "where are the operations", and above all the three things that make a green from it mean
+# something: it prints what it read, it has a positive control that fires on every run, and it reds
+# on an operation the import arm is structurally blind to.
+
+
+def _write_repo(root: Path, files: dict[str, str]) -> list[Path]:
+    """Write ``files`` (repo-relative path -> text) under ``root`` and return the paths, sorted."""
+    out: list[Path] = []
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        out.append(path)
+    return sorted(out)
+
+
+def test_every_rule_maps_into_the_taxonomy() -> None:
+    ops = _gate().crypto_operations
+    classes = set(ops.OPERATION_CLASSES)
+    assert set(ops.EXACT_RULES.values()) <= classes
+    assert set(ops.PREFIX_RULES.values()) <= classes
+    assert set(ops.METHOD_RULES.values()) <= classes
+    assert all(prefix.endswith(".") for prefix in ops.PREFIX_RULES), ops.PREFIX_RULES
+    for fixed, _reason in ops.METHOD_OVERRIDES.values():
+        assert fixed is None or fixed in classes
+
+
+def test_every_allow_list_entry_carries_a_reason() -> None:
+    # An allow-list entry with no reason is a silencer, not a claim a reviewer can check.
+    gate = _gate()
+    ops = gate.crypto_operations
+    for table in (ops.NOT_OPERATIONS, ops.OPAQUE_PROVIDERS, gate.IMPORT_ONLY):
+        for key, reason in table.items():
+            assert isinstance(reason, str) and len(reason.split()) >= 5, (key, reason)
+    for key, (_fixed, reason) in ops.METHOD_OVERRIDES.items():
+        assert len(reason.split()) >= 5, (key, reason)
+
+
+def test_every_opaque_provider_names_a_real_function() -> None:
+    # An opaque entry that names nothing hides nothing today, but it would silently hide whatever is
+    # later written under that name. So each must resolve to a module-level function in the tree.
+    for qualified in _gate().crypto_operations.OPAQUE_PROVIDERS:
+        module, _, name = qualified.rpartition(".")
+        path = _ROOT / (module.replace(".", "/") + ".py")
+        assert path.is_file(), qualified
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        defined = {
+            n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assert name in defined, qualified
+
+
+def test_the_positive_control_fires_on_the_shipped_instrument() -> None:
+    assert _gate().operations_self_test() == []
+
+
+def test_the_positive_control_reds_when_the_matcher_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control is only a control if breaking the instrument breaks it. Kill every rule and it must
+    # report, rather than letting a matcher that finds nothing render as a clean tree.
+    gate = _gate()
+    monkeypatch.setattr(gate.crypto_operations, "EXACT_RULES", {})
+    monkeypatch.setattr(gate.crypto_operations, "PREFIX_RULES", {})
+    violations = gate.operations_self_test()
+    assert violations and "POSITIVE CONTROL" in violations[0], violations
+
+
+def test_a_planted_operation_the_import_arm_cannot_see_reds_the_operation_arm(
+    tmp_path: Path,
+) -> None:
+    # THE DISCRIMINATING CASE. redaction.py is inventoried for `hashlib` and hashes with sha256. Plant
+    # md5 beside it: the file, its imports and its operation CLASSES are all unchanged, so the import
+    # arm stays green, and only the operation arm's callee-bearing token can see the new algorithm.
+    gate = _gate()
+    rel = "messagefoundry/redaction.py"
+    assert gate.OPERATION_INVENTORY[rel] == frozenset({"hash:hashlib.sha256"})
+    files = _write_repo(
+        tmp_path,
+        {
+            rel: (
+                "import hashlib\n\n\n"
+                "def label(b: bytes) -> str:\n    return hashlib.sha256(b).hexdigest()\n\n\n"
+                "def planted(b: bytes) -> str:\n    return hashlib.md5(b).hexdigest()\n"
+            )
+        },
+    )
+
+    imports = gate.discover(tmp_path / "messagefoundry")
+    import_undocumented, _ = gate.find_violations(imports, gate.INVENTORY, check_stale=False)
+    assert import_undocumented == [], "the import arm should be blind to this; the test is moot"
+
+    violations, _ops = gate.check_operations(files, tmp_path, check_stale=False)
+    assert violations == [
+        f"{rel}: undocumented crypto operation use ['hash:hashlib.md5'] "
+        "(documented: ['hash:hashlib.sha256'])"
+    ]
+
+
+def test_crypto_through_an_unregistered_first_party_helper_is_found() -> None:
+    # The #1164 shape, with no seam list to lean on: a helper in a package nobody registered builds a
+    # context, and modules that import no crypto at all call it through a package re-export and a
+    # RELATIVE import. The direct site and both crossings must be reported.
+    ops = _gate().crypto_operations
+    sources = {
+        "newpkg/__init__.py": "from .tlshelp import make_ctx\n",
+        "newpkg/tlshelp.py": (
+            "import ssl\n\n\ndef _inner():\n    return ssl.create_default_context()\n\n\n"
+            "def make_ctx():\n    return _inner()\n"
+        ),
+        "newpkg/sender.py": "from newpkg import make_ctx\n\n\ndef send():\n    make_ctx()\n",
+        "newpkg/other.py": "from . import tlshelp\n\n\ndef go():\n    tlshelp.make_ctx()\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found == {
+        "newpkg/tlshelp.py": frozenset({"tls_context:ssl.create_default_context"}),
+        "newpkg/sender.py": frozenset({"tls_context:via newpkg.tlshelp"}),
+        "newpkg/other.py": frozenset({"tls_context:via newpkg.tlshelp"}),
+    }
+
+
+def test_the_alert_sink_smtp_hop_is_an_operation_site_on_the_real_tree() -> None:
+    # The worked example the item was filed about. alert_sinks.py imports no crypto trigger of its own
+    # and reaches its verifying STARTTLS context through tls_policy.build_smtp_tls_context.
+    gate = _gate()
+    files = [p for root in gate.WALK_ROOTS for p in gate.python_sources(_ROOT / root)]
+    operations = gate.crypto_operations.discover_operations(files, _ROOT)
+    sites = [
+        op
+        for op in operations
+        if op.path == "messagefoundry/pipeline/alert_sinks.py"
+        and op.via == "messagefoundry.config.tls_policy.build_smtp_tls_context"
+    ]
+    assert "tls_context" in {op.op_class for op in sites}, sites
+
+
+def test_an_unbacked_operation_row_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other direction of the diff: a documented token the file no longer backs must red, or the
+    # inventory drifts into a list of things that used to be true.
+    gate = _gate()
+    rel = "pkg/a.py"
+    files = _write_repo(tmp_path, {rel: "import hashlib\n\nhashlib.sha256(b'')\n"})
+    monkeypatch.setattr(
+        gate, "OPERATION_INVENTORY", {rel: frozenset({"hash:hashlib.sha256", "mac:hmac.new"})}
+    )
+    monkeypatch.setattr(gate, "INVENTORY", {})
+    monkeypatch.setattr(gate, "IMPORT_ONLY", {})
+    violations, _ops = gate.check_operations(files, tmp_path, check_stale=True)
+    assert violations == [
+        f"{rel}: inventory lists ['mac:hmac.new'] but the file no longer performs it"
+    ]
+
+
+def test_import_only_is_diffed_both_ways(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _gate()
+    files = _write_repo(
+        tmp_path,
+        {
+            "pkg/typesonly.py": "from ssl import SSLContext\n\nx: SSLContext | None = None\n",
+            "pkg/does.py": "import ssl\n\nssl.create_default_context()\n",
+        },
+    )
+    monkeypatch.setattr(
+        gate,
+        "OPERATION_INVENTORY",
+        {"pkg/does.py": frozenset({"tls_context:ssl.create_default_context"})},
+    )
+    monkeypatch.setattr(
+        gate,
+        "INVENTORY",
+        {"pkg/typesonly.py": frozenset({"ssl"}), "pkg/does.py": frozenset({"ssl"})},
+    )
+
+    # An INVENTORY row whose file performs no operation, with no IMPORT_ONLY reason: red.
+    monkeypatch.setattr(gate, "IMPORT_ONLY", {})
+    violations, _ = gate.check_operations(files, tmp_path, check_stale=True)
+    assert len(violations) == 1 and violations[0].startswith("pkg/typesonly.py: INVENTORY lists")
+
+    # Explained: green.
+    monkeypatch.setattr(gate, "IMPORT_ONLY", {"pkg/typesonly.py": "a type annotation only"})
+    assert gate.check_operations(files, tmp_path, check_stale=True)[0] == []
+
+    # An IMPORT_ONLY claim the tree contradicts: red.
+    monkeypatch.setattr(
+        gate,
+        "IMPORT_ONLY",
+        {"pkg/typesonly.py": "a type annotation only", "pkg/does.py": "claims no operation"},
+    )
+    violations, _ = gate.check_operations(files, tmp_path, check_stale=True)
+    assert len(violations) == 1 and violations[0].startswith("pkg/does.py: IMPORT_ONLY says")
+
+
+def test_the_scanned_line_prints_before_the_verdict_with_every_class(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gate = _gate()
+    assert gate.main([]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("crypto-inventory: scanned "), lines[0]
+    for name in gate.crypto_operations.OPERATION_CLASSES:
+        assert f"{name}=" in lines[0], (name, lines[0])
+    assert lines[-1].startswith("crypto-inventory: OK - "), lines[-1]
+    assert "AT LEAST" in lines[-1]
+
+
+def test_a_method_rule_is_not_guessed_on_a_resolvable_first_party_call() -> None:
+    # `.encrypt()` on an unknown receiver is counted, but a first-party function that merely happens
+    # to be NAMED like a crypto verb is left to provider propagation, which knows whether it does any.
+    ops = _gate().crypto_operations
+    sources = {
+        "messagefoundry/fake.py": "def verify():\n    return True\n",
+        "messagefoundry/caller.py": (
+            "from messagefoundry import fake\n\n\ndef go(cipher):\n"
+            "    fake.verify()\n    return cipher.encrypt(b'x')\n"
+        ),
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found == {"messagefoundry/caller.py": frozenset({"cipher:.encrypt()"})}
