@@ -15,6 +15,16 @@ baseline headers unless its emitter hand-copies them, and hand-copying has alrea
 So this is a FLOOR rather than a seventh hand-copy: a pure-ASGI send wrapper registered LAST (hence
 the OUTERMOST user middleware) that applies the baseline to every ``http.response.start``.
 
+**A WebSocket handshake is an HTTP exchange too, and the floor covers it** (BACKLOG #1120). This
+module used to pass every WebSocket scope through on the premise that websockets carry no HTTP
+response headers. That was false for the handshake: ``101`` on accept and a refusal both reach the
+browser as HTTP responses. See :class:`SecurityHeaderFloorMiddleware` for the three messages it
+covers, and :func:`refuse_websocket` for how a route refuses a handshake.
+
+**What this floor cannot reach is the responses uvicorn writes itself**, below the ASGI app: the
+malformed-request ``400``, the ``500`` after an app error that started no response, and the
+WebSocket ``500``. :mod:`messagefoundry.api.protocol_headers` covers those at the protocol layer.
+
 **Two write modes, and the difference is load-bearing.**
 
 ``setdefault`` for the single-valued names (:data:`BASELINE_SECURITY_HEADERS`, :data:`HSTS_HEADER`).
@@ -64,7 +74,9 @@ import ipaddress
 from collections.abc import Iterable
 
 from starlette.datastructures import MutableHeaders
+from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.websockets import WebSocket
 
 __all__ = [
     "BASELINE_SECURITY_HEADERS",
@@ -73,13 +85,16 @@ __all__ = [
     "FRAME_ANCESTORS_DIRECTIVE",
     "HSTS_HEADER",
     "HSTS_VALUE",
+    "WEBSOCKET_DENIAL_EXTENSION",
     "SecurityHeaderFloorMiddleware",
     "csp_names_frame_ancestors",
     "host_is_ip_literal",
     "hsts_applies",
     "hsts_notable",
+    "refuse_websocket",
     "request_host",
     "served_chain_is_self_signed",
+    "websocket_denial_supported",
 ]
 
 #: The scheme-independent baseline, in ONE place. ``_security_headers``, the unhandled-exception
@@ -99,6 +114,10 @@ FRAME_ANCESTORS_DIRECTIVE = "frame-ancestors"
 #: The whole second policy this floor appends. ``'none'`` is the strictest value the directive takes,
 #: and the requirement's posture limb is default-DENY, so there is no narrower correct answer.
 FRAME_ANCESTORS_CSP = f"{FRAME_ANCESTORS_DIRECTIVE} 'none'"
+
+#: The ASGI extension that lets an app answer a WebSocket handshake with an HTTP response.
+WEBSOCKET_DENIAL_EXTENSION = "websocket.http.response"
+_WS_TO_HTTP_SCHEME = {"ws": "http", "wss": "https"}
 
 
 def hsts_applies(scheme: str, exposure_protected: bool) -> bool:
@@ -216,8 +235,54 @@ def request_host(scope: Scope) -> str:
     return ""
 
 
+def websocket_denial_supported(scope: Scope) -> bool:
+    """Whether the server offers the ASGI ``websocket.http.response`` extension on this scope.
+
+    Only then can a pre-accept refusal be a real HTTP response. uvicorn's WebSocket protocols all
+    offer it; a server that does not must get the bare ``websocket.close`` instead."""
+    return WEBSOCKET_DENIAL_EXTENSION in (scope.get("extensions") or {})
+
+
+async def refuse_websocket(websocket: WebSocket, response: Response, *, close_code: int) -> None:
+    """Refuse a WebSocket handshake BEFORE ``accept``, as an HTTP response where the server allows it.
+
+    With the extension, ``response`` is sent as the handshake's answer and the floor puts the baseline
+    on it. Without it, the socket gets the bare ``close_code`` close it always got, so the refusal is
+    exactly as strict on either arm: the route never runs and no frame is ever sent."""
+    if websocket_denial_supported(websocket.scope):
+        await websocket.send_denial_response(response)
+    else:
+        await websocket.close(code=close_code)
+
+
+def _apply_floor(message: Message, want_hsts: bool) -> None:
+    """Add the floor to one response-start message, in place. See the module docstring for why the
+    single-valued names are ``setdefault`` and the frame-ancestors policy is an append."""
+    message.setdefault("headers", [])  # optional on websocket.accept
+    headers = MutableHeaders(scope=message)
+    for name, value in BASELINE_SECURITY_HEADERS:
+        headers.setdefault(name, value)
+    if want_hsts:
+        headers.setdefault(HSTS_HEADER, HSTS_VALUE)
+    if not csp_names_frame_ancestors(headers.getlist(CSP_HEADER)):
+        headers.append(CSP_HEADER, FRAME_ANCESTORS_CSP)
+
+
 class SecurityHeaderFloorMiddleware:
     """Apply the baseline security headers to every HTTP response, whatever emitted it.
+
+    That includes the WebSocket handshake's answer. A handshake is an HTTP request, and it gets an
+    HTTP response either way: ``101`` on ``websocket.accept``, or a refusal. The floor covers both
+    response-start messages a WebSocket scope can send (``websocket.accept`` and
+    ``websocket.http.response.start``).
+
+    **It also turns a bare pre-accept ``websocket.close`` into a ``403`` it can put headers on**,
+    when the server offers the ``websocket.http.response`` extension. uvicorn already answers a bare
+    pre-accept close with an empty ``403``, and no application header can reach that response. So
+    the conversion keeps the status and the empty body and adds only the headers. This is what
+    covers refusals no first-party code writes: Starlette's close for an unmatched WebSocket path,
+    and FastAPI's close on a WebSocket validation error. A close AFTER ``accept`` is a WebSocket
+    frame, not an HTTP response, and passes through untouched.
 
     Pure ASGI, not ``BaseHTTPMiddleware``: no task hop, and -- the load-bearing property -- it does
     NOTHING on the request path. It calls straight through, wrapping only ``send``. That is what lets
@@ -230,9 +295,8 @@ class SecurityHeaderFloorMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        # Lifespan and websockets carry no HTTP response headers, and swallowing lifespan would break
-        # startup/shutdown outright.
-        if scope["type"] != "http":
+        # Lifespan carries no response at all, and swallowing it would break startup/shutdown.
+        if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
 
@@ -240,24 +304,51 @@ class SecurityHeaderFloorMiddleware:
         # harness may hand us a scope with no app, and a header floor must degrade to "emit the
         # scheme-independent baseline" rather than crash the response it exists to harden.
         state = getattr(scope.get("app"), "state", None)
+        # A WebSocket scope names its scheme ws/wss. HSTS keys on whether the hop is https, and a
+        # wss handshake is exactly that, so map it before asking the one shared gate.
+        scheme: str = scope.get("scheme", "")
         want_hsts = hsts_notable(
-            scope.get("scheme", ""),
+            _WS_TO_HTTP_SCHEME.get(scheme, scheme),
             bool(getattr(state, "exposure_protected", False)),
             host=request_host(scope),
         )
+        if scope["type"] == "http":
+            await self._serve_http(scope, receive, send, want_hsts)
+        else:
+            await self._serve_websocket(scope, receive, send, want_hsts)
 
-        async def send_wrapper(message: Message) -> None:
+    async def _serve_http(
+        self, scope: Scope, receive: Receive, send: Send, want_hsts: bool
+    ) -> None:
+        async def send_http(message: Message) -> None:
             if message["type"] == "http.response.start":
-                headers = MutableHeaders(scope=message)
-                for name, value in BASELINE_SECURITY_HEADERS:
-                    headers.setdefault(name, value)
-                if want_hsts:
-                    headers.setdefault(HSTS_HEADER, HSTS_VALUE)
-                # APPEND, never setdefault: setdefault is a no-op on a response that already carries a
-                # policy, which is precisely the attachment sandbox and the /ui nonce policy. See the
-                # module docstring for why a second field cannot weaken either.
-                if not csp_names_frame_ancestors(headers.getlist(CSP_HEADER)):
-                    headers.append(CSP_HEADER, FRAME_ANCESTORS_CSP)
+                _apply_floor(message, want_hsts)
             await send(message)
 
-        await self.app(scope, receive, send_wrapper)
+        await self.app(scope, receive, send_http)
+
+    async def _serve_websocket(
+        self, scope: Scope, receive: Receive, send: Send, want_hsts: bool
+    ) -> None:
+        can_deny = websocket_denial_supported(scope)
+        answered = False
+
+        async def send_websocket(message: Message) -> None:
+            nonlocal answered
+            if answered:
+                await send(message)
+                return
+            mtype = message["type"]
+            if mtype == "websocket.close" and can_deny:
+                answered = True
+                start: Message = {"type": "websocket.http.response.start", "status": 403}
+                _apply_floor(start, want_hsts)
+                await send(start)
+                await send({"type": "websocket.http.response.body", "body": b""})
+                return
+            if mtype in ("websocket.accept", "websocket.http.response.start"):
+                answered = True
+                _apply_floor(message, want_hsts)
+            await send(message)
+
+        await self.app(scope, receive, send_websocket)

@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The security header floor, measured ON THE WIRE through a real uvicorn (BACKLOG #1120).
+
+In-process tests see ASGI messages. They cannot see what the server does with them, and the server
+is where the gap was: uvicorn turns a bare pre-accept ``websocket.close`` into an HTTP 403 of its own
+making. So this suite starts the locked uvicorn on a loopback socket, speaks raw HTTP/1.1 to it, and
+reads the response bytes a browser would read.
+
+**Every family is paired with a vacuity control in the same run.** The same probe, against a bare
+ASGI app with no floor, must find the headers ABSENT. A suite whose probe cannot report absence
+proves nothing by reporting presence.
+
+**The uvicorn version is pinned here on purpose.** The population of responses uvicorn writes itself
+changes with its version, and no first-party inventory can enumerate it. A version bump turns this
+suite red until someone re-reads that population and moves the pin.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import socket
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import pytest
+import uvicorn
+from starlette.types import Receive, Scope, Send
+
+from messagefoundry.api import create_app
+from messagefoundry.api.header_floor import (
+    BASELINE_SECURITY_HEADERS,
+    CSP_HEADER,
+    FRAME_ANCESTORS_CSP,
+)
+from messagefoundry.pipeline import Engine
+
+#: The uvicorn this suite was measured against. See the module docstring before moving it.
+_MEASURED_UVICORN = "0.49.0"
+
+_HANDSHAKE = (
+    "GET {path} HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "\r\n"
+)
+
+
+@pytest.fixture
+async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
+    eng = await Engine.create(tmp_path / "wire.db", poll_interval=0.02)
+    yield eng
+    await eng.stop()
+
+
+@asynccontextmanager
+async def _served(app: Any, **config: Any) -> AsyncIterator[int]:
+    """Serve ``app`` on an ephemeral loopback port for the duration of the block."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = int(sock.getsockname()[1])
+    server = uvicorn.Server(
+        uvicorn.Config(app, lifespan="off", log_config=None, server_header=False, **config)
+    )
+    task = asyncio.create_task(server.serve(sockets=[sock]))
+    try:
+        for _ in range(500):
+            if server.started or task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert server.started, "uvicorn did not start"
+        yield port
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(task, 10.0)
+        sock.close()
+
+
+async def _exchange(port: int, request: bytes) -> tuple[int, list[tuple[str, str]], bytes]:
+    """Send raw bytes and read the whole response until the server closes the connection."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(request)
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), 10.0)
+    finally:
+        writer.close()
+    head, _, body = raw.partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    status = int(lines[0].split(" ", 2)[1])
+    headers = []
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers.append((name.strip().lower(), value.strip()))
+    return status, headers, body
+
+
+def _floored(headers: list[tuple[str, str]]) -> bool:
+    """Whether a response carries the whole baseline and denies framing in EVERY policy it sends."""
+    baseline = all((n.lower(), v) in headers for n, v in BASELINE_SECURITY_HEADERS)
+    directives = [
+        d.strip()
+        for n, policy in headers
+        if n == CSP_HEADER.lower()
+        for d in policy.split(";")
+        if d.strip().casefold().startswith("frame-ancestors")
+    ]
+    return baseline and bool(directives) and all(d == FRAME_ANCESTORS_CSP for d in directives)
+
+
+async def _bare_ws_refusal(scope: Scope, receive: Receive, send: Send) -> None:
+    """The vacuity control: a pre-accept refusal with no floor anywhere in the stack."""
+    assert scope["type"] == "websocket"
+    await receive()
+    await send({"type": "websocket.close", "code": 1008})
+
+
+def test_the_suite_is_measuring_the_uvicorn_it_was_written_against() -> None:
+    assert uvicorn.__version__ == _MEASURED_UVICORN, (
+        f"uvicorn is {uvicorn.__version__}, and this suite measured {_MEASURED_UVICORN}. The set of "
+        "responses uvicorn writes itself may have changed: re-read its protocol modules for every "
+        "response it emits below the ASGI app, extend the families here, then move the pin."
+    )
+
+
+async def test_a_refused_handshake_on_the_wire_carries_the_floor(engine: Engine) -> None:
+    async with _served(_bare_ws_refusal) as port:
+        control = await _exchange(port, _HANDSHAKE.format(path="/ws/stats").encode())
+    assert control[0] == 403
+    assert not _floored(control[1]), f"the probe cannot see absence: {control[1]}"
+
+    async with _served(create_app(engine)) as port:
+        route = await _exchange(port, _HANDSHAKE.format(path="/ws/stats").encode())
+        framework = await _exchange(port, _HANDSHAKE.format(path="/ws/no-such-route").encode())
+    for status, headers, _ in (route, framework):
+        assert status == 403
+        assert _floored(headers), headers
