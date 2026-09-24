@@ -81,6 +81,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   time, so it runs in linear time, not quadratic. A bomb now stops at the ceiling, not up to one
   window past it. `gzip_decompress` and `zip_decompress` do not use this loop and are unchanged.
   ([BACKLOG #1964](docs/BACKLOG.md))
+- **BREAKING — sign-in now checks a stored passkey with the same rule as registration.** This
+  reverses two promises in the 0.4.0 notes: "Passkeys registered on 0.3.2 still work" and "A
+  passkey already registered on another curve still signs in". Neither holds any more. A stored
+  RS256 key, a stored ES256 key on P-384 or P-521, or a stored curve encoded as `true` or `1.0`
+  is now refused at sign-in. 0.3.2 registered all three, and 0.4.0 still registered the third. The
+  refusal is audited as `auth.webauthn_failed`. **A deploying site with such a key would see its
+  owner refused at every passkey sign-in; a passkey-only user would stay refused until an admin
+  runs `admin_reset_mfa`.** **Migration:** register an ES256 passkey on P-256 or an EdDSA
+  passkey, or use TOTP. ([BACKLOG #1166](docs/BACKLOG.md))
 ### Changed
 - **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
   cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
