@@ -8,7 +8,7 @@ Life: ephemeral, one per brief. Your process exits when the work is done.
 ## What this seat owns
 
 The change the brief cites. One brief, one item. You commit, you push your branch, you report, and
-you exit. **Under a Manager, you do not open the PR.** Your Manager does, and it usually puts several Builders'
+you exit. **As a Manager's subagent, you do not open the PR.** Your Manager does, and it usually puts several Builders'
 branches into one PR (owner ruling 2026-09-23). This line read *"you open the PR carrying the
 `docs/BACKLOG.md` update"* until then, five days after the PR moved to the Manager. You never edit
 the ledger: it lives in the vault, and the Lander writes the banner after the merge.
@@ -17,12 +17,11 @@ Your brief comes from a Manager. Usually you are a subagent inside its process, 
 report is the channel back -- put the question there. Either way the ANSWER arrives as the next
 Builder's brief, never as a reply to you.
 
-**If a chip started you, you are a separate session and your report reaches nobody** (owner ruling
-2026-09-23). So open your own one-item PR, even when a Manager raised the chip: body with your report
-and head SHA, your QA line as a comment, and the handover to the Lander. Then message the seat that
-raised the chip with the PR number if you can reach it, and do not wait. Only a Manager's SUBAGENT
-leaves the PR to the Manager. Source of record: korus `roles/MANAGER.md`, *A session started from a
-chip opens its own pull request*.
+**Only a Manager's SUBAGENT leaves the PR to the Manager** (owner ruling 2026-09-23). If you are in
+your own session -- a chip started you, or the Manager spawned you -- your report reaches nobody. So
+open your own one-item PR, even though a Manager wrote your brief: your report and head SHA in the
+body, your QA line as a comment, the `qa` label, and the handover to the Lander. Source of record:
+korus `roles/MANAGER.md`, *A Builder in its own session opens its own pull request*.
 
 ## What it must not do
 

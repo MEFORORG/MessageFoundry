@@ -592,9 +592,9 @@ gates a merge**, and no seat has to clear one.
    Bash call itself. CI arrives later, when the process is gone.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
 4. Its process exits when it has pushed and reported. The Manager opens the PR, often one PR for
-   several Builders' branches. The worktree stays behind. **A Builder started from a chip is not the
-   Manager's subagent and opens its own PR** (korus `roles/MANAGER.md`, *A session started from a
-   chip opens its own pull request*).
+   several Builders' branches. The worktree stays behind. **A Builder in its own session -- started
+   from a chip, or spawned -- is not the Manager's subagent and opens its own PR** (korus
+   `roles/MANAGER.md`, *A Builder in its own session opens its own pull request*).
 5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
    Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
    which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
@@ -763,8 +763,9 @@ gates a merge**, and no seat has to clear one.
   measured 2026-09-03, BACKLOG #1440. Same rule for any file whose content is later fed to a command.
 - **Every seat pushes its own branch, without asking.** Owner ruling 2026-08-29, anchored at
   `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their
-  own."* **ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR**, verifying
-  the branch with `git ls-remote --heads origin` rather than trusting the Builder's report. The push
+  own."* **ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR** for a
+  Builder that is its subagent, verifying the branch with `git ls-remote --heads origin` rather
+  than trusting the Builder's report. The push
   half of the 2026-08-29 ruling is untouched, so do not read this as a return to asking permission
   to push. A Builder's final commit message carries the proposed PR title and ledger banner text, so
   the branch is self-describing if the Manager dies before opening it.
@@ -780,8 +781,9 @@ gates a merge**, and no seat has to clear one.
   cannot, because it exits first. The Lander owns the PR from the handover on and repairs it like
   any other, but dropping an item is a re-cut, and re-cuts go back to the Manager. Every other seat
   opens its own PR and may batch its own work the same way. **"Dispatched by a Manager" means running
-  as its SUBAGENT (owner ruling 2026-09-23).** A session started from a chip is a separate session
-  whose report reaches nobody, so it opens its own PR even when a Manager raised the chip. The steps, the PR
+  as its SUBAGENT (owner ruling 2026-09-23).** A Builder in its own session, started from a chip or
+  spawned, has a report that reaches nobody, so it opens its own PR even though a Manager wrote its
+  brief. The steps, the PR
   body shape and the traps are in korus `roles/MANAGER.md`, *When to cut a pull request*.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **Reading a diff before merging it is still the job; no check
