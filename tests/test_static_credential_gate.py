@@ -329,7 +329,7 @@ async def _get_posture(
     *,
     graph: bool = True,
     settings: ServiceSettings | None = None,
-    filtered: bool = False,
+    sharded: bool = False,
 ) -> dict[str, Any]:
     """GET /security/posture over the basic-auth graph, with the stashes a test chooses."""
     import httpx
@@ -338,17 +338,18 @@ async def _get_posture(
 
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=True)
-    registry_filter: Callable[[Registry], Registry] | None = (lambda r: r) if filtered else None
-    eng = await Engine.create(
-        tmp_path / "e.db", poll_interval=0.02, registry_filter=registry_filter
-    )
-    if graph:
-        eng.add_registry(load_config(cfg))
-    app = create_app(eng, allow_no_auth=True)
-    if settings is not None:
-        app.state.static_credential_settings = settings
-        app.state.security = settings.security
+    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
     try:
+        if graph:
+            registry = load_config(cfg)
+            if sharded:
+                # What filter_registry_for_shard attaches when the config has two or more shards.
+                registry.shard_id, registry.all_shard_ids = "a", ("a", "b")
+            eng.add_registry(registry)
+        app = create_app(eng, allow_no_auth=True)
+        if settings is not None:
+            app.state.static_credential_settings = settings
+            app.state.security = settings.security
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
             body: dict[str, Any] = (await client.get("/security/posture")).json()
@@ -369,17 +370,17 @@ async def test_the_posture_does_not_mark_an_inert_opt_out_as_accepted(tmp_path: 
 
 
 async def test_an_engine_shard_does_not_call_its_inventory_complete(tmp_path: Path) -> None:
-    """An engine shard's registry holds only its own connections (ADR 0037)."""
-    body = await _get_posture(tmp_path, settings=_settings(gate=False), filtered=True)
+    """An engine shard's registry holds only its own connections (ADR 0037). A single-shard config
+    carries no shard identity and reads as the whole graph, so only a real shard set says partial."""
+    body = await _get_posture(tmp_path, settings=_settings(gate=False), sharded=True)
     scope = str(body["static_credential_hops_scope"])
     assert scope.startswith("partial") and "engine shards" in scope
 
 
 async def test_a_posture_that_read_neither_half_says_not_read(tmp_path: Path) -> None:
-    from messagefoundry.api.models import STATIC_CREDENTIAL_HOPS_NOT_READ
-
     body = await _get_posture(tmp_path, graph=False)
-    assert body["static_credential_hops_scope"] == STATIC_CREDENTIAL_HOPS_NOT_READ
+    scope = str(body["static_credential_hops_scope"])
+    assert scope.startswith("not read:") and "graph" in scope and "settings" in scope
     assert body["static_credential_hops"] == []
 
 
@@ -395,13 +396,13 @@ def test_the_check_never_prints_a_configured_value_it_could_not_load(tmp_path: P
         'username = "svc"\npassword = 918273645\n',
         encoding="utf-8",
     )
-    result = next(
-        r for r in run_checks(cfg, run_lint=False).results if r.name == "static-credentials"
-    )
+    results = run_checks(cfg, run_lint=False).results
+    result = next(r for r in results if r.name == "static-credentials")
     detail = str(result.detail)
     assert not result.ok and "settings did not load" in detail
     assert "store.password" in detail  # the control: the failure is the password's own
-    assert "918273645" not in detail
+    # Every check that reads the same file renders the same failure, so none may print the value.
+    assert [r.name for r in results if "918273645" in str(r.detail)] == []
 
 
 async def test_a_first_load_refusal_closes_the_store(tmp_path: Path) -> None:

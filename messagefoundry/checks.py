@@ -1532,23 +1532,16 @@ def _resolve_service_toml(
     return _find_service_toml(config_dir)
 
 
-def _settings_error_without_values(exc: Exception) -> str:
-    """A settings-load failure, rendered without any configured value (BACKLOG #1182).
+def _settings_error(exc: Exception) -> str:
+    """A ``load_settings`` failure for a check detail, with no configured value in it.
 
-    A pydantic ``ValidationError`` prints ``input_value=<the value>``, so an unquoted numeric password
-    in ``[store]`` would land in check output and any CI log. It is rendered as each field's location
-    and error type only. Any other failure goes through :func:`~messagefoundry.redaction.safe_exc`."""
-    from pydantic import ValidationError
+    ``str(exc)`` on a pydantic error prints ``input_value=``, so an unquoted numeric password would land
+    in check output and any CI log (BACKLOG #1182). Every check's settings arm goes through the one
+    designated renderer, :func:`~messagefoundry.config.settings.settings_error_detail`. Imported
+    lazily, as every engine import in this module is."""
+    from messagefoundry.config.settings import settings_error_detail
 
-    from messagefoundry.redaction import safe_exc
-
-    if isinstance(exc, ValidationError):
-        fields = "; ".join(
-            f"{'.'.join(str(part) for part in err['loc'])} ({err['type']})"
-            for err in exc.errors(include_input=False, include_url=False, include_context=False)
-        )
-        return f"{exc.error_count()} invalid setting(s): {fields}"
-    return safe_exc(exc)
+    return settings_error_detail(exc)
 
 
 def _find_service_toml(config_dir: str | Path) -> Path | None:
@@ -1615,7 +1608,7 @@ def _check_posture(
             "posture",
             ok=False,
             required=True,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
 
     if settings.ai.environment is None:
@@ -1710,7 +1703,7 @@ def _check_build(
             "build-check",
             ok=False,
             required=True,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
     try:
         # allow_empty: same reason as reference-backend (BACKLOG #1648) -- REQUIRED leg, and its skip
@@ -1818,7 +1811,7 @@ def _check_alert_smtp_tls(
             "alert-smtp-tls",
             ok=False,
             required=False,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
     alerts = settings.alerts
     if not (alerts.email_smtp_host and alerts.email_from):
@@ -2140,7 +2133,7 @@ def _check_static_credentials(
                 name,
                 ok=False,
                 required=False,
-                detail=f"settings did not load: {_settings_error_without_values(exc)}",
+                detail=f"settings did not load: {_settings_error(exc)}",
             )
     hops = static_credential_hops(registry=registry, settings=settings)
     sec = settings.security if settings is not None else None
@@ -2275,7 +2268,7 @@ def _check_oidc_auth_params(
             "oidc-auth-params",
             ok=False,
             required=False,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
     auth = settings.auth
     if not auth.oidc_enabled:
@@ -2461,7 +2454,7 @@ def _check_reference_backend(
             "reference-backend",
             ok=False,
             required=True,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
     try:
         # allow_empty: this leg is REQUIRED and its subject is `registry.references`, which exists

@@ -84,7 +84,6 @@ from messagefoundry.api.metrics import (
 )
 from messagefoundry.api.models import (
     STATIC_CREDENTIAL_HOPS_COMPLETE,
-    STATIC_CREDENTIAL_HOPS_NOT_READ,
     STATIC_CREDENTIAL_HOPS_PARTIAL,
     STORE_PRIVILEGE_NOT_PROBED,
     AiChatRequest,
@@ -2026,13 +2025,14 @@ def create_app(
                 ("the service settings (none were stashed by serve)", cred_settings is None),
                 (
                     "connections other engine shards own (messagefoundry check reads them all)",
-                    runner is not None and engine.registry_filtered,
+                    # Set only when the config has two or more engine shards (ADR 0073).
+                    runner is not None and runner.registry.all_shard_ids is not None,
                 ),
             )
             if missing
         ]
         if runner is None and cred_settings is None:
-            static_hops_scope = STATIC_CREDENTIAL_HOPS_NOT_READ
+            static_hops_scope = "not read: " + "; ".join(unseen)
         elif unseen:
             static_hops_scope = STATIC_CREDENTIAL_HOPS_PARTIAL + "; ".join(unseen)
         else:

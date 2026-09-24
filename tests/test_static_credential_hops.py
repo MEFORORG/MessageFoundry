@@ -464,9 +464,9 @@ def test_an_at_outside_the_authority_names_no_host(
         ({"server": "db.example.invalid"}, "db.example.invalid"),
         ({"server": "tcp:db.example.invalid,1433"}, "db.example.invalid,1433"),
         ({"server": r"db.example.invalid\INST"}, r"db.example.invalid\INST"),
-        # A port setting joins the SQL Server form with its own separator, as a host's joins with ":".
+        # A database server joins its port as the DSN does, however the server was spelled.
         ({"server": "tcp:db.example.invalid", "port": 1433}, "db.example.invalid,1433"),
-        ({"server": "db.example.invalid", "port": 1433}, "db.example.invalid:1433"),
+        ({"server": "db.example.invalid", "port": 1433}, "db.example.invalid,1433"),
         # A bare IPv6 host is what a socket takes; the label brackets it so the port stays readable.
         ({"host": "2001:db8::1", "port": 2575}, "[2001:db8::1]:2575"),
         ({"host": "::1"}, "[::1]"),
@@ -496,6 +496,17 @@ def test_an_unparseable_address_is_withheld_not_echoed(value: str) -> None:
     label = _peer_label({"url": value})
     assert "s3cret" not in label.lower() and "sk_live" not in label and "12" not in label
     assert "withheld" in label
+
+
+@pytest.mark.parametrize(
+    "host", ["fe80::1%user:S3CRET@x", "fe80::1%sk_live_12345", "fe80::1%\tS3CRET", "fe80::1%\x00S"]
+)
+def test_an_ipv6_zone_id_is_withheld(host: str) -> None:
+    """``ip_address`` accepts nearly any text after ``%`` and echoes it back."""
+    label = _peer_label({"host": host, "port": 2575})
+    # The first case parses as a userinfo before host "x", which is dropped; the rest are withheld.
+    assert "S3CRET" not in label and "sk_live" not in label and "%" not in label
+    assert "\t" not in label and "\x00" not in label
 
 
 def test_http_digest_is_read_from_the_mode_the_connector_reads() -> None:

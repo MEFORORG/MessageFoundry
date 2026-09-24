@@ -4508,7 +4508,10 @@ def _split_address(text: str) -> tuple[str, str, str] | None:
 
 def _bare_ipv6(text: str) -> str | None:
     """``[addr]`` for a bare IPv6 literal, which a ``host`` setting may hold and a socket accepts, but
-    which no authority parse can read (its colons look like a port)."""
+    which no authority parse can read (its colons look like a port). A zone ID (``%...``) is refused:
+    ``ip_address`` accepts almost any text after the ``%`` and hands it back unchanged."""
+    if "%" in text:
+        return None
     try:
         addr = ipaddress.ip_address(text.strip())
     except ValueError:
@@ -4548,14 +4551,15 @@ def _peer_label(settings: Mapping[str, Any]) -> str:
         elif parsed := _split_address(str(raw)):
             scheme, host, port = parsed
         elif key == "server" and (sql := _SQL_SERVER.fullmatch(str(raw).strip())):
-            # SQL Server's own form keeps its ``,port`` separator, including for a port setting.
-            port = sql.group(2) or port_setting
-            return f"{sql.group(1)},{port}" if port else sql.group(1)
+            scheme, host, port = "", sql.group(1), sql.group(2) or ""
         else:
             return _WITHHELD_PEER
         if key != "url" and not port:
             port = port_setting
-        label = f"{host}:{port}" if port else host
+        # A database ``server`` joins its port as the DSN does (``SERVER=host,port``), however the
+        # operator spelled it; every other address uses ``host:port``.
+        sep = "," if key == "server" else ":"
+        label = f"{host}{sep}{port}" if port else host
         return f"{scheme}://{label}" if scheme else label
     return "(unknown peer)"
 
