@@ -1970,6 +1970,16 @@ class AuthStore(Protocol):
         to it. A required keyword turns that omission into a type error at every call site."""
         ...
 
+    async def withdraw_ad_channel_scope(self, user_id: str, *, now: float | None = None) -> bool:
+        """Withdraw a directory-derived scope to NULL (which denies), and report whether it did.
+
+        BACKLOG #1927. A COMPARE-AND-SET, not a read-then-write: the AD login sync decides to
+        withdraw from a user row it read several awaits earlier, and an administrator may set a
+        scope in between. The WHERE clause re-checks provenance in the same statement, so a scope
+        marked ``"manual"`` by then is left alone and this returns ``False``. So is a scope that is
+        already NULL. The withdrawn row is marked ``"ad"``."""
+        ...
+
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None
     ) -> None:

@@ -122,6 +122,8 @@ from messagefoundry.store.store import (
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
     AuditHeadMovedError,
@@ -605,9 +607,8 @@ _SCHEMA: list[str] = [
         -- and UNIQUE(username) is what refuses a racing double-create.
         directory_object_id  TEXT,
         password_claimed_at  DOUBLE PRECISION,
-        -- BACKLOG #1927: who last wrote channel_scope, 'ad' (the AD login sync) or 'manual' (an
-        -- administrator). NULL = no writer recorded; the AD login sync withdraws any scope not
-        -- marked 'manual' when no mapped group matches.
+        -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
+        -- on UserRecord.channel_scope_source.
         channel_scope_source TEXT
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
@@ -1259,8 +1260,8 @@ class PostgresStore:
             # window the item exists to close. No backfill exists: nothing has ever held the
             # directory's identifier.
             ("directory_object_id", "TEXT"),
-            # Scope provenance (BACKLOG #1927): NULL on existing rows = "no writer recorded", which
-            # the AD login sync withdraws when no mapped group matches. No backfill is possible.
+            # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source). No
+            # backfill: nothing recorded which writer set a scope until now.
             ("channel_scope_source", "TEXT"),
         ):
             if column not in users_cols:
@@ -7130,6 +7131,20 @@ class PostgresStore:
             now,
             user_id,
         )
+
+    async def withdraw_ad_channel_scope(self, user_id: str, *, now: float | None = None) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        result = await self._pool.execute(
+            "UPDATE users SET channel_scope=NULL, channel_scope_source=$1, updated_at=$2"
+            " WHERE id=$3 AND channel_scope IS NOT NULL"
+            " AND (channel_scope_source IS NULL OR channel_scope_source <> $4)",
+            SCOPE_SOURCE_AD,
+            now,
+            user_id,
+            SCOPE_SOURCE_MANUAL,
+        )
+        return _rowcount(result) > 0
 
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None

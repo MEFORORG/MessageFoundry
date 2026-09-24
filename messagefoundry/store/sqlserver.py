@@ -109,6 +109,9 @@ from messagefoundry.store.store import (
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
+    WITHDRAW_AD_SCOPE_SQL,
     AlertInstance,
     AlertSummary,
     AuditHeadMovedError,
@@ -1486,9 +1489,8 @@ _SCHEMA: list[str] = [
         -- GUID is 36 characters, so the width is slack, not a bound.
         directory_object_id NVARCHAR(256) NULL,
         password_claimed_at FLOAT NULL,
-        -- BACKLOG #1927: who last wrote channel_scope, 'ad' (the AD login sync) or 'manual' (an
-        -- administrator). NULL = no writer recorded; the AD login sync withdraws any scope not
-        -- marked 'manual' when no mapped group matches.
+        -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
+        -- on UserRecord.channel_scope_source.
         channel_scope_source NVARCHAR(16) NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
@@ -1516,9 +1518,8 @@ _SCHEMA: list[str] = [
     # is the item. No backfill exists; nothing has ever held the directory's identifier.
     """IF COL_LENGTH('users','directory_object_id') IS NULL
         ALTER TABLE users ADD directory_object_id NVARCHAR(256) NULL""",
-    # Scope provenance (BACKLOG #1927): COL_LENGTH-gated ADD on a pre-existing users table. NULL on
-    # existing rows = "no writer recorded", which the AD login sync withdraws when no mapped group
-    # matches, so it fails closed. No backfill is possible.
+    # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source):
+    # COL_LENGTH-gated ADD on a pre-existing users table. No backfill is possible.
     """IF COL_LENGTH('users','channel_scope_source') IS NULL
         ALTER TABLE users ADD channel_scope_source NVARCHAR(16) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
@@ -10377,6 +10378,21 @@ class SqlServerStore:
             "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
             (scope_json, source, now, user_id),
         )
+
+    async def withdraw_ad_channel_scope(self, user_id: str, *, now: float | None = None) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    WITHDRAW_AD_SCOPE_SQL, (SCOPE_SOURCE_AD, now, user_id, SCOPE_SOURCE_MANUAL)
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return bool(count) and int(count) > 0
 
     async def set_user_username(
         self, user_id: str, username: str, *, now: float | None = None

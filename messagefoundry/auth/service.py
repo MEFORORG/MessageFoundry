@@ -2009,7 +2009,7 @@ class AuthService:
             )
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
-        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups)
+        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
         identity = Identity.build(
             user_id=user.id,
             username=user.username,
@@ -2081,20 +2081,28 @@ class AuthService:
         )
 
     async def _sync_ad_channel_scope(
-        self, user: UserRecord, roles: frozenset[Role], groups: Iterable[str]
+        self,
+        user: UserRecord,
+        roles: frozenset[Role],
+        groups: Iterable[str],
+        *,
+        client: str | None = None,
     ) -> UserRecord:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
         requests (mirrors role sync). Administrators are always all-channels. Returns the (possibly
         refreshed) user record.
 
+        **A matching group is authoritative**: its scope replaces whatever is stored, an
+        administrator's included, and the scope is then the directory's.
+
         **When no mapped group matches, the outcome depends on who wrote the stored scope (BACKLOG
-        #1927).** A scope an administrator set (``channel_scope_source == "manual"``) is left
-        untouched, so the map stays opt-in and never clobbers a hand-set scope. Any other stored
-        scope is WITHDRAWN to NULL, which denies (BACKLOG #1152). This path used to return early for
-        every no-match login, so a user removed from their last scope-mapped group kept the channels
-        the directory had granted for as long as the account existed. A scope with no recorded
-        writer is withdrawn too: every writer now records one, so only a row older than the column
-        can lack it, and withdrawing an unvouched grant is the closed direction.
+        #1927).** A scope an administrator set is left untouched, so on this branch the map stays
+        opt-in. Any other scope is WITHDRAWN to NULL, which denies (BACKLOG #1152); the rule is
+        stated on ``UserRecord.channel_scope_source``. This path used to return early for every
+        no-match login, so a user removed from their last scope-mapped group kept the channels the
+        directory had granted for as long as the account existed. A scope that already denies is
+        left as it is, because rewriting ``[]`` to NULL changes no decision and would revoke
+        sessions for nothing.
 
         A wildcard group row persists the explicit ``["*"]`` grant. It used to persist SQL NULL and
         rely on NULL meaning "all"; with an absent scope now denying, that collapse would have
@@ -2102,18 +2110,27 @@ class AuthService:
         if Role.ADMINISTRATOR in roles:
             return user
         channels = await self._store.channels_for_ad_groups(groups)
-        scope_json: str | None
-        granted: str | list[str] | None
-        if channels:
-            wildcard = ALL_CHANNELS in channels
-            granted = ALL_CHANNELS if wildcard else sorted(c for c in channels if c != ALL_CHANNELS)
-            scope_json = _json([ALL_CHANNELS]) if wildcard else _json(granted)
-            if user.channel_scope == scope_json and user.channel_scope_source == SCOPE_SOURCE_AD:
+        if not channels:
+            if user.channel_scope_source == SCOPE_SOURCE_MANUAL:
                 return user
-        else:
-            if user.channel_scope is None or user.channel_scope_source == SCOPE_SOURCE_MANUAL:
-                return user
-            scope_json = granted = None
+            if _allowed_channels(user, roles) == frozenset():
+                return user  # already a deny; nothing to withdraw
+            # Compare-and-set: an administrator may have set a scope since ``user`` was read.
+            if not await self._store.withdraw_ad_channel_scope(user.id):
+                return await self._store.get_user(user.id) or user
+            await self._store.revoke_user_sessions(user.id)
+            await self._audit(
+                "auth.ad_scope_resynced",
+                actor=user.username,
+                detail=_json({"channels": None}),
+                client=client,
+            )
+            return await self._store.get_user(user.id) or user
+        wildcard = ALL_CHANNELS in channels
+        specific = sorted(c for c in channels if c != ALL_CHANNELS)
+        scope_json = _json([ALL_CHANNELS]) if wildcard else _json(specific)
+        if user.channel_scope == scope_json and user.channel_scope_source == SCOPE_SOURCE_AD:
+            return user
         await self._store.set_user_channel_scope(user.id, scope_json, source=SCOPE_SOURCE_AD)
         # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
         # moved -- the directory taking over an identical manual scope changes no decision, so
@@ -2123,7 +2140,8 @@ class AuthService:
         await self._audit(
             "auth.ad_scope_resynced",
             actor=user.username,
-            detail=_json({"channels": granted}),
+            detail=_json({"channels": ALL_CHANNELS if wildcard else specific}),
+            client=client,
         )
         return await self._store.get_user(user.id) or user
 
