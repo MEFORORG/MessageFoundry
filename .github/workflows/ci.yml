@@ -3583,7 +3583,10 @@ jobs:
       # with sign-in required, on its own fresh data directory, and uninstalls it afterwards. The helper
       # asserts the SCM run-as account and the owner of each sampled service process, so an arm that
       # silently ran as some other account goes red instead of measuring the wrong thing. Every red
-      # names the identity that could not open the store and the trio file(s) carrying no entry for it.
+      # names the identity and the trio file(s) granting it no read+write, and is tagged [STORE ACCESS]
+      # only when a log shows an open failure -- [NOT SHOWN TO BE STORE ACCESS] otherwise, so a refused
+      # start gate or a held port is not read as the lockout. A green that re-secured nothing prints
+      # GREEN (CONDITIONAL) with a warning. The helper's header says how each arm goes red.
       #
       # `!cancelled()` rather than the default `success()`: both readings are wanted on every run, so
       # the start-first arm still runs when the provision-first arm or the auth-off smoke went red.

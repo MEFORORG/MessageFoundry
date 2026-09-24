@@ -31,16 +31,20 @@
            after the store opened, so it is the proof that the operator opened it.
         3. The service is started again and must reach the same refusal, which proves it can still
            open the store that the operator's open re-secured. If step 2 instead PROVISIONED (no
-           bootstrap account existed), the gate would pass, so the proof is /health and sign-in.
+           bootstrap account existed), the gate would pass, so the proof is /health and sign-in. If
+           step 2 FAILED, the service is restarted anyway as a control: reopening the store it
+           created itself tells "restricted to the service" apart from "restricted to nobody usable".
 
     THE SERVICE IDENTITY IS CHECKED, NOT ASSUMED. The SCM's configured run-as account must be
     NT SERVICE\<ServiceName>, and every process sampled under the service must run as it. Where the
     engine is up (provision first), the sample must include the engine process itself.
 
-    WHAT A RED MEANS. Every red names the identity that could not open the store, says whether the
-    service log shows an open failure, and lists for each file of the trio the entries it carries and
-    whether any grants that identity read and write. That list is a READING of the DACL, not an
-    access check: it names the file, and the behaviour above says the open failed.
+    WHAT A RED MEANS. Every red names the identity that could not open the store, and lists for each
+    file of the trio the entries it carries and whether any grants that identity read and write. That
+    list is a READING of the DACL, not an access check: it names the file, and the behaviour above
+    says the open failed. A red is tagged [STORE ACCESS] only when the service log or the probe
+    output shows an open failure; otherwise it is tagged [NOT SHOWN TO BE STORE ACCESS], because a
+    refused start gate or a held port also stops the engine from serving.
 
     A GREEN CAN BE CONDITIONAL, and says so. store.py's _secure_file only logs when icacls fails,
     so if it could not restrict the trio under some identity (for example, a %USERNAME% icacls
@@ -102,6 +106,10 @@ $Failures = New-Object System.Collections.ArrayList
 $Readings = New-Object System.Collections.ArrayList
 $Conditions = New-Object System.Collections.ArrayList
 $OwnersSeen = @{}
+# The engine processes whose run-as account was READ in the current serving phase. Reset per phase,
+# so an earlier phase's sample cannot vouch for a later engine.
+$PhaseEngineOwners = New-Object System.Collections.ArrayList
+$CurrentPhase = "setup"
 
 function Format-Annotation([string]$Text) {
     # GitHub workflow-command data must escape these three, or a multi-line message is cut at the
@@ -161,6 +169,21 @@ function Get-OperatorSids {
     return $sids
 }
 
+function Get-DataBits([int]$Rights) {
+    <#
+      Reduce an ACE's access mask to the two bits an open for writing needs: 1 = ReadData, 2 = WriteData.
+      Generic rights are mapped, because a raw mask carrying GENERIC_ALL (0x10000000), GENERIC_READ
+      (0x80000000) or GENERIC_WRITE (0x40000000) sets neither bit yet grants both.
+    #>
+    $v = [long]$Rights
+    if ($v -lt 0) { $v += 4294967296 }
+    $bits = $v -band 3
+    if ($v -band 268435456) { $bits = $bits -bor 3 }
+    if ($v -band 2147483648) { $bits = $bits -bor 1 }
+    if ($v -band 1073741824) { $bits = $bits -bor 2 }
+    return [int]$bits
+}
+
 function Get-TrioReport {
     <#
       For each file of the trio: absent, or its owner, whether inheritance is removed (protected),
@@ -169,8 +192,7 @@ function Get-TrioReport {
       because an identity refused READ_CONTROL on the file is itself the finding.
     #>
     param([string]$Identity, [string[]]$IdentitySids)
-    $need = [int]([Security.AccessControl.FileSystemRights]::ReadData -bor
-        [Security.AccessControl.FileSystemRights]::WriteData)
+    $need = 3
     $lines = @()
     $missing = @()
     foreach ($suffix in "", "-wal", "-shm") {
@@ -195,8 +217,8 @@ function Get-TrioReport {
             $kind = if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) { "DENY " } else { "" }
             $aces += "$kind$($rule.IdentityReference):$($rule.FileSystemRights)"
             if ($IdentitySids -notcontains $sid) { continue }
-            if ($kind) { $denied = $denied -bor [int]$rule.FileSystemRights }
-            else { $allowed = $allowed -bor [int]$rule.FileSystemRights }
+            $bits = Get-DataBits ([int]$rule.FileSystemRights)
+            if ($kind) { $denied = $denied -bor $bits } else { $allowed = $allowed -bor $bits }
         }
         $grantsRw = (($allowed -band $need) -eq $need) -and (($denied -band $need) -eq 0)
         $verdict = if ($grantsRw) { "grants $Identity read+write" }
@@ -216,9 +238,9 @@ function Get-LogMatches {
       opens with read-write sharing, because NSSM may still hold the file open for writing; a reader
       that hit a sharing violation here would return nothing and turn a success into a timeout.
     #>
-    param([string]$Pattern, [switch]$Recurse)
+    param([string]$Pattern)
     if (-not (Test-Path -LiteralPath $LogDir)) { return @() }
-    $files = @(Get-ChildItem -LiteralPath $LogDir -File -Filter "*.log" -Recurse:$Recurse)
+    $files = @(Get-ChildItem -LiteralPath $LogDir -File -Filter "*.log")
     $found = @()
     foreach ($f in $files) {
         $lines = @(Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue)
@@ -238,11 +260,20 @@ function Get-Attribution {
     $files = if ($trio.Missing.Count -gt 0) { "Trio file(s) granting $Identity no read+write: $($trio.Missing -join ', ')." }
              else { "Every present trio file grants $Identity read+write, so the cause is probably NOT file access; read the output below." }
     $hits = @(Get-LogMatches $OpenErrorPattern | Select-Object -First 3 | ForEach-Object { Get-Excerpt $_.Line 240 })
-    if ($Output -and $Output -match $OpenErrorPattern) { $hits += "operator CLI: " + (Get-Excerpt $Output 240) }
+    if ($Output -and $Output -match $OpenErrorPattern) { $hits += "probe output: " + (Get-Excerpt $Output 240) }
+    # The KIND leads the message, so a red that is not shown to be file access cannot be read as the
+    # lockout Wave 0 is looking for: a refused start gate or a held port also fails to serve.
+    $kind = if ($hits.Count -gt 0) { "[STORE ACCESS]" } else { "[NOT SHOWN TO BE STORE ACCESS]" }
     $log = if ($hits.Count -gt 0) { "Open-failure evidence: $($hits -join ' || ')." }
-           else { "No open-failure line was found in the service log or the CLI output." }
+           else { "No open-failure line was found in the service log or the probe output." }
     $out = if ($Output) { " Output: $(Get-Excerpt $Output)." } else { "" }
-    return "$files $log Trio: $($trio.Text).$out"
+    return "$kind $files $log Trio: $($trio.Text).$out"
+}
+
+function Get-DbSddl {
+    # The .db's DACL as SDDL, or a marker when this caller cannot read it (restricted to another).
+    if (-not (Test-Path -LiteralPath $DbPath)) { return "absent" }
+    try { return (Get-Acl -LiteralPath $DbPath).Sddl } catch { return "unreadable" }
 }
 
 function Show-Trio([string]$Label) {
@@ -253,22 +284,30 @@ function Show-Trio([string]$Label) {
     }
 }
 
-function Test-Resecured([string]$Identity, [string]$Output) {
+function Test-Resecured {
     <#
-      Did this identity's open re-secure the store? store.py strips inheritance when it succeeds, so
-      a .db still inheriting, or a restriction warning in the logs or the CLI output, means it did
-      not. A DACL this caller cannot read was restricted to somebody else, which counts as secured.
+      Did this identity's open re-secure the store? Three readings, any one of which says it did not:
+      the .db still inherits (store.py strips inheritance when icacls succeeds); the .db's DACL is
+      byte-identical to what it was before this open, which catches a SECOND opener whose restriction
+      silently did nothing; or a restriction warning. -FromServiceLog reads the service's current
+      logs for that warning, and is passed only for the service's own opens, so an earlier service
+      warning is never charged to the operator. An unreadable DACL on both sides tells nothing.
     #>
+    param([string]$Identity, [string]$Output, [string]$SddlBefore, [switch]$FromServiceLog)
     $notes = @()
-    if (Test-Path -LiteralPath $DbPath) {
-        try {
-            if (-not (Get-Acl -LiteralPath $DbPath).AreAccessRulesProtected) {
-                $notes += "the .db still inherits its directory's entries"
-            }
-        } catch { }
+    $after = Get-DbSddl
+    if ($after -ne "absent" -and $after -ne "unreadable") {
+        if (-not (Get-Acl -LiteralPath $DbPath).AreAccessRulesProtected) {
+            $notes += "the .db still inherits its directory's entries"
+        }
+        if ($SddlBefore -and $SddlBefore -eq $after) {
+            $notes += "the .db's DACL is unchanged by this open ($after)"
+        }
     }
-    foreach ($m in (Get-LogMatches -Pattern $RestrictFailPattern | Select-Object -First 2)) {
-        $notes += "service log: $(Get-Excerpt $m.Line 200)"
+    if ($FromServiceLog) {
+        foreach ($m in (Get-LogMatches -Pattern $RestrictFailPattern | Select-Object -First 2)) {
+            $notes += "service log: $(Get-Excerpt $m.Line 200)"
+        }
     }
     if ($Output -and $Output -match $RestrictFailPattern) { $notes += "CLI: $(Get-Excerpt $Output 200)" }
     if ($notes.Count -gt 0) {
@@ -327,6 +366,9 @@ function Update-OwnerSample([string]$When) {
     # Record every sampled process's account. Any account other than the virtual account is a red:
     # the arm would then not be measuring the default virtual account at all.
     foreach ($p in @(Get-ServiceProcess)) {
+        if ($p.Account -ne "unreadable" -and $EngineImages -contains $p.Name.ToLowerInvariant()) {
+            [void]$PhaseEngineOwners.Add($p.Account)
+        }
         $key = "$($p.Name)=$($p.Account)"
         if ($OwnersSeen.ContainsKey($key)) { continue }
         $OwnersSeen[$key] = $true
@@ -340,10 +382,24 @@ function Update-OwnerSample([string]$When) {
 }
 
 function Test-EngineSampled {
-    foreach ($k in $OwnersSeen.Keys) {
-        if ($EngineImages -contains (($k -split "=", 2)[0]).ToLowerInvariant()) { return $true }
+    # True only when an engine process's owner was READ in the current phase. An unreadable owner, or
+    # one sampled in an earlier phase, does not verify the engine that is serving now.
+    return ($PhaseEngineOwners.Count -gt 0)
+}
+
+function Stop-ServiceProcessTree {
+    # Bounded fallback for a service that will not stop: end the service process and every engine
+    # process naming this store. Stop-Service is not used here because under Windows PowerShell 5.1
+    # it waits on a STOP_PENDING service with no time limit.
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"
+    if ($svc -and [int]$svc.ProcessId -ne 0) {
+        Stop-Process -Id ([int]$svc.ProcessId) -Force -ErrorAction SilentlyContinue
     }
-    return $false
+    foreach ($p in (Get-CimInstance Win32_Process | Where-Object {
+                $_.CommandLine -and $_.CommandLine.IndexOf($DbPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                $EngineImages -contains $_.Name.ToLowerInvariant() })) {
+        Stop-Process -Id ([int]$p.ProcessId) -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Stop-TheService {
@@ -360,10 +416,15 @@ function Stop-TheService {
         $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if (-not $svc -or $svc.Status -eq "Stopped") { break }
         if ((Get-Date) -ge $deadline) {
-            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-            $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            Stop-ServiceProcessTree
+            $grace = (Get-Date).AddSeconds(15)
+            while ((Get-Date) -lt $grace) {
+                $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+                if (-not $svc -or $svc.Status -eq "Stopped") { break }
+                Start-Sleep -Milliseconds 500
+            }
             if ($svc -and $svc.Status -ne "Stopped") {
-                throw "service '$ServiceName' is still '$($svc.Status)' 60 s after the stop"
+                throw "service '$ServiceName' is still '$($svc.Status)' after the stop and a forced end of its processes"
             }
             break
         }
@@ -406,6 +467,23 @@ function Invoke-OperatorCli {
     Write-Host "----- operator CLI ($($Arguments[0])) exit=$code -----"
     Write-Host $text
     return New-Object PSObject -Property @{ Code = $code; Text = $text }
+}
+
+function Start-TheService([string]$Phase) {
+    <#
+      Start the service for a named phase. Moves the previous phase's logs aside first, so a log line
+      found later belongs to this phase, and resets the per-phase engine sample. A non-zero `nssm
+      start` is recorded, not failed: an engine that dies early on an unreadable store can make NSSM
+      report the start as failed, and that is the very case the phase's own proof must attribute.
+    #>
+    $script:CurrentPhase = "service $Phase"
+    $PhaseEngineOwners.Clear()
+    Move-PhaseLogs ("before-" + ($Phase -replace "[^A-Za-z0-9]+", "-"))
+    $global:LASTEXITCODE = $null
+    & $Nssm start $ServiceName | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Add-Reading "nssm start for $Phase exited '$LASTEXITCODE'; the phase's own proof decides the verdict"
+    }
 }
 
 function Wait-ForGateRefusal([string]$Phase) {
@@ -615,37 +693,43 @@ try {
 
     if ($Order -eq "ProvisionFirst") {
         # 1. The operator provisions the fresh store.
+        $CurrentPhase = "operator provision"
         $r = Invoke-OperatorCli -Arguments $provisionArgs -Secrets $cliSecrets
         Show-Trio "operator provisioned"
         if ($r.Code -ne 0) {
             Add-Failure ("$Operator could not provision the fresh store $DbPath through provision-admin " +
                 "(exit $($r.Code)). " + (Get-Attribution $Operator (Get-OperatorSids) $r.Text))
         } else {
-            Test-Resecured $Operator $r.Text
+            Test-Resecured -Identity $Operator -Output $r.Text -SddlBefore "absent"
             # 2 and 3. The service starts on the store the operator created and secured, and serves.
-            Move-PhaseLogs "before-start"
-            & $Nssm start $ServiceName | Out-Host
+            $before = Get-DbSddl
+            Start-TheService "start"
+            $failed = $Failures.Count
             Test-ServiceServes "the start" "$Operator provisioned"
             Stop-TheService
             Show-Trio "service started"
-            Test-Resecured $ServiceIdentity ""
+            if ($Failures.Count -eq $failed) {
+                Test-Resecured -Identity $ServiceIdentity -SddlBefore $before -FromServiceLog
+            }
         }
     } else {
         # 1. The service starts first on a fresh store and is refused by the ADR 0167 gate.
-        Move-PhaseLogs "before-first-start"
-        & $Nssm start $ServiceName | Out-Host
+        Start-TheService "first start"
         $opened = Wait-ForGateRefusal "the first start"
         Stop-TheService
         Show-Trio "service first start"
-        if (-not $opened -or -not (Test-Path -LiteralPath $DbPath)) {
-            Add-Failure ("$ServiceIdentity never reached the account gate on a fresh store in " +
-                "$WaitSeconds s, so it did not create and open $DbPath. " +
+        if (-not $opened) {
+            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but never reached the account gate, so its open is unproven" }
+                    else { "never created $DbPath" }
+            Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
                 (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
             Show-LogTail
         } else {
             Add-Reading "$ServiceIdentity created and opened $DbPath, then the ADR 0167 gate refused it (expected)"
-            Test-Resecured $ServiceIdentity ""
+            Test-Resecured -Identity $ServiceIdentity -SddlBefore "absent" -FromServiceLog
             # 2. The operator opens that store through the CLI's path.
+            $CurrentPhase = "operator open"
+            $before = Get-DbSddl
             $r = Invoke-OperatorCli -Arguments $provisionArgs -Secrets $cliSecrets
             Show-Trio "operator open"
             $provisioned = ($r.Code -eq 0)
@@ -654,19 +738,36 @@ try {
                 Add-Failure ("$Operator could not open $DbPath, which $ServiceIdentity created and " +
                     "secured, through provision-admin's open path (exit $($r.Code)). " +
                     (Get-Attribution $Operator (Get-OperatorSids) $r.Text))
-                Add-Reading "the restart phase was not run: the operator never opened the store, so nothing re-secured it"
+                # CONTROL: nothing re-secured the store, so a service that cannot reopen even its own
+                # store means the first open locked out EVERY identity, not only the operator. That
+                # separates "restricted to the service" from "restricted to nobody usable".
+                Start-TheService "reopen of its own store (control)"
+                $own = Wait-ForGateRefusal "the control reopen"
+                Stop-TheService
+                if ($own) {
+                    Add-Reading "control: $ServiceIdentity reopened the store it created, so the store is restricted to the service and not to nobody"
+                } else {
+                    Add-Failure ("control: $ServiceIdentity could not reopen even the store it created " +
+                        "itself, which nobody else touched, so its own first open locked out every " +
+                        "identity. " + (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
+                    Show-LogTail
+                }
             } else {
                 $how = if ($provisioned) { "and provisioned it (no bootstrap account existed)" }
                        else { "and provision-admin declined on the bootstrap Administrator (expected)" }
                 Add-Reading "$Operator opened $DbPath $how"
-                Test-Resecured $Operator $r.Text
+                Test-Resecured -Identity $Operator -Output $r.Text -SddlBefore $before
                 # 3. The service starts again on the store the operator's open re-secured.
-                Move-PhaseLogs "before-restart"
-                & $Nssm start $ServiceName | Out-Host
+                $before = Get-DbSddl
+                Start-TheService "restart"
                 if ($provisioned) {
                     # An addressed Administrator now exists, so the gate passes: prove the open by serving.
+                    $failed = $Failures.Count
                     Test-ServiceServes "the restart" "$Operator's open re-secured"
                     Stop-TheService
+                    if ($Failures.Count -eq $failed) {
+                        Test-Resecured -Identity $ServiceIdentity -SddlBefore $before -FromServiceLog
+                    }
                 } else {
                     $reopened = Wait-ForGateRefusal "the restart"
                     Stop-TheService
@@ -677,6 +778,7 @@ try {
                         Show-LogTail
                     } else {
                         Add-Reading "$ServiceIdentity reopened $DbPath after $Operator's open"
+                        Test-Resecured -Identity $ServiceIdentity -SddlBefore $before -FromServiceLog
                     }
                 }
                 Show-Trio "service restart"
@@ -684,8 +786,13 @@ try {
         }
     }
 } catch {
-    $detail = if (Test-Path -LiteralPath $DbPath) { " Trio: $((Get-TrioReport -Identity $ServiceIdentity -IdentitySids (Get-ServiceSids)).Text)" } else { "" }
-    Add-Failure "the $Order arm stopped before its measurement finished: $($_.Exception.Message).$detail"
+    # Name the phase in flight and read the trio from that phase's identity, so an aborted arm still
+    # says whose step it was.
+    $who = if ($CurrentPhase -like "operator*") { $Operator } else { $ServiceIdentity }
+    $sids = if ($CurrentPhase -like "operator*") { Get-OperatorSids } else { Get-ServiceSids }
+    $detail = if (Test-Path -LiteralPath $DbPath) { " Trio: $((Get-TrioReport -Identity $who -IdentitySids $sids).Text)" } else { "" }
+    Add-Failure ("the $Order arm stopped during '$CurrentPhase' ($who) before its measurement " +
+        "finished: $($_.Exception.Message).$detail")
     Show-LogTail
 } finally {
     try {
