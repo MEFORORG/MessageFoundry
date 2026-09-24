@@ -460,7 +460,9 @@ class StoreSettings(_Section):
     # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
     # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
     # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
-    # a LOOSENING -- `security_loosenings()` names it. No effect without an encryption key.
+    # a LOOSENING -- `security_loosenings()` names it. No effect without an encryption key. It also
+    # restores the passthrough for a plaintext UPLOADED FILE, which a keyed store otherwise refuses
+    # until `rotate-key` seals it, alerting under `upload-cipher` (owner ruling 2026-09-23).
     allow_unmarked_ciphertext: bool = False
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
@@ -5503,7 +5505,10 @@ def security_loosenings(
                 "an UNMARKED value in an encrypted column reads back as plaintext instead of being "
                 "refused — anyone who can write the store can strip a ciphertext's marker or plant a "
                 "plaintext row and have the engine accept it as that row's content, and the next "
-                "rotate-key seals it as genuine ciphertext (no effect without a store key)",
+                "rotate-key seals it as genuine ciphertext. It also serves a plaintext uploaded file: "
+                "anyone who can write [store].uploads_dir, with no store access at all, can drop a "
+                "sidecar with a chosen uploader and have it listed, browsed and resent "
+                "(no effect without a store key)",
             )
         )
     # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the
