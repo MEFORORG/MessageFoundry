@@ -21,17 +21,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   Administrator, from the host.** Under `enforce`, with `[auth].notify_security_events` and
   `[alerts].security_notifications_required` on (both defaults), the engine refuses to start unless
   an enabled Administrator has a notification address. `provision-admin` run without `--email`
-  left exactly that state. It then refused to run again, because an enabled Administrator existed,
-  and the web console cannot be reached while the engine refuses to start. The new command takes
+  left exactly that state. It then refused to run again, because an enabled Administrator existed.
+  The web console cannot be reached while the engine refuses to start. The new command takes
   `--username` and `--email`, plus `--service-config`, `--db` and `--json`. It works on the store
-  directly, on the same host gate as `admin-unlock`, so run it with the engine stopped. It only
-  fills an absent address. It refuses at least a blank address, a non-Administrator, a disabled
-  account, and an account that already has an address. Change an existing address from the web
-  console, which notifies the old address. Run again with the same address, it reports success and
-  writes nothing. It appends an `auth.admin_notify_email_set` audit row before it writes the
-  address, so the address never lands unaudited. If that write then fails, it does not report
-  success. The warning `provision-admin` prints for a missing `--email` now names this command.
-  (`BACKLOG #1136`)
+  directly, behind the same host gate as `admin-unlock`. Run it with the engine stopped. A running
+  engine could change the address between the command's check and its write, or hold the lock its
+  audit row needs. It only fills an absent address. It refuses at least a blank address, a
+  non-Administrator, a disabled account, and an account that already has an address. Change an
+  existing address from the web console, which notifies the old address. A second run with the same
+  address reports success and writes nothing. The command appends an `auth.admin_notify_email_set`
+  audit row before it writes the address, so the address never lands unaudited. If that write then
+  fails, it does not report success. The warning `provision-admin` prints for a missing `--email`
+  now names this command. (`BACKLOG #1136`)
 
 ### Changed
 - **BREAKING — the web console engine UI seam moved, so this engine no longer pairs with web
@@ -92,14 +93,16 @@ All notable changes to MessageFoundry are documented here. The format follows
     file; the entry under Security covers that. The standalone test harness is not part of this
     change, and its default engine URL is still `http://127.0.0.1:8765`.
 - **BREAKING — `messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture
-  file.** The cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES`
-  (16 MiB) and rises to the largest `max_message_bytes` any inbound in the graph sets. The file's
-  size is checked before it is read, so an oversized fixture is never read whole. A fixture over the
-  cap that 0.4.0 read would now fail the run: `dryrun` exits with an error naming the file, and
-  `check` fails its `dryrun` gate. `docs/CONNECTIONS.md` also carries a code-derived ASVS 5.1.1
-  file-surface inventory, with upload and download tables and stated exclusions, and a test fails
-  when the code and the tables drift apart. **Migration:** split a fixture file over the cap into
-  smaller files. (`BACKLOG #1127`)
+  file.** The cap is 16 MiB (`MAX_FIXTURE_FILE_BYTES`, the engine's default per-message ceiling). It
+  rises to the largest `max_message_bytes` that any inbound in the graph sets, and no other setting
+  moves it. The cap applies to the whole file, not to each message in it. The file's size is
+  checked before it is read, so an oversized fixture is never read whole. A fixture over the cap
+  that 0.4.0 read would now fail the run. `dryrun` exits with an error naming the file, and `check`
+  fails its `dryrun` gate. `docs/CONNECTIONS.md` also carries an ASVS 5.1.1 file-surface inventory,
+  with upload and download tables and stated exclusions. A test fails when a row that follows the
+  code drifts from it. The doc names the parts kept by hand, and the test does not check those for
+  gaps. **Migration:** split a fixture file over the cap into smaller files.
+  (`BACKLOG #1127`)
 - **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
   `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
   that topology the engine mints no certificate (ADR 0172 decision 3). So the
@@ -119,9 +122,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   and `POST /me/password`, after `password must`, and in the refusal from
   `messagefoundry provision-admin`. The status code is unchanged. The list is unchanged too, so the
   same passwords are refused. The old wording mis-described it, since the list also holds generic
-  default-credential words such as `admin` and `password`. `docs/SECURITY.md` now publishes the
-  list in full, and a test holds it equal to `CONTEXT_WORDS`. **Migration:** a client that matches
-  the old clause in the `detail` must match the new one. (`BACKLOG #1135`, `#1132`)
+  default-credential words such as `admin` and `password`. `docs/SECURITY.md` already published the
+  list in full, and a new test holds it equal to `CONTEXT_WORDS`. **Migration:** a client that
+  matches the old clause in the `detail` must match the new one. (`BACKLOG #1135`, `#1132`)
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
@@ -147,11 +150,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   `[security].enforcement = "enforce"`, the default, an off-box identity provider with no
   `[auth].oidc_tls_crl_file` now stops `serve`. The refusal comes when the API is built, after the
   engine has started its listeners and workers. Neither `messagefoundry check` nor
-  `messagefoundry verify` reports it ahead of time. See ADR 0173 section 4.3. **Migration:** with
-  OIDC on, set `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the
-  token and JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file
-  becomes a trusted root for this hop. Or run with `[security].enforcement = "warn"`, which logs a
-  warning for each leg instead. (`BACKLOG #1887`)
+  `messagefoundry verify` reports it ahead of time. ADR 0173 AC-4 records these limits.
+  **Migration:** with OIDC on, set `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each
+  CA that issues the token and JWKS endpoint certificates. Put only CRLs in it, because a
+  certificate in that file becomes a trusted root for this hop. `[security].enforcement = "warn"`
+  also lets `serve` start, but it turns every enforce-only refusal in the instance into a warning,
+  not this one alone. (`BACKLOG #1887`)
 - **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine
   0.4.0 set no content cipher, so the `cryptography` library chose its default, AES-128-CBC. The
   mode is still CBC, and the content key is still wrapped with RSAES-PKCS1-v1_5. Signing is
@@ -205,6 +209,29 @@ All notable changes to MessageFoundry are documented here. The format follows
   the route's `purpose` (`session_terminate`, `mfa_enroll` or `mfa_confirm`), adopts that `token`,
   and retries. The JSON API has no passkey step, so a passkey-only account ends its sessions from the
   web console, where `/ui/reauth` asks for the passkey. (`BACKLOG #1951`)
+- **BREAKING — a keyed store now refuses an unmarked value in an encrypted column, where 0.4.0
+  read it back as plaintext.** Once a store key is set, only the keyed writer writes a covered
+  column. So a non-blank value there without the `mfenc:` marker is a stripped marker or a planted
+  row. The cipher raises `CipherError` on it. A purged `''` is never refused. The sweep at each
+  keyed open still seals legacy plaintext, but only on a surface that holds no sealed value yet. On
+  a surface that already holds one, it leaves the unmarked value in place and reports it. Under
+  `serve`, each refusal raises an `integrity_drift` alert under the subject `store-cipher`. The
+  alert names the table and column, never the row or the value. A CLI command that opens the store
+  only logs the refusal. **An unmarked `state` or `reference` value on a sealed surface would stop
+  the engine from starting**, because both caches load at open. The opt-out,
+  `[store].allow_unmarked_ciphertext`, ships off and is reported as a loosening when on.
+  (`BACKLOG #1169`)
+  - At least these gaps remain. The uploaded-file store still reads an unmarked value back as
+    plaintext. A surface with no ciphertext yet at a keyed open counts as unsealed, so a row
+    planted there is sealed as if it were real.
+  - A store keyed under 0.4.0 can hold legitimate unmarked values in at least two cases. One is a
+    first keyed open that stopped part-way through its sweep, which 0.4.0 committed in batches.
+    The other is a value made only of spaces on SQL Server, which 0.4.0's sweep skipped. The new
+    code refuses both.
+  - **Migration:** the engine names each column where it finds unmarked values beside sealed ones.
+    If you know those values are legitimate, start it once with
+    `[store].allow_unmarked_ciphertext = true`. That open seals them. Then set the setting back
+    to `false`.
 - **A lockout, and a sign-in that succeeds after failures, now write their own audit rows, so they
   reach the user's security-events feed.** Engine 0.4.0 wrote no row of its own for either event.
   Each lived only in the out-of-band notice, so no account saw either event in
@@ -251,23 +278,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   generated files so the engine mints a new pair. Then restart the tray, which does not reload a
   pin that already loaded, and re-pin every other client that pinned the old certificate.
   (`BACKLOG #1276`)
-- **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
-  as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
-  a non-blank value without the marker is a stripped marker or a planted row. The cipher raises
-  `CipherError` on it. A purged `''` is never refused. The sweep that runs at each keyed open now
-  seals legacy plaintext only on a surface that holds no sealed value yet; on any other surface it
-  leaves the unmarked value in place and reports it. Each refusal raises an `integrity_drift` alert
-  under the subject `store-cipher`, naming the table and column but never the row or the value.
-  **A planted `state` or `reference` value would stop the engine from starting**, because both
-  caches load at open. The opt-out, `[store].allow_unmarked_ciphertext`, ships off and is reported
-  as a loosening when on. The uploaded-file store is not covered: it still reads an unmarked value
-  back as plaintext. (`BACKLOG #1169`)
 - **The DICOM deflate guard now bounds exactly the bytes `dcmread` inflates, and fails closed.**
   Engine 0.4.0's guard found the deflated Data Set with its own walk of the file meta. It let
   through any header it could not follow, and pydicom reads headers more leniently. So a crafted
   Deflated Explicit VR Little Endian object could pass the guard and then inflate without bound in
-  `dcmread`, through `DicomPeek.parse`, `DicomDataset.parse` or the outbound C-STORE SCU.
-  (`BACKLOG #1926`)
+  `dcmread`. That path runs through `DicomPeek.parse`, `DicomDataset.parse` and the outbound
+  C-STORE SCU. (`BACKLOG #1926`)
   - The guard now replays pydicom's own header readers, the ones `dcmread` runs just before it
     inflates, and bounds that stream. That covers at least a missing or wrong group length, a
     second transfer-syntax element, a forced read with no preamble, and a command set before the
@@ -276,9 +292,9 @@ All notable changes to MessageFoundry are documented here. The format follows
     that lacks one of the replayed readers makes DICOM parsing fail with an error naming it, rather
     than parse unguarded.
   - The bounded inflate now stops at the end of the deflate stream. In 0.4.0 it looped without end
-    on a Data Set that inflates past 64 KiB and has any byte after the stream's end. pydicom and
-    pynetdicom pad an odd-length deflated Data Set with one NUL byte, so an ordinary object could
-    hit it. The inbound C-STORE SCP ran the same loop.
+    on some Data Sets. Such a Data Set inflated past 64 KiB but not past the cap, and had any byte
+    after the stream's end. pydicom and pynetdicom pad an odd-length deflated Data Set with one NUL
+    byte, so an ordinary object could hit it. The inbound C-STORE SCP ran the same loop.
   - The `[dicom]` extra now requires `pydicom>=3.0.2,<3.1`, where 0.4.0 allowed `<4`. The guard
     replays private pydicom readers, and its agreement test covers only the locked release, 3.0.2.
     No pydicom 3.1 or later had been published when this changed, so the cap rules out no release
