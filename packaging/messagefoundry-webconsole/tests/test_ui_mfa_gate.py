@@ -418,6 +418,14 @@ async def test_a_pending_session_cannot_end_an_enrolled_accounts_sessions(
 
         assert await service.identity_for_token(other.token) is not None
 
+    # Each refusal leaves a row, as the JSON twin's does: otherwise probing is silent.
+    denied = [
+        a["detail"] or ""
+        for a in await engine.store.list_audit()
+        if a["action"] == "auth.mfa_denied"
+    ]
+    assert sum("/ui/account/sessions/" in d for d in denied) == 2
+
 
 async def test_a_session_that_proved_its_code_at_reauth_can_end_sessions(
     engine: Engine, monkeypatch: pytest.MonkeyPatch

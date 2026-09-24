@@ -436,7 +436,7 @@ async def _enroll_totp_out_of_band(
 
 
 async def _reauth_to_terminate(c: httpx.AsyncClient, tok: str) -> str:
-    """A password re-proof bound to ``session_terminate``; asserts it succeeds, returns the new token.
+    """Re-prove the password for ``session_terminate``; assert it succeeds, return the new token.
 
     It succeeds even where the grant is refused: it is still a genuine password proof, and the
     session is re-keyed either way (ASVS 7.2.4)."""
@@ -590,7 +590,8 @@ def test_every_reauth_only_gate_action_is_refused_to_a_pending_enrolled_session(
             name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
             if name not in gates:
                 continue
-            arg = node.args[0]
+            kw = [k.value for k in node.keywords if k.arg == "action"]
+            arg = node.args[0] if node.args else kw[0]
             assert isinstance(arg, (ast.Name, ast.Attribute)), f"{source}: {ast.dump(arg)}"
             const = arg.id if isinstance(arg, ast.Name) else arg.attr
             wired.add(getattr(service_module, const))

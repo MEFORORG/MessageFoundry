@@ -945,7 +945,10 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
 Ordinary reads — listing users, the AD maps, the audit log, a single message — are **not** step-up
 gated. Four routes take the *password-only* variant (`require_reauth_only[_action]`), deliberately
 **without** the MFA gate so a required-but-unenrolled user cannot deadlock: `POST /me/mfa/enroll`,
-`POST /me/mfa/confirm`, `DELETE /me/sessions/{session_id}`, `DELETE /me/sessions`.
+`POST /me/mfa/confirm`, `DELETE /me/sessions/{session_id}`, `DELETE /me/sessions`. The skip serves
+an account with no factor only: a pending session on an account that has one gets `403` +
+`X-MFA-Required` on all four (BACKLOG #1951; see the "Binding a NEW second factor, or ending
+sessions" row).
 
 This re-proves the password (secondary verification). With **WP-14 native TOTP MFA** built, the step-up
 gate **also** requires the session's second factor: an MFA-required caller is refused with `403` +
@@ -1661,7 +1664,8 @@ reachable from a pending session and revokes every session of the account when i
 password, so on a first deployment a caller holding only the password would still sign such a user
 out that way, and change the password too. Refusing it there is an open question: the must-change
 confinement does not exempt `/auth/mfa-verify`, so an account that is both must-change and pending
-would have no way forward.
+would have no way forward. The console's `POST /ui/account/password` has the same shape, since it
+is reachable while pending.
 
 Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
 this: an **Active sessions…** view in the account menu lists your sessions and offers per-session

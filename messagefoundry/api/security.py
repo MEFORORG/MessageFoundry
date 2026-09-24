@@ -774,7 +774,7 @@ def require_reauth_only_action(
 
     Carries the same ``mfa_gate=False`` opt-out as :func:`require_reauth_only`, for the same reason;
     the session-terminate routes use it too. A pending session on an account that HAS a factor is
-    still refused (see ``AuthService._PENDING_REFUSED_ACTIONS``), with ``X-MFA-Required`` rather than
+    still refused (see ``AuthService._PENDING_REFUSED_ACTIONS``), with ``X-MFA-Required`` and not
     a step-up header: a password re-proof mints it nothing, so pointing it at ``POST /me/reauth``
     would loop a client that already typed the right password (BACKLOG #1951)."""
     base = require(*permissions, mfa_gate=False)
@@ -784,8 +784,10 @@ def require_reauth_only_action(
         auth = get_auth(request)
         if auth is not None and auth.enabled:
             token = bearer_token(request)
-            # Before the grant check, which pops: a refusal here must not burn a grant. Audited like
-            # require()'s MFA gate, since this is the same refusal reached past that gate's carve-out.
+            new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
+            # After the new-IP signal, so a refused request still records it, and before the grant
+            # check, which pops: a refusal here must not burn a grant. Audited like require()'s MFA
+            # gate, since this is the same refusal reached past that gate's carve-out.
             if await auth.factor_binding_is_blocked(token, action):
                 await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
                 raise HTTPException(
@@ -793,7 +795,6 @@ def require_reauth_only_action(
                     "multi-factor verification required; POST /auth/mfa-verify then retry",
                     headers={"X-MFA-Required": "1"},
                 )
-            new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
             if new_ip or not await _action_step_up_ok(auth, token, action):
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,

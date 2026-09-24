@@ -3080,8 +3080,8 @@ class AuthService:
             await self._store.mark_session_reauthed(hash_token(token), client=client)
             # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
             # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
-            # asking after would refuse every such grant on a session that is perfectly fine. It covers
-            # every action in _PENDING_REFUSED_ACTIONS, session_terminate included (BACKLOG #1951).
+            # asking after would refuse every such grant on a session that is perfectly fine. It
+            # covers every action in _PENDING_REFUSED_ACTIONS, session_terminate too (#1951).
             grant_refused = purpose is not None and await self._factor_binding_is_blocked(
                 token, purpose
             )
@@ -3126,8 +3126,8 @@ class AuthService:
     #:   is these routes only: ``POST /me/password`` still revokes every session from a pending one.
     #:
     #: A new action on either reauth-only action gate belongs here too. A test in
-    #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or console
-    #: packages. The action-less ``require_ui_reauth_only`` gate does not consult this set at all.
+    #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
+    #: console packages. The action-less ``require_ui_reauth_only`` gate never consults it.
     _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
