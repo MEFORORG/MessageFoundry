@@ -42,6 +42,7 @@ import re
 import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from typing import ClassVar
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import client_cert_principal, constant_time_match_any
@@ -549,6 +550,9 @@ class HttpSource(SourceConnector):
 
     A faithful :class:`~messagefoundry.transports.mllp.MLLPSource` sibling: same bind/stop lifecycle,
     per-connection IP allowlist, inbound TLS, and on-by-default ``connection_event`` plumbing."""
+
+    #: The 202 carries the committed message id, so the runner starts this source with the receipt handler.
+    wants_receipt: ClassVar[bool] = True
 
     def __init__(self, config: Source) -> None:
         s = config.settings
