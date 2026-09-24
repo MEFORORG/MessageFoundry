@@ -7,18 +7,21 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- **An admin-issued temporary password now comes with a deadline and a reminder.** The
-  `PASSWORD_RESET` security notice to the holder now states the instant the temporary password stops
-  working, and asks them to sign in and choose a new one before then. A disabled account's notice
-  carries no deadline line. A new `[alerts]` event, `initial_credential_expiring`, reminds the
-  operator once per credential per engine process while the credential is still unclaimed, in the
-  last third of the `[auth].initial_password_expiry_hours` window capped at 24 hours (24 hours at the
-  default 72). It names the holder as `user:<username>` plus the deadline and whole hours left, never
-  the password. With no `[alerts]` transport configured it goes to the log (`LoggingAlertSink`). At
-  `initial_password_expiry_hours = 0` nothing expires and no reminder runs. **Catch-all alert rules
-  match this event**, because `connection` defaults to `*`: a catch-all `mute` or `transports = []`
-  rule silences it, and a catch-all `control_action` is dispatched at `user:<username>`. Scope such
-  rules to real connection names or to one `event_type`. ([BACKLOG #1141](docs/BACKLOG.md))
+- **The reset notice now states when a temporary password stops working, and the operator gets a
+  reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
+  already enforced it. The `PASSWORD_RESET` security notice to the holder now states that instant,
+  and asks them to choose a new password before then. A disabled account's notice carries no
+  deadline line. A new `[alerts]` event, `initial_credential_expiring`, reminds the operator while
+  an admin-issued temporary password is still unclaimed. It fires at most once per credential per
+  engine process, in the last third of the window, capped at 24 hours (24 hours at the default 72).
+  It names the holder as `user:<username>` and carries the deadline and whole hours left, never the
+  password. With no `[alerts]` transport it goes to the log (`LoggingAlertSink`), where no rule
+  applies. At `initial_password_expiry_hours = 0` no reminder runs. **Catch-all alert rules match
+  this event**, because a rule's `connection` defaults to `*`. When such a rule is the first match,
+  its `mute` or `transports = []` silences the reminder. Its `control_action` is dispatched at
+  `user:<username>`, or, with `control_target` set, at that real connection, which it restarts.
+  Scope such rules to real connection names or to one `event_type`.
+  ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
 - **OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,

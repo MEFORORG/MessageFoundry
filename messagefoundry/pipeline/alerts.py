@@ -175,9 +175,11 @@ class AlertSink(Protocol):
         the whole hours left (``0`` in the final hour).
 
         The prefix does not hide the event from rules. ``AlertRule.connection`` defaults to ``"*"``,
-        so a catch-all rule matches it. A catch-all ``mute`` or ``transports=[]`` rule silences this
-        reminder, and a catch-all ``control_action`` is dispatched at ``user:<name>`` unless the rule
-        sets ``control_target``. Scope such rules to real connection names or to one ``event_type``.
+        so a catch-all rule matches it. Where a catch-all rule is the first match, its ``mute`` or
+        ``transports=[]`` silences this reminder. Its ``control_action`` is dispatched at ``name``,
+        or, when the rule sets ``control_target``, at that real connection, which it restarts. Scope
+        such rules to real connection names or to one ``event_type``. Rules apply only where
+        ``[alerts]`` has a transport; without one, :class:`LoggingAlertSink` logs every event.
 
         The engine cannot reach the holder of a credential it handed to an administrator, so this goes
         to the operator: tell the holder, or, if the credential lapses unclaimed, reset it again. The
