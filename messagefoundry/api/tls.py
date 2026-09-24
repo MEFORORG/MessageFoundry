@@ -126,6 +126,19 @@ def api_tls_source(*, cert_file: str | None, tls_terminated_upstream: bool) -> A
     return "upstream" if tls_terminated_upstream else "generated"
 
 
+def plaintext_upstream_hop_unacknowledged(api: ApiSettings) -> bool:
+    """True when ``serve`` refuses to start on BACKLOG #1179: the engine serves the proxy-to-engine
+    hop in plaintext (``api_tls_source`` is ``upstream``) and no operator has acknowledged it.
+
+    One predicate for both callers, ``serve`` and the ``upstream-hop-ack`` leg of
+    ``messagefoundry check``, so the refusal and the gate agree by construction.
+    """
+    source = api_tls_source(
+        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
+    )
+    return source == "upstream" and not api.plaintext_upstream_hop_acknowledged
+
+
 @dataclass(frozen=True)
 class ApiTlsPlan:
     """What the API bind **will** serve with, decided without reading or writing a single file.

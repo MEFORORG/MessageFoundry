@@ -444,3 +444,49 @@ def test_hop_ack_check_fails_a_stray_acknowledgement(tmp_path: Path) -> None:
     result = _hop_ack_check(toml)
     assert result.required and not result.ok and not result.skipped
     assert "plaintext_upstream_hop_acknowledged requires" in result.detail
+
+
+def test_hop_ack_check_allows_an_acknowledgement_beside_an_operator_cert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # serve allows this (test_api_tls.py); the check must not fail it.
+    _posture_b_toml(tmp_path, intra="mtls", floor="1.2", ack=True, cert=_self_signed(tmp_path))
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+    result = _hop_ack_check(tmp_path / "messagefoundry.toml")
+    assert result.required and result.ok and not result.skipped
+    assert "operator" in result.detail
+
+
+def test_hop_ack_check_fails_through_the_default_toml_search(tmp_path: Path) -> None:
+    # The documented `check --config config` form passes no service_config: the check walks up to
+    # the repo's messagefoundry.toml. A leg that only worked with an explicit path would pass here.
+    cfg = _config_repo(
+        tmp_path, '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+    )
+    result = next(
+        r for r in run_checks(cfg, run_lint=False).results if r.name == "upstream-hop-ack"
+    )
+    assert result.required and not result.ok and not result.skipped
+
+
+def test_hop_ack_check_skips_without_a_service_toml(tmp_path: Path) -> None:
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    result = next(
+        r
+        for r in run_checks(cfg, run_lint=False, suppress_service_toml_search=True).results
+        if r.name == "upstream-hop-ack"
+    )
+    assert result.required and result.ok and result.skipped
+
+
+def test_hop_ack_check_load_failure_echoes_no_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A ValidationError's str() carries the section's input values, env-sourced secrets included.
+    monkeypatch.setenv("MEFOR_API_TLS_KEY_PASSWORD", "SUPERSECRET123")
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text("[api]\nplaintext_upstream_hop_acknowledged = true\n", encoding="utf-8")
+    result = _hop_ack_check(toml)
+    assert not result.ok
+    assert "SUPERSECRET123" not in result.detail

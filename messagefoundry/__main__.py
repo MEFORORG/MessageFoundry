@@ -2300,8 +2300,8 @@ def _serve(args: argparse.Namespace) -> int:
         # an operator tls_cert_file wins over the no-mint branch, so with one the hop is TLS and there
         # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
         # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
-        # hop the engine leaves unprotected.
-        from messagefoundry.api.tls import api_tls_source
+        # hop the engine leaves unprotected. The predicate is shared with `messagefoundry check`.
+        from messagefoundry.api.tls import api_tls_source, plaintext_upstream_hop_unacknowledged
 
         serves_plaintext = (
             api_tls_source(
@@ -2310,7 +2310,7 @@ def _serve(args: argparse.Namespace) -> int:
             )
             == "upstream"
         )
-        if serves_plaintext and not settings.api.plaintext_upstream_hop_acknowledged:
+        if plaintext_upstream_hop_unacknowledged(settings.api):
             print(
                 "error: refusing to serve behind an upstream TLS terminator "
                 "([api].tls_terminated_upstream) without [api].plaintext_upstream_hop_acknowledged. "
