@@ -27,6 +27,7 @@ import json
 import sys
 from pathlib import Path
 
+from harness.frame_cap import max_frame_bytes_arg
 from harness.reconcile.compare import DEFAULT_KEY, ReconcileResult, load_messages, reconcile
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
@@ -116,9 +117,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     cap.add_argument(
         "--max-frame-bytes",
-        type=int,
+        type=max_frame_bytes_arg,
         default=DEFAULT_MAX_FRAME_BYTES,
-        help="largest MLLP frame accepted; a bigger one drops its connection (default: %(default)s, the engine's MLLP default)",
+        help="largest MLLP frame accepted; a bigger one drops its connection. 0 turns the cap off, "
+        "as on the engine's MLLP source; a negative value is refused "
+        "(default: %(default)s, the engine's MLLP default)",
     )
 
     cmp = sub.add_parser(

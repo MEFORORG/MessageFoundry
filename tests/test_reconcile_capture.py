@@ -14,10 +14,14 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from typing import Any
 
+import pytest
+
+from harness.reconcile import __main__ as reconcile_cli
 from harness.reconcile.capture import CaptureSink
 from messagefoundry.transports.mllp import MLLPDecoder, frame
-from tests._mllp_over_cap import send_over_cap
+from tests._mllp_over_cap import send_over_cap, send_valid_then_over_cap
 
 
 def _message(control_id: str) -> str:
@@ -137,3 +141,92 @@ def test_capture_drops_an_over_cap_frame_and_keeps_nothing(tmp_path: Path) -> No
 
     assert asyncio.run(scenario()) == b""  # no ACK: the connection was dropped
     assert out.read_text(encoding="utf-8") == ""
+
+
+def test_capture_acks_a_valid_frame_before_dropping_a_pipelined_over_cap_one(
+    tmp_path: Path,
+) -> None:
+    """A refusal must not take back the ACK the sink already built for an earlier frame in the same
+    read. The valid frame is captured and acknowledged, then the connection closes (BACKLOG #1127
+    follow-up)."""
+    out = tmp_path / "cap.jsonl"
+    message = _message("CID1")
+    cap = len(message.encode())
+
+    async def scenario() -> tuple[bytes, bool]:
+        sink = CaptureSink(out, host="127.0.0.1", ports=(0,), max_frame_bytes=cap)
+        await sink.start()
+        try:
+            got = await send_valid_then_over_cap(sink.bound_ports[0], message, cap)
+        finally:
+            await sink.stop()
+        assert sink.captured == 1 and sink.refused == 1
+        return got
+
+    got, closed = asyncio.run(scenario())
+    acks = list(MLLPDecoder().feed(got))
+    assert closed, "the over-cap frame did not drop the connection"
+    assert len(acks) == 1 and b"MSA|AA|CID1" in acks[0]
+    records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert [r["control_id"] for r in records] == ["CID1"]
+
+
+def test_capture_max_frame_bytes_zero_turns_the_cap_off(tmp_path: Path) -> None:
+    """``0`` means no cap, as on the engine's MLLP source. A live zero would refuse every frame."""
+
+    async def scenario() -> list[bytes]:
+        sink = CaptureSink(tmp_path / "cap.jsonl", host="127.0.0.1", ports=(0,), max_frame_bytes=0)
+        await sink.start()
+        try:
+            return await _send(sink.bound_ports[0], ["CID1"])
+        finally:
+            await sink.stop()
+
+    acks = asyncio.run(scenario())
+    assert len(acks) == 1 and b"MSA|AA|CID1" in acks[0]
+
+
+def test_capture_refuses_a_negative_max_frame_bytes(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="max_frame_bytes must be zero or more"):
+        CaptureSink(tmp_path / "cap.jsonl", max_frame_bytes=-1)
+
+
+def test_capture_refuses_a_fractional_max_frame_bytes(tmp_path: Path) -> None:
+    """0.5 is neither zero nor a byte count; truncated, it would be a live cap refusing every frame."""
+    half: Any = 0.5
+    with pytest.raises(ValueError, match="max_frame_bytes must be zero or more whole bytes"):
+        CaptureSink(tmp_path / "cap.jsonl", max_frame_bytes=half)
+
+
+def test_capture_cli_refuses_a_negative_max_frame_bytes_at_parse(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ran: list[Any] = []
+
+    async def fake_run(args: Any) -> int:  # stands in for the sink, which would run until Ctrl-C
+        ran.append(args)
+        return 0
+
+    monkeypatch.setattr(reconcile_cli, "_run_capture", fake_run)
+    argv = ["capture", "--port", "0", "--out", str(tmp_path / "c.jsonl"), "--max-frame-bytes"]
+    with pytest.raises(SystemExit) as excinfo:
+        reconcile_cli.main([*argv, "-1"])
+    assert excinfo.value.code == 2
+    assert "--max-frame-bytes" in capsys.readouterr().err
+    assert ran == []  # refused at parse, before a sink was built
+
+
+def test_capture_cli_passes_zero_through_as_cap_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Any] = []
+
+    async def fake_run(args: Any) -> int:
+        seen.append(args.max_frame_bytes)
+        return 0
+
+    monkeypatch.setattr(reconcile_cli, "_run_capture", fake_run)
+    argv = ["capture", "--port", "0", "--out", str(tmp_path / "c.jsonl")]
+    assert reconcile_cli.main([*argv, "--max-frame-bytes", "0"]) == 0
+    assert reconcile_cli.main(argv) == 0
+    assert seen == [0, reconcile_cli.DEFAULT_MAX_FRAME_BYTES]

@@ -20,6 +20,7 @@ from datetime import datetime
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
 
+from harness.frame_cap import resolve_max_frame_bytes
 from messagefoundry.config import AckMode
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
 from messagefoundry.transports.mllp import (
@@ -182,11 +183,12 @@ class SendWorker(QObject):
 class MllpReceiver(QObject):
     """A localhost MLLP listener: emits each inbound message and replies per :attr:`ack_mode`.
 
-    It bounds each frame at :attr:`max_frame_bytes`, the engine's MLLP default. The harness wheel is
-    attached to every release and this listener takes frames from another party, so it is an ASVS
-    5.1.1 upload feature (``docs/CONNECTIONS.md``, BACKLOG #1127). An over-cap frame is never handed
-    on or acknowledged: the connection is dropped, as the engine's MLLP source does, and
-    :attr:`refused` says why."""
+    It bounds each frame at :attr:`max_frame_bytes`, the engine's MLLP default; ``0`` turns the cap
+    off, as on the engine. The harness wheel is attached to every release and this listener takes
+    frames from another party, so it is an ASVS 5.1.1 upload feature (``docs/CONNECTIONS.md``,
+    BACKLOG #1127). An over-cap frame is never handed on or acknowledged: the connection is dropped,
+    as the engine's MLLP source does, and :attr:`refused` says why. A frame accepted before the
+    refusal still gets its ACK first, including a delayed one."""
 
     received = Signal(object)  # Received
     refused = Signal(str)  # "<peer>: <reason>" for a connection dropped over an over-cap frame
@@ -200,7 +202,22 @@ class MllpReceiver(QObject):
         self.delay_seconds = 1.0  # DELAY_AA: how long to wait before acknowledging
         self.fail_first = 1  # FAIL_THEN_AA: reject this many deliveries per control id, then accept
         self._seen: dict[str, int] = {}  # control id -> arrivals (drives duplicate detection)
-        self.max_frame_bytes = DEFAULT_MAX_FRAME_BYTES  # read per connection, when it is accepted
+        # DELAY_AA acknowledgements not yet written, per connection, and the refused connections
+        # held open only until theirs are. A refusal drops the decoder at once, so a refused
+        # connection reads nothing more, but it must not take back an ACK already owed.
+        self._pending_acks: dict[QTcpSocket, int] = {}
+        self._closing: set[QTcpSocket] = set()
+        self._max_frame_bytes: int | None = DEFAULT_MAX_FRAME_BYTES
+
+    @property
+    def max_frame_bytes(self) -> int | None:
+        """The frame cap each new connection is given; ``0`` or ``None`` turns it off."""
+        return self._max_frame_bytes
+
+    @max_frame_bytes.setter
+    def max_frame_bytes(self, value: int | None) -> None:
+        resolve_max_frame_bytes(value)  # refuse a negative here, not inside a Qt slot later
+        self._max_frame_bytes = value
 
     def is_listening(self) -> bool:
         return self._server.isListening()
@@ -213,25 +230,33 @@ class MllpReceiver(QObject):
         return self._server.listen(QHostAddress(QHostAddress.SpecialAddress.LocalHost), port)
 
     def stop(self) -> None:
-        for sock in list(self._decoders):
+        for sock in [*self._decoders, *self._closing]:
             sock.disconnectFromHost()
         self._decoders.clear()
+        self._closing.clear()
+        self._pending_acks.clear()
         self._server.close()
 
     def _on_new_connection(self) -> None:
         while self._server.hasPendingConnections():
             sock = self._server.nextPendingConnection()
-            self._decoders[sock] = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
+            self._decoders[sock] = MLLPDecoder(
+                max_frame_bytes=resolve_max_frame_bytes(self._max_frame_bytes)
+            )
             sock.readyRead.connect(lambda s=sock: self._on_ready_read(s))
             sock.disconnected.connect(lambda s=sock: self._cleanup(s))
 
     def _cleanup(self, sock: QTcpSocket) -> None:
         self._decoders.pop(sock, None)
+        self._closing.discard(sock)
+        self._pending_acks.pop(sock, None)
         sock.deleteLater()
 
     def _on_ready_read(self, sock: QTcpSocket) -> None:
         decoder = self._decoders.get(sock)
         if decoder is None:
+            if sock in self._closing:
+                sock.readAll()  # refused: discard, so a held-open socket cannot buffer without bound
             return
         try:
             for message in decoder.feed(bytes(sock.readAll().data())):
@@ -245,9 +270,13 @@ class MllpReceiver(QObject):
         except MLLPFrameError as exc:
             # Drop the decoder first so a late readyRead finds nothing to feed. Disconnect rather
             # than abort: an ACK already written for a valid frame earlier in this read still goes.
+            # A delayed ACK not yet written holds the connection open until it is (_delayed_aa).
             self._decoders.pop(sock, None)
             self.refused.emit(f"{sock.peerAddress().toString()}:{sock.peerPort()}: {exc}")
-            sock.disconnectFromHost()
+            if self._pending_acks.get(sock):
+                self._closing.add(sock)
+            else:
+                sock.disconnectFromHost()
 
     def _reply(self, sock: QTcpSocket, text: str, control_id: str, seen: int) -> None:
         """Acknowledge per the active reply mode — including faults that make the engine retry."""
@@ -259,6 +288,7 @@ class MllpReceiver(QObject):
         elif mode == CLOSE:
             sock.disconnectFromHost()  # no ACK at all → the engine's send fails immediately
         elif mode == DELAY_AA:
+            self._pending_acks[sock] = self._pending_acks.get(sock, 0) + 1
             QTimer.singleShot(
                 max(0, int(self.delay_seconds * 1000)), lambda: self._delayed_aa(sock, text)
             )
@@ -267,12 +297,22 @@ class MllpReceiver(QObject):
             self._write_ack(sock, text, code, AckMode.ORIGINAL)
 
     def _delayed_aa(self, sock: QTcpSocket, text: str) -> None:
-        if sock not in self._decoders:  # the engine may have timed out and closed by now
-            return
-        try:  # noqa: SIM105 - suppress() would drop the reason recorded on the except below
+        if sock not in self._decoders and sock not in self._closing:
+            return  # the engine may have timed out and closed by now
+        remaining = self._pending_acks.get(sock, 1) - 1
+        if remaining > 0:
+            self._pending_acks[sock] = remaining
+        else:
+            self._pending_acks.pop(sock, None)
+        try:
             self._write_ack(sock, text, "AA", AckMode.ORIGINAL)
+            if sock in self._closing and remaining <= 0:
+                # The last ACK owed on a refused connection is written: now drop it. Disconnect
+                # sends what is buffered before it closes.
+                self._closing.discard(sock)
+                sock.disconnectFromHost()
         except RuntimeError:  # underlying socket already deleted
-            pass
+            self._closing.discard(sock)
 
     @staticmethod
     def _write_ack(sock: QTcpSocket, text: str, code: str, ack_mode: AckMode) -> None:

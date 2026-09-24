@@ -20,12 +20,13 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from harness.mllp import CLOSE, FAIL_THEN_AA, MllpReceiver, Received  # noqa: E402
+from harness.mllp import CLOSE, DELAY_AA, FAIL_THEN_AA, MllpReceiver, Received  # noqa: E402
 from messagefoundry.transports.mllp import (  # noqa: E402
     DEFAULT_MAX_FRAME_BYTES,
     MLLPDecoder,
     frame,
 )
+from tests._mllp_over_cap import valid_then_over_cap  # noqa: E402
 
 _MSG = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01^ADT_A01|X1|P|2.5.1\rEVN|A01|20260101\r"
 
@@ -152,3 +153,66 @@ def test_a_frame_at_the_cap_is_still_received(qapp: Any, recv: MllpReceiver) -> 
     ack = _send_once(qapp, recv.port())
     assert got and got[0].control_id == "X1"
     assert b"MSA|AA|X1" in ack
+
+
+def _send_pipelined_until_close(qapp: Any, port: int, payload: bytes) -> tuple[list[bytes], bool]:
+    """Send ``payload`` in one write, then read until the peer closes or 5 s pass, spinning the Qt
+    loop so the receiver runs. Returns the decoded frames read and whether the peer closed. A close
+    is seen only after every byte sent before it, so an ACK in the list arrived before the close."""
+    client = socket.create_connection(("127.0.0.1", port), 3)
+    client.settimeout(0.05)
+    client.sendall(payload)
+    got = b""
+    closed = False
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        qapp.processEvents()
+        try:
+            chunk = client.recv(4096)
+        except TimeoutError:
+            continue
+        except ConnectionResetError:
+            closed = True
+            break
+        if not chunk:
+            closed = True
+            break
+        got += chunk
+    client.close()
+    return list(MLLPDecoder().feed(got)), closed
+
+
+@pytest.mark.parametrize("mode", ["AA", DELAY_AA])
+def test_a_valid_frame_is_acknowledged_before_a_pipelined_over_cap_frame_drops_it(
+    qapp: Any, recv: MllpReceiver, mode: str
+) -> None:
+    """A refusal must not take back the ACK owed to an earlier frame in the same read, including a
+    delayed one: the valid frame's AA arrives, then the connection closes (BACKLOG #1127 follow-up)."""
+    recv.ack_mode = mode
+    recv.delay_seconds = 0.3
+    cap = len(_MSG.encode())
+    recv.max_frame_bytes = cap
+    got: list[Received] = []
+    refused: list[str] = []
+    recv.received.connect(got.append)
+    recv.refused.connect(refused.append)
+    assert recv.start(0)
+    acks, closed = _send_pipelined_until_close(qapp, recv.port(), valid_then_over_cap(_MSG, cap))
+    assert [r.control_id for r in got] == ["X1"]
+    assert len(refused) == 1
+    assert closed, "the over-cap frame did not drop the connection"
+    assert len(acks) == 1 and b"MSA|AA|X1" in acks[0]
+
+
+def test_max_frame_bytes_zero_turns_the_receiver_cap_off(qapp: Any, recv: MllpReceiver) -> None:
+    """``0`` means no cap, as on the engine's MLLP source. A live zero would refuse every frame."""
+    recv.ack_mode = "AA"
+    recv.max_frame_bytes = 0
+    assert recv.start(0)
+    assert b"MSA|AA|X1" in _send_once(qapp, recv.port())
+
+
+def test_a_negative_receiver_max_frame_bytes_is_refused(recv: MllpReceiver) -> None:
+    with pytest.raises(ValueError, match="max_frame_bytes must be zero or more"):
+        recv.max_frame_bytes = -1
+    assert recv.max_frame_bytes == DEFAULT_MAX_FRAME_BYTES
