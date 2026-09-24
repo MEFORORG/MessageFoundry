@@ -37,8 +37,9 @@ from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
-    check_resubmitted_body,
+    admit_resubmitted_body,
 )
+from messagefoundry.store.store import Stage
 
 PW = "Correct-Horse-Battery-Staple-9"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN123^^^H^MR||DOE^JANE\r"
@@ -271,6 +272,25 @@ async def test_edit_resend_direct_with_a_nul_is_refused(engine: Engine, tmp_path
     )
     assert r.status_code == 422, r.text
     await _assert_nothing_committed(engine, mid, r)
+    # The direct path's own artifact is an outbound row to OB2; the in1 count cannot see it.
+    async with engine.store._read() as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM queue WHERE stage=? AND destination_name=?",
+            (Stage.OUTBOUND.value, "OB2"),
+        )
+        row = await cur.fetchone()
+    assert row is not None and row[0] == 0
+
+
+async def test_upload_resend_into_a_binary_inbound_commits_carriage(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The listener commits a binary inbound's body as mfb64:v1: carriage; so must the resend.
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path, content_type=ContentType.BINARY)))
+    r = await _upload_then_resend(engine, tmp_path, ADT)
+    assert r.status_code == 200, r.text
+    row = await engine.store.get_message(r.json()["message_id"])
+    assert row is not None and row["raw"].startswith("mfb64:v1:")
 
 
 async def test_edit_resend_reroute_that_fits_is_still_resubmitted(
@@ -296,30 +316,30 @@ def _ic(content_type: ContentType, max_message_bytes: int | None = None) -> Inbo
 
 
 def test_guard_applies_the_hl7_ceiling_per_connection() -> None:
-    check_resubmitted_body(ADT, _ic(ContentType.HL7V2, max_message_bytes=len(ADT)))
+    admit_resubmitted_body(ADT, _ic(ContentType.HL7V2, max_message_bytes=len(ADT)))
     with pytest.raises(IngressGuardError) as exc:
-        check_resubmitted_body(ADT, _ic(ContentType.HL7V2, max_message_bytes=len(ADT) - 1))
+        admit_resubmitted_body(ADT, _ic(ContentType.HL7V2, max_message_bytes=len(ADT) - 1))
     assert exc.value.phase == "size"
 
 
 def test_guard_sniffs_the_declared_type() -> None:
-    check_resubmitted_body('{"a": 1}', _ic(ContentType.JSON))
+    admit_resubmitted_body('{"a": 1}', _ic(ContentType.JSON))
     with pytest.raises(IngressGuardError) as exc:
-        check_resubmitted_body(ADT, _ic(ContentType.JSON))
+        admit_resubmitted_body(ADT, _ic(ContentType.JSON))
     assert exc.value.phase == "type"
     with pytest.raises(IngressGuardError) as exc:
-        check_resubmitted_body('{"a": 1}', _ic(ContentType.HL7V2))
-    assert exc.value.phase == "type"
+        admit_resubmitted_body('{"a": 1}', _ic(ContentType.HL7V2))
+    assert exc.value.phase == "type"  # the sniff names it before Peek.parse would
 
 
 def test_guard_sniffs_a_binary_inbound_on_its_bytes() -> None:
     dicom = b"\x00" * 128 + b"DICM" + b"\x02\x00"
-    check_resubmitted_body(carry(dicom), _ic(ContentType.DICOM))
+    admit_resubmitted_body(carry(dicom), _ic(ContentType.DICOM))
     with pytest.raises(IngressGuardError) as exc:
-        check_resubmitted_body(ADT, _ic(ContentType.DICOM))
+        admit_resubmitted_body(ADT, _ic(ContentType.DICOM))
     assert exc.value.phase == "type"
     with pytest.raises(IngressGuardError) as exc:
-        check_resubmitted_body("mfb64:v1:not base64!", _ic(ContentType.BINARY))
+        admit_resubmitted_body("mfb64:v1:not base64!", _ic(ContentType.BINARY))
     assert exc.value.phase == "decode"
 
 
@@ -329,30 +349,60 @@ def test_guard_refuses_text_the_declared_charset_cannot_hold() -> None:
         ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575, "encoding": "ascii"}),
         router="r",
     )
-    check_resubmitted_body(ADT, ic)
+    admit_resubmitted_body(ADT, ic)
     with pytest.raises(IngressGuardError) as exc:
-        check_resubmitted_body(ADT.replace("JANE", "JOSÉ"), ic)
+        admit_resubmitted_body(ADT.replace("JANE", "JOSÉ"), ic)
     assert exc.value.phase == "decode"
     # The reason names a position, never the character, because it is returned and audited.
     assert "É" not in exc.value.reason and "\\xc9" not in exc.value.reason
 
 
 def test_guard_without_an_inbound_keeps_the_engine_wide_rules() -> None:
-    check_resubmitted_body("anything at all", None)
+    admit_resubmitted_body("anything at all", None)
     with pytest.raises(IngressGuardError) as exc:
-        check_resubmitted_body("a\x00b", None)
+        admit_resubmitted_body("a\x00b", None)
     assert exc.value.phase == "decode"
     with pytest.raises(IngressGuardError) as exc:
-        check_resubmitted_body("A" * (DEFAULT_MAX_MESSAGE_BYTES + 1), None)
+        admit_resubmitted_body("A" * (DEFAULT_MAX_MESSAGE_BYTES + 1), None)
     assert exc.value.phase == "size"
 
 
 def test_guard_applies_the_hl7_segment_cap_peek_parse_applies() -> None:
     from messagefoundry.parsing.peek import DEFAULT_MAX_SEGMENTS
 
-    too_many = (
-        "MSH|^~\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r" + "NTE|1\r" * DEFAULT_MAX_SEGMENTS
-    )
+    too_many = ADT + "NTE|1\r" * DEFAULT_MAX_SEGMENTS
     with pytest.raises(IngressGuardError) as exc:
-        check_resubmitted_body(too_many, _ic(ContentType.HL7V2))
+        admit_resubmitted_body(too_many, _ic(ContentType.HL7V2))
     assert exc.value.phase == "size" and "max segments" in exc.value.reason
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "FHS|^~\\&|S\r" + ADT,  # a batch header the sniff admits and Peek.parse refuses
+        "﻿" + ADT,  # a BOM the sniff strips and Peek.parse does not
+        "MSH",  # a bare segment id
+    ],
+)
+def test_guard_refuses_what_peek_parse_refuses_and_the_sniff_admits(body: str) -> None:
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(body, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "parse"
+
+
+def test_guard_returns_the_form_the_listener_commits() -> None:
+    # HL7 is committed \r-normalized, as the listener's normalize() leaves it.
+    assert admit_resubmitted_body(ADT.replace("\r", "\r\n"), _ic(ContentType.HL7V2)) == ADT
+    # Another text type is committed verbatim.
+    assert admit_resubmitted_body('{"a":\r\n1}', _ic(ContentType.JSON)) == '{"a":\r\n1}'
+    # A binary inbound's row is carriage: bare text is carried, carriage is kept as it is.
+    assert admit_resubmitted_body("plain", _ic(ContentType.BINARY)) == carry(b"plain")
+    assert admit_resubmitted_body(carry(b"x"), _ic(ContentType.BINARY)) == carry(b"x")
+
+
+def test_guard_holds_a_streaming_inbound_to_the_engine_ceiling() -> None:
+    # A streaming inbound raises max_message_bytes to pay for a detach the resend path does not do.
+    big = ADT + "NTE|1||" + "A" * DEFAULT_MAX_MESSAGE_BYTES + "\r"
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(big, _ic(ContentType.HL7V2, max_message_bytes=64 * 1024 * 1024))
+    assert exc.value.phase == "size"

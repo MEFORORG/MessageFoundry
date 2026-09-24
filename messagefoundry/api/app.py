@@ -311,7 +311,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.ingress_guards import IngressGuardError, check_resubmitted_body
+from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
     NotDeployedError,
@@ -1200,9 +1200,9 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 
 #: The status a refused operator resubmission answers with, by the ingress guard that refused it
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
-#: the same status the upload route gives a non-text file. A body the listener could not have decoded
-#: is 422.
-_INGRESS_GUARD_STATUS: dict[str, int] = {"size": 413, "type": 415, "decode": 422}
+#: the same status the upload route gives a non-text file. A body the listener could not have decoded,
+#: or an HL7 body ``Peek.parse`` refuses, is 422.
+_INGRESS_GUARD_STATUS: dict[str, int] = {"size": 413, "type": 415, "decode": 422, "parse": 422}
 
 
 async def _guard_resubmission(
@@ -1215,20 +1215,21 @@ async def _guard_resubmission(
     action: str,
     channel_id: str | None,
     detail: dict[str, object],
-) -> None:
-    """Refuse a resubmitted body the target inbound's listener would refuse (BACKLOG #1911).
+) -> str:
+    """Admit a resubmitted body as the target inbound's listener would, or refuse it (BACKLOG #1911).
 
     The upload resend and the edit-resend paths write the stage row directly, so the listener's size
-    ceiling and declared-type sniff never ran on them. This runs the same guards
-    (:func:`~messagefoundry.pipeline.ingress_guards.check_resubmitted_body`) before anything is written.
-    A refusal is an HTTP 4xx, an ``action`` audit row and a log line, and nothing is committed, so
+    ceiling and declared-type checks never ran on them. This runs the same guards
+    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmitted_body`) before anything is written
+    and returns the form to commit, which the caller writes instead of the body it was handed. A
+    refusal is an HTTP 4xx, an ``action`` audit row and a log line, and no message row is written, so
     count-and-log holds: no body is accepted and then dropped. Off the event loop, because the body can
     be as large as an upload.
 
     The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
     of the body, so neither the row nor the 4xx detail echoes PHI."""
     try:
-        await asyncio.to_thread(check_resubmitted_body, raw, inbound)
+        return await asyncio.to_thread(admit_resubmitted_body, raw, inbound)
     except IngressGuardError as exc:
         await engine.store.record_audit(
             action,
@@ -4359,7 +4360,7 @@ def create_app(
                 raise HTTPException(404, f"no such outbound connection: {body.to}") from None
             # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
             # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
-            await _guard_resubmission(
+            admitted = await _guard_resubmission(
                 engine,
                 identity,
                 request,
@@ -4371,7 +4372,7 @@ def create_app(
             )
             try:
                 direct = await engine.edit_resend_direct(
-                    message_id, to=body.to, raw=body.raw, idempotency_key=body.idempotency_key
+                    message_id, to=body.to, raw=admitted, idempotency_key=body.idempotency_key
                 )
             except ResendError as exc:
                 # Empty edited body / idempotency-key reused for a different target → 409. str(exc)
@@ -4411,7 +4412,7 @@ def create_app(
         # inbound's own ceiling and declared type apply. An origin inbound that is no longer registered
         # has no declared type, so only the engine-wide guards apply to it.
         rr = engine.registry_runner
-        await _guard_resubmission(
+        admitted = await _guard_resubmission(
             engine,
             identity,
             request,
@@ -4423,7 +4424,7 @@ def create_app(
         )
         try:
             outcome = await engine.edit_resend_reroute(
-                message_id, raw=body.raw, idempotency_key=body.idempotency_key
+                message_id, raw=admitted, idempotency_key=body.idempotency_key
             )
         except ResendError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -4951,20 +4952,25 @@ def create_app(
                 404, f"no message at index {body.index} (file has {len(parts)} messages)"
             )
         # BACKLOG #1911: the inject writes an INGRESS row directly, so run the target inbound's own
-        # ceiling and declared-type sniff first. An upload may be larger than one message may be.
-        await _guard_resubmission(
+        # ceiling and declared-type checks first. An upload may be larger than one message may be.
+        # Re-resolved rather than trusted from the check above: a reload during the awaits since then
+        # may have dropped or retyped the inbound, and guarding with no inbound would fail open.
+        target = rr.registry.inbound.get(body.to)
+        if target is None:
+            raise HTTPException(404, f"no such inbound connection: {body.to}")
+        admitted = await _guard_resubmission(
             engine,
             identity,
             request,
             raw=parts[body.index],
-            inbound=rr.registry.inbound.get(body.to),
+            inbound=target,
             action="upload.resend_reject",
             channel_id=body.to,
             detail={"file_id": file_id, "index": body.index, "to": body.to},
         )
         mid = await engine.inject_message(
             channel_id=body.to,
-            raw=parts[body.index],
+            raw=admitted,
             source_type="upload",
             metadata=json.dumps({"upload_file_id": file_id, "upload_index": body.index}),
         )

@@ -139,8 +139,8 @@ RESEND_STOPPED_NOTICE = (
 )
 RESEND_REFUSED_NOTICE = (
     "That resend did not run — nothing was injected. The target inbound connection would refuse "
-    "that message from a sender: it is larger than the connection accepts, it does not match the "
-    "connection's declared content type, or the connection's character set cannot hold it."
+    "that message from a sender. For example, it may be larger than the connection accepts, or not "
+    "match the connection's declared content type."
 )
 DELETE_FAILED_NOTICE = (
     "That delete did not run — nothing was removed. The file was not found. It may already be gone."

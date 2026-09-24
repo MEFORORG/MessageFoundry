@@ -23,16 +23,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1168](docs/BACKLOG.md))
 - **An operator resend now meets the target inbound's ingress guards.** `POST
   /uploads/{file_id}/resend` and `POST /messages/{message_id}/edit-resend` wrote the stage row
-  directly, so the inbound's size ceiling and declared-type sniff never ran on them. An uploaded file
+  directly, so the inbound's size ceiling and declared-type checks never ran on them. An uploaded file
   may be 25 MiB by default, so a single message larger than the 16 MiB ingress ceiling could be
   injected into any inbound, and an HL7 message could be injected into a JSON one. Both routes now
-  run the same guards first: the ceiling (the inbound's own `max_message_bytes` for HL7, the engine
-  16 MiB otherwise), the declared-type sniff, the NUL rule, and a check that the inbound's charset
-  can hold the text. A refusal answers 413, 415 or 422, writes an `upload.resend_reject` or
-  `message_edit_resend_reject` audit row, and commits nothing. The edit-resend direct path (`to`
-  set) writes an outbound row, so it has no inbound type to sniff; only the NUL rule and the 16 MiB
-  ceiling apply there. The web console shows an uploaded-log resend refused this way as its own
-  notice. ([BACKLOG #1911](docs/BACKLOG.md))
+  run the listener's checks first, at least: the size ceiling (an HL7 inbound's own lower
+  `max_message_bytes`, never above 16 MiB), the declared-type sniff, `Peek.parse` for HL7, the NUL
+  rule, and a check that the inbound's charset can hold the text. A refusal answers 413, 415 or 422,
+  writes an `upload.resend_reject` or `message_edit_resend_reject` audit row, and writes no message.
+  An admitted body is committed in the listener's form: HL7 with `\r` line endings, and a binary
+  inbound's body as `mfb64:v1:` carriage. Strict `hl7apy` validation is still not run on a
+  resubmission. The edit-resend direct path (`to` set) writes an outbound row, so only the NUL rule
+  applies there in practice; its body is already held below 16 MiB by the 1 MiB request cap. The web
+  console shows an uploaded-log resend refused this way as its own notice.
+  ([BACKLOG #1911](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 
