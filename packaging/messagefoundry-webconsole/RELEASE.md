@@ -107,8 +107,10 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 
 ### Reminder — what stays true regardless of publish
 
-- A plain `pip install messagefoundry` remains **byte-identical**; `serve_ui` is default-off and the
-  console is an optional extra.
+- A plain `pip install messagefoundry` remains **byte-identical**: the engine wheel does not contain
+  the console. The console is on by default for a loopback bind, and with it absent the engine serves
+  the JSON API only and prints a warning. It installs as its own distribution; the engine
+  `[webconsole]` extra is not declared until step 1 lands.
 - Publishing this wheel does **not** buy deploy independence — a new console build still needs an engine
   **restart** (same-origin, in-process mount). See
   [`docs/WEBCONSOLE-PACKAGE.md` §5](../../docs/WEBCONSOLE-PACKAGE.md).

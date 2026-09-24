@@ -42,13 +42,15 @@ def _client_data(kind: str, challenge: bytes, origin: str) -> bytes:
     ).encode("utf-8")
 
 
-def _cose_ec2_public_key(key: ec.EllipticCurvePrivateKey) -> bytes:
+def _cose_ec2_public_key(key: ec.EllipticCurvePrivateKey, *, crv: int = 1) -> bytes:
+    """The key as COSE. ``crv`` is 1 (P-256) for a real passkey; anything else LABELS this P-256
+    point as another curve, which is how the curve-validation tests build a mismatched credential."""
     nums = key.public_key().public_numbers()
     return encode_cbor(
         {
             1: 2,  # kty: EC2
             3: -7,  # alg: ES256
-            -1: 1,  # crv: P-256
+            -1: crv,
             -2: nums.x.to_bytes(32, "big"),
             -3: nums.y.to_bytes(32, "big"),
         }
@@ -62,6 +64,9 @@ class SoftAuthenticator:
     rp_id: str = "t"
     origin: str = "http://t"
     sign_count: int = 0
+    #: The COSE curve label this authenticator REGISTERS its P-256 key under. 1 (P-256) is honest;
+    #: any other value makes a credential whose curve does not match its key (BACKLOG #1166).
+    crv: int = 1
     credential_id: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     _key: ec.EllipticCurvePrivateKey = field(
         default_factory=lambda: ec.generate_private_key(ec.SECP256R1())
@@ -70,6 +75,10 @@ class SoftAuthenticator:
     @property
     def credential_id_b64(self) -> str:
         return bytes_to_base64url(self.credential_id)
+
+    def cose_public_key(self, *, crv: int | None = None) -> bytes:
+        """This authenticator's public key as COSE, labelled ``crv`` (default: its own label)."""
+        return _cose_ec2_public_key(self._key, crv=self.crv if crv is None else crv)
 
     def _rp_hash(self) -> bytes:
         return hashlib.sha256(self.rp_id.encode("utf-8")).digest()
@@ -81,7 +90,7 @@ class SoftAuthenticator:
             _AAGUID
             + struct.pack(">H", len(self.credential_id))
             + self.credential_id
-            + _cose_ec2_public_key(self._key)
+            + self.cose_public_key()
         )
         auth_data = (
             self._rp_hash()

@@ -386,25 +386,25 @@ INVENTORY: dict[str, frozenset[str]] = {
     # Content addressing / cache invalidation — not a security control, no secret material involved.
     # store.crypto seam (#282) + ASVS 11.2.4 (#301): each backend imports the cipher's
     # MARKER_PREFIX + cell_aad/CipherError to encrypt/decrypt PHI columns through the shared cipher
-    # seam (delegated at-rest crypto); hmac = compare_digest ONLY (constant-time comparison of the
-    # audit-chain row MAC + the external-anchor head in verify_audit_chain). No key is held/derived
-    # here and no digest is COMPUTED here — the digest primitive stays the shared audit_row_hash in
-    # store/store.py, so all three backends produce byte-identical chains.
+    # seam (delegated at-rest crypto). No key is held/derived here and no digest is COMPUTED here —
+    # the digest primitive stays the shared audit_row_hash in store/store.py, so all three backends
+    # produce byte-identical chains. BACKLOG #1904 dropped `hmac` from both: the constant-time audit
+    # walk moved into the shared `verify_audit_rows` in store/store.py, which carries it.
     "messagefoundry/store/postgres.py": frozenset(
         {
             "messagefoundry.config.tls_policy",
             "hashlib",
-            "hmac",
             "ssl",
             "messagefoundry.store.crypto",
         }
     ),
     "messagefoundry/store/sqlserver.py": frozenset(
-        {"messagefoundry.config.tls_policy", "hashlib", "hmac", "messagefoundry.store.crypto"}
+        {"messagefoundry.config.tls_policy", "hashlib", "messagefoundry.store.crypto"}
     ),
     # #190: hmac = the keyed HMAC-SHA256 audit-chain digest (audit_row_hash) — tamper-evidence that a
-    # row-writer without the store DEK cannot forge; hashlib = the keyless SHA-256 chain + delivery/body
-    # digests. The HMAC key is HKDF-derived (in crypto.py) from the DEK. store.crypto seam = the at-rest
+    # row-writer without the store DEK cannot forge — and, since BACKLOG #1904, the constant-time walk
+    # all three backends share (verify_audit_rows); hashlib = the keyless SHA-256 chain, the audit
+    # key-range digest (ADR 0193) + delivery/body digests. The HMAC key is HKDF-derived (in crypto.py) from the DEK. store.crypto seam = the at-rest
     # cipher (MARKER_PREFIX/cell_aad/CipherError) it drives over the PHI columns.
     "messagefoundry/store/store.py": frozenset({"hashlib", "hmac", "messagefoundry.store.crypto"}),
     # BACKLOG #1178 (ASVS 12.3.1): probe_tcp_reachable builds NO context -- it accepts the caller's

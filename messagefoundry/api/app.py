@@ -1984,6 +1984,8 @@ def create_app(
                 expired_hops,
                 db_hops,
                 store_privilege,
+                # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
+                engine.store.audit_chain_unkeyed(),
             )
         ]
         store_privilege_view = (
@@ -3007,7 +3009,8 @@ def create_app(
     async def test_alert_email(
         request: Request,
         body: AlertTestEmailRequest | None = None,
-        identity: Identity = Depends(require(Permission.SERVICE_CONFIGURE)),
+        # BACKLOG #287 (ASVS 2.4.2): paced, because a configured request dials a live SMTP server.
+        identity: Identity = Depends(require_paced(Permission.SERVICE_CONFIGURE)),
     ) -> AlertTestEmailResult:
         """Send a synthetic, **PHI-free** test event through the configured ``[alerts]`` email transport
         so an operator can verify the alert mail server end-to-end (BACKLOG #118). This is the SAME code
@@ -5009,7 +5012,8 @@ def create_app(
         preset_id: ResourceId,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MESSAGES_READ)),
+        # BACKLOG #287 (ASVS 2.4.2): a state-changing DELETE, so it charges the admin-write floor.
+        identity: Identity = Depends(require_paced(Permission.MESSAGES_READ)),
     ) -> SearchPresetDeleteResult:
         """Delete one of the caller's presets (owner-scoped). Audited."""
         deleted = await engine.store.delete_search_preset(
@@ -5572,7 +5576,8 @@ def create_app(
         request: Request,
         body: LogLevelUpdate,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+        # BACKLOG #287 (ASVS 2.4.2): a state-changing PATCH, so it charges the admin-write floor.
+        identity: Identity = Depends(require_paced(Permission.MONITORING_DIAGNOSE)),
     ) -> LogLevelInfo:
         """Change the live root + uvicorn log level WITHOUT a restart (#171, ADR 0130). The override is
         **ephemeral**: a process restart re-asserts ``[logging].level``, and a ``/config/reload`` does NOT
