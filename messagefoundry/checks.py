@@ -2348,18 +2348,20 @@ def _check_upstream_hop_ack(
     ``[api].plaintext_upstream_hop_acknowledged`` -- the BACKLOG #1179 refusal ``serve`` applies,
     brought forward to commit/CI time.
 
-    Without it the gate passes a config that ``serve`` then refuses with exit 2. Keyed on
-    :func:`~messagefoundry.api.tls.api_tls_source`, the same branch order ``serve`` and the listener
-    use, so the two cannot disagree about when the hop is plaintext. ``serve`` refuses this in EVERY
+    Without it the gate passes a config that ``serve`` then refuses with exit 2. The decision is
+    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_unacknowledged`, the predicate ``serve``
+    calls, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
     enforcement mode, so this check reads no dial either.
 
     Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`: no
-    ``messagefoundry.toml`` → SKIP (a bare config dir declares no terminator); present but refused by
-    the loader → FAIL (BACKLOG #1318)."""
+    ``messagefoundry.toml`` → SKIP; present but refused by the loader → FAIL (BACKLOG #1318). Parity
+    holds only for the file this check resolves. A terminator declared through ``MEFOR_API_*``
+    environment variables alone reaches ``serve`` and not this SKIP arm, and the file lookup differs
+    from ``serve``'s in the ways :func:`_check_posture` documents."""
     from pydantic import ValidationError
 
-    from messagefoundry.api.tls import api_tls_source
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.api.tls import api_tls_source, plaintext_upstream_hop_unacknowledged
+    from messagefoundry.config.settings import load_settings, settings_error_detail
 
     if service_config is not None:
         toml: Path | None = Path(service_config) if Path(service_config).is_file() else None
@@ -2379,21 +2381,16 @@ def _check_upstream_hop_ack(
     try:
         settings = load_settings(config_path=toml)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        return CheckResult(
-            "upstream-hop-ack", ok=False, required=True, detail=f"settings did not load: {exc}"
-        )
-    api = settings.api
-    source = api_tls_source(
-        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
-    )
-    if source != "upstream":
+        # settings_error_detail, not str(exc): a ValidationError echoes input values, and the
+        # environment-sourced secrets are among them.
         return CheckResult(
             "upstream-hop-ack",
-            ok=True,
+            ok=False,
             required=True,
-            detail=f"no plaintext proxy-to-engine hop (API TLS source: {source})",
+            detail=f"settings did not load: {settings_error_detail(exc)}",
         )
-    if not api.plaintext_upstream_hop_acknowledged:
+    api = settings.api
+    if plaintext_upstream_hop_unacknowledged(api):
         return CheckResult(
             "upstream-hop-ack",
             ok=False,
@@ -2406,11 +2403,18 @@ def _check_upstream_hop_ack(
                 "[api].tls_cert_file (see docs/SECURITY.md)"
             ),
         )
+    source = api_tls_source(
+        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
+    )
     return CheckResult(
         "upstream-hop-ack",
         ok=True,
         required=True,
-        detail="plaintext proxy-to-engine hop acknowledged ([api].plaintext_upstream_hop_acknowledged)",
+        detail=(
+            "plaintext proxy-to-engine hop acknowledged ([api].plaintext_upstream_hop_acknowledged)"
+            if source == "upstream"
+            else f"no plaintext proxy-to-engine hop (API TLS source: {source})"
+        ),
     )
 
 
