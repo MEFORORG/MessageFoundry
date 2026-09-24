@@ -211,10 +211,9 @@ path** (no separate at-rest tier):
 `install-service.ps1` leaves it (the exact test is stated once, in the ADR 0163 note linked below).
 There each file gets an explicit, protected DACL naming only the principals the directory allows, so
 the service account and the operator running `provision-admin` can both open the store in either
-order. That reaches every member of Administrators whose token carries the group ENABLED, not only
-the one who provisioned; a UAC-filtered session, which carries it deny-only, loses the access the old
-rewrite granted the operator's own user SID. Accepted by the batch 121 Manager on an adversarial pass ([ADR 0163](adr/0163-first-run-provisioning-without-a-default-account-the-not-present-arm-via-an-engine-consumed-request.md),
-note of 2026-09-24). It is best-effort and non-fatal: a skipped or
+order. What that widens and narrows, and why it was accepted, is stated once in the
+[ADR 0163](adr/0163-first-run-provisioning-without-a-default-account-the-not-present-arm-via-an-engine-consumed-request.md)
+note of 2026-09-24. It is best-effort and non-fatal: a skipped or
 failed restriction is **logged** (STORE-2), with directory-level ACLs ([SERVICE.md](SERVICE.md)) as
 the backstop. **This is the SQLite tier only.** On SQL Server / Postgres the engine creates no database
 file and applies no ACL — permissions on `.mdf`/`.ldf`/tempdb/native backups are entirely the DBA's.

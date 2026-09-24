@@ -252,7 +252,8 @@ right or inheritance shape is not hardened (the parser pins `OICI` with `FA` and
   Privilege Use" is enabled. A backup-privilege read (`SeBackupPrivilege`, `robocopy /B` say) is
   recorded only where "Audit: Audit the use of Backup and Restore privilege" is ALSO on, so it was
   silent by default, before and after. A read through the explicit entry now raises nothing unless
-  the file carries an object-access audit SACL, which nothing sets today.
+  "Audit File System" is enabled AND an object-access SACL applies -- a per-file or directory SACL,
+  which nothing here sets, or Global Object Access Auditing, which a site may.
 - **Decision: accepted, not an owner question.** The batch 121 Manager ruled this on 2026-09-24, on
   an independent adversarial pass that returned ACCEPT WITH CHANGES at medium-high confidence: it
   found no new capability and the narrowing above. **The measurement the pass named as reopening it:**
@@ -260,13 +261,15 @@ right or inheritance shape is not hardened (the parser pins `OICI` with `FA` and
   allow. That would mean the deny-only reading is wrong, and the change widens non-elevated sessions
   after all.
 - **Optional follow-up, not built:** an inheritable audit SACL on the data directory, set by
-  `install-service.ps1`, would restore a record of administrator reads.
+  `install-service.ps1`, would restore a record of administrator reads where "Audit File System" is on.
 - **Pre-existing follow-up, not built:** restore staging in `messagefoundry/pipeline/dr_backup.py` (the
   `TemporaryDirectory` with prefix `mefor-restore-` under `dest_store_path.parent`) still calls
-  `_secure_file`, which grants the operator's user SID. That leaves `archive.tar` so granted, and the
-  staged `store.db` too until it is placed. Placement hard-links it where it can, and a hard link shares
-  one security descriptor, so once the published store is restricted the staged link carries the same
-  DACL (measured); on the copy fallback it does not.
+  `_secure_file`, which grants the operator's user SID but removes only INHERITED entries. That leaves
+  `archive.tar`, and `extracted_store.db` until it is placed, with the operator plus any entry the
+  file carries explicitly -- and the hosted runners showed Python 3.13+ temp-directory entries arriving
+  as explicit ones (CI run 36039014999). Placement hard-links the store where it can, and a hard link
+  shares one security descriptor, so once the published store is restricted the staged link carries the
+  same DACL (measured); on the copy fallback it does not.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 
@@ -275,9 +278,11 @@ Wave 0 lockout returns for it:
 
 - a run-as account other than a per-service virtual account or LocalSystem: a gMSA, a dedicated user,
   LocalService or NetworkService;
-- a data directory owned by anyone else. `install-service.ps1` sets the config directory's owner but
-  not the data directory's; an elevated installer's new directory is owned by Administrators under the
-  default owner policy, which is what the Wave 0 runners showed, but not under "Object creator";
+- a data directory owned by anyone else. `install-service.ps1` now sets it to Administrators
+  (`Set-DataDirOwner`), because the default-owner policy can leave the creating user as owner: under
+  "Object creator", and for the hosted runners' built-in Administrator (RID 500), measured owning the
+  objects it creates (CI run 36039014999). A directory made some other way can still be refused, and
+  the engine logs a WARNING naming the reason whenever it refuses a directory whose inheritance is off;
 - a store whose directory is not itself protected, such as `-DbPath` in a subdirectory of the data
   directory, and a path through any reparse point, including a folder-mounted volume.
 

@@ -112,6 +112,10 @@ def test_a_localsystem_install_grants_system_and_administrators_only() -> None:
             f"O:BAD:PAI(A;OICI;FA;;;SY)(A;CIIO;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})",
         ),
         (
+            "a deny entry in the installer's own shape",
+            _INSTALLER_DIR + f"(D;OICI;0x1301bf;;;{_TI})",
+        ),
+        (
             "Administrators read-only, installer inheritance",
             f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FR;;;BA)(A;OICI;0x1301bf;;;{_TI})",
         ),
@@ -140,6 +144,47 @@ def test_a_directory_with_a_deny_entry_is_not_hardened() -> None:
     # The trio's DACL does not carry the directory's denies over, so a store derived from a directory
     # that denies somebody would be WIDER than the directory. Refusing is the only honest option.
     assert _grants(_INSTALLER_DIR + "(D;OICI;FA;;;BG)") is None
+
+
+def test_a_refused_locked_directory_is_logged_and_an_ordinary_one_is_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The fallback brings back the Wave 0 lockout, whose only other symptom is "unable to open
+    # database file", so a directory someone locked down that still fails must be NAMED, with why.
+    # An ordinary inheriting directory (a checkout, a temp directory) must stay quiet.
+    monkeypatch.setattr(store_mod, "_is_windows", lambda: True)
+    monkeypatch.setattr(store_mod, "_reaches_through_a_link", lambda _p: False)
+    locked_wrong = (
+        f"O:S-1-5-21-1-2-3-1001D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})"
+    )
+    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, **_kw: locked_wrong)
+    with caplog.at_level("WARNING", logger=store_mod.log.name):
+        assert store_mod._store_dir_grants(tmp_path) is None
+    assert any(
+        str(tmp_path) in r.getMessage() and "owned by" in r.getMessage() for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+    caplog.clear()
+    ordinary = "O:S-1-5-21-1-2-3-1001D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;S-1-5-21-1-2-3-1001)"
+    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, **_kw: ordinary)
+    with caplog.at_level("WARNING", logger=store_mod.log.name):
+        assert store_mod._store_dir_grants(tmp_path) is None
+    assert not caplog.records, [r.getMessage() for r in caplog.records]
+
+
+def test_the_installer_makes_administrators_the_data_directory_owner() -> None:
+    # The rule requires an owner of SYSTEM, Administrators or the service, and the installer is what
+    # must produce it. Static: this suite cannot run an elevated install; the hosted store-access arms
+    # run the real one. The call must follow the DACL lockdown of the same directory.
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
+    ).read_text(encoding="utf-8")
+    body = script[
+        script.index("function Set-DataDirOwner") : script.index("function Get-BroadAclResidue")
+    ]
+    assert "/setowner" in body and "*S-1-5-32-544" in body, body
+    lock = script.index("Set-SecureDataDirAcl -Path $DataDir")
+    own = script.index("Set-DataDirOwner -Path $DataDir")
+    assert own > lock, "Set-DataDirOwner must run after the data directory's DACL lockdown"
 
 
 def test_an_exact_trio_dacl_is_recognised_and_nothing_else_is() -> None:
@@ -369,8 +414,8 @@ def test_a_store_file_gets_exactly_the_hardened_principals(tmp_path: Path) -> No
     db = data / "messagefoundry.db"
     db.write_bytes(b"")
     _run([_icacls(), str(db), "/inheritance:r", "/grant:r", f"*{me}:F", "*S-1-5-32-545:R"])
-    _harden(data)
     try:
+        _harden(data)
         store_mod._secure_store_file(db, dir_grants=(_SY, _BA, _TI))
         dacl = _read_back(db)
         assert dacl.protected, dacl
@@ -386,7 +431,7 @@ def test_a_store_file_gets_exactly_the_hardened_principals(tmp_path: Path) -> No
         if _elevated():
             assert dacl.owner == _BA, dacl
         else:
-            assert dacl.owner == me, dacl
+            assert dacl.owner in _my_sids(), dacl
             assert not store_mod._trio_dacl_is_exact(dacl, (_SY, _BA, _TI))
     finally:
         _release(data, me)
@@ -395,15 +440,17 @@ def test_a_store_file_gets_exactly_the_hardened_principals(tmp_path: Path) -> No
 @_windows_only
 def test_a_directory_owned_by_a_standard_user_is_not_hardened(tmp_path: Path) -> None:
     # Its owner keeps WRITE_DAC over it, so its entries do not bind the owner; the rule must refuse it
-    # even with the installer's exact entries. Runs only where the test user is NOT an elevated
-    # administrator, since an elevated user's new directory is owned by Administrators.
-    if _elevated():
-        pytest.skip("an elevated user's directory is owned by Administrators, not by the user")
+    # even with the installer's exact entries. Skipped only where this user's new directory is owned by
+    # SYSTEM or Administrators, which is read from the directory rather than assumed from elevation:
+    # the hosted runners' elevated RID-500 user owns its own objects (CI run 36039014999).
     me = _my_sid()
     data = tmp_path / "data"
     data.mkdir()
-    _harden(data)
+    owner = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(data, owner=True) or "")
+    if owner is not None and owner.owner in (_SY, _BA):
+        pytest.skip(f"this user's new directories are owned by {owner.owner}, not by the user")
     try:
+        _harden(data)
         assert store_mod._store_dir_grants(data) is None
     finally:
         _release(data, me)
@@ -491,8 +538,8 @@ async def test_open_in_a_hardened_directory_grants_the_directorys_principals(
     # Owner set explicitly: the hosted runner's user is the built-in Administrator, whose new objects
     # it owns itself (CI run 36039014999), while the installer's data directory on the same runner is
     # owned by Administrators (Wave 0, run 36026471545). The fixture states the installer's owner.
-    _harden(data, owner_ba=True)
     try:
+        _harden(data, owner_ba=True)
         assert store_mod._store_dir_grants(data) == (_SY, _BA, _TI)
         store = await store_mod.MessageStore.open(data / "messagefoundry.db")
         await store.close()

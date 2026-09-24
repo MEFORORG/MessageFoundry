@@ -2850,53 +2850,65 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
     return _SddlDacl(protected="P" in flags, aces=tuple(aces), owner=owner)
 
 
+def _hardening_refusal(directory: _SddlDacl) -> str | None:
+    """Why ``directory`` is NOT hardened, or ``None`` when it is (see :func:`_hardened_trio_grants`).
+
+    The first failing condition, in a fixed order, as one operator-readable sentence. The checks read
+    the whole DACL, so a directory that fails two ways is refused whichever entry comes first."""
+    if not directory.protected:
+        return "it does not block inheritance"
+    if not directory.aces:  # defence in depth: the both-built-ins check below also refuses this
+        return "its DACL is empty"
+    named: set[str] = set()
+    services: set[str] = set()
+    for ace_type, flags, rights, sid in directory.aces:
+        trusted = sid in _STORE_DIR_TRUSTED_SIDS
+        service = not trusted and bool(_SERVICE_SID.fullmatch(sid))
+        if ace_type != "A":
+            return f"it carries a {ace_type} entry for {sid}, which the trio would not carry over"
+        if not (trusted or service):
+            return f"it grants {sid}, which is not SYSTEM, Administrators or one service account"
+        if _sddl_flag_set(flags) != {"OI", "CI"} or rights != _trio_right(sid):
+            return (
+                f"it grants {sid} ({flags};{rights}), not the installer's shape "
+                f"(OICI;{_trio_right(sid)})"
+            )
+        (named if trusted else services).add(sid)
+    # Both built-in principals are required, as the installer always writes them: without
+    # Administrators among the grants, a file it owns could never be made exact, and would be
+    # rewritten -- and warned about -- on every start.
+    if named != set(_STORE_DIR_TRUSTED_SIDS):
+        return "it does not grant both SYSTEM and Administrators"
+    if len(services) > 1:
+        return "it grants more than one service account"
+    if directory.owner is None or (
+        directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
+    ):
+        return f"it is owned by {directory.owner}, which keeps WRITE_DAC over it"
+    return None
+
+
 def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
     """The principals the trio is granted when ``directory`` is HARDENED, else ``None``.
 
-    Hardened means the directory is exactly what install-service.ps1's Set-SecureDataDirAcl writes:
-    inheritance blocked; every ACE an allow with the installer's own inheritance (``OICI``) and
-    rights -- full control (``FA``) for SYSTEM and Administrators, both present, and Modify
-    (``0x1301bf``) for at most ONE per-service account -- and nothing else; no deny ACE, because the
-    trio's DACL does not carry denies over; and an owner of SYSTEM, Administrators or that service
-    account, because an owner keeps WRITE_DAC over the directory.
+    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
+    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
+    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
+    present, and Modify (``0x1301bf``) for at most ONE per-service account -- and nothing else; no
+    deny ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM,
+    Administrators or that service account, because an owner keeps WRITE_DAC over the directory.
 
     The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
     written with FA/Modify: a directory granting Administrators read, or a service container-only,
     or a different service read, would otherwise produce a store WIDER than its directory. Any shape
     but the installer's falls back to the owner-only rewrite. The answer names only principals the
     directory allows, never who happens to be opening."""
-    if not directory.protected or not directory.aces:
+    if _hardening_refusal(directory) is not None:
         return None
-    named: set[str] = set()
-    services: set[str] = set()
-    for ace_type, flags, rights, sid in directory.aces:
-        trusted = sid in _STORE_DIR_TRUSTED_SIDS
-        service = not trusted and bool(_SERVICE_SID.fullmatch(sid))
-        if ace_type != "A" or not (trusted or service):
-            return None
-        if _sddl_flag_set(flags) != {"OI", "CI"} or rights != _trio_right(sid):
-            # The principals are the installer's but the shape is not. Say so: the fallback is the
-            # owner-only rewrite, which brings back the Wave 0 lockout with no other symptom.
-            log.warning(
-                "the store directory grants %s (%s;%s), not the installer's shape (OICI;%s), so the "
-                "store there is restricted owner-only (ADR 0163 note of 2026-09-24)",
-                sid,
-                flags,
-                rights,
-                _trio_right(sid),
-            )
-            return None
-        (named if trusted else services).add(sid)
-    # Both built-in principals are required, as the installer always writes them: without
-    # Administrators among the grants, a file it owns could never be made exact, and would be
-    # rewritten -- and warned about -- on every start.
-    if named != set(_STORE_DIR_TRUSTED_SIDS) or len(services) > 1:
-        return None
-    if directory.owner is None or (
-        directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
-    ):
-        return None
-    return (*_STORE_DIR_TRUSTED_SIDS, *sorted(services))
+    services = sorted(
+        sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS
+    )
+    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(services))
 
 
 def _sddl_flag_set(flags: str) -> set[str]:
@@ -3023,7 +3035,24 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
     if sddl is None:
         return None
     parsed = _parse_sddl_dacl(sddl)
-    return None if parsed is None else _hardened_trio_grants(parsed)
+    if parsed is None:
+        return None
+    reason = _hardening_refusal(parsed)
+    if reason is not None:
+        # A directory someone deliberately locked (inheritance off) that still fails the test is the
+        # case an operator needs to hear about: the fallback brings back the Wave 0 lockout, whose
+        # only other symptom is "unable to open database file". An ordinary inheriting directory (a
+        # developer checkout, a temp directory) is the expected fallback and stays quiet.
+        if parsed.protected:
+            log.warning(
+                "%s is locked down but %s, so the store there is restricted owner-only; the service "
+                "account and an operator's provision-admin cannot then both open it (ADR 0163 note "
+                "of 2026-09-24)",
+                directory,
+                reason,
+            )
+        return None
+    return _hardened_trio_grants(parsed)
 
 
 def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:
@@ -3042,7 +3071,8 @@ def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = N
     import ctypes
     from ctypes import wintypes
 
-    aces = "".join(f"(A;;{_trio_right(sid)};;;{sid})" for sid in grants)
+    # Written in the canonical SDDL spelling (lower-case ``0x`` hex); only COMPARISONS upper-case.
+    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS)};;;{sid})" for sid in grants)
     sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
