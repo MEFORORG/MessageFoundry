@@ -6,6 +6,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **The OIDC token endpoint and JWKS legs now carry the posture-keyed revocation guard (BACKLOG
+  #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
+  off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
+  deployment.
+
 ## [0.4.0] — 2026-09-23 — Early Access
 
 This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the
