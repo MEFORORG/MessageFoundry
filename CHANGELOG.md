@@ -67,7 +67,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   **A planted `state` or `reference` value would stop the engine from starting**, because both
   caches load at open. The opt-out, `[store].allow_unmarked_ciphertext`, ships off and is reported
   as a loosening when on. ([BACKLOG #1169](docs/BACKLOG.md))
-- **A keyed store now refuses a plaintext uploaded file on read until an operator runs
+- **BREAKING: a keyed store now refuses a plaintext uploaded file on read until an operator runs
   `rotate-key`, which seals it.** This follows an owner ruling of 2026-09-23. An upload stored
   before the key was enabled has no `mfenc:` marker, and neither does a file planted in
   `[store].uploads_dir`. The AES-GCM store cipher now refuses both, and each refusal raises an
@@ -81,7 +81,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   `rotate-key` with the engine stopped.** Under `cipher_provider = "vault_transit"`, uploads keep
   the plaintext passthrough; that is a stated residual, and `docs/PHI.md` section 3 says why. The
   existing `[store].allow_unmarked_ciphertext` opt-out also restores the passthrough for uploads.
-  ([BACKLOG #1169](docs/BACKLOG.md))
+  **Migration:** 0.4.0 read a plaintext upload on a keyed store with no operator step. After you
+  upgrade, stop the engine and run `messagefoundry rotate-key` once. The current key is enough; it
+  does not need a new one. The command seals every plaintext upload, and until it runs they stay
+  refused, as above. The startup WARNING says how many are waiting. Uploads written while the key was
+  already set are sealed at write and need no step. ([BACKLOG #1169](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

@@ -188,7 +188,7 @@ class UploadUnreadableError(UploadError, CipherError):
     On a keyed store that is usually a plaintext upload stored before the key was enabled, which a
     keyed store refuses until ``rotate-key`` seals it (owner ruling 2026-09-23). It can also be a file
     under a key that is no longer configured. It is a :class:`CipherError` too, so any caller that
-    already catches the cipher's error still does. The API maps it to HTTP 409 without importing the
+    already catches the cipher's error still does. The API maps it to HTTP 423 without importing the
     cipher module. The message is the cipher's own, which names only the surface and the fix."""
 
 
