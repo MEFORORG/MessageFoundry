@@ -45,7 +45,8 @@ Zero deployments (CLAUDE.md section 0): this is what a first deployment would ha
    secret** (no in-heap HMAC key and no isolated-module MAC), **`audit_log` is empty, and no keying
    watermark is recorded** -- so the next append would be a keyless row 1 -- a non-`None` value
    closes the store and raises `KeylessAuditChainRefused`, naming the deciding setting. A SQLite file
-   the same call created is removed again. **The default is the refusal**
+   the same call created is left in place: it holds no audit row, so a keyed open still keys it from
+   row 1, and deleting it would race a `serve` creating the same file. **The default is the refusal**
    (`[security].allow_unencrypted_phi`), so a caller that does not decide is refused rather than
    waved through.
 3. Every CLI command that opens the store passes `keyless_opt_out_refusal(...)` and turns the

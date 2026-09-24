@@ -325,8 +325,9 @@ def test_provision_admin_refuses_a_configured_key_the_provider_did_not_resolve(
     db = shell / "mismatch.db"
     rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
     out = capsys.readouterr().out
-    assert rc != 0, out
+    assert rc == 2, out  # BACKLOG #1916: every keyless refusal is "could not start"
     assert "resolved no key" in json.loads(out)["error"]
+    assert db.exists(), "the store the open created is left in place, so the count below is real"
 
     async def no_audit_rows() -> int:
         store = await MessageStore.open(db)

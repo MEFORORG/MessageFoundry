@@ -2303,8 +2303,9 @@ async def open_store(
     non-``None`` value raises :class:`KeylessAuditChainRefused` with the handle closed. **The default
     is the refusal**, so a caller that does not decide is refused rather than waved through; that is
     what makes this the gate for every command, where #1905's gate covered only the two commands that
-    called it. A SQLite file this call created is removed again on refusal. A server backend has built
-    its schema by then, which starts no chain: a later keyed open still keys the empty log from row 1.
+    called it. A SQLite file this call created, or a server database's schema, is left in place on
+    refusal. That starts no chain -- a later keyed open still keys the empty log from row 1 -- and
+    deleting a file here would race a ``serve`` creating the same one.
     An empty chain that is already KEYED is not refused here: its appends refuse on their own, and a
     writer asks :meth:`Store.audit_append_refusal` before its first write.
 
@@ -2312,8 +2313,7 @@ async def open_store(
     ``rekey-audit`` passes it, because that command is the remedy the warning names.
     """
     # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
-    absent = _absent_sqlite_store(settings)
-    if not create and absent is not None:
+    if not create and (absent := _absent_sqlite_store(settings)) is not None:
         raise StoreNotFoundError(absent)
     # The at-rest cipher via the single build_store_cipher seam: ADR 0019 key sourcing + the ADR 0138
     # cipher_provider dispatch. Default `aesgcm` is the in-process AES-256-GCM keyring (active + retired
@@ -2350,17 +2350,15 @@ async def open_store(
             store,
             keyless_chain_refusal,
             key_named=bool(settings.encryption_key or settings.encryption_key_file),
-            created=absent,
         )
     return store
 
 
 async def _refuse_to_start_a_keyless_chain(
-    store: Store, refused_by: str, *, key_named: bool, created: Path | None
+    store: Store, refused_by: str, *, key_named: bool
 ) -> None:
     """Close ``store`` and raise :class:`KeylessAuditChainRefused` when its next audit row would be a
-    keyless row 1. ``created`` is the SQLite file this open created, removed again on refusal so a
-    refused command leaves nothing behind for the next ``serve`` to find."""
+    keyless row 1."""
     try:
         count, _head = await store.audit_anchor()
         # An EMPTY chain that is already keyed (a watermark, no key here) is not a keyless start: its
@@ -2370,10 +2368,7 @@ async def _refuse_to_start_a_keyless_chain(
         await _close_quietly(store)
         raise
     if starts_keyless:
-        await store.close()
-        if created is not None:
-            for suffix in ("", "-wal", "-shm", "-journal"):
-                Path(f"{created}{suffix}").unlink(missing_ok=True)
+        await _close_quietly(store)
         raise KeylessAuditChainRefused(store.path, refused_by, key_named=key_named)
 
 

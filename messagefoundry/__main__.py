@@ -4868,7 +4868,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # environment is not visible here, which is how the documented order used to go wrong.
     keyless_gate = _keyless_store_gate(settings)
     if keyless_gate is not None:
-        return _emit_error(
+        # Exit 2, the same "could not start" as the three keyless checks after the open (#1916).
+        _emit_error(
             "no store key is set in this shell (MEFOR_STORE_ENCRYPTION_KEY, or "
             "[store].encryption_key_file in the service config); refusing to provision. "
             "provision-admin opens the store and writes its first audit row, and an audit chain that "
@@ -4879,6 +4880,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             f"The deciding setting is {keyless_gate}, the same one that makes `serve` refuse to start.",
             as_json=args.json,
         )
+        return 2
     if not _store_key_configured(settings):
         # An audited opt-out applies, so this proceeds keyless -- and must not do so quietly, because a
         # stale opt-out left in a shell is how a keyed production store would get a keyless first row.

@@ -498,12 +498,13 @@ def test_backup_refuses_before_running_when_its_audit_row_would_be_refused(
     assert _audit_rows(db) == 0
 
 
-def test_a_refused_create_leaves_no_store_behind(
+def test_a_key_the_provider_did_not_resolve_is_refused_at_the_seam_with_its_cause(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """``provision-admin`` creates the store. A key named in the settings that the key provider does
-    not resolve passes the CLI gate and is refused at the seam; the file that open created is removed,
-    so the next ``serve`` does not find a store someone half-made."""
+    not resolve passes the CLI gate and is refused at the seam, which names that cause. The file the
+    open created is left, deliberately: it holds no audit row and no account, so a keyed ``serve``
+    still keys it from row 1, and deleting it would race a ``serve`` creating the same file."""
     monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "env")
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(shell / "service.key"))
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
@@ -512,4 +513,5 @@ def test_a_refused_create_leaves_no_store_behind(
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 2
     assert "resolved no key" in error
-    assert not db.exists()
+    assert _audit_rows(db) == 0
+    assert _users(db) == 0
