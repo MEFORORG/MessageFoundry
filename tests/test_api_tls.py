@@ -226,13 +226,16 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
     http_cls = captured.get("http")
     assert http_cls is not None
     assert "connection_made" in vars(http_cls)  # the shim's per-connection cert-stashing override
+    # BACKLOG #1120: the shim is stacked ON the header-floored protocol, never instead of it.
+    assert "send_400_response" in vars(http_cls.__mro__[1])
 
 
 def test_serve_mtls_without_cert_map_keeps_stock_protocol(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Mutual-auth-only (client CA but NO cert-identity map, e.g. console mTLS) keeps the stock protocol:
-    # no behaviour change without a client CA + map. So uvicorn gets no `http` override.
+    # Mutual-auth-only (client CA but NO cert-identity map, e.g. console mTLS) never gets the mTLS
+    # shim: no behaviour change without a client CA + map. Since BACKLOG #1120 uvicorn always gets
+    # the header-floored protocol, so this asserts the shim is absent rather than that `http` is.
     from messagefoundry.store.crypto import generate_key
 
     cert, key = _self_signed(tmp_path)
@@ -253,7 +256,10 @@ def test_serve_mtls_without_cert_map_keeps_stock_protocol(
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
-    assert "http" not in captured  # stock protocol — the shim is never wired without a map
+    http_cls = captured["http"]
+    assert "connection_made" not in vars(http_cls)  # the shim is never wired without a map
+    assert "send_400_response" in vars(http_cls)  # the header-floored protocol (BACKLOG #1120)
+    assert "send_500_response" in vars(captured["ws"])
 
 
 def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(
