@@ -587,6 +587,20 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/uploads.py": (
         r"f'^\\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})\\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\\.tmp\\Z'",
     ),
+    # BACKLOG #1142 -- the icacls line-1 path echo. Unresolvable BY CONSTRUCTION: the pattern is built
+    # from the trust-anchor path being checked, which is runtime configuration, so there is no literal
+    # to write. The per-character template is written inside the call, so it is part of this pin and
+    # an edit to it reds the build. An ASCII character goes through ``re.escape``, which escapes
+    # ``? * + {`` and every other metacharacter; any other character becomes a bare ``.`` (``..``
+    # outside the BMP). So the path part carries no quantifier at all. The only repetition is the
+    # trailing ``\s+``, in an alternation with ``$``, inside no quantified group and followed by
+    # nothing. The two branches overlap before a final newline, which is harmless for the same
+    # reason: there is nothing after the group to retry against. No nested quantifier and no
+    # backtracking. The caller uses the anchored ``.match``, which this scanner does not read; a
+    # switch to ``.search`` would re-walk the path part at every start position.
+    "messagefoundry/auth/trust_anchors.py": (
+        r"""''.join((re.escape(ch) if ch.isascii() else '..' if ord(ch) > 65535 else '.' for ch in anchor_path)) + '(?:\\s+|$)'""",
+    ),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py

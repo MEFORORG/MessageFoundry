@@ -286,6 +286,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import (
     EnvRef,
+    InboundConnection,
     Registry,
     WiringError,
     accepted_cleartext_hops,
@@ -314,6 +315,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
+from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
     NotDeployedError,
@@ -354,6 +356,7 @@ from messagefoundry.uploads import (
     UploadRetentionRunner,
     UploadStore,
     UploadTooLargeError,
+    UploadUnreadableError,
     browse_messages,
     sanitize_filename,
     split_uploaded,
@@ -1198,6 +1201,50 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
     if backend == StoreBackend.SQLSERVER.value:
         return list(_SQLSERVER_PLAINTEXT_RESIDUAL)  # () since H4 — full parity, no residual
     return []
+
+
+#: The status a refused operator resubmission answers with, by the ingress guard that refused it
+#: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
+#: the same status the upload route gives a non-text file. A body the listener could not have decoded,
+#: or an HL7 body ``Peek.parse`` refuses, is 422.
+_INGRESS_GUARD_STATUS: dict[str, int] = {"size": 413, "type": 415, "decode": 422, "parse": 422}
+
+
+async def _guard_resubmission(
+    engine: Engine,
+    identity: Identity,
+    request: Request,
+    *,
+    raw: str,
+    inbound: InboundConnection | None,
+    action: str,
+    channel_id: str | None,
+    detail: dict[str, object],
+) -> str:
+    """Admit a resubmitted body as the target inbound's listener would, or refuse it (BACKLOG #1911).
+
+    The upload resend and the edit-resend paths write the stage row directly, so the listener's size
+    ceiling and declared-type checks never ran on them. This runs the same guards
+    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmitted_body`) before anything is written
+    and returns the form to commit, which the caller writes instead of the body it was handed. A
+    refusal is an HTTP 4xx, an ``action`` audit row and a log line, and no message row is written, so
+    count-and-log holds: no body is accepted and then dropped. Off the event loop, because the body can
+    be as large as an upload.
+
+    The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
+    of the body, so neither the row nor the 4xx detail echoes PHI."""
+    try:
+        return await asyncio.to_thread(admit_resubmitted_body, raw, inbound)
+    except IngressGuardError as exc:
+        await engine.store.record_audit(
+            action,
+            actor=identity.username,
+            channel_id=channel_id,
+            detail=json.dumps({**detail, "phase": exc.phase, "reason": exc.reason}),
+            client=client_ip(request),
+        )
+        _log.warning("%s: refused by the ingress guards (phase=%s)", action, exc.phase)
+        raise HTTPException(_INGRESS_GUARD_STATUS[exc.phase], exc.reason) from None
 
 
 async def _audit_channel_denied(
@@ -4316,9 +4363,21 @@ def create_app(
                     raise HTTPException(409, _outbound_down_detail(rr, body.to))
             except KeyError:
                 raise HTTPException(404, f"no such outbound connection: {body.to}") from None
+            # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+            # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
+            admitted = await _guard_resubmission(
+                engine,
+                identity,
+                request,
+                raw=body.raw,
+                inbound=None,
+                action="message_edit_resend_reject",
+                channel_id=row["channel_id"],
+                detail={"message_id": message_id, "mode": "direct", "to": body.to},
+            )
             try:
                 direct = await engine.edit_resend_direct(
-                    message_id, to=body.to, raw=body.raw, idempotency_key=body.idempotency_key
+                    message_id, to=body.to, raw=admitted, idempotency_key=body.idempotency_key
                 )
             except ResendError as exc:
                 # Empty edited body / idempotency-key reused for a different target → 409. str(exc)
@@ -4354,9 +4413,31 @@ def create_app(
                 400,
                 "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
             )
+        # BACKLOG #1911: the re-route writes an INGRESS row on the origin channel, so the origin
+        # inbound's own ceiling and declared type apply. With no such inbound in THIS runner's registry
+        # (no config loaded, the inbound removed, or owned by another engine shard, whose registry is
+        # filtered to its own inbounds) there is nothing to guard with, so refuse rather than fail open.
+        rr = engine.registry_runner
+        origin = rr.registry.inbound.get(row["channel_id"]) if rr is not None else None
+        if origin is None:
+            raise HTTPException(
+                409,
+                f"origin inbound {row['channel_id']!r} is not registered on this engine; "
+                "re-route on the engine shard that owns it",
+            )
+        admitted = await _guard_resubmission(
+            engine,
+            identity,
+            request,
+            raw=body.raw,
+            inbound=origin,
+            action="message_edit_resend_reject",
+            channel_id=row["channel_id"],
+            detail={"message_id": message_id, "mode": "reroute"},
+        )
         try:
             outcome = await engine.edit_resend_reroute(
-                message_id, raw=body.raw, idempotency_key=body.idempotency_key
+                message_id, raw=admitted, idempotency_key=body.idempotency_key
             )
         except ResendError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -4437,6 +4518,18 @@ def create_app(
             return True
         return bool(meta.uploader_id) and meta.uploader_id == identity.user_id
 
+    # BACKLOG #1169: the store cipher refused the file. On a keyed store that is usually a plaintext
+    # upload stored before the key was enabled, which `rotate-key` seals (owner ruling 2026-09-23); it
+    # can also be a file under a key that is no longer configured. 423 Locked says the file exists and
+    # needs an operator, where an unhandled CipherError answered 500. It is not 409, which the resend
+    # route already spends on "inbound not running" and the web console maps to that text. No file
+    # detail is in the body.
+    _UPLOAD_UNREADABLE_STATUS = 423
+    _UPLOAD_UNREADABLE = (
+        "this uploaded file cannot be read under the configured store key; if it was stored before "
+        "the key was enabled, an operator must run 'messagefoundry rotate-key' to seal it"
+    )
+
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
     ) -> UploadedFileMeta:
@@ -4457,6 +4550,13 @@ def create_app(
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
+            raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
+            # for everyone but an override holder, who may see any file anyway and is the one who
+            # can act on it; the refused sidecar is not an existence oracle for anyone else.
+            if identity.has(Permission.FILES_ACCESS_ANY):
+                raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
             raise HTTPException(404, "no such uploaded file") from None
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
@@ -4731,6 +4831,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         result = await asyncio.to_thread(
             browse_messages,
             data,
@@ -4878,14 +4980,33 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         parts = await asyncio.to_thread(split_uploaded, data)
         if body.index >= len(parts):
             raise HTTPException(
                 404, f"no message at index {body.index} (file has {len(parts)} messages)"
             )
+        # BACKLOG #1911: the inject writes an INGRESS row directly, so run the target inbound's own
+        # ceiling and declared-type checks first. An upload may be larger than one message may be.
+        # Re-resolved rather than trusted from the check above: a reload during the awaits since then
+        # may have dropped or retyped the inbound, and guarding with no inbound would fail open.
+        target = rr.registry.inbound.get(body.to)
+        if target is None:
+            raise HTTPException(404, f"no such inbound connection: {body.to}")
+        admitted = await _guard_resubmission(
+            engine,
+            identity,
+            request,
+            raw=parts[body.index],
+            inbound=target,
+            action="upload.resend_reject",
+            channel_id=body.to,
+            detail={"file_id": file_id, "index": body.index, "to": body.to},
+        )
         mid = await engine.inject_message(
             channel_id=body.to,
-            raw=parts[body.index],
+            raw=admitted,
             source_type="upload",
             metadata=json.dumps({"upload_file_id": file_id, "upload_index": body.index}),
         )
@@ -4923,6 +5044,8 @@ def create_app(
             meta = await us.delete(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         await engine.store.record_audit(
             "upload.delete",
             actor=identity.username,
@@ -7108,6 +7231,11 @@ def create_managed_app(
             # callback closes over the opened store so the leaf uploads module never imports it.
             _upload_store: UploadStore | None = getattr(app.state, "upload_store", None)
             if _upload_store is not None:
+                # BACKLOG #1169, owner ruling 2026-09-23: a keyed store refuses a plaintext upload
+                # until `rotate-key` seals it, and a refused file just drops out of the listing. Say
+                # how many are waiting (the count only, never a filename) so the operator knows to
+                # run it. Counting reads a few bytes per file; the engine never seals them here.
+                await _upload_store.warn_if_unsealed()
 
                 async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
                     # BACKLOG #1224: the retention runner has no operator and no request behind it, so

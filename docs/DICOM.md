@@ -53,7 +53,8 @@ server **off the asyncio event loop**, bridges each received object back onto th
 DIMSE analog of MLLP's commit-before-ACK; nothing is accepted-and-dropped). Security: calling-AE allowlist +
 peer-IP allowlist + `require_called_ae_title` + a `max_object_bytes` cap (charged against the raw received
 Data Set *before* it is decoded, so an over-cap object is a DIMSE failure before any decode, re-encode or
-commit) + DICOM-over-TLS. A non-loopback cleartext SCP is refused at startup unless `serve --allow-insecure-bind`.
+commit; never above the engine's 16 MiB binary ingress ceiling) + DICOM-over-TLS. An object the engine's
+ingress refuses is recorded `ERROR` and answered with a DIMSE failure, never Success (BACKLOG #1910). A non-loopback cleartext SCP is refused at startup unless `serve --allow-insecure-bind`.
 
 ### Outbound — C-STORE SCU + C-ECHO (`DICOM()` outbound)
 Forward an object to a downstream PACS over a C-STORE association (full Mirth-sender parity). The blocking
