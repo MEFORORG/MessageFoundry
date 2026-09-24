@@ -3829,7 +3829,7 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
 
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, read_messages
+    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
     from messagefoundry.redaction import safe_error
 
     resolved = _resolve_offline_anchor(args)
@@ -3841,7 +3841,7 @@ def _dryrun(args: argparse.Namespace) -> int:
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     try:
-        messages = read_messages(args.messages)
+        messages = read_messages(args.messages, cap=fixture_cap(reg))
     except (FileNotFoundError, ValueError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 

@@ -107,16 +107,20 @@ CAPTURE_FACTORIES: dict[str, str] = {
     "Database": "database",
 }
 
-#: Where the IDE extension's local file pickers live (owner ruling 2026-09-23: 5.1.1 upload features).
+#: Where the IDE extension's local file pickers live (the doc's IDE row says why they count).
 _IDE_SRC = _ROOT / "ide" / "src"
+_PICKER_CALL = re.compile(r"\.showOpenDialog\s*\(")
+_TS_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 
 
 def ide_pickers(src: Path, root: Path) -> set[str]:
-    """Repo-relative paths of the ``.ts`` files that open a file picker (``showOpenDialog(``)."""
+    """Repo-relative paths of the shipped ``.ts`` files that call ``showOpenDialog(``. Comments and
+    the extension's own tests (``src/test/``) are skipped: neither is a surface a user reaches."""
     return {
         f.relative_to(root).as_posix()
         for f in sorted(src.rglob("*.ts"))
-        if "showOpenDialog(" in f.read_text(encoding="utf-8")
+        if "test" not in f.relative_to(src).parts[:-1]
+        and _PICKER_CALL.search(_TS_COMMENT.sub("", f.read_text(encoding="utf-8")))
     }
 
 
@@ -339,7 +343,8 @@ def test_every_ide_file_picker_is_named_in_the_picker_row() -> None:
     assert first_cells == pickers, (
         f"IDE picker row differs from the code: {sorted(first_cells ^ pickers)}"
     )
-    row = next(r for key, r in _UPLOAD_ROWS.items() if key in pickers)
+    row = next((r for key, r in _UPLOAD_ROWS.items() if key in pickers), None)
+    assert row is not None, "no upload row is KEYED by an IDE picker path"
     assert has_figure(row, f"MAX_FIXTURE_FILE_BYTES` = {_size(dryrun.MAX_FIXTURE_FILE_BYTES)}")
 
 
@@ -707,6 +712,9 @@ def test_self_test_a_new_ide_picker_is_found(tmp_path: Path) -> None:
     src.mkdir(parents=True)
     (src / "a.ts").write_text("await vscode.window.showOpenDialog({});", encoding="utf-8")
     (src / "b.ts").write_text("// showOpenDialog is mentioned, not called", encoding="utf-8")
+    (src / "c.ts").write_text("/* vscode.window.showOpenDialog({}) */", encoding="utf-8")
+    (src / "test").mkdir()
+    (src / "test" / "d.ts").write_text("await vscode.window.showOpenDialog({});", encoding="utf-8")
     assert ide_pickers(src, tmp_path) == {"ide/src/a.ts"}
 
 

@@ -781,7 +781,8 @@ counts:
 - An **upload feature** is any shipped surface where a party other than the host operator, working at
   the host, supplies content that the product persists or processes. Content means a file, a DICOM
   object or a message body. A request body that only steers an operation, such as a search needle or a form
-  field, is a parameter and not content.
+  field, is a parameter and not content. One addition by owner ruling of 2026-09-23: the IDE
+  extension's local file pickers count too, although a developer at the host uses them.
 - A **download** is any response the product sends with `Content-Disposition: attachment`.
 
 How each part of the list is kept:
@@ -816,12 +817,12 @@ figure stops matching the constant named beside it.
 | `database`: database poller, `DatabasePoll(...)` ([Database source](#database-source--databasepoll)) | rows from `poll_statement`, each handed on as one body in the declared `content_type` | not applicable; table rows | no byte cap of its own; the engine's per-message ceiling below rejects an oversized row after it is read; `poll_max_rows`, default `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows per poll | no unpacking on intake |
 | `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | off unless `[store].uploads_dir` is set. Plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file straight onto a chosen inbound's ingress stage, so that inbound's listener checks, including the per-message ceiling below, do not run on it | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
 | `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | not checked: the edited text is taken as typed. It re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. Either way the listener's checks do not run on it | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
-| `ide/src/testBench.ts` (Load Message Set) and `ide/src/stepsView.ts` (Use for Live Values): the IDE extension's local file pickers, a 5.1.1 upload feature by owner ruling of 2026-09-23 | any file: each picked path goes to `messagefoundry dryrun`, which runs it against an inbound's declared `content_type` | the dialog offers `.hl7` first and also "All files", so no extension is enforced | `MAX_FIXTURE_FILE_BYTES` = 16 MiB per file (`pipeline/dryrun.py`), refused with a message naming the file before it is read whole. The Steps view also reads its picked sample inside the extension to list its segments, and that read has no cap | no unpacking |
+| `ide/src/testBench.ts` (Load Message Set) and `ide/src/stepsView.ts` (Use for Live Values): the IDE extension's local file pickers, a 5.1.1 upload feature by owner ruling of 2026-09-23 | any file: each picked path goes to `messagefoundry dryrun`, which runs it against an inbound's declared `content_type` | the dialog offers `.hl7` first and also "All files", so no extension is enforced | `MAX_FIXTURE_FILE_BYTES` = 16 MiB per file (`pipeline/dryrun.py`), raised to the largest `max_message_bytes` an inbound in the graph sets; refused with a message naming the file, before it is read whole. `dryrun` then applies the per-message ceiling below itself. The Steps view also reads its picked sample inside the extension to list its segments, and that read has no cap. The live-debug sample choice (`liveDebug.ts`, a pick list of `.hl7` files) feeds the same `dryrun` read | no unpacking |
 | `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop. A re-ingressed reply does not pass the `Loopback()` inbound's listener checks, so the read bound in this row is its bound | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound, both checked only after the whole result set is fetched | no unpacking on capture |
 
 Two limits apply after intake. The first covers the rows keyed by a connector type, the first eight.
-The other rows skip the listener, so it does not reach them. The second covers content from any
-row:
+The other rows skip the listener, so it does not reach them, except that `dryrun` applies the same
+ceiling to what the IDE row feeds it. The second covers content from any row:
 
 - **The engine's per-message ceiling.** The listener applies `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB
   (`parsing/peek.py`) to each received body, measured in characters once a text body is decoded. A
@@ -869,12 +870,14 @@ row only. The two export rows are made safe as their own row says.
   which cap the store member at `_MAX_RESTORE_MEMBER_BYTES` = 16 GiB; `restore --config-to`, which
   also caps the config bundle at `_MAX_CONFIG_MEMBERS` = 10,000 members and
   `_MAX_CONFIG_BYTES` = 1 GiB; `import corepoint`; `cert import`; `dryrun` and `check` run by hand,
-  which read fixtures under the IDE row's `MAX_FIXTURE_FILE_BYTES` cap; and `support-bundle`, which
+  which read fixture files under the IDE row's cap (`check` reads each fixture's `.expect` sidecar
+  whole); and `support-bundle`, which
   writes its archive to the local disk and serves nothing.
 - `/ai/chat` (POST) carries a prompt, not a file: a parameter that `AiChatRequest.prompt` caps at
   200,000 characters, which the engine relays to the configured AI provider ([AI.md](AI.md)).
-- The test harness (`harness/`) is test tooling, not a shipped product surface. Its MLLP receiver
-  sets no frame cap.
+- The test harness (`harness/`) is test tooling, excluded by Manager decision of 2026-09-23. It is
+  built as a separate distribution and attached to each release, and its MLLP receiver sets no frame
+  cap.
 
 **The embedded-document detach is a STAGE, not a receiver, and its ceilings are stated here
 because the requirement asks for unpacked size wherever content is accepted.** When an inbound sets
