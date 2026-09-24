@@ -73,7 +73,7 @@ class DicomDataset:
         data = object_bytes(raw)
         # ASVS 5.2.3: bound a Deflated Explicit VR LE object's inflate BEFORE dcmread (which would
         # otherwise decompress the whole deflate stream into memory unbounded). Over-cap → DicomBombError
-        # (a DicomError → dead-letter). No-op for a non-deflated object. It gets the same `force` as
+        # (a DicomError, so it dead-letters). No-op for a non-deflated object. It gets the same `force` as
         # dcmread, because a forced read inflates an object that has no preamble (BACKLOG #1926).
         guard_part10_deflate(data, force=force)
         dcmread = load_dcmread()

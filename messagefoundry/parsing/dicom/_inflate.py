@@ -68,7 +68,7 @@ DEFAULT_MAX_INFLATED_BYTES = 16 * 1024 * 1024
 _INFLATE_CHUNK = 65536
 
 
-def bounded_inflate_or_error(compressed: bytes, *, max_bytes: int) -> None:
+def bounded_inflate_or_error(compressed: bytes | memoryview, *, max_bytes: int) -> None:
     """Inflate a **raw DEFLATE** stream (RFC 1951, DICOM Deflated Explicit VR LE) in bounded memory,
     **discarding** the output, and raise :class:`DicomBombError` if the cumulative uncompressed size
     would exceed ``max_bytes``. Streams the decompression in :data:`_INFLATE_CHUNK`-bounded chunks so a
@@ -87,7 +87,11 @@ def bounded_inflate_or_error(compressed: bytes, *, max_bytes: int) -> None:
         # guard's CPU grows with the square of the compressed size (4 s at 32 MiB, measured 2026-09-24).
         for offset in range(0, len(view), _INFLATE_CHUNK):
             pending: bytes | memoryview = view[offset : offset + _INFLATE_CHUNK]
-            while pending:
+            # Stop at the end of the stream as well as at the end of the window. After the end, zlib
+            # keeps any trailing input in ``unconsumed_tail`` and never consumes it, so a loop on
+            # ``pending`` alone spins forever. pydicom and pynetdicom both pad an odd-length stream
+            # with one NUL, so a legitimate object is enough to hit that.
+            while pending and not decompressor.eof:
                 out = decompressor.decompress(pending, _INFLATE_CHUNK)
                 total += len(out)
                 if total > max_bytes:
@@ -132,7 +136,7 @@ def guard_part10_deflate(data: bytes, *, force: bool, max_bytes: int | None = No
     )
 
 
-def _deflated_data_set(data: bytes, *, force: bool) -> bytes | None:
+def _deflated_data_set(data: bytes, *, force: bool) -> memoryview | None:
     """The bytes ``dcmread`` would inflate, or ``None`` when it would inflate nothing.
 
     Replays the header half of ``pydicom.filereader.read_partial`` with the same functions, in the same
@@ -158,4 +162,4 @@ def _deflated_data_set(data: bytes, *, force: bool) -> bytes | None:
         return None
     if transfer_syntax != DEFLATED_EXPLICIT_VR_LE:
         return None
-    return data[fp.tell() :]
+    return memoryview(data)[fp.tell() :]  # a view: the body can be up to max_object_bytes

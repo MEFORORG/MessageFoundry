@@ -196,8 +196,8 @@ def test_guard_bounds_exactly_the_bytes_pydicom_inflates(
     inflated: list[bytes] = []
     real_bound = _inflate.bounded_inflate_or_error
 
-    def record_bound(stream: bytes, *, max_bytes: int) -> None:
-        guarded.append(stream)
+    def record_bound(stream: bytes | memoryview, *, max_bytes: int) -> None:
+        guarded.append(bytes(stream))
         real_bound(stream, max_bytes=max_bytes)
 
     def record_decompress(data: bytes, *args: Any) -> bytes:
@@ -252,6 +252,20 @@ def test_bound_counts_a_stream_that_spans_many_input_windows() -> None:
     compressor = zlib.compressobj(0, zlib.DEFLATED, -zlib.MAX_WBITS)
     stream = compressor.compress(payload) + compressor.flush() + b"trailing bytes after the stream"
     assert len(stream) > 8 * _CAP
+
+    _inflate.bounded_inflate_or_error(stream, max_bytes=len(payload))
+    with pytest.raises(DicomBombError):
+        _inflate.bounded_inflate_or_error(stream, max_bytes=len(payload) - 1)
+
+
+@pytest.mark.timeout(20)
+def test_bound_stops_at_the_end_of_a_padded_stream() -> None:
+    # pydicom and pynetdicom pad an odd-length deflated Data Set with one NUL. On a stream whose output
+    # needs more than one round, zlib keeps that byte in unconsumed_tail after the end, and a loop that
+    # only watched the tail spun forever. The payload is compressible, so it takes many rounds.
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    payload = bytes(range(256)) * 800
+    stream = compressor.compress(payload) + compressor.flush() + b"\x00"
 
     _inflate.bounded_inflate_or_error(stream, max_bytes=len(payload))
     with pytest.raises(DicomBombError):
