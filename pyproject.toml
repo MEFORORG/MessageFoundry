@@ -164,7 +164,9 @@ fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0", "annotated-types<0.8"]
 # traversal); pynetdicom>=3.0.4 requires pydicom>=3,<4 (the 3.x lines pair cleanly). dicomweb-client (DICOMweb
 # STOW-RS, Phase-2) is a SEPARATE extra — it drags numpy+pillow+requests, so it is added in the Phase-2 PR, never
 # folded into [dicom].
-dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<4"]
+# pydicom is capped below 3.1 because the deflate guard replays private pydicom header readers, and the
+# agreement test (tests/test_dicom_deflate_guard.py) only proves the locked release (BACKLOG #1926).
+dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<3.1"]
 # Opt-in STRICT X12 validation for parsing/x12/validate.py (ADR 0012, BACKLOG #32). Lazy-imported, so
 # the tolerant X12Peek/X12Message hot path (the default) never needs it. pyx12 is the reference
 # implementation-guide validator (e.g. 005010X222A1 for 837P) and also emits the 997/999 ack as a
