@@ -34,12 +34,14 @@ real, version-pinned uvicorn with a vacuity control in the same run.
 from __future__ import annotations
 
 import ast
+import functools
 import re
 from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from _ast_sites import callee_name
 
 _REPO = Path(__file__).resolve().parent.parent
 _ROOTS = ("messagefoundry", "messagefoundry_webconsole")
@@ -50,6 +52,11 @@ _ASGI_RESPONSE_STARTS = frozenset(
 _STATUS_LINE = re.compile(r"HTTP/\d\.\d \S")
 _PROTOCOL_METHODS = frozenset({"send_400_response", "send_500_response"})
 _SERVER_CALLS = frozenset({"run", "Server", "Config"})
+_WS_NAMES = frozenset({"ws", "websocket"})
+_MESSAGE_KINDS = {
+    **dict.fromkeys(_ASGI_RESPONSE_STARTS, "asgi-response-start"),
+    "websocket.close": "ws-close",
+}
 
 
 class Site(NamedTuple):
@@ -80,14 +87,11 @@ class _Collector(ast.NodeVisitor):
             self._add("protocol-override")
         self._scoped(node)
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        if node.name in _PROTOCOL_METHODS:
-            self._add("protocol-override")
-        self._scoped(node)
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        name = callee_name(node) or ""
         if name in ("FastAPI", "Starlette"):
             self._add("asgi-app")
         if (
@@ -103,18 +107,26 @@ class _Collector(ast.NodeVisitor):
                 isinstance(first, ast.Constant) and first.value == 500
             ):
                 self._add("error-handler")
-        if name == "close" and any(kw.arg == "code" for kw in node.keywords):
+        # Any close on a name that holds a WebSocket, however the code is passed or if it is not
+        # passed at all (a bare close before accept is a refusal too), plus any close(code=...).
+        receiver = func.value if isinstance(func, ast.Attribute) else None
+        if name == "close" and (
+            (isinstance(receiver, ast.Name) and receiver.id in _WS_NAMES)
+            or any(kw.arg == "code" for kw in node.keywords)
+        ):
             self._add("ws-close")
         self.generic_visit(node)
 
     def visit_Dict(self, node: ast.Dict) -> None:
         for key, value in zip(node.keys, node.values, strict=True):
-            if not (isinstance(key, ast.Constant) and key.value == "type"):
-                continue
-            if isinstance(value, ast.Constant) and value.value in _ASGI_RESPONSE_STARTS:
-                self._add("asgi-response-start")
-            if isinstance(value, ast.Constant) and value.value == "websocket.close":
-                self._add("ws-close")
+            if (
+                isinstance(key, ast.Constant)
+                and key.value == "type"
+                and isinstance(value, ast.Constant)
+            ):
+                kind = _MESSAGE_KINDS.get(str(value.value))
+                if kind:
+                    self._add(kind)
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:
@@ -140,7 +152,9 @@ def scan_source(source: str, path: str) -> Counter[Site]:
     return Counter(collector.sites)
 
 
+@functools.cache
 def scan_tree() -> Counter[Site]:
+    """Parsed once per run; callers combine it with ``+``/``-``, which return new counters."""
     found: Counter[Site] = Counter()
     for root in _ROOTS:
         for file in sorted((_REPO / root).rglob("*.py")):
@@ -252,7 +266,7 @@ _PLANTED = {
         "async def mw(scope, receive, send):\n"
         "    await send({'type': 'http.response.start', 'status': 200, 'headers': []})\n"
     ),
-    "ws-close": "async def route(ws):\n    await ws.close(code=1008)\n",
+    "ws-close": "async def route(websocket):\n    await websocket.close()\n",
     "status-line": "def raw(w, code):\n    w.write(f'HTTP/1.1 {code} OK'.encode())\n",
     "protocol-override": "class P:\n    def send_500_response(self):\n        pass\n",
 }
