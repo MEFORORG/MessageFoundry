@@ -19,6 +19,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
   off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
   deployment.
+- **BREAKING — an HTTP-family reply with ambiguous length framing now fails before its body is
+  read.** 0.4.0 let `http.client` pick one reading, which could hand back raw chunk framing or the
+  shorter of two lengths as the partner's answer. Refused now, under RFC 9112 section 6, at least:
+  `Transfer-Encoding` beside `Content-Length`; a `Content-Length` that is not plain digits, such as
+  `+5` or `5, 5`, or two that differ; `Transfer-Encoding` on an HTTP/1.0 reply; a codings list whose
+  final coding is not a single `chunked`, including `gzip, chunked`; and `Transfer-Encoding` on a
+  204, 304 or 1xx reply. A REST, SOAP, FHIR or DICOMweb delivery, and an OAuth2 or SMART token
+  request, raises `AmbiguousFramingError`, a transient delivery error that is retried and then
+  dead-lettered. A `fhir_lookup` reply raises inside the Handler. The OIDC token and JWKS reads
+  refuse the same replies, and the sign-in that made the read fails as an unavailable IdP.
+  Connection probes and the alert webhook discard the body and are not checked. **Migration:** none
+  in configuration; the partner or its proxy must frame the reply by one rule. (ASVS 4.2.1,
+  [BACKLOG #1125](docs/BACKLOG.md))
 ### Changed
 - **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
   cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
