@@ -47,7 +47,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   would see that partner fail to open the message after its relay has already accepted it**, so the
   failure would surface on the partner's side, not as a send error here.
   ([BACKLOG #1168](docs/BACKLOG.md))
-- **An operator resend now meets the target inbound's ingress guards.** `POST
+- **BREAKING — an operator resend now meets the target inbound's ingress guards.** `POST
   /uploads/{file_id}/resend` and `POST /messages/{message_id}/edit-resend` wrote the stage row
   directly, so the inbound's size ceiling and declared-type checks never ran on them. An uploaded file
   may be 25 MiB by default, so a single message larger than the 16 MiB ingress ceiling could be
@@ -56,14 +56,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   `max_message_bytes`, never above 16 MiB), `Peek.parse` for HL7 or the declared-type sniff for
   another type, the NUL rule, and a check that the inbound's charset can hold the text. A refusal
   answers 413, 415 or 422, writes an `upload.resend_reject` or `message_edit_resend_reject` audit
-  row, and writes no message.
+  row, and writes no message. **A resend that 0.4.0 accepted can now be refused**: an oversize body,
+  a body that does not match the inbound's declared type, or an HL7 body `Peek.parse` rejects.
   An admitted body is committed in the listener's form: HL7 with `\r` line endings, and a binary
   inbound's body as `mfb64:v1:` carriage. Strict `hl7apy` validation is still not run on a
   resubmission. A re-route whose origin inbound this engine does not hold (removed, or owned by
-  another engine shard) is refused with 409 rather than written unchecked. The edit-resend direct path (`to` set) writes an outbound row, so only the NUL rule
-  applies there in practice; its body is already held below 16 MiB by the 1 MiB request cap. The web
-  console shows an uploaded-log resend refused this way as its own notice.
-  ([BACKLOG #1911](docs/BACKLOG.md))
+  another engine shard) is now refused with 409 rather than written unchecked. The edit-resend
+  direct path (`to` set) writes an outbound row, so only the NUL rule applies there in practice; its
+  body is already held below 16 MiB by the 1 MiB request cap. The web console shows an uploaded-log
+  resend refused this way as its own notice. ([BACKLOG #1911](docs/BACKLOG.md))
 - **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
   as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
   a non-blank value without the marker is a stripped marker or a planted row. The cipher raises
