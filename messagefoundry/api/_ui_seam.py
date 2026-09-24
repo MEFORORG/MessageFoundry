@@ -176,6 +176,12 @@ from typing import Any
 #: above -- and they force a bump. Unnumbered: the ``vN`` labels are retired as identifiers (#1220
 #: above); the digest is the identifier.
 #:
+#: BACKLOG #1954 (ASVS 6.3.3): ``AuthService`` gained the public ``password_change_owes_factor``,
+#: which the console's password page, ``require_ui`` and the ``/ui/login``, ``/ui/mfa``,
+#: ``/ui/reauth`` and ``/ui/reauth/webauthn`` routes call to decide where a must-change session
+#: goes. A METHOD the console calls, so it forces a bump for the reason the
+#: ``factor_binding_is_blocked`` entry above gives. Unnumbered, as above.
+#:
 #: ASVS 13.2.1 / BACKLOG #1182: ``SecurityPosture`` gained the additive ``static_credential_hops`` (a
 #: list of the new ``StaticCredentialHopView``) and ``static_credential_hops_scope``, the inventory
 #: of backend hops that present an unchanging credential or none. The two new fields change the
@@ -189,7 +195,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "a6d2b141a035e5ea"
+ENGINE_UI_SEAM: str = "ab2e10f1b28a610f"
 
 
 @dataclass(frozen=True, slots=True)

@@ -1036,6 +1036,45 @@ async def _users_columns(store) -> set[str]:
         }
 
 
+async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
+    """BACKLOG #1927 on Postgres: a scope write records its writer, and the guarded ADD restores a
+    dropped ``users.channel_scope_source`` with NULL on the existing row (no backfill).
+
+    The column is dropped and the ``schema_meta`` marker cleared first, so the ADD branch really
+    runs; with either left in place deleting the migration would still pass."""
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    await store.create_user(user_id="scope-src", username="scope-src", auth_provider="ad", now=1.0)
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+    await store.set_user_channel_scope("scope-src", None, source=SCOPE_SOURCE_MANUAL)
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_MANUAL)
+
+    # The compare-and-set (BACKLOG #1927): a manual scope and a changed value both refuse it.
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_MANUAL)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is False
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_OLD"]') is False
+    assert (await store.get_user("scope-src")).channel_scope == '["IB_A"]'
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is True
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_AD)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is False  # idempotent
+
+    async with store._pool.acquire() as conn:
+        await conn.execute("ALTER TABLE users DROP COLUMN channel_scope_source")
+        await conn.execute("DELETE FROM schema_meta")
+    assert "channel_scope_source" not in await _users_columns(store)  # positive control
+    assert await store._ensure_schema() is True
+    assert "channel_scope_source" in await _users_columns(store)
+    assert (await store.get_user("scope-src")).channel_scope_source is None
+    async with store._pool.acquire() as conn:
+        await conn.execute("DELETE FROM schema_meta")
+    assert await store._ensure_schema() is True  # the guard skips a present column
+
+
 async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
     """The guarded ADD for ``users.directory_object_id`` (BACKLOG #1471) on a pre-#1471 database.
 

@@ -831,7 +831,12 @@ Full model: **[SECURITY.md](SECURITY.md)**. PHI-relevant facts only here:
 - **RBAC, deny-by-default.** Viewing PHI is gated by dedicated permissions: `messages:view_raw`
   (raw body) and `messages:view_summary` (patient summaries). Holding neither means no PHI access.
 - **Sessions** are opaque server-side tokens (store keeps only the SHA-256), with idle (30 min) and
-  absolute (12 h) timeouts; password change / disable revokes sessions immediately.
+  absolute (12 h) timeouts; a password change or a local disable revokes sessions at once. Some
+  paths lag a revocation. A running bulk export keeps going. A change made in Active Directory, or
+  to the AD group maps, can wait for the reconciler, the next login or the session cap. A user
+  dropped from their last scope-mapped AD group would keep the old channel scope in live sessions,
+  and any PHI view it carries. That would last until their next login, within the session cap. See
+  [SECURITY.md](SECURITY.md#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832).
 - **Local passwords** are argon2id; lockout after 5 failed attempts. AD users bind over LDAPS.
 
 ### Browser ops dashboard (`/ui`, ADR 0065) — `[M1: read-only; pending owner ASVS sign-off]`

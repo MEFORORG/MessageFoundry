@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 
 import pytest
 
@@ -256,7 +257,7 @@ async def test_a_p256_key_whose_curve_is_not_the_integer_1_is_refused_and_audite
 async def test_an_unusable_stored_key_fails_the_assertion_audited_not_raised(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The backstop for a key that is already stored. Enrolment now refuses this shape, so the
+    """A key that is already stored is checked again at sign-in. Enrolment refuses this shape, so the
     stored row is substituted to stand in for one enrolled before that check or damaged since. The
     assertion must come back refused and audited, never as an exception out of the service."""
     store = await MessageStore.open(":memory:")
@@ -280,6 +281,67 @@ async def test_an_unusable_stored_key_fails_the_assertion_audited_not_raised(
         assert ok is False
         after = (await _events(service, identity.username)).count("auth.webauthn_failed")
         assert after == before + 1
+    finally:
+        await store.close()
+
+
+async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1166: sign-in re-screens the stored key with the registration rule.
+
+    The stored key is a REAL ES256 key on P-384 and the signature over it is good, so at engine
+    ``5ccff7cb3`` this signed in. The refusal is deliberate: audited with no detail, since the
+    detail slot carries nothing from the key, and no WARNING, which is kept for raw failures.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from webauthn.helpers import encode_cbor
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+
+        key = ec.generate_private_key(ec.SECP384R1())
+        nums = key.public_key().public_numbers()
+        p384 = encode_cbor(
+            {1: 2, 3: -7, -1: 2, -2: nums.x.to_bytes(48, "big"), -3: nums.y.to_bytes(48, "big")}
+        )
+        signer = dataclasses.replace(auth, _key=key)  # same credential id, P-384 signature
+        real_get = store.get_webauthn_credential
+
+        async def on_p384(credential_id_hash: str) -> WebAuthnCredential | None:
+            cred = await real_get(credential_id_hash)
+            if cred is None:
+                return None
+            return dataclasses.replace(cred, public_key=bytes_to_base64url(p384))
+
+        monkeypatch.setattr(store, "get_webauthn_credential", on_p384)
+        logger = "messagefoundry.auth.webauthn"
+        with caplog.at_level(logging.WARNING, logger=logger):
+            ok, _ = await _assert_once(service, token, signer)
+        assert ok is False
+        assert not [r for r in caplog.records if r.name == logger]
+        events = await service.security_events_for(identity.username)
+        failed = [e for e in events if e["action"] == "auth.webauthn_failed"]
+        assert len(failed) == 1 and not failed[0]["detail"]
+        assert "auth.webauthn_verified" not in [e["action"] for e in events]
+
+        # The witness that the signature is good, so the refusal above is the check and not a
+        # broken fixture: the library alone accepts this signer against the stored P-384 key.
+        from webauthn import verify_authentication_response
+
+        challenge = wa.new_challenge()
+        verified = verify_authentication_response(
+            credential=signer.get_response(challenge, sign_count=0),
+            expected_challenge=challenge,
+            expected_rp_id=RP,
+            expected_origin=ORIGIN,
+            credential_public_key=p384,
+            credential_current_sign_count=0,
+        )
+        assert verified.new_sign_count == 0
     finally:
         await store.close()
 

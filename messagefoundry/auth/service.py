@@ -73,7 +73,13 @@ from messagefoundry.config.secretprovider import SecretProvider, resolve_connect
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.store.base import AdminStore
-from messagefoundry.store.store import SessionRecord, UserRecord, WebAuthnCredential
+from messagefoundry.store.store import (
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
+    SessionRecord,
+    UserRecord,
+    WebAuthnCredential,
+)
 from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
@@ -2084,7 +2090,7 @@ class AuthService:
             )
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
-        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups)
+        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
         identity = Identity.build(
             user_id=user.id,
             username=user.username,
@@ -2156,13 +2162,28 @@ class AuthService:
         )
 
     async def _sync_ad_channel_scope(
-        self, user: UserRecord, roles: frozenset[Role], groups: Iterable[str]
+        self,
+        user: UserRecord,
+        roles: frozenset[Role],
+        groups: Iterable[str],
+        *,
+        client: str | None = None,
     ) -> UserRecord:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
-        requests (mirrors role sync). Administrators are always all-channels. If no group mapping
-        matches, the per-user scope is left untouched — opt-in, so it never clobbers a manual scope,
-        and since BACKLOG #1152 an untouched scope is a DENY rather than the whole estate. Returns
-        the (possibly refreshed) user record.
+        requests (mirrors role sync). Administrators are always all-channels. Returns the (possibly
+        refreshed) user record.
+
+        **A matching group is authoritative**: its scope replaces whatever is stored, an
+        administrator's included, and the scope is then the directory's.
+
+        **When no mapped group matches, the outcome depends on who wrote the stored scope (BACKLOG
+        #1927).** A scope an administrator set is left untouched, so on this branch the map stays
+        opt-in. Any other scope is WITHDRAWN to NULL, which denies (BACKLOG #1152); the rule is
+        stated on ``UserRecord.channel_scope_source``. This path used to return early for every
+        no-match login, so a user removed from their last scope-mapped group kept the channels the
+        directory had granted for as long as the account existed. A scope that already denies is
+        left as it is, because rewriting ``[]`` to NULL changes no decision and would revoke
+        sessions for nothing.
 
         A wildcard group row persists the explicit ``["*"]`` grant. It used to persist SQL NULL and
         rely on NULL meaning "all"; with an absent scope now denying, that collapse would have
@@ -2171,20 +2192,39 @@ class AuthService:
             return user
         channels = await self._store.channels_for_ad_groups(groups)
         if not channels:
-            return user
+            if user.channel_scope_source == SCOPE_SOURCE_MANUAL:
+                return user
+            if user.channel_scope is None or _allowed_channels(user, roles) == frozenset():
+                return user  # already a deny; nothing to withdraw
+            # Compare-and-set against the value read: an administrator or a concurrent login may
+            # have written the scope since ``user`` was read.
+            if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
+                return await self._store.get_user(user.id) or user
+            await self._store.revoke_user_sessions(user.id)
+            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
+            await self._audit(
+                "auth.ad_scope_resynced",
+                actor=user.username,
+                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
+                client=client,
+            )
+            return await self._store.get_user(user.id) or user
         wildcard = ALL_CHANNELS in channels
         specific = sorted(c for c in channels if c != ALL_CHANNELS)
         scope_json = _json([ALL_CHANNELS]) if wildcard else _json(specific)
-        if user.channel_scope == scope_json:
+        if user.channel_scope == scope_json and user.channel_scope_source == SCOPE_SOURCE_AD:
             return user
-        await self._store.set_user_channel_scope(user.id, scope_json)
-        await self._store.revoke_user_sessions(
-            user.id
-        )  # drop stale-scope tokens (new one issued after)
+        await self._store.set_user_channel_scope(user.id, scope_json, source=SCOPE_SOURCE_AD)
+        # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
+        # moved -- the directory taking over an identical manual scope changes no decision, so
+        # there is nothing stale to drop -- but that write is still audited below.
+        if scope_json != user.channel_scope:
+            await self._store.revoke_user_sessions(user.id)
         await self._audit(
             "auth.ad_scope_resynced",
             actor=user.username,
             detail=_json({"channels": ALL_CHANNELS if wildcard else specific}),
+            client=client,
         )
         return await self._store.get_user(user.id) or user
 
@@ -3235,8 +3275,10 @@ class AuthService:
     #: - binding a new factor (``mfa_enroll``, ``mfa_confirm``, ``webauthn_enroll``) is a promotion
     #:   path, because both ceremonies mark the session MFA-satisfied on success;
     #: - ending sessions (``session_terminate``, BACKLOG #1951, ASVS 7.5.2) through the terminate
-    #:   routes would let a password holder sign the real user out without the second factor. That
-    #:   is these routes only: ``POST /me/password`` still revokes every session from a pending one.
+    #:   routes would let a password holder sign the real user out without the second factor.
+    #:
+    #: Changing the password does both at once, but it takes no grant and rides no reauth-only gate,
+    #: so it asks the same rule through :meth:`password_change_owes_factor` instead (BACKLOG #1954).
     #:
     #: A new action on either reauth-only action gate belongs here too. A test in
     #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
@@ -3271,6 +3313,15 @@ class AuthService:
         """
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
+        return await self._owes_enrolled_factor(token)
+
+    async def _owes_enrolled_factor(self, token: str | None, *, local_only: bool = False) -> bool:
+        """Whether the session is MFA-pending on an account that already HAS a second factor.
+
+        Fails closed (True) when the session or its user cannot be found. ``local_only`` answers
+        False for a directory account, whose password the engine does not hold. It names AD rather
+        than excluding everything that is not LOCAL: ``_build_identity`` maps an unrecognized
+        provider back to LOCAL, so the password handler treats that row as local and changes it."""
         if not token:
             return True  # no session to act on, so fail closed (as below)
         if await self.mfa_satisfied(token):
@@ -3281,7 +3332,21 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return True
+        if local_only and user.auth_provider == AuthProvider.AD.value:
+            return False
         return await self._second_factor_enrolled(user)
+
+    async def password_change_owes_factor(self, token: str | None) -> bool:
+        """Whether this session must prove its second factor before it may change the password.
+
+        BACKLOG #1954 (ASVS 6.3.3). A change revokes every session, so a password holder on a
+        pending session must not reach it on the password alone. True for a pending session on
+        an account that holds a factor, unless it is a directory (AD) account, and when the session
+        or its user cannot be found. An account with no factor has nothing to prove and
+        rotates as before, and a directory account is left to the route's 400, which changes
+        nothing. PUBLIC for the reason :meth:`factor_binding_is_blocked` gives: the JSON gate and
+        the web console's password and factor pages all ask it, so the planes cannot drift."""
+        return await self._owes_enrolled_factor(token, local_only=True)
 
     async def factor_binding_is_blocked(self, token: str | None, action: str) -> bool:
         """PUBLIC contract boundary over :meth:`_factor_binding_is_blocked`, for the ROUTE gates.
@@ -4526,7 +4591,7 @@ class AuthService:
         :data:`~messagefoundry.auth.identity.ALL_CHANNELS` grants the whole estate. Administrators
         are all-channels by role, so a scope set on one still has no effect."""
         scope_json = None if channels is None else _json(sorted(set(channels)))
-        await self._store.set_user_channel_scope(user_id, scope_json)
+        await self._store.set_user_channel_scope(user_id, scope_json, source=SCOPE_SOURCE_MANUAL)
         await self._store.revoke_user_sessions(user_id)
         await self._audit(
             "user.channel_scope_changed",

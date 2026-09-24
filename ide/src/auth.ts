@@ -182,7 +182,9 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
     // Both of these produce a token that LOOKS fine and then 403s later, so say so now, at the moment
     // the user can act on it, rather than letting them discover it as an opaque failure mid-promote.
     if (res.must_change_password) {
-      // The engine 403s this token on every route except /auth/logout, /auth/me and /me/password.
+      // The engine 403s this token on every route outside its must-change exempt set
+      // (_MUST_CHANGE_EXEMPT_PATHS in messagefoundry/api/security.py). The console page below
+      // asks for an enrolled second factor first when the account has one (BACKLOG #1954).
       // BACKLOG #1141 (ASVS 6.4.5): name the instant the temporary credential dies, when sent.
       void showConsoleFix(
         url,
