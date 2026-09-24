@@ -739,6 +739,36 @@ def main(argv: list[str] | None = None) -> int:
     provision_admin.add_argument("--db", default=None, help="store path (overrides [store].path)")
     provision_admin.add_argument("--json", action="store_true", help="emit JSON")
 
+    # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An Administrator provisioned without --email is
+    # refused at the next start by the ADR 0167 deliverability gate, and provision-admin then refuses
+    # too, because an enabled Administrator exists. This is the offline exit, on admin-unlock's gate.
+    admin_set_notify_email = sub.add_parser(
+        "admin-set-notify-email",
+        help="set a missing security-notice address on an enabled Administrator from the host "
+        "(offline; fills an absent address only, never clears or changes one)",
+        description="Set the engine-owned notification address (users.notify_email) on an enabled "
+        "Administrator that has none, so a PHI instance under [security].enforcement=enforce can "
+        "start. Runs against the store directly, on the same host gate as admin-unlock; run it with "
+        "the engine stopped. It refuses a blank address, a non-Administrator, a disabled account, "
+        "and an account that already has an address: change an existing address from the web "
+        "console, which notifies the old one.",
+    )
+    admin_set_notify_email.add_argument(
+        "--username", required=True, help="the enabled Administrator to address"
+    )
+    admin_set_notify_email.add_argument(
+        "--email", required=True, help="the notification address to set (must not be blank)"
+    )
+    admin_set_notify_email.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    admin_set_notify_email.add_argument(
+        "--db", default=None, help="store path (overrides [store].path)"
+    )
+    admin_set_notify_email.add_argument("--json", action="store_true", help="emit JSON")
+
     audit_verify = sub.add_parser(
         "audit-verify", help="verify the audit-log hash chain (tamper-evidence)"
     )
@@ -4654,27 +4684,18 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         return 2
 
 
-def _admin_unlock(args: argparse.Namespace) -> int:
-    """Clear a local account's lockout from the host (BACKLOG #1236, ADR 0171).
+def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | int:
+    """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
-    THE GATE IS HOST ACCESS, AND IT IS A REAL ONE RATHER THAN AN ABSENT ONE. Reaching this needs the
-    service config, the store path and, on an encrypted store, the key material -- which is the
-    operator who installed the engine. Anyone holding all three already has the database and does not
-    need an unlock affordance to reach an account. So this grants no capability that the trust
-    boundary did not already imply, which is what makes it safe to ship unauthenticated.
-
-    IT DOES NOT RESET A PASSWORD, DELIBERATELY. Clearing the lockout returns the account to its
-    ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
-    resolves the lockout, and a reset would hand whoever runs this a working account.
+    Shared by ``admin-unlock`` and ``admin-set-notify-email`` so the gate is stated once (ADR 0171,
+    ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it legitimately creates the
+    store, so it cannot carry the M-31 guard below.
     """
-    import asyncio
-    import getpass
     from pathlib import Path
 
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
-    from messagefoundry.store.base import open_store
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -4694,6 +4715,30 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             f"'no such user' (check --db / [store].path)",
             as_json=args.json,
         )
+    return settings
+
+
+def _admin_unlock(args: argparse.Namespace) -> int:
+    """Clear a local account's lockout from the host (BACKLOG #1236, ADR 0171).
+
+    THE GATE IS HOST ACCESS, AND IT IS A REAL ONE RATHER THAN AN ABSENT ONE. Reaching this needs the
+    service config, the store path and, on an encrypted store, the key material -- which is the
+    operator who installed the engine. Anyone holding all three already has the database and does not
+    need an unlock affordance to reach an account. So this grants no capability that the trust
+    boundary did not already imply, which is what makes it safe to ship unauthenticated.
+
+    IT DOES NOT RESET A PASSWORD, DELIBERATELY. Clearing the lockout returns the account to its
+    ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
+    resolves the lockout, and a reset would hand whoever runs this a working account.
+    """
+    import asyncio
+    import getpass
+
+    from messagefoundry.store.base import open_store
+
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
 
     async def run() -> tuple[str, float | None]:
         store = await open_store(settings.store)
@@ -4942,8 +4987,157 @@ def _provision_admin(args: argparse.Namespace) -> int:
     if not (args.email and args.email.strip()):
         _safe_print(
             "WARNING: no notification address. A PHI instance under [security].enforcement=enforce "
-            "refuses to start unless some enabled Administrator carries one -- re-run with --email, "
-            "or set one from the web console."
+            "refuses to start unless some enabled Administrator carries one -- set it with "
+            f"`messagefoundry admin-set-notify-email --username {outcome.username!r} --email "
+            "<address>` before the first serve."
+        )
+    return 0
+
+
+def _admin_set_notify_email(args: argparse.Namespace) -> int:
+    """Set a missing notification address on an enabled Administrator from the host (#1136).
+
+    ADR 0183 Amendment A, Wave 1c. The ADR 0167 gate refuses a PHI start under ``enforce`` unless some
+    enabled Administrator carries ``notify_email``. ``provision-admin`` without ``--email`` leaves
+    exactly that state, and then refuses to run again because an enabled Administrator exists; the
+    web console cannot be reached while the engine refuses. This is the exit that trades no control.
+
+    **The gate is host access**, the one argued on :func:`_admin_unlock` and in ADR 0171, and it runs
+    through the same :func:`_host_gated_store_settings`.
+
+    **IT FILLS AN ABSENT ADDRESS AND NOTHING ELSE.** A blank value is refused by
+    :func:`~messagefoundry.store.store.require_notify_email`, the check every write of the column
+    uses, so there is no spelling of a clear. An account that already has an address is refused too:
+    repointing it here would move where notices go without the ``EMAIL_CHANGED`` notice to the old
+    address that :meth:`AuthService.update_user` sends, because no notifier runs offline. It is also
+    refused on a non-Administrator or a disabled account, because neither counts at the gate, and a
+    success there would leave the start refused while reporting OK.
+
+    **THE AUDIT ROW IS APPENDED BEFORE THE ADDRESS IS WRITTEN.** The two are separate commits, so one
+    order or the other can leave them disagreeing. A keyed store opened from a shell without its key
+    (the key sits in the service's NSSM environment) opens fine and then refuses a keyless append;
+    written the other way round, the address would land unaudited. This order can instead leave an
+    audit row for a write that then failed; the command then appends a ``..._failed`` row and says
+    so rather than reporting OK. An unaudited change to where security notices go is the worse of
+    the two.
+
+    **Run it with the engine stopped**, as ``admin-unlock`` is. The fill-only check is a read and
+    then an unconditional write, so a live engine could change the address in between.
+
+    Re-running with the address already in place is a success that writes nothing, so an automated
+    install step can be repeated.
+    """
+    import asyncio
+    import getpass
+
+    from messagefoundry.api.auth_models import _NAME_MAX
+    from messagefoundry.auth.permissions import Role
+    from messagefoundry.store.base import open_store
+    from messagefoundry.store.crypto import StoreKeylessError
+    from messagefoundry.store.store import require_notify_email
+
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
+    try:
+        # Validated before the store opens, so a refusal touches nothing. The same helper every
+        # write of the column uses, plus the web console's length bound, so this offline surface
+        # accepts nothing the console's user form refuses.
+        address = require_notify_email(args.email)
+    except ValueError as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    if len(args.email) > _NAME_MAX:
+        return _emit_error(
+            f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
+        )
+    # Stripped as `provision_first_administrator` strips it, so the argv that created the account
+    # also finds it.
+    wanted = args.username.strip()
+    actor = f"cli:{getpass.getuser()}"
+    # Store failures a refused write can raise on SQLite. `RuntimeError` covers the audit chain's
+    # keyed-append refusal and the store's own acquire timeout.
+    store_errors = (RuntimeError, sqlite3.DatabaseError)
+
+    async def run() -> tuple[str, str, str]:
+        """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
+        try:
+            store = await open_store(settings.store)
+        except StoreKeylessError as exc:
+            # A keyed store with encrypted rows, opened from a shell without its key, refuses at
+            # open. Nothing has been read or written.
+            return ("open-refused", wanted, str(exc))
+        try:
+            user = await store.get_user_by_username(wanted)
+            if user is None:
+                return ("no-such-user", wanted, "")
+            # The predicate the ADR 0167 gate applies, read the same way: holding the Administrator
+            # role in `user_roles`, and enabled. Role first, so a disabled Viewer is named as what it
+            # is rather than as a disabled Administrator.
+            if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
+                return ("not-admin", user.username, "")
+            if user.disabled:
+                return ("disabled", user.username, "")
+            if user.notify_email == address:
+                return ("unchanged", user.username, store.path)
+            if user.notify_email:
+                return ("has-address", user.username, "")
+            # PHI-free, and the address itself is left out, as `provision-admin` records only
+            # whether one was set. The actor names the OS user, as `admin-unlock` does.
+            detail = json.dumps({"username": user.username})
+            try:
+                await store.record_audit("auth.admin_notify_email_set", actor=actor, detail=detail)
+            except store_errors as exc:
+                # The chain refused the append (no key in this shell, the current range's key not
+                # held, or a running engine holding the write lock). Nothing has been written yet.
+                return ("audit-refused", user.username, str(exc))
+            try:
+                await store.set_user_notify_email(user.id, email=address)
+            except store_errors as exc:
+                # The row above now records a change that did not happen, so say so in the log too.
+                try:
+                    await store.record_audit(
+                        "auth.admin_notify_email_set_failed", actor=actor, detail=detail
+                    )
+                    logged = "a matching _failed audit row was appended"
+                except store_errors as follow:
+                    logged = f"appending the matching _failed audit row also failed ({follow})"
+                return ("write-failed", user.username, f"{exc}; {logged}")
+            return ("set", user.username, store.path)
+        finally:
+            await store.close()
+
+    try:
+        outcome, username, extra = asyncio.run(run())
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    refusals = {
+        "open-refused": f"{extra}. Nothing was written",
+        "no-such-user": f"no account named {username!r}",
+        "not-admin": f"the account {username!r} is not an Administrator; the start gate asks only "
+        "about enabled Administrators",
+        "disabled": f"the Administrator {username!r} is disabled and does not count at the start "
+        "gate. Address another enabled Administrator; if none is left, `provision-admin "
+        "--username <name> --email <address>` creates one",
+        "has-address": f"the account {username!r} already has a notification address; this command "
+        "only fills a missing one -- change it from the web console, which notifies the old address",
+        "audit-refused": f"{extra}. Nothing was written: the audit row goes first, and the store "
+        "refused it. If the engine is running, stop it and re-run",
+        "write-failed": f"the audit row for {username!r} was written, but setting the address "
+        f"failed ({extra}); the address is NOT set. Stop the engine and re-run",
+    }
+    if outcome in refusals:
+        return _emit_error(refusals[outcome], as_json=args.json)
+    changed = outcome == "set"
+    if args.json:
+        _print_json(
+            {"ok": True, "username": username, "changed": changed, "store": extra}, compact=True
+        )
+    else:
+        # `_safe_print`: both the username and the store path are operator-supplied. The path is
+        # named, as `provision-admin` names it, so a mistyped --db or config shows on screen.
+        verb = "set" if changed else "already had"
+        _safe_print(
+            f"OK: {verb} the notification address for Administrator {username!r} in {extra}"
         )
     return 0
 
@@ -6516,6 +6710,7 @@ _DISPATCH = {
     "verify": _verify,
     "support-bundle": _support_bundle,
     "service": _service,
+    "admin-set-notify-email": _admin_set_notify_email,
 }
 
 
