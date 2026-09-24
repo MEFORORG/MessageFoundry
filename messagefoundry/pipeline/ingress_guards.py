@@ -35,17 +35,27 @@ silently.
 
 from __future__ import annotations
 
+import codecs
+
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.wiring import InboundConnection
 from messagefoundry.parsing import RawMessage, normalize
-from messagefoundry.parsing.binary import is_marked
-from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+from messagefoundry.parsing.binary import BinaryCarriageError, is_marked
+from messagefoundry.parsing.binary import decode as decode_carriage
+from messagefoundry.parsing.peek import (
+    DEFAULT_MAX_MESSAGE_BYTES,
+    HL7PeekError,
+    Peek,
+    enforce_size_limits,
+)
+from messagefoundry.parsing.sniff import _content_matches_declared, text_sniff_head
 from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "INGRESS_MAX_BYTES",
     "NUL_REJECTED_REASON",
     "IngressGuardError",
+    "admit_resubmitted_body",
     "carry_binary_ingress",
     "decode_ingress",
     "ingress_encoding",
@@ -70,6 +80,8 @@ class IngressGuardError(Exception):
 
     ``phase`` names which guard fired (``"decode"`` or ``"size"``) and matches the live listener's ACK
     phase labels, so a caller that records dispositions can map it onto the same one the engine writes.
+    :func:`admit_resubmitted_body` adds two more, ``"type"`` for the declared-type sniff and
+    ``"parse"`` for ``Peek.parse``; the dry-run entry points never raise either.
     """
 
     def __init__(self, reason: str, *, phase: str) -> None:
@@ -109,6 +121,13 @@ def ingress_size_error(size: int) -> str | None:
     return None
 
 
+def _raise_if_oversize(size: int) -> None:
+    """Raise the ``size``-phase refusal when :func:`ingress_size_error` reports an overrun."""
+    oversize = ingress_size_error(size)
+    if oversize is not None:
+        raise IngressGuardError(oversize, phase="size")
+
+
 def store_safe_raw(raw: str | bytes, content_type: str, *, text: str | None = None) -> str:
     """A ``str`` view of a REJECTED body that a TEXT store can hold (INGEST-4 / ADR 0028).
 
@@ -126,6 +145,44 @@ def store_safe_raw(raw: str | bytes, content_type: str, *, text: str | None = No
     return RawMessage.from_bytes(data, content_type).raw
 
 
+def _encode_declared(raw: str, ic: InboundConnection) -> bytes:
+    """``raw`` in the inbound's declared charset, or the ``decode``-phase refusal when it cannot be.
+
+    A text a charset cannot hold is one the listener could never have decoded from a sender's bytes.
+    The reason names a position and never the character: ``str(UnicodeEncodeError)`` quotes the
+    offending character, which is a byte of the body."""
+    encoding = ingress_encoding(ic)
+    try:
+        return raw.encode(encoding)
+    except UnicodeEncodeError as exc:
+        raise IngressGuardError(
+            f"encode error ({encoding}): {exc.reason} at position {exc.start}", phase="decode"
+        ) from exc
+    except LookupError as exc:
+        raise IngressGuardError(
+            f"encode error ({encoding}): {safe_exc(exc)}", phase="decode"
+        ) from exc
+
+
+#: Codecs in which every ASCII character encodes, so an ASCII-only text needs no trial encode.
+_ASCII_SUPERSET_CODECS = frozenset({"ascii", "utf-8", "iso8859-1", "cp1252"})
+
+
+def _check_encodable(raw: str, ic: InboundConnection) -> None:
+    """Refuse ``raw`` when the inbound's declared charset cannot hold it (``decode`` phase).
+
+    An ASCII-only text in an ASCII-superset codec is skipped rather than encoded: a trial encode of an
+    upload-sized body is a full copy for an answer that is already known. Any other case, including
+    an unknown codec name, goes to :func:`_encode_declared`, which owns the refusal wording."""
+    try:
+        name: str | None = codecs.lookup(ingress_encoding(ic)).name
+    except LookupError:
+        name = None
+    if name in _ASCII_SUPERSET_CODECS and raw.isascii():
+        return
+    _encode_declared(raw, ic)
+
+
 def carry_binary_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     """Carry a BYTE-oriented body (``content_type.is_binary``) the way the listener does — no decode.
 
@@ -141,20 +198,12 @@ def carry_binary_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     if isinstance(raw, str):
         if is_marked(raw):
             return raw
-        encoding = ingress_encoding(ic)
-        try:
-            data = raw.encode(encoding)
-        except (UnicodeEncodeError, LookupError) as exc:
-            raise IngressGuardError(
-                f"encode error ({encoding}): {safe_exc(exc)}", phase="decode"
-            ) from exc
+        data = _encode_declared(raw, ic)
     else:
         data = raw
     # Measured on the RAW bytes, pre-base64-inflation, so the carriage codec cannot walk past the
     # ceiling — the same side of the encode the listener measures on.
-    oversize = ingress_size_error(len(data))
-    if oversize is not None:
-        raise IngressGuardError(oversize, phase="size")
+    _raise_if_oversize(len(data))
     return RawMessage.from_bytes(data, ic.content_type.value).raw
 
 
@@ -196,7 +245,93 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     if "\x00" in text:
         raise IngressGuardError(NUL_REJECTED_REASON, phase="decode")
     if not hl7v2:
-        oversize = ingress_size_error(len(text))
-        if oversize is not None:
-            raise IngressGuardError(oversize, phase="size")
+        _raise_if_oversize(len(text))
     return text
+
+
+def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
+    """Admit an operator-resubmitted body the way the inbound ``ic`` admits a sender's (BACKLOG #1911).
+
+    The upload resend (``POST /uploads/{file_id}/resend``) and the edit-resend re-route write straight
+    to the ingress stage, so the listener never sees the body. This runs the listener's guards over it
+    first, raises :class:`IngressGuardError` for the first one that fails, and otherwise returns the
+    form the listener would have committed -- the caller commits that, not ``raw``:
+
+    * **decode** -- a text inbound's declared charset must be able to hold the text, since the listener
+      could only ever have produced it by decoding bytes in that charset; then the NUL rule. A binary
+      inbound's ``mfb64:v1:`` carriage must decode.
+    * **size** -- for an HL7 inbound, the size and segment caps ``Peek.parse`` enforces at
+      :func:`peek_max_bytes`, so a connection's own lower ``max_message_bytes`` holds, but never above
+      the engine ceiling (see below); the engine ceiling for any other type, in the listener's units.
+    * **type** -- the declared-type magic-byte sniff the listener applies to a non-HL7 body.
+    * **parse** -- an HL7 body must pass ``Peek.parse``, which is the listener's only HL7 type check.
+
+    The committed form is the ``\\r``-normalized text for HL7, the text verbatim for another text
+    type, and canonical ``mfb64:v1:`` carriage for a binary type.
+
+    ``ic`` is ``None`` when there is no inbound to guard for: the edit-resend direct path writes an
+    outbound row, and a re-route whose origin inbound is no longer registered has no declared type. Only
+    the engine-wide rules apply then, the NUL rule and the engine ceiling, and ``raw`` is returned as
+    is. Both callers today already bound that body below the ceiling (``EditResendRequest.raw`` and the
+    API's 1 MiB request cap), so the ceiling there is a backstop.
+
+    **Not mirrored, and a resubmission can therefore still differ from a sender's body:** strict
+    ``hl7apy`` validation (an inbound with ``validation.strict`` would ``AE``-NAK a body this admits),
+    and document detach. A streaming inbound raises ``max_message_bytes`` to pay for a detach this path
+    does not do, so its HL7 ceiling here stays at the engine default rather than the raised value.
+
+    The reason never carries a byte of the body, so a caller may return it to the operator and audit it."""
+    if ic is None:
+        if "\x00" in raw:
+            raise IngressGuardError(NUL_REJECTED_REASON, phase="decode")
+        _raise_if_oversize(len(raw))
+        return raw
+    if ic.content_type.is_binary:
+        if is_marked(raw):
+            try:
+                data = decode_carriage(raw)
+            except BinaryCarriageError as exc:
+                raise IngressGuardError(
+                    f"binary carriage error: {safe_exc(exc)}", phase="decode"
+                ) from exc
+        else:
+            data = _encode_declared(raw, ic)
+        # Measured on the raw bytes, before base64 inflation, as the listener measures a binary body.
+        _raise_if_oversize(len(data))
+        _raise_if_mistyped(ic, data)
+        # A binary inbound's rows are carriage (ADR 0028); text committed bare would fail .raw_bytes.
+        # Re-encoded even when it arrived marked, so a non-canonical form (a line break inside the
+        # base64) is stored as the listener's canonical, unbroken carriage.
+        return RawMessage.from_bytes(data, ic.content_type.value).raw
+    _check_encodable(raw, ic)
+    text = decode_ingress(raw, ic)
+    if ic.content_type is ContentType.HL7V2:
+        # The listener's HL7 type check IS Peek.parse, and the magic-byte sniff is NOT applied here,
+        # as the listener does not apply it: the two disagree in BOTH directions (the sniff admits an
+        # FHS/BHS- or BOM-led body Peek refuses, and refuses a body led by NBSP or \x1c that Peek's
+        # str.lstrip() accepts). The size and segment caps run first, on their own, so an oversize
+        # body is told apart from a malformed one. The ceiling is capped at the engine
+        # default because a streaming inbound's raised max_message_bytes pays for a detach that this
+        # path does not do.
+        ceiling = min(peek_max_bytes(ic), DEFAULT_MAX_MESSAGE_BYTES)
+        try:
+            enforce_size_limits(text, max_bytes=ceiling)
+        except HL7PeekError as exc:
+            raise IngressGuardError(str(exc), phase="size") from exc
+        try:
+            Peek.parse(text, max_bytes=ceiling)
+        except HL7PeekError as exc:
+            raise IngressGuardError(f"parse error: {safe_exc(exc)}", phase="parse") from exc
+    else:
+        _raise_if_mistyped(ic, text_sniff_head(text))
+    return text
+
+
+def _raise_if_mistyped(ic: InboundConnection, head: bytes) -> None:
+    """Raise the ``type``-phase refusal when ``head`` contradicts the inbound's declared type."""
+    if not _content_matches_declared(ic.content_type, head):
+        raise IngressGuardError(
+            f"ingress body does not match its declared content type "
+            f"{ic.content_type.value!r} (no matching magic bytes)",
+            phase="type",
+        )
