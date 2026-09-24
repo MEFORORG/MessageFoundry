@@ -3585,8 +3585,9 @@ jobs:
       # silently ran as some other account goes red instead of measuring the wrong thing. Every red
       # names the identity and the trio file(s) granting it no read+write, and is tagged [STORE ACCESS]
       # only when a log shows an open failure -- [NOT SHOWN TO BE STORE ACCESS] otherwise, so a refused
-      # start gate or a held port is not read as the lockout. A green that re-secured nothing prints
-      # GREEN (CONDITIONAL) with a warning. The helper's header says how each arm goes red.
+      # start gate or a held port is not read as the lockout. After every open each trio file may grant only
+      # SYSTEM, Administrators, the service account and the operator, or the arm goes red. A restriction
+      # the engine logged as failed prints GREEN (CONDITIONAL). The helper's header says how each arm reds.
       #
       # `!cancelled()` rather than the default `success()`: both readings are wanted on every run, so
       # the start-first arm still runs when the provision-first arm or the auth-off smoke went red.

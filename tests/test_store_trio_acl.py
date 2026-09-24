@@ -1,27 +1,27 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The SQLite store trio's DACL when the data directory is hardened (ADR 0183 Wave 0b, ADR 0163).
+"""The SQLite store trio's DACL in a hardened data directory (ADR 0183 Wave 0b, ADR 0163).
 
-ADR 0183 Wave 0 measured, on hosted windows-2022 and windows-2025 (CI run 36026471545), that the
-old re-secure made whichever identity opened a fresh store first its ONLY principal: the operator
-running ``provision-admin`` locked the NSSM service account out, and the service locked the operator
-out. The fix: when the store's directory is HARDENED (inheritance removed, and every entry names
-SYSTEM, BUILTIN\\Administrators or one per-service virtual account), the trio inherits exactly what
-that directory grants instead of being rewritten to the opener alone. Anywhere else the old
-owner-only restriction is unchanged.
+ADR 0183 Wave 0 measured, on hosted windows-2022 and windows-2025 (CI run 36026471545), that the old
+re-secure made whichever identity opened a fresh store first its ONLY principal: the operator running
+``provision-admin`` locked the NSSM service account out, and the service locked the operator out. The
+fix: when the store's directory is HARDENED the way install-service.ps1 leaves it, every open writes
+the same explicit, protected DACL -- SYSTEM, Administrators, and the directory's one service account --
+whoever opens. Anywhere else the owner-only rewrite is unchanged.
 
 Three tiers, each saying what it can and cannot show:
 
-* The SDDL decision is pure and runs on every platform.
-* The Windows tests run the real ``icacls`` against a real directory and skip off Windows, because
-  the mechanism is a Windows DACL. They read the result back as SDDL, so the reading does not depend
-  on the display language. Once a file inherits a hardened directory, its non-elevated owner holds
-  only the implicit READ_CONTROL and WRITE_DAC, and ``icacls`` asks for more than that (measured:
-  exit 5, "Access is denied"). So those reads use ``_read_dacl_sddl``, which asks for the DACL alone,
-  and a separate test checks that reader against ``icacls /save`` where both can read.
-* One test needs an ELEVATED token, because it drives ``MessageStore.open`` inside a directory only
-  SYSTEM, Administrators and a service account may write. It skips when not elevated; the hosted
-  ``windows-service-smoke`` store-access arms cover the same ground as the real service account.
+* The SDDL decisions are pure and run on every platform, as does the wiring into ``open``.
+* The Windows tests drive the real ``icacls`` on real files and skip off Windows, because the
+  mechanism is a Windows DACL. A non-elevated user cannot make BUILTIN\\Administrators a directory's
+  owner, so those tests pass the grant set directly to the file step and test directory DETECTION on
+  the refusing side (a user-owned directory, a junction). They read results back as SDDL through
+  ``_read_dacl_sddl``, which needs only READ_CONTROL: once a file carries no entry for its
+  non-elevated owner, ``icacls`` itself is refused (measured: exit 5). A separate test checks that
+  reader against ``icacls /save`` where both can read.
+* One test needs an ELEVATED token: it opens a store end to end in an installer-shaped directory. It
+  skips when not elevated. The hosted ``windows-service-smoke`` store-access arms run the same flow
+  under the real NSSM service account.
 """
 
 from __future__ import annotations
@@ -39,80 +39,131 @@ _windows_only = pytest.mark.skipif(
 )
 
 #: NT SERVICE\TrustedInstaller: a per-service virtual-account SID present on every Windows host, used
-#: here as the stand-in for NT SERVICE\MessageFoundry, which exists only once the service is installed.
+#: as the stand-in for NT SERVICE\MessageFoundry, which exists only once the service is installed.
 _TI = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+_OTHER_SERVICE = "S-1-5-80-1-2-3-4-5"
+_SY, _BA = "S-1-5-18", "S-1-5-32-544"
 
-#: The data directory install-service.ps1 writes: protected, SYSTEM and Administrators full control,
-#: the run-as virtual account Modify, all inherited by files (OI) and folders (CI).
+#: The data directory install-service.ps1 writes: owned by Administrators, protected, SYSTEM and
+#: Administrators full control, the run-as virtual account Modify, inherited by files and folders.
 _INSTALLER_DIR = f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})"
 
 
-# --- the decision, on every platform ------------------------------------------------------------
+# --- the decisions, on every platform -------------------------------------------------------------
 
 
-def test_the_installers_data_directory_confines_the_store() -> None:
-    dacl = store_mod._parse_sddl_dacl(_INSTALLER_DIR)
-    assert dacl is not None
-    assert store_mod._dacl_confines_store(dacl)
+def _grants(sddl: str) -> tuple[str, ...] | None:
+    dacl = store_mod._parse_sddl_dacl(sddl)
+    return None if dacl is None else store_mod._hardened_trio_grants(dacl)
+
+
+def test_the_installers_data_directory_is_hardened() -> None:
+    assert _grants(_INSTALLER_DIR) == (_SY, _BA, _TI)
+
+
+def test_a_localsystem_install_grants_system_and_administrators_only() -> None:
+    # -AllowLocalSystem: the directory names no service account, so the trio names none either.
+    assert _grants("O:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)") == (_SY, _BA)
 
 
 @pytest.mark.parametrize(
     ("label", "sddl"),
     [
-        ("inheritance still on", f"D:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{_TI})"),
-        ("BUILTIN\\Users by alias", "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"),
-        ("BUILTIN\\Users by SID", "D:P(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;S-1-5-32-545)"),
-        ("Everyone", "D:P(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)"),
-        ("Authenticated Users", "D:P(A;OICI;FA;;;BA)(A;OICI;FR;;;AU)"),
-        ("NT SERVICE\\ALL SERVICES", "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-80-0)"),
-        ("a named user or group", "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)"),
-        ("CREATOR OWNER", "D:P(A;OICI;FA;;;SY)(A;OICIIO;FA;;;CO)"),
-        ("a callback ACE", "D:P(A;OICI;FA;;;SY)(XA;OICI;FA;;;WD;(@User.x == 1))"),
-        ("a null DACL", "D:NO_ACCESS_CONTROL"),
-        ("an empty DACL", "D:P"),
+        ("inheritance still on", f"O:BAD:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{_TI})"),
+        ("BUILTIN\\Users by alias", "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)"),
+        ("BUILTIN\\Users by SID", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;S-1-5-32-545)"),
+        ("Everyone", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)"),
+        ("Authenticated Users", "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FR;;;AU)"),
+        ("NT SERVICE\\ALL SERVICES", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-80-0)"),
+        (
+            "a second service account",
+            f"O:BAD:P(A;;FA;;;SY)(A;;FA;;;{_TI})(A;;FA;;;{_OTHER_SERVICE})",
+        ),
+        ("a named user or group", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)"),
+        ("CREATOR OWNER", "O:BAD:P(A;OICI;FA;;;SY)(A;OICIIO;FA;;;CO)"),
+        ("OWNER RIGHTS", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)"),
+        ("owned by a standard user", "O:S-1-5-21-1-2-3-1001D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+        (
+            "owned by an unnamed service",
+            f"O:{_OTHER_SERVICE}D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;{_TI})",
+        ),
+        ("no owner read", "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+        ("deny entries only", "O:BAD:P(D;OICI;FA;;;WD)"),
+        ("a callback ACE", "O:BAD:P(A;OICI;FA;;;SY)(XA;OICI;FA;;;WD;(@User.x == 1))"),
+        ("a null DACL", "O:BAD:NO_ACCESS_CONTROL"),
+        ("an empty DACL", "O:BAD:P"),
         ("no DACL section", "O:BAG:SY"),
         ("garbage", "not an sddl string"),
     ],
 )
-def test_a_directory_that_admits_anyone_else_does_not_confine_the_store(
-    label: str, sddl: str
-) -> None:
+def test_a_directory_that_admits_anyone_else_is_not_hardened(label: str, sddl: str) -> None:
     # Each row admits (or may admit) a principal beyond SYSTEM, Administrators and one service
-    # account, or cannot be read with confidence. Every one must fall back to the owner-only rewrite.
-    dacl = store_mod._parse_sddl_dacl(sddl)
-    assert dacl is None or not store_mod._dacl_confines_store(dacl), label
+    # account, lets an outsider rewrite the directory, or cannot be read with confidence. Every one
+    # must fall back to the owner-only rewrite.
+    assert _grants(sddl) is None, label
 
 
 def test_a_deny_entry_does_not_disqualify_a_hardened_directory() -> None:
     # A deny only narrows access, so it cannot let anybody else in.
-    dacl = store_mod._parse_sddl_dacl(_INSTALLER_DIR + "(D;OICI;FA;;;BG)")
-    assert dacl is not None and store_mod._dacl_confines_store(dacl)
+    assert _grants(_INSTALLER_DIR + "(D;OICI;FA;;;BG)") == (_SY, _BA, _TI)
 
 
-def test_inherited_only_is_recognised() -> None:
-    inheriting = store_mod._parse_sddl_dacl(
-        f"D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1301bf;;;{_TI})"
-    )
-    owner_only = store_mod._parse_sddl_dacl("D:PAI(A;;FA;;;S-1-5-21-1-2-3-1001)")
-    mixed = store_mod._parse_sddl_dacl("D:AI(A;;FA;;;S-1-5-21-1-2-3-1001)(A;ID;FA;;;SY)")
-    assert inheriting is not None and store_mod._dacl_inherits_only(inheriting)
-    assert owner_only is not None and not store_mod._dacl_inherits_only(owner_only)
-    assert mixed is not None and not store_mod._dacl_inherits_only(mixed)
+def test_an_exact_trio_dacl_is_recognised_and_nothing_else_is() -> None:
+    grants = (_SY, _BA, _TI)
+    exact = store_mod._parse_sddl_dacl(f"D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_TI})")
+    inheriting = store_mod._parse_sddl_dacl(f"D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{_TI})")
+    extra = store_mod._parse_sddl_dacl(f"D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{_TI})(A;;FR;;;BU)")
+    missing = store_mod._parse_sddl_dacl("D:PAI(A;;FA;;;SY)(A;;FA;;;BA)")
+    # A stale entry marked inherited, as a file moved in from a broad directory keeps (measured).
+    stale = store_mod._parse_sddl_dacl(f"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;ID;FR;;;{_TI})")
+    assert exact is not None and store_mod._trio_dacl_is_exact(exact, grants)
+    for label, dacl in (
+        ("inheriting", inheriting),
+        ("extra", extra),
+        ("missing", missing),
+        ("stale", stale),
+    ):
+        assert dacl is not None and not store_mod._trio_dacl_is_exact(dacl, grants), label
 
 
-def test_off_windows_the_store_file_still_gets_the_owner_only_restriction(
+def test_without_hardened_grants_the_store_file_gets_the_owner_only_restriction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The new path is Windows-only; everywhere else it must hand straight to _secure_file.
     seen: list[Path] = []
     monkeypatch.setattr(store_mod, "_secure_file", lambda path, **_kw: seen.append(path))
-    monkeypatch.setattr(store_mod.os, "name", "posix")
     target = tmp_path / "s.db"
-    store_mod._secure_store_file(target, dir_confines=True)
-    assert seen == [target]
+    store_mod._secure_store_file(target, dir_grants=None)
+    monkeypatch.setattr(store_mod, "_is_windows", lambda: False)
+    store_mod._secure_store_file(target, dir_grants=(_SY,))
+    assert seen == [target, target]
 
 
-# --- the real mechanism, on Windows ------------------------------------------------------------
+async def test_open_applies_the_hardened_rule_to_the_store_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The wiring, on every platform and without elevation: open must ask about the store's OWN
+    # directory and pass that answer to every trio file it secures. RED before the fix: open called
+    # _secure_file_async directly, so neither seam was consulted.
+    asked: list[Path] = []
+    secured: list[tuple[str, object]] = []
+
+    def _grants_for(directory: Path) -> tuple[str, ...]:
+        asked.append(directory)
+        return (_SY,)
+
+    monkeypatch.setattr(store_mod, "_store_dir_grants", _grants_for)
+    monkeypatch.setattr(
+        store_mod,
+        "_secure_store_file",
+        lambda path, *, dir_grants: secured.append((path.name, dir_grants)),
+    )
+    store = await store_mod.MessageStore.open(tmp_path / "wired.db")
+    await store.close()
+    assert asked == [tmp_path]
+    assert ("wired.db", (_SY,)) in secured, secured
+
+
+# --- the real mechanism, on Windows ---------------------------------------------------------------
 
 
 def _run(argv: list[str]) -> str:
@@ -137,13 +188,21 @@ def _my_sid() -> str:
 
 
 def _sddl_of(path: Path, scratch: Path) -> str:
-    """The DACL of ``path`` as SDDL, read by ``icacls /save`` -- independent of the ctypes reader, and
+    """The DACL of ``path`` as SDDL, read by ``icacls /save``: independent of the ctypes reader, and
     language-independent. It needs more than READ_CONTROL, so it works only where the caller has an
     explicit or group grant on the file."""
     out = scratch / f"acl-{path.name}.txt"
     _run([_icacls(), str(path), "/save", str(out)])
     text = out.read_bytes().decode("utf-16-le").lstrip("\ufeff")
     return [line for line in text.splitlines() if line.strip()][1]
+
+
+def _read_back(path: Path) -> store_mod._SddlDacl:
+    sddl = store_mod._read_dacl_sddl(path)
+    assert sddl is not None, f"the owner could not read the DACL of {path} back"
+    dacl = store_mod._parse_sddl_dacl(sddl)
+    assert dacl is not None, sddl
+    return dacl
 
 
 def _harden(directory: Path) -> None:
@@ -162,102 +221,128 @@ def _harden(directory: Path) -> None:
 
 
 def _release(directory: Path, sid: str) -> None:
-    # Hand the directory back to the test user so pytest can clean it up. The owner keeps WRITE_DAC.
-    subprocess.run(  # noqa: S603
+    # Hand the tree back to the test user so pytest can clean it up; the owner keeps WRITE_DAC.
+    result = subprocess.run(  # noqa: S603
         [_icacls(), str(directory), "/grant", f"*{sid}:(OI)(CI)F", "/T", "/C"],
         check=False,
         capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"cleanup could not restore access to {directory}: {result.stdout}"
     )
 
 
 @_windows_only
-def test_a_store_file_in_a_hardened_directory_inherits_the_directory(tmp_path: Path) -> None:
-    """The fix itself, runnable without elevation. The file is made owner-only first, the way the old
-    re-secure left it, and the directory is then hardened. Its owner keeps READ_CONTROL and WRITE_DAC,
-    so it can still be re-secured and read back although the owner cannot create files there.
+def test_a_store_file_gets_exactly_the_hardened_principals(tmp_path: Path) -> None:
+    """The file step, without elevation. The file starts the way the old re-secure left it (its opener
+    alone) plus a stale explicit BUILTIN\\Users read, as a moved-in or restored file can carry. It must
+    end protected, naming exactly SYSTEM, Administrators and the service account, and nobody else.
 
-    RED before the fix: the open path's restriction rewrote the file to its opener alone, so the
-    service account (here TrustedInstaller's SID) and Administrators had no entry."""
+    RED before the fix: the restriction rewrote it to the opener alone, so the service account and
+    Administrators had no entry (and Wave 0 saw exactly that under NSSM)."""
     me = _my_sid()
     data = tmp_path / "data"
     data.mkdir()
     db = data / "messagefoundry.db"
     db.write_bytes(b"")
-    _run([_icacls(), str(db), "/inheritance:r", "/grant:r", f"*{me}:F"])
+    _run([_icacls(), str(db), "/inheritance:r", "/grant:r", f"*{me}:F", "*S-1-5-32-545:R"])
     _harden(data)
     try:
-        confines = store_mod._store_dir_confines(data)
-        assert confines, (
-            f"a directory hardened like the installer's did not confine: {_sddl_of(data, tmp_path)}"
-        )
-        store_mod._secure_store_file(db, dir_confines=confines)
-        sddl = store_mod._read_dacl_sddl(db)
-        assert sddl is not None, "the owner could not read the DACL back"
-        dacl = store_mod._parse_sddl_dacl(sddl)
-        assert dacl is not None
-        assert not dacl.protected, "the store file still blocks inheritance"
-        sids = {sid for _type, _flags, sid in dacl.aces}
-        assert sids == {"SY", "BA", _TI}, (
-            f"expected exactly SYSTEM, Administrators and the service: {dacl}"
-        )
-        assert store_mod._dacl_inherits_only(dacl), dacl
+        store_mod._secure_store_file(db, dir_grants=(_SY, _BA, _TI))
+        dacl = _read_back(db)
+        assert store_mod._trio_dacl_is_exact(dacl, (_SY, _BA, _TI)), dacl
     finally:
         _release(data, me)
 
 
 @_windows_only
-def test_a_store_file_outside_a_hardened_directory_stays_owner_only(tmp_path: Path) -> None:
-    # A developer checkout or a temp directory inherits a broad parent, so the old owner-only
-    # restriction must still apply there: this is the half of ADR 0163's property the fix keeps.
+def test_an_exact_store_file_is_left_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The service account holds Modify, not WRITE_DAC, so a second opener that rewrote an already
+    # exact DACL would fail and warn on every start. It must not try.
     me = _my_sid()
     db = tmp_path / "messagefoundry.db"
     db.write_bytes(b"")
-    confines = store_mod._store_dir_confines(tmp_path)
-    assert not confines
-    store_mod._secure_store_file(db, dir_confines=confines)
-    dacl = store_mod._parse_sddl_dacl(_sddl_of(db, tmp_path))
-    assert dacl is not None and dacl.protected
-    assert {sid for _t, _f, sid in dacl.aces} == {me}, dacl
+    _run(
+        [
+            _icacls(),
+            str(db),
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:F",
+            "*S-1-5-32-544:F",
+            f"*{_TI}:M",
+        ]
+    )
+    try:
+        calls: list[tuple[str, ...]] = []
+
+        def _record(path: Path, *args: object) -> bool:
+            calls.append(tuple(str(a) for a in args))
+            return True
+
+        monkeypatch.setattr(store_mod, "_write_trio_dacl", _record)
+        store_mod._secure_store_file(db, dir_grants=(_SY, _BA, _TI))
+        assert calls == [], f"an exact store file was rewritten: {calls}"
+    finally:
+        _release(tmp_path, me)
+
+
+@_windows_only
+def test_a_directory_owned_by_a_standard_user_is_not_hardened(tmp_path: Path) -> None:
+    # Its owner keeps WRITE_DAC over it, so its entries do not bind the owner; the rule must refuse it
+    # even with the installer's exact entries. Runs only where the test user is NOT an elevated
+    # administrator, since an elevated user's new directory is owned by Administrators.
+    if _elevated():
+        pytest.skip("an elevated user's directory is owned by Administrators, not by the user")
+    me = _my_sid()
+    data = tmp_path / "data"
+    data.mkdir()
+    _harden(data)
+    try:
+        assert store_mod._store_dir_grants(data) is None
+    finally:
+        _release(data, me)
+
+
+@_windows_only
+def test_a_store_directory_reached_through_a_junction_is_not_hardened(tmp_path: Path) -> None:
+    # A junction has its own DACL, while files created through it inherit the TARGET's (measured).
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    _run(["cmd.exe", "/c", "mklink", "/J", str(link), str(target)])
+    try:
+        assert store_mod._reaches_through_a_link(link)
+        assert not store_mod._reaches_through_a_link(target)
+        assert store_mod._store_dir_grants(link) is None
+    finally:
+        subprocess.run(["cmd.exe", "/c", "rmdir", str(link)], check=False, capture_output=True)  # noqa: S603
+
+
+@_windows_only
+def test_a_store_outside_a_hardened_directory_stays_owner_only(tmp_path: Path) -> None:
+    # A developer checkout or a temp directory: the half of ADR 0163's property the fix keeps.
+    me = _my_sid()
+    db = tmp_path / "messagefoundry.db"
+    db.write_bytes(b"")
+    grants = store_mod._store_dir_grants(tmp_path)
+    assert grants is None
+    store_mod._secure_store_file(db, dir_grants=grants)
+    dacl = _read_back(db)
+    assert dacl.protected and {sid for _t, _f, sid in dacl.aces} == {me}, dacl
 
 
 @_windows_only
 def test_the_dacl_reader_agrees_with_icacls(tmp_path: Path) -> None:
-    # The hardened-directory tests read back through _read_dacl_sddl, so check it against icacls
-    # /save on a file both can read. Without this, a reader returning the wrong file's DACL, or a
-    # stale one, would pass those tests.
+    # The Windows tests read back through _read_dacl_sddl, so check it against icacls /save on a file
+    # both can read. Without this, a reader returning the wrong file's DACL would pass them.
     db = tmp_path / "agree.db"
     db.write_bytes(b"")
     _run([_icacls(), str(db), "/inheritance:r", "/grant:r", f"*{_my_sid()}:F", "*S-1-5-18:R"])
     ours = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(db) or "")
     theirs = store_mod._parse_sddl_dacl(_sddl_of(db, tmp_path))
     assert ours is not None and ours == theirs, (ours, theirs)
-
-
-@_windows_only
-def test_a_file_already_inheriting_a_hardened_directory_is_left_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The service account holds Modify, not WRITE_DAC, so a second opener that rewrote an already
-    # correct DACL would fail and log a warning on every start. It must not try.
-    me = _my_sid()
-    data = tmp_path / "data"
-    data.mkdir()
-    db = data / "messagefoundry.db"
-    db.write_bytes(b"")
-    _harden(data)
-    try:
-        calls: list[list[str]] = []
-        real = store_mod.subprocess.run
-
-        def _spy(argv: list[str], *args: object, **kwargs: object) -> object:
-            calls.append(list(argv))
-            return real(argv, *args, **kwargs)  # type: ignore[call-overload]
-
-        monkeypatch.setattr(store_mod.subprocess, "run", _spy)
-        store_mod._secure_store_file(db, dir_confines=True)
-        assert calls == [], f"an already-inheriting store file was rewritten: {calls}"
-    finally:
-        _release(data, me)
 
 
 def _elevated() -> bool:
@@ -273,20 +358,21 @@ def _elevated() -> bool:
     reason="needs an elevated token: it opens a store inside a directory only SYSTEM, "
     "Administrators and a service account may write (the hosted Windows legs are elevated)",
 )
-async def test_open_in_a_hardened_directory_leaves_the_trio_to_the_directory(
+async def test_open_in_a_hardened_directory_grants_the_directorys_principals(
     tmp_path: Path,
 ) -> None:
-    """End to end through MessageStore.open, as an elevated operator in an installer-shaped directory.
-    RED before the fix: the .db came back protected, granting the operator alone."""
+    """End to end through MessageStore.open, as an elevated operator in an installer-shaped directory
+    (an elevated user's new directory is owned by Administrators). RED before the fix: the .db came
+    back protected, granting the operator alone."""
     me = _my_sid()
     data = tmp_path / "data"
     data.mkdir()
     _harden(data)
     try:
+        assert store_mod._store_dir_grants(data) == (_SY, _BA, _TI)
         store = await store_mod.MessageStore.open(data / "messagefoundry.db")
         await store.close()
-        dacl = store_mod._parse_sddl_dacl(_sddl_of(data / "messagefoundry.db", tmp_path))
-        assert dacl is not None and not dacl.protected, dacl
-        assert {sid for _t, _f, sid in dacl.aces} == {"SY", "BA", _TI}, dacl
+        dacl = _read_back(data / "messagefoundry.db")
+        assert store_mod._trio_dacl_is_exact(dacl, (_SY, _BA, _TI)), dacl
     finally:
         _release(data, me)

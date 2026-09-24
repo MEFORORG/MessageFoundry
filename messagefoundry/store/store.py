@@ -2740,15 +2740,15 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
 
 
 async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
-    """:func:`_secure_file` dispatched off the event loop — for the two callers that run ON one.
+    """:func:`_secure_file` dispatched off the event loop, for a caller that runs ON one.
 
     On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
     straight from a coroutine, that span is dead time for every other task on the loop: a deploying
     site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
     DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
     ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
-    off it). ``MessageStore.open`` secures three files, but it completes before the API serves and
-    before any listener binds, so its stall has nothing to stall.
+    off it). ``MessageStore.open`` secures its three files through :func:`_secure_store_file`, also
+    dispatched off the loop.
 
     The synchronous :func:`_secure_file` stays the callable for every caller that is NOT on a loop —
     the CLI key/cert writers, the lifespan bootstrap admin, and the ``config/*_edit.py`` writers
@@ -2767,41 +2767,57 @@ async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | N
 # `_secure_file` rewrites a file to its opener ALONE. For the store trio that made whichever identity
 # opened a fresh store first its only principal, measured on hosted windows-2022 and windows-2025 (CI
 # run 36026471545): an operator's `provision-admin` locked the NSSM service account out, and the
-# service locked the operator out. Neither process can know the other's identity -- the CLI cannot
-# see the service's account, the service cannot know which administrator comes later -- so no grant
-# NAMED by the opener fixes both orders.
+# service locked the operator out. Neither process can name the other -- the CLI cannot see the
+# service's account, the service cannot know which administrator comes later -- so no grant keyed on
+# the OPENER fixes both orders.
 #
 # The data directory already names the right set. install-service.ps1 removes its inheritance and
-# grants SYSTEM, BUILTIN\Administrators and the run-as account, inherited by files. So where the
-# store's directory is HARDENED like that, the trio INHERITS the directory instead of being rewritten
-# to its opener. Everywhere else -- a developer checkout, a temp directory, any directory that admits
-# a principal outside that set -- the owner-only rewrite applies exactly as before. The test is an
-# ALLOW-list, so a directory granting anyone else, or one this code cannot parse, falls back to it.
+# grants SYSTEM, BUILTIN\Administrators and the run-as account. So where the store's directory is
+# HARDENED like that, every open writes the SAME explicit, protected DACL on the trio: SYSTEM and
+# Administrators full control, and the one per-service account Modify. It does not depend on who
+# opens, so the second opener finds it already exact and needs no WRITE_DAC; it is protected, so a
+# later edit to the directory does not reach the store. Anywhere else -- a developer checkout, a temp
+# directory, a directory admitting anyone else, one reached through a link, or one this code cannot
+# read -- the owner-only rewrite applies exactly as before. Every test below is an ALLOW-list.
 
-#: SDDL aliases the confinement test resolves. Any other alias names a principal outside the set.
+#: SDDL aliases the hardening test resolves. Any other alias names a principal outside the set.
 _SDDL_SID_ALIASES: Mapping[str, str] = MappingProxyType({"SY": "S-1-5-18", "BA": "S-1-5-32-544"})
 #: NT AUTHORITY\SYSTEM and BUILTIN\Administrators.
-_STORE_DIR_TRUSTED_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544"})
+_STORE_DIR_TRUSTED_SIDS = ("S-1-5-18", "S-1-5-32-544")
 #: One per-service virtual account, NT SERVICE\<name>: S-1-5-80 plus exactly five sub-authorities.
 #: NT SERVICE\ALL SERVICES is S-1-5-80-0 and does NOT match, because it admits every service.
 _SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+")
 _SDDL_DENY_TYPES = frozenset({"D", "OD", "XD"})
 _SDDL_ACE = re.compile(r"\(([^()]*)\)")
+_SDDL_OWNER = re.compile(r"O:(S-[0-9-]+|[A-Z]{2})")
+#: The SDDL right for each principal of the trio: full control (FA) for SYSTEM and Administrators,
+#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for the service.
+_TRIO_RIGHTS: Mapping[str, str] = MappingProxyType({"S-1-5-18": "FA", "S-1-5-32-544": "FA"})
+_SERVICE_RIGHTS = "0x1301bf"
 
 
 @dataclass(frozen=True)
 class _SddlDacl:
-    """A DACL read from SDDL: whether inheritance is blocked, and each ACE as (type, flags, sid)."""
+    """A security descriptor read from SDDL: its owner (when requested), whether the DACL blocks
+    inheritance, and each ACE as (type, flags, sid) with SYSTEM/Administrators aliases resolved."""
 
     protected: bool
     aces: tuple[tuple[str, str, str], ...]
+    owner: str | None = None
+
+
+def _resolve_sid(sid: str) -> str:
+    return _SDDL_SID_ALIASES.get(sid, sid)
 
 
 def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
-    """The ``D:`` section of an SDDL string, or ``None`` when it is absent or not plainly parseable.
+    """The owner and ``D:`` section of an SDDL string, or ``None`` when the DACL is absent or not
+    plainly parseable.
 
-    ``None`` is the fail-closed answer: every caller treats it as "not confined", so a shape this does
+    ``None`` is the fail-closed answer: every caller treats it as "not hardened", so a shape this does
     not understand (a callback ACE, a resource attribute, a null DACL) gets the owner-only rewrite."""
+    owner_match = _SDDL_OWNER.search(sddl)
+    owner = _resolve_sid(owner_match.group(1)) if owner_match else None
     start = sddl.find("D:")
     if start < 0:
         return None
@@ -2819,41 +2835,64 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
         parts = match.group(1).split(";")
         if len(parts) != 6:
             return None
-        aces.append((parts[0], parts[1], parts[5]))
+        aces.append((parts[0], parts[1], _resolve_sid(parts[5])))
     # Anything left over once the ACEs are removed is a shape this parser does not model.
     if _SDDL_ACE.sub("", rest).strip():
         return None
-    return _SddlDacl(protected="P" in flags, aces=tuple(aces))
+    return _SddlDacl(protected="P" in flags, aces=tuple(aces), owner=owner)
 
 
-def _dacl_confines_store(dacl: _SddlDacl) -> bool:
-    """Does this directory DACL confine a store to SYSTEM, Administrators and per-service accounts?
+def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
+    """The principals the trio is granted when ``directory`` is HARDENED, else ``None``.
 
-    It must block inheritance, and every non-deny ACE must name one of those principals. A deny entry
-    only narrows access, so it cannot let anyone else in."""
-    if not dacl.protected or not dacl.aces:
-        return False
-    for ace_type, _flags, sid in dacl.aces:
+    Hardened means all of: inheritance blocked; every non-deny ACE an allow ACE naming SYSTEM,
+    Administrators, or ONE per-service account (a second one is refused: the data directory has one
+    run-as account); an owner of SYSTEM, Administrators or that service account, because an owner
+    keeps WRITE_DAC over the directory; and at least one allow ACE. A deny entry only narrows access.
+    The answer is SYSTEM, Administrators and the service account (when there is one) -- never more
+    than the directory grants, and never who happens to be opening."""
+    if not directory.protected:
+        return None
+    services: set[str] = set()
+    allows = 0
+    for ace_type, _flags, sid in directory.aces:
         if ace_type in _SDDL_DENY_TYPES:
             continue
         if ace_type != "A":
+            return None
+        allows += 1
+        if sid in _STORE_DIR_TRUSTED_SIDS:
+            continue
+        if not _SERVICE_SID.fullmatch(sid):
+            return None
+        services.add(sid)
+    if allows == 0 or len(services) > 1:
+        return None
+    if directory.owner is None or (
+        directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
+    ):
+        return None
+    return (*_STORE_DIR_TRUSTED_SIDS, *sorted(services))
+
+
+def _trio_dacl_is_exact(dacl: _SddlDacl, grants: Sequence[str]) -> bool:
+    """Does this file DACL already carry exactly ``grants``: protected, explicit allow ACEs only, one
+    per principal? Rights are not compared; a weakened right fails the open loudly, not silently."""
+    if not dacl.protected or len(dacl.aces) != len(grants):
+        return False
+    for ace_type, flags, _sid in dacl.aces:
+        if ace_type != "A" or "ID" in flags:
             return False
-        resolved = _SDDL_SID_ALIASES.get(sid, sid)
-        if resolved not in _STORE_DIR_TRUSTED_SIDS and not _SERVICE_SID.fullmatch(resolved):
-            return False
-    return True
+    return {sid for _t, _f, sid in dacl.aces} == set(grants)
 
 
-def _dacl_inherits_only(dacl: _SddlDacl) -> bool:
-    """Is this file DACL purely inherited (not protected, and every ACE carries the ``ID`` flag)?"""
-    return (not dacl.protected) and bool(dacl.aces) and all("ID" in f for _t, f, _s in dacl.aces)
+def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
+    """The DACL of ``path`` (and its owner, when asked) as SDDL, or ``None`` when it cannot be read.
+    Windows only.
 
-
-def _read_dacl_sddl(path: Path) -> str | None:
-    """The DACL of ``path`` as SDDL, or ``None`` when it cannot be read. Windows only.
-
-    GetNamedSecurityInfoW asks for DACL_SECURITY_INFORMATION alone, so it needs only READ_CONTROL,
-    and SDDL names principals by SID, so the answer does not depend on the display language."""
+    GetNamedSecurityInfoW asks for the DACL and owner alone, so it needs only READ_CONTROL, and SDDL
+    names principals by SID, so the answer does not depend on the display language. A failure is
+    logged with its Win32 status, because the caller then falls back to the owner-only rewrite."""
     if sys.platform != "win32":
         return None
     import ctypes
@@ -2883,26 +2922,23 @@ def _read_dacl_sddl(path: Path) -> str | None:
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.restype = ctypes.c_void_p
     se_file_object = 1
-    dacl_security_information = 0x4
+    info = 0x4 | (0x1 if owner else 0)  # DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION
     sddl_revision_1 = 1
     descriptor = ctypes.c_void_p()
     status = advapi32.GetNamedSecurityInfoW(
-        str(path),
-        se_file_object,
-        dacl_security_information,
-        None,
-        None,
-        None,
-        None,
-        ctypes.byref(descriptor),
+        str(path), se_file_object, info, None, None, None, None, ctypes.byref(descriptor)
     )
     if status != 0:
+        log.warning("could not read the DACL of %s (Win32 status %s)", path, status)
         return None
     try:
         text = wintypes.LPWSTR()
         if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor, sddl_revision_1, dacl_security_information, ctypes.byref(text), None
+            descriptor, sddl_revision_1, info, ctypes.byref(text), None
         ):
+            log.warning(
+                "could not render the DACL of %s (Win32 status %s)", path, ctypes.get_last_error()
+            )
             return None
         try:
             return text.value
@@ -2912,52 +2948,134 @@ def _read_dacl_sddl(path: Path) -> str | None:
         kernel32.LocalFree(descriptor)
 
 
-def _store_dir_confines(directory: Path) -> bool:
-    """Is the store's directory hardened (see :func:`_dacl_confines_store`)? ``False`` off Windows,
-    and whenever the DACL cannot be read or parsed -- both fall back to the owner-only rewrite."""
-    if os.name != "nt":
-        return False
-    sddl = _read_dacl_sddl(directory)
+def _is_windows() -> bool:
+    """A seam the tests patch, instead of patching the process-wide ``os.name``."""
+    return os.name == "nt"
+
+
+def _reaches_through_a_link(path: Path) -> bool:
+    """Does ``path`` or any component above it resolve somewhere else (a junction or a symlink)?
+
+    A link has its OWN security descriptor: measured, GetNamedSecurityInfoW on a junction returns the
+    junction's DACL while files created through it inherit the target's. So a hardened link over a
+    broad target would pass the test while the store landed in the broad directory. Refused outright."""
+    try:
+        return os.path.normcase(os.path.realpath(path)) != os.path.normcase(os.path.abspath(path))
+    except OSError:
+        return True
+
+
+def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
+    """The trio grants for a store in ``directory`` (see :func:`_hardened_trio_grants`), or ``None``
+    for the owner-only rewrite: off Windows, through a link, or when the DACL cannot be read or
+    parsed."""
+    if not _is_windows() or _reaches_through_a_link(directory):
+        return None
+    sddl = _read_dacl_sddl(directory, owner=True)
     if sddl is None:
+        return None
+    parsed = _parse_sddl_dacl(sddl)
+    return None if parsed is None else _hardened_trio_grants(parsed)
+
+
+def _write_trio_dacl(path: Path, grants: Sequence[str]) -> bool:
+    """Replace the DACL of ``path`` with a PROTECTED one naming exactly ``grants``, in one call; log and
+    return ``False`` on failure. Windows only. A seam for tests.
+
+    One SetNamedSecurityInfoW call rather than icacls, for two measured reasons: icacls cannot drop
+    an unnamed principal's explicit entry while granting, so it takes two calls, and after the first
+    of them a caller whose access was only that entry is refused by the second (exit 5). Setting the
+    whole DACL at once needs only WRITE_DAC, which the owner always holds, and leaves no intermediate
+    state. It is a Win32 API, not a program on a search path, so nothing can be planted in its place."""
+    if sys.platform != "win32":
         return False
-    dacl = _parse_sddl_dacl(sddl)
-    return dacl is not None and _dacl_confines_store(dacl)
+    import ctypes
+    from ctypes import wintypes
+
+    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS)};;;{sid})" for sid in grants)
+    sddl = f"D:P{aces}"
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+    ]
+    convert.restype = wintypes.BOOL
+    get_dacl = advapi32.GetSecurityDescriptorDacl
+    get_dacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_dacl.restype = wintypes.BOOL
+    set_info = advapi32.SetNamedSecurityInfoW
+    set_info.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    set_info.restype = wintypes.DWORD
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    descriptor = ctypes.c_void_p()
+    if not convert(sddl, 1, ctypes.byref(descriptor), None):
+        log.warning(
+            "could not restrict %s: its DACL %s did not convert (Win32 status %s)",
+            path,
+            sddl,
+            ctypes.get_last_error(),
+        )
+        return False
+    try:
+        present, defaulted = wintypes.BOOL(), wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        if not get_dacl(
+            descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)
+        ):
+            log.warning("could not restrict %s (Win32 status %s)", path, ctypes.get_last_error())
+            return False
+        se_file_object = 1
+        info = 0x4 | 0x80000000  # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        status = set_info(str(path), se_file_object, info, None, None, dacl, None)
+        if status != 0:
+            log.warning(
+                "could not restrict %s to its hardened directory's principals (Win32 status %s)",
+                path,
+                status,
+            )
+            return False
+        return True
+    finally:
+        kernel32.LocalFree(descriptor)
 
 
-def _secure_store_file(path: Path, *, dir_confines: bool) -> None:
-    """Restrict one file of the SQLite store trio.
+def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
+    """Restrict one file of the SQLite store trio, or a restored store.
 
-    Outside a hardened directory, or off Windows, this is :func:`_secure_file`: owner-only, exactly as
-    before. Inside one, the file is left to INHERIT the directory -- SYSTEM, Administrators and the
-    per-service account the installer granted -- so the service and the operator who provisions the
-    store can both open it, in either order. A file already purely inheriting is left untouched: the
-    service account holds Modify, not WRITE_DAC, so rewriting a correct DACL would fail and warn on
-    every start. Otherwise ``icacls /reset`` drops explicit entries and restores inheritance. Like
-    :func:`_secure_file` it is best-effort and logs rather than raises."""
-    if os.name != "nt" or not dir_confines:
+    ``dir_grants`` is :func:`_store_dir_grants` of the file's directory. ``None`` -- off Windows, or
+    outside a hardened directory -- is :func:`_secure_file`, owner-only, exactly as before. Otherwise
+    the file gets an explicit, protected DACL naming exactly those principals, which is the same
+    whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
+    one). A file already exact is left untouched: the service account holds Modify, not WRITE_DAC, so
+    rewriting a correct DACL it does not own would fail and warn on every start. A file reached
+    through a link is refused, as for the directory. Best-effort, like :func:`_secure_file`: it logs
+    rather than raises."""
+    if dir_grants is None or not _is_windows() or _reaches_through_a_link(path):
         _secure_file(path)
         return
     current = _read_dacl_sddl(path)
     parsed = _parse_sddl_dacl(current) if current is not None else None
-    if parsed is not None and _dacl_inherits_only(parsed):
+    if parsed is not None and _trio_dacl_is_exact(parsed, dir_grants):
         return
-    try:
-        result = subprocess.run(  # nosec B603 B607
-            [_system_exe("icacls.exe"), str(path), "/reset"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError as exc:
-        log.warning("could not restore inheritance on %s: %s", path, exc)
-        return
-    if result.returncode != 0:
-        log.warning(
-            "icacls could not restrict %s to its hardened directory (exit %s): %s",
-            path,
-            result.returncode,
-            (result.stderr or result.stdout or "").strip(),
-        )
+    _write_trio_dacl(path, dir_grants)
 
 
 def _opt_float(value: Any) -> float | None:
@@ -3946,14 +4064,14 @@ class MessageStore:
                 # ADR 0183 Wave 0b: in a HARDENED data directory the trio inherits the directory, so
                 # the service account and the provisioning operator can both open it in either order;
                 # elsewhere it is rewritten owner-only as before. See _secure_store_file.
-                confines = await asyncio.to_thread(_store_dir_confines, main.parent)
+                grants = await asyncio.to_thread(_store_dir_grants, main.parent)
                 for f in (
                     main,
                     main.with_name(main.name + "-wal"),
                     main.with_name(main.name + "-shm"),
                 ):
                     if f.exists():
-                        await asyncio.to_thread(_secure_store_file, f, dir_confines=confines)
+                        await asyncio.to_thread(_secure_store_file, f, dir_grants=grants)
             store = cls(
                 db,
                 path=path,

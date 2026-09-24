@@ -209,9 +209,10 @@ path** (no separate at-rest tier):
 `icacls` (inheritance off) through `_secure_file()`
 ([store/store.py](../messagefoundry/store/store.py)), **except** in a data directory hardened the way
 `install-service.ps1` leaves it (inheritance removed; every entry names SYSTEM,
-`BUILTIN\Administrators` or one per-service account). There the three files inherit exactly that set,
-so the service account and the operator running `provision-admin` can both open the store in either
-order ([ADR 0163](adr/0163-first-run-provisioning-without-a-default-account-the-not-present-arm-via-an-engine-consumed-request.md),
+`BUILTIN\Administrators` or one per-service account; owned by one of those). There each file
+gets an explicit, protected DACL naming exactly that set, so the service account and the operator
+running `provision-admin` can both open the store in either order; it reaches every elevated local
+Administrator, not only the one who provisioned ([ADR 0163](adr/0163-first-run-provisioning-without-a-default-account-the-not-present-arm-via-an-engine-consumed-request.md),
 note of 2026-09-24). It is best-effort and non-fatal: a skipped or
 failed restriction is **logged** (STORE-2), with directory-level ACLs ([SERVICE.md](SERVICE.md)) as
 the backstop. **This is the SQLite tier only.** On SQL Server / Postgres the engine creates no database

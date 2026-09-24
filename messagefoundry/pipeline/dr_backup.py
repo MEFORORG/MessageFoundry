@@ -2066,8 +2066,10 @@ def _place_restored_store(src: Path, dest: Path) -> int:
     it is locked down the way ``Store.snapshot_to`` locks its own output down."""
     import shutil
 
-    # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path.
-    from messagefoundry.store.store import _secure_file
+    # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path. It is the
+    # store-trio rule, not bare _secure_file: restored into a hardened data directory, an owner-only
+    # file would lock the service account out of the store it is about to open (ADR 0183 Wave 0b).
+    from messagefoundry.store.store import _secure_store_file, _store_dir_grants
 
     size = src.stat().st_size
     try:
@@ -2094,7 +2096,7 @@ def _place_restored_store(src: Path, dest: Path) -> int:
             # has closed the handle, which Windows requires before an unlink.
             if not placed:
                 dest.unlink(missing_ok=True)
-    _secure_file(dest)
+    _secure_store_file(dest, dir_grants=_store_dir_grants(dest.parent))
     return size
 
 
