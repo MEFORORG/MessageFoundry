@@ -696,7 +696,11 @@ async def test_must_change_password_blocks_websocket(engine: Engine) -> None:
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     admin = await create_admin(service)
-    admin_token = (await service.login(admin.username, admin.password)).token
+    admin_login = await service.login(admin.username, admin.password)
+    # A failed login would leave no token, and a token-less WS is refused too, which would pass the
+    # denial below for the wrong reason.
+    assert admin_login.ok and admin_login.token is not None
+    admin_token = admin_login.token
     # the not-yet-rotated admin (holds monitoring:read) is denied the WS
     denied = await authorize_ws(_FakeWS(service, admin_token), Permission.MONITORING_READ)  # type: ignore[arg-type]
     assert denied is None
@@ -805,6 +809,9 @@ async def _assert_http_grant_deny_precision(store: object) -> None:
     # sits ABOVE the permission loop — leaving it on would refuse every request with auth.mfa_denied
     # before any grant/deny row could be written, testing the wrong guard.
     service = AuthService(store, AuthSettings(require_mfa=False))  # type: ignore[arg-type]
+    # The exact audit counts below need a fresh store. This asks it the same way in every mode,
+    # which a check on initialize()'s return value (the first-run account) no longer does.
+    assert await store.count_users() == 0  # type: ignore[attr-defined]
     await service.initialize()
     await _add(service, "adm", Role.ADMINISTRATOR)  # holds approvals:approve + messages:purge
     await _add(service, "op", Role.OPERATOR)  # holds messages:purge, NOT approvals:approve

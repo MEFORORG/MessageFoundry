@@ -23,7 +23,7 @@ from messagefoundry.auth.notifications import (
     ROLES_CHANGED,
     SecurityEvent,
 )
-from messagefoundry.auth.service import AuthService, IssuedCredential
+from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService, IssuedCredential
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, create_admin
@@ -63,7 +63,7 @@ async def _claim(service: AuthService, username: str, one_time_password: str) ->
 
 async def _claim_bootstrap(service: AuthService, boot_password: str) -> str:
     """:func:`_claim` for the bootstrap admin, whose name is fixed."""
-    return await _claim(service, "admin", boot_password)
+    return await _claim(service, BOOTSTRAP_USERNAME, boot_password)
 
 
 async def test_bootstrap_admin_created_once_and_can_log_in() -> None:
