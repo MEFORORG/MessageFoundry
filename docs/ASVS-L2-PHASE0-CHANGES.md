@@ -153,9 +153,12 @@ for, not how it is protected before it gets there.
 > `scripts/service/import-db-ca.ps1`, which installs a trust anchor into the machine root store. It
 > also includes `scripts/service/install-service.ps1`, which checks the service wrapper against a
 > pinned SHA-256. That script ADDS TLS 1.2 to the enabled protocols with `-bor`, which is not a floor,
-> so the pinned hash is the control that holds. Both arms run as `--non-python-operations` in the
-> `ide` CI job. **They are not merge-gating**: that job is not a required context, so the required
-> green still says nothing about non-Python crypto beyond randomness.
+> so the pinned hash is the control that holds. Both arms run as `--non-python-operations` in their
+> own `crypto-operations` CI job (owner decision 2026-09-24). It has no path gate, so it reports on
+> every pull request. **It blocks a merge only once branch protection requires its context.**
+> [`.github/required-contexts.txt`](../.github/required-contexts.txt) is the checked-in record of
+> that set. Until protection names it, the required green still says nothing about non-Python
+> crypto beyond randomness.
 
 | Asset | Algorithm / detail | Source / storage | Lifecycle |
 |---|---|---|---|

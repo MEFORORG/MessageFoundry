@@ -662,10 +662,9 @@ def test_a_method_rule_is_not_guessed_on_a_resolvable_first_party_call() -> None
 
 # --- BACKLOG #1164: the NON-PYTHON operation arm ---------------------------------------------------
 #
-# Every test here runs over a FIXTURE repo, never the real tree. That is deliberate: this arm is not
-# merge-gating, and a real-tree assertion on this required pytest leg would make it gating by the
-# back door. These pin the instrument's mechanics; whether the tree is clean is the `ide` job's
-# report, and making that count is the owner's branch-protection decision.
+# Every test here runs over a FIXTURE repo, never the real tree. These pin the instrument's
+# mechanics. Whether the real tree is clean is the report of the `crypto-operations` job in ci.yml,
+# which the owner chose on 2026-09-24 as this arm's gate.
 
 
 def test_non_python_operation_patterns_map_into_the_taxonomy() -> None:
@@ -748,7 +747,7 @@ def test_the_non_python_arm_refuses_an_empty_walk_and_reports_stale_rows(
     assert any(v.startswith("ide/src/gone.ts: inventory lists") for v in violations), violations
 
 
-# --- BACKLOG #1164: the PowerShell operation arm (same non-gating mode, fixtures only) ------------
+# --- BACKLOG #1164: the PowerShell operation arm (same mode, fixtures only) -----------------------
 
 
 def test_powershell_patterns_and_inventory_map_into_the_taxonomy() -> None:

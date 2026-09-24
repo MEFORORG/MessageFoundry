@@ -102,8 +102,8 @@ import pytest
 # (``ide/src/cspNonce.ts`` draws CSPRNG bytes from ``node:crypto``; ``ide/src/engineClient.ts`` pins a
 # TLS floor), none of which any Python walker can see. The crypto gate's non-Python arms read them
 # instead: randomness under the required run (BACKLOG #1172), every operation class under
-# ``--non-python-operations`` in the non-required ``ide`` job (BACKLOG #1164). This comment
-# previously stated the exclusion as a property of the tree and that was the wrong fact.
+# ``--non-python-operations`` in its own ``crypto-operations`` job in ci.yml (BACKLOG #1164).
+# This comment previously stated the exclusion as a property of the tree and that was the wrong fact.
 #
 # ``scripts/`` is walked by neither the ReDoS nor the single-JSON/URL-parser clause: it is
 # build/release tooling not reachable from untrusted input, and the retired release-sync checker

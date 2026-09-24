@@ -96,9 +96,9 @@ request, and the console's WebAuthn ceremony in ``static/app.js``) is found by a
 :func:`check_powershell_operations`, reads the ``.ps1`` and ``.psm1`` files under ``scripts/``,
 including the
 operator deployment path that installs a trust anchor and verifies a pinned service binary. Both
-run only under ``--non-python-operations``, from the ``ide`` CI job, which is not a required
-context: they report, and they do not block a merge. So the required green still says nothing
-about non-Python crypto beyond randomness.
+run only under ``--non-python-operations``, from their own ``crypto-operations`` CI job. Where that
+job runs, and what decides whether it blocks a merge, is stated once, at
+``NON_PYTHON_OPERATION_PATTERNS``.
 
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
@@ -151,7 +151,8 @@ import crypto_operations  # noqa: E402
 # this gate's green now means "no undocumented crypto in the PYTHON of five roots, AND no
 # undocumented or weak RANDOMNESS source in the non-Python roots". The randomness half is the only
 # non-Python claim the REQUIRED run supports. The extension's TLS floor is found by the operation arm
-# (:func:`check_non_python_operations`, BACKLOG #1164), which is not merge-gating.
+# (:func:`check_non_python_operations`, BACKLOG #1164), which runs in its own CI job; see
+# ``NON_PYTHON_OPERATION_PATTERNS`` for where, and for who answers whether it gates a merge.
 # ``samples/`` is absent by design too, on the SAME rationale as the ``ide/`` exclusion (ASVS 11.1.3):
 # it is author-space EXAMPLE config, not shipped engine code, so its crypto (e.g. a content-fingerprint
 # ``hashlib.sha256`` in a sample Handler) is out of the deployed-system inventory scope — the gate
@@ -1594,14 +1595,17 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
 
 
 # --------------------------------------------------------------------------------------------
-# The NON-PYTHON OPERATION arm (BACKLOG #1164, ASVS 11.1.3). NOT MERGE-GATING, on purpose.
+# The NON-PYTHON OPERATION arm (BACKLOG #1164, ASVS 11.1.3). ITS OWN CI JOB.
 # --------------------------------------------------------------------------------------------
 # The randomness arm above reads the non-Python roots for ONE operation class. This arm reads them
 # for every class in the operation taxonomy, by pattern, so the extension's TLS floor and the
 # console's WebAuthn ceremony stop being invisible. It runs only under ``--non-python-operations``,
-# which CI invokes from the ``ide`` job. That job is not a required context and ``ci-gate`` does
-# not need it, so a red here is visible but does not block a merge. Making it count is a
-# branch-protection decision that belongs to the owner, not to this file.
+# which CI invokes from the ``crypto-operations`` job in ci.yml (owner decision 2026-09-24). That
+# job has no path gate, so it reports on every pull request, push to main and merge-queue entry.
+# It blocks a merge only while BRANCH PROTECTION requires its context, a server setting this file
+# cannot see; ``.github/required-contexts.txt`` is the checked-in record of that set. A job that
+# reports is not thereby a job that gates. So until protection names it, the required green still
+# says nothing about non-Python crypto beyond randomness.
 #
 # A PATTERN INSTRUMENT, NOT A PARSER. It matches option keys (``minVersion:``) anywhere, not only
 # inside a TLS options object, which errs toward reporting. What it cannot see is listed with every
@@ -1766,7 +1770,7 @@ def check_non_python_operations(repo: Path) -> tuple[list[str], int, dict[str, f
 
 
 # --------------------------------------------------------------------------------------------
-# The POWERSHELL operation arm (BACKLOG #1164). Same mode, same non-gating CI step.
+# The POWERSHELL operation arm (BACKLOG #1164). Same mode, same CI job as the arm above.
 # --------------------------------------------------------------------------------------------
 # ``scripts/`` is a Python walk root, and it also holds the repository's PowerShell: the coordination
 # tooling and, more to the point, the operator deployment path in ``scripts/service/``, which
@@ -2009,7 +2013,7 @@ def _main_non_python_operations() -> int:
         return 1
     print(
         "crypto-inventory (non-Python operations): OK - no undocumented or stale operation. "
-        "Pattern-level, so AT LEAST this; and NOT merge-gating (see NON_PYTHON_OPERATION_PATTERNS)."
+        "Pattern-level, so AT LEAST this (see NON_PYTHON_OPERATION_PATTERNS)."
     )
     return 0
 
