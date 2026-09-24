@@ -16,6 +16,7 @@ Lives in ``pipeline/`` (next to the operator alert plumbing it reuses) and impor
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 
 from messagefoundry.auth.notifications import (
@@ -78,6 +79,21 @@ _DESCRIPTIONS = {
 }
 
 
+def _utc_stamp(ts: object) -> str | None:
+    """A deadline instant in the format every other surface states it in, or ``None``.
+
+    Same format and same refusal as ``messagefoundry.api.security.deadline_utc``, which this module
+    cannot import (``pipeline`` sits below ``api``). ``tests/test_security_notify.py`` pins the two
+    to one string. ``None`` for a value that is not a number or cannot be rendered, so the caller
+    drops the sentence rather than failing the send."""
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _build_body(event: SecurityEvent) -> str:
     """A short, PHI-free notice. The recipient is the account owner, so naming their own account /
     source IP / new email is appropriate; no message data or secrets ever appear here."""
@@ -89,6 +105,15 @@ def _build_body(event: SecurityEvent) -> str:
     failed = event.detail.get("failed_attempts")
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
+    if event.event_type == PASSWORD_RESET:
+        # BACKLOG #1141 (ASVS 6.4.5): the renewal instruction for an expiring credential, sent to the
+        # holder. `expires_at` is the instant the login gate refuses on, read off the stored stamp.
+        expires = _utc_stamp(event.detail.get("expires_at"))
+        if expires is not None:
+            lines.append(
+                f"The temporary password stops working at {expires}. Sign in with it and choose "
+                "a new password before then."
+            )
     if event.event_type == EMAIL_CHANGED:
         # BACKLOG #1139: an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL, not a repoint, and
         # it must not render as the repoint wording minus a line. "Was changed" with the new value
