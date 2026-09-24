@@ -14,6 +14,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   editor and the rename planner refuse it before writing, and the Corepoint importer folds a
   generated connection name that would fail it. **Migration:** rename such connections to fit the pattern;
   stored history stays under the old name. ([BACKLOG #1107](docs/BACKLOG.md))
+- **`POST /cluster/stepdown` now drains a node that has already self-fenced.** Such a node has
+  cleared its leader flag, but its lease row stays live until `leader_lease_ttl_seconds` runs out.
+  In 0.4.0 the stepdown sent no write there and answered `409` "not the current leader", while
+  `GET /cluster/nodes` still named the node as `lease_owner`. Now the stepdown expires that row and
+  answers `200`, so a standby can take the lease at once. `ClusterStepdownResult` and the
+  `cluster_stepdown` audit row gain a `lease_released` field, which says whether the call expired a
+  lease row naming this node. A self-fenced drain reads `was_leader: false, lease_released: true`.
+  The endpoint answers `409` only when both are false. A retry after a `release-unconfirmed` `503`
+  now answers `200` while the row still names this node, and `409` once a standby has taken it.
+  The new field changes the web console engine UI seam, so install the engine and the console
+  together. ([BACKLOG #1508](docs/BACKLOG.md))
+- **Documented: leader preference does not steer a planned failover.** A stepdown writes the lease
+  expiry as zero, so every promotable sibling can take a released lease on its next heartbeat,
+  whatever its `acquire_delay_seconds`. The delay still applies to a lease that expired on its own.
+  No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
+  pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
 - **The DICOM C-STORE SCP no longer answers Success for an object the engine does not accept.**
   The SCP's `max_object_bytes` defaults to 128 MiB, but the engine's binary ingress records any
