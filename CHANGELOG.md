@@ -21,6 +21,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   would see that partner fail to open the message after its relay has already accepted it**, so the
   failure would surface on the partner's side, not as a send error here.
   ([BACKLOG #1168](docs/BACKLOG.md))
+- **An opt-in refusal of backend hops on an unchanging credential, and an inventory of every such
+  hop.** `[security].require_nonstatic_credentials` ships off. When on, `serve` refuses every backend
+  hop that presents a password, API key, static token or no credential at all, unless
+  `[security].static_credential_accepted` names it with a reason. The inventory covers the connection
+  graph and six service-settings sections. It appears in `GET /security/posture` as
+  `static_credential_hops`, served `Cache-Control: no-store`, and in `messagefoundry check`. Each
+  hop's detail names its peer as scheme, host and port only. **BREAKING for anything that parses
+  `check` output:** the `static-db-credentials` check line is renamed `static-credentials`, because it
+  now covers every backend hop and not only database hops. ([BACKLOG #1182](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

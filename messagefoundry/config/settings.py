@@ -4570,9 +4570,9 @@ class SecuritySettings(_Section):
     # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
     # any hop that config/static_credentials.py's static_credential_hops() names lacks an entry in
     # static_credential_accepted below; the refuse/warn split is [security].enforcement, exactly like
-    # [store].require_managed_identity. The settings half ([store], [alerts], [auth], [ai], [secrets])
-    # is checked before anything starts; the graph half at every graph load and /config/reload, where
-    # a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
+    # [store].require_managed_identity. The settings half (six sections: [store], [secrets],
+    # [alerts], [ai], [auth] and [logging]) is checked before anything starts; the graph half at every
+    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
     # (among them the alert webhook, DICOMweb, Tcp, X12, a File alternate-share credential, a
     # forward-proxy credential, FTP, SMTP AUTH, a Postgres store, Vault tokens, the AI broker key, OIDC
     # client_secret and the LDAP bind; each hop's compliant_kind field is the source of record), so

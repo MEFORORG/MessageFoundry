@@ -303,7 +303,7 @@ async def test_the_posture_view_carries_the_inventory_and_its_scope(tmp_path: Pa
     assert hops["OB_REST"]["credential"] == "static"
     assert hops["settings:store"]["accepted"] is False
     assert "OB_SMART" not in hops
-    assert body["static_credential_hops_scope"] is None
+    assert body["static_credential_hops_scope"].startswith("complete:")
     assert _SECRET not in str(body)
 
 
@@ -363,3 +363,75 @@ async def test_a_first_load_refusal_closes_the_store(tmp_path: Path) -> None:
         t for t in threading.enumerate() if t.ident not in before and not t.daemon and t.is_alive()
     ]
     assert leaked == []
+
+
+# --- the probes, on every surface a detail reaches ------------------------------------------------
+#
+# A detail reaches GET /security/posture, `messagefoundry check`, the serve refusal (the refusal
+# text, raised as a WiringError at the first graph load) and a WARNING log line (the same text under
+# enforcement = warn). Each surface is driven over the probe graph, whose addresses carry the
+# secrets the earlier label let through.
+
+
+def _assert_probe_free(text: str) -> None:
+    from tests.test_static_credential_hops import PROBE_SECRETS
+
+    for secret in PROBE_SECRETS:
+        assert secret not in text, secret
+    # The control: the probe hops ARE on this surface, so the absence above is the label's doing.
+    assert "proxy.corp.invalid:3128" in text and "OB_PROBE_PATH" in text
+
+
+def _probe_config(tmp_path: Path) -> Path:
+    from tests.test_static_credential_hops import write_probe_graph
+
+    cfg = tmp_path / "cfg"
+    write_probe_graph(cfg)
+    return cfg
+
+
+def test_the_probes_do_not_reach_the_serve_refusal(tmp_path: Path) -> None:
+    registry = load_config(_probe_config(tmp_path), allow_empty=True)
+    with pytest.raises(WiringError) as exc:
+        _guard(_settings(gate=True))(registry)
+    _assert_probe_free(str(exc.value))
+
+
+def test_the_probes_do_not_reach_the_warning_log_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry = load_config(_probe_config(tmp_path), allow_empty=True)
+    with caplog.at_level(logging.WARNING):
+        _guard(_settings(gate=True), enforcing=False)(registry)
+    _assert_probe_free(caplog.text)
+
+
+def test_the_probes_do_not_reach_the_check_line(tmp_path: Path) -> None:
+    from messagefoundry.checks import run_checks
+
+    cfg = _probe_config(tmp_path)
+    result = next(
+        r
+        for r in run_checks(cfg, run_lint=False, suppress_service_toml_search=True).results
+        if r.name == "static-credentials"
+    )
+    _assert_probe_free(str(result.detail))
+
+
+async def test_the_probes_do_not_reach_the_posture_response(tmp_path: Path) -> None:
+    import httpx
+
+    from messagefoundry.api.app import create_app
+
+    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng.add_registry(load_config(_probe_config(tmp_path), allow_empty=True))
+    app = create_app(eng, allow_no_auth=True)
+    app.state.static_credential_settings = _settings(gate=False)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            resp = await client.get("/security/posture")
+    finally:
+        await eng.stop()
+    _assert_probe_free(resp.text)
+    assert resp.headers.get("cache-control") == "no-store"

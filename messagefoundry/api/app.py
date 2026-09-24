@@ -83,6 +83,8 @@ from messagefoundry.api.metrics import (
     render_metrics,
 )
 from messagefoundry.api.models import (
+    STATIC_CREDENTIAL_HOPS_COMPLETE,
+    STATIC_CREDENTIAL_HOPS_PARTIAL,
     STORE_PRIVILEGE_NOT_PROBED,
     AiChatRequest,
     AiChatResponse,
@@ -1904,6 +1906,7 @@ def create_app(
     @app.get("/security/posture", response_model=SecurityPosture)
     async def security_posture(
         request: Request,
+        response: Response,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> SecurityPosture:
@@ -2016,7 +2019,15 @@ def create_app(
             )
             if missing
         ]
-        static_hops_scope = f"not read: {'; '.join(unseen)}" if unseen else None
+        static_hops_scope = (
+            STATIC_CREDENTIAL_HOPS_PARTIAL + "; ".join(unseen)
+            if unseen
+            else STATIC_CREDENTIAL_HOPS_COMPLETE
+        )
+        # The inventory names every weak backend hop and its peer, which is a map worth not leaving in
+        # a browser or proxy cache. Set per route, as auth_routes._no_store does for a token-bearing
+        # reply, because no _NO_STORE_PREFIXES family reaches /security.
+        response.headers["Cache-Control"] = "no-store"
         store_privilege_view = (
             StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
             if store_privilege is None

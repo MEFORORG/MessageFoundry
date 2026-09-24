@@ -14,8 +14,8 @@ the classification the owner ruled on 2026-08-22 and funded on 2026-09-22.
 :func:`~messagefoundry.config.wiring.accepted_cleartext_hops` and its siblings: every surface that
 reports or gates the set calls it, so no two of them can disagree. It has two halves because the engine
 keeps its hops in two places: the connection graph (a ``Registry``) and the service settings
-(``[store]``, ``[alerts]``, ``[auth]``, ``[ai]``, ``[secrets]``). A caller passes ``None`` for a half it
-cannot see, and must then say so in its own output rather than report a subset as if it were
+(``[store]``, ``[secrets]``, ``[alerts]``, ``[ai]``, ``[auth]`` and ``[logging]``). A caller passes
+``None`` for a half it cannot see, and must then say so in its own output rather than report a subset as if it were
 everything.
 
 **What counts as a hop here.** A hop the engine DIALS, where the engine is the party that would have to
@@ -58,8 +58,13 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   any, sits under a driver keyword the engine cannot enumerate. See ``static_credential_db_hops``.
 
 Pure apart from :func:`apply_static_credential_gate`, which also logs: every function reads its
-arguments and touches nothing else. None renders a secret value, only the NAME of the setting that
-holds one."""
+arguments and touches nothing else.
+
+**A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
+set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
+a scheme, a host and a port and nothing else; userinfo, path, query and fragment are never copied, and
+an address that does not parse is withheld behind fixed text. Where a detail names a credential it
+names the SETTING that holds it, never the value."""
 
 from __future__ import annotations
 
@@ -104,7 +109,8 @@ class StaticCredentialHop:
     """One backend hop that does not meet ASVS 13.2.1's credential verb.
 
     ``name`` is the hop's identity: the key an operator opts it out with. ``detail`` names what the hop
-    presents and its peer, and never carries a secret value. ``compliant_kind`` says whether the
+    presents and its peer as scheme, host and port; the module docstring says why it cannot carry a
+    secret. ``compliant_kind`` says whether the
     product offers a compliant credential kind for this hop in any configuration."""
 
     name: str
@@ -121,15 +127,6 @@ class StaticCredentialHop:
 _HTTP_FAMILY = frozenset(
     {ConnectorType.REST, ConnectorType.FHIR, ConnectorType.SOAP, ConnectorType.DICOMWEB}
 )
-
-
-def _peer(settings: Mapping[str, Any]) -> str:
-    """``wiring._peer_label`` with any query string and fragment cut off.
-
-    The label already masks URL userinfo and renders an unresolved ``env()`` as its key. It keeps the
-    query, and a query can carry a credential (``?api_key=...``). This label reaches a startup refusal
-    and the reload log, so the query goes: the scheme, host and path are enough to name the peer."""
-    return _peer_label(settings).split("?", 1)[0].split("#", 1)[0]
 
 
 def _smart(settings: Mapping[str, Any]) -> bool:
@@ -210,11 +207,14 @@ def _proxy_hop(
     proxy_url = settings.get("proxy_url") or site_proxy
     if site_proxy is not None and not proxy_url:
         return None  # no proxy at all: the credential is never sent
+    # From a closed set, not echoed: only a known scheme name reaches the detail.
     kind = str(settings.get("proxy_auth_type") or "basic")
+    if kind not in ("basic", "digest"):
+        kind = "static"
     return StaticCredentialHop(
         f"proxy:{name}",
         "static",
-        f"forward-proxy {kind} credential ({_peer({'url': proxy_url})})",
+        f"forward-proxy {kind} credential ({_peer_label({'url': proxy_url})})",
         False,
     )
 
@@ -239,7 +239,7 @@ def _connection_hop(
     name: str, ctype: ConnectorType, settings: Mapping[str, Any]
 ) -> StaticCredentialHop | None:
     """Classify one dialled connection's own hop. DATABASE is not here: the database arm owns it."""
-    peer = _peer(settings)
+    peer = _peer_label(settings)
     if ctype in (ConnectorType.MLLP, ConnectorType.DIMSE):
         # The client certificate is loaded only into a TLS context; with tls off it is never sent.
         if settings.get("tls") and settings.get("tls_cert_file"):
@@ -301,7 +301,9 @@ def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCreden
             out.append(proxy)
     for lk in registry.fhir_lookups.values():
         name = f"fhir_lookup:{lk.name}"
-        hop = _http_hop(name, ConnectorType.FHIR, lk.settings, _peer(lk.settings), lookup=True)
+        hop = _http_hop(
+            name, ConnectorType.FHIR, lk.settings, _peer_label(lk.settings), lookup=True
+        )
         if hop is not None:
             out.append(hop)
         if proxy := _proxy_hop(name, lk.settings, site_proxy):
@@ -442,8 +444,8 @@ def apply_static_credential_gate(
     Returns the refusal message when a hop in that half has no opt-out, else ``None``; the caller
     refuses or warns on ``[security].enforcement``. Logs, at WARNING, one line per honoured opt-out
     (hop name and the operator's reason: this is the startup audit of every opt-out) and one line per
-    opt-out that matches no hop in this half. Never logs a secret: a hop's detail names the setting,
-    not its value. Returns ``None`` without reading or logging anything when the gate is off."""
+    opt-out that matches no hop in this half. The lines carry hop names, the operator's own reasons
+    and details, and a detail cannot carry a secret (see the module docstring). Returns ``None`` without reading or logging anything when the gate is off."""
     security = settings.security
     if not security.require_nonstatic_credentials:
         return None

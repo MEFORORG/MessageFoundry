@@ -53,11 +53,11 @@ section reference.
 | Sign-in & identity | `require_sign_in` | `true` |
 | | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
+| | `sign_out_after_idle_minutes` | `30` |
+| | `max_session_hours` | `12` |
 | Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
 | Backend credentials | `require_nonstatic_credentials` | `false` (*not* a loosening — it TIGHTENS, refusing backend hops on a static credential or none. Opt-in by owner decision, because several hops have no compliant kind in the product) |
 | | `static_credential_accepted` | `{}` (each opt-out is a loosening while `require_nonstatic_credentials` is on, and is reported as `static_credential_accepted`; with the refusal off an opt-out does nothing and is not reported) |
-| | `sign_out_after_idle_minutes` | `30` |
-| | `max_session_hours` | `12` |
 | Data handling | `block_unlisted_outbound` | `true` |
 | | `delete_message_bodies_after_days` | `30` (`0` = keep forever) |
 | | `allow_keeping_phi_indefinitely` | `false` |
@@ -328,6 +328,26 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   where that clamp degrades to the *unclamped* escape and would provide no refusal at all. So this cell
   gets an explicit `[security]` acknowledgment instead — the first verify-off hop governed that way.
 - **Still refused:** nothing here relaxes the connectors. This switch reaches the `[alerts]` cell only.
+
+### `static_credential_accepted` — a backend hop runs on an unchanging credential while the refusal is on
+This deviation exists only while `require_nonstatic_credentials = true`. With the refusal off, nothing
+is refused, so an opt-out does nothing and is not reported.
+
+- **What you lose:** for each hop you name, ASVS 13.2.1's ask that a backend hop use a service
+  account, a short-term token or a certificate. The named hop presents a password, an API key, a static
+  bearer token or a Vault token, or presents nothing at all. Whoever holds that credential can use it
+  until someone rotates it by hand.
+- **When acceptable:** the hop has no compliant credential kind in the product. Each hop's
+  `compliant_kind` says so. The alert webhook, DICOMweb, `Tcp`, `X12`, FTP, SMTP AUTH, a forward proxy,
+  a Postgres store, the Vault tokens, the AI broker key, the OIDC `client_secret` and the LDAP bind are
+  at least some of these. Where a compliant kind exists, move the hop to it rather than opting out.
+- **Compensating controls:** every opt-out needs a written reason, and a blank one is refused at load.
+  Serve logs each honoured opt-out at WARNING with the hop name and the reason, and it also logs an
+  opt-out that matches no hop. `security_loosenings()` names the opt-outs.
+  `GET /security/posture` marks each opted-out hop `accepted`, and `messagefoundry check` marks it
+  `[opted out]`.
+- **What the reports show:** each hop's detail names what it presents and its peer, as scheme, host
+  and port only. It never shows the credential, a URL path or a query.
 
 ### `enforcement = warn` — warn instead of refuse on the PHI serve-gate floor
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the

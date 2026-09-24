@@ -668,7 +668,8 @@ def test_expiry_relaxed_hops_never_leaks_a_url_credential() -> None:
     )
     peers = dict(expiry_relaxed_hops(reg))
     assert "hunter2" not in peers["OB_REST"]
-    assert peers["OB_REST"] == "https://svc:***@api.example/ingest"
+    # BACKLOG #1182: the label keeps scheme, host and port only, so the user and the path go too.
+    assert peers["OB_REST"] == "https://api.example"
     assert peers["OB_ENV"] == "env(partner_host):7"
 
 

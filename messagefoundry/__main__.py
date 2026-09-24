@@ -1713,8 +1713,8 @@ def _serve(args: argparse.Namespace) -> int:
     # Static-credential refusal (BACKLOG #1182, ASVS 13.2.1), OPT-IN and off by default (owner decision
     # 2026-09-23). [security].require_nonstatic_credentials refuses every backend hop that presents an
     # unchanging credential or none unless [security].static_credential_accepted names it. Two halves,
-    # one reader: the SETTINGS half ([store], [alerts], [auth], [ai], [secrets]) is checked here, before
-    # anything starts; the GRAPH half is checked by the registry guard below at the first graph load and
+    # one reader: the SETTINGS half ([store], [secrets], [alerts], [ai], [auth], [logging]) is checked
+    # here, before anything starts; the GRAPH half is checked by the registry guard below at the first graph load and
     # on every /config/reload, because the graph is not loaded in this function (load_config executes
     # operator code, so it is not run twice). Same refuse/warn split as require_managed_identity above.
     # Each honoured opt-out is logged at WARNING, which the root lastResort handler surfaces before

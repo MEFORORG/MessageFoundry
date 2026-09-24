@@ -25,7 +25,12 @@ from messagefoundry.config.static_credentials import (
     evaluate_static_credential_gate,
     static_credential_hops,
 )
-from messagefoundry.config.wiring import Registry, load_config, static_credential_db_hops
+from messagefoundry.config.wiring import (
+    Registry,
+    _peer_label,
+    load_config,
+    static_credential_db_hops,
+)
 
 _MODULE = """
 from messagefoundry import (
@@ -371,4 +376,112 @@ def test_a_query_string_never_reaches_a_detail(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (hop,) = static_credential_hops(registry=load_config(cfg, allow_empty=True), settings=None)
-    assert "SEKRIT" not in hop.detail and "a.example.invalid/x" in hop.detail
+    assert "SEKRIT" not in hop.detail and "frag" not in hop.detail
+    # The path goes too: a webhook path can itself be the secret. Scheme and host name the peer.
+    assert "(https://a.example.invalid)" in hop.detail
+
+
+# --- a detail cannot carry a secret, by construction ---------------------------------------------
+#
+# The reviewer's four probes against the earlier label, which masked only the password half of a
+# URL's userinfo. The label now carries scheme, host and port and nothing else, and it says so with a
+# fixed placeholder when the address does not parse, rather than echoing the raw string.
+
+#: A graph whose every address carries a secret the old label let through. Each goes through a real
+#: factory, so a probe the factories refuse outright would fail here rather than test nothing.
+PROBE_MODULE = """
+from messagefoundry import MLLP, Rest, env, outbound
+
+# 1. A proxy URL with no scheme: the old label kept the whole password.
+outbound("OB_PROBE_PROXY", Rest(url="https://p1.example.invalid/x",
+    proxy="user:S3CRET@proxy.corp.invalid:3128", proxy_user="u", proxy_password=env("ppw")))
+# 2. A key-only userinfo (the key is the user half): the old label kept the key.
+outbound("OB_PROBE_KEY", Rest(url="https://p2.example.invalid/x",
+    proxy="http://sk_live_ABC123:@proxy2.example.invalid:3128", proxy_user="u",
+    proxy_password=env("ppw")))
+outbound("OB_PROBE_KEY_HOST", MLLP(host="sk_live_KEY9:@mllp.example.invalid", port=2575))
+# 3. A secret in the path, as a webhook URL carries one.
+outbound("OB_PROBE_PATH", Rest(url="https://hooks.example.invalid/services/T/B/CAPSECRET"))
+# 4. An @ in the query: the old label named b.c as the host.
+outbound("OB_PROBE_QUERY_AT", Rest(url="https://api.example.invalid:8443/x?e=a@b.c"))
+"""
+
+#: Every secret-bearing fragment of the probes. None may appear in any detail.
+PROBE_SECRETS = ("S3CRET", "sk_live_ABC123", "sk_live_KEY9", "CAPSECRET", "services", "b.c", "e=a")
+
+#: What each probe's detail must still name, so a label that emitted nothing would not pass.
+PROBE_PEERS = {
+    "proxy:OB_PROBE_PROXY": "(proxy.corp.invalid:3128)",
+    "proxy:OB_PROBE_KEY": "(http://proxy2.example.invalid:3128)",
+    "OB_PROBE_KEY_HOST": "(mllp.example.invalid:2575)",
+    "OB_PROBE_PATH": "(https://hooks.example.invalid)",
+}
+
+
+def write_probe_graph(cfg: Path) -> None:
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(PROBE_MODULE, encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def probe_hops(tmp_path_factory: pytest.TempPathFactory) -> dict[str, StaticCredentialHop]:
+    cfg = tmp_path_factory.mktemp("probe_hops") / "config"
+    write_probe_graph(cfg)
+    hops = static_credential_hops(registry=load_config(cfg, allow_empty=True), settings=None)
+    return {h.name: h for h in hops}
+
+
+def test_no_probe_secret_reaches_a_detail(probe_hops: dict[str, StaticCredentialHop]) -> None:
+    assert set(PROBE_PEERS) | {"OB_PROBE_QUERY_AT"} <= set(probe_hops)
+    for hop in probe_hops.values():
+        for secret in PROBE_SECRETS:
+            assert secret not in hop.detail, hop
+        assert "@" not in hop.detail and "?" not in hop.detail, hop
+
+
+def test_each_probe_still_names_its_host(probe_hops: dict[str, StaticCredentialHop]) -> None:
+    for name, peer in PROBE_PEERS.items():
+        assert peer in probe_hops[name].detail, probe_hops[name]
+
+
+def test_an_at_outside_the_authority_names_no_host(
+    probe_hops: dict[str, StaticCredentialHop],
+) -> None:
+    """``?e=a@b.c`` and a password holding an unencoded ``/`` look the same to a parser, so the label
+    names no host rather than guess. The old label named ``b.c``."""
+    detail = probe_hops["OB_PROBE_QUERY_AT"].detail
+    assert "api.example.invalid" not in detail and "withheld" in detail
+
+
+@pytest.mark.parametrize(
+    ("settings", "label"),
+    [
+        ({"host": "h.example.invalid", "port": 2575}, "h.example.invalid:2575"),
+        ({"url": "https://a.example.invalid:8443/p?q=1#f"}, "https://a.example.invalid:8443"),
+        ({"url": "https://[2001:db8::1]:443/p"}, "https://[2001:db8::1]:443"),
+        ({"url": "user:S3CRET@proxy.corp.invalid:3128"}, "proxy.corp.invalid:3128"),
+        ({"url": "https://sk_live_ABC123:@api.example.invalid/"}, "https://api.example.invalid"),
+        ({"server": "db.example.invalid"}, "db.example.invalid"),
+        ({"server": "tcp:db.example.invalid,1433"}, "db.example.invalid,1433"),
+        ({"server": r"db.example.invalid\INST"}, r"db.example.invalid\INST"),
+        ({}, "(unknown peer)"),
+    ],
+)
+def test_the_label_keeps_scheme_host_and_port(settings: dict[str, object], label: str) -> None:
+    assert _peer_label(settings) == label
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://user:12/34@host.example.invalid/",  # a password holding an unencoded "/"
+        "https://sk_live_A?B@host.example.invalid/",  # a key holding an unencoded "?"
+        "https://user%3AS3CRET%40host.example.invalid/",  # an encoded userinfo in the host
+        "https://host.example.invalid:S3CRET/",  # a non-numeric port
+        "not a url at all S3CRET",
+    ],
+)
+def test_an_unparseable_address_is_withheld_not_echoed(value: str) -> None:
+    label = _peer_label({"url": value})
+    assert "S3CRET" not in label and "sk_live" not in label and "12" not in label
+    assert "withheld" in label
