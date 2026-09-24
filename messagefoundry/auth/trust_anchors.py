@@ -58,7 +58,7 @@ log = logging.getLogger(__name__)
 #: The audit action for every trust-anchor observation. One action so an operator can filter the whole
 #: family, and so :func:`_last_fingerprint` can find the prior load. The ``event`` field in the detail
 #: carries which one: ``observed`` (baseline), ``changed``, ``pin_mismatch``, ``acl_insecure``, and
-#: ``acl_indeterminate`` (the ACL could not be read at all — BACKLOG #1142).
+#: ``acl_indeterminate`` (the ACL could not be determined — BACKLOG #1142).
 AUDIT_ACTION = "auth.trust_anchor"
 
 
@@ -122,84 +122,111 @@ def _normalize_pin(pin: str) -> str:
 #: non-owner can substitute the anchor. SYSTEM and Administrators are deliberately absent: they are
 #: already trusted (they can rewrite any file regardless).
 #:
-#: The English display names, matched as a lowercase substring of the icacls principal token (so
-#: ``BUILTIN\Users`` and ``DOMAIN\Domain Users`` both match). This half is **at least** these and can
-#: never be complete: ``icacls`` resolves a SID to its *localized* name by default, so a German
-#: ``Jeder`` or a Spanish ``Todos`` is Everyone under a name this set does not carry. The SID half
-#: below is the locale-invariant matcher; this one is a convenience for the host that speaks English.
-#: The ``NT AUTHORITY\`` prefix is kept on the three pseudo-groups so a real account named
-#: ``DOMAIN\ServiceAccount`` is not mistaken for ``NT AUTHORITY\SERVICE``.
-_BROAD_PRINCIPAL_NAMES: tuple[str, ...] = (
-    "everyone",
-    "authenticated users",
-    "\\users",  # BUILTIN\Users or DOMAIN\Users
-    "domain users",
-    "nt authority\\interactive",
-    "nt authority\\service",
-    "nt authority\\batch",
-    "creator owner",
+#: The English display names, in two sets, both matched WHOLE rather than as substrings. A substring
+#: match read an ordinary account such as ``DESKTOP-A\usersync`` as ``\Users``, and a false "broad"
+#: refuses a secure anchor under enforce. This half is **at least** these and can never be complete:
+#: ``icacls`` resolves a SID to its *localized* name by default, so a German ``Jeder`` or a Spanish
+#: ``Todos`` is Everyone under a name this set does not carry. The SID half below is the
+#: locale-invariant matcher; this one is a convenience for the host that speaks English.
+#:
+#: Whole principal tokens. ``NT AUTHORITY\`` stays on the pseudo-groups so an account named
+#: ``DOMAIN\Service`` is not read as ``NT AUTHORITY\SERVICE``, and ``Local account`` is whole so
+#: ``Local account and member of Administrators group`` (trusted, as Administrators) is not caught.
+_BROAD_PRINCIPAL_NAMES: frozenset[str] = frozenset(
+    {
+        "everyone",
+        "nt authority\\authenticated users",
+        "nt authority\\interactive",
+        "nt authority\\service",
+        "nt authority\\batch",
+        "nt authority\\network",
+        "nt authority\\anonymous logon",
+        "nt authority\\local account",
+    }
 )
 
-#: The locale-invariant half: well-known SIDs, matched **whole** against the principal token (icacls
-#: renders an unresolvable SID with a leading ``*``). Whole-token matching is load-bearing rather than
-#: tidiness — as substrings, ``S-1-5-3`` (BATCH) is a prefix of ``S-1-5-32-544``
-#: (``BUILTIN\Administrators``, deliberately trusted) and ``S-1-5-11`` (Authenticated Users) of
-#: ``S-1-5-113`` (Local Account), so a substring set would report the administrators ACE that sits on
-#: every ordinary Windows file as a broad-principal write.
+#: Group names matched whole against the part after the LAST ``\`` of the token, under any qualifier:
+#: ``BUILTIN\Users``, ``DOMAIN\Users`` and ``DOMAIN\Domain Users`` all match.
+_BROAD_GROUP_LEAF_NAMES: frozenset[str] = frozenset(
+    {"users", "domain users", "guests", "domain guests", "authenticated users"}
+)
+
+#: The locale-invariant half: well-known SIDs, matched **whole** against the principal token, with or
+#: without a leading ``*`` (plain ``icacls`` printed an unresolvable SID with none, measured on
+#: Windows 11). Whole-token matching is load-bearing rather than tidiness: as substrings,
+#: ``S-1-5-3`` (BATCH) is a prefix of ``S-1-5-32-544`` (``BUILTIN\Administrators``, deliberately
+#: trusted) and ``S-1-5-11`` (Authenticated Users) of ``S-1-5-114`` (local administrators), so a
+#: substring set would report the administrators ACE that sits on every ordinary Windows file as a
+#: broad-principal write.
 _BROAD_PRINCIPAL_SIDS: frozenset[str] = frozenset(
     {
         "s-1-1-0",  # Everyone
         "s-1-5-11",  # Authenticated Users
         "s-1-5-32-545",  # BUILTIN\Users
+        "s-1-5-32-546",  # BUILTIN\Guests
+        "s-1-5-2",  # NT AUTHORITY\NETWORK
+        "s-1-5-3",  # NT AUTHORITY\BATCH
         "s-1-5-4",  # NT AUTHORITY\INTERACTIVE
         "s-1-5-6",  # NT AUTHORITY\SERVICE
-        "s-1-5-3",  # NT AUTHORITY\BATCH
-        "s-1-3-0",  # CREATOR OWNER
+        "s-1-5-7",  # NT AUTHORITY\ANONYMOUS LOGON
+        "s-1-5-113",  # NT AUTHORITY\Local account (every local user)
     }
 )
 
-# INTERACTIVE / SERVICE / BATCH / CREATOR OWNER are broad here and are *trusted* by
-# ``_evaluate_config_dacl`` (``messagefoundry/config/wiring.py``). That divergence is deliberate: the
-# config guard is handed the object's owner SID and can therefore resolve the CREATOR OWNER
-# placeholder to a principal it already trusts, while this parser is handed text and no owner, so it
-# cannot tell the owner from any other creator. Measured on Windows 11: ``icacls`` on a file in a
-# temp directory or a user profile lists only SYSTEM, Administrators and the owner, so none of the
-# four fires on an ordinary anchor placement — whereas ``icacls C:\Users\Public`` lists
-# ``NT AUTHORITY\INTERACTIVE:(OI)(CI)(IO)(M,DC)`` and the same for SERVICE and BATCH, which
-# object-inherit propagates as ``(I)(M)`` onto every file created there. An anchor placed in that
-# directory is modifiable by every interactive logon, and before BACKLOG #1142 it read as owner-only.
+#: Domain-relative RIDs that are broad in every domain: an unresolved ``S-1-5-21-<domain>-<rid>``.
+_BROAD_DOMAIN_RIDS: frozenset[str] = frozenset({"513", "514"})  # Domain Users, Domain Guests
 
-#: icacls right tokens that permit modifying the file's contents (simple + specific write masks).
+# INTERACTIVE, SERVICE and BATCH are broad here, as ``_evaluate_config_dacl``
+# (``messagefoundry/config/wiring.py``) also refuses them. Commit 0adde6059 measured why on
+# Windows 11: ``icacls C:\Users\Public`` lists ``NT AUTHORITY\INTERACTIVE:(OI)(CI)(IO)(M,DC)`` and
+# the same for SERVICE and BATCH, which object-inherit propagates as ``(I)(M)`` onto every file
+# created there. An anchor placed in that directory is modifiable by every interactive logon, and
+# before BACKLOG #1142 it read as owner-only.
+#
+# CREATOR OWNER and OWNER RIGHTS are NOT broad, matching wiring.py's trusted set. OWNER RIGHTS
+# (S-1-3-4) carries the current owner's rights. CREATOR OWNER (S-1-3-0) is a placeholder that no
+# logon token ever carries, so an ACE for it on a file grants nobody anything.
+
+#: icacls right tokens that permit modifying or replacing the file (simple + specific write masks).
+#: DELETE (``D``/``DE``) is here because deleting an anchor and planting a new one replaces it, and
+#: wiring.py's write mask counts DELETE too.
 _WRITE_RIGHTS: frozenset[str] = frozenset(
-    {"F", "M", "W", "WD", "AD", "WEA", "WA", "WO", "WDAC", "GA", "GW"}
+    {"F", "M", "W", "D", "DE", "WD", "AD", "WEA", "WA", "WO", "WDAC", "GA", "GW"}
 )
 
 
 def _is_broad_principal(principal: str) -> bool:
     """Whether an already-lowercased icacls principal token names an identity broader than the file's
-    owner. The SID is matched whole (after any leading ``*``); the display name as a substring."""
-    if principal.lstrip("*") in _BROAD_PRINCIPAL_SIDS:
+    owner. Every match is whole: the SID after any leading ``*``, the display name as a whole token,
+    or a group name as the part after the last ``\\``."""
+    sid = principal.lstrip("*")
+    if sid in _BROAD_PRINCIPAL_SIDS:
         return True
-    return any(name in principal for name in _BROAD_PRINCIPAL_NAMES)
+    if sid.startswith("s-1-5-21-") and sid.rsplit("-", 1)[-1] in _BROAD_DOMAIN_RIDS:
+        return True
+    if principal in _BROAD_PRINCIPAL_NAMES:
+        return True
+    return principal.rsplit("\\", 1)[-1] in _BROAD_GROUP_LEAF_NAMES
 
 
-#: Bare (unqualified) principal names that denote the file's own owner, so a write grant to them is
-#: an owner grant. Matched whole against the lowercased principal token.
-_OWNER_BARE_NAMES: frozenset[str] = frozenset({"owner rights"})
+#: Bare (unqualified) principal names that are the owner, or that grant nobody anything, so a write
+#: grant to them is not a non-owner write. Matched whole against the lowercased principal token.
+_OWNER_BARE_NAMES: frozenset[str] = frozenset({"owner rights", "creator owner"})
 
 
 def _is_bare_name(principal: str) -> bool:
     """Whether an icacls principal token is a bare display name: no ``DOMAIN\\`` qualifier and no
     SID form. The file's owner is always an account, and icacls always prints an account
     qualified (``COMPUTER\\user``, ``DOMAIN\\user``, ``AzureAD\\user``). Bare names are the
-    well-known groups icacls prints unqualified, such as ``Everyone`` and ``CREATOR OWNER`` -- and
-    their localized forms, such as the German ``Jeder``, which no name set can list in full.
+    well-known groups icacls prints unqualified, such as ``Everyone`` -- and their localized forms,
+    such as the German ``Jeder``, which no name set can list in full.
 
     A SID is excluded with or without the leading ``*``: measured on Windows 11, plain ``icacls``
     prints an unresolvable SID bare (``S-1-5-21-...:(I)(M)``), and the well-known broad SIDs are
-    already matched whole by :data:`_BROAD_PRINCIPAL_SIDS`. ``OWNER RIGHTS`` (S-1-3-4) is excluded
-    because it IS the owner: measured on Windows 11, a pytest temp file carries
-    ``OWNER RIGHTS:(I)(F)`` beside SYSTEM and Administrators and nothing else."""
+    already matched whole by :data:`_BROAD_PRINCIPAL_SIDS`. The names in :data:`_OWNER_BARE_NAMES`
+    are excluded too. ``OWNER RIGHTS`` is the owner: measured on Windows 11, a pytest temp file
+    carries ``OWNER RIGHTS:(I)(F)`` beside SYSTEM and Administrators and nothing else. Only their
+    English names are listed, so a host that localizes them reads such a file as ``None``."""
     if "\\" in principal or principal.lstrip("*").startswith("s-1-"):
         return False
     return principal not in _OWNER_BARE_NAMES
@@ -274,9 +301,10 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     ``_secure_file``, whose ``icacls`` mechanism it mirrors). ``None`` when the DACL cannot be
     determined, so the caller degrades rather than refusing on an inconclusive read.
 
-    Three things make it undeterminable on Windows, and all three are ``None``: ``icacls`` could not
-    be run, it exited non-zero, or (BACKLOG #1142) it exited zero with output carrying no ACE the
-    parser could attribute to a principal. Each logs a warning naming which one happened.
+    These make it undeterminable on Windows, and all answer ``None``: ``icacls`` could not be run,
+    it exited non-zero, it returned no output, or (BACKLOG #1142) the parser answered ``None``. That
+    last covers two causes the warning names together: no ACE it could attribute to a principal, or
+    a write grant to a bare principal name it does not recognise.
 
     * POSIX: no group- or other-WRITE bit (``mode & 0o022 == 0``).
     * Windows: read the DACL with ``icacls <path>`` (no modifying flags) and flag any broad-group ACE
@@ -294,10 +322,19 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
                 [_system_exe("icacls.exe"), os.fspath(path)],
                 check=False,
                 capture_output=True,
-                text=True,
+                # icacls writes the OEM code page to a pipe. Decoding it with the default ANSI code
+                # page failed on a non-ASCII path (measured: "Schluessel" with u-umlaut came back as
+                # byte 0x81, stdout arrived as None, and the parse raised AttributeError, which no
+                # caller catches). "oem" decodes it so the echoed path matches the one passed;
+                # errors="replace" keeps a stray byte from ever making the read crash.
+                encoding="oem",
+                errors="replace",
             )
         except OSError as exc:
             log.warning("icacls could not read the DACL of %s: %s", path, exc)
+            return None
+        if result.stdout is None:
+            log.warning("icacls returned no readable output for %s", path)
             return None
         if result.returncode != 0:
             log.warning(

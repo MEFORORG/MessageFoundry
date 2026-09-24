@@ -243,25 +243,86 @@ def test_icacls_batch_modify_is_not_owner_only() -> None:
     assert owner_only_from_icacls(text, anchor_path=_PATH) is False
 
 
-def test_icacls_creator_owner_full_is_not_owner_only() -> None:
+def test_icacls_creator_owner_grants_nobody_so_stays_owner_only() -> None:
+    # CREATOR OWNER (S-1-3-0) is a placeholder no logon token carries, so an ACE for it on a file
+    # grants nobody anything. wiring.py trusts it for the same reason. Reading it as broad would make
+    # enforce refuse a secure anchor.
     text = _icacls(r"DESKTOP-A\svc:(F)", r"CREATOR OWNER:(I)(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+    text = _icacls(r"DESKTOP-A\svc:(F)", r"*S-1-3-0:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        r"NT AUTHORITY\NETWORK",
+        r"NT AUTHORITY\ANONYMOUS LOGON",
+        r"NT AUTHORITY\Local account",
+        r"BUILTIN\Guests",
+        r"CORP\Domain Users",
+        r"CORP\Domain Guests",
+    ],
+)
+def test_icacls_more_broad_names_write_is_not_owner_only(principal: str) -> None:
+    text = _icacls(r"DESKTOP-A\svc:(F)", f"{principal}:(M)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        r"DESKTOP-A\usersync",
+        r"CORP\everyone-admins",
+        r"NT AUTHORITY\Local account and member of Administrators group",
+        r"NT AUTHORITY\NETWORK SERVICE",
+    ],
+)
+def test_icacls_broad_names_match_whole_not_as_substrings(principal: str) -> None:
+    # A substring match read an ordinary account such as DESKTOP-A\usersync as \Users, and a false
+    # "broad" makes enforce refuse a secure anchor.
+    text = _icacls(r"DESKTOP-A\svc:(F)", f"{principal}:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+
+
+@pytest.mark.parametrize("rights", ["(D)", "(DE)", "(I)(DE,RC)"])
+def test_icacls_broad_delete_is_not_owner_only(rights: str) -> None:
+    # Delete-then-plant replaces the anchor, and wiring.py's write mask counts DELETE too.
+    text = _icacls(r"DESKTOP-A\svc:(F)", f"Everyone:{rights}")
     assert owner_only_from_icacls(text, anchor_path=_PATH) is False
 
 
 @pytest.mark.parametrize(
     "sid",
-    ["*S-1-5-4", "*S-1-5-6", "*S-1-5-3", "*S-1-3-0", "*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545"],
+    [
+        "*S-1-5-4",
+        "*S-1-5-6",
+        "*S-1-5-3",
+        "*S-1-1-0",
+        "*S-1-5-11",
+        "*S-1-5-32-545",
+        "*S-1-5-32-546",
+        "*S-1-5-2",
+        "*S-1-5-7",
+        "*S-1-5-113",
+        "S-1-5-21-1-2-3-513",
+        "S-1-5-21-1-2-3-514",
+    ],
 )
 def test_icacls_broad_sid_write_is_not_owner_only(sid: str) -> None:
     text = _icacls(r"DESKTOP-A\svc:(F)", f"{sid}:(F)")
     assert owner_only_from_icacls(text, anchor_path=_PATH) is False
 
 
-@pytest.mark.parametrize("sid", ["*S-1-5-32-544", "*S-1-5-18", "*S-1-5-64", "*S-1-5-113"])
+@pytest.mark.parametrize(
+    "sid", ["*S-1-5-32-544", "*S-1-5-18", "*S-1-5-64", "*S-1-5-114", "S-1-5-21-1-2-3-5130"]
+)
 def test_icacls_trusted_or_unrelated_sid_is_not_matched_as_broad(sid: str) -> None:
     # A SID is matched WHOLE, never as a substring: "S-1-5-3" (BATCH) is a leading substring of
     # "S-1-5-32-544" (BUILTIN\Administrators, deliberately trusted) and "S-1-5-6" (SERVICE) of
-    # "S-1-5-64". A substring set would refuse the administrators ACE that ships on every anchor.
+    # "S-1-5-64", and "S-1-5-11" (Authenticated Users) of "S-1-5-114" (local administrators). A
+    # substring set would refuse the administrators ACE that ships on every anchor. The last case
+    # checks a domain RID is matched whole too: RID 5130 is not Domain Users (513).
     text = _icacls(r"DESKTOP-A\svc:(F)", f"{sid}:(F)")
     assert owner_only_from_icacls(text, anchor_path=_PATH) is True
 
@@ -321,6 +382,19 @@ def test_icacls_unknown_bare_name_does_not_outvote_a_recognised_broad_write() ->
 )
 def test_icacls_slice1_probes_never_read_as_owner_only(text: str, expected: bool | None) -> None:
     assert owner_only_from_icacls(text, anchor_path=_PATH) is expected
+
+
+@_windows_only
+def test_dacl_read_of_a_non_ascii_path_does_not_crash(tmp_path: Path) -> None:
+    # icacls writes the OEM code page. Decoded as ANSI, a u-umlaut came back as byte 0x81, stdout
+    # arrived as None, and the parse raised AttributeError, which no caller catches: a startup crash
+    # rather than a degrade. The echoed path must also decode to the path passed, so it is stripped
+    # and the verdict matches the same file under an ASCII name.
+    d = tmp_path / "Schlüssel"
+    d.mkdir()
+    p = _pem(d, b"x")
+    ascii_twin = _pem(tmp_path, b"x")
+    assert dacl_is_owner_only(p) == dacl_is_owner_only(ascii_twin)
 
 
 @_posix_only
@@ -391,8 +465,11 @@ async def test_preflight_dormant_writes_no_audit(store: MessageStore) -> None:
 
 
 async def test_preflight_baseline_then_unchanged_then_changed(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The row counts below are about fingerprints. Pin the ACL read so a host whose temp ACL reads
+    # as indeterminate (an extra acl_indeterminate row) cannot change them.
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     p = _pem(tmp_path, b"v1")
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
 
@@ -416,8 +493,9 @@ async def test_preflight_baseline_then_unchanged_then_changed(
 
 
 async def test_preflight_pin_mismatch_refuses_at_reload_and_audits(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)  # same reason as the test above
     p = _pem(tmp_path, b"orig")
     spec = AnchorSpec(
         "oidc", "[auth].oidc_tls_ca_cert_file", str(p), hashlib.sha256(b"orig").hexdigest()
