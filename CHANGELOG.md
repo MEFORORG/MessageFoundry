@@ -15,6 +15,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
   Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
+- **The DIRECT S/MIME connector now encrypts message content with AES-256-CBC.** The library default
+  it used before was AES-128-CBC. Every DIRECT message's content cipher changes on the wire; nothing
+  else about the envelope does. **A deploying site whose partner stack cannot decrypt AES-256-CBC
+  would see that partner fail to open the message after its relay has already accepted it**, so the
+  failure would surface on the partner's side, not as a send error here.
+  ([BACKLOG #1168](docs/BACKLOG.md))
 - **The OIDC token endpoint and JWKS legs now carry the posture-keyed revocation guard (BACKLOG
   #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
   off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
