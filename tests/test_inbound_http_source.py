@@ -654,55 +654,136 @@ async def test_the_head_parse_refuses_the_rfc_9112_desync_grammar(label: str, ra
 
 _CHUNKED_BODY = b"3\r\nabc\r\n0\r\n\r\n"
 
+# The reason each framing guard in `_read_head` gives, so a case can name the guard it pins.
+_TE_REFUSED = "transfer-encoding is not supported; use Content-Length"
+_CL_TE_REFUSED = "ambiguous framing: Content-Length with Transfer-Encoding"
+_UNDERSCORE_REFUSED = "underscore in a framing header name"
+
 
 @pytest.mark.parametrize(
-    ("label", "framing"),
+    ("label", "request_line", "framing", "reason"),
     [
-        ("exact", b"Transfer-Encoding: chunked\r\n"),
-        ("value title case", b"Transfer-Encoding: Chunked\r\n"),
-        ("value upper case", b"Transfer-Encoding: CHUNKED\r\n"),
-        ("name upper case", b"TRANSFER-ENCODING: chunked\r\n"),
-        ("name and value mixed", b"transfer-Encoding: cHuNkEd\r\n"),
-        ("gzip then chunked", b"Transfer-Encoding: gzip, chunked\r\n"),
-        ("gzip then upper chunked", b"Transfer-Encoding: gzip, CHUNKED\r\n"),
-        ("no space after comma", b"Transfer-Encoding: gzip,chunked\r\n"),
-        ("chunked then gzip", b"Transfer-Encoding: chunked, gzip\r\n"),
-        ("surrounding ows", b"Transfer-Encoding: \t chunked \t\r\n"),
-        ("gzip alone", b"Transfer-Encoding: gzip\r\n"),
-        ("deflate alone", b"Transfer-Encoding: Deflate\r\n"),
-        ("empty value", b"Transfer-Encoding:\r\n"),
-        ("list with empty member", b"Transfer-Encoding: ,chunked\r\n"),
-        # With a Content-Length beside it, whatever the coding: RFC 9112 section 6.1 lets TE
-        # override CL, so the two together are the CL.TE smuggling shape.
-        ("cl with gzip", b"Content-Length: 3\r\nTransfer-Encoding: gzip\r\n"),
-        ("cl with mixed-case chunked", b"Content-Length: 3\r\nTransfer-Encoding: Chunked\r\n"),
-        ("te before cl", b"Transfer-Encoding: identity\r\nContent-Length: 3\r\n"),
+        ("exact", b"POST /ingest", b"Transfer-Encoding: chunked\r\n", _TE_REFUSED),
+        ("value title case", b"POST /ingest", b"Transfer-Encoding: Chunked\r\n", _TE_REFUSED),
+        ("value upper case", b"POST /ingest", b"Transfer-Encoding: CHUNKED\r\n", _TE_REFUSED),
+        ("name upper case", b"POST /ingest", b"TRANSFER-ENCODING: chunked\r\n", _TE_REFUSED),
+        ("name and value mixed", b"POST /ingest", b"transfer-Encoding: cHuNkEd\r\n", _TE_REFUSED),
+        (
+            "gzip then chunked",
+            b"POST /ingest",
+            b"Transfer-Encoding: gzip, chunked\r\n",
+            _TE_REFUSED,
+        ),
+        (
+            "gzip then upper chunked",
+            b"POST /ingest",
+            b"Transfer-Encoding: gzip, CHUNKED\r\n",
+            _TE_REFUSED,
+        ),
+        (
+            "no space after comma",
+            b"POST /ingest",
+            b"Transfer-Encoding: gzip,chunked\r\n",
+            _TE_REFUSED,
+        ),
+        (
+            "chunked then gzip",
+            b"POST /ingest",
+            b"Transfer-Encoding: chunked, gzip\r\n",
+            _TE_REFUSED,
+        ),
+        ("surrounding ows", b"POST /ingest", b"Transfer-Encoding: \t chunked \t\r\n", _TE_REFUSED),
+        ("coding parameter", b"POST /ingest", b"Transfer-Encoding: chunked;x=1\r\n", _TE_REFUSED),
+        ("quoted coding", b"POST /ingest", b'Transfer-Encoding: "chunked"\r\n', _TE_REFUSED),
+        ("gzip alone", b"POST /ingest", b"Transfer-Encoding: gzip\r\n", _TE_REFUSED),
+        ("deflate alone", b"POST /ingest", b"Transfer-Encoding: Deflate\r\n", _TE_REFUSED),
+        ("empty value", b"POST /ingest", b"Transfer-Encoding:\r\n", _TE_REFUSED),
+        (
+            "list with empty member",
+            b"POST /ingest",
+            b"Transfer-Encoding: ,chunked\r\n",
+            _TE_REFUSED,
+        ),
+        # A bodyless method gets the same refusal for a non-chunked coding.
+        ("get with gzip", b"GET /health", b"Transfer-Encoding: gzip\r\n", _TE_REFUSED),
+        ("delete with identity", b"DELETE /x", b"Transfer-Encoding: identity\r\n", _TE_REFUSED),
+        # `Transfer_Encoding` is a valid token, so it used to pass both guards and be framed by its
+        # Content-Length, while a front end that folds `_` into `-` reads it as chunked.
+        ("underscore te", b"POST /ingest", b"Transfer_Encoding: chunked\r\n", _UNDERSCORE_REFUSED),
+        (
+            "underscore te with cl",
+            b"POST /ingest",
+            b"Transfer_Encoding: chunked\r\nContent-Length: 3\r\n",
+            _UNDERSCORE_REFUSED,
+        ),
+        (
+            "underscore cl with te",
+            b"POST /ingest",
+            b"Content_Length: 3\r\nTransfer-Encoding: chunked\r\n",
+            _UNDERSCORE_REFUSED,
+        ),
+        # With a Content-Length beside it the OLDER ambiguity guard fires first, whatever the
+        # coding: RFC 9112 section 6.1 lets TE override CL, so the pair is the CL.TE shape.
+        (
+            "cl with gzip",
+            b"POST /ingest",
+            b"Content-Length: 3\r\nTransfer-Encoding: gzip\r\n",
+            _CL_TE_REFUSED,
+        ),
+        (
+            "cl with mixed-case chunked",
+            b"POST /ingest",
+            b"Content-Length: 3\r\nTransfer-Encoding: Chunked\r\n",
+            _CL_TE_REFUSED,
+        ),
+        (
+            "te before cl",
+            b"POST /ingest",
+            b"Transfer-Encoding: identity\r\nContent-Length: 3\r\n",
+            _CL_TE_REFUSED,
+        ),
     ],
 )
 async def test_any_transfer_encoding_is_refused_whatever_its_spelling(
-    label: str, framing: bytes
+    label: str, request_line: bytes, framing: bytes, reason: str
 ) -> None:
     """BACKLOG #1913. The listener decodes no transfer coding, so ANY Transfer-Encoding is refused
-    in the head phase, before a body byte is read.
+    in the head phase, and the body is left unread.
 
-    The pre-#1125 test was exact equality on the lowered value, so a coding list such as
-    `gzip, chunked` fell through and its body was read raw. Every spelling a proxy might still
-    read as chunked is here: case in the name and the value, a coding list in either order, OWS,
-    and the empty and degenerate lists. The accept-control is the test below it.
+    Before #1125 the test was exact equality on the lowered value, so a coding list such as
+    `gzip, chunked` fell through and its body was read raw. The spellings here are at least these:
+    case in the name and the value, coding lists in either order, OWS, a parameter, a quoted
+    coding, empty lists, a bodyless method, and an underscore name. Each case names the guard it
+    pins, so deleting one guard reds its own rows. The accept-controls are the test below this one.
     """
-    raw = b"POST /ingest HTTP/1.1\r\nHost: h\r\n" + framing + b"\r\n" + _CHUNKED_BODY
+    raw = request_line + b" HTTP/1.1\r\nHost: h\r\n" + framing + b"\r\n" + _CHUNKED_BODY
     reader = await _reader_from(raw)
     with pytest.raises(HttpRequestError) as excinfo:
         await _read_head(reader, max_header_bytes=8192)
     assert excinfo.value.status == 400, label
     assert excinfo.value.kind == "framing_error", label
+    assert excinfo.value.reason == reason, label
+    # Refused from the head alone: not one body byte was consumed.
+    assert await reader.read() == _CHUNKED_BODY, label
 
 
-async def test_the_same_post_framed_by_content_length_alone_is_read() -> None:
-    # Accept-control for the Transfer-Encoding refusals above: the identical request line, host
-    # and reader, framed by Content-Length alone, parses and yields exactly its declared bytes. A
-    # head parse gone refuse-everything reds here rather than passing there.
-    raw = b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"
+@pytest.mark.parametrize(
+    "lookalike",
+    [
+        b"",
+        # The hop-by-hop `TE` request header names codings the CLIENT accepts in a response. It
+        # frames nothing, and gRPC-style senders set it.
+        b"TE: trailers\r\n",
+        b"X-Transfer-Encoding: chunked\r\n",
+        b"Transfer-Encodings: chunked\r\n",
+        b"X_Custom_Header: 1\r\n",
+    ],
+)
+async def test_a_post_framed_by_content_length_alone_is_read(lookalike: bytes) -> None:
+    # Accept-controls for the refusals above: the same request framed by Content-Length alone,
+    # beside a header that only resembles a framing header, parses and yields its declared bytes.
+    # A guard that over-matches the header name reds here rather than passing there.
+    raw = b"POST /ingest HTTP/1.1\r\nHost: h\r\n" + lookalike + b"Content-Length: 3\r\n\r\nabc"
     req = await _read_request(
         await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
     )
@@ -761,12 +842,16 @@ async def test_a_lowercase_method_is_not_folded_into_a_known_one() -> None:
     ("raw", "status"),
     [
         (b"POST /ingest HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\nabc", 400),
-        # BACKLOG #1913: case does not get a coding past the refusal, and neither does pairing a
-        # non-chunked coding with a Content-Length.
-        (b"POST /ingest HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, CHUNKED\r\n\r\nabc", 400),
+        # A non-chunked coding beside a Content-Length (the ambiguity guard, DELTA-06), and an
+        # underscore alias of Transfer-Encoding beside one (BACKLOG #1913).
         (
             b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n"
             b"Transfer-Encoding: Gzip\r\n\r\nabc",
+            400,
+        ),
+        (
+            b"POST /ingest HTTP/1.1\r\nHost: h\r\nTransfer_Encoding: chunked\r\n"
+            b"Content-Length: 3\r\n\r\nabc",
             400,
         ),
         (b"POST /ingest HTTP/1.1\r\nHost: h\r\n\r\nabc", 411),

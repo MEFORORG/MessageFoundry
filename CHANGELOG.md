@@ -7,15 +7,24 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Security
-- **The `Http()` inbound listener now refuses any `Transfer-Encoding`, not only an exact
-  `chunked`.** The listener decodes no transfer coding. Until this release it refused a request only
-  when the header read exactly `chunked`, so `gzip, chunked`, `chunked,` and `identity` passed and the
-  body was read raw as the message. Every such request is now answered `400` before a body byte is
-  read, whatever the coding, its case or its spacing. A request carrying both `Transfer-Encoding` and
-  `Content-Length` was already refused and still is. The refusal is logged as a `framing_error`
-  connection event and writes no ingress row, like the listener's other framing refusals. **A
-  deploying sender that sets `Transfer-Encoding` on its POST would be refused**; send a
-  `Content-Length` instead. ([BACKLOG #1125](docs/BACKLOG.md), [BACKLOG #1913](docs/BACKLOG.md))
+- **The `Http()` inbound listener now refuses any `Transfer-Encoding`, not only `chunked`.** The
+  listener decodes no transfer coding. In 0.4.0 it refused the header only when its whole value was
+  `chunked`. A coding list such as `gzip, chunked` got through, and so did `chunked,` and `identity`.
+  The listener then read the body raw and stored it as the message. A `GET` or `HEAD` carrying
+  `Transfer-Encoding` was also accepted. Now the listener refuses any `Transfer-Encoding` with `400`,
+  on every method, before it reads a body byte. It also refuses a header named `Transfer_Encoding` or
+  `Content_Length`, which a front end that swaps `_` for `-` would read as real framing. A request with
+  both `Transfer-Encoding` and `Content-Length` was already refused and still is. Each refusal is
+  logged as a `framing_error` connection event and writes no ingress row. **A deploying sender that
+  sets `Transfer-Encoding` would be refused**, and must send a `Content-Length` instead.
+  ([BACKLOG #1125](docs/BACKLOG.md), [BACKLOG #1913](docs/BACKLOG.md))
+- **The `Http()` inbound listener reads request framing more strictly.** A `POST`, `PUT` or `PATCH`
+  with no `Content-Length` is now refused with `411`; 0.4.0 read it to the end of the connection and
+  stored what it got. A non-zero `Content-Length` on `GET`, `HEAD` or `DELETE` is now refused with
+  `400`. A lowercase method such as `post` is no longer treated as `POST`. The header grammar is
+  stricter too: a bare LF or CR, a folded header line, space before the colon, a `Content-Length`
+  such as `+3` or `1_0`, and any HTTP version other than 1.x are all refused with `400`. **A deploying
+  sender relying on any of these would be refused.** ([BACKLOG #1125](docs/BACKLOG.md))
 - **OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
   `[auth].oidc_max_age_seconds`, is sent as `max_age` on every authorization request. It defaults
   to 43200 seconds (12 hours), accepts 300 to 86400, and has no off switch. The engine now requires

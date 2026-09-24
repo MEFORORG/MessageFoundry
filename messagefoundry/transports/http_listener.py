@@ -173,6 +173,11 @@ _HEADER_VALUE_RE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
 #: ``+3`` framed three -- both measured against the shipped parser (BACKLOG #1125).
 _CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 
+#: The two headers that frame a request body. A name that becomes one of these once ``_`` is read
+#: as ``-`` is refused (BACKLOG #1913): ``Transfer_Encoding`` is a valid token, so it slipped past
+#: both framing guards here, while a front end that folds underscores into hyphens reads it as real.
+_FRAMING_HEADERS = frozenset({"content-length", "transfer-encoding"})
+
 #: The health-probe methods: answered with a static 200 and no ingress row (ADR 0023 D2).
 _HEALTH_PROBE_METHODS = frozenset({"GET", "HEAD"})
 
@@ -399,6 +404,8 @@ async def _read_head(
         if _FIELD_VALUE_CTL_RE.search(value):
             raise HttpRequestError(400, "control character in header value", kind="framing_error")
         key = name.lower()
+        if "_" in key and key.replace("_", "-") in _FRAMING_HEADERS:
+            raise HttpRequestError(400, "underscore in a framing header name", kind="framing_error")
         header_counts[key] = header_counts.get(key, 0) + 1
         headers[key] = value.strip(" \t")
 
@@ -429,10 +436,12 @@ async def _read_head(
     # unauthenticated peer a slow-loris hold on the cheapest path; refusing answers faster than
     # either.
     #
-    # `Transfer-Encoding` is refused by PRESENCE, not by matching `chunked`. There is no transfer
-    # coding this listener can decode, so presence is the conformant answer as well as the strict
-    # one -- and an exact-equality test measurably missed `gzip, chunked`, `chunked,` and
-    # `identity`, all of which reached the POST path and were ingested as clinical payload.
+    # `Transfer-Encoding` is refused by PRESENCE, not by matching `chunked`. This listener decodes
+    # no transfer coding, and an exact-equality test measurably missed `gzip, chunked`, `chunked,`
+    # and `identity`, all of which reached the POST path and were ingested as clinical payload.
+    # This is a deliberate departure from RFC 9112, not conformance: section 7 makes parsing
+    # chunked a MUST, and section 6.1 says an unknown coding SHOULD get 501. Every coding gets the
+    # same 400 here, so one framing refusal covers them all (BACKLOG #1125, #1913).
     if "transfer-encoding" in headers:
         raise HttpRequestError(
             400, "transfer-encoding is not supported; use Content-Length", kind="framing_error"
