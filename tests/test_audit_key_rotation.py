@@ -292,7 +292,14 @@ async def test_a_forged_range_row_does_not_route_live_appends(
         cur = await store._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
         head = await cur.fetchone()
         assert head is not None
-        closes = {"key_id": "whatever", "from_id": 1, "to_id": 1, "rows": 1, "digest": ""}
+        closes = {
+            "key_id": "whatever",
+            "from_id": 1,
+            "to_id": 1,
+            "rows": 1,
+            "digest": "",
+            "prev_hash": "",
+        }
         detail = audit_epoch_detail(x_id, closes, audit_handover_tag(x_id, closes, (x_mac, None)))
         forged = audit_row_hash(
             head["row_hash"],
@@ -776,5 +783,78 @@ async def test_a_forged_keyless_prefix_is_caught_after_the_first_key_is_dropped(
         await store._db.commit()
         ok, msg = await store.verify_audit_chain()
         assert not ok, f"a forged keyless prefix verified with the first key dropped: {msg}"
+        # Reported at the B-keyed range row (id=6), which holds the proof, naming the rows below id=4.
+        assert "id=6" in (msg or "") and "rows before id=4" in (msg or ""), msg
     finally:
         await store.close()
+
+
+def test_a_key_holders_range_row_that_misstates_its_link_is_caught() -> None:
+    """Offline, with every key held: a key holder signs a range row whose ``prev_hash`` is wrong.
+    MAC, tag, digest and fields are all valid, so only the link check catches it."""
+    rows = _rows_across_a_rotation(_A, _B, closes_edit={"prev_hash": "0" * 64})
+    ok, msg = _verify_rows(rows, _A, (_A, _B))
+    assert not ok and "rows before id=1" in (msg or ""), msg
+
+
+def test_a_closing_record_without_its_link_is_malformed() -> None:
+    from messagefoundry.store.store import parse_audit_epoch
+
+    closes = {"key_id": "k", "from_id": 1, "to_id": 1, "rows": 1, "digest": "d"}
+    assert parse_audit_epoch(json.dumps({"key_id": "n", "closes": closes, "handover": "t"})) is None
+    closes["prev_hash"] = ""
+    assert parse_audit_epoch(json.dumps({"key_id": "n", "closes": closes, "handover": "t"}))
+
+
+async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Path) -> None:
+    """A row appended between the roll's read and its append would sit inside the closed range but
+    outside its digest. The append names the head it sealed and is refused before writing."""
+    path, a, b = tmp_path / "moved.db", generate_key(), generate_key()
+    store = await _open(path, a)
+    try:
+        await _seed(store, "a", 2)
+    finally:
+        await store.close()
+    store = await _open(path, b, (a,))
+    try:
+        real_rows = store._audit_rows
+
+        async def rows_then_a_racing_append(from_id: int, *, limit: int | None = None) -> object:
+            got = await real_rows(from_id, limit=limit)
+            await store.record_audit("racing", actor="engine")  # lands after the seal
+            return got
+
+        store._audit_rows = rows_then_a_racing_append  # type: ignore[method-assign]
+        ok, msg = await store.roll_audit_key_epoch()
+        assert not ok and "changed while" in msg, msg
+        store._audit_rows = real_rows  # type: ignore[method-assign]
+        cur = await store._db.execute(
+            "SELECT COUNT(*) AS n FROM audit_log WHERE action=?", (AUDIT_KEY_EPOCH_ACTION,)
+        )
+        row = await cur.fetchone()
+        assert row is not None and int(row["n"]) == 0, "a refused roll must write nothing"
+        ok, msg = await store.verify_audit_chain()
+        assert ok, msg
+    finally:
+        await store.close()
+
+
+async def test_sql_server_clamps_the_every_row_floor_to_int() -> None:
+    """``audit_log.id`` is INT on SQL Server; the floor handed to it must be INT's minimum, and a real
+    lower bound must pass through unchanged."""
+    from typing import Any
+
+    from messagefoundry.store.store import AUDIT_ALL_ROWS
+    from tests.test_asvs_transit_audit_mac_server_backends import _bare
+
+    store = _bare("sqlserver")
+    seen: list[tuple[Any, ...]] = []
+
+    async def _fetchall(_sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        seen.append(params)
+        return []
+
+    store._fetchall = _fetchall
+    await store._audit_rows(AUDIT_ALL_ROWS)
+    await store._audit_rows(7)
+    assert seen == [(-(2**31),), (7,)]

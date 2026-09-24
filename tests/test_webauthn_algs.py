@@ -11,7 +11,9 @@ two halves fail differently and only one of them refuses anything:
 * ``verify_registration_response`` decides what is ACCEPTED. This is the refusal.
 
 A change that restricted only the first would read like a fix and admit exactly the same
-credentials, so every enforcement row here goes through ``wa.verify_registration``.
+credentials, so the registration enforcement rows go through ``wa.verify_registration``. The last
+section adds the second place a key is refused: sign-in re-checks the STORED key with the same
+rule, so its rows go through ``wa.verify_assertion`` (BACKLOG #1166).
 
 The RSA credential builder is local rather than in ``tests/_soft_webauthn.py``: that helper exists
 to produce credentials the engine ACCEPTS, and these rows need one it must refuse. ``tests/`` sits
@@ -27,12 +29,15 @@ import logging
 import secrets
 import struct
 from collections.abc import Callable
+from decimal import Decimal
+from fractions import Fraction
 
 import pytest
 
 pytest.importorskip("webauthn")
 
-from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa  # noqa: E402
+from cryptography.hazmat.primitives import hashes  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa  # noqa: E402
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat  # noqa: E402
 from webauthn.helpers import bytes_to_base64url, encode_cbor, parse_cbor  # noqa: E402
 from webauthn.helpers.cose import COSEAlgorithmIdentifier  # noqa: E402
@@ -239,7 +244,7 @@ def test_the_rsa_fixture_is_well_formed_apart_from_its_key_type() -> None:
 # FIRST ASSERTION, after the credential had enrolled, and on the mismatched-curve path it arrived as
 # a raw ``ValueError`` from ``cryptography`` that ``verify_assertion`` did not catch -- a 500, not
 # the audited invalid-input path ADR 0068 decision 1 requires. These rows move the refusal to
-# registration and pin the assertion side as a backstop.
+# registration and pin that sign-in refuses the same stored keys as invalid input.
 
 _P256 = 1
 _P384 = 2
@@ -254,7 +259,7 @@ def _okp(key: ed25519.Ed25519PrivateKey, *, alg: int = -8, crv: int = _ED25519) 
     return encode_cbor({1: 1, 3: alg, -1: crv, -2: _ed25519_raw(key)})
 
 
-def _relabelled(cose_key: bytes, **changes: int | None) -> bytes:
+def _relabelled(cose_key: bytes, **changes: object) -> bytes:
     """``cose_key`` with COSE labels changed; a ``None`` value drops the label."""
     names = {"kty": 1, "alg": 3, "crv": -1}
     fields = dict(parse_cbor(cose_key))
@@ -268,6 +273,10 @@ def _relabelled(cose_key: bytes, **changes: int | None) -> bytes:
 
 def _p256() -> bytes:
     return SoftAuthenticator(rp_id=RP, origin=ORIGIN).cose_public_key()
+
+
+def _eddsa() -> bytes:
+    return _okp(ed25519.Ed25519PrivateKey.generate())
 
 
 #: Credentials the pinned library ENROLLED before this check, measured at engine ``0076e3cec``, and
@@ -340,7 +349,7 @@ def test_the_curve_rows_use_a_well_formed_response() -> None:
     If this is refused, the builder is broken and the refusal rows prove nothing. EdDSA rides
     through ``_registration_response`` too, so the OKP arm of the check is shown to admit Ed25519.
     """
-    for cose_key in (_p256(), _okp(ed25519.Ed25519PrivateKey.generate())):
+    for cose_key in (_p256(), _eddsa()):
         _assert_registers(cose_key)
 
 
@@ -388,27 +397,18 @@ def test_es256_on_a_curve_other_than_p256_is_refused_at_registration(
 
 
 @_LARGER_CURVES
-def test_a_stored_es256_key_on_a_larger_curve_still_asserts(
-    curve: ec.EllipticCurve, crv: int, size: int
+def test_a_stored_es256_key_on_a_larger_curve_is_refused_at_sign_in(
+    curve: ec.EllipticCurve, crv: int, size: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The pin is registration-only, on purpose: a key enrolled before it must not lock anyone out.
+    """Sign-in re-screens the stored key with the registration rule (BACKLOG #1166).
 
-    It verifies and clears the floor, so ``verify_assertion`` does not re-screen its curve.
+    This row used to pin the opposite: a key enrolled before the P-256 pin still signed in. ADR
+    0068 records why that exception went. The key is real and the signature is good (the
+    library-alone control below), so only the check can refuse it.
     """
-    key = ec.generate_private_key(curve)
-    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN, _key=key)  # signs ECDSA over SHA-256
-    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
-    assert (
-        wa.verify_assertion(
-            response_json=soft.get_response(challenge),
-            challenge=challenge,
-            rp_id=RP,
-            origin=ORIGIN,
-            public_key=_cose_es256(key, crv, size),
-            current_sign_count=0,
-        )
-        == 0
-    )
+    respond, public_key = _stored_es256(curve, crv, size)
+    caught = _refused_at_sign_in(respond, public_key, caplog)
+    assert str(caught).startswith("COSE algorithm -7 is accepted only as")
 
 
 def _assert_registers(cose_key: bytes) -> None:
@@ -434,9 +434,10 @@ def _assert_registers(cose_key: bytes) -> None:
 def test_an_unusable_stored_key_fails_assertion_as_invalid_input(
     stored: Callable[[SoftAuthenticator], bytes],
 ) -> None:
-    """The backstop. Registration now refuses these, but a stored key is data the assertion path
-    must not trust: a raw ``ValueError``, ``KeyError`` or ``IndexError`` here escapes the
-    service's audited refusal and becomes a 500. Each row raised one of those at ``0076e3cec``."""
+    """Registration now refuses these, but a stored key is data the assertion path must not
+    trust: a raw ``ValueError``, ``KeyError`` or ``IndexError`` here escapes the service's audited
+    refusal and becomes a 500. Each row raised one of those at ``0076e3cec``. The stored-key
+    check in ``verify_assertion`` now refuses each before the library verifies anything."""
     soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
     challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
     with pytest.raises(wa.WebAuthnVerificationError):
@@ -510,3 +511,326 @@ def test_a_raw_library_failure_is_logged_by_type_and_a_library_refusal_is_not(
     warnings = [r for r in caplog.records if r.name == logger]
     assert len(warnings) == 1 and "KeyError" in warnings[0].getMessage()
     assert "registration" in warnings[0].getMessage()
+
+
+# --- the pin compares CBOR integers, not values that merely equal one (BACKLOG #1953) ----------
+#
+# In Python, ``True``, ``1.0``, ``Decimal(1)`` and ``Fraction(1)`` all equal the integer 1. The
+# library indexes the decoded CBOR by label and compares values with ``==``. The P-256 pin used
+# ``int()``. So every row below ENROLLED at engine ``5ccff7cb3``. Each is a real key with one
+# defect: a stand-in for an integer, as a value or as a label. Two other shapes enrolled too: an
+# array in place of the map, and an extra label that is not an integer or a text string.
+
+
+def _rekeyed(cose_key: bytes, label: int, stand_in: object) -> bytes:
+    """``cose_key`` with the entry under ``label`` moved to the key ``stand_in``, value unchanged."""
+    fields = dict(parse_cbor(cose_key))
+    fields[stand_in] = fields.pop(label)
+    return encode_cbor(fields)
+
+
+def _as_array(cose_key: bytes, **changes: object) -> bytes:
+    """``cose_key`` as a CBOR array, each value at the position the library reads for its label."""
+    fields: dict[int, object] = dict(parse_cbor(_relabelled(cose_key, **changes)))
+    positive = max(label for label in fields if label >= 0) + 1
+    array: list[object] = [0] * (positive - min(label for label in fields if label < 0))
+    for label, value in fields.items():
+        array[label] = value
+    return encode_cbor(array)
+
+
+_VALUE = "COSE key {} must be an integer"
+_LABEL = "COSE key label must be an integer or a text string"
+_MAP = "COSE key must be a map"
+
+#: Each row with the start of the refusal it must meet, so it cannot pass on a different rule.
+_NON_INTEGER_COSE_KEYS: dict[str, tuple[Callable[[], bytes], str]] = {
+    "ES256 with crv true": (lambda: _relabelled(_p256(), crv=True), _VALUE.format("crv")),
+    "ES256 with crv 1.0": (lambda: _relabelled(_p256(), crv=1.0), _VALUE.format("crv")),
+    "ES256 with crv Decimal 1": (
+        lambda: _relabelled(_p256(), crv=Decimal(1)),
+        _VALUE.format("crv"),
+    ),
+    "ES256 with crv Fraction 1": (
+        lambda: _relabelled(_p256(), crv=Fraction(1)),
+        _VALUE.format("crv"),
+    ),
+    "ES256 with alg -7.0": (lambda: _relabelled(_p256(), alg=-7.0), _VALUE.format("alg")),
+    "ES256 with kty 2.0": (lambda: _relabelled(_p256(), kty=2.0), _VALUE.format("kty")),
+    "EdDSA with kty true": (lambda: _relabelled(_eddsa(), kty=True), _VALUE.format("kty")),
+    "EdDSA with crv 6.0": (lambda: _relabelled(_eddsa(), crv=6.0), _VALUE.format("crv")),
+    "EdDSA with alg -8.0": (lambda: _relabelled(_eddsa(), alg=-8.0), _VALUE.format("alg")),
+    "ES256 with the kty label written true": (lambda: _rekeyed(_p256(), 1, True), _LABEL),
+    "ES256 with the alg label written 3.0": (lambda: _rekeyed(_p256(), 3, 3.0), _LABEL),
+    "ES256 with the crv label written -1.0": (lambda: _rekeyed(_p256(), -1, -1.0), _LABEL),
+    "ES256 with the x label written Fraction -2": (
+        lambda: _rekeyed(_p256(), -2, Fraction(-2)),
+        _LABEL,
+    ),
+    "EdDSA with the kty label written true": (lambda: _rekeyed(_eddsa(), 1, True), _LABEL),
+    "ES256 with an extra byte-string label": (
+        lambda: encode_cbor({**parse_cbor(_p256()), b"k": 1}),
+        _LABEL,
+    ),
+    "ES256 as an array": (lambda: _as_array(_p256()), _MAP),
+    "ES256 as an array with crv true": (lambda: _as_array(_p256(), crv=True), _MAP),
+    "EdDSA as an array with kty true": (lambda: _as_array(_eddsa(), kty=True), _MAP),
+}
+
+
+@pytest.mark.parametrize(
+    ("build", "refusal"), _NON_INTEGER_COSE_KEYS.values(), ids=_NON_INTEGER_COSE_KEYS.keys()
+)
+def test_a_stand_in_for_a_cose_integer_is_refused_at_registration(
+    build: Callable[[], bytes], refusal: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A deliberate refusal on the audited path, like the curve pin: no WARNING is logged.
+
+    Each row names the refusal it must meet. So a row cannot pass on the shape pin, whose
+    message starts ``COSE algorithm``, or on a neighbouring rule after a fixture breaks. An array
+    row must meet the map rule itself: the label rule would also refuse its byte strings.
+    """
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    logger = "messagefoundry.auth.webauthn"
+    with (
+        caplog.at_level(logging.WARNING, logger=logger),
+        pytest.raises(wa.WebAuthnVerificationError) as caught,
+    ):
+        wa.verify_registration(
+            response_json=_registration_response(challenge, build()),
+            challenge=challenge,
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+    assert str(caught.value).startswith(refusal)
+    assert not [r for r in caplog.records if r.name == logger]
+
+
+def test_the_stand_in_rows_are_otherwise_well_formed() -> None:
+    """The positive control for the table above: the same two rewrites, carrying the integer.
+
+    If these were refused, the rows would prove only that the rewrite breaks a key, not that the
+    type check refuses it. A text-string label is a legal COSE label (RFC 9052 section 7) that
+    names no parameter the checks read, so it rides along here and must not be refused.
+    """
+    _assert_registers(_relabelled(_p256(), kty=2, alg=-7, crv=_P256))
+    _assert_registers(_relabelled(_eddsa(), kty=1, alg=-8, crv=_ED25519))
+    for label in (1, 3, -1, -2):
+        _assert_registers(_rekeyed(_p256(), label, label))
+        _assert_registers(_rekeyed(_eddsa(), label, label))
+    with_text_label = dict(parse_cbor(_p256()))
+    with_text_label["note"] = "x"
+    _assert_registers(encode_cbor(with_text_label))
+
+
+# --- sign-in re-screens the stored key with the registration rule (BACKLOG #1166) --------------
+#
+# ``verify_assertion`` used to trust the stored key, and the library's own sign-in checks do not
+# include the registration rule. ADR 0068 records why the exception for older keys went.
+#
+# With a real key and a good signature, the P-384, P-521, RSA, crv and kty rows SIGNED IN at
+# engine ``5ccff7cb3`` and ``9f51a2ada``; the library-alone control below pins each signature. The
+# two ``alg`` rows did not sign in: the library refused them with its own message, so they pin
+# which layer refuses.
+
+
+def _assertion_response(challenge: bytes, sign: Callable[[bytes], bytes]) -> str:
+    """A well-formed ``navigator.credentials.get`` response signed by ``sign``."""
+    credential_id = secrets.token_bytes(32)
+    client_data = json.dumps(
+        {"type": "webauthn.get", "challenge": bytes_to_base64url(challenge), "origin": ORIGIN}
+    ).encode("utf-8")
+    rp_hash = hashlib.sha256(RP.encode("utf-8")).digest()
+    auth_data = rp_hash + bytes([_FLAG_UP]) + struct.pack(">I", 0)
+    signature = sign(auth_data + hashlib.sha256(client_data).digest())
+    return json.dumps(
+        {
+            "id": bytes_to_base64url(credential_id),
+            "rawId": bytes_to_base64url(credential_id),
+            "response": {
+                "clientDataJSON": bytes_to_base64url(client_data),
+                "authenticatorData": bytes_to_base64url(auth_data),
+                "signature": bytes_to_base64url(signature),
+                "userHandle": None,
+            },
+            "type": "public-key",
+            "clientExtensionResults": {},
+        }
+    )
+
+
+def _rsa_signer(key: rsa.RSAPrivateKey) -> Callable[[bytes], str]:
+    """An assertion response maker that signs RS256, the way an RSA authenticator would."""
+
+    def sign(data: bytes) -> bytes:
+        return key.sign(data, padding.PKCS1v15(), hashes.SHA256())
+
+    return lambda challenge: _assertion_response(challenge, sign)
+
+
+def _ed25519_signer(key: ed25519.Ed25519PrivateKey) -> Callable[[bytes], str]:
+    return lambda challenge: _assertion_response(challenge, key.sign)
+
+
+def _signs_in(respond: Callable[[bytes], str], stored: bytes) -> int:
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    return wa.verify_assertion(
+        response_json=respond(challenge),
+        challenge=challenge,
+        rp_id=RP,
+        origin=ORIGIN,
+        public_key=stored,
+        current_sign_count=0,
+    )
+
+
+def _refused_at_sign_in(
+    respond: Callable[[bytes], str], stored: bytes, caplog: pytest.LogCaptureFixture
+) -> wa.WebAuthnVerificationError:
+    """Assert the audited refusal, with no WARNING: the refusal is deliberate, not a raw failure."""
+    logger = "messagefoundry.auth.webauthn"
+    with (
+        caplog.at_level(logging.WARNING, logger=logger),
+        pytest.raises(wa.WebAuthnVerificationError) as caught,
+    ):
+        _signs_in(respond, stored)
+    assert not [r for r in caplog.records if r.name == logger]
+    return caught.value
+
+
+def _rs256(key: rsa.RSAPrivateKey) -> bytes:
+    return _cose_rsa(key.public_key(), int(COSEAlgorithmIdentifier.RSASSA_PKCS1_v1_5_SHA_256))
+
+
+@pytest.mark.parametrize("bits", [1024, 2048])
+def test_a_stored_rsa_key_is_refused_at_sign_in(
+    bits: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RS256 carries no modulus floor, and a stored 1024-bit key used to sign in."""
+    caught = _refused_at_sign_in(*_stored_rsa(bits), caplog)
+    assert str(caught) == "COSE algorithm -257 is not accepted"
+
+
+def _stored_rsa(bits: int) -> tuple[Callable[[bytes], str], bytes]:
+    key = _rsa_key(bits)
+    return _rsa_signer(key), _rs256(key)
+
+
+def _stored_es256(
+    curve: ec.EllipticCurve, crv: int, size: int
+) -> tuple[Callable[[bytes], str], bytes]:
+    key = ec.generate_private_key(curve)
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN, _key=key)
+    return soft.get_response, _cose_es256(key, crv, size)
+
+
+def _stored_p256(**changes: object) -> tuple[Callable[[bytes], str], bytes]:
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    return soft.get_response, _relabelled(soft.cose_public_key(), **changes)
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        lambda: _stored_rsa(1024),
+        lambda: _stored_rsa(2048),
+        lambda: _stored_es256(ec.SECP384R1(), _P384, 48),
+        lambda: _stored_es256(ec.SECP521R1(), 3, 66),
+        lambda: _stored_p256(crv=True),
+        lambda: _stored_p256(crv=1.0),
+        lambda: _stored_p256(kty=2.0),
+    ],
+    ids=[
+        "RS256 1024",
+        "RS256 2048",
+        "ES256 P-384",
+        "ES256 P-521",
+        "crv true",
+        "crv 1.0",
+        "kty 2.0",
+    ],
+)
+def test_the_refused_stored_keys_verify_under_the_library_alone(
+    stored: Callable[[], tuple[Callable[[bytes], str], bytes]],
+) -> None:
+    """The positive control for the sign-in refusal rows: each signature is good.
+
+    If the library alone refused one of these, its refusal row would pass on a broken fixture
+    rather than on the check.
+    """
+    from webauthn import verify_authentication_response
+
+    respond, public_key = stored()
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    verified = verify_authentication_response(
+        credential=respond(challenge),
+        expected_challenge=challenge,
+        expected_rp_id=RP,
+        expected_origin=ORIGIN,
+        credential_public_key=public_key,
+        credential_current_sign_count=0,
+    )
+    assert verified.new_sign_count == 0
+
+
+#: Stored P-256 keys with one stand-in for a COSE integer, each with the refusal it must meet.
+#: ``alg`` as text is the row a type check inside the library catch gets wrong: ``int("x")``
+#: raises a raw ``ValueError``, which the catch turns into a WARNING and a different message.
+#: Only sign-in can show it, because registration's library call refuses that ``alg`` first.
+_NON_INTEGER_STORED_KEYS: dict[str, tuple[Callable[[bytes], bytes], str]] = {
+    "crv true": (lambda k: _relabelled(k, crv=True), _VALUE.format("crv")),
+    "crv 1.0": (lambda k: _relabelled(k, crv=1.0), _VALUE.format("crv")),
+    "alg true": (lambda k: _relabelled(k, alg=True), _VALUE.format("alg")),
+    "alg as text": (lambda k: _relabelled(k, alg="x"), _VALUE.format("alg")),
+    "kty 2.0": (lambda k: _relabelled(k, kty=2.0), _VALUE.format("kty")),
+}
+
+
+@pytest.mark.parametrize(
+    ("rewrite", "refusal"), _NON_INTEGER_STORED_KEYS.values(), ids=_NON_INTEGER_STORED_KEYS.keys()
+)
+def test_a_stored_key_with_a_stand_in_integer_is_refused_at_sign_in(
+    rewrite: Callable[[bytes], bytes], refusal: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Sign-in runs the same integer check as registration, so a stand-in cannot sign in."""
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    caught = _refused_at_sign_in(soft.get_response, rewrite(soft.cose_public_key()), caplog)
+    assert str(caught).startswith(refusal)
+
+
+@pytest.mark.parametrize("alg", [True, False], ids=["alg true", "alg false"])
+def test_an_alg_given_as_a_bool_is_refused_at_registration(alg: bool) -> None:
+    """End to end, the LIBRARY refuses both, before our check runs.
+
+    ``True`` is not in the pinned set it is handed, and ``False`` fails its missing-``alg`` test.
+    So this row pins the outcome, not our check. The next row pins our check.
+    """
+    challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
+    with pytest.raises(wa.WebAuthnVerificationError):
+        wa.verify_registration(
+            response_json=_registration_response(challenge, _relabelled(_p256(), alg=alg)),
+            challenge=challenge,
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+
+
+def test_the_shared_check_refuses_an_alg_of_true_by_its_type() -> None:
+    """The helper both ceremonies call refuses ``alg: true`` by its type, not by its value.
+
+    That sign-in calls it is pinned by the ``alg true`` row above, through ``verify_assertion``.
+    """
+    with pytest.raises(wa.WebAuthnVerificationError) as caught:
+        wa._require_usable_public_key(_relabelled(_p256(), alg=True), ceremony="registration")
+    assert str(caught.value) == "COSE key alg must be an integer, not bool"
+
+
+def test_p256_es256_and_ed25519_eddsa_pass_both_ceremonies() -> None:
+    """The positive control: the re-screen refuses nothing the registration rule keeps."""
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    _assert_registers(soft.cose_public_key())
+    assert _signs_in(soft.get_response, soft.cose_public_key()) == 0
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    _assert_registers(_okp(key))
+    assert _signs_in(_ed25519_signer(key), _okp(key)) == 0

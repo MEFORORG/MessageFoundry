@@ -42,6 +42,7 @@ import re
 import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from typing import ClassVar
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import client_cert_principal, constant_time_match_any
@@ -82,7 +83,6 @@ DEFAULT_MAX_BODY_BYTES = (
 DEFAULT_MAX_HEADER_BYTES = (
     64 * 1024
 )  # cap the request line + headers (a header-flood / slow-loris guard)
-_READ_CHUNK = 65536  # body read granularity
 
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled (mirrors MLLPSource; bounds shutdown).
@@ -168,6 +168,46 @@ _HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 #: A header field-value: printable US-ASCII, no leading or trailing space, and **no control
 #: characters at all** — which is what excludes CR and LF, the header-injection primitive.
 _HEADER_VALUE_RE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
+
+#: ``Content-Length = 1*DIGIT`` (RFC 9112 section 6.2), used INSTEAD of ``int()`` on the intake
+#: path. ``int()`` accepts a leading sign and PEP 515 underscores, so ``1_0`` framed ten bytes and
+#: ``+3`` framed three -- both measured against the shipped parser (BACKLOG #1125).
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
+
+#: The two headers that frame a request body. A name that becomes one of these once ``_`` is read
+#: as ``-`` is refused (BACKLOG #1913): ``Transfer_Encoding`` is a valid token, so it slipped past
+#: both framing guards here, while a front end that folds underscores into hyphens reads it as real.
+_FRAMING_HEADERS = frozenset({"content-length", "transfer-encoding"})
+
+#: The health-probe methods: answered with a static 200 and no ingress row (ADR 0023 D2).
+_HEALTH_PROBE_METHODS = frozenset({"GET", "HEAD"})
+
+#: Methods this listener ingests a body for. Each must declare a ``Content-Length``; with none the
+#: request is refused 411 in the head parse rather than read to EOF (BACKLOG #1125). Every OTHER
+#: method, the health probes included, may declare only ``Content-Length: 0``: it declares no body
+#: and desyncs nothing, and it is the shape a health checker actually sends. A non-zero length is
+#: refused, because those are the declared bytes this listener would never read.
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+#: A ``Content-Length`` with more significant digits than this is refused. It is far past any body
+#: cap, and ``int()`` raises past 4300 digits (CPython's ``sys.int_info.default_max_str_digits``),
+#: counting leading zeros, which escaped as a 500. So the head parse strips the zeros, checks this
+#: cap, and stores the normalised digits; no ``int()`` ever sees the raw wire text.
+_MAX_CONTENT_LENGTH_DIGITS = 18
+
+#: A request-target: visible US-ASCII only (RFC 9112 section 3.2, RFC 3986). No space, HTAB, VT,
+#: FF or other control character, which some recipients treat as request-line separators.
+_REQUEST_TARGET_RE = re.compile(r"[\x21-\x7e]+")
+
+#: A control character in a header field-value (RFC 9110 section 5.5 allows VCHAR, obs-text, SP and
+#: HTAB). CR and LF are already refused with the head; this catches the rest, NUL included.
+_FIELD_VALUE_CTL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+#: ``HTTP-version = "HTTP/" DIGIT "." DIGIT`` (RFC 9112 section 2.3), and the major version must be 1.
+#: A ``startswith("HTTP/")`` test accepted ``HTTP/1.1x``; a fronting proxy that parses the version
+#: strictly and an origin that does not is one of the shapes a desync is built from. HTTP/0.9 has no
+#: header block and HTTP/2 is not a text protocol, so neither is parsed with HTTP/1.1 framing.
+_HTTP_VERSION_RE = re.compile(r"HTTP/1\.[0-9]")
 
 
 def _validated_header(name: str, value: str) -> str:
@@ -281,9 +321,8 @@ async def _read_head(
     **The split is a security boundary, not tidying** (ADR 0154 D6). It is what lets intake
     authentication examine a request's credentials *before* its body is buffered. Authenticating
     after a combined read would let an anonymous peer command up to
-    ``max_connections × max_body_bytes`` of resident heap — transiently about twice that on the
-    no-``Content-Length`` path, where :func:`_read_to_eof` accumulates a chunk list and then joins it
-    — before a single credential byte was examined. The connection cap cannot shed that load either,
+    ``max_connections × max_body_bytes`` of resident heap before a single credential byte was
+    examined. The connection cap cannot shed that load either,
     because it is consulted earlier still, in ``_on_client``. Keep any new pre-body refusal here.
 
     Raises :class:`HttpRequestError` (carrying the status + connection-event kind) on an unbounded
@@ -302,12 +341,41 @@ async def _read_head(
 
     try:
         text = head.decode("iso-8859-1")  # HTTP/1.1 header octets are latin-1 (RFC 7230)
+    except UnicodeDecodeError as exc:
+        raise HttpRequestError(400, "malformed request line", kind="framing_error") from exc
+
+    # A BARE LF IS REFUSED BEFORE THE HEAD IS SPLIT, and this one is not pedantry (BACKLOG #1125).
+    # RFC 9112 section 2.2 makes CRLF the only line terminator. Splitting on "\r\n" alone leaves a
+    # bare LF INSIDE a line, which measurably fused two headers into one: `Host: t\nContent-Length: 3`
+    # parsed to a single `host` field and the Content-Length VANISHED from the dict, so both framing
+    # guards below inspected a request whose framing header they could no longer see. A bare LF in
+    # the request line was worse -- the header dict came out EMPTY while the body was still read.
+    # A fronting proxy that accepts bare LF as a terminator and an origin that does not is the
+    # textbook desync pair, so this is refused rather than normalised.
+    #
+    # A BARE CR is the same primitive from the other side. RFC 9112 section 2.2 lets a recipient
+    # treat it as a line break, so `Host: h\rContent-Length: 3` is a Host header here and a
+    # Content-Length to a proxy that splits on CR. That shape measurably reached the POST path with
+    # the Content-Length hidden inside the Host value.
+    bare = text.replace("\r\n", "")
+    if "\n" in bare:
+        raise HttpRequestError(400, "bare LF in request head", kind="framing_error")
+    if "\r" in bare:
+        raise HttpRequestError(400, "bare CR in request head", kind="framing_error")
+
+    try:
         lines = text.split("\r\n")
         request_line = lines[0]
         method, target, version = request_line.split(" ", 2)
-    except (UnicodeDecodeError, ValueError) as exc:
+    except ValueError as exc:
         raise HttpRequestError(400, "malformed request line", kind="framing_error") from exc
-    if not version.startswith("HTTP/"):
+    # `method = token` (RFC 9110 section 9.1). Checked here because the method now selects the
+    # framing rule below, so a method this parser and a proxy disagree on is a framing decision.
+    if (
+        not _HEADER_NAME_RE.fullmatch(method)
+        or not _REQUEST_TARGET_RE.fullmatch(target)
+        or not _HTTP_VERSION_RE.fullmatch(version)
+    ):
         raise HttpRequestError(400, "malformed request line", kind="framing_error")
 
     headers: dict[str, str] = {}
@@ -315,12 +383,32 @@ async def _read_head(
     for line in lines[1:]:
         if not line:
             continue
+        # A LINE THAT STARTS WITH SPACE OR TAB IS AN obs-fold CONTINUATION (RFC 9112 section 5.2),
+        # and a server must refuse it or unfold it. Before this check `.strip()` read
+        # ` Content-Length: 3` as a real framing header, while a proxy that unfolds reads it as
+        # more of the previous header's value. Refused, like every other shape the two could split on.
+        if line[0] in " \t":
+            raise HttpRequestError(400, "obsolete line folding in header", kind="framing_error")
         name, sep, value = line.partition(":")
         if not sep:
             raise HttpRequestError(400, "malformed header line", kind="framing_error")
-        key = name.strip().lower()
+        # WHITESPACE BEFORE THE COLON IS A MUST-REJECT (RFC 9112 section 5.1), not something to
+        # strip. `.strip()` normalised `Content-Length : 3` into a valid framing header, which is
+        # precisely the shape a strict proxy drops and a lenient origin honours.
+        if name != name.rstrip():
+            raise HttpRequestError(400, "whitespace before header colon", kind="framing_error")
+        # `field-name = token`. Anything else is a name a proxy may read differently.
+        if not _HEADER_NAME_RE.fullmatch(name):
+            raise HttpRequestError(400, "malformed header line", kind="framing_error")
+        # Only OWS (SP and HTAB) is trimmed. `str.strip()` also removed VT, FF, NBSP and NEL, so
+        # `Content-Length: 3\x0b` framed three bytes here while a strict proxy refused the header.
+        if _FIELD_VALUE_CTL_RE.search(value):
+            raise HttpRequestError(400, "control character in header value", kind="framing_error")
+        key = name.lower()
+        if "_" in key and key.replace("_", "-") in _FRAMING_HEADERS:
+            raise HttpRequestError(400, "underscore in a framing header name", kind="framing_error")
         header_counts[key] = header_counts.get(key, 0) + 1
-        headers[key] = value.strip()
+        headers[key] = value.strip(" \t")
 
     # Reject AMBIGUOUS framing before any Content-Length is trusted — the HTTP request-smuggling
     # defense (RFC 7230 §3.3.3). A duplicate Content-Length / Transfer-Encoding, or the two present
@@ -334,7 +422,56 @@ async def _read_head(
             400, "ambiguous framing: Content-Length with Transfer-Encoding", kind="framing_error"
         )
 
-    method = method.upper()
+    # The method is NOT case-folded: it is a case-sensitive token (RFC 9110 section 9.1), and it
+    # picks the framing rule below. Folding `post` to POST would apply a rule a proxy does not.
+
+    # FRAMING IS DECIDED HERE, FOR EVERY METHOD, BEFORE ANY METHOD DISPATCH (BACKLOG #1125, ASVS
+    # 4.2.1). RFC 9112 makes framing a property of the MESSAGE, not of the method, and the earlier
+    # arrangement -- a GET/HEAD short-circuit in `_read_body` that ran BEFORE the framing refusal --
+    # accepted a GET carrying `Transfer-Encoding: chunked` or a `Content-Length` with an empty body
+    # and its declared bytes left unread on the socket.
+    #
+    # **Refuse, never consume.** Measured before this change: a GET declaring 16 MiB and sending
+    # none was answered 200 in 0.002s, while the POST path held the socket for the full 3s
+    # `receive_timeout`. Making a bodyless method READ its declared body would hand an
+    # unauthenticated peer a slow-loris hold on the cheapest path; refusing answers faster than
+    # either.
+    #
+    # `Transfer-Encoding` is refused by PRESENCE, not by matching `chunked`. This listener decodes
+    # no transfer coding, and an exact-equality test measurably missed `gzip, chunked`, `chunked,`
+    # and `identity`, all of which reached the POST path and were ingested as clinical payload.
+    # This is a deliberate departure from RFC 9112, not conformance: section 7 makes parsing
+    # chunked a MUST, and section 6.1 says an unknown coding SHOULD get 501. Every coding gets the
+    # same 400 here, so one framing refusal covers them all (BACKLOG #1125, #1913).
+    if "transfer-encoding" in headers:
+        raise HttpRequestError(
+            400, "transfer-encoding is not supported; use Content-Length", kind="framing_error"
+        )
+
+    cl_raw = headers.get("content-length")
+    if cl_raw is not None:
+        # `1*DIGIT` per RFC 9112, NOT `int()`. `int()` accepts a leading plus and PEP 515
+        # underscores, so `Content-Length: 1_0` framed TEN bytes and `+3` framed three -- measured.
+        if not _CONTENT_LENGTH_RE.fullmatch(cl_raw):
+            raise HttpRequestError(400, "invalid Content-Length", kind="framing_error")
+        digits = cl_raw.lstrip("0") or "0"
+        if len(digits) > _MAX_CONTENT_LENGTH_DIGITS:
+            raise HttpRequestError(400, "invalid Content-Length", kind="framing_error")
+        headers["content-length"] = digits
+        # CARVE-OUT, and it is the one shape the tree actually exercises: `Content-Length: 0` on a
+        # method this listener reads no body for declares no body, so it desyncs nothing and a
+        # health checker that sends it stays green. A NON-ZERO length there is refused -- those are
+        # the declared bytes that would be left on the wire, or buffered only to answer 405.
+        if method not in _BODY_METHODS and digits != "0":
+            raise HttpRequestError(400, "request must not declare a body", kind="framing_error")
+    elif method in _BODY_METHODS:
+        # A BODY METHOD WITH NO FRAMING IS REFUSED, NOT READ TO EOF. RFC 9112 section 6.3 says such
+        # a request has a ZERO-length body, so a proxy forwards the head and treats any bytes after
+        # it as the next request, while the old read-to-EOF path ingested those same bytes as this
+        # request's clinical payload. 411 Length Required is the RFC 9110 status for a server that
+        # refuses a request with no Content-Length.
+        raise HttpRequestError(411, "Content-Length is required", kind="framing_error")
+
     return HttpRequest(method, target, headers, b"")
 
 
@@ -347,36 +484,35 @@ async def _read_body(
     """Read the body belonging to an already-parsed ``head``, applying the body cap.
 
     Split out of :func:`_read_request` so authentication can run between the two halves (see
-    :func:`_read_head`). The ordering inside is load-bearing and is preserved exactly as it shipped:
-    the GET/HEAD short-circuit runs **before** the chunked refusal, so a ``GET`` carrying
-    ``Transfer-Encoding: chunked`` is accepted with an empty body rather than refused. Hoisting that
-    refusal would read as hardening and would in fact be a silent behaviour change."""
-    # Only methods that carry a body read one. GET/HEAD are health probes (no body, no ingress).
-    if head.method in ("GET", "HEAD"):
+    :func:`_read_head`).
+
+    **This function no longer decides framing, and the ordering warning that used to live here is
+    gone because the thing it warned about was done deliberately** (BACKLOG #1125, ASVS 4.2.1). It
+    said the GET/HEAD short-circuit running before the chunked refusal was load-bearing, and that
+    hoisting the refusal "would read as hardening and would in fact be a silent behaviour change".
+    The change was not silent: it went to adversarial review, and the authoring commit was read
+    (``f2ef0ea92``, the ADR 0154 intake-auth increment) and names no ruling and no incident -- it
+    was change-control caution to stop that refactor altering behaviour by accident, and it worked.
+
+    Framing is now settled in :func:`_read_head` for EVERY method before dispatch, so by the time
+    this runs a ``Transfer-Encoding`` has already been refused and a ``Content-Length`` is already
+    known to be at most 18 normalised digits, to be present on a body method, and to be absent or
+    zero on every other method. What remains here is the read itself."""
+    # Only body methods read one. Any other method reaching this point has already been proven to
+    # declare no body, so this discards nothing that was ever on the wire.
+    if head.method not in _BODY_METHODS:
         return b""
 
-    body = b""
     cl_raw = head.headers.get("content-length")
-    if head.headers.get("transfer-encoding", "").lower() == "chunked":
-        # Chunked intake is not part of the first slice — a partner that streams must use Content-Length.
-        raise HttpRequestError(
-            400, "chunked transfer-encoding is not supported", kind="framing_error"
-        )
-    if cl_raw is not None:
-        try:
-            content_length = int(cl_raw)
-            if content_length < 0:
-                raise ValueError
-        except ValueError as exc:
-            raise HttpRequestError(400, "invalid Content-Length", kind="framing_error") from exc
-        if max_body_bytes is not None and content_length > max_body_bytes:
-            # Refuse on the DECLARED size before reading a single body byte (don't buffer to find out).
-            raise HttpRequestError(413, "body exceeds cap", kind="frame_oversize")
-        body = await _read_exactly(reader, content_length)
-    elif head.method in ("POST", "PUT", "PATCH"):
-        # No Content-Length and not chunked: read to EOF (Connection: close), still bounded by the cap.
-        body = await _read_to_eof(reader, max_body_bytes)
-    return body
+    if cl_raw is None:
+        # The head parse refuses this; kept so a head built any other way can never fall through
+        # to an empty body committed as a message.
+        raise HttpRequestError(411, "Content-Length is required", kind="framing_error")
+    content_length = int(cl_raw)  # at most 18 digits, normalised by the head parse
+    if max_body_bytes is not None and content_length > max_body_bytes:
+        # Refuse on the DECLARED size before reading a single body byte (don't buffer to find out).
+        raise HttpRequestError(413, "body exceeds cap", kind="frame_oversize")
+    return await _read_exactly(reader, content_length)
 
 
 async def _read_request(
@@ -410,22 +546,6 @@ async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
         raise HttpRequestError(400, "incomplete request body", kind="framing_error") from exc
 
 
-async def _read_to_eof(reader: asyncio.StreamReader, cap: int | None) -> bytes:
-    """Read body bytes to EOF, enforcing ``cap`` (None disables it). Refuses past the cap rather than
-    buffering an unbounded body (the OOM guard the MLLPDecoder cap provides for framed transports)."""
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = await reader.read(_READ_CHUNK)
-        if not chunk:
-            break
-        total += len(chunk)
-        if cap is not None and total > cap:
-            raise HttpRequestError(413, "body exceeds cap", kind="frame_oversize")
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
 # The runner injects an HTTP receipt handler that commits the body to ingress and returns the engine
 # message_id (the first-slice receipt), or returns None when the body was NOT committed (a post-decode
 # engine guard, e.g. the ingress size ceiling). Distinct from the bytes->str|None InboundHandler so the
@@ -439,6 +559,9 @@ class HttpSource(SourceConnector):
 
     A faithful :class:`~messagefoundry.transports.mllp.MLLPSource` sibling: same bind/stop lifecycle,
     per-connection IP allowlist, inbound TLS, and on-by-default ``connection_event`` plumbing."""
+
+    #: The 202 carries the committed message id, so the runner starts this source with the receipt handler.
+    wants_receipt: ClassVar[bool] = True
 
     def __init__(self, config: Source) -> None:
         s = config.settings
@@ -675,7 +798,9 @@ class HttpSource(SourceConnector):
             return head.headers.get(self.intake_api_key_header)
         if self.intake_auth == "bearer":
             scheme, _, token = head.headers.get("authorization", "").partition(" ")
-            return token.strip() if scheme.lower() == "bearer" else None
+            # OWS only, matching the header-value trim in the head parse; str.strip() would also
+            # remove NBSP and NEL, so a bearer token and an API key would be trimmed differently.
+            return token.strip(" \t") if scheme.lower() == "bearer" else None
         return None
 
     def _authorize_head(self, head: HttpRequest, peer_host: str | None) -> None:
@@ -686,7 +811,7 @@ class HttpSource(SourceConnector):
         """
         if self.intake_auth not in ("api_key", "bearer"):
             return
-        if head.method in ("GET", "HEAD") and self.intake_auth_health == "allow":
+        if head.method in _HEALTH_PROBE_METHODS and self.intake_auth_health == "allow":
             return  # explicit opt-out for a load-balancer probe that cannot carry the credential
         peer = peer_host or "unknown"
         limited = self._rate_limit_refusal(peer)
@@ -866,11 +991,11 @@ class HttpSource(SourceConnector):
             return True
 
         # Health probe: GET/HEAD answer a static, non-PHI 200 WITHOUT an ingress row (ADR 0023 D2).
-        if request.method in ("GET", "HEAD"):
+        if request.method in _HEALTH_PROBE_METHODS:
             body = "" if request.method == "HEAD" else '{"status":"ok"}'
             await self._respond(writer, build_response(200, body))
             return False
-        if request.method not in ("POST", "PUT", "PATCH"):
+        if request.method not in _BODY_METHODS:
             await self._write_safely(writer, build_response(405, '{"error":"method not allowed"}'))
             return False
 

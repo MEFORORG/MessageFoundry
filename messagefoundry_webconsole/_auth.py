@@ -48,8 +48,10 @@ __all__ = [
     "is_unlock_action",
     "login_redirect_response",
     "lookup_ui_action",
+    "must_change_target",
     "oidc_flow_cookie_name",
     "register_ui_action",
+    "rotation_comes_first",
     "require_ui",
     "require_ui_reauth_only",
     "require_ui_reauth_only_action",
@@ -240,6 +242,39 @@ def _mfa_redirect() -> HTTPException:
     return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/mfa"})
 
 
+async def rotation_comes_first(auth: AuthService, must_change: bool, token: str | None) -> bool:
+    """Whether a session is confined to the password page (L4b) right now.
+
+    A must-change session with no factor, or with its factor proven, can only rotate. One that still
+    owes a factor it has enrolled proves it first, since the password page refuses it until then
+    (``AuthService.password_change_owes_factor``, BACKLOG #1954); an administrator reset is at least
+    one shipped way in, because it keeps factors. Where the routing is a redirect,
+    :func:`must_change_target` asks the same question.
+
+    Fails closed on an unknown state (BACKLOG #1974): see :func:`_owes_known_factor`."""
+    return must_change and not await _owes_known_factor(auth, token)
+
+
+async def _owes_known_factor(auth: AuthService, token: str | None) -> bool:
+    """Whether the session owes a factor it has enrolled, and still EXISTS to prove it.
+
+    ``password_change_owes_factor`` answers True for a missing session or user too (its own
+    docstring). Read as "owes a factor", that unknown state would release a must-change session
+    from the confinement, so a True counts only while the token still resolves to an identity
+    (BACKLOG #1974). Session and user rows are never restored once gone, so a token that resolves
+    after the check resolved during it. ``activity=False``: this probe is not user activity."""
+    if not await auth.password_change_owes_factor(token):
+        return False
+    return await auth.identity_for_token(token, activity=False) is not None
+
+
+async def must_change_target(auth: AuthService, token: str | None) -> str:
+    """Where a must-change session is sent: the factor page while it owes an enrolled factor,
+    otherwise the password page. It asks what :func:`rotation_comes_first` asks, so an unknown
+    state is confined on both paths and never audited as an MFA refusal."""
+    return "/ui/mfa" if await _owes_known_factor(auth, token) else "/ui/account/password"
+
+
 def require_ui(
     *permissions: Permission,
     phi: bool = False,
@@ -267,7 +302,8 @@ def require_ui(
 
     A ``must_change_password`` account is 303'd to the browser change-password page (L4b) from every
     /ui route — ``allow_must_change=True`` is set ONLY by that page's own GET/POST (so the rotation
-    can actually happen; anything else would loop).
+    can actually happen; anything else would loop). While it still owes a factor it has enrolled,
+    it goes to ``/ui/mfa`` instead (``must_change_target``, BACKLOG #1954).
 
     ``activity=False`` (ASVS 14.3.1) validates the session WITHOUT refreshing its idle clock — the
     same contract the engine's /ws/stats keepalive uses. Set it on the console's **timer-driven
@@ -293,10 +329,14 @@ def require_ui(
             # too (14.3.1). A visitor with NO cookie never had a session — plain form, no code.
             raise _login_redirect("expired" if token else "")
         if identity.must_change_password and not allow_must_change:
-            # A flagged account can go nowhere but the change-password page (L4b) until it rotates.
-            raise HTTPException(
-                status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/account/password"}
-            )
+            # A flagged account can go nowhere but the change-password page (L4b) until it rotates,
+            # or the factor page first when it still owes an enrolled factor (BACKLOG #1954).
+            target = await must_change_target(auth, token)
+            if target == "/ui/mfa":
+                # The MFA refusal in all but name, so it is audited like the one below (#1197).
+                client = request.client.host if request.client else None
+                await auth.audit_mfa_denied(identity, request.url.path, client=client)
+            raise HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": target})
         # ASVS 6.3.3, the cookie mirror of the JSON gate. Ordering matches require(): must_change
         # above, permissions below — a pending session must not learn whether it holds a permission.
         if not allow_mfa_pending and not await auth.mfa_satisfied(token):
@@ -793,11 +833,13 @@ def require_ui_reauth_only_action(
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_ui_reauth_only` (password-only, **no MFA gate** so a required-but-unenrolled
     session can still enroll its first factor), but the step-up must be a fresh proof **bound to**
-    ``action`` (single-use, ADR 0077 / ASVS 7.5.1). Used by the browser factor-binding enroll lanes.
-    Falls back to the session window under ``[auth].require_action_step_up = false``. Same ``new_ip``-
-    first short-circuit so a forced new-IP step-up leaves the single-use grant UNCONSUMED."""
-    # allow_mfa_pending: a genuine exemption, not a re-route. These gate the ENROLLMENT path, and
-    # an un-enrolled user can never satisfy a gate standing in front of the route that enrolls them.
+    ``action`` (single-use, ADR 0077 / ASVS 7.5.1). Used by the browser factor-binding enroll lanes
+    and the session-terminate lanes. Falls back to the session window under
+    ``[auth].require_action_step_up = false``. Same ``new_ip``-first short-circuit so a forced
+    new-IP step-up leaves the single-use grant UNCONSUMED."""
+    # allow_mfa_pending: a genuine exemption, not a re-route. It serves an account with NO factor,
+    # which can never satisfy a gate standing in front of the route that enrolls it, or that ends
+    # a session it does not recognise. An account that HAS a factor is refused below (#1951).
     base = require_ui(*permissions, allow_mfa_pending=True)
 
     async def dependency(request: Request) -> Identity:
@@ -808,10 +850,15 @@ def require_ui_reauth_only_action(
         token = session_token(request)
         client = request.client.host if request.client else None
         new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
+        nxt = reauth_next(request) if reauth_next is not None else None
+        if await auth.factor_binding_is_blocked(token, action):
+            # A pending session on an account that HAS a factor (see _PENDING_REFUSED_ACTIONS).
+            # Audited like require_ui's own MFA refusal and like the JSON twin; /ui/reauth then asks
+            # for the code before the password.
+            await auth.audit_mfa_denied(identity, request.url.path, client=client)
+            raise _reauth_redirect(request, nxt)
         if new_ip or not await _ui_action_step_up_ok(auth, token, action):
-            raise _reauth_redirect(
-                request, reauth_next(request) if reauth_next is not None else None
-            )
+            raise _reauth_redirect(request, nxt)
         return identity
 
     return dependency

@@ -919,6 +919,7 @@ def test_serve_refuses_auth_off_behind_declared_terminator(
         "security.require_sign_in = false\n"
         "[api]\n"
         "tls_terminated_upstream = true\n"
+        "plaintext_upstream_hop_acknowledged = true\n"
         'trusted_proxies = ["10.0.0.1"]\n',  # settings.py requires this alongside the terminator
         encoding="utf-8",
     )
@@ -979,6 +980,7 @@ def test_serve_auth_on_behind_terminator_unaffected_by_arm(
         "security.local_access_only = true\n"
         "[api]\n"
         "tls_terminated_upstream = true\n"
+        "plaintext_upstream_hop_acknowledged = true\n"
         'trusted_proxies = ["10.0.0.1"]\n',
         encoding="utf-8",
     )
@@ -1109,7 +1111,7 @@ def _expose_toml(
             if public_origin is not None
             else ""
         )
-        + '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        + '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
         encoding="utf-8",
@@ -1282,7 +1284,7 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
         # BACKLOG #1026, same reason: a declared-terminator PHI instance under `enforce` refuses
         # without a public address, and the single-factor ACK is what is on trial here.
         'security.web_console_public_address = "https://mefor.example.org"\n'
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
         encoding="utf-8",
@@ -1318,7 +1320,7 @@ def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
         'security.listen_address = "0.0.0.0"\n'
         "security.require_mfa = false\n"
         "security.block_unlisted_outbound = true\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         # Opt out of the BACKLOG #187 secure default so the single-factor-at-exposure gate fires even
         # on an AD-enabled bind (the gate keys on require_mfa only, whatever the providers in play).
@@ -1621,7 +1623,7 @@ def test_serve_ui_upstream_requires_public_origin(
         monkeypatch,
         "security.serve_web_console = true\n"
         "security.block_unlisted_outbound = true\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 2
     err = capsys.readouterr().err
@@ -1647,7 +1649,7 @@ def test_serve_ui_upstream_with_public_origin_starts(
         "alerts.security_notifications_required = false\n"
         "security.serve_web_console = true\n"
         'security.web_console_public_address = "https://mefor.example.org"\n'
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 0
     assert _UI_TERMINATOR_REFUSAL not in capsys.readouterr().err
@@ -1664,7 +1666,7 @@ def test_serve_ui_http_public_origin_refused_with_declared_tls(
         "security.serve_web_console = true\n"
         'security.web_console_public_address = "http://mefor.example.org"\n'
         "security.block_unlisted_outbound = true\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 2
     # Anchored on the relocation map, not a literal, for the reason _relocated_public_origin_key
@@ -1787,7 +1789,7 @@ def test_serve_ui_exposed_emits_842_guidance_and_new_ip_advisory(
         'security.web_console_public_address = "https://mefor.example.org"\n'
         "security.require_mfa = true\n"
         "security.block_unlisted_outbound = true\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.2"]\n',
         env="staging",
     )
     assert rc == 0
@@ -1812,6 +1814,7 @@ security.require_mfa = false
 security.block_unlisted_outbound = true
 [api]
 tls_terminated_upstream = true
+plaintext_upstream_hop_acknowledged = true
 trusted_proxies = ["10.0.0.2"]
 """,
         env="prod",
@@ -1837,6 +1840,7 @@ security.require_mfa = false
 security.block_unlisted_outbound = true
 [api]
 tls_terminated_upstream = true
+plaintext_upstream_hop_acknowledged = true
 trusted_proxies = ["10.0.0.2"]
 """,
         env="staging",
@@ -1871,7 +1875,7 @@ _EXPOSURE_TAIL = (
     '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
 )
 _DECLARED_PROXY = (
-    '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+    '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
     'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
 )
 
@@ -2122,7 +2126,7 @@ def test_serve_ui_explicit_offloopback_still_refuses(
         monkeypatch,
         "security.serve_web_console = true\n"
         "security.block_unlisted_outbound = true\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 2
     err = capsys.readouterr().err
@@ -2145,7 +2149,7 @@ def test_serve_ui_default_on_offloopback_degrades_json_only(
         monkeypatch,
         'security.enforcement = "warn"\n'
         "security.block_unlisted_outbound = true\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 0
     err = capsys.readouterr().err

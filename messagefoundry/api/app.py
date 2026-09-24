@@ -74,6 +74,7 @@ from messagefoundry.api.header_floor import (
     HSTS_VALUE,
     SecurityHeaderFloorMiddleware,
     hsts_notable,
+    refuse_websocket,
 )
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
@@ -285,6 +286,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import (
     EnvRef,
+    InboundConnection,
     Registry,
     WiringError,
     accepted_cleartext_hops,
@@ -300,7 +302,11 @@ from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runt
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import (
+    AlertSink,
+    LoggingAlertSink,
+    store_cipher_refusal_forwarder,
+)
 from messagefoundry.pipeline.cluster import (
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
@@ -309,6 +315,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
+from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
     NotDeployedError,
@@ -1193,6 +1200,50 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
     if backend == StoreBackend.SQLSERVER.value:
         return list(_SQLSERVER_PLAINTEXT_RESIDUAL)  # () since H4 — full parity, no residual
     return []
+
+
+#: The status a refused operator resubmission answers with, by the ingress guard that refused it
+#: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
+#: the same status the upload route gives a non-text file. A body the listener could not have decoded,
+#: or an HL7 body ``Peek.parse`` refuses, is 422.
+_INGRESS_GUARD_STATUS: dict[str, int] = {"size": 413, "type": 415, "decode": 422, "parse": 422}
+
+
+async def _guard_resubmission(
+    engine: Engine,
+    identity: Identity,
+    request: Request,
+    *,
+    raw: str,
+    inbound: InboundConnection | None,
+    action: str,
+    channel_id: str | None,
+    detail: dict[str, object],
+) -> str:
+    """Admit a resubmitted body as the target inbound's listener would, or refuse it (BACKLOG #1911).
+
+    The upload resend and the edit-resend paths write the stage row directly, so the listener's size
+    ceiling and declared-type checks never ran on them. This runs the same guards
+    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmitted_body`) before anything is written
+    and returns the form to commit, which the caller writes instead of the body it was handed. A
+    refusal is an HTTP 4xx, an ``action`` audit row and a log line, and no message row is written, so
+    count-and-log holds: no body is accepted and then dropped. Off the event loop, because the body can
+    be as large as an upload.
+
+    The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
+    of the body, so neither the row nor the 4xx detail echoes PHI."""
+    try:
+        return await asyncio.to_thread(admit_resubmitted_body, raw, inbound)
+    except IngressGuardError as exc:
+        await engine.store.record_audit(
+            action,
+            actor=identity.username,
+            channel_id=channel_id,
+            detail=json.dumps({**detail, "phase": exc.phase, "reason": exc.reason}),
+            client=client_ip(request),
+        )
+        _log.warning("%s: refused by the ingress guards (phase=%s)", action, exc.phase)
+        raise HTTPException(_INGRESS_GUARD_STATUS[exc.phase], exc.reason) from None
 
 
 async def _audit_channel_denied(
@@ -4311,9 +4362,21 @@ def create_app(
                     raise HTTPException(409, _outbound_down_detail(rr, body.to))
             except KeyError:
                 raise HTTPException(404, f"no such outbound connection: {body.to}") from None
+            # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+            # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
+            admitted = await _guard_resubmission(
+                engine,
+                identity,
+                request,
+                raw=body.raw,
+                inbound=None,
+                action="message_edit_resend_reject",
+                channel_id=row["channel_id"],
+                detail={"message_id": message_id, "mode": "direct", "to": body.to},
+            )
             try:
                 direct = await engine.edit_resend_direct(
-                    message_id, to=body.to, raw=body.raw, idempotency_key=body.idempotency_key
+                    message_id, to=body.to, raw=admitted, idempotency_key=body.idempotency_key
                 )
             except ResendError as exc:
                 # Empty edited body / idempotency-key reused for a different target → 409. str(exc)
@@ -4349,9 +4412,31 @@ def create_app(
                 400,
                 "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
             )
+        # BACKLOG #1911: the re-route writes an INGRESS row on the origin channel, so the origin
+        # inbound's own ceiling and declared type apply. With no such inbound in THIS runner's registry
+        # (no config loaded, the inbound removed, or owned by another engine shard, whose registry is
+        # filtered to its own inbounds) there is nothing to guard with, so refuse rather than fail open.
+        rr = engine.registry_runner
+        origin = rr.registry.inbound.get(row["channel_id"]) if rr is not None else None
+        if origin is None:
+            raise HTTPException(
+                409,
+                f"origin inbound {row['channel_id']!r} is not registered on this engine; "
+                "re-route on the engine shard that owns it",
+            )
+        admitted = await _guard_resubmission(
+            engine,
+            identity,
+            request,
+            raw=body.raw,
+            inbound=origin,
+            action="message_edit_resend_reject",
+            channel_id=row["channel_id"],
+            detail={"message_id": message_id, "mode": "reroute"},
+        )
         try:
             outcome = await engine.edit_resend_reroute(
-                message_id, raw=body.raw, idempotency_key=body.idempotency_key
+                message_id, raw=admitted, idempotency_key=body.idempotency_key
             )
         except ResendError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -4878,9 +4963,26 @@ def create_app(
             raise HTTPException(
                 404, f"no message at index {body.index} (file has {len(parts)} messages)"
             )
+        # BACKLOG #1911: the inject writes an INGRESS row directly, so run the target inbound's own
+        # ceiling and declared-type checks first. An upload may be larger than one message may be.
+        # Re-resolved rather than trusted from the check above: a reload during the awaits since then
+        # may have dropped or retyped the inbound, and guarding with no inbound would fail open.
+        target = rr.registry.inbound.get(body.to)
+        if target is None:
+            raise HTTPException(404, f"no such inbound connection: {body.to}")
+        admitted = await _guard_resubmission(
+            engine,
+            identity,
+            request,
+            raw=parts[body.index],
+            inbound=target,
+            action="upload.resend_reject",
+            channel_id=body.to,
+            detail={"file_id": file_id, "index": body.index, "to": body.to},
+        )
         mid = await engine.inject_message(
             channel_id=body.to,
-            raw=parts[body.index],
+            raw=admitted,
             source_type="upload",
             metadata=json.dumps({"upload_file_id": file_id, "upload_index": body.index}),
         )
@@ -6159,17 +6261,31 @@ def create_app(
         if identity is None:
             identity = await authorize_ws(websocket, Permission.MONITORING_READ)
             token = ws_token(websocket)
+        # The three refusals below happen BEFORE accept, so each is the handshake's HTTP answer
+        # (BACKLOG #1120; see header_floor.refuse_websocket).
         if identity is None:
-            await websocket.close(code=1008)  # policy violation (unauthenticated/forbidden)
+            await refuse_websocket(
+                websocket,
+                JSONResponse({"detail": "not authenticated or not permitted"}, status_code=403),
+                close_code=1008,  # policy violation (unauthenticated/forbidden)
+            )
             return
         handshake_identity: Identity = identity  # non-None past the guard; used on the no-auth path
         engine_obj: Engine | None = getattr(websocket.app.state, "engine", None)
         if engine_obj is None:
-            await websocket.close(code=1011)
+            await refuse_websocket(
+                websocket,
+                JSONResponse({"detail": "engine unavailable"}, status_code=503),
+                close_code=1011,
+            )
             return
         state = websocket.app.state
         if getattr(state, "ws_count", 0) >= _MAX_WS_CONNECTIONS:
-            await websocket.close(code=1013)  # try again later — too many live monitor sockets
+            await refuse_websocket(
+                websocket,
+                JSONResponse({"detail": "too many live monitor sockets"}, status_code=503),
+                close_code=1013,  # try again later
+            )
             return
         auth: AuthService | None = getattr(state, "auth", None)
         # Server-rendered connections fragment for the browser dashboard, installed by the web console
@@ -6771,12 +6887,53 @@ def create_managed_app(
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
         # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
-        store = await open_store(
-            resolved,
-            create=True,
-            message_events=message_events,
-            posture=_hop_posture,
+        # Operational alert notifier (webhook/email). None when no transport is configured → the
+        # engine falls back to the logging sink. Its background dispatch task is owned by this
+        # lifespan: started here, drained + stopped after the engine in the finally below.
+        # Connector SecretProvider (ADR 0019 §5, BACKLOG #196): built once from [secrets] and threaded to
+        # every credential point (SMTP password → notifier/security-notifier, AD bind password →
+        # AuthService). None = [secrets].provider unset/'none' → env-sourced credentials, byte-identical.
+        # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
+        # startup rather than degrading to a blank credential.
+        secret_provider = (
+            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
         )
+        notifier = (
+            notifier_from_settings(
+                alerts_settings,
+                secret_provider=secret_provider,
+                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
+                # an estate on a private CA needs no per-alert CA path.
+                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
+                posture=_hop_posture,
+            )
+            if alerts_settings is not None
+            else None
+        )
+        # BACKLOG #1169: the notifier is built BEFORE the store opens so the cipher's refusal hook can
+        # reach it during the open. A planted `state`/`reference` value on a sealed surface aborts the
+        # open (those tables are read eagerly), and a planted row the at-open sweep finds is left in
+        # place; both raise `integrity_drift("store-cipher")`, naming only the table and column. With no
+        # notifier the logging sink carries it, as it does for the engine.
+        try:
+            store = await open_store(
+                resolved,
+                create=True,
+                message_events=message_events,
+                posture=_hop_posture,
+                refusal_hook=store_cipher_refusal_forwarder(
+                    notifier if notifier is not None else LoggingAlertSink(),
+                    asyncio.get_running_loop(),
+                ),
+            )
+        except BaseException:
+            if notifier is not None:
+                # The open failed before the notifier would normally start. Start and drain it, or
+                # an alert raised during the open (the reason the open failed) is never sent.
+                notifier.start()
+                await notifier.aclose()
+            raise
         # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
         # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
         # operator opts in; every uploaded-logs route 503s when None.
@@ -6802,30 +6959,6 @@ def create_managed_app(
                 # opened — this is the serve path, so it is the one that actually runs sharded.
                 store=store,
             )
-        # Operational alert notifier (webhook/email). None when no transport is configured → the
-        # engine falls back to the logging sink. Its background dispatch task is owned by this
-        # lifespan: started here, drained + stopped after the engine in the finally below.
-        # Connector SecretProvider (ADR 0019 §5, BACKLOG #196): built once from [secrets] and threaded to
-        # every credential point (SMTP password → notifier/security-notifier, AD bind password →
-        # AuthService). None = [secrets].provider unset/'none' → env-sourced credentials, byte-identical.
-        # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
-        # startup rather than degrading to a blank credential.
-        secret_provider = (
-            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
-        )
-        notifier = (
-            notifier_from_settings(
-                alerts_settings,
-                secret_provider=secret_provider,
-                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
-                # an estate on a private CA needs no per-alert CA path.
-                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
-                posture=_hop_posture,
-            )
-            if alerts_settings is not None
-            else None
-        )
         if notifier is not None:
             # Durable operator alert-state (ADR 0044, #56): wire the open store so every emit upserts a
             # resolvable alert instance (GET /alerts/active) and an inverse signal auto-resolves it. A
@@ -7108,7 +7241,8 @@ def create_managed_app(
                 # transport, sent to each affected user's own address. The notifier is wired only when the
                 # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
                 # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
-                # fabricate a transport — then only the audited /me/security-events pull feed records events.
+                # fabricate a transport — then nothing is emailed; auth/notifications.py states which
+                # events the audited /me/security-events pull feed still shows.
                 # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
                 # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
                 # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two

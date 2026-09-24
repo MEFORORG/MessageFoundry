@@ -35,6 +35,7 @@ independently, so overlapping id sets are reachable in normal operation. They no
 from __future__ import annotations
 
 import asyncio
+import bisect
 import functools
 import hashlib
 import hmac
@@ -63,6 +64,7 @@ from types import MappingProxyType
 from typing import (
     Any,
     Final,
+    Literal,
     NoReturn,
     NotRequired,
     Protocol,
@@ -98,14 +100,16 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    allows_unmarked,
     audit_key_id,
     cell_aad,
     cipher_info,
     decrypt_json_cell,
+    report_unmarked,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations
+from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -1208,6 +1212,23 @@ class DbStatus:
     synchronous: str | None = None
 
 
+#: Who last wrote ``users.channel_scope`` (BACKLOG #1927). The AD login sync writes
+#: :data:`SCOPE_SOURCE_AD`; an administrator's ``PUT /users/{id}/channel-scope`` writes
+#: :data:`SCOPE_SOURCE_MANUAL`. What that decides is on ``UserRecord.channel_scope_source``.
+ChannelScopeSource = Literal["ad", "manual"]
+SCOPE_SOURCE_AD: Final[ChannelScopeSource] = "ad"
+SCOPE_SOURCE_MANUAL: Final[ChannelScopeSource] = "manual"
+
+#: The compare-and-set behind ``withdraw_ad_channel_scope`` on SQLite. Postgres carries a ``$n``
+#: twin and SQL Server a collation-pinned one. Binds: new source, now, user id, the expected scope,
+#: the manual marker.
+WITHDRAW_AD_SCOPE_SQL: Final = (
+    "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"
+    " WHERE id=? AND channel_scope = ?"
+    " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
+)
+
+
 @dataclass(frozen=True)
 class UserRecord:
     """A user account (local or AD). ``password_hash`` + lockout fields are NULL for AD users."""
@@ -1295,6 +1316,13 @@ class UserRecord:
     # to meet the durability rule and is deliberately not taken: accounts may still be created without
     # an address, so the column would need a placeholder the notifier treats as absent anyway.
     notify_email: str | None = None
+    # WHO LAST WROTE ``channel_scope`` (BACKLOG #1927), and the one place this rule is stated; the
+    # other comments point here. ``"ad"`` for the AD login sync, ``"manual"`` for an administrator,
+    # written in the same statement as the scope by every scope writer. NULL means no scope writer
+    # has run: a fresh account (``create_user`` writes neither column), or a row written before
+    # this column existed. When no mapped group matches, the AD login sync withdraws every scope
+    # not marked ``"manual"``, so an unvouched grant fails closed.
+    channel_scope_source: ChannelScopeSource | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -1334,6 +1362,9 @@ class UserRecord:
             # silently excluded from every security notice. A loud failure on a mapping that lacks the
             # column beats a quiet, permanent loss of the notification channel.
             notify_email=d["notify_email"],
+            # A ``.get()``: a missing key decodes to NULL, which the login sync withdraws. The quiet
+            # direction is the closed one.
+            channel_scope_source=d.get("channel_scope_source"),
         )
 
 
@@ -1808,6 +1839,16 @@ def audit_mac_bytes(value: str | None) -> bytes:
 #: ``SELECT ... ORDER BY id`` walked it. ``0`` here silently dropped such rows from the tamper check.
 AUDIT_ALL_ROWS: Final = -(2**63)
 
+
+class AuditHeadMovedError(RuntimeError):
+    """``record_audit(expect_prev=...)`` found a different chain head from the one expected.
+
+    ``rotate-key`` seals the closing record from one read of the chain, then appends the range row.
+    A row appended in between would sit inside the closed range yet outside its digest, and once the
+    outgoing key is dropped nothing could prove it. So the append names the head it sealed, and is
+    refused -- before anything is written -- when the head has moved."""
+
+
 #: The action of the row that opens a new keyed range of the audit chain.
 AUDIT_KEY_EPOCH_ACTION: Final = "audit.key_epoch"
 
@@ -1904,12 +1945,7 @@ def audit_range_closing(
     last id, its row count, a SHA-256 digest over every row, and ``prev_hash`` -- the stored
     ``row_hash`` of the row just BEFORE the range (``""``, the chain's genesis, when there is none).
     ``rows`` are the range's rows, in id order -- everything from ``from_id`` up to (not including) the
-    new range row.
-
-    ``prev_hash`` is the range's link to everything before it. While the range's key is held, the MAC
-    on its first row carries that link; once the key is dropped, only this record does. Without it the
-    rows below a dropped range -- the keyless prefix under a ``rekey-audit`` watermark, above all --
-    could be rewritten and re-hashed and the chain would still verify (PR 1446, Lander blocker)."""
+    new range row. Why ``prev_hash`` is load-bearing: ADR 0193, Decision item 4."""
     digest = hashlib.sha256()
     last = from_id - 1
     for r in rows:
@@ -1974,10 +2010,11 @@ def parse_audit_epoch(detail: str | None) -> tuple[str, dict[str, Any], str] | N
     key_id, closes, handover = obj.get("key_id"), obj.get("closes"), obj.get("handover")
     if not isinstance(key_id, str) or not key_id or not isinstance(closes, dict):
         return None
-    # Scalars only, and only the fields a closing record has. The tag check RE-SERIALISES `closes`, and
+    # Exactly the fields a closing record has -- a record missing `prev_hash` or `digest` is malformed
+    # here, at open as in verify -- and scalars only. The tag check RE-SERIALISES `closes`, and
     # json.dumps recurses deeper than json.loads tolerates, so a nested value would raise
     # RecursionError there -- at open, and in the startup verify -- rather than read as a break.
-    if not set(closes) <= _AUDIT_CLOSES_FIELDS or not all(
+    if set(closes) != _AUDIT_CLOSES_FIELDS or not all(
         v is None or isinstance(v, (int, str)) for v in closes.values()
     ):
         return None
@@ -2053,7 +2090,8 @@ def verify_audit_rows(
             assert keyed_from is not None  # for the type checker: `keyed` implies it
             range_key, range_from = first_key_id, keyed_from
             range_last = keyed_from - 1
-            range_prev = prev  # the last keyless row's stored hash, or "" (genesis) when none
+            # The link below the range must survive its key being dropped (ADR 0193, item 4).
+            range_prev = prev
             if range_key is not None:
                 seen_keys.add(range_key)
         if keyed and r["action"] == AUDIT_KEY_EPOCH_ACTION:
@@ -2085,7 +2123,7 @@ def verify_audit_rows(
                 seen_keys.add(new_key)
                 range_key, range_from = new_key, rid
                 range_digest, range_rows, range_last = hashlib.sha256(), 0, rid - 1
-                range_prev = prev  # the stored hash of the row before this range row
+                range_prev = prev  # as above: the link that outlives this range's key
         key: bytes | None = None
         mac: AuditMacFn | None = None
         held = True
@@ -2146,8 +2184,17 @@ def verify_audit_rows(
         link_ok = hmac.compare_digest(
             audit_mac_bytes(str(claimed.get("prev_hash"))), audit_mac_bytes(actual["prev_hash"])
         )
-        if not (fields_ok and digest_ok and link_ok):
+        if not (fields_ok and digest_ok):
             breaks.append((rid, "audit key-range row does not match the range it closes"))
+        if not link_ok:
+            # Reported at the range row, which holds the proof, but naming where the tampering is.
+            breaks.append(
+                (
+                    rid,
+                    "the rows before id="
+                    f"{actual['from_id']} no longer match the link this key-range row recorded",
+                )
+            )
         out_secret = _audit_secret_for(outgoing, mac_keys, mac_fn)
         if out_secret is not None and not _audit_tag_ok(new_key, claimed, handover, out_secret):
             breaks.append(
@@ -2214,13 +2261,6 @@ class AuditRangeHost(Protocol):
         matched EXACTLY on the action (a case-insensitive collation must not widen it)."""
         ...
 
-    async def verify_audit_chain(
-        self,
-        *,
-        expected_anchor: tuple[int, str] | None = None,
-        expected_prefix: tuple[int, str] | None = None,
-    ) -> tuple[bool, str | None]: ...
-
     async def record_audit(
         self,
         action: str,
@@ -2230,6 +2270,7 @@ class AuditRangeHost(Protocol):
         detail: str | None = None,
         client: str | None = None,
         now: float | None = None,
+        expect_prev: str | None = None,
     ) -> None: ...
 
 
@@ -2402,17 +2443,18 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         first_key_id=host._audit_first_key_id,
         mac_keys=host._audit_mac_keys,
         mac_fn=host._audit_mac_fn,
-        capable=True,  # active_id is not None, so a keying secret is in hand
+        capable=host._audit_mac_key is not None or host._audit_mac_fn is not None,
     )
     if not ok:
         return False, f"refusing to roll a broken audit chain: {msg}"
-    before = [r for r in rows if int(r["id"]) < current_from]
+    split = bisect.bisect_left([int(r["id"]) for r in rows], current_from)
     closes = audit_range_closing(
-        [r for r in rows if int(r["id"]) >= current_from],
+        rows[split:],
         key_id=current,
         from_id=current_from,
-        prev_hash=(before[-1]["row_hash"] or "") if before else "",
+        prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
+    sealed_head = (rows[-1]["row_hash"] or "") if rows else ""
     handover = audit_handover_tag(active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:
@@ -2420,6 +2462,13 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
             AUDIT_KEY_EPOCH_ACTION,
             actor="system:rotate-key",
             detail=audit_epoch_detail(active_id, closes, handover),
+            expect_prev=sealed_head,
+        )
+    except AuditHeadMovedError:
+        host._audit_range_key_id = current
+        return False, (
+            "the audit log changed while the chain was being rolled, so nothing was written; stop "
+            "the engine and re-run `messagefoundry rotate-key`"
         )
     except BaseException:
         host._audit_range_key_id = current
@@ -2716,6 +2765,37 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+def _grant_read(path: Path, principal: str) -> None:
+    """Grant ``principal`` READ on one file, ADDITIVELY -- Windows only, best-effort, logged.
+
+    The opposite direction from :func:`_secure_file`, and for a file that holds nothing secret: the
+    API certificate the engine mints is public (every TLS client receives it in the handshake), yet
+    it sits in a data directory locked to SYSTEM, Administrators and the service account, so a local
+    client that must pin it cannot read it (``api/tls.py`` ``_let_local_users_read_cert``). Existing
+    ACEs and inheritance are kept; only the one grant is added. ``principal`` is one argv token (a
+    ``*S-...`` SID), never a shell word. A failure is logged and never raised.
+    """
+    if os.name != "nt":
+        return
+    try:
+        result = subprocess.run(  # nosec B603 B607
+            [_system_exe("icacls.exe"), str(path), "/grant", f"{principal}:(R)"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        log.warning("could not grant read on %s: %s", path, exc)
+        return
+    if result.returncode != 0:
+        log.warning(
+            "icacls could not grant read on %s (exit %s): %s",
+            path,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
 
 
 async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
@@ -3294,7 +3374,8 @@ CREATE TABLE IF NOT EXISTS users (
     oidc_issuer          TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC issuer; NULL = not federated / never federated-logged-in
     oidc_subject         TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC sub; the account's federated login is pinned to (issuer, sub), refusing a reassigned username
     directory_object_id  TEXT,                 -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID); what an AD login resolves this row by, because sAMAccountName is recyclable. NULL = no directory binding, and an unbound row is never adopted by a login presenting an id
-    password_claimed_at  REAL                  -- BACKLOG #1245: when the holder set their OWN credential via authenticated self-service rotation; NULL = never claimed. Write-once (COALESCE in set_password); an admin reset must neither set nor clear it
+    password_claimed_at  REAL,                 -- BACKLOG #1245: when the holder set their OWN credential via authenticated self-service rotation; NULL = never claimed. Write-once (COALESCE in set_password); an admin reset must neither set nor clear it
+    channel_scope_source TEXT                  -- BACKLOG #1927: who last wrote channel_scope ('ad' or 'manual'). The rule is on UserRecord.channel_scope_source. NO COMMA in this comment: SQLite DROP COLUMN scans back for one
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -3606,7 +3687,7 @@ class MessageStore:
     def _dec(self, value: str | None, *, aad: bytes) -> str | None:
         if value is None:
             return value
-        # '' and legacy plaintext pass through unchanged; a v1 marker decrypts with None AAD (dual-read),
+        # '' passes through; any other unmarked value is refused unless allowed (#1169); a v1 marker decrypts with None AAD (dual-read),
         # a v2 marker with this `aad` — a wrong-cell v2 blob fails the tag → CipherError (fail-closed).
         return self._cipher.decrypt(value, aad=aad)
 
@@ -3747,7 +3828,8 @@ class MessageStore:
             # since on a store that is having a key enabled for the first time it is itself a large
             # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
             await store.checkpoint_cipher_invocations()
-            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+            await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
             await (
                 store._load_state_cache()
@@ -4126,12 +4208,24 @@ class MessageStore:
     )
 
     async def _encrypt_existing_rows(self) -> None:
-        """Encrypt any legacy plaintext values in the cipher-covered columns in place when encryption
-        is enabled (STORE-1 / WP-5).
+        """Seal legacy plaintext in the cipher-covered columns when encryption is enabled (STORE-1 /
+        WP-5), one (table, column) SURFACE at a time.
 
-        Idempotent and batched: skips rows already carrying the ciphertext prefix (and NULL / blank
-        ``''`` values — the latter is a purged/empty marker we must not turn into ciphertext), so reads
-        work throughout and re-running is a no-op. Bounded memory (processes in chunks)."""
+        Runs at EVERY keyed open, not once. That is why a surface is sealed only while it is still
+        UNSEALED -- while it holds no marked value at all (BACKLOG #1169, ASVS 11.3.3). Once one
+        ciphertext exists there, the keyed writer is the only thing that writes that column, so a
+        non-blank unmarked value beside it is a stripped marker or a planted row. Sealing it would
+        launder the plant into genuine ciphertext, so it is left in place and every read of it is
+        refused (:class:`~messagefoundry.store.crypto._UnmarkedPolicy`). The state comes from the data,
+        never from a persisted flag, so it cannot go stale. ``[store].allow_unmarked_ciphertext``
+        restores the old sweep, which seals every unmarked value.
+
+        NULL and blank ``''`` are never sealed: ``''`` is what every purge path writes.
+
+        **Each surface seals in ONE transaction.** A crash part-way through a first keyed open would
+        otherwise leave a surface half-sealed, and the next open would read that as sealed and refuse
+        the other half -- legitimate legacy rows. See :meth:`_seal_surface` for how the AES-GCM
+        invocation bound (ASVS 11.3.4) stays ahead of a burst it cannot top up mid-transaction."""
         if not self._cipher.encrypts:
             return
         # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
@@ -4141,303 +4235,156 @@ class MessageStore:
         total = 0
         async with self._lock:
             for table, column in self._CIPHER_COLUMNS:
-                while True:
-                    # NOT LIKE / <> '' are both NULL (excluded) for NULL columns, so only non-null,
-                    # non-blank, not-yet-encrypted values are selected.
-                    cur = await self._db.execute(
-                        f"SELECT id, {column} FROM {table}"
-                        f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT 500",
-                        (like,),
-                    )
-                    rows = list(await cur.fetchall())
-                    if not rows:
-                        break
-                    await self._db.executemany(
-                        f"UPDATE {table} SET {column}=? WHERE id=?",
-                        [
-                            (
-                                self._cipher.encrypt(
-                                    r[column], aad=cell_aad(table, column, r["id"])
-                                ),
-                                r["id"],
-                            )
-                            for r in rows
-                        ],
-                    )
-                    await self._commit()
-                    await self._charge_bound_batch()
-                    total += len(rows)
-            # The `state` table (composite PK, ADR 0005) can't use the id-keyed loop — migrate it
-            # separately so a key enabled on an existing DB encrypts any legacy plaintext state values.
-            while True:
-                cur = await self._db.execute(
-                    "SELECT namespace, key, value FROM state"
-                    " WHERE value NOT LIKE ? AND value <> '' LIMIT 500",
-                    (like,),
-                )
-                rows = list(await cur.fetchall())
-                if not rows:
-                    break
-                await self._db.executemany(
-                    "UPDATE state SET value=? WHERE namespace=? AND key=?",
-                    [
-                        (
-                            self._cipher.encrypt(
-                                r["value"],
-                                aad=cell_aad("state", "value", r["namespace"], r["key"]),
-                            ),
-                            r["namespace"],
-                            r["key"],
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._commit()
-                await self._charge_bound_batch()
-                total += len(rows)
-            # The `reference` table (composite PK name,version,key — ADR 0006) likewise can't use the
-            # id-keyed loop; migrate any legacy plaintext snapshot values separately.
-            while True:
-                cur = await self._db.execute(
-                    "SELECT name, version, key, value FROM reference"
-                    " WHERE value NOT LIKE ? AND value <> '' LIMIT 500",
-                    (like,),
-                )
-                rows = list(await cur.fetchall())
-                if not rows:
-                    break
-                await self._db.executemany(
-                    "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?",
-                    [
-                        (
-                            self._cipher.encrypt(
-                                r["value"],
-                                aad=cell_aad(
-                                    "reference", "value", r["name"], r["version"], r["key"]
-                                ),
-                            ),
-                            r["name"],
-                            r["version"],
-                            r["key"],
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._commit()
-                await self._charge_bound_batch()
-                total += len(rows)
-            # The `response` table (composite PK message_id,destination_name,response_seq — ADR 0013) has
-            # encrypted columns (body, detail, resp_headers — #154) and no `id`; migrate each on its own
-            # pass. (A brand-new table, so normally a no-op — present for parity with state/reference.)
+                total += await self._seal_surface(table, column, like, aad_cols=("id",))
+            # The `state` table (composite PK, ADR 0005) binds its AAD to (namespace, key).
+            total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
+            # The `reference` table (composite PK name,version,key — ADR 0006).
+            total += await self._seal_surface(
+                "reference", "value", like, aad_cols=("name", "version", "key")
+            )
+            # The `response` table (composite PK message_id,destination_name,response_seq — ADR 0013)
+            # has three encrypted columns (body, detail, resp_headers — #154), each its own surface.
             for column in ("body", "detail", "resp_headers"):
-                while True:
-                    cur = await self._db.execute(
-                        f"SELECT message_id, destination_name, response_seq, {column} FROM response"
-                        f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT 500",
-                        (like,),
-                    )
-                    rows = list(await cur.fetchall())
-                    if not rows:
-                        break
-                    await self._db.executemany(
-                        f"UPDATE response SET {column}=?"
-                        " WHERE message_id=? AND destination_name=? AND response_seq=?",
-                        [
-                            (
-                                self._cipher.encrypt(
-                                    r[column],
-                                    aad=cell_aad(
-                                        "response",
-                                        column,
-                                        r["message_id"],
-                                        r["destination_name"],
-                                        r["response_seq"],
-                                    ),
-                                ),
-                                r["message_id"],
-                                r["destination_name"],
-                                r["response_seq"],
-                            )
-                            for r in rows
-                        ],
-                    )
-                    await self._commit()
-                    await self._charge_bound_batch()
-                    total += len(rows)
-            # The `shared_body` table (store-once-deliver-many) is keyed by `hash` (the plaintext content
-            # address), not `id`; migrate any legacy plaintext body separately. (Normally a no-op — a
-            # brand-new table — present for parity with state/reference/response.)
-            while True:
-                cur = await self._db.execute(
-                    "SELECT hash, body FROM shared_body WHERE body NOT LIKE ? AND body <> '' LIMIT 500",
-                    (like,),
+                total += await self._seal_surface(
+                    "response",
+                    column,
+                    like,
+                    aad_cols=("message_id", "destination_name", "response_seq"),
                 )
-                rows = list(await cur.fetchall())
-                if not rows:
-                    break
-                await self._db.executemany(
-                    "UPDATE shared_body SET body=? WHERE hash=?",
-                    [
-                        (
-                            self._cipher.encrypt(
-                                r["body"], aad=cell_aad("shared_body", "body", r["hash"])
-                            ),
-                            r["hash"],
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._commit()
-                await self._charge_bound_batch()
-                total += len(rows)
-            # The `attachment_chunk` table (#149, ADR 0105) is cipher-covered (`ciphertext`) and keyed by
-            # the composite (attachment_id, seq); seal any legacy plaintext chunk. Normally a no-op (a
-            # brand-new table, and Phase 0 writes nothing) — present for parity with shared_body/state.
-            while True:
-                cur = await self._db.execute(
-                    "SELECT attachment_id, seq, ciphertext FROM attachment_chunk"
-                    " WHERE ciphertext NOT LIKE ? AND ciphertext <> '' LIMIT 500",
-                    (like,),
-                )
-                rows = list(await cur.fetchall())
-                if not rows:
-                    break
-                await self._db.executemany(
-                    "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?",
-                    [
-                        (
-                            self._cipher.encrypt(
-                                r["ciphertext"],
-                                aad=cell_aad(
-                                    "attachment_chunk",
-                                    "ciphertext",
-                                    r["attachment_id"],
-                                    r["seq"],
-                                ),
-                            ),
-                            r["attachment_id"],
-                            r["seq"],
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._commit()
-                await self._charge_bound_batch()
-                total += len(rows)
+            # The `shared_body` table (store-once-deliver-many) is keyed by `hash`, the plaintext
+            # content address.
+            total += await self._seal_surface("shared_body", "body", like, aad_cols=("hash",))
+            # The `attachment_chunk` table (#149, ADR 0105), composite (attachment_id, seq).
+            total += await self._seal_surface(
+                "attachment_chunk", "ciphertext", like, aad_cols=("attachment_id", "seq")
+            )
             # The `message_events` (detail), `connection_event` (reason), and `alert_instance` (reason)
             # tables have an AUTOINCREMENT `id`, so their cell_aad binds to insert-time-known natural
-            # columns, not `id` — they migrate on their own composite passes (UPDATE targets `id`, but the
-            # AAD is rebuilt from the selected natural columns so it matches the write/read path exactly).
-            total += await self._encrypt_message_events(like)
-            total += await self._encrypt_connection_events(like)
-            total += await self._encrypt_alert_instances(like)
+            # columns, not `id` — the UPDATE targets `id`, but the AAD is rebuilt from the selected
+            # natural columns so it matches the write/read path exactly (ASVS 11.3.3).
+            total += await self._seal_surface(
+                "message_events",
+                "detail",
+                like,
+                aad_cols=("message_id", "ts", "event"),
+                key_cols=("id",),
+            )
+            total += await self._seal_surface(
+                "connection_event",
+                "reason",
+                like,
+                aad_cols=("connection", "ts", "kind"),
+                key_cols=("id",),
+            )
+            # alert_instance binds to (event_type, connection) — the de-dup grain the upsert keys on,
+            # so the same AAD covers the INSERT and the re-fire UPDATE that never sees the id.
+            total += await self._seal_surface(
+                "alert_instance",
+                "reason",
+                like,
+                aad_cols=("event_type", "connection"),
+                key_cols=("id",),
+            )
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
 
-    async def _encrypt_message_events(self, like: str) -> int:
-        """One-time encrypt of legacy plaintext ``message_events.detail`` (caller holds the lock). The
-        cell_aad is (message_id, ts, event) — the row's insert-time-known identity — so a migrated value
-        decrypts under the same AAD ``events_for`` reads it with (ASVS 11.3.3)."""
-        migrated = 0
-        while True:
-            cur = await self._db.execute(
-                "SELECT id, message_id, ts, event, detail FROM message_events"
-                " WHERE detail NOT LIKE ? AND detail <> '' LIMIT 500",
-                (like,),
-            )
-            rows = list(await cur.fetchall())
-            if not rows:
-                break
-            await self._db.executemany(
-                "UPDATE message_events SET detail=? WHERE id=?",
-                [
-                    (
-                        self._cipher.encrypt(
-                            r["detail"],
-                            aad=cell_aad(
-                                "message_events", "detail", r["message_id"], r["ts"], r["event"]
-                            ),
-                        ),
-                        r["id"],
-                    )
-                    for r in rows
-                ],
-            )
-            await self._commit()
-            await self._charge_bound_batch()
-            migrated += len(rows)
-        return migrated
+    async def _seal_surface(
+        self,
+        table: str,
+        column: str,
+        like: str,
+        *,
+        aad_cols: tuple[str, ...],
+        key_cols: tuple[str, ...] | None = None,
+        batch: int = 500,
+    ) -> int:
+        """Seal one (table, column) surface's legacy plaintext, in ONE transaction; return the count.
 
-    async def _encrypt_connection_events(self, like: str) -> int:
-        """One-time encrypt of legacy plaintext ``connection_event.reason`` (caller holds the lock),
-        bound to (connection, ts, kind) — the row's insert-time-known identity (ASVS 11.3.3)."""
-        migrated = 0
-        while True:
-            cur = await self._db.execute(
-                "SELECT id, connection, ts, kind, reason FROM connection_event"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT 500",
-                (like,),
-            )
-            rows = list(await cur.fetchall())
-            if not rows:
-                break
-            await self._db.executemany(
-                "UPDATE connection_event SET reason=? WHERE id=?",
-                [
-                    (
-                        self._cipher.encrypt(
-                            r["reason"],
-                            aad=cell_aad(
-                                "connection_event", "reason", r["connection"], r["ts"], r["kind"]
-                            ),
-                        ),
-                        r["id"],
-                    )
-                    for r in rows
-                ],
-            )
-            await self._commit()
-            await self._charge_bound_batch()
-            migrated += len(rows)
-        return migrated
+        The caller holds ``self._lock``. ``aad_cols`` rebuild the cell AAD the write/read path binds;
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. All identifiers are code
+        constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a parameter.
 
-    async def _encrypt_alert_instances(self, like: str) -> int:
-        """One-time encrypt of legacy plaintext ``alert_instance.reason`` (caller holds the lock), bound
-        to (event_type, connection) — the de-dup grain the upsert keys on, so the same AAD covers both the
-        INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3)."""
-        migrated = 0
-        while True:
+        Three steps, in this order:
+
+        1. **Derive the surface's state from the data.** No unmarked non-blank value: nothing to do.
+           A marked value already present: the surface is SEALED, so its unmarked values are left in
+           place and refused at read (unless the opt-out is on).
+        2. **Reserve the whole burst on the AES-GCM bound first** (ASVS 11.3.4). On SQLite the
+           reservation commits the one writer connection, so it cannot happen once the seal's
+           transaction is open. Reserving everything up front is what lets the seal skip the per-batch
+           charge without the persisted total ever trailing an encrypt.
+        3. **Seal every batch, then commit once.** Any failure rolls the whole surface back.
+        """
+        keys = key_cols if key_cols is not None else aad_cols
+        pending_where = f"{column} NOT LIKE ? AND {column} <> ''"
+        cur = await self._db.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", (like,)
+        )
+        row = await cur.fetchone()
+        pending = int(row["n"]) if row is not None else 0
+        if not pending:
+            return 0
+        if not allows_unmarked(self._cipher):
             cur = await self._db.execute(
-                "SELECT id, event_type, connection, reason FROM alert_instance"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT 500",
-                (like,),
+                f"SELECT 1 FROM {table} WHERE {column} LIKE ? LIMIT 1", (like,)
             )
-            rows = list(await cur.fetchall())
-            if not rows:
-                break
-            await self._db.executemany(
-                "UPDATE alert_instance SET reason=? WHERE id=?",
-                [
-                    (
-                        self._cipher.encrypt(
-                            r["reason"],
-                            aad=cell_aad(
-                                "alert_instance", "reason", r["event_type"], r["connection"]
+            if await cur.fetchone() is not None:
+                log.warning(
+                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
+                    "sealed and every read of them is refused (a stripped marker or a planted row). "
+                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
+                    table,
+                    column,
+                    pending,
+                )
+                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
+                # invisible except in the log. Names the cell only (BACKLOG #1169).
+                report_unmarked(self._cipher, table, column)
+                return 0
+        await reserve_invocations_ahead(self._cipher, self._add_cipher_invocations_locked, pending)
+        select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
+        where_keys = " AND ".join(f"{c}=?" for c in keys)
+        sealed = 0
+        try:
+            while True:
+                # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
+                # matching NOT LIKE and the loop terminates inside the one transaction.
+                cur = await self._db.execute(
+                    f"SELECT {select_cols}, {column} AS v FROM {table}"
+                    f" WHERE {pending_where} LIMIT {int(batch)}",
+                    (like,),
+                )
+                rows = list(await cur.fetchall())
+                if not rows:
+                    break
+                await self._db.executemany(
+                    f"UPDATE {table} SET {column}=? WHERE {where_keys}",
+                    [
+                        (
+                            self._cipher.encrypt(
+                                r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
                             ),
-                        ),
-                        r["id"],
-                    )
-                    for r in rows
-                ],
-            )
+                            *(r[c] for c in keys),
+                        )
+                        for r in rows
+                    ],
+                )
+                sealed += len(rows)
             await self._commit()
-            await self._charge_bound_batch()
-            migrated += len(rows)
-        return migrated
+        except BaseException as exc:
+            # Unwind the WHOLE surface: a half-sealed surface reads as sealed on the next open, which
+            # would refuse the legitimate legacy rows this pass had not reached yet.
+            await _unwind_and_raise(self._db, exc, role="writer")
+        # Top the reserve back up for whatever follows; the burst itself was reserved in step 2.
+        await self._charge_bound_batch()
+        return sealed
 
     async def reencrypt_to_active(self, *, batch: int = 500) -> int:
         """Re-encrypt every cipher-covered value under the **active** key — the key-rotation re-encrypt
-        path (ASVS 11.2.2), run offline via ``messagefoundry rotate-key``. Rewrites values that are
+        path (ASVS 11.2.2), run offline via ``messagefoundry rotate-key``. Since BACKLOG #1169 an unmarked
+        value on a sealed surface is REFUSED here, so a planted row aborts the rotation naming its cell
+        instead of being laundered into ciphertext; the open that precedes it has already sealed every
+        unsealed surface. Rewrites values that are
         plaintext or under a *retired* key; skips values already under the active key (idempotent) and
         NULL/blank ones. A value no configured key can decrypt raises (rotation needs the prior key
         supplied via ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED``) — it never silently drops PHI. Returns the
@@ -4880,6 +4827,9 @@ class MessageStore:
             # in since the upgrade. No backfill is possible anyway; nothing in the store has ever
             # held the directory's identifier.
             ("directory_object_id", "TEXT"),
+            # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source). No
+            # backfill: nothing recorded which writer set a scope until now.
+            ("channel_scope_source", "TEXT"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -6414,8 +6364,10 @@ class MessageStore:
         except Exception as exc:
             # Same as claim_ready: an undecryptable head must not stall the lane — dead-letter it and
             # let the next poll advance to the new head, rather than re-raising into the worker (H-1).
-            # The dead-letter records the message ERROR (visible in the tracking view); a push alert
-            # for a poison ingress row is a documented follow-up (the store can't reach the AlertSink).
+            # The dead-letter records the message ERROR (visible in the tracking view). An UNMARKED
+            # payload is also pushed as an `integrity_drift` alert: the cipher's refusal hook reaches
+            # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its tag still
+            # gets no push alert -- a documented follow-up.
             log.warning("dead-lettering undecryptable queue row %s: %s", claimed["id"], exc)
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
             await self.dead_letter_now(
@@ -9297,6 +9249,7 @@ class MessageStore:
         detail: str | None = None,
         client: str | None = None,
         now: float | None = None,
+        expect_prev: str | None = None,
     ) -> None:
         """Append a row to the general audit log — the seam for PHI-access auditing (summary
         displays, detail views, exports, …). ``detail`` is an opaque (JSON) string.
@@ -9316,6 +9269,8 @@ class MessageStore:
             cur = await self._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
             last = await cur.fetchone()
             prev = last["row_hash"] if last and last["row_hash"] else ""
+            if expect_prev is not None and prev != expect_prev:
+                raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
             _key, _mac = (
                 self._audit_append_mac()
             )  # keyed (in-heap or Transit) once watermark set, else keyless
@@ -10325,17 +10280,36 @@ class MessageStore:
             await self._commit()
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
         """Set a user's per-channel scope. ``scope_json`` is a JSON list of granted connection names
-        (``'["*"]'`` for every channel), or ``None`` to clear it — which denies (BACKLOG #1152)."""
+        (``'["*"]'`` for every channel), or ``None`` to clear it — which denies (BACKLOG #1152).
+        ``source`` records who wrote it, in the same statement (BACKLOG #1927)."""
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(
-                "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
-                (scope_json, now, user_id),
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
+                (scope_json, source, now, user_id),
             )
             await self._commit()
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            cur = await self._db.execute(
+                WITHDRAW_AD_SCOPE_SQL,
+                (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
+            )
+            await self._commit()
+            return int(cur.rowcount) > 0
 
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None
@@ -10427,7 +10401,8 @@ class MessageStore:
 
     async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         """Channels mapped to a user's AD groups (per-channel RBAC C3). May include the sentinel
-        ``'*'`` (all). Empty = no group mapping matched (caller falls back to the per-user scope)."""
+        ``'*'`` (all). Empty = no group mapping matched; the AD login sync then keeps a manual scope
+        and withdraws any other (BACKLOG #1927)."""
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
         if not normalized:
             return set()
@@ -10886,7 +10861,18 @@ class MessageStore:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
                 continue  # not past its own (per-connection) window — skip
-            raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            try:
+                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            except CipherError as exc:
+                # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
+                # must not abort the whole retention pass. The row is left exactly as found; the
+                # message names only the cell and the message id, never the body (BACKLOG #1169).
+                log.warning(
+                    "document strip skipped message %s: its body could not be read: %s",
+                    row["id"],
+                    exc,
+                )
+                continue
             new_raw, n_docs, n_bytes = _strip_documents(
                 raw,
                 pruned_at=now,

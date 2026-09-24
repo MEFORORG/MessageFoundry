@@ -515,7 +515,37 @@ floor. It follows the pairing RFC 9053 section 2.1 recommends for interoperabili
 with P-256 only, which is also how the WebAuthn specification describes -7. The refusal is
 deliberate, so it reaches the audited path without the WARNING a raw library failure logs.
 
+**The pin compares CBOR integers (BACKLOG #1953).** As first built, the pin coerced the curve
+with `int()`, and the library compares every value with `==`. In Python, `True`, `1.0`,
+`Decimal(1)` and `Fraction(1)` all equal 1, so an ES256 key whose curve read `true` or `1.0`
+enrolled past the pin. Registration now requires the integer type itself for the labels and for
+`kty`, `alg` and `crv`. It also refuses a key sent as an array, which the library indexes like a
+map, and any label that is not an integer or a text string (RFC 9052 section 7). These refusals
+are deliberate too, so they log no WARNING.
+
 **The pin is registration-only, by design.** `verify_assertion` does not re-screen a stored
 key's curve. A credential enrolled before the pin may be ES256 on P-384 or P-521; it still
 verifies and still clears the floor, so refusing it at assertion would lock its owner out for
 no security gain. A test pins that such a stored key still asserts.
+
+**Superseded (2026-09-24, BACKLOG #1166): sign-in checks the stored key too.** The paragraph
+above no longer holds. `verify_assertion` now runs the same check as registration on the stored
+key, before it verifies the signature. The library's own sign-in checks do not include that
+rule. So before this change, some stored keys that registration refuses still signed in, among
+them RS256 at 1024 or 2048 bits, ES256 on P-384 or P-521, and a curve that reads `true`.
+
+Current registration refuses all of those keys. A store could still hold one: 0.3.2 registered
+RS256 and ES256 on other curves, and 0.4.0 registered a curve that reads `true` or `1.0`. The
+paragraph above kept those keys working to spare their owners a lockout. That exception
+protected nobody, because MessageFoundry has no deployments (CLAUDE.md section 0). So both
+ceremonies now apply one rule, and sign-in does not trust the store to hold only what current
+registration would write. This breaks the 0.4.0 changelog's promise that such passkeys still
+sign in, so the change needs a BREAKING changelog entry of its own.
+
+A key that breaks the rule is refused on the audited invalid-input path with no WARNING. A key
+the library cannot decode at all still logs its raw exception type at WARNING, as before.
+
+This also retires two earlier sentences. Under "Both halves, deliberately", the registration
+call is no longer the only place a credential is refused. Under "Residual closed", the
+assertion-side catch is no longer the backstop for a stored key; the check above is, and the
+catch now guards the response itself.

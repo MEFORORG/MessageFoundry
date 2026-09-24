@@ -36,6 +36,7 @@ from messagefoundry.auth.service import AuthService, BootstrapAdmin
 from messagefoundry.config.settings import AuthSettings, StoreSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
+from tests._admin_account import ADMIN_USERNAME, create_admin
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -179,16 +180,15 @@ def test_ad_requires_ldaps_unless_overridden() -> None:
 
 
 async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None:
-    # M2 + ASVS 6.3.3. A bootstrap admin is must_change AND (since 6.3.3) mfa_pending at the same
+    # M2 + ASVS 6.3.3. An unclaimed admin is must_change AND (since 6.3.3) mfa_pending at the same
     # instant, so this pins BOTH the refusal ORDER and the fact that the pair is escapable — the
     # bricked-fresh-account regression. Order is load-bearing: GET /me/mfa is MFA-exempt but NOT
     # must-change-exempt, so leading with MFA would send this account to /auth/mfa-verify, which it
     # cannot satisfy before rotating. The account must be told to rotate FIRST.
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
-    boot = await service.initialize()
-    assert boot is not None
+    admin = await create_admin(service)
     async with _client(engine, service) as c:
-        login = await _login(c, boot.username, boot.password)
+        login = await _login(c, admin.username, admin.password)
         assert login.status_code == 200 and login.json()["must_change_password"] is True
         h = _auth(login.json()["token"])
         # a rotation-required session may not reach protected routes...
@@ -202,13 +202,13 @@ async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None
         rotated = await c.post(
             "/me/password",
             headers=h,
-            json={"current_password": boot.password, "new_password": "a-rotated-passphrase-99"},
+            json={"current_password": admin.password, "new_password": "a-rotated-passphrase-99"},
         )
         assert rotated.status_code == 200
 
         # Rotating clears must_change, but the second factor is still owed: the fresh session is
         # MFA-pending and now carries the OTHER refusal.
-        tok = (await _login(c, "admin", "a-rotated-passphrase-99")).json()["token"]
+        tok = (await _login(c, admin.username, "a-rotated-passphrase-99")).json()["token"]
         pending = await c.get("/users", headers=_auth(tok))
         assert pending.status_code == 403 and pending.headers.get("X-MFA-Required") == "1"
 
@@ -281,19 +281,19 @@ def test_bootstrap_states_no_deadline_when_expiry_is_off(
 
 async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engine) -> None:
     principal = AdPrincipal(
-        username="admin",  # collides with the LOCAL bootstrap admin
+        username=ADMIN_USERNAME,  # collides with the LOCAL admin created below
         display_name=None,
         email=None,
-        dn="CN=admin,DC=x",
+        dn=f"CN={ADMIN_USERNAME},DC=x",
         groups=frozenset(),
     )
 
     class _FakeLdap:
         def authenticate(self, username: str, password: str) -> AdPrincipal | None:
-            return principal if (username == "admin" and password == "pw") else None
+            return principal if (username == ADMIN_USERNAME and password == "pw") else None
 
         def resolve_principal(self, username: str) -> AdPrincipal | None:
-            return principal if username == "admin" else None
+            return principal if username == ADMIN_USERNAME else None
 
     settings = AuthSettings(
         ad_enabled=True,
@@ -303,9 +303,9 @@ async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engin
         ad_bind_password="x",
     )
     service = AuthService(engine.store, settings, ldap=_FakeLdap())  # type: ignore[arg-type]
-    await service.initialize()  # creates the LOCAL 'admin'
+    await create_admin(service)  # the LOCAL account the AD login must not adopt
     async with _client(engine, service) as c:
-        r = await _login(c, "admin", "pw", provider="ad")
+        r = await _login(c, ADMIN_USERNAME, "pw", provider="ad")
         assert r.status_code == 401  # the AD bind cannot take over the local account
 
 
@@ -316,17 +316,16 @@ async def test_cannot_remove_last_administrator(engine: Engine) -> None:
     # Last-admin guard test (step-up admin CRUD), not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the roles/CRUD ops first.
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    boot = await service.initialize()
-    assert boot is not None
+    admin = await create_admin(service)
     async with _client(engine, service) as c:
-        h = _auth((await _login(c, "admin", boot.password)).json()["token"])
+        h = _auth((await _login(c, admin.username, admin.password)).json()["token"])
         # clear the must-change flag so the admin can operate
         await c.post(
             "/me/password",
             headers=h,
-            json={"current_password": boot.password, "new_password": "a-rotated-passphrase-99"},
+            json={"current_password": admin.password, "new_password": "a-rotated-passphrase-99"},
         )
-        h = _auth((await _login(c, "admin", "a-rotated-passphrase-99")).json()["token"])
+        h = _auth((await _login(c, admin.username, "a-rotated-passphrase-99")).json()["token"])
         my_id = (await c.get("/auth/me", headers=h)).json()["user_id"]
         # stripping admin from the only administrator is refused
         assert (
@@ -696,11 +695,14 @@ async def test_must_change_password_blocks_websocket(engine: Engine) -> None:
     from messagefoundry.auth import Permission
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    boot = await service.initialize()
-    assert boot is not None
-    boot_token = (await service.login("admin", boot.password)).token
-    # the not-yet-rotated bootstrap admin (holds monitoring:read) is denied the WS
-    denied = await authorize_ws(_FakeWS(service, boot_token), Permission.MONITORING_READ)  # type: ignore[arg-type]
+    admin = await create_admin(service)
+    admin_login = await service.login(admin.username, admin.password)
+    # A failed login would leave no token, and a token-less WS is refused too, which would pass the
+    # denial below for the wrong reason.
+    assert admin_login.ok and admin_login.token is not None
+    admin_token = admin_login.token
+    # the not-yet-rotated admin (holds monitoring:read) is denied the WS
+    denied = await authorize_ws(_FakeWS(service, admin_token), Permission.MONITORING_READ)  # type: ignore[arg-type]
     assert denied is None
     # a normal user with the permission is allowed through
     await _add(service, "vw", Role.VIEWER)
@@ -715,7 +717,7 @@ async def test_ws_permission_denied_is_audited(engine: Engine) -> None:
     from messagefoundry.auth import Permission
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    assert await service.initialize() is not None
+    await service.initialize()
     await _add(service, "vw", Role.VIEWER)
     vw_token = (await service.login("vw", PW)).token
     # VIEWER holds monitoring:read but not config:deploy → requesting it on the WS is denied + audited.
@@ -738,7 +740,7 @@ async def test_ws_permission_granted_is_audited_for_sensitive_only(engine: Engin
     from messagefoundry.auth import Permission
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    assert await service.initialize() is not None
+    await service.initialize()
     await _add(service, "adm", Role.ADMINISTRATOR)
     await _add(service, "vw", Role.VIEWER)
     adm_token = (await service.login("adm", PW)).token
@@ -807,7 +809,10 @@ async def _assert_http_grant_deny_precision(store: object) -> None:
     # sits ABOVE the permission loop — leaving it on would refuse every request with auth.mfa_denied
     # before any grant/deny row could be written, testing the wrong guard.
     service = AuthService(store, AuthSettings(require_mfa=False))  # type: ignore[arg-type]
-    assert await service.initialize() is not None
+    # The exact audit counts below need a fresh store. This asks it the same way in every mode,
+    # which a check on initialize()'s return value (the first-run account) no longer does.
+    assert await store.count_users() == 0  # type: ignore[attr-defined]
+    await service.initialize()
     await _add(service, "adm", Role.ADMINISTRATOR)  # holds approvals:approve + messages:purge
     await _add(service, "op", Role.OPERATOR)  # holds messages:purge, NOT approvals:approve
     await _add(service, "vw", Role.VIEWER)  # holds neither
@@ -893,7 +898,7 @@ async def test_audit_all_authz_audits_every_grant_but_never_phi_view(engine: Eng
     from messagefoundry.auth import Permission
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    assert await service.initialize() is not None
+    await service.initialize()
     await _add(
         service, "adm", Role.ADMINISTRATOR
     )  # holds read + view_summary + purge + monitoring:read

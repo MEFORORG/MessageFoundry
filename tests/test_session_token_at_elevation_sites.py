@@ -241,9 +241,9 @@ async def test_the_step_up_reauth_elevates_the_token_in_place() -> None:
     the rotation, while the grant is minted AFTER against the new hash. Reading the grant off the new
     token is what proves both halves happened in that order.
 
-    ``purpose`` is a NON-factor-binding action on purpose — ``_factor_binding_is_blocked`` would
-    correctly refuse a binding one from a pending session whose account already has a factor, and
-    that refusal would hide the grant this asserts.
+    The account holds NO factor on purpose. ``_factor_binding_is_blocked`` would correctly refuse
+    this purpose (and every factor-binding one) to a pending session whose account already has a
+    factor (BACKLOG #1951), and that refusal would hide the grant this asserts.
     """
     store, service = await _service()
     try:

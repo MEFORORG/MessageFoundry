@@ -700,10 +700,25 @@ async def test_edit_resend_reject_path_charges_the_phi_read_budget(engine: Engin
         assert r.headers["Retry-After"]
 
 
-async def test_edit_resend_reroute_redirects_to_child(engine: Engine) -> None:
+async def test_edit_resend_reroute_redirects_to_child(engine: Engine, tmp_path: Path) -> None:
     # Re-route re-ingresses the EDITED body as a fresh correlated child on the origin channel; the /ui
     # route lands the operator on the NEW child's detail. Store-level reingress needs no started
-    # pipeline.
+    # pipeline, but the origin inbound must be registered: its ingress guards run on the edited body,
+    # and with no inbound to guard with the re-route refuses (BACKLOG #1911).
+    (tmp_path / "in").mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "ch1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     mid = await _seed(engine)
@@ -6488,6 +6503,7 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
                 "sub": "S-1-5-21-fed",
                 "exp": now + 600,
                 "iat": now,
+                "auth_time": now,  # REQUIRED since BACKLOG #1150 (max_age is always requested)
                 "nonce": params["nonce"],
                 "preferred_username": "jdoe@corp.example",
                 "amr": ["pwd", "mfa"],
@@ -6673,3 +6689,141 @@ async def test_search_get_ignores_a_needle_left_on_the_query_string(engine: Engi
         control = await c.get("/ui/messages/search", params={"field_path": "PID-3"})
         assert control.status_code == 200
         assert "match(es)" in control.text  # control: field_path is kept and still searches
+
+
+# --- BACKLOG #1141 (ASVS 6.4.5): console surfaces state the deadline the login gate enforces ------
+#
+# Each test pins the RENDERED instant to the stored ``password_changed_at`` and then to the gate
+# itself: a page reading a fresh clock renders a different second, and a gate re-opened at twice the
+# window still admits the credential after the rendered instant. Both must turn these red.
+
+_EXPIRY_HOURS = 72
+
+
+async def _expiring_service(engine: Engine, hours: int = _EXPIRY_HOURS) -> AuthService:
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False, login_rate_limit_enabled=False, initial_password_expiry_hours=hours
+        ),
+    )
+    await service.initialize()
+    return service
+
+
+def _console_stamp(ts: float) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+async def _move_deadline_to(engine: Engine, user_id: str, deadline: float) -> None:
+    """Move the stored stamp so the 6.4.1 deadline lands on ``deadline`` (the gate reads the clock)."""
+    await engine.store._db.execute(
+        "UPDATE users SET password_changed_at=? WHERE id=?",
+        (deadline - _EXPIRY_HOURS * 3600, user_id),
+    )
+    await engine.store._db.commit()
+
+
+async def _stored_deadline(engine: Engine, user_id: str) -> float:
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.password_changed_at is not None
+    return user.password_changed_at + _EXPIRY_HOURS * 3600
+
+
+async def test_create_user_form_states_the_initial_password_window(engine: Engine) -> None:
+    # (a) The form renders before the account exists, so it states the WINDOW from the setting.
+    service = await _expiring_service(engine)
+    async with _boss_client(engine, service) as c:
+        r = await c.get("/ui/users/new")
+        assert r.status_code == 200
+        assert "It stops working 72 hours after you create the account" in r.text
+    # Control: at expiry 0 there is no window, and the sentence is absent rather than softened.
+    off = await _expiring_service(engine, hours=0)
+    async with _client(engine, off) as c:
+        await _cookie_login(c, "boss")
+        r = await c.get("/ui/users/new")
+        assert r.status_code == 200
+        assert "must change it at first sign-in" in r.text
+        assert "stops working" not in r.text
+
+
+async def test_the_page_after_create_states_the_initial_password_deadline(engine: Engine) -> None:
+    # (a) The create POST lands on the user's page, which states the instant off the stored stamp.
+    service = await _expiring_service(engine)
+    async with _boss_client(engine, service) as c:
+        r = await _post_pairs(c, "/ui/users", [("username", "hana"), ("password", PW)])
+        assert r.status_code == 303
+        hana = await _uid(service, "hana")
+        page = await c.get(r.headers["location"])
+        assert _console_stamp(await _stored_deadline(engine, hana)) in page.text
+        assert "stops working at" in page.text
+
+        # The page tracks the STORED stamp, and the gate agrees with it on both sides.
+        await _move_deadline_to(engine, hana, time.time() + 30)
+        page = await c.get(f"/ui/users/{hana}")
+        assert _console_stamp(await _stored_deadline(engine, hana)) in page.text
+        async with _client(engine, service) as holder:
+            ok = await holder.post("/ui/login", data={"username": "hana", "password": PW})
+            assert ok.headers["location"] == "/ui/account/password"  # before it: works
+        await _move_deadline_to(engine, hana, time.time() - 1)
+        page = await c.get(f"/ui/users/{hana}")
+        assert _console_stamp(await _stored_deadline(engine, hana)) in page.text
+        async with _client(engine, service) as holder:
+            refused = await holder.post("/ui/login", data={"username": "hana", "password": PW})
+            assert refused.headers["location"] != "/ui/account/password"  # after it: refused
+            assert "mf_session" not in holder.cookies
+
+        # Control: an account whose holder set their own password shows no deadline.
+        boss_page = await c.get(f"/ui/users/{await _uid(service, 'boss')}")
+        assert "stops working at" not in boss_page.text
+
+
+async def test_forced_change_page_states_the_deadline_the_gate_refuses_at(engine: Engine) -> None:
+    # (d) The one surface the holder always reaches, with no address or mail relay needed.
+    service = await _expiring_service(engine)
+    ivan = await service.create_local_user(
+        username="ivan", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    )
+    await _move_deadline_to(engine, ivan, time.time() + 30)
+    expected = _console_stamp(await _stored_deadline(engine, ivan))
+    async with _client(engine, service) as c:
+        r = await _cookie_login(c, "ivan")
+        assert r.headers["location"] == "/ui/account/password"  # before it: works
+        page = await c.get("/ui/account/password")
+        assert f"Your temporary password stops working at {expected}." in page.text
+        # A rejected attempt re-renders with the same deadline.
+        bad = await c.post(
+            "/ui/account/password",
+            data={"current_password": PW, "new_password": "x", "new_password2": "y"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert bad.status_code == 400 and expected in bad.text
+    await _move_deadline_to(engine, ivan, time.time() - 1)
+    async with _client(engine, service) as c:
+        r = await _cookie_login(c, "ivan")
+        assert r.headers["location"] != "/ui/account/password"  # after it: refused
+
+
+def test_the_voluntary_change_page_states_no_deadline() -> None:
+    # Control for the page builder: the deadline sentence belongs to the forced variant only.
+    from messagefoundry_webconsole.pages import account as pages
+
+    assert "stops working" in str(pages.password_page(forced=True, credential_expires_at=1.8e9))
+    assert "stops working" not in str(pages.password_page(forced=True))
+    assert "stops working" not in str(
+        pages.password_page(forced=False, credential_expires_at=1.8e9)
+    )
+    # A deadline past what the clock can render drops the sentence instead of raising: this page is
+    # the only one a must-change holder can reach, so it must never 500.
+    assert "stops working" not in str(pages.password_page(forced=True, credential_expires_at=1e15))
+
+
+def test_the_create_form_states_a_large_window_in_plain_digits() -> None:
+    from messagefoundry_webconsole.pages import admin as pages
+
+    assert "stops working 1,000,000 hours after" in str(
+        pages.user_new_page([], credential_window_hours=1_000_000.0)
+    )
+    assert "stops working 1 hour after" in str(pages.user_new_page([], credential_window_hours=1.0))
