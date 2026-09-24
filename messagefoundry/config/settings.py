@@ -2198,7 +2198,7 @@ class AuthSettings(_Section):
     password_require_digit: bool = False
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    password_check_context: bool = True  # reject passwords containing app/vendor/HL7 terms
+    password_check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term
     password_check_username: bool = (
         True  # reject passwords containing the user's own username (6.2.11)
     )
