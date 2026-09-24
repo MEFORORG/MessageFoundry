@@ -228,6 +228,12 @@ def aad_cell_name(aad: bytes | None) -> tuple[str, str]:
     return fields[1].decode("utf-8", "replace"), fields[2].decode("utf-8", "replace")
 
 
+#: The cell-AAD table name the uploaded-file store (``uploads.py``) seals under, for the refusal that
+#: special-cases it. ``uploads.py`` keeps the literal in its ``cell_aad`` calls, because the cipher
+#: registry test enumerates literal cells, and ``pipeline/alerts.py`` keeps its own copy.
+#: ``tests/test_uploads_strict_ciphertext.py`` pins all three spellings together.
+UPLOADED_FILE_AAD_TABLE = "uploaded_file"
+
 #: Called when a keyed cipher REFUSES an unmarked value, with the ``(table, column)`` from the cell
 #: AAD. Never the row key and never the value, so an implementation may forward it to an alert.
 UnmarkedRefusalHook = Callable[[str, str], None]
@@ -248,9 +254,10 @@ class _UnmarkedPolicy:
     so ``''`` is the one unmarked value a keyed store legitimately holds. NULL never reaches here.
 
     ``allow_unmarked`` is the audited opt-out, ``[store].allow_unmarked_ciphertext``. The per-call
-    ``allow_unmarked=True`` exists for exactly one caller, the uploaded-file store, whose behaviour at
-    first key-enable is an open owner question; it keeps that surface byte-identical rather than
-    deciding it here."""
+    ``allow_unmarked=True`` belongs to the uploaded-file store (``uploads.py``). Its reseal pass, run
+    by ``rotate-key``, passes it to seal a plaintext upload, and its reads pass it under a cipher that
+    pass cannot reseal. Under an AES-GCM cipher no other upload path passes it, so a keyed store
+    refuses a plaintext upload until ``rotate-key`` seals it (owner ruling 2026-09-23)."""
 
     _allow_unmarked: bool
     _refusal_hook: UnmarkedRefusalHook | None
@@ -289,16 +296,20 @@ class _UnmarkedPolicy:
         if not stored or allow_unmarked or self._allow_unmarked:
             return stored
         table, column = aad_cell_name(aad)
+        if table == UPLOADED_FILE_AAD_TABLE:
+            # An uploaded file (BACKLOG #1169, owner ruling 2026-09-23). Usually one stored before
+            # the key was enabled, and the fix is rotate-key, never the loosening.
+            cause = "a plaintext upload stored before the key was enabled, or a planted one"
+            fix = "run 'messagefoundry rotate-key' with the engine stopped to seal it"
+        else:
+            cause = "a stripped marker or a planted row"
+            fix = "set [store].allow_unmarked_ciphertext to accept unmarked values"
         _log.warning(
-            "refused an unmarked value in cipher column %s.%s: a keyed store holds only marked "
-            "ciphertext there, so this is a stripped marker or a planted row",
-            table,
-            column,
+            "refused an unmarked value in cipher column %s.%s: %s; %s", table, column, cause, fix
         )
         self.report_unmarked(table, column)
         raise CipherError(
-            f"refused an unmarked value in cipher column {table}.{column} (a stripped marker or a "
-            "planted row); set [store].allow_unmarked_ciphertext to accept unmarked values"
+            f"refused an unmarked value in cipher column {table}.{column} ({cause}); {fix}"
         )
 
 
