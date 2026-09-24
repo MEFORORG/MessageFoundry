@@ -64,7 +64,7 @@ def _pem(key: object) -> str:
 
 @pytest.fixture(scope="session")
 def rsa_pem() -> str:
-    return _pem(rsa.generate_private_key(public_exponent=65537, key_size=2048))
+    return _pem(rsa.generate_private_key(public_exponent=65537, key_size=3072))
 
 
 @pytest.fixture(scope="session")

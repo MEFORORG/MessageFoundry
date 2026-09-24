@@ -1443,8 +1443,9 @@ def MLLP(
 
     ``tls_ciphers`` (**both directions**, ADR 0188) is the opt-in OpenSSL cipher string for **this
     hop**, the per-connection sibling of ``[api].tls_ciphers``. Unset (the default) the listener and
-    the destination build exactly the context they build today — the interpreter's inherited suite
-    list, six CBC-SHA2 suites included, which is what keeps a legacy hospital peer negotiable. Set, the
+    the destination offer the approved AEAD suites, the default on every hop the engine builds
+    (BACKLOG #300). A legacy peer that speaks only CBC cannot negotiate TLS 1.2 with them, and this
+    setting cannot reopen CBC: the fix is a reviewed change to ``_APPROVED_TLS_SUITES``. Set, the
     string is validated by the **same** strict allow-list that guards ``[api].tls_ciphers`` (AEAD-only,
     forward-secret, encrypting, peer-authenticating, 128-bit floor) and then applied, so opting in
     NARROWS this one hop. A rejected string fails loud at construction, surfaced by
@@ -2628,9 +2629,10 @@ def DICOM(
 
     **Per-connection suite list (``tls_ciphers``, both directions, ADR 0188).** The opt-in OpenSSL
     cipher string for **this** hop, the per-connection sibling of ``[api].tls_ciphers``. Unset (the
-    default) the SCP and the SCU build exactly the context they build today — the interpreter's
-    inherited suite list, six CBC-SHA2 suites included, which is what keeps an older modality or PACS
-    negotiable. Set, the string is validated by the **same** strict allow-list that guards
+    default) the SCP and the SCU offer the approved AEAD suites, the default on every hop the engine
+    builds (BACKLOG #300). An older modality or PACS that speaks only CBC cannot negotiate TLS 1.2 with
+    them, and this setting cannot reopen CBC: the fix is a reviewed change to
+    ``_APPROVED_TLS_SUITES``. Set, the string is validated by the **same** strict allow-list that guards
     ``[api].tls_ciphers`` (AEAD-only, forward-secret, encrypting, peer-authenticating, 128-bit floor)
     and then applied, so opting in NARROWS this one hop. A rejected string fails loud at construction,
     surfaced by ``messagefoundry check`` / dry-run."""
