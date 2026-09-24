@@ -15,6 +15,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
   Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
+### Changed
+- **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
+  cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
+  to the largest `max_message_bytes` any inbound in the graph sets. The file's size is checked
+  before it is read, so an oversized fixture is never read whole. A fixture over the cap that
+  0.4.0 read would now fail the run. [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) also carries a
+  code-derived ASVS 5.1.1 file-surface inventory, with upload and download tables and stated
+  exclusions, and a test fails when the code and the tables drift apart.
+  ([BACKLOG #1127](docs/BACKLOG.md))
 - **BREAKING — every TLS context the engine builds now defaults to the approved AEAD TLS 1.2
   suites, MLLP and DICOM included, and the engine's own signing key must be RSA-3072 or larger.**
   A CBC-only TLS 1.2 peer that connected on 0.4.0 would now fail the handshake. For MLLP and DICOM

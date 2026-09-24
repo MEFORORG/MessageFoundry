@@ -14,6 +14,7 @@ identically, and the pre-routing decode + guards are shared through
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ from messagefoundry.parsing import (
     summarize,
     validate,
 )
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline._sandbox_codec import build_payload
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
@@ -79,9 +81,51 @@ __all__ = [
     "read_messages",
     "read_message_sets",
     "split_messages",
+    "MAX_FIXTURE_FILE_BYTES",
+    "fixture_cap",
 ]
 
 log = logging.getLogger(__name__)
+
+#: Default largest fixture FILE ``dryrun`` and ``check`` will read (ASVS 5.1.1, BACKLOG #1127; the
+#: IDE file pickers that feed this reader are listed in ``docs/CONNECTIONS.md``). It is the engine's
+#: per-message ceiling. :func:`fixture_cap` raises it for a graph whose inbound sets a larger
+#: ``max_message_bytes``, so a fixture the engine would admit is never refused by its own preview.
+MAX_FIXTURE_FILE_BYTES = DEFAULT_MAX_MESSAGE_BYTES
+
+
+def fixture_cap(registry: Registry | None = None) -> int:
+    """The fixture-file cap for ``registry``: :data:`MAX_FIXTURE_FILE_BYTES`, or the largest
+    per-inbound ``max_message_bytes`` when one is set higher (a streaming inbound, ADR 0105)."""
+    caps = [MAX_FIXTURE_FILE_BYTES]
+    if registry is not None:
+        caps.extend(
+            ic.max_message_bytes for ic in registry.inbound.values() if ic.max_message_bytes
+        )
+    return max(caps)
+
+
+def _read_fixture(path: Path, cap: int) -> bytes:
+    """``path``'s bytes, or ``ValueError`` when it is over ``cap`` or cannot be read.
+
+    Refuses on the size the file reports before reading, then reads at most one byte past what is
+    left of the cap, so an oversized file, or one that grows while it is read, never lands in memory
+    whole. An unreadable path (a directory named ``*.hl7``, a permission error) is a ``ValueError``
+    naming the file, so both callers report it rather than raise a traceback."""
+    too_big = f"{path} is over the {cap}-byte dry-run file cap; split it into smaller fixture files"
+    try:
+        with path.open("rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size > cap:
+                raise ValueError(too_big)
+            data = fh.read(size + 1)
+            if len(data) > size:
+                data += fh.read(cap + 1 - len(data))
+    except OSError as exc:
+        raise ValueError(f"cannot read fixture {path}: {exc.strerror or exc}") from exc
+    if len(data) > cap:
+        raise ValueError(too_big)
+    return data
 
 
 class TraceHook(Protocol):
@@ -966,17 +1010,19 @@ def split_messages(raw: bytes) -> list[bytes]:
     return [m.encode("latin-1") for m in messages]
 
 
-def read_messages(paths: list[str]) -> list[tuple[str, str, bytes]]:
+def read_messages(paths: list[str], *, cap: int | None = None) -> list[tuple[str, str, bytes]]:
     """Resolve ``paths`` (files and/or directories) to ``(label, file_path, content)`` per message.
 
     Directories contribute their ``*.hl7`` files (sorted); batch files yield one entry per message
     (``"name [i]"``). Raises ``FileNotFoundError`` for a missing path and ``ValueError`` for a
-    directory with no ``*.hl7`` files.
+    directory with no ``*.hl7`` files, or for a file over ``cap`` (default :func:`fixture_cap`) or
+    unreadable.
 
     ``content`` is **bytes** — the fixture's own, undecoded (BACKLOG #1689). See
     :func:`split_messages` for why the decode cannot happen here: it belongs to the inbound a fixture
     is about to be run against, and this reader does not know which one that is.
     """
+    limit = fixture_cap() if cap is None else cap
     out: list[tuple[str, str, bytes]] = []
     for raw_path in paths:
         path = Path(raw_path)
@@ -989,7 +1035,7 @@ def read_messages(paths: list[str]) -> list[tuple[str, str, bytes]]:
         else:
             raise FileNotFoundError(f"no such file or directory: {path}")
         for f in files:
-            messages = split_messages(f.read_bytes())
+            messages = split_messages(_read_fixture(f, limit))
             if len(messages) == 1:
                 out.append((f.name, str(f), messages[0]))
             else:
@@ -998,7 +1044,7 @@ def read_messages(paths: list[str]) -> list[tuple[str, str, bytes]]:
 
 
 def read_message_sets(
-    root: str | Path, inbound_names: Collection[str]
+    root: str | Path, inbound_names: Collection[str], *, cap: int | None = None
 ) -> list[tuple[str, str, bytes, str | None]]:
     """Like :func:`read_messages` but **recursive** and feed-aware, for ``messagefoundry check`` (#11).
 
@@ -1008,13 +1054,15 @@ def read_message_sets(
     names no inbound, is *unmapped* (``None``) and the caller dry-runs it against **every** inbound —
     the all-×-all fallback. Returns ``(label, file_path, content, target_inbound | None)`` per message
     (a batch file yields one entry per message). A single-file ``root`` is one unmapped fixture.
-    Raises ``FileNotFoundError`` for a missing ``root``.
+    Raises ``FileNotFoundError`` for a missing ``root`` and ``ValueError`` for a file over
+    ``cap`` (default :func:`fixture_cap`) or unreadable.
 
     ``content`` is **bytes**, for the reason :func:`read_messages` gives — and the cross-product is
     what makes it the only coherent contract here: ONE unmapped fixture is dry-run against EVERY
     deployed inbound, each with its own declared ``encoding``, so there is no single charset this
     function could decode with, and no single inbound it could be handed instead.
     """
+    limit = fixture_cap() if cap is None else cap
     names = set(inbound_names)
     root_path = Path(root)
     pairs: list[tuple[Path, str | None]] = []
@@ -1031,7 +1079,7 @@ def read_message_sets(
         raise FileNotFoundError(f"no such file or directory: {root_path}")
     out: list[tuple[str, str, bytes, str | None]] = []
     for f, target in pairs:
-        messages = split_messages(f.read_bytes())
+        messages = split_messages(_read_fixture(f, limit))
         if len(messages) == 1:
             out.append((f.name, str(f), messages[0], target))
         else:
