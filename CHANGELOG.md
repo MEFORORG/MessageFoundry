@@ -19,6 +19,24 @@ All notable changes to MessageFoundry are documented here. The format follows
   #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
   off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
   deployment.
+- **BREAKING: the Windows trust-anchor ACL check no longer reads what it cannot parse as
+  owner-only, and it knows more broad principals.** This check runs at startup and reload on
+  `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and `[api].tls_client_ca_file`.
+  0.4.0 passed an anchor whose `icacls` output was empty, was not `icacls` output, or granted write
+  to a bare name it did not know, such as the German `Jeder` for Everyone. Those now read as
+  indeterminate: the engine logs a warning, writes a new `acl_indeterminate` row under the
+  `auth.trust_anchor` audit action, and **still starts**, under `enforce` as under `warn`. An
+  anchor whose ACL cannot be read on any platform now gets that row too; 0.4.0 wrote none. **What
+  now refuses under the default `[security].enforcement = enforce`** is a write or DELETE grant to
+  a broad principal 0.4.0 missed: `NT AUTHORITY\INTERACTIVE`, `SERVICE`, `BATCH`, `NETWORK`,
+  `ANONYMOUS LOGON` or `Local account`, `Guests` or `Domain Guests`, an unresolved Domain Users or
+  Domain Guests SID (`S-1-5-21-...-513` or `-514`), or a DELETE-only grant to any broad principal.
+  An anchor created under `C:\Users\Public` inherits `NT AUTHORITY\INTERACTIVE:(I)(M)`, so it
+  started under 0.4.0 and now refuses; at `warn` it starts with an `acl_insecure` row. Names now
+  match whole, so an account such as `DESKTOP-A\usersync` no longer reads as `BUILTIN\Users`, and
+  an anchor 0.4.0 refused for it now passes. **Migration:** before you upgrade, run
+  `icacls <anchor>` and remove any such grant, or move the anchor out of `C:\Users\Public`.
+  ([BACKLOG #1142](docs/BACKLOG.md))
 ### Changed
 - **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
   cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
