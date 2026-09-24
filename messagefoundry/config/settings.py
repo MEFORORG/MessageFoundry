@@ -3143,6 +3143,13 @@ _ALERT_EVENT_TYPES = frozenset(
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
         # events the stop also emits.
         "log_write_failed",
+        # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
+        # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
+        "approval_stale_requester",
+        # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
+        # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
+        "ad_reconcile_aborted",
+        "ad_session_revoked",
         # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
         # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
     }
@@ -3253,7 +3260,7 @@ class AlertRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # --- match (all conditions must hold) ---
-    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | secret_rotation | connection_error | message_stall | saturation | integrity_drift | update_available | backup_failed | lane_stuck | rcsi_off_degraded | bootstrap_admin_expiring
+    event_type: str = "any"  # "any" | a member of _ALERT_EVENT_TYPES (validated below)
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
     min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
     min_oldest_seconds: float | None = Field(
@@ -5240,6 +5247,7 @@ def security_loosenings(
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
     store_privilege: StorePrivilegePosture | None,
+    audit_chain_unkeyed: bool | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -5251,8 +5259,9 @@ def security_loosenings(
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), three per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a generic-ODBC ``DATABASE`` hop
-    with TLS unenforced (#333) -- the store principal's OBSERVED privilege posture (#1008), and
-    ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
+    with TLS unenforced (#333) -- the store principal's OBSERVED privilege posture (#1008), the
+    OBSERVED keying of the audit chain (#1905), and ``[store].schema_management = auto`` on a server
+    backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -5285,6 +5294,12 @@ def security_loosenings(
     a clean result and this registry never renders it as one. Note the switch that acts on the finding
     — ``[store].require_least_privilege`` — is a HARDENING, so it is not itself reported here; the
     DEVIATION is what the observation found, exactly as with the three connection-scoped entries.
+
+    ``audit_chain_unkeyed`` is the second store OBSERVATION (BACKLOG #1905), from the open store's
+    ``audit_chain_unkeyed()``: the store holds a key, yet its audit chain is keyless SHA-256 because
+    rows were written before any key was in hand, and a keyed open never re-keys existing rows.
+    ``None`` has the same meaning as for ``store_privilege`` -- no store is open at this call site, so
+    nothing was observed -- and is never read as a clean result.
 
     The three sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -5591,6 +5606,21 @@ def security_loosenings(
                     "its runbook says it must not",
                 )
             )
+    # --- the AUDIT CHAIN's observed keying (BACKLOG #1905). An observation, like the entry above: no
+    # switch declares it. A store that holds a key but opened onto a keyless chain with rows carries
+    # tamper-evidence an attacker with write access can forge, and nothing else in this registry
+    # would say so -- the at-rest entries report a MISSING key, and here the key is present.
+    if audit_chain_unkeyed:
+        out.append(
+            (
+                "audit_chain_unkeyed",
+                "the audit chain is KEYLESS SHA-256 although a store key is configured -- its rows "
+                "were written before the key was in hand, and opening with a key does not re-key "
+                "existing rows, so anyone who can write audit_log can forge a row that verifies "
+                "clean; stop the engine and run `messagefoundry rekey-audit` to verify the chain and "
+                "key every row after it",
+            )
+        )
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.

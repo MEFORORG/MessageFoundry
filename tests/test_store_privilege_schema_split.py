@@ -138,6 +138,7 @@ def _loosening_names(store: StoreSettings) -> set[str]:
             (),
             (),
             None,
+            None,
         )
     }
 

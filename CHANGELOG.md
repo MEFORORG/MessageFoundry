@@ -25,12 +25,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   schema, as excess. Set `schema_management = "auto"` to keep the engine building its own schema;
   on a server DB that is reported by `security_loosenings()` as `schema_management`.
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
+
+## [0.4.0] — 2026-09-23 — Early Access
+
+This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the
+non-breaking fixes rather than listing them all; the git history is the full record.
+
+### Added
 - **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
-  truncated tail.** A previous release shipped `audit-anchor` / `audit-verify --expected-anchor` and
-  recorded, accurately at the time, that `[integrity].audit_verify_on_start` "is unchanged — it is a
-  bare walk and stays blind to a truncated tail". **That sentence no longer describes the engine.**
-  Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes and every startup
-  compares against it; leave it empty (the default) and the walk is byte-identical to before.
+  truncated tail.** `audit-anchor` / `audit-verify --expected-anchor`, also new in this release (under
+  Changed below), landed first and recorded, accurately at the time, that
+  `[integrity].audit_verify_on_start` "is unchanged — it is a bare walk and stays blind to a truncated
+  tail". **With this key and `audit_verify_on_start = true` both set, that sentence no longer describes
+  the engine.** Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes, and
+  every startup that runs the check compares against it. The key alone arms nothing: with
+  `audit_verify_on_start` left at its default of `false`, startup logs a WARNING that the anchor is
+  never read. Leave the key empty (the default) and the walk is byte-identical to before.
   **It consumes the anchor as a PREFIX, not as the CLI's exact seal, and that is the whole reason a
   startup setting can hold one.** The exact seal compares the *current* head, so it diverges on the
   next appended row — and a running engine writes audit rows, so a startup check built on it would
@@ -76,6 +86,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   there is the filesystem ACL. The PostgreSQL least-privilege grant is now documented
   ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.2), which it previously was not.
   ([BACKLOG #1008](docs/BACKLOG.md))
+- **Three new alert events: `approval_stale_requester`, `ad_session_revoked` and
+  `ad_reconcile_aborted`.** The first fires when a dual-control release is refused because the
+  requester no longer holds the authority it needs (under Security below). The other two come from
+  the directory session reconciler. It raises one `ad_session_revoked` per account whose sessions it
+  revoked, and one `ad_reconcile_aborted` when its mass-revoke breaker stops a pass. Each has a
+  matching audit row: `approval.stale_requester`, `auth.ad_session_revoked` and
+  `auth.ad_reconcile_aborted`. A pass that stops because the whole directory is unreachable raises
+  no alert, and neither does a pass that fails part-way. An `[[alerts.rules]]` `event_type` can now
+  name all three, and `any` matches them too. ([BACKLOG #289](docs/BACKLOG.md))
 
 ### Removed
 - **BREAKING: `[security].handles_real_patient_data` is gone, and with it the whole data-class axis.**
@@ -94,13 +113,40 @@ All notable changes to MessageFoundry are documented here. The format follows
   under the shipped `enforcement = enforce`), `block_unlisted_outbound`,
   `allow_keeping_phi_indefinitely`, `allow_single_factor_admin_when_exposed`,
   `allow_unverified_alert_smtp_tls`, `[alerts].security_notifications_required`, a per-connection
-  `cleartext_accepted` / `tls_revocation_attested`, or the `[security].enforcement` dial.
+  `cleartext_accepted`, a CRL for a revocation-checked hop, or the `[security].enforcement` dial.
+  (A per-connection `tls_revocation_attested` exists in the engine but no factory parameter or
+  `connections.toml` key can set it.)
   **What this costs:** a box that ran key-free on the declaration now needs a key or the audited
   per-gate ack. Nothing is deployed (there is no migration), and both in-repo users of the declaration —
   CI's SQL Server load leg and the failover load harness — moved to per-gate relaxations that are
   *narrower* than what they replace. See
   [ADR 0186](docs/adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
   and BACKLOG #1279.
+- **BREAKING — `[egress].fhir_require_structured_params` is gone, and with it the flat `?`-query form of
+  `fhir_lookup`.** In 0.3.2 the setting defaulted to `false`, so a read query such as
+  `"Patient?identifier=..."` was sent as written unless a site opted out. The flat form appended the
+  author's string unencoded, so it was removed rather than left behind a setting. A query carrying `?`
+  now raises `FhirLookupError` whatever the config says. With nothing left to switch, setting the key
+  now **refuses at load**, under the unknown-key refusal in Changed below.
+  **Migration:** delete the key from `messagefoundry.toml`. Move each flat query to `params=`, so
+  `fhir_lookup("epic", "Patient?identifier=MRN|" + mrn)` becomes
+  `fhir_lookup("epic", "Patient", params={"identifier": FhirToken("MRN", mrn)})`.
+  ([BACKLOG #1243](docs/BACKLOG.md), [ADR 0043](docs/adr/0043-fhir-read-lookup.md))
+- **BREAKING — the Active Directory password sign-in (LDAP simple bind) is gone.** `POST
+  /auth/login` with the `ad` provider now answers `401` and writes an audit row with the reason
+  `pathway_retired`. `GET /auth/providers` reports `ad: false`, and the web console no longer offers
+  the form. AD users sign in through Windows SSO (Kerberos, `POST /auth/negotiate`) or OIDC. The
+  directory bind itself stays, because group mapping, the session reconciler and an AD account's
+  step-up re-authentication still use it. **Migration:** turn on `[auth].kerberos_enabled` or OIDC
+  for AD users, and change any client that posted an AD username and password to `/auth/login`.
+  (BACKLOG #1137)
+- **BREAKING — `Soap(ws_password_type="digest")` is gone.** The WS-Security PasswordDigest form
+  hashes the password with SHA-1, so it was retired with the other weak algorithms. A SOAP outbound
+  that sets it now fails at load and at `messagefoundry check`. **Migration:** set
+  `ws_password_type="text"` over TLS; the partner must accept PasswordText. (BACKLOG #1171)
+- **BREAKING — `messagefoundry.apiclient` drops the `audit_summary` keyword from `list_messages` and
+  `list_dead_letters`.** No route ever read it. A call that passes it raises `TypeError`.
+  **Migration:** drop the keyword. ([BACKLOG #1645](docs/BACKLOG.md))
 
 ### Changed
 - **Setting `[integrity].fail_closed_on_drift` on an editable install now says so at startup, and two
@@ -119,7 +165,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   resolution of the baseline's trust domain: the wheel's own `RECORD` stays the baseline, no runtime
   out-of-domain anchor is adopted, and the control detects an *inconsistent* in-place edit and not a
   *consistent* one. (BACKLOG #1679)
-- **An Active Directory login is now identified by the directory's immutable id, not by
+- **BREAKING — an Active Directory login is now identified by the directory's immutable id, not by
   `sAMAccountName`.** A directory frees a deleted account's name and may reissue it to a different
   person. The engine resolved an AD principal by that name, so a recycle without a matching
   MessageFoundry `delete_user` adopted the departed operator's row and re-bound its `user_id` -- the
@@ -134,7 +180,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   told rather than left to assume the control is running. **A directory-side rename now keeps the
   account instead of minting a second one**, which is the other half of the same defect: before this,
   a rename resolved to nothing and silently orphaned the uploads and presets keyed to the first row.
-  ([BACKLOG #1471](docs/BACKLOG.md))
+  **Who this bites:** every AD account row that 0.3.2 created has no stored id. Its first 0.4.0
+  sign-in through a directory that returns `objectGUID` is therefore refused as
+  `directory_identity_conflict`. **Migration:** an administrator deletes each such MessageFoundry
+  user row (`DELETE /users/{user_id}`; on a store created by 0.3.2 this first needs the saved-search
+  fix under the second Changed heading), and the person's next directory sign-in creates a new row
+  bound to the id. Uploaded files, saved search presets and a per-user channel scope keyed to the old
+  row do not carry over. ([BACKLOG #1471](docs/BACKLOG.md))
 - **The directory session reconciler is keyed on that same immutable id, and the stored username is
   now a cache the directory refreshes.** Identifying a login by `objectGUID` while
   `reconcile_directory_sessions` went on probing `resolve_principal(<the stored name>)` left a renamed
@@ -154,10 +206,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   deliberately** -- an operator able to set it could point a row at a directory account it is not bound
   to, which is the privilege transfer #1471 closes; there is still no setter for
   `directory_object_id`. ([BACKLOG #1532](docs/BACKLOG.md))
-- **Web console engine UI seam `93ba1f10b9dccfc8` -> `b93f38d097f97a45`.** `SecurityPosture` gained the
-  additive `store_privilege` object above, and `StorePrivilegeView` joins the discovered surface.
-  Additive with a default, so an older console ignores it; the seam still moves because the golden seam
-  contract introspects that model's field set.
+- **BREAKING — web console engine UI seam: this release ships `75c4117d21fd0b98`.** 0.3.2 shipped the integer seam
+  `14`. The seam is now a digest of the surface the console uses (BACKLOG #1220), and it moved several
+  times in this release. One move, `93ba1f10b9dccfc8` -> `b93f38d097f97a45`, came when `SecurityPosture`
+  gained the additive `store_privilege` object above and `StorePrivilegeView` joined the discovered
+  surface. That field is additive with a default, but the seam still moves, because the golden seam
+  contract introspects that model's field set. A console accepts exactly one seam, so with the console
+  on, the engine refuses to start against a console built for any other seam. **Migration:** upgrade
+  the web console wheel together with the engine, to the release built for this seam.
 - **`DEPLOY-SERVER-DB.md` §1.2 posture B now states its prerequisite.** "A DBA pre-creates the objects"
   is not sufficient on its own: the engine skips its DDL batch only when the `schema_meta` marker
   records the current batch, and on PostgreSQL `CREATE TABLE IF NOT EXISTS` against an existing table
@@ -180,8 +236,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   maintenance window, a database move, a backup/restore, a hand-off. Anchoring and immediately
   re-verifying compares a value to itself; re-checking a held anchor against a **running** engine alarms
   on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
-  the control, and `[integrity].audit_verify_on_start` is unchanged — it is a bare walk and stays blind
-  to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
+  the control. `[integrity].audit_verify_on_start` on its own is still a bare walk and stays blind to a
+  truncated tail; `[integrity].audit_anchor_file` (under Added above) gives it an anchor.
+  ([BACKLOG #328](docs/BACKLOG.md))
 - **The advisory `raise-fstring` lint in `messagefoundry check` now reads three more spellings of the
   same risk.** It matched only an f-string, so `raise ValueError("bad " + x)`, the `%` form and
   `.format(...)` carried an interpolated message past it — the identical free-text PHI payload, in the
@@ -195,15 +252,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   unflagged. ([BACKLOG #1676](docs/BACKLOG.md))
 
 ### Changed
-- **An API request body with an unknown or misspelled key is now refused with HTTP 422 instead of
-  being accepted and silently dropped.** Pydantic's default is `extra="ignore"`, and none of the 125
-  models in `messagefoundry/api/models.py` and `messagefoundry/api/auth_models.py` overrode it — so a
+- **BREAKING — an API request body with an unknown or misspelled key is now refused with HTTP 422
+  instead of being accepted and silently dropped.** Pydantic's default is `extra="ignore"`, and in
+  0.3.2 no model in `messagefoundry/api/models.py` or `messagefoundry/api/auth_models.py`
+  overrode it — so a
   key the engine did not recognise vanished and the route answered success. The sharpest case was
-  `PUT /users/{id}/channel-scope`: `channels` is optional and `None` means *all channels*, so
-  `{"chanels": ["IB_ACME_ADT"]}` asked for one connection and granted every one of them.
-  **The posture is request-scoped, and that is the whole design.** The 32 models FastAPI parses out
-  of a request body now subclass `messagefoundry.api.request_model.RequestModel`, which forbids
-  unknown keys; the 93 response-only models stay tolerant, because `messagefoundry.apiclient` reads
+  `PUT /users/{id}/channel-scope`: in 0.3.2 `channels` was optional and `None` meant *all channels*,
+  so `{"chanels": ["IB_ACME_ADT"]}` asked for one connection and granted every one of them. (`None`
+  now means *no* channels; see the BREAKING channel-scope entry under Security.)
+  **The posture is request-scoped, and that is the whole design.** Those two files now hold 130
+  models. The 33 that FastAPI parses out of a request body subclass
+  `messagefoundry.api.request_model.RequestModel`, which forbids unknown keys; the 97 response-only
+  models stay tolerant, because `messagefoundry.apiclient` reads
   engine responses into those same classes and the web console ships as a separately-versioned wheel
   — a strict response model would make an older client raise on a newer engine that merely grew a
   field. Five shapes (`AdGroupMap`, `AdGroupMapEntry`, `AdGroupScopeEntry`, `AdGroupScopeMap`,
@@ -211,9 +271,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   RBAC writes is a mis-grant, so adding a field to one of them needs the client bump in the same
   release. ([BACKLOG #1109](docs/BACKLOG.md))
 
-- **A `fhir_lookup` search value now states its KIND, and a plain string carrying one of FHIR's
-  value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer control: it
-  stops one value becoming two search parameters, and it cannot help at the FHIR value layer, where
+- **BREAKING — a `fhir_lookup` search value now states its KIND, and a plain string carrying one of
+  FHIR's value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer
+  control: it stops one value becoming two search parameters, and it cannot help at the FHIR value
+  layer, where
   `,` `|` and `$` are FHIR's own separators. The FHIR specification is explicit that a server
   percent-decodes a parameter value first and reads FHIR's syntax second (R4 section 3.1.1.4.19, R5
   section 3.2.1.5.7), so `%7C` arrives as a live token separator. A message-derived value carrying one
@@ -225,8 +286,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   **you** wrote — a composite, a quantity, a comma-separated OR or `_sort` list — percent-encoded only.
   **Refusal rather than FHIR's backslash escape, deliberately:** the escape is correct only if the far
   end implements the unescape, and server behaviour there varies, whereas a value that never leaves the
-  process cannot be misread by any server. Escaping stays available as an additive fourth kind for a
-  site that has a real FHIR server and can verify it.
+  process cannot be misread by any server. Escaping is not built; it is left as a possible additive
+  fourth kind for a site that has a real FHIR server and can verify it.
   **Migration:** `{"identifier": "MRN|" + mrn}` becomes `{"identifier": FhirToken("MRN", mrn)}`, which
   puts identical bytes on the wire. Import `FhirToken` / `FhirRaw` from `messagefoundry`. A non-string
   scalar also raises now — it was never in the declared type, but `urlencode` used to coerce it, so
@@ -260,8 +321,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   narrow trail; that is now reported as a loosening at `serve` and on `GET /security/posture`. PHI-view
   grants stay excluded at either value, because the PHI-access audit path already records them.
   ([BACKLOG #1277](docs/BACKLOG.md), [ADR 0118](docs/adr/0118-secure-by-default-security-configuration-section.md) §5 amended)
-- **A PHI instance reached through a declared reverse proxy with `[security].require_mfa` explicitly
-  off would refuse to start on first deployment, where it previously would not have.** The
+- **BREAKING — a PHI instance reached through a declared reverse proxy with `[security].require_mfa`
+  explicitly off would refuse to start on first deployment, where it previously would not have.** The
   MFA-at-exposure gate derived "is this instance exposed?" from `[api].serve_ui`, a field the ADR 0143
   console degrade arms rewrite **in place** earlier in the same startup. On the topology the runbooks
   recommend — a loopback bind behind a declared TLS terminator, with the web console left at its
@@ -358,8 +419,476 @@ All notable changes to MessageFoundry are documented here. The format follows
   its section — a typo, a key copied from newer documentation, or a setting since removed from the
   engine. **Remedy:** correct the spelling; the error names the section and the key. Nothing needs
   migrating, because a key that is refused now was doing nothing before.
+- **BREAKING — `convert_hl7_timestamp(..., from_tz=...)` now raises at the daylight-saving edges
+  instead of guessing.** Twice a year a local wall-clock time happens twice (the fall-back overlap) or
+  never (the spring-forward gap), and a timestamp with no offset cannot say which instant it means.
+  0.3.2 silently picked one, which could be an hour wrong. The function now raises
+  `AmbiguousLocalTimeError` or `NonExistentLocalTimeError`, so a Handler that calls it at those times
+  fails the message instead of sending a shifted time. Both subclass `DstTransitionError`, a
+  `ValueError`, and they are exported from `messagefoundry` with the `DstEdgePolicy` type. Only a time
+  the sender wrote is refused: a value with no time field keeps its 0.3.2 result, and a timestamp that
+  carries its own offset is unaffected.
+  **Migration:** pass `on_dst_edge="earlier"` to keep the 0.3.2 result exactly, or `"later"` for the
+  other offset. Better, have the sender include its offset. ([BACKLOG #1686](docs/BACKLOG.md))
+- **BREAKING — `gzip_decompress`, `deflate_decompress` and `zip_decompress` now require
+  `max_output_bytes`.** In 0.3.2 it defaulted to `None`, which meant no ceiling, so a Handler that
+  forgot it could be handed a decompression bomb. It is now keyword-only with no default, so a 0.3.2
+  call such as `gzip_decompress(data)` raises `TypeError` and the message fails. **Migration:** pass
+  a byte ceiling, for example `gzip_decompress(data, max_output_bytes=64 * 1024 * 1024)`, or pass
+  `max_output_bytes=None` to keep the 0.3.2 behaviour on input you have already bounded.
+  ([BACKLOG #1237](docs/BACKLOG.md))
+- **BREAKING — three smaller changes to the helpers a Router or Handler calls.** Each one makes a
+  0.3.2 call raise, so the message goes to `ERROR` instead of being processed.
+  - An HL7 field path with an index below 1, such as `PID-5.0` or `PID-0`, now raises
+    `HL7PeekError`. In 0.3.2 index 0 wrapped to the *last* item, so a read returned a value nobody
+    asked for and a write overwrote the last component or the segment id. **Migration:** use
+    1-based indexes. ([BACKLOG #1089](docs/BACKLOG.md))
+  - `XmlMessage.find`, `get`, `get_all`, `exists`, `set` and `set_attribute` now take their
+    expression, value and attribute name positionally only, because the keyword slots now carry
+    `$variable` bindings for safe XPath. A 0.3.2 call such as `msg.get(expression="//x")` raises
+    `TypeError`. **Migration:** pass those arguments by position, and bind message data as a
+    `$variable` rather than formatting it into the expression. ([BACKLOG #1049](docs/BACKLOG.md))
+  - `messagefoundry.parsing.validate()` no longer takes `profile=`. It was accepted and never read.
+    **Migration:** drop the argument.
+- **BREAKING — a Handler that returns anything but `Send`, `SetState`, `SetMeta`, an iterable of
+  those, or `None` now fails the message.** In 0.3.2 an unrecognised item fell silently out of the
+  result: returning the `Message` itself, a `str`, `bytes`, a `dict` or a `(name, msg)` tuple
+  finalized the message `FILTERED`, and a stray item in a list was dropped while the `Send`s beside it
+  were delivered. Each of those is now an `ERROR` (dead-lettered and replayable), and a list holding
+  one bad item delivers nothing. A `None` *inside* a list counts as a bad item. The reverse also
+  changed: a tuple or generator of `Send`s used to deliver nothing and now delivers. **Migration:**
+  return only those types, and filter `None` out of a list you build conditionally (for example
+  `[s for s in (a, b) if s is not None]`). ([BACKLOG #1687](docs/BACKLOG.md))
+- **BREAKING — a network intake now checks a non-HL7 body against the connection's declared content
+  type.** In 0.3.2 only the File and remote-file sources checked it. Now a body on any listener or
+  poller that contradicts its declared type is stored as `ERROR` and never routed: `json` or `fhir`
+  must start with `{` or `[`, `xml` with `<`, `x12` with `ISA`, and `dicom` needs `DICM` at byte
+  128. `text`, `binary` and `hl7v2` are not checked. An HTTP sender still gets `202`, but with no
+  `message_id`. **Migration:** declare the content type the feed really sends, or `text` / `binary`.
+  ([BACKLOG #1109](docs/BACKLOG.md))
+- **BREAKING — an `Http()` inbound bound off loopback now needs a peer control, or it refuses to
+  start.** 0.3.2 checked only that an exposed HTTP listener used TLS, so an off-loopback intake with
+  TLS and no caller identity passed. Under `[security].enforcement = enforce`, the default, the
+  connection now starts only with one of: `intake_auth` (`api_key`, `bearer` or `mtls_subject` with
+  subjects), or a `source_ip_allowlist` whose entries are no wider than /8 (IPv4) or /32 (IPv6).
+  `tls` with `tls_ca_file` alone does not count, and `--allow-insecure-bind` does not waive it. Only
+  that connection fails. **Migration:** add `source_ip_allowlist=[...]` to the `inbound(...)` call,
+  or set `intake_auth="api_key"` with `intake_api_key=env(...)`. (ADR 0154)
+- **BREAKING — two new default limits on the MLLP listener.** `max_connections_per_host` (32)
+  refuses the 33rd concurrent connection from one source address, and `max_frame_seconds` (60)
+  closes a connection whose frame has not finished 60 seconds after its start byte, with no ACK and
+  no NAK. 0.3.2 had neither. Behind a source-NAT proxy or load balancer every partner arrives as one
+  address, so 32 becomes the whole listener's capacity. A large frame on a slow link (below about
+  2.2 Mbit/s for the 16 MiB frame cap) never completes, and the sender resends it. **Migration:**
+  set `MLLP(max_connections_per_host=None)` behind NAT, and raise `max_frame_seconds` whenever you
+  raise `max_frame_bytes` or serve a slow link. ([BACKLOG #1725](docs/BACKLOG.md))
+- **BREAKING — `DatabasePoll` now reads at most 500 rows per poll (`poll_max_rows`).** In 0.3.2 a poll
+  fetched every row. Rows past the 500th wait for the next poll, which picks them up only if
+  `mark_statement` takes each handled row out of `poll_statement`'s result. With no
+  `mark_statement`, or one that does not remove rows, the same 500 rows come back every poll and the
+  rest are never read. A mark keyed on a column that is not unique to one row can mark unread rows
+  as done. The File, FTP and SFTP pollers' new `poll_max_files` (500) only delays unread files.
+  **Migration:** key the mark on one row, or set `poll_max_rows=None` to fetch every row as before.
+  ([BACKLOG #1114](docs/BACKLOG.md))
+- **BREAKING — at startup, the backlog of an inbound connection that is no longer configured is
+  dead-lettered.** In 0.3.2 its ingress, routed and response rows stayed pending, and resumed if the
+  connection came back. Now each is marked dead ("inbound removed from registry"), the message
+  becomes `ERROR`, and dead-letter retention applies. **Migration:** before removing or renaming a
+  busy inbound, let it drain. After a restart, replay the dead-lettered messages once the inbound is
+  back. ([BACKLOG #1612](docs/BACKLOG.md))
+- **BREAKING — `zip_decompress` refuses more archives.** An archive with two members of the same
+  name, an unsafe member name, or a member whose content contradicts its file extension (`.hl7`,
+  `.json`, `.xml`, `.pdf` and others) now raises `CompressionError`. In 0.3.2 the last duplicate
+  won and any member was accepted. **Migration:** fix the archive at its source.
+  ([BACKLOG #1128](docs/BACKLOG.md), [#1581](docs/BACKLOG.md))
+- **BREAKING — an HTTP-family reply over 16 MiB now fails.** 0.3.2 read a partner's response with no
+  size limit. A REST, SOAP, FHIR or DICOMweb delivery whose reply is larger than 16 MiB now raises
+  `ResponseTooLargeError`, which is retried and then dead-lettered. A `fhir_lookup` reply over the cap
+  raises inside the Handler, so under the default `internal_error = "continue"` that message goes
+  to `ERROR` with no retry. An OAuth2 or SMART token
+  response is capped at 256 KiB. There is no setting to raise either ceiling. **Migration:** none in
+  configuration; the partner must send a smaller reply. (ASVS 15.2.2)
+- **BREAKING — `File(sort=)` accepts only `"name"` or `"mtime"`.** In 0.3.2 any other string, such as
+  `"Name"` or `"size"`, silently gave name order. It now fails the connection at build.
+  **Migration:** `sort="name"`. ([BACKLOG #1655](docs/BACKLOG.md))
+- **BREAKING — an `env()` value that `connections.toml` reads with `cast = "bool"` now honours its
+  spelling.** When the value arrives as text (a `MEFOR_VALUE_*` variable, or a quoted value in
+  `environments/<env>.toml`), 0.3.2 cast it with Python's `bool()`, so `"false"`, `"0"`, `"no"` and
+  `"off"` all became `true`, and only an empty string became `false`. Those four spellings now give
+  `false`, and an empty or unrecognised value refuses at load. **Migration:** use one of `true`,
+  `1`, `yes`, `on`, `false`, `0`, `no` or `off`, and check each such value still means what you
+  intended. ([BACKLOG #1651](docs/BACKLOG.md))
+- **BREAKING — `serve` refuses a config directory that declares no connections.** In 0.3.2 a
+  directory with no inbound and no outbound loaded, served an idle engine, and passed
+  `messagefoundry check`. `serve` now refuses it, with no opt-out, and `check` fails on it unless
+  given the new `--allow-empty-config`. **Migration:** declare at least one connection before
+  `serve`; pass `--allow-empty-config` to a `check` run over an intentionally empty directory.
+  ([BACKLOG #1648](docs/BACKLOG.md))
+- **BREAKING — the engine API always serves HTTPS, and mints a self-signed certificate on first run
+  when none is configured.** 0.3.2 served plain `http://127.0.0.1:8765` unless `[api].tls_cert_file`
+  was set. 0.4.0 serves `https://` on the same address. With no certificate configured, it writes
+  `api-generated-cert.pem` and `api-generated-key.pem` beside the store database on first start and
+  reuses them. That certificate names only `[api].host`, so `https://localhost` fails the host-name
+  check. The only plaintext topology left is a declared reverse proxy terminating TLS in front
+  (`[api].tls_terminated_upstream`). `messagefoundry.apiclient` still defaults to
+  `http://127.0.0.1:8765`, which a default 0.4.0 engine no longer answers. Off loopback, the client
+  now refuses to send a password or token over plain `http` even with `allow_insecure=True`, where
+  0.3.2 sent it with a warning.
+  **Who this bites:** every script, `curl` call, monitoring probe, `ws://` stats client and
+  `EngineClient()` built with default arguments. **Migration:** use `https://127.0.0.1:8765` and
+  trust `api-generated-cert.pem` (for example `curl --cacert`, or `EngineClient(url, cacert=...)`),
+  or set `[api].tls_cert_file` and `[api].tls_key_file` to a certificate your clients already trust.
+  ([ADR 0172](docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md),
+  [BACKLOG #1276](docs/BACKLOG.md), [#1179](docs/BACKLOG.md))
+- **BREAKING — search criteria that can carry patient data left the query string, and the old form
+  now returns more, not less.** `GET /messages/search`, `GET /messages/export` and
+  `GET /uploads/{file_id}/messages` no longer declare `content` or `field_value`, and an undeclared
+  query parameter is dropped silently. So a 0.3.2 call with `content` alone answers `400`, a call
+  with `field_path` and `field_value` matches every message that merely has that field (and export
+  streams them), and the uploads browse lists the whole file unfiltered. **Migration:** send the
+  criteria in the JSON body of `POST /messages/search`, `POST /messages/export` or
+  `POST /uploads/{file_id}/messages/search`. ([BACKLOG #1184](docs/BACKLOG.md))
+- **BREAKING — list and search responses mask the message summary and metadata.** `GET /messages`,
+  both message searches, `GET /dead-letters` and the layered search now return `summary` and
+  `metadata` masked for display (for example `MRN ****0001`). Only `GET /messages/{id}` reveals them,
+  which needs `messages:view_raw` and spends the PHI-read budget. No setting turns the mask off.
+  **Migration:** fetch each message you need in full with `GET /messages/{id}`.
+  ([BACKLOG #1187](docs/BACKLOG.md))
+- **BREAKING — `GET /uploads` is paged and owner-scoped, and files uploaded under 0.3.2 are visible
+  only to administrators.** It now returns at most `limit` files (default 50, up to 500) from
+  `offset`, with `total` counting the whole visible set. A caller sees only its own uploads unless it
+  holds `files:access_any` (Administrator). A 0.3.2 upload's metadata has no owner id, so it matches
+  no ordinary user, and browsing, resending or deleting it answers `404` for them. **Migration:** page
+  with `offset` until you reach `total`, and have an administrator handle files uploaded before the
+  upgrade. ([BACKLOG #1152](docs/BACKLOG.md))
+- **BREAKING — a connection name that does not match `^[A-Za-z][A-Za-z0-9_-]{0,255}$` can no longer
+  be named through the API.** Such a name still loads and runs, but every `/connections/{name}/...`
+  route, the connection filters on message, dead-letter and event queries, resend targets and
+  channel-scope grants now answer `422` for it. So `ADT.In`, `Lab Results` or `2ndLab` cannot be
+  started, stopped, tested, purged or filtered on. **Migration:** rename such connections to fit the
+  pattern; stored history stays under the old name. ([BACKLOG #1108](docs/BACKLOG.md))
+- **BREAKING — three storage fields in the status response can now be `null`.**
+  `DbInfo.disk_free_bytes`, `LogInfo.disk_free_bytes` and `LogInfo.size_bytes` were `int`. They are
+  now `null` when the engine cannot measure them, which is always the case for `disk_free_bytes` on
+  PostgreSQL and SQL Server, where 0.3.2 reported `0`. A 0.3.2 `messagefoundry.apiclient` fails to
+  parse that response. **Migration:** treat the fields as optional, and upgrade API clients with the
+  engine. ([BACKLOG #1563](docs/BACKLOG.md))
+- **BREAKING — a request that has not started its response after 120 seconds now answers `503`.**
+  0.3.2 had no request deadline. A long integrity check, deep search or export on a large store can
+  now hit it, and no setting raises it. **Migration:** narrow the request, for example with a smaller
+  `limit` or `scan_limit`. ([BACKLOG #1044](docs/BACKLOG.md))
+- **BREAKING — in `messagefoundry.apiclient`, a JSON dump of a result withholds its patient-data
+  fields.** Message, dead-letter, event and response models the client parses now emit `null` for
+  `summary`, `error` and `metadata` under `model_dump_json()` or `model_dump(mode="json")`. Reading
+  the attributes still works. **Migration:** read the attributes, or use a Python-mode
+  `model_dump()`. ([BACKLOG #1045](docs/BACKLOG.md))
+- **BREAKING — a dual-control approval still pending from 0.3.2 cannot be approved.** Its row has no
+  requester id, so approving it answers `409`. **Migration:** settle pending approvals before the
+  upgrade, or reject and request them again after. ([BACKLOG #1540](docs/BACKLOG.md))
+- **BREAKING — on a store created by 0.3.2, saved searches and user deletion fail.** The
+  `search_presets.owner` column was renamed `owner_user_id`, and the store upgrade does not rename it,
+  so every preset call and `DELETE /users/{user_id}` fails with `no such column: owner_user_id`.
+  Measured on SQLite: a store created by 0.3.2 fails both calls under 0.4.0, and a store 0.4.0
+  created passes both. 0.3.2 also keyed presets on the username, where 0.4.0 keys them on the user id.
+  **Migration:** until the upgrade handles it, drop the `search_presets` table before the first 0.4.0
+  start; 0.4.0 creates it again, empty. Saved presets are lost. ([BACKLOG #1232](docs/BACKLOG.md))
+- **BREAKING — the default retry limit is now 100 attempts, not unlimited.**
+  `[delivery].retry_max_attempts` and `RetryPolicy.max_attempts` defaulted to `None` (retry forever)
+  in 0.3.2. At 100, with the default backoff, a destination that stays down for about 7 hours 50 minutes
+  dead-letters the message at the head of its lane, and the lane moves on. The dead-letter queue is
+  replayable. A global or environment value of `0` now refuses at load. **Migration:** set
+  `retry_max_attempts = "forever"` (or `MEFOR_DELIVERY_RETRY_MAX_ATTEMPTS=forever`,
+  `max_attempts = "forever"` in `[outbound.retry]`, or `RetryPolicy(max_attempts=None)` in code) to
+  keep 0.3.2's behaviour, and replace `0` with `1`. ([BACKLOG #1051](docs/BACKLOG.md))
+- **BREAKING — if the application log cannot be written, the engine now stops its connections.** In
+  0.3.2 a failed log write was reported to stderr and processing went on. Under the new default,
+  `[logging].on_write_failure = "stop"`, the engine first rolls the log aside; if the replacement is
+  unwritable too, it stops every connection the process owns, and delivery stays halted until the log
+  is writable and the lanes are restarted. **Migration:** set `[logging].on_write_failure =
+  "continue"` to keep running without a log record, which is reported as a loosening.
+  ([BACKLOG #122](docs/BACKLOG.md))
+- **BREAKING — an expired store encryption key now stops the engine from starting.** In 0.3.2 an
+  overdue store key only raised an alert. Under `enforce`, an encrypted store whose key is older than
+  `store_key_max_age_days` plus `enforce_grace_days` (365 + 30 by default), or whose age cannot be
+  determined, now refuses to start. Age runs from `[secret_rotation].store_key_last_rotated` if set,
+  otherwise from the date the engine first saw that key. **Migration:** run `messagefoundry
+  rotate-key`, correct `store_key_last_rotated`, or set `[secret_rotation].enforce_store_key_expiry =
+  false`, which is reported as a loosening. ([BACKLOG #1004](docs/BACKLOG.md))
+- **BREAKING — message bodies are purged after 30 days on every instance that sets no retention
+  window.** 0.3.2 kept bodies forever on an instance it did not treat as carrying patient data.
+  Every instance does now, so each unset window among `[security].delete_message_bodies_after_days`,
+  `[retention].dead_letter_days` and `[retention].reference_snapshot_days` defaults to 30 days, and
+  the purge runs. `dead_letter_days` now also purges a dead row at the ingress and routed stages. An
+  explicit `0` refuses to start under `enforce`. **Migration:** set each window explicitly, or set
+  `[security].allow_keeping_phi_indefinitely = true` to keep bodies. ([BACKLOG #1279](docs/BACKLOG.md),
+  [#1188](docs/BACKLOG.md))
+- **BREAKING — behind a declared TLS-terminating proxy under `enforce`, startup now measures the
+  proxy.** With `[api].tls_terminated_upstream` on, `serve` refuses to start without
+  `[security].web_console_public_address`. It then connects to that address at startup and refuses
+  unless the proxy is reachable, refuses TLS 1.0 and 1.1, and negotiates TLS 1.3. An IP-literal
+  address is refused. **Migration:** set the address to the DNS origin browsers use, enable TLS 1.3 on
+  the proxy, and start the proxy before the engine. ([BACKLOG #1026](docs/BACKLOG.md))
+- **BREAKING — on Windows, the config directory's owner is now checked.** 0.3.2 trusted the owner
+  unconditionally. The owner must now be the service's run-as account, a well-known administrator
+  identity, or a direct member of the local Administrators group, and an owner whose membership
+  cannot be resolved is refused. A directory owned by an operator who is an administrator only
+  through a domain group no longer loads. **Migration:** `icacls <config dir> /setowner
+  "*S-1-5-32-544" /T /C`, or re-run the service installer with `-LockConfigDir`.
+  ([BACKLOG #1647](docs/BACKLOG.md))
+- **BREAKING — `connections.toml` `[settings]` values must match their parameter's type.** A quoted
+  number or boolean such as `port = "2575"` or `persistent = "yes"` loaded in 0.3.2 and is now
+  refused, naming the connection and setting. So is an `env()` default of the wrong type, such as
+  `{ env = "port", cast = "int", default = "16" }`. **Migration:** write numbers and booleans
+  unquoted. ([BACKLOG #1650](docs/BACKLOG.md))
+- **BREAKING — two settings that 0.3.2 silently ignored now take effect.** `validate_directory =
+  true` on a File or remote-file *outbound* now refuses to start the lane when the directory is
+  missing, and nothing creates it; 0.3.2 created it on first write. `MEFOR_SANDBOX_MODE` is now read,
+  so `subprocess` there runs Routers and Handlers in the sandbox, with its time and memory caps.
+  **Migration:** create the directory first, or drop the setting; unset the variable if you did not
+  mean it. ([BACKLOG #114](docs/BACKLOG.md), [#1365](docs/BACKLOG.md))
+- **BREAKING — more settings are range-checked at load.** `[ai].provider` must be `"claude"`, the only
+  provider the engine can serve. `[cluster]` timings now refuse a leader fence and lease TTL pair that
+  leaves no detection margin (roughly, keep the TTL more than 2 seconds above the fence), whether or
+  not clustering is on. `[store].db_schema` is refused on a backend other than PostgreSQL.
+  **Migration:** correct each value the error names. ([BACKLOG #95](docs/BACKLOG.md),
+  [#1497](docs/BACKLOG.md))
+- **BREAKING — a rolling upgrade of a SQL Server cluster can elect two leaders, and a 0.3.2 node
+  cannot verify a 0.4.0 backup.** The SQL Server lease key changed from
+  `<db_schema, or dbo>:mefor_cluster_leader` to `mefor_cluster_leader`, so a 0.3.2 node and a
+  0.4.0 node contend for different lease rows. A 0.4.0 backup manifest counts every table, and
+  0.3.2's verifier compares it against its own four and fails. 0.4.0 still reads and restores a
+  0.3.2 backup. **Migration:** stop every node, upgrade them all, then start; upgrade a DR standby
+  before it seeds from a 0.4.0 primary.
+- **BREAKING — the first 0.4.0 start on PostgreSQL or SQL Server runs the schema upgrade and needs
+  DDL rights.** The PostgreSQL migration revision and the schema hash both moved, so the first open
+  runs the whole DDL batch. The 0.3.2 runbook allowed revoking `db_ddladmin` after the first start;
+  such a principal now fails to open the store, and `serve` refuses. **Migration:** grant DDL rights
+  for the first 0.4.0 start, then revoke them again.
+- **BREAKING — several CLI commands now fail where 0.3.2 reported success, or print differently.**
+  - `messagefoundry check` exits 1 when fixtures exist but no dry-run ran, when a pinned `.expect`
+    now reads `NOT_DEPLOYED`, and when a `messagefoundry.toml` is found but fails to load (0.3.2
+    skipped that leg). ([BACKLOG #1671](docs/BACKLOG.md), [#1318](docs/BACKLOG.md))
+  - `messagefoundry verify` fails, not skips, an unknown `--inbound` or a config with no inbound. It
+    fails a missing SQLite store and a missing writable directory, which 0.3.2 created and then
+    passed. The `host.console` check is gone. ([BACKLOG #1708](docs/BACKLOG.md),
+    [#1713](docs/BACKLOG.md))
+  - `messagefoundry backup`, and any caller of `open_store()`, no longer creates a missing SQLite
+    store; `backup` exits 2 and `open_store` raises `StoreNotFoundError`. `serve` still creates it,
+    and code that provisions a store passes `create=True`. ([BACKLOG #1780](docs/BACKLOG.md))
+  - `messagefoundry rotate-key` on a `vault_transit` store exits 2 instead of printing "re-encrypted
+    0 value(s)" and exiting 0. ([BACKLOG #1165](docs/BACKLOG.md))
+  - Text-mode error lines now go to stderr, not stdout, for `alert`, `backup`, `codeset`,
+    `connection`, `dryrun`, `graph`, `impact`, `import`, `init`, `lens`, `restore-verify` and
+    `security`. ([BACKLOG #1673](docs/BACKLOG.md))
+  - `messagefoundry dryrun` prints the disposition `not_deployed` where 0.3.2 printed `filtered` for
+    a message whose only destinations are not deployed. ([BACKLOG #1690](docs/BACKLOG.md))
+  - `messagefoundry --version` prints a second line, `package: <path>`.
+    ([BACKLOG #1677](docs/BACKLOG.md))
+  **Migration:** read each new failure as the real result it is; capture stderr (`2>&1`) or use
+  `--json`; run `serve` once before `backup` or `verify` on a new install.
+- **BREAKING — with `[integrity].fail_closed_on_drift = true`, an install the engine cannot attest
+  now refuses to start.** In 0.3.2 an install with no `RECORD`, a stripped one, or code loaded from
+  outside the install root was silently skipped even under fail-closed. It now raises
+  `IntegrityError`. The default (`false`) is unchanged. **Migration:** install the non-editable wheel,
+  or leave `fail_closed_on_drift` off. ([BACKLOG #1679](docs/BACKLOG.md))
+- **BREAKING — the forward proxy and the OAuth2 token host must now be on an egress allow-list.**
+  A `proxy_url` other than `"default"` now needs its host in the new `[egress].allowed_proxy`, and an
+  `oauth2_token_url` host must be in `[egress].allowed_http`; otherwise the graph refuses to load.
+  **Migration:** add `[egress] allowed_proxy = ["proxy.example.org:3128"]` and the token host to
+  `allowed_http`. ([BACKLOG #1659](docs/BACKLOG.md))
+- **BREAKING — the MLLP listener's automatic ACK now stamps MSH-7 with a UTC offset.** 0.3.2 wrote
+  local time as 14 digits (`YYYYMMDDHHMMSS`). The ACK now writes `YYYYMMDDHHMMSS±ZZZZ`, which HL7
+  allows and which pins the instant across a daylight-saving change. **Migration:** none in
+  configuration; a partner or test that parses a fixed 14-digit MSH-7 must accept the offset.
+- **BREAKING — an attachment download is served as `application/octet-stream` with a `.bin` name
+  unless its type is on a short allow-list.** 0.3.2 passed through any type a browser would not run
+  and took the extension from the host's type table. Now only `application/dicom`,
+  `application/json`, `application/pdf`, `image/bmp`, `image/gif`, `image/jpeg`, `image/png`,
+  `image/tiff`, `text/csv` and `text/plain` keep their type and extension; the bytes are unchanged.
+  **Migration:** a client that files downloads by `Content-Type` or file name identifies other types
+  from the bytes.
+- **BREAKING — a few narrower refusals.** Each worked in 0.3.2:
+  - `db_lookup` refuses a statement carrying a write keyword anywhere outside a literal, so a read
+    with a `MERGE JOIN` hint, or an unquoted column named `merge`, is now refused. **Migration:**
+    drop the hint or quote the name. ([BACKLOG #1574](docs/BACKLOG.md))
+  - `anonymize_checked()` and the anonymizer tooling refuse a salt with too little entropy, not just
+    a short one. **Migration:** use a random salt; a new salt changes every pseudonym.
+  - Under a pinned `[tls]` trust anchor, every off-loopback HTTP-family hop now uses it: REST,
+    SOAP, FHIR and DICOMweb deliveries, `fhir_lookup`, and the SMART and OAuth2 token requests. In
+    0.3.2 none of them read the anchor, so a partner or token endpoint on a public CA outside it now
+    fails. **Migration:** add that CA to the anchor, or leave `[tls].trust_anchor_mode` at `system`.
+    ([BACKLOG #1180](docs/BACKLOG.md), [#1660](docs/BACKLOG.md), [#1794](docs/BACKLOG.md))
+  - The 8 KiB limits on an outbound URL and header value are now checked at send time as well as at
+    build, and a header name over 256 characters is refused. A per-message header or token that
+    grows past them now fails the delivery; a `fhir_lookup` URL that does fails the Handler's
+    message.
+  - `messagefoundry codeset rename` validates the old name, so a code set whose file stem carries a
+    dot, such as `lab.results`, can no longer be renamed with it. **Migration:** rename the file by
+    hand.
+  - DR activation on SQLite refuses a seed that restored nothing: a config-only seed, which 0.3.2
+    activated, and a drill seeded from an empty primary. **Migration:** seed from a full backup of
+    a primary that holds data. ([BACKLOG #1717](docs/BACKLOG.md))
+- **BREAKING — the `[vault]` clients no longer follow HTTP redirects.** 0.3.2 let the Vault client
+  follow a redirect, carrying its token to the new location. A Vault address that answers with a
+  redirect, such as a standby node pointing at the active one, now fails. **Migration:** point the
+  `[vault]` address at the active node or at a load balancer that forwards rather than redirects.
+  ([BACKLOG #1042](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING — raising a session's authority now re-keys it: each of the five elevation steps
+  issues a fresh session token and retires the old one.** Re-authentication (`POST /me/reauth`),
+  MFA verification (`POST /auth/mfa-verify`), MFA enrolment (`POST /me/mfa/confirm`), and the web
+  console's passkey registration and passkey second-factor step each rotate the session (ASVS
+  7.2.4). So a token captured before the second factor is never elevated in place. The rotation keeps
+  the session's MFA state, and the old token stops resolving at once, with no grace window.
+  `/me/reauth` and `/auth/mfa-verify` now return `{"detail": ..., "token": ...}` where 0.3.2
+  returned `{"detail": ...}`. `/me/mfa/confirm` returns `token` beside `recovery_codes`. All three
+  responses are sent `Cache-Control: no-store`. The web console re-issues its own cookie. A rotation
+  also closes an open `/ws/stats` socket at its next check, and the console falls back to polling.
+  **Migration:** after any of those three calls succeeds, replace the stored bearer token with the
+  response's `token`. A client that keeps the old one gets `401` on its next call and must sign in
+  again. (BACKLOG #1146)
+- **BREAKING — the per-channel scope is deny-by-default: an account with no channel scope now
+  reaches no channel.** In 0.3.2 an empty (`NULL`) scope meant *all channels*, and every account was
+  created with one, so the per-channel checks narrowed nobody. An empty scope now denies. *All
+  channels* is a grant somebody types: the token `*`, stored as `["*"]`. Administrators still reach
+  every channel through their role. `PUT /users/{user_id}/channel-scope` still accepts
+  `{"channels": null}`, and it now means *no* channels, so a 0.3.2 client that sent `null` to grant
+  everything now revokes everything. **Who this bites:** every non-administrator account carried over
+  from 0.3.2. Its channel-scoped lists come back empty and its per-connection actions are refused.
+  **Migration:** grant each such account its connections, or `{"channels": ["*"]}` for all of them,
+  and change any client that sends `null` to send `["*"]`. (BACKLOG #1152)
+- **BREAKING — TOTP codes are now computed with HMAC-SHA-256 instead of SHA-1, so every
+  authenticator enrolled on 0.3.2 stops producing codes the engine accepts.** The engine stores no
+  per-user algorithm, so this is a cutover, not a migration. An enrolled user just sees
+  `invalid code`, with nothing else to say why. New enrolments advertise `algorithm=SHA256` in the
+  `otpauth://` URI. Some authenticator apps ignore that parameter and compute SHA-1 anyway, and
+  their codes never match. Recovery codes and passkeys from 0.3.2 still work. **Migration:** each
+  TOTP user enrols again, in an app that honours the `algorithm` parameter. The simplest route is
+  an administrator clearing the factor with `POST /users/{user_id}/reset-mfa`; an administrator
+  cannot reset their own. Otherwise the user signs in with a 0.3.2 recovery code, registers a
+  passkey, removes the TOTP factor (`DELETE /me/mfa` refuses to remove the last factor while MFA is
+  required) and enrols again. A sole administrator whose only factor is TOTP must take that route.
+- **BREAKING — a Windows (Kerberos) sign-in now starts MFA-pending, and a directory account may enrol
+  an engine second factor.** In 0.3.2 the Kerberos leg marked the session MFA-satisfied on the
+  directory's behalf, so an AD user never met the engine's MFA gate. The engine never receives that
+  assertion, so it no longer grants it. With `[security].require_mfa` on, which is the default, a
+  Kerberos session is held to the MFA-exempt routes until the user completes an engine factor, and
+  `POST /auth/negotiate` now reports `mfa_required: true` for it. **Migration:** each AD user enrols
+  TOTP or a passkey at their first 0.4.0 sign-in (enrolment is now open to directory accounts) and
+  completes it at each sign-in after that. (BACKLOG #1144)
+- **BREAKING — security notices now go to an engine-owned address that a directory sign-in does not
+  change.** In 0.3.2 one column was both the profile email and the address every out-of-band
+  security notice went to, and each AD or OIDC sign-in overwrote it with the directory's value. The
+  new `users.notify_email` column is seeded once from the account's email, at upgrade and at account
+  creation. After that, only an administrator's `PATCH /users/{user_id}` with a non-blank `email`
+  moves it. So after the upgrade a directory repoint no longer redirects notices, and clearing an
+  account's email no longer stops them. `UserSummary` gains a read-only `notify_email`.
+  **Migration:** when a directory account's address changes, also set it with `PATCH
+  /users/{user_id}`, and read `notify_email`, not `email`, to see where notices go.
+  ([BACKLOG #1139](docs/BACKLOG.md), [ADR 0182](docs/adr/0182-split-the-account-mirror-address-from-the-engine-owned-notification-address.md))
+- **BREAKING — under `enforce`, the engine refuses to start unless an enabled Administrator has a
+  notification address.** 0.3.2 checked only that an SMTP transport was configured, so notices about
+  the most privileged accounts could go nowhere. With `[auth].notify_security_events` and
+  `[alerts].security_notifications_required` on, both defaults, startup now fails if no enabled
+  Administrator has a `notify_email`. **Migration:** before upgrading, give at least one enabled
+  Administrator an email address (0.4.0 copies it into `notify_email` at upgrade), or set
+  `[alerts].security_notifications_required = false`. ([BACKLOG #1020](docs/BACKLOG.md))
+- **BREAKING — three sensitive actions now need a re-authentication bound to that one action.**
+  `DELETE /me/sessions` and `DELETE /me/sessions/{id}`, `POST /users/{user_id}/reset-password` and
+  `POST /users/{user_id}/reset-mfa` were satisfied in 0.3.2 by any recent step-up. Each now needs a
+  single-use grant. Without one the call answers `403` with an `X-Step-Up-Action` header naming the
+  action. `reset-mfa` on the caller's own account now answers `400`. **Migration:** before each call,
+  send `POST /me/reauth` with `purpose` set to that header's value (`session_terminate`,
+  `admin_reset_password` or `admin_reset_mfa`), and adopt the new token it returns. Another
+  Administrator resets your own MFA. ([BACKLOG #1148](docs/BACKLOG.md), [#1149](docs/BACKLOG.md))
+- **BREAKING — revocation checking reaches more hops, and the blanket attestation no longer waives
+  it under `enforce`.** In 0.3.2 the process-wide `MEFOR_TLS_REVOCATION_ATTESTED=1` let every verified
+  outbound TLS hop through the revocation refusal. Under `enforce` it now does not, and no
+  per-connection attestation can be written in config. So an off-loopback verified outbound hop
+  needs an in-engine CRL check. The syslog TLS forwarder, the SMART token hop and the remote
+  PostgreSQL store hop are now guarded too. An inbound MLLP, HTTP or DICOM listener that requires
+  client certificates (`tls` with `tls_ca_file`) and loads no CRL now refuses to start, on loopback
+  as well. **Migration:** set `[tls].crl_file` (a PEM with the CA and its CRL) for outbound hops,
+  `[logging].forward_tls_crl_file` for the syslog forwarder, `[store].ssl_crl_file` for PostgreSQL,
+  and `tls_crl_file=` on each mTLS listener; or run with `[security].enforcement = "warn"`.
+  ([BACKLOG #299](docs/BACKLOG.md), [#1005](docs/BACKLOG.md))
+- **BREAKING — SMTP connections now verify the server certificate.** 0.3.2 called `starttls()` with
+  no TLS context, which checks neither the certificate nor the host name. `Email()`, `SMTP()`,
+  `Direct()` and the alert and security-notice mailer now verify both by default (`tls_verify`,
+  `tls_check_hostname`, `[alerts].email_tls_verify`). A relay with a self-signed or private-CA
+  certificate, or one reached by an address its certificate does not name, now fails: deliveries
+  retry and dead-letter, and alert mail stops. Under `enforce`, `[alerts].email_use_tls = false` or
+  `email_tls_verify = false` now refuses to start. On any posture, alert and security-notice mail
+  with `email_use_tls = false` and an `email_username` now fails at send rather than sending the
+  password in cleartext.
+  SMTP login now offers only `PLAIN` and `LOGIN`, so a relay that accepts only `CRAM-MD5` refuses
+  it. **Migration:** point `tls_ca_file` (per connection), `[alerts].email_tls_ca_file` or
+  `[tls].internal_ca_file` at the relay's CA, and reach it by the name on its certificate. For alert
+  mail only, `[security].allow_unverified_alert_smtp_tls = true` is the audited opt-out.
+  (BACKLOG #323)
+- **BREAKING — `MEFOR_ALLOW_INSECURE_TLS` no longer lets a cleartext hop cross, and three more
+  cleartext or unverified hops are refused.** In 0.3.2 that variable let an off-box `http://` REST,
+  SOAP, FHIR, DICOMweb or `FhirLookup` hop, or a credential sent over one, cross with a warning when
+  enforcement was off. Only a per-connection `cleartext_accepted` with `cleartext_reason` does that
+  now ([ADR 0153](docs/adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)).
+  A plain-`http` SMART token endpoint is refused even under `enforce`. An off-loopback
+  generic-dialect `DatabasePoll` or database hop with no TLS refuses under `enforce`; an outbound
+  can declare `cleartext_accepted`, a `DatabasePoll` cannot. An LDAPS directory with
+  `ad_tls_verify = false`, which `MEFOR_ALLOW_INSECURE_TLS` let start in 0.3.2, no longer starts
+  under `enforce`. `[logging].forward_hop_attested = true` now needs `forward_hop_attested_reason`.
+  **Migration:** use TLS, or declare `cleartext_accepted = true` with a reason on each hop you accept;
+  give the directory a CA with `ad_tls_ca_cert_file`; add the reason.
+- **BREAKING — weaker algorithms and short keys are refused.** Each of these worked in 0.3.2:
+  - HTTP Digest now accepts only `SHA-256` and `SHA-512-256`. A challenge naming `MD5`, or naming
+    no algorithm (which means MD5), fails every send. (BACKLOG #1171)
+  - An RSA key under 2048 bits is refused for JWS and SMART signing, and for a `Direct()` S/MIME
+    key, the partner's `recipient_cert` and the `trust_anchor`. A `Direct()` EC key must be on
+    P-256, P-384 or P-521. (BACKLOG #1166)
+  - XML signature verification refuses SHA-224 and SHA3-224 digests. (BACKLOG #1171)
+  - A new passkey whose authenticator offers only RS256 cannot be registered; TPM-backed Windows
+    Hello is that group. Passkeys registered on 0.3.2 still work. (BACKLOG #1166)
+  - `[api].tls_ciphers` must now resolve only to suites on the approved list, so a string that
+    reaches a CBC suite, or `DHE-RSA-CHACHA20-POLY1305`, refuses at load. (BACKLOG #1317)
+  - The Vault key provider refuses a Transit key whose type is weaker than the floor, such as
+    `rsa-2048`. (BACKLOG #1166)
+  - SFTP now offers only SHA-2 ETM MACs with AES-CTR or AES-GCM; 0.3.2 passed no restriction, so
+    a server offering only older MACs or CBC ciphers now fails the handshake. (BACKLOG #1170)
+  **Migration:** the partner or key owner must offer the stronger option: SHA-256 Digest, a key of
+  2048 bits or more, an ES256 passkey on P-256 or an EdDSA passkey (or TOTP),
+  `tls_ciphers = "ECDHE+AESGCM:ECDHE+CHACHA20"`, an AES or RSA-3072 Transit key. There is no setting
+  that re-admits them.
+- **BREAKING — a new ES256 passkey must use the P-256 curve.** 0.3.2 also registered an ES256
+  passkey on P-384 or P-521. Registration now refuses one. This is not a strength rule: those keys
+  verify and are strong enough. It follows the pairing RFC 9053 recommends, SHA-256 with P-256
+  only, which is also how the WebAuthn specification describes ES256. A passkey already registered
+  on another curve still signs in. **Migration:** register an ES256 passkey on P-256 or an EdDSA
+  passkey, or use TOTP. ([BACKLOG #1166](docs/BACKLOG.md))
+- **BREAKING — directory sessions are now rechecked every 5 minutes by default.** In 0.3.2
+  `[auth].ad_session_recheck_seconds` defaulted to `0`, so a signed-in AD user's session was never
+  checked against the directory again. The default is now `300`: each pass looks the signed-in AD
+  users up in the directory (up to 200 per pass), and after two consecutive passes in which the
+  directory no longer returns an account, its sessions are revoked. **Migration:** set
+  `[auth].ad_session_recheck_seconds = 0` to turn it off, which is reported as a loosening.
+- **BREAKING — editing an AD group map signs out every AD session, the caller's included.** In 0.3.2 a
+  change to `PUT /ad-group-map` or `PUT /ad-group-scope-map` took effect at each AD user's next
+  sign-in. Both now revoke every live directory session at once, as the other authorization setters
+  already did. **Migration:** a script that edits a map as an AD user signs in again before its next
+  call. ([BACKLOG #1154](docs/BACKLOG.md))
+- **BREAKING — `DELETE /me/mfa` refuses to remove the last second factor while MFA is required.**
+  0.3.2 allowed it. It now answers `400`. **Migration:** enrol another factor first, or have another
+  administrator reset it. ([BACKLOG #1022](docs/BACKLOG.md))
+- **BREAKING — an unclaimed bootstrap administrator now expires under
+  `[auth].initial_password_expiry_hours` too.** 0.3.2 exempted it from that clock and left it to
+  `bootstrap_expiry_hours`, so `bootstrap_expiry_hours = 0` kept it alive indefinitely. It now also
+  dies 72 hours after it was issued, by default. **Migration:** claim the bootstrap account before
+  the upgrade, or set `[auth].initial_password_expiry_hours = 0`. (`messagefoundry provision-admin`
+  helps only on a fresh store: it refuses once an enabled Administrator exists.)
+  ([BACKLOG #1245](docs/BACKLOG.md))
+- **BREAKING — the OIDC id_token is checked more strictly.** A token whose `typ` header is present
+  and is not `JWT`, a token without `iat` or `sub`, and a token carrying an `events` claim are now
+  refused. `[auth].oidc_flow_ttl_seconds` must be between 30 and 1800. **Migration:** correct the
+  identity provider's token profile, and set the flow TTL inside that range.
 - **The web console's step-up actions would have refused an MFA-pending session without the audit
   row the console's other MFA refusals write.** `require_ui_step_up` and `require_ui_step_up_action` switched off
   `require_ui`'s second-factor gate to keep their `/ui/reauth?next=` continuation, then refused a
@@ -383,6 +912,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   custom role; that role would have exceeded its stated scope (HIPAA minimum-necessary) on first
   deployment. No built-in role reaches it — `ADMINISTRATOR` and `OPERATOR` grant both permissions —
   and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
+- **A dual-control release now re-checks the person who asked for it (ASVS 8.3.2).** A held
+  request can wait hours for its second approver, and the requester's authority can be withdrawn in
+  that time. `POST /approvals/{approval_id}/approve` now answers `409` when the requester's account
+  is gone or disabled, no longer holds the operation's permission (`messages:replay`,
+  `messages:purge` or `config:deploy`), or has left the channel scope the operation needs. The
+  refusal writes an `approval.stale_requester` audit row and raises the `approval_stale_requester`
+  alert. The request stays pending, so an approver can reject it. The check reads the engine's own
+  copy of the account, so a change made only in Active Directory counts once it reaches that copy.
+  ([BACKLOG #289](docs/BACKLOG.md))
+- **Three more admin writes now count against the per-account write limit (ASVS 2.4.2).**
+  `PATCH /logging/level`, `DELETE /search/presets/{preset_id}` and `POST /alerts/test-email` were
+  not rate-limited. They now share the budget the other paced admin writes draw on: past 12
+  writes a second from one account, each answers `429` with `Retry-After: 1`. A client that stays
+  under the limit sees no change. `[auth].admin_write_rate_limit_per_actor` and
+  `admin_write_rate_limit_window_seconds` set the limit, and `admin_write_rate_limit_enabled =
+  false` turns it off for every paced write. ([BACKLOG #287](docs/BACKLOG.md))
 
 ### Fixed
 - **The load harness's no-loss reconcile failed a run for being SLOW, and ejected pull requests from
@@ -427,9 +972,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   either genuinely absent rows or a short `engine_read` sample, which is the question
   `harness/load/connscale/intake_audit.py` exists to settle per message.
   ([BACKLOG #1866](docs/BACKLOG.md))
-- **`audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a clean chain
-  of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit` only asked
-  whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
+- **BREAKING — `audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a
+  clean chain of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit`
+  only asked whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite
+  database —
   what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind — so it
   walked past the guard, `open_store` migrated 372,736 bytes of schema **into the file that was
   meant to be the evidence**, and the command printed `OK: verified 0 audit row(s)` and exited 0. A
@@ -444,7 +990,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   no longer read an empty log as detected tamper. `audit-anchor` keeps exit 0 on a real store whose
   log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
   only the non-audit-database paths. ([BACKLOG #1669](docs/BACKLOG.md))
-- **`verify --smoke self` reported PASS on a synthetic message the config would have dropped.**
+- **BREAKING — `verify --smoke self` reported PASS on a synthetic message the config would have
+  dropped.**
   `smoke_self` failed only on `DryRunResult.error`, which `dry_run` sets for a parse failure, a
   strict-validation failure or a Router/Handler raise. `UNROUTED` (the Router selected no handler) and
   `FILTERED` (Handlers ran and sent nothing, including a sole destination that is
@@ -469,7 +1016,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   every shipped snippet body and asserts none teaches the removed form — a test that merely checked
   the JSON parses would not have caught it.
   ([ADR 0043](docs/adr/0043-fhir-read-lookup.md))
-- **A CR/LF inside an exception message could forge a whole log line on the text sink.**
+- **BREAKING — a CR/LF inside an exception message could forge a whole log line on the text sink.**
   `ControlCharScrubFilter` escaped only the rendered message, and `logging.Formatter` appends a record's
   traceback (`exc_text`) and stack dump (`stack_info`) **verbatim** — so a newline-bearing exception
   string landed at column 0 on its own physical line, where a payload padded to the record layout was
@@ -481,8 +1028,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   JSON sink is unchanged in substance (`json.dumps` already escaped these fields); its `exception`
   and `stack` values now carry the same indent.
 - **The DICOM C-STORE SCP's fail-closed refusal named a settings key that does not exist.** It told
-  the operator to set `[inbound].source_ip_allowlist`; `InboundSettings` has no such field and section
-  models ignore unknown keys, so an operator following the engine's **own error message** wrote a key
+  the operator to set `[inbound].source_ip_allowlist`; `InboundSettings` has no such field and, in
+  0.3.2, section models ignored unknown keys (they now refuse one, under the BREAKING unknown-key
+  entry in Changed), so an operator following the engine's **own error message** wrote a key
   into `messagefoundry.toml` that was accepted and silently discarded — leaving a non-loopback SCP
   with no peer-IP gate while believing it had one. Aggravated by the construction gate *counting*
   controls: a `calling_ae_allowlist` (a caller-asserted AE Title with no cryptographic binding) plus
@@ -492,31 +1040,34 @@ All notable changes to MessageFoundry are documented here. The format follows
   real, so a site running MLLP alongside DICOM cannot read it as licence to delete a working
   allowlist. The same wrong spelling is corrected in the module docstring, the gate comment,
   `config/wiring.py`, `config/settings.py`, `docs/SECURITY.md` and `docs/ASVS-L2-PHASE0-CHANGES.md`.
-  Whether an AE-title list alone should keep satisfying that gate is tracked as **BACKLOG #252** — it
-  is an ADR 0025 §9 contract change and is deliberately **not** decided here.
+  Whether an AE-title list alone should keep satisfying that gate was tracked as **BACKLOG #252** — it
+  is an ADR 0025 §9 contract change and was deliberately **not** decided in this fix. It has since been
+  decided: see the BREAKING DICOM C-STORE SCP entry under Changed (BACKLOG #316).
 - **Two startup gates described themselves against the deployment tier rather than the enforcement
   dial.** Comments on the managed-identity and security-notification gates read "refuse (production) /
   warn (non-production)" over branches that read `enforcing` — and `enforce` is the shipped default on
   `dev` and `staging` as much as on `prod`, so all three refuse. Comment-only, no behaviour change,
   but these are the comments two published documentation defects were copied from.
 - **The load harness's no-loss reconcile did not enforce the `read >= sent // 2` intake guarantee
-  0.3.2 documented.** The unconfirmed-send excusal is capped at `max(connections, half the run)`, but
+  0.3.2 documented.** The unconfirmed-send excusal was capped at `max(connections, half the run)`, but
   that `max()` takes the connection count as a *floor*, and every call site passes a connection count
   — so on a short, low-rate step (connscale-smoke's N=100 cell: ~105 sends, 100 connections) the count
   won the max() and the intake bound degraded to `read >= 5`, the very vacuity the cap exists to
   prevent. Nothing clamped the excusal to `sent` either, so `timeouts > sent` degraded it to
-  `read >= 0`. The half-the-run cap still decides the systemic no-ACK verdict (0.3.2's de-flake is
-  unchanged), and an **unconditional intake floor** the excusal cannot lower now enforces
-  `read >= sent // 2` in all three reconcile copies, at every call site. The estate copy also gained
-  the honest-reporting branch its two siblings had: it previously printed `read>=sent, …` on a
-  bounded-excused run whose read was demonstrably below `sent`, and its over-budget detail string now
-  matches theirs — a test pins the three in step, since nothing enforced the claim that they were.
-  *Known gap, unfixed:* the systemic no-ACK verdict is still gated on the same capped budget, so a
-  dead ACK path that nonetheless delivered everything still passes when `connections >= sent`; an
-  intake floor cannot catch a fault whose signature is a high read with no ACKs. Bounding that arm
-  needs its own change.
-- **`messagefoundry adr-analyze` exited 0 over an ADR directory that does not exist.** `Path.glob`
-  yields nothing and raises nothing for a missing directory, so a missing, non-directory, or
+  `read >= 0`. In the connscale and estate copies the run-fraction cap still decides the systemic
+  no-ACK verdict (it has since widened from half to three quarters of the run), and an
+  **unconditional intake floor** the excusal cannot lower enforces `read >= sent // 2` at every call
+  site. The load runner's copy had both as well, until the #1866 entry above retired them there. The
+  estate copy also gained the honest-reporting branch its two siblings had: it previously printed
+  `read>=sent, …` on a bounded-excused run whose read was demonstrably below `sent`, and its
+  over-budget detail string now matches connscale's — a test pins those two in step, since nothing
+  enforced the claim that they were.
+  *Known gap, unfixed in the connscale and estate copies:* their systemic no-ACK verdict is still gated
+  on the same capped budget, so a dead ACK path that nonetheless delivered everything still passes
+  when `connections >= sent`; an intake floor cannot catch a fault whose signature is a high read with
+  no ACKs. The load runner's copy now catches it on that signature, under the #1866 entry above.
+- **BREAKING — `messagefoundry adr-analyze` exited 0 over an ADR directory that does not exist.**
+  `Path.glob` yields nothing and raises nothing for a missing directory, so a missing, non-directory, or
   ADR-less `--adr-dir` produced zero reports and `AnalysisResult.ok = True` — the exact shape of a
   clean run. Withdrawing the ADRs would have silently turned a failing advisory check into a
   passing one. `AnalysisResult` now carries an `error` field, set to a line naming the directory
@@ -530,6 +1081,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   matched: both `Path.exists` and `Path.glob` swallow `OSError`, so a directory the process cannot
   read is indistinguishable here from one that is absent, and a message guessing between them would
   send an operator after the wrong cause.
+- **A passkey that could never sign in is now refused when it is registered.** A credential whose
+  curve was unknown, whose point was not on its curve, or whose key type did not match its algorithm
+  used to enrol and then fail at every sign-in. Registration now builds the key the way sign-in
+  does, and refuses it there. A malformed key at either step used to answer `500`; it now lands on
+  the audited invalid-input path. A passkey that can sign in is not affected.
+  ([BACKLOG #1166](docs/BACKLOG.md))
 
 ## [0.3.2] — 2026-07-28 — Early Access
 
@@ -1522,7 +2079,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.15...v0.3.0
