@@ -27,6 +27,8 @@ import logging
 import secrets
 import struct
 from collections.abc import Callable
+from decimal import Decimal
+from fractions import Fraction
 
 import pytest
 
@@ -518,12 +520,11 @@ def test_a_raw_library_failure_is_logged_by_type_and_a_library_refusal_is_not(
 
 # --- the pin compares CBOR integers, not values that merely equal one (BACKLOG #1953) ----------
 #
-# Python's ``bool`` is a subclass of ``int`` and ``1.0 == 1``, so a COSE key decoded with ``true`` or
-# ``1.0`` where an integer belongs compares equal to the identifier it imitates. The library indexes
-# the decoded CBOR by label and compares its values with ``==``, and the P-256 pin used ``int()``,
-# so every row below ENROLLED at engine ``5ccff7cb3``: a real key whose one defect is a stand-in
-# for an integer, as a parameter value or as the label that names it, or an array standing in for
-# the map, whose positions the library's indexing reads as labels.
+# In Python, ``True``, ``1.0``, ``Decimal(1)`` and ``Fraction(1)`` all equal the integer 1. The
+# library indexes the decoded CBOR by label and compares values with ``==``. The P-256 pin used
+# ``int()``. So every row below ENROLLED at engine ``5ccff7cb3``. Each is a real key with one
+# defect: a stand-in for an integer, as a value or as a label. Two other shapes enrolled too: an
+# array in place of the map, and an extra label that is not an integer or a text string.
 
 
 def _rekeyed(cose_key: bytes, label: int, stand_in: object) -> bytes:
@@ -543,45 +544,56 @@ def _as_array(cose_key: bytes, **changes: object) -> bytes:
     return encode_cbor(array)
 
 
-#: Every row reaches the shape check: each passed the library's own screens at ``5ccff7cb3``.
-_NON_INTEGER_COSE_KEYS: dict[str, Callable[[], bytes]] = {
-    "ES256 with crv true": lambda: _relabelled(_p256(), crv=True),
-    "ES256 with crv 1.0": lambda: _relabelled(_p256(), crv=1.0),
-    "ES256 with alg -7.0": lambda: _relabelled(_p256(), alg=-7.0),
-    "ES256 with kty 2.0": lambda: _relabelled(_p256(), kty=2.0),
-    "EdDSA with kty true": lambda: _relabelled(_eddsa(), kty=True),
-    "EdDSA with crv 6.0": lambda: _relabelled(_eddsa(), crv=6.0),
-    "EdDSA with alg -8.0": lambda: _relabelled(_eddsa(), alg=-8.0),
-    "ES256 with the kty label written true": lambda: _rekeyed(_p256(), 1, True),
-    "ES256 with the alg label written 3.0": lambda: _rekeyed(_p256(), 3, 3.0),
-    "ES256 with the crv label written -1.0": lambda: _rekeyed(_p256(), -1, -1.0),
-    "ES256 with the x label written -2.0": lambda: _rekeyed(_p256(), -2, -2.0),
-    "EdDSA with the kty label written true": lambda: _rekeyed(_eddsa(), 1, True),
-}
+_VALUE = "COSE key {} must be an integer"
+_LABEL = "COSE key label must be an integer or a text string"
+_MAP = "COSE key must be a map"
 
-#: The same keys with the map written as an array. Each also ENROLLED at ``5ccff7cb3``.
-_ARRAY_COSE_KEYS: dict[str, Callable[[], bytes]] = {
-    "ES256 as an array": lambda: _as_array(_p256()),
-    "ES256 as an array with crv true": lambda: _as_array(_p256(), crv=True),
-    "EdDSA as an array with kty true": lambda: _as_array(_eddsa(), kty=True),
+#: Each row with the start of the refusal it must meet, so it cannot pass on a different rule.
+_NON_INTEGER_COSE_KEYS: dict[str, tuple[Callable[[], bytes], str]] = {
+    "ES256 with crv true": (lambda: _relabelled(_p256(), crv=True), _VALUE.format("crv")),
+    "ES256 with crv 1.0": (lambda: _relabelled(_p256(), crv=1.0), _VALUE.format("crv")),
+    "ES256 with crv Decimal 1": (
+        lambda: _relabelled(_p256(), crv=Decimal(1)),
+        _VALUE.format("crv"),
+    ),
+    "ES256 with crv Fraction 1": (
+        lambda: _relabelled(_p256(), crv=Fraction(1)),
+        _VALUE.format("crv"),
+    ),
+    "ES256 with alg -7.0": (lambda: _relabelled(_p256(), alg=-7.0), _VALUE.format("alg")),
+    "ES256 with kty 2.0": (lambda: _relabelled(_p256(), kty=2.0), _VALUE.format("kty")),
+    "EdDSA with kty true": (lambda: _relabelled(_eddsa(), kty=True), _VALUE.format("kty")),
+    "EdDSA with crv 6.0": (lambda: _relabelled(_eddsa(), crv=6.0), _VALUE.format("crv")),
+    "EdDSA with alg -8.0": (lambda: _relabelled(_eddsa(), alg=-8.0), _VALUE.format("alg")),
+    "ES256 with the kty label written true": (lambda: _rekeyed(_p256(), 1, True), _LABEL),
+    "ES256 with the alg label written 3.0": (lambda: _rekeyed(_p256(), 3, 3.0), _LABEL),
+    "ES256 with the crv label written -1.0": (lambda: _rekeyed(_p256(), -1, -1.0), _LABEL),
+    "ES256 with the x label written Fraction -2": (
+        lambda: _rekeyed(_p256(), -2, Fraction(-2)),
+        _LABEL,
+    ),
+    "EdDSA with the kty label written true": (lambda: _rekeyed(_eddsa(), 1, True), _LABEL),
+    "ES256 with an extra byte-string label": (
+        lambda: encode_cbor({**parse_cbor(_p256()), b"k": 1}),
+        _LABEL,
+    ),
+    "ES256 as an array": (lambda: _as_array(_p256()), _MAP),
+    "ES256 as an array with crv true": (lambda: _as_array(_p256(), crv=True), _MAP),
+    "EdDSA as an array with kty true": (lambda: _as_array(_eddsa(), kty=True), _MAP),
 }
 
 
 @pytest.mark.parametrize(
-    ("build", "refusal"),
-    [(build, "COSE key ") for build in _NON_INTEGER_COSE_KEYS.values()]
-    + [(build, "COSE key must be a map") for build in _ARRAY_COSE_KEYS.values()],
-    ids=[*_NON_INTEGER_COSE_KEYS, *_ARRAY_COSE_KEYS],
+    ("build", "refusal"), _NON_INTEGER_COSE_KEYS.values(), ids=_NON_INTEGER_COSE_KEYS.keys()
 )
 def test_a_stand_in_for_a_cose_integer_is_refused_at_registration(
     build: Callable[[], bytes], refusal: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A deliberate refusal on the audited path, like the curve pin: no WARNING is logged.
 
-    The message pins WHICH check refused: the screen's all start ``COSE key``, and the shape pin's
-    starts ``COSE algorithm``, so a row cannot pass on the pin or on a broken fixture. An array
-    row must meet the map rule itself, not the label rule, which would also refuse its byte
-    strings when iterated as labels.
+    Each row names the refusal it must meet. So a row cannot pass on the shape pin, whose
+    message starts ``COSE algorithm``, or on a neighbouring rule after a fixture breaks. An array
+    row must meet the map rule itself: the label rule would also refuse its byte strings.
     """
     challenge = secrets.token_bytes(wa.CHALLENGE_BYTES)
     logger = "messagefoundry.auth.webauthn"
