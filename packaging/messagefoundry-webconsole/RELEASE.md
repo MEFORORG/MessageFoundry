@@ -96,12 +96,42 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 
 - [ ] Confirm the tag matches the PyPI version. (The tag == PyPI == mirror checker was retired
       with the publish machinery at the MEFORORG cutover; there is no mirror to compare against.)
-- [ ] `pip install "messagefoundry[webconsole]"` resolves the pair inside the compat range.
-- [ ] `serve_ui=true` boots end-to-end on the CLI/service path with the console installed, and the
-      engine still **boots + refuses `serve_ui` cleanly** with the console **absent** (return 2 /
-      `RuntimeError`, not a bare `ImportError`).
-- [ ] Confirm the seam handshake: an out-of-range pair fails at resolve (PEP 508) and at startup
-      (`UiSeamMismatch`).
+- [ ] Once steps 1 and 2 have landed and been published, confirm `pip install
+      "messagefoundry[webconsole]"` resolves the pair inside the compat range. Until then the
+      published engine has no `[webconsole]` extra, so this command installs the engine alone.
+      The published console declares a bare `messagefoundry` dependency, so it sets no range.
+
+The operator key is `[security].serve_web_console`. The loader refuses the old `[api].serve_ui`
+spelling. [`docs/WEBCONSOLE-PACKAGE.md` section 4](../../docs/WEBCONSOLE-PACKAGE.md) states what
+`serve` does when the console is absent. Run the next three checks in order, in a clean venv that
+holds wheels only. An editable checkout finds the console in the repository root even after you
+uninstall it, so the absent checks would pass for the wrong reason.
+
+- [ ] Install the console with an engine whose `ENGINE_UI_SEAM` the console supports. Leave
+      `serve_web_console` unset, and `serve` must boot on the CLI/service path and serve `/ui`. Bind
+      to loopback with no `tls_terminated_upstream` and no `web_console_public_address`, since
+      either one turns the default console off. Make sure no `MEFOR_` variable sets the console, in
+      the shell or in the service's environment. Keep this setup for the rest of this section.
+- [ ] Uninstall the console and run `serve` again. It must warn that the package
+      `'messagefoundry-webconsole' is not installed`, serve the JSON API only, and keep running.
+      That is the expected result, not a refusal.
+- [ ] Still without the console, set `serve_web_console = true` under `[security]` and run `serve`.
+      It must print `error: [security].serve_web_console=true needs the web console package` and
+      exit with code 2. **Without the explicit key you see only the warning, which proves nothing
+      about the refusal.**
+
+The two console-absent checks exercise the engine, not the console wheel. Run them against the
+engine you pair this release with.
+
+- [ ] Confirm the startup handshake. Reinstall the console, pair it with an engine whose
+      `ENGINE_UI_SEAM` is not in the console's `SUPPORTED_ENGINE_SEAMS`, and set
+      `serve_web_console = true`. Startup must fail with `UiSeamMismatch`, which `assert_engine_seam`
+      raises. Today no install-time metadata refuses a mismatched pair; this startup check is what
+      does. A pair far enough apart can fail earlier, with a bare `ImportError`, when one package
+      imports a name the other lacks.
+- [ ] Once steps 1 and 2 have landed and been published, confirm an out-of-range pair also fails at
+      resolve (PEP 508). Until then no published metadata declares a range, so nothing fails at
+      resolve.
 
 ---
 
