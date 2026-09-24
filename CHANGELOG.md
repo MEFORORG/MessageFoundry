@@ -6,6 +6,52 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`credential_expires_at` tells a client when an admin-issued temporary password stops working.**
+  `POST /auth/login` returns it in `LoginResponse` when `must_change_password` is set. `POST /users`
+  returns it in `UserSummary` for the account it creates. It is a Unix timestamp, read from the same
+  stored stamp the login gate checks. It is `null` in at least these cases: no change is owed, or
+  `[auth].initial_password_expiry_hours` is `0` or less. `GET /users` always returns `null` here.
+  That route needs only `users:read`, and a list of live temporary passwords is a target list. The
+  never-claimed bootstrap account also gets `null`, because `bootstrap-admin.txt` already states its
+  earlier deadline. The web console's create-user form now states how many hours the password
+  lasts. Its user page and forced change-password page state the time, and so does the IDE's
+  must-change warning. (`BACKLOG #1141`)
+- **`messagefoundry admin-set-notify-email` sets a missing notification address on an enabled
+  Administrator, from the host.** Under `enforce`, with `[auth].notify_security_events` and
+  `[alerts].security_notifications_required` on (both defaults), the engine refuses to start unless
+  an enabled Administrator has a notification address. `provision-admin` run without `--email`
+  left exactly that state. It then refused to run again, because an enabled Administrator existed.
+  The web console cannot be reached while the engine refuses to start. The new command takes
+  `--username` and `--email`, plus `--service-config`, `--db` and `--json`. It works on the store
+  directly, behind the same host gate as `admin-unlock`. Run it with the engine stopped. A running
+  engine could change the address between the command's check and its write, or hold the lock its
+  audit row needs. It only fills an absent address. It refuses at least a blank address, a
+  non-Administrator, a disabled account, and an account that already has an address. Change an
+  existing address from the web console, which notifies the old address. A second run with the same
+  address reports success and writes nothing. The command appends an `auth.admin_notify_email_set`
+  audit row before it writes the address, so the address never lands unaudited. If that write then
+  fails, it does not report success. The warning `provision-admin` prints for a missing `--email`
+  now names this command. (`BACKLOG #1136`)
+- **On SQL Server and PostgreSQL the engine's runtime login no longer runs schema DDL, and
+  `messagefoundry store provision-schema` does it instead.** New `[store].schema_management`
+  takes `auto` or `external`; **`external` is the server-DB default**, and SQLite is always
+  `auto`. Under `external`, `serve` reads the `schema_meta` marker and **refuses to start** when it
+  does not match this build, naming the database, the login's default schema, and the command. It runs
+  no schema DDL and, on SQL Server, no `ALTER DATABASE`, so a refused start leaves the database as it
+  found it. A clustered node's coordinator tables now ride the same batch. A DBA runs
+  `provision-schema` as a DDL-capable principal, with the engines stopped, before the first start and
+  before the first start of any upgrade whose schema moved. It needs no store key, a re-run on a
+  current schema is a no-op, and it exits 3 when `READ_COMMITTED_SNAPSHOT` is still off. On
+  PostgreSQL an external-mode start also refuses when the runtime role lacks row access to a store
+  object, instead of failing mid-pipeline. The runtime login then
+  needs row access only: `db_datareader` + `db_datawriter` on SQL Server, `USAGE` plus row grants on
+  PostgreSQL ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.1, §1.2, §2). The startup
+  privilege probe follows the mode: under `external` it names `db_ddladmin`, or `CREATE` on the store
+  schema, as excess. Set `schema_management = "auto"` to keep the engine building its own schema;
+  on a server DB that is reported by `security_loosenings()` as `schema_management`.
+  ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
+
 ### Changed
 - **BREAKING — the config loader refuses a connection name that does not match
   `^[A-Za-z][A-Za-z0-9_-]{0,255}$`.** In 0.4.0 such a name still loaded and ran, and only the API
@@ -29,6 +75,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
 ### Security
+- **An approval can no longer be granted faster than a person could read it.** A new setting,
+  `[approvals].min_dwell_seconds`, sets the youngest age at which a pending request may be
+  approved. It defaults to 2.0 seconds, which is provisional and derived from the keystroke-level
+  model; `docs/SECURITY.md` states the derivation. `ApprovalGate.approve()` refuses a younger
+  request with `409`, stating the remaining wait, and writes an `approval.too_early` audit row. The
+  request stays pending, and nothing retries it. The check sits inside `approve()`, so every release
+  path meets it. `0` means no floor. `[approvals].expiry_hours` now also refuses NaN, infinity and
+  overflow, and with dual control on, startup refuses a floor at or past the expiry. Dual control
+  (`[approvals].enabled`) still ships off. ([BACKLOG #287](docs/BACKLOG.md))
 - **BREAKING: the `Http()` inbound listener now refuses any `Transfer-Encoding`, not only
   `chunked`.** The listener decodes no transfer coding. In 0.4.0 it refused the header only when its
   whole value was `chunked`. A coding list such as `gzip, chunked` got through, and so did `chunked,`
@@ -54,42 +109,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   - any HTTP version other than 1.x.
 
   **A deploying sender relying on any of these would be refused.** ([BACKLOG #1125](docs/BACKLOG.md))
-- **OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
-  `[auth].oidc_max_age_seconds`, is sent as `max_age` on every authorization request. It defaults
-  to 43200 seconds (12 hours), accepts 300 to 86400, and has no off switch. The engine now requires
-  the `auth_time` claim and refuses a sign-in whose `auth_time` is missing (`auth_time_missing`) or
-  older than `max_age` (`auth_time_stale`). The session ends at the earliest of `auth_time + max_age`,
-  the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
-  `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
-  Federation still ships off (`oidc_enabled = false`). ([BACKLOG #296](docs/BACKLOG.md))
-### Added
-- **On SQL Server and PostgreSQL the engine's runtime login no longer runs schema DDL, and
-  `messagefoundry store provision-schema` does it instead.** New `[store].schema_management`
-  takes `auto` or `external`; **`external` is the server-DB default**, and SQLite is always
-  `auto`. Under `external`, `serve` reads the `schema_meta` marker and **refuses to start** when it
-  does not match this build, naming the database, the login's default schema, and the command. It runs
-  no schema DDL and, on SQL Server, no `ALTER DATABASE`, so a refused start leaves the database as it
-  found it. A clustered node's coordinator tables now ride the same batch. A DBA runs
-  `provision-schema` as a DDL-capable principal, with the engines stopped, before the first start and
-  before the first start of any upgrade whose schema moved. It needs no store key, a re-run on a
-  current schema is a no-op, and it exits 3 when `READ_COMMITTED_SNAPSHOT` is still off. On
-  PostgreSQL an external-mode start also refuses when the runtime role lacks row access to a store
-  object, instead of failing mid-pipeline. The runtime login then
-  needs row access only: `db_datareader` + `db_datawriter` on SQL Server, `USAGE` plus row grants on
-  PostgreSQL ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.1, §1.2, §2). The startup
-  privilege probe follows the mode: under `external` it names `db_ddladmin`, or `CREATE` on the store
-  schema, as excess. Set `schema_management = "auto"` to keep the engine building its own schema;
-  on a server DB that is reported by `security_loosenings()` as `schema_management`.
-  ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
   `provision-admin` fails for the same reason, where the deadline is, and that changing
   `password_check_breached` needs a restart (BACKLOG #1886).
-- **The OIDC token endpoint and JWKS legs now carry the posture-keyed revocation guard (BACKLOG
-  #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
-  off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
-  deployment.
 - **BREAKING — an HTTP-family reply with ambiguous length framing now fails before its body is
   read.** 0.4.0 let `http.client` pick one reading, which could hand back raw chunk framing or the
   shorter of two lengths as the partner's answer. Refused now, under RFC 9112 section 6, at least:
@@ -149,15 +173,99 @@ All notable changes to MessageFoundry are documented here. The format follows
   owner refused at every passkey sign-in; a passkey-only user would stay refused until an admin
   runs `admin_reset_mfa`.** **Migration:** register an ES256 passkey on P-256 or an EdDSA
   passkey, or use TOTP. ([BACKLOG #1166](docs/BACKLOG.md))
+- **BREAKING: the Windows trust-anchor ACL check no longer reads what it cannot parse as
+  owner-only, and it knows more broad principals.** This is the ACL check on
+  `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and `[api].tls_client_ca_file`, run
+  at startup and on a config deploy that re-checks the anchors. 0.4.0 passed an anchor whose
+  `icacls` output was empty or was not `icacls` output. It also passed a write grant to a bare
+  name it did not know, such as the German `Jeder` for Everyone, and a line-1 write grant it could
+  not split from the echoed path. Those now read as indeterminate. The engine logs a warning,
+  writes a new `acl_indeterminate` row under the `auth.trust_anchor` audit action, and still
+  starts, under `enforce` as under `warn`. 0.4.0 wrote no row for an ACL it could not read.
+  Under the default `[security].enforcement = enforce`, the check now refuses a write or DELETE
+  grant to broad principals 0.4.0 missed. They include at least `NT AUTHORITY\INTERACTIVE`,
+  `SERVICE`, `BATCH`, `NETWORK`, `ANONYMOUS LOGON` and `Local account`, `Guests`, `Domain
+  Guests`, a bare `Users`, and an unresolved Domain Users or Domain Guests SID
+  (`S-1-5-21-...-513` or `-514`). A DELETE-only grant to any broad principal now refuses too. A
+  file created under `C:\Users\Public` inherits modify rights for `INTERACTIVE`, `SERVICE` and
+  `BATCH`, so such an anchor started under 0.4.0 and now refuses. At `warn` it starts with an
+  `acl_insecure` row. Two cases 0.4.0 refused now pass. Names match whole, so an account such as
+  `DESKTOP-A\usersync` no longer reads as `BUILTIN\Users`. A non-ASCII anchor path is now decoded
+  in the OEM code page and matched to its echo, so its own characters no longer read as a
+  principal. **Migration:** before you upgrade, run `icacls <anchor>` and look for write grants
+  to those principals. Copy an anchor out of `C:\Users\Public` into a folder that grants them no
+  write, rather than moving it: a move keeps the inherited grants. Or run `icacls <anchor> /reset`
+  after the move.
+  ([BACKLOG #1142](docs/BACKLOG.md))
 ### Changed
-- **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
-  cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
-  to the largest `max_message_bytes` any inbound in the graph sets. The file's size is checked
-  before it is read, so an oversized fixture is never read whole. A fixture over the cap that
-  0.4.0 read would now fail the run. [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) also carries a
-  code-derived ASVS 5.1.1 file-surface inventory, with upload and download tables and stated
-  exclusions, and a test fails when the code and the tables drift apart.
-  ([BACKLOG #1127](docs/BACKLOG.md))
+- **BREAKING — the web console engine UI seam moved, so this engine no longer pairs with web
+  console 0.3.0.** Engine 0.4.0 shipped `75c4117d21fd0b98`. The seam moved because the console now
+  imports three deadline helpers from `messagefoundry.api.security`, and `UserSummary` gained
+  `credential_expires_at` (under Added). A console accepts exactly one seam. The web console 0.3.0
+  release, tagged `webconsole-v0.3.0` beside engine 0.4.0, accepts only `75c4117d21fd0b98`. So
+  with the console on, this engine refuses to start with that release installed
+  (`UiSeamMismatch`). The version number alone does not tell a matching console apart, so check
+  the constant. This entry does not quote the new value, because it can move again before the
+  release. **Migration:** upgrade the web console together with the engine, to a release whose
+  `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS` holds this engine's
+  `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. Or set `[security].serve_web_console = false` to
+  run the JSON API alone. (`BACKLOG #1141`)
+- **BREAKING — the `403` for a session that must change its password is no longer always the exact
+  string `password change required`.** When the engine can state the temporary password's
+  deadline, the detail now reads `password change required; the temporary password stops working at
+  <time>`. The time is UTC ISO 8601, for example `2026-09-27T14:00:00Z`. The never-claimed
+  bootstrap account still gets the bare string. The old text stays as the prefix, so a client that
+  matches it as a substring still works. **Migration:** a client that compares the whole `detail`
+  string must match on the prefix `password change required` instead. (`BACKLOG #1141`)
+- **BREAKING — `/ws/stats` refusals now carry an HTTP status that says why.** Engine 0.4.0 answered
+  every refused handshake with an empty `403`. On a server that offers the ASGI
+  `websocket.http.response` extension, as uvicorn does, the answers now differ. An unauthenticated
+  or forbidden handshake gets `403` with a JSON `detail`. An unavailable engine, or too many open
+  monitor sockets, gets `503`. Without the extension the route still sends the bare close it sent
+  before. **Migration:** a client that reads the handshake status should treat `503` as "try again
+  later", not as a sign-in failure. (`BACKLOG #1120`)
+- **BREAKING — `EngineClient()` and the Windows tray now default to `https://127.0.0.1:8765`, and
+  the tray pins the certificate a stock engine mints.** Engine 0.4.0 serves https by default. Yet
+  `EngineClient()` still aimed at `http://127.0.0.1:8765`, which a stock engine does not answer.
+  So did the tray, unless its service entry named both `--host` and `--port`. A tray that took its
+  address from the service entry already chose https. It then reported the engine down, because
+  no trust store holds the minted certificate. (`BACKLOG #1276`)
+  - `messagefoundry.apiclient.EngineClient` now defaults `base_url` to https. Its trust is
+    unchanged. Without `cacert=`, it verifies against the OS trust store, so a stock engine's
+    certificate fails verification. The client never turns verification off.
+  - The tray's `DEFAULT_ENGINE_URL` is now https. `messagefoundry.tray.config.compose_config()` now
+    defaults `engine_tls` to `True`, because an engine on its own defaults mints a pair.
+  - When the engine mints its own pair, the tray now finds `api-generated-cert.pem` through the
+    service entry and pins it as its only trust anchor. It looks beside `--db`, else
+    `[store].path`, else `messagefoundry.db` under the service's `AppDirectory`. It finds nothing
+    in at least these cases: a relative store path with no `AppDirectory` to sit under, or one
+    under `--project-root` or `[environments].base_dir`. It can also name the wrong file, for
+    example when `MEFOR_STORE_PATH` in the service's environment moves the store.
+    `messagefoundry.tray.poller.StatusPoller` applies the pin unless the caller passes its own
+    `client_factory`. A tray started before the engine's first run picks the file up once it
+    loads, with no restart.
+  - A new `tray.toml` key, `engine_cacert`, names the file to pin. It must be an absolute path; a
+    relative one is ignored. An explicit `engine_url` drops the file the tray found. A pin that
+    will not load falls back to the OS trust store, never to no verification.
+  - **Migration:** to reach a stock engine, give `EngineClient` a `cacert=` that names
+    `api-generated-cert.pem`. For an engine behind `[api].tls_terminated_upstream`, which speaks
+    plain http, pass `base_url="http://127.0.0.1:8765"`. A tray that does not take its address
+    from the service entry now tries https. Set `engine_url` in `tray.toml` to reach a plain-http
+    engine. Set `engine_cacert` wherever the tray cannot find a stock engine's certificate on its
+    own, as with no service entry or in the cases above. The tray must also be able to read that
+    file; the entry under Security covers that. The standalone test harness is not part of this
+    change, and its default engine URL is still `http://127.0.0.1:8765`.
+- **BREAKING — `messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture
+  file.** The cap is 16 MiB (`MAX_FIXTURE_FILE_BYTES`, the engine's default per-message ceiling). It
+  rises to the largest `max_message_bytes` that any inbound in the graph sets, and no other setting
+  moves it. The cap applies to the whole file, not to each message in it. The file's size is
+  checked before it is read, so an oversized fixture is never read whole. A fixture over the cap
+  that 0.4.0 read would now fail the run. `dryrun` exits with an error naming the file, and `check`
+  fails its `dryrun` gate. `docs/CONNECTIONS.md` also carries an ASVS 5.1.1 file-surface inventory,
+  with upload and download tables and stated exclusions. A test fails when a row that follows the
+  code drifts from it. The doc names the parts kept by hand, and the test does not check those for
+  gaps. **Migration:** split a fixture file over the cap into smaller files.
+  (`BACKLOG #1127`)
 - **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
   `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
   that topology the engine mints no certificate (ADR 0172 decision 3). So the
@@ -172,13 +280,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   `[api].plaintext_upstream_hop_acknowledged = true`. 0.4.0 refuses the key as unrecognized, so do
   not add it first. Or set `[api].tls_cert_file` and `[api].tls_key_file` so the engine serves that
   hop over TLS. The proxy must then speak https to the engine and trust that certificate, or every
-  request through it fails. ([BACKLOG #1179](docs/BACKLOG.md))
-- **The DIRECT S/MIME connector now encrypts message content with AES-256-CBC.** The library default
-  it used before was AES-128-CBC. Every DIRECT message's content cipher changes on the wire; nothing
-  else about the envelope does. **A deploying site whose partner stack cannot decrypt AES-256-CBC
-  would see that partner fail to open the message after its relay has already accepted it**, so the
-  failure would surface on the partner's side, not as a send error here.
-  ([BACKLOG #1168](docs/BACKLOG.md))
+  request through it fails. (`BACKLOG #1179`)
+- **BREAKING — the password-policy refusal for a context word now names the list it checks.**
+  Engine 0.4.0 said `not contain application or vendor terms`. The clause now reads `not contain a
+  word from the context-word deny-list`. It appears in at least the `400` detail from `POST /users`
+  and `POST /me/password`, after `password must`, and in the refusal from
+  `messagefoundry provision-admin`. The status code is unchanged. The list is unchanged too, so the
+  same passwords are refused. The old wording mis-described it, since the list also holds generic
+  default-credential words such as `admin` and `password`. `docs/SECURITY.md` already published the
+  list in full, and a new test holds it equal to `CONTEXT_WORDS`. **Migration:** a client that
+  matches the old clause in the `detail` must match the new one. (`BACKLOG #1135`, `#1132`)
 - **BREAKING — an operator resend now meets the target inbound's ingress guards.** `POST
   /uploads/{file_id}/resend` and `POST /messages/{message_id}/edit-resend` wrote the stage row
   directly, so the inbound's size ceiling and declared-type checks never ran on them. An uploaded file
@@ -210,16 +321,116 @@ All notable changes to MessageFoundry are documented here. The format follows
   returns, and retry. The JSON API has no passkey leg, so a passkey-only account proves its factor on
   the web console.
   ([BACKLOG #1954](docs/BACKLOG.md))
-- **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
-  as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
-  a non-blank value without the marker is a stripped marker or a planted row. The cipher raises
-  `CipherError` on it. A purged `''` is never refused. The sweep that runs at each keyed open now
-  seals legacy plaintext only on a surface that holds no sealed value yet; on any other surface it
-  leaves the unmarked value in place and reports it. Each refusal raises an `integrity_drift` alert
-  under the subject `store-cipher`, naming the table and column but never the row or the value.
-  **A planted `state` or `reference` value would stop the engine from starting**, because both
-  caches load at open. The opt-out, `[store].allow_unmarked_ciphertext`, ships off and is reported
-  as a loosening when on. ([BACKLOG #1169](docs/BACKLOG.md))
+
+### Security
+- **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
+  `[auth].oidc_max_age_seconds`, is sent as `max_age` on every authorization request. It defaults
+  to 43200 seconds (12 hours), accepts 300 to 86400, and has no off switch. The engine now requires
+  the `auth_time` claim and refuses a sign-in whose `auth_time` is missing (`auth_time_missing`) or
+  older than `max_age` (`auth_time_stale`). The session ends at the earliest of `auth_time + max_age`,
+  the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
+  `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
+  Federation still ships off (`oidc_enabled = false`). `exp`, `iat`, `nbf` and `auth_time` must now
+  be finite numbers (`claim_not_numeric`). An `auth_time` further ahead than the clock skew is
+  refused (`issued_in_future`). With `[auth].oidc_prompt = "none"`, the IdP may answer
+  `login_required` once its own sign-in is older than `max_age`. The user then signs in at the IdP
+  directly. `messagefoundry verify --section federation` gains a MANUAL `fed.max_age` row. Its token
+  replay now fails an unexpired `id_token` with no `auth_time`. It skips one whose `auth_time` has
+  aged past `max_age`. **Migration:** with OIDC on, confirm that the IdP returns `auth_time` when
+  the request carries `max_age`, as OpenID Connect Core requires. No setting turns the check off.
+  (`BACKLOG #296`)
+- **BREAKING — the OIDC token endpoint and JWKS legs now carry the posture-keyed revocation
+  guard.** Engine 0.4.0 checked revocation on these legs only when `[auth].oidc_tls_crl_file` was
+  set, and started without it. Each leg is guarded on its own host, so an off-box JWKS host is
+  guarded even when the token endpoint is on loopback. With OIDC on and
+  `[security].enforcement = "enforce"`, the default, an off-box identity provider with no
+  `[auth].oidc_tls_crl_file` now stops `serve`. The refusal comes when the API is built, after the
+  engine has started its listeners and workers. Neither `messagefoundry check` nor
+  `messagefoundry verify` reports it ahead of time. ADR 0173 section 4.3 called for this guard,
+  and ADR 0173 AC-4 records these limits. **Migration:** with OIDC on, set
+  `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the token and
+  JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file becomes a
+  trusted root for this hop. `[security].enforcement = "warn"` also lets `serve` start, but it
+  turns every enforce-only refusal in the instance into a warning, not this one alone.
+  (`BACKLOG #1887`)
+- **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine
+  0.4.0 set no content cipher, so the `cryptography` library chose its default, AES-128-CBC. The
+  mode is still CBC, and the content key is still wrapped with RSAES-PKCS1-v1_5. Signing is
+  unchanged. With a 2048-bit RSA recipient key, the message as a whole stays near 112 bits of
+  strength. A partner whose S/MIME stack cannot decrypt AES-256-CBC cannot read these messages.
+  The engine cannot see that failure. The SMTP relay accepts each message before the partner tries
+  to decrypt it, so the engine records a successful delivery. **Migration:** before upgrading,
+  confirm that each Direct partner's health information service provider decrypts AES-256-CBC. RFC 5751 requires S/MIME agents to
+  support AES-128-CBC (MUST) and only recommends AES-256-CBC (SHOULD+). No setting restores
+  AES-128-CBC. (`BACKLOG #1168`)
+- **BREAKING — the inbound `Http()` listener now settles a request's framing before it reads the
+  body, and refuses framing it would have to guess at.** When a front proxy and the engine disagree
+  about where a request ends, a request can be smuggled past the proxy (ASVS 4.2.1). Each refusal
+  writes a `framing_error` connection event and no ingress row. No setting re-admits the old
+  shapes. (`BACKLOG #1125`)
+  - A `POST`, `PUT` or `PATCH` with no `Content-Length` now gets `411`. Engine 0.4.0 read it to the
+    end of the connection and ingested it.
+  - Any `Transfer-Encoding` now gets `400`, on every method. Engine 0.4.0 already refused one sent
+    beside a `Content-Length`, or sent twice. Otherwise it refused only `chunked`, in any letter
+    case, and never on `GET` or `HEAD`. So a lone `gzip, chunked` on a `POST` got through.
+  - A `GET` or `HEAD` that declares a non-zero body now gets `400`, where engine 0.4.0 answered
+    `200`. Any other method outside `POST`, `PUT` and `PATCH` that declares a body gets `400` too.
+    `Content-Length: 0` is still accepted.
+  - Methods are now case-sensitive. A lowercase `post` is no longer ingested, and a lowercase `get`
+    or `head` is no longer answered as a health probe.
+  - At least these also get `400`:
+    - a `Content-Length` with a leading `+`, an underscore or more than 18 significant digits;
+    - whitespace before a header colon, or a folded header line;
+    - a bare CR or LF in the head, or a control character in a header value;
+    - a method or header name that is not a token;
+    - an HTTP version other than 1.x.
+  - **Migration:** a sending partner puts a `Content-Length` on every `POST`, `PUT` or `PATCH`,
+    sends no `Transfer-Encoding`, and writes the method in capitals. A health checker sends `GET`
+    or `HEAD` in capitals, with no body.
+- **BREAKING — an MFA-pending session on an account that has a second factor can no longer end
+  sessions through the `/me/sessions` routes.** `DELETE /me/sessions` and
+  `DELETE /me/sessions/{session_id}` skip the MFA gate, so an account with no factor can still end
+  its own sessions. In 0.4.0 that also let a caller holding
+  only the password sign out a user who has a factor. Now, for an account with a TOTP factor or a
+  passkey, a pending session gets `403` with `X-MFA-Required: 1` from both routes. `POST /me/reauth`
+  with `purpose` `session_terminate` still answers `200` and returns a new token, but it mints no
+  grant. `POST /me/mfa/enroll` and `POST /me/mfa/confirm` already refused this case in 0.4.0. They
+  now answer with `X-MFA-Required` instead of `X-Step-Up-Required` and `X-Step-Up-Action`. Each
+  refusal on those four routes writes an `auth.mfa_denied` audit row. Every `auth.reauth` audit row
+  now carries a `grant_refused` field. An account with no factor is unaffected. The web console
+  applies the same rule and sends the browser to `/ui/reauth`, which asks for the second factor
+  as well as the password. `POST /me/password` still revokes every session from a pending session;
+  this change does not cover it. **Migration:** on a `403` with `X-MFA-Required` from those four routes, prove the
+  existing factor on that same session first. A JSON client sends a TOTP or recovery code to
+  `POST /auth/mfa-verify` and adopts the `token` it returns. Then it sends `POST /me/reauth` with
+  the route's `purpose` (`session_terminate`, `mfa_enroll` or `mfa_confirm`), adopts that `token`,
+  and retries. The JSON API has no passkey step, so a passkey-only account ends its sessions from the
+  web console, where `/ui/reauth` asks for the passkey. (`BACKLOG #1951`)
+- **BREAKING — a keyed store now refuses an unmarked value in an encrypted column, where 0.4.0
+  read it back as plaintext.** Once a store key is set, only the keyed writer writes a covered
+  column. So a non-blank value there without the `mfenc:` marker is a stripped marker or a planted
+  row. The cipher raises `CipherError` on it. A purged `''` is never refused. The sweep at each
+  keyed open still seals legacy plaintext, but only on a surface that holds no sealed value yet. On
+  a surface that already holds one, it leaves the unmarked value in place and reports it. Under
+  `serve`, each refusal raises an `integrity_drift` alert under the subject `store-cipher`. The
+  alert names the table and column, never the row or the value. A CLI command that opens the store
+  only logs the refusal. **An unmarked `state` or `reference` value on a sealed surface would stop
+  the engine from starting**, because both caches load at open. The opt-out,
+  `[store].allow_unmarked_ciphertext`, ships off and is reported as a loosening when on.
+  (`BACKLOG #1169`)
+  - At least these gaps remain. The Direct S/MIME enveloped body is not covered. A surface with
+    no ciphertext yet at a keyed open counts as unsealed, so a row planted there is sealed as if it
+    were real.
+  - Uploaded files follow their own rule, in the separate BREAKING entry on plaintext uploaded
+    files. `docs/PHI.md` section 3 lists that rule's limits.
+  - A store keyed under 0.4.0 can hold legitimate unmarked values in at least two cases. One is a
+    first keyed open that stopped part-way through its sweep, which 0.4.0 committed in batches.
+    The other is a value made only of spaces on SQL Server, which 0.4.0's sweep skipped. The new
+    code refuses both.
+  - **Migration:** the engine names each column where it finds unmarked values beside sealed ones.
+    If you know those values are legitimate, start it once with
+    `[store].allow_unmarked_ciphertext = true`. That open seals them. Then set the setting back
+    to `false`.
 - **BREAKING: a keyed store now refuses a plaintext uploaded file on read until an operator runs
   `rotate-key`, which seals it.** This follows an owner ruling of 2026-09-23. An upload stored
   before the key was enabled has no `mfenc:` marker, and neither does a file planted in
@@ -239,6 +450,73 @@ All notable changes to MessageFoundry are documented here. The format follows
   does not need a new one. The command seals every plaintext upload, and until it runs they stay
   refused, as above. The startup WARNING says how many are waiting. Uploads written while the key was
   already set are sealed at write and need no step. ([BACKLOG #1169](docs/BACKLOG.md))
+- **A lockout, and a sign-in that succeeds after failures, now write their own audit rows, so they
+  reach the user's security-events feed.** Engine 0.4.0 wrote no row of its own for either event.
+  Each lived only in the out-of-band notice, so no account saw either event in
+  `GET /me/security-events`. An account with no notification address, or on an engine with no
+  mail relay, got no notice of it at all. Two new audit actions carry them. `auth.account_locked` is written when a wrong password, or a
+  wrong TOTP or recovery code, crosses the lockout threshold. `auth.login_after_failures` is written
+  when a local password sign-in succeeds after three or more failures. Each row names the account
+  as its actor and carries no more detail than the attempt's own row. The failure count stays in
+  the notice. (`BACKLOG #1138`)
+- **Refused WebSocket handshakes now carry the baseline security headers, and some responses
+  uvicorn writes on its own gain two of them.** A WebSocket handshake gets an HTTP answer, but the
+  header floor used to pass every WebSocket through untouched. It now adds to the `101` on accept
+  the same baseline every HTTP response gets. That includes at least
+  `X-Content-Type-Options: nosniff` and `frame-ancestors 'none'`, plus HSTS where HSTS applies. On
+  a server that offers the ASGI `websocket.http.response` extension, as uvicorn does, it adds them
+  to every refusal before accept as well. There, a WebSocket refused by
+  `[security].allowed_client_networks` gets the same `403` body an HTTP request gets. Under
+  `messagefoundry serve`, a new module, `messagefoundry/api/protocol_headers.py`, adds only
+  `nosniff` and `frame-ancestors 'none'` to responses uvicorn writes below the app. It never adds
+  HSTS. It covers at least uvicorn's `400` for a request it cannot parse, and its `500` when the
+  app fails without starting a response. It also covers uvicorn's WebSocket `500` and the legacy
+  websockets server's own handshake answers. Each step it adds fails open. On an error it logs a
+  WARNING, once per response family and step, and leaves uvicorn's own response as it was. Those
+  steps rely on uvicorn and websockets internals, measured at uvicorn 0.49.0 and websockets 16.0,
+  the versions `requirements.lock` pins. `pyproject.toml` admits other versions, and on one of
+  them a step may fail open and leave its headers off. (`BACKLOG #1120`)
+- **Passkey registration now requires real CBOR integers where the COSE key needs them.** Engine
+  0.4.0's P-256 pin for ES256 let `true`, `1.0` and some other non-integer CBOR values stand in for
+  an integer. So an ES256 key whose curve read `true` or `1.0` could enrol past the pin.
+  Registration now refuses a key whose `kty` or `alg` is not an integer, or, for an OKP or EC2 key,
+  whose `crv` is not one. It also refuses a label that is neither an integer nor a text string (RFC
+  9052 section 7), and a key sent as a CBOR array. Each refusal is audited as
+  `auth.webauthn_failed`. Passkeys already registered are not re-checked. (`BACKLOG #1953`)
+- **On Windows, the engine now lets local users read the API certificate it mints, and never the
+  key.** When it mints its self-signed pair, it grants `BUILTIN\Users` read on
+  `api-generated-cert.pem` alone. `scripts\service\install-service.ps1` locks the data directory
+  to SYSTEM, Administrators and the service account. The tray runs as the signed-in user, so on
+  such a host it may not be able to read the file it pins (under Changed). The certificate is
+  public, since every TLS client receives it in the handshake. The key stays readable only by its
+  owner. The grant adds one entry for this one file and leaves the directory as it was. It is
+  best-effort: a failure is logged, and the engine still starts. **Migration:** the engine reuses
+  a pair it already has, and engine 0.4.0 minted its pairs without the grant. On such a host,
+  grant local users read on `api-generated-cert.pem` alone, never the key. Or delete both
+  generated files so the engine mints a new pair. Then restart the tray, which does not reload a
+  pin that already loaded, and re-pin every other client that pinned the old certificate.
+  (`BACKLOG #1276`)
+- **The DICOM deflate guard now bounds exactly the bytes `dcmread` inflates, and fails closed.**
+  Engine 0.4.0's guard found the deflated Data Set with its own walk of the file meta. It let
+  through any header it could not follow, and pydicom reads headers more leniently. So a crafted
+  Deflated Explicit VR Little Endian object could pass the guard and then inflate without bound in
+  `dcmread`. That path runs through `DicomPeek.parse`, `DicomDataset.parse` and the outbound
+  C-STORE SCU. (`BACKLOG #1926`)
+  - The guard now replays pydicom's own header readers, the ones `dcmread` runs just before it
+    inflates, and bounds that stream. That covers at least a missing or wrong group length, a
+    second transfer-syntax element, a forced read with no preamble, and a command set before the
+    Data Set.
+  - A header pydicom cannot read is refused the way `dcmread`'s own failure would be. A pydicom
+    that lacks one of the replayed readers makes DICOM parsing fail with an error naming it, rather
+    than parse unguarded.
+  - The bounded inflate now stops at the end of the deflate stream. In 0.4.0 it looped without end
+    on some Data Sets. Such a Data Set inflated past 64 KiB but not past the cap, and had any byte
+    after the stream's end. pydicom and pynetdicom pad an odd-length deflated Data Set with one NUL
+    byte, so an ordinary object could hit it. The inbound C-STORE SCP ran the same loop.
+  - The `[dicom]` extra now requires `pydicom>=3.0.2,<3.1`, where 0.4.0 allowed `<4`. The guard
+    replays private pydicom readers, and its agreement test covers only the locked release, 3.0.2.
+    No pydicom 3.1 or later had been published when this changed, so the cap rules out no release
+    a 0.4.0 `[dicom]` install could have picked.
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

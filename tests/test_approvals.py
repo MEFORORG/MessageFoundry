@@ -37,7 +37,11 @@ from messagefoundry.store import OutboxStatus
 
 PW = "a-strong-test-passphrase"
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
-ON = ApprovalsSettings(enabled=True, operations=["dead_letter_replay", "connection_purge"])
+# min_dwell_seconds=0: these tests request and release within milliseconds, which the shipped 2.0 s
+# floor (ASVS 2.4.2) would refuse. The floor has its own suite, tests/test_approval_min_dwell.py.
+ON = ApprovalsSettings(
+    enabled=True, operations=["dead_letter_replay", "connection_purge"], min_dwell_seconds=0.0
+)
 OFF = ApprovalsSettings(enabled=False)
 
 

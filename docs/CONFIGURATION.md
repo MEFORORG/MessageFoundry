@@ -1523,6 +1523,7 @@ Optional **dual-control (maker-checker)** approval for high-value actions (ASVS 
 | `enabled` | bool | `false` | turn on dual-control; off = every action executes inline as before |
 | `operations` | list[str] | `["connection_purge", "dead_letter_replay"]` | which operations require approval; each must be a known op key (a typo is refused at startup) |
 | `expiry_hours` | num | 72 | a pending request can no longer be approved after this many hours (`0` = never expires) |
+| `min_dwell_seconds` | num (>= 0) | 2.0 | **(ASVS 2.4.2):** a pending request cannot be approved until it is this many seconds old. An earlier approve gets **409** and an `approval.too_early` audit row, and the request stays pending. `0` = no floor. With dual control on and requests expiring, startup refuses a floor as long as the expiry window. The check converts `expiry_hours` to seconds first. With `expiry_hours = 0`, any finite floor is accepted. The default is **provisional** and comes from published human-timing research. Where it comes from, and what the floor does not do, is in [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235) |
 
 ### `[integrity]`
 Startup **self-attestation of the installed engine wheel** ([ADR 0041](adr/0041-load-path-attestation-and-change-attribution.md)

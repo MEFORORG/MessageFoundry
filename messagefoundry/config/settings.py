@@ -4243,13 +4243,28 @@ class ApprovalsSettings(_Section):
     2.3.5). **Off by default** so a single-operator deployment is never blocked. When ``enabled``, an
     action in ``operations`` is held as a pending request and must be released by a *distinct* second
     user holding ``approvals:approve`` — the requester can never approve their own. A request older than
-    ``expiry_hours`` can no longer be approved."""
+    ``expiry_hours`` can no longer be approved, and one younger than ``min_dwell_seconds`` cannot be
+    approved YET.
+
+    ``min_dwell_seconds`` is the FLOOR beside ``expiry_hours``' CEILING (ASVS 2.4.2, BACKLOG #287). An
+    approve that arrives sooner gets a 409 and an ``approval.too_early`` audit row.
+
+    **The default (2.0 s) is PROVISIONAL.** It comes from published human-timing research, not from a
+    timed session (owner ruling 2026-09-23). Source: Card, Moran and Newell, "The keystroke-level model
+    for user performance time with interactive systems", Communications of the ACM 23(7), 1980,
+    pp. 396-410. How the default follows from it, and what the floor does not do, is stated once in
+    docs/SECURITY.md under "Dual-control approval for high-value actions". Change the two together."""
 
     enabled: bool = False
     operations: list[str] = Field(default_factory=lambda: sorted(_DEFAULT_APPROVABLE_OPERATIONS))
-    expiry_hours: float = (
-        72.0  # a pending request expires this many hours after it's made (0 = never)
-    )
+    # A pending request expires this many hours after it's made (0 = never). allow_inf_nan=False because
+    # a non-finite expiry means something different on each store backend, and none of them is what an
+    # operator asked for. `nan > 0` is also False, so a nan expiry would skip the dwell cross-check below.
+    expiry_hours: float = Field(default=72.0, allow_inf_nan=False)
+    # Seconds a pending request must have existed before it may be approved (0 = no floor), measured
+    # from its own ``requested_at``. allow_inf_nan=False matters: nan compares False against everything,
+    # so `age < nan` would switch the floor OFF silently.
+    min_dwell_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
 
     @field_validator("operations")
     @classmethod
@@ -4267,7 +4282,27 @@ class ApprovalsSettings(_Section):
     def _check_expiry(cls, v: float) -> float:
         if v < 0:
             raise ValueError("approvals.expiry_hours must be >= 0 (0 = never expires)")
+        # A huge FINITE value still overflows to inf once guard() turns it into seconds, which is the
+        # non-finite expiry allow_inf_nan exists to refuse.
+        if v * 3600.0 == float("inf"):
+            raise ValueError("approvals.expiry_hours is too large to express in seconds")
         return v
+
+    @model_validator(mode="after")
+    def _dwell_inside_expiry(self) -> ApprovalsSettings:
+        # A floor at or past the ceiling leaves no moment when a request can be approved: each one is
+        # refused as too early and then as expired. Refuse that at startup, not at the first release.
+        # Only while dual control is ON: a disabled feature must not refuse startup over its defaults.
+        if (
+            self.enabled
+            and self.expiry_hours > 0
+            and self.min_dwell_seconds >= self.expiry_hours * 3600.0
+        ):
+            raise ValueError(
+                "approvals.min_dwell_seconds must be shorter than approvals.expiry_hours, or no "
+                "request could ever be approved"
+            )
+        return self
 
 
 #: The two snapshot mechanisms for the SQLite store backup (ADR 0049). ``vacuum_into`` (default) writes
