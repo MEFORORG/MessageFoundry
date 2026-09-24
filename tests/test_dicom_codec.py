@@ -169,7 +169,8 @@ def test_missing_dicom_extra_raises_runtimeerror_not_valueerror(
     with pytest.raises(RuntimeError, match=r"messagefoundry\[dicom\]"):
         _deps.load_dcmread()
 
-    # Both parse entry points funnel through load_dcmread, so both surface the same RuntimeError.
+    # Both parse entry points reach pydicom through _deps (the deflate guard's load_header_readers,
+    # then load_dcmread), so both surface the same RuntimeError.
     for parse in (DicomDataset.parse, DicomPeek.parse):
         with pytest.raises(RuntimeError) as excinfo:
             parse(b"MEFOR-not-a-dicom-object")
