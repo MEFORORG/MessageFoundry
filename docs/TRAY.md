@@ -144,7 +144,10 @@ The engine's certificate **is verified**, against one of two trust anchors:
 - **The engine's own minted certificate, pinned.** A stock engine writes it beside its store
   database as `api-generated-cert.pem`. The tray finds it from the same registry entry: `--db` in
   `AppParameters`, else `[store].path`, else `messagefoundry.db` under `AppDirectory`. It trusts that
-  one file and nothing else, so a stock install works with no import step. Set `engine_cacert` in
+  one file and nothing else, so a stock install works with no import step. The data directory is
+  locked to SYSTEM, Administrators and the service account, so when the engine mints the pair it
+  grants local users read on the certificate alone. The certificate is public, since every client
+  receives it in the TLS handshake. The key stays owner-only. Set `engine_cacert` in
   `tray.toml`, as an absolute path, when the tray cannot find the file, for example under
   `--project-root`.
 - **The Windows trust store**, when the engine serves your own `[api].tls_cert_file`. An

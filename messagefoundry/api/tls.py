@@ -203,6 +203,30 @@ def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
         orphan.unlink()
 
 
+#: BUILTIN\Users, by SID so the grant does not depend on the host's display language.
+_LOCAL_USERS_SID = "*S-1-5-32-545"
+
+
+def _let_local_users_read_cert(cert_path: Path) -> None:
+    """Grant local users READ on the minted CERTIFICATE, so a local client can pin it. Never the key.
+
+    ``scripts/service/install-service.ps1`` locks the data directory to SYSTEM, Administrators and
+    the service account, and the pair is minted there. The tray runs as the logged-on user with a
+    filtered token, so without this it cannot read the file it has to pin, and it reads a running
+    engine as down. The certificate is public: every client that connects receives it in the TLS
+    handshake, so letting local users read it discloses nothing. The key stays owner-only
+    (:func:`_write_private_key`).
+
+    Windows only, because the tray is. Best-effort, like ``store._secure_file``: a failed grant is
+    logged and never stops the engine. The grant is ADDITIVE and names only this file; the
+    directory's ACL is untouched. It runs through ``store._grant_read``, the existing ``icacls``
+    site, so this module spawns no process of its own.
+    """
+    from messagefoundry.store.store import _grant_read
+
+    _grant_read(cert_path, _LOCAL_USERS_SID)
+
+
 def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, str | None] | None:
     """Return the ``(cert_path, key_path)`` the API should serve with, minting on first run.
 
@@ -225,7 +249,9 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
 
     **Mint-once, then reuse.** The pair is written with :func:`_write_private_key`'s ``O_EXCL`` +
     ``0o600`` + Windows-DACL sequence, which REFUSES to overwrite. So a second start finds the
-    files and loads them; it does not re-mint, and it cannot clobber a key.
+    files and loads them; it does not re-mint, and it cannot clobber a key. The certificate, and
+    only the certificate, is then made readable by local users so the tray can pin it
+    (:func:`_let_local_users_read_cert`).
 
     **A HALF-PAIR IS THE EXCEPTION, and it re-mints rather than refusing** -- see
     :func:`_discard_half_minted_pair`. Reuse needs BOTH files, so one alone is unusable AND a trap:
@@ -277,6 +303,7 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
         # engine rather than degrade it. `finally`, not `except`, so no failure mode is missed.
         if not paired:
             key_path.unlink(missing_ok=True)
+    _let_local_users_read_cert(cert_path)
     log.warning(
         "no [api].tls_cert_file configured — minted a SELF-SIGNED certificate for %s at %s. It has "
         "no chain of trust and is a PLACEHOLDER: browsers will show a trust interstitial until it "
