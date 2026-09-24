@@ -14,8 +14,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   `[auth].initial_password_expiry_hours` is `0`. `GET /users` always returns `null` here. That route
   needs only `users:read`, and a list of live temporary passwords is a target list. The
   never-claimed bootstrap account also gets `null`, because `bootstrap-admin.txt` already states its
-  earlier deadline. The web console's create-user form, user page and forced change-password page
-  now state the deadline, and so does the IDE's must-change warning. (`BACKLOG #1141`)
+  earlier deadline. The web console's create-user form now states how many hours the password
+  lasts. Its user page and forced change-password page state the time, and so does the IDE's
+  must-change warning. (`BACKLOG #1141`)
 
 ### Changed
 - **BREAKING — web console engine UI seam: the engine now provides `65ee7bd5234eb01b`.** Engine
@@ -23,14 +24,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   helpers from `messagefoundry.api.security`, and `UserSummary` gained `credential_expires_at`
   (under Added). A console accepts exactly one seam. The web console 0.3.0 release, tagged
   `webconsole-v0.3.0` beside engine 0.4.0, accepts only `75c4117d21fd0b98`. So with the console on,
-  this engine refuses to start with that release installed (`UiSeamMismatch`). **Migration:**
-  upgrade the web console together with the engine, to a release whose
+  this engine refuses to start with that release installed (`UiSeamMismatch`). The version number
+  alone does not tell a matching console apart, so check the constant. **Migration:** upgrade the
+  web console together with the engine, to a release whose
   `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS` holds `65ee7bd5234eb01b`. Or set
   `[security].serve_web_console = false` to run the JSON API alone. (`BACKLOG #1141`)
-- **BREAKING — the `403` for a session that must change its password is no longer the exact string
-  `password change required`.** When the temporary password has a deadline, the detail now reads
-  `password change required; the temporary password stops working at <time>`. The time is UTC ISO
-  8601, for example `2026-09-27T14:00:00Z`. The old text stays as the prefix, so a client that
+- **BREAKING — the `403` for a session that must change its password is no longer always the exact
+  string `password change required`.** When the engine can state the temporary password's
+  deadline, the detail now reads `password change required; the temporary password stops working at
+  <time>`. The time is UTC ISO 8601, for example `2026-09-27T14:00:00Z`. The never-claimed
+  bootstrap account still gets the bare string. The old text stays as the prefix, so a client that
   matches it as a substring still works. **Migration:** a client that compares the whole `detail`
   string must match on the prefix `password change required` instead. (`BACKLOG #1141`)
 - **BREAKING — `/ws/stats` refusals now carry an HTTP status that says why.** Engine 0.4.0 answered
@@ -49,13 +52,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   older than `max_age` (`auth_time_stale`). The session ends at the earliest of `auth_time + max_age`,
   the `id_token` `exp`, and the configured session caps. **A deploying site whose IdP does not return
   `auth_time` would have every federated sign-in refused**; that is spec-correct and deliberate.
-  Federation still ships off (`oidc_enabled = false`). With `[auth].oidc_prompt = "none"`, once the
-  IdP's own sign-in is older than `max_age`, the IdP answers `login_required`, and the user must
-  sign in at the IdP directly. `messagefoundry verify --section federation` gains a MANUAL
-  `fed.max_age` row. Its token replay now fails an `id_token` with no `auth_time`, and skips one
-  whose `auth_time` has aged past `max_age`. **Migration:** with OIDC on, confirm that the IdP
-  returns `auth_time` when the request carries `max_age`, as OpenID Connect Core requires. No
-  setting turns the check off. (`BACKLOG #296`)
+  Federation still ships off (`oidc_enabled = false`). `exp`, `iat`, `nbf` and `auth_time` must now
+  be finite numbers (`claim_not_numeric`). An `auth_time` further ahead than the clock skew is
+  refused (`issued_in_future`). With `[auth].oidc_prompt = "none"`, the IdP may answer
+  `login_required` once its own sign-in is older than `max_age`. The user then signs in at the IdP
+  directly. `messagefoundry verify --section federation` gains a MANUAL `fed.max_age` row. Its token
+  replay now fails an unexpired `id_token` with no `auth_time`. It skips one whose `auth_time` has
+  aged past `max_age`. **Migration:** with OIDC on, confirm that the IdP returns `auth_time` when
+  the request carries `max_age`, as OpenID Connect Core requires. No setting turns the check off.
+  (`BACKLOG #296`)
 - **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine
   0.4.0 set no content cipher, so the `cryptography` library chose its default, AES-128-CBC. The
   mode is still CBC, and the content key is still wrapped with RSAES-PKCS1-v1_5. Signing is
@@ -73,20 +78,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   shapes. (`BACKLOG #1125`)
   - A `POST`, `PUT` or `PATCH` with no `Content-Length` now gets `411`. Engine 0.4.0 read it to the
     end of the connection and ingested it.
-  - Any `Transfer-Encoding` now gets `400`, on every method. Engine 0.4.0 refused only `chunked`,
-    in any letter case, and never on `GET` or `HEAD`. So a value such as `gzip, chunked` got
-    through.
+  - Any `Transfer-Encoding` now gets `400`, on every method. Engine 0.4.0 already refused one sent
+    beside a `Content-Length`, or sent twice. Otherwise it refused only `chunked`, in any letter
+    case, and never on `GET` or `HEAD`. So a lone `gzip, chunked` on a `POST` got through.
   - A `GET` or `HEAD` that declares a non-zero body now gets `400`, where engine 0.4.0 answered
     `200`. Any other method outside `POST`, `PUT` and `PATCH` that declares a body gets `400` too.
     `Content-Length: 0` is still accepted.
-  - Methods are now case-sensitive, so a lowercase `post` is no longer ingested.
-  - At least these also get `400`: a `Content-Length` with a sign, an underscore or more than 18
-    significant digits; whitespace before a header colon; a folded header line; a bare CR or LF in
-    the head; a control character in a header value; a method or header name that is not a token;
-    and an HTTP version other than 1.x.
+  - Methods are now case-sensitive. A lowercase `post` is no longer ingested, and a lowercase `get`
+    or `head` is no longer answered as a health probe.
+  - At least these also get `400`: a `Content-Length` with a leading `+`, an underscore or more than
+    18 significant digits; whitespace before a header colon; a folded header line; a bare CR or LF
+    in the head; a control character in a header value; a method or header name that is not a
+    token; and an HTTP version other than 1.x.
   - **Migration:** a sending partner puts a `Content-Length` on every `POST`, `PUT` or `PATCH`,
-    sends no `Transfer-Encoding`, and writes the method in capitals. A health checker sends its
-    `GET` or `HEAD` with no body.
+    sends no `Transfer-Encoding`, and writes the method in capitals. A health checker sends `GET`
+    or `HEAD` in capitals, with no body.
 - **BREAKING — an MFA-pending session on an account that has a second factor can no longer end
   sessions.** `DELETE /me/sessions` and `DELETE /me/sessions/{session_id}` skip the MFA gate, so an
   account with no factor can still end its own sessions. In 0.4.0 that also let a caller holding
@@ -100,32 +106,35 @@ All notable changes to MessageFoundry are documented here. The format follows
   applies the same rule and sends the browser to `/ui/reauth`, which asks for the code first.
   `POST /me/password` still revokes every session from a pending session; this change does not
   cover it. **Migration:** on a `403` with `X-MFA-Required` from those four routes, prove the
-  existing factor first. Use a TOTP or recovery code at `POST /auth/mfa-verify` and adopt the
-  `token` it returns, or use the code or passkey step of the console's `/ui/reauth`. Then send
-  `POST /me/reauth` with the route's `purpose` (`session_terminate`, `mfa_enroll` or
-  `mfa_confirm`), adopt its `token`, and retry. (`BACKLOG #1951`)
+  existing factor on that same session first. A JSON client sends a TOTP or recovery code to
+  `POST /auth/mfa-verify` and adopts the `token` it returns. Then it sends `POST /me/reauth` with
+  the route's `purpose` (`session_terminate`, `mfa_enroll` or `mfa_confirm`), adopts that `token`,
+  and retries. The JSON API has no passkey step, so a passkey-only account ends its sessions from the
+  web console, where `/ui/reauth` asks for the passkey first. (`BACKLOG #1951`)
 - **A lockout, and a sign-in that succeeds after failures, now write their own audit rows, so they
   reach the user's security-events feed.** Engine 0.4.0 wrote no row of its own for either event.
-  Each lived only in the out-of-band notice, so an account with no notification address, or an
-  engine with no mail relay, never saw it in `GET /me/security-events`. Two new audit actions carry
-  them. `auth.account_locked` is written when a wrong password, or a wrong code at
-  `POST /auth/mfa-verify`, crosses the lockout threshold. `auth.login_after_failures` is written
+  Each lived only in the out-of-band notice. So an account with no notification address never saw
+  it in `GET /me/security-events`, and neither did any account on an engine with no mail relay.
+  Two new audit actions carry them. `auth.account_locked` is written when a wrong password, or a
+  wrong TOTP or recovery code, crosses the lockout threshold. `auth.login_after_failures` is written
   when a local password sign-in succeeds after three or more failures. Each row names the account
   as its actor and carries no more detail than the attempt's own row. The failure count stays in
   the notice. (`BACKLOG #1138`)
-- **Refused WebSocket handshakes, and some responses uvicorn writes on its own, now carry the
-  baseline security headers.** A WebSocket handshake gets an HTTP answer, but the header floor used
-  to pass every WebSocket through untouched. It now adds to the `101` on accept the same baseline
-  every HTTP response gets. That includes at least `X-Content-Type-Options: nosniff` and
-  `frame-ancestors 'none'`, plus HSTS where HSTS applies. On a server that offers the ASGI
-  `websocket.http.response` extension, as uvicorn does, it adds them to every refusal before
-  accept as well. There, a WebSocket refused by `[security].allowed_client_networks` gets the same
-  `403` body an HTTP request gets. Under `messagefoundry serve`, a new module,
-  `messagefoundry/api/protocol_headers.py`, adds `nosniff` and `frame-ancestors 'none'`, never
-  HSTS, to responses uvicorn writes below the app. They include at least its `400` for a request it
-  cannot parse, its `500` when the app fails without starting a response, its WebSocket `500`, and
-  the legacy websockets server's own handshake answers. Each step it adds fails open. On an error it
-  logs a WARNING, once per step, and leaves uvicorn's own response as it was. (`BACKLOG #1120`)
+- **Refused WebSocket handshakes now carry the baseline security headers, and some responses
+  uvicorn writes on its own gain two of them.** A WebSocket handshake gets an HTTP answer, but the
+  header floor used to pass every WebSocket through untouched. It now adds to the `101` on accept
+  the same baseline every HTTP response gets. That includes at least
+  `X-Content-Type-Options: nosniff` and `frame-ancestors 'none'`, plus HSTS where HSTS applies. On
+  a server that offers the ASGI `websocket.http.response` extension, as uvicorn does, it adds them
+  to every refusal before accept as well. There, a WebSocket refused by
+  `[security].allowed_client_networks` gets the same `403` body an HTTP request gets. Under
+  `messagefoundry serve`, a new module, `messagefoundry/api/protocol_headers.py`, adds only
+  `nosniff` and `frame-ancestors 'none'` to responses uvicorn writes below the app. It never adds
+  HSTS. It covers at least uvicorn's `400` for a request it cannot parse, and its `500` when the
+  app fails without starting a response. It also covers uvicorn's WebSocket `500` and the legacy
+  websockets server's own handshake answers. Each step it adds fails open. On an error it logs a
+  WARNING, once per response family and step, and leaves uvicorn's own response as it was.
+  (`BACKLOG #1120`)
 - **Passkey registration now requires real CBOR integers where the COSE key needs them.** Engine
   0.4.0's P-256 pin for ES256 let `true`, `1.0` and some other non-integer CBOR values stand in for
   an integer. So an ES256 key whose curve read `true` or `1.0` could enrol past the pin.

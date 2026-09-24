@@ -10,6 +10,7 @@ import errno
 import json
 import logging
 import ssl
+import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -2304,3 +2305,41 @@ def test_the_upstream_terminator_topology_keeps_the_host_prefix_without_minting(
     # on an operator remembering to set both keys.
     with pytest.raises(ValidationError, match="requires .api..trusted_proxies"):
         ApiSettings(tls_terminated_upstream=True)
+
+
+def _sddl(path: str, out_dir: Path) -> str:
+    """The file's DACL as SDDL, via ``icacls /save``: SIDs as aliases, so no display language."""
+    import subprocess
+
+    out = out_dir / (Path(path).name + ".acl")
+    subprocess.run(["icacls", path, "/save", str(out)], check=True, capture_output=True)
+    return out.read_bytes().decode("utf-16")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the grant is Windows-only, as the tray is")
+def test_local_users_can_read_the_minted_certificate_but_not_the_key(tmp_path: Path) -> None:
+    """The tray runs as the logged-on user and must pin this certificate, while the installer locks
+    the data directory to SYSTEM, Administrators and the service account. The cert is public (every
+    handshake hands it out); the key must stay owner-only. BU is the SDDL alias for BUILTIN\\Users.
+    """
+    state = tmp_path / "state"
+    cert, key = ensure_api_tls_material(ApiSettings(), state_dir=state)
+    cert_acl = _sddl(cert, tmp_path)
+    key_acl = _sddl(key, tmp_path)
+    assert ";;;BU)" in cert_acl, cert_acl
+    assert ";;;BU)" not in key_acl, key_acl
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the grant is Windows-only, as the tray is")
+def test_a_failed_read_grant_never_stops_the_mint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Best-effort, like ``store._secure_file``: the engine still gets its pair, and the log says why
+    the tray will not be able to pin it."""
+    monkeypatch.setattr(
+        "messagefoundry.store.store._system_exe", lambda *_p: str(tmp_path / "no-icacls.exe")
+    )
+    with caplog.at_level(logging.WARNING):
+        cert, key = ensure_api_tls_material(ApiSettings(), state_dir=tmp_path / "state")
+    assert Path(cert).exists() and Path(key).exists()
+    assert "could not grant read on" in caplog.text
