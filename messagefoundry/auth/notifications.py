@@ -13,8 +13,15 @@ sender — which turns an event into a per-user email over the ``[alerts]`` SMTP
 failure is logged and never breaks authentication or an admin action.
 
 The persistent, pull-based companion (``GET /me/security-events``) is a user-scoped view over the
-existing tamper-evident audit log — these same events are already audited — so a user with no
-deliverable mailbox can still review their security history.
+existing tamper-evident audit log, so a user with no deliverable mailbox can still review their
+security history.
+
+**WHAT THE FEED SHOWS IS STATED HERE ONCE; other comments point here.** It selects audit rows whose
+actor is the user's username AND whose action starts ``auth.``. The two 6.3.5 events meet both, as
+``auth.account_locked`` and ``auth.login_after_failures`` (BACKLOG #1138). An event whose row fails
+either test is not in the feed, and the user learns of it only from the notice. At least two kinds
+fail: a row naming another actor, such as the administrator who reset a password, and a row under
+another action, such as the ``user.updated`` an administrator's email change or disable writes.
 """
 
 from __future__ import annotations
@@ -22,7 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-# Event types (the values double as the audit-action suffix / feed category). PHI-free by construction.
+# Event types. PHI-free by construction. A value is NOT an audit action: each call site audits under
+# its own action name, and the two 6.3.5 kinds map to theirs in auth/service.py.
 ACCOUNT_LOCKED = "account_locked"  # 6.3.5 — repeated failures crossed the lockout threshold
 LOGIN_AFTER_FAILURES = (
     "login_after_failures"  # 6.3.5 — first success following >= N failed attempts

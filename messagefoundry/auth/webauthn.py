@@ -26,7 +26,7 @@ import json
 import logging
 import secrets
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -169,6 +169,40 @@ def _refusal(exc: Exception, *, ceremony: str) -> WebAuthnVerificationError:
     return WebAuthnVerificationError(str(exc))
 
 
+def _require_cose_integers(fields: object) -> None:
+    """Refuse a COSE key unless it is a map with integer labels and integer kty, alg and crv.
+
+    The library indexes the decoded CBOR by label and compares each value with ``==``, and the
+    P-256 pin used ``int()``. Python lets several non-integers pass both: ``True``, ``1.0``, and
+    the ``Decimal`` and ``Fraction`` that cbor2 decodes from tags 4 and 30. So a key reading
+    ``crv: true`` or ``crv: 1.0``, or carrying its ``kty`` under the label ``true``, enrolled
+    (BACKLOG #1953). This requires the integer type itself, so no such value can stand in.
+
+    It is stricter than that bypass in two ways, both from RFC 9052 section 7. The key must be a
+    map: the library also indexes an array, reading its positions as labels. And every label must
+    be an integer or a text string, so a null, byte-string or float label is refused even where
+    it names nothing. A text label never matches an integer index, so it is let through. ``crv``
+    is read only for OKP (1) and EC2 (2), the key types where label -1 is the curve. These
+    refusals name a type, never a value, because the value is the attacker's.
+    """
+    if not isinstance(fields, Mapping):
+        raise WebAuthnVerificationError(f"COSE key must be a map, not {type(fields).__name__}")
+    for label in fields:
+        if type(label) is not int and type(label) is not str:
+            raise WebAuthnVerificationError(
+                f"COSE key label must be an integer or a text string, not {type(label).__name__}"
+            )
+    params = [("kty", 1), ("alg", 3)]
+    if fields.get(1) in (1, 2):
+        params.append(("crv", -1))
+    for name, label in params:
+        value = fields.get(label)
+        if value is not None and type(value) is not int:
+            raise WebAuthnVerificationError(
+                f"COSE key {name} must be an integer, not {type(value).__name__}"
+            )
+
+
 def _require_usable_public_key(cose_key: bytes) -> None:
     """Refuse a credential public key that no assertion could ever verify against.
 
@@ -182,17 +216,25 @@ def _require_usable_public_key(cose_key: bytes) -> None:
     It also binds each identifier to one key type and curve (:data:`_COSE_KEY_SHAPE_FOR_ALG`),
     so an ES256 credential on P-384 or P-521 is refused here although it would verify. That is
     the owner's 2026-09-23 ruling, and it is a deliberate refusal, so it is not logged.
+
+    That binding compares integers, so :func:`_require_cose_integers` runs before it. Its
+    refusals are deliberate too, and not logged.
     """
-    from webauthn.helpers import decode_credential_public_key, decoded_public_key_to_cryptography
+    from webauthn.helpers import (
+        decode_credential_public_key,
+        decoded_public_key_to_cryptography,
+        parse_cbor,
+    )
 
     try:
         decoded = decode_credential_public_key(cose_key)
         decoded_public_key_to_cryptography(decoded)
-        alg, kty = int(decoded.alg), int(decoded.kty)
-        crv = getattr(decoded, "crv", None)
-        shape = (kty, None if crv is None else int(crv))
+        fields = parse_cbor(cose_key)
     except _invalid_input_errors() as exc:
         raise _refusal(exc, ceremony="registration") from exc
+    _require_cose_integers(fields)
+    alg, kty, crv = decoded.alg, decoded.kty, getattr(decoded, "crv", None)
+    shape = (kty, crv)
     if _COSE_KEY_SHAPE_FOR_ALG.get(alg) != shape:
         raise WebAuthnVerificationError(
             f"COSE algorithm {alg} is accepted only as key type and curve "

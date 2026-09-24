@@ -284,6 +284,21 @@ export function describeNetworkCode(code: string | undefined, url: string): stri
   }
 }
 
+/** The must-change warning, naming the credential's deadline in UTC when the engine sent one. */
+export function mustChangeProblem(credentialExpiresAt: number | null | undefined): string {
+  const base = "this account must change its password before it can do anything.";
+  if (typeof credentialExpiresAt !== "number" || !Number.isFinite(credentialExpiresAt)) {
+    return base;
+  }
+  let when: string;
+  try {
+    when = new Date(credentialExpiresAt * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+  } catch {
+    return base; // past the Date range (the engine's expiry setting has no upper bound)
+  }
+  return `${base} The temporary password stops working at ${when}.`;
+}
+
 /** Sub-classify a 403 from the engine's `detail` string (stable; already extracted by engineClient). */
 export function classifyForbidden(detail: string): BlockedReason {
   const d = detail.toLowerCase();
