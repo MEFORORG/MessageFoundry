@@ -21,6 +21,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   would see that partner fail to open the message after its relay has already accepted it**, so the
   failure would surface on the partner's side, not as a send error here.
   ([BACKLOG #1168](docs/BACKLOG.md))
+- **BREAKING — sign-in now checks a stored passkey with the same rule as registration.** This
+  reverses two promises in the 0.4.0 notes: "Passkeys registered on 0.3.2 still work" and "A
+  passkey already registered on another curve still signs in". Neither holds any more. A stored
+  RS256 key, a stored ES256 key on P-384 or P-521, or a stored curve encoded as `true` or `1.0`
+  is now refused at sign-in. 0.3.2 registered all three, and 0.4.0 still registered the third. The
+  refusal is audited as `auth.webauthn_failed`. **A deploying site with such a key would see its
+  owner refused at every passkey sign-in; a passkey-only user would stay refused until an admin
+  runs `admin_reset_mfa`.** **Migration:** register an ES256 passkey on P-256 or an EdDSA
+  passkey, or use TOTP. ([BACKLOG #1166](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 
