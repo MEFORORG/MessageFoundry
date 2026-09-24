@@ -17,6 +17,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   earlier deadline. The web console's create-user form now states how many hours the password
   lasts. Its user page and forced change-password page state the time, and so does the IDE's
   must-change warning. (`BACKLOG #1141`)
+- **`messagefoundry admin-set-notify-email` sets a missing notification address on an enabled
+  Administrator, from the host.** Under `enforce`, the engine refuses to start unless an enabled
+  Administrator has a notification address. `provision-admin` run without `--email` left exactly
+  that state. It then refused to run again, because an enabled Administrator existed, and the web
+  console cannot be reached while the engine refuses to start. The new command takes `--username`
+  and `--email`, plus `--service-config`, `--db` and `--json`. It works on the store directly, on
+  the same host gate as `admin-unlock`, so run it with the engine stopped. It only fills an absent
+  address. It refuses at least a blank address, a non-Administrator, a disabled account, and an
+  account that already has an address. Change an existing address from the web console, which
+  notifies the old address. Run again with the same address, it reports success and writes
+  nothing. It appends an `auth.admin_notify_email_set` audit row before it writes the address, and
+  an `auth.admin_notify_email_set_failed` row if that write then fails. The warning
+  `provision-admin` prints for a missing `--email` now names this command. (`BACKLOG #1136`)
 
 ### Changed
 - **BREAKING — the web console engine UI seam moved, so this engine no longer pairs with web
@@ -76,14 +89,15 @@ All notable changes to MessageFoundry are documented here. The format follows
     own, as with no service entry or in the cases above. The tray must also be able to read that
     file; the entry under Security covers that. The standalone test harness is not part of this
     change, and its default engine URL is still `http://127.0.0.1:8765`.
-- **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
-  cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
-  to the largest `max_message_bytes` any inbound in the graph sets. The file's size is checked
-  before it is read, so an oversized fixture is never read whole. A fixture over the cap that
-  0.4.0 read would now fail the run. [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) also carries a
-  code-derived ASVS 5.1.1 file-surface inventory, with upload and download tables and stated
-  exclusions, and a test fails when the code and the tables drift apart.
-  ([BACKLOG #1127](docs/BACKLOG.md))
+- **BREAKING — `messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture
+  file.** The cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES`
+  (16 MiB) and rises to the largest `max_message_bytes` any inbound in the graph sets. The file's
+  size is checked before it is read, so an oversized fixture is never read whole. A fixture over the
+  cap that 0.4.0 read would now fail the run: `dryrun` exits with an error naming the file, and
+  `check` fails its `dryrun` gate. `docs/CONNECTIONS.md` also carries a code-derived ASVS 5.1.1
+  file-surface inventory, with upload and download tables and stated exclusions, and a test fails
+  when the code and the tables drift apart. **Migration:** split a fixture file over the cap into
+  smaller files. (`BACKLOG #1127`)
 - **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
   `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
   that topology the engine mints no certificate (ADR 0172 decision 3). So the
@@ -96,7 +110,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   `[api].plaintext_upstream_hop_acknowledged = true`. 0.4.0 refuses the key as unrecognized, so do
   not add it first. Or set `[api].tls_cert_file` and `[api].tls_key_file` so the engine serves that
   hop over TLS. The proxy must then speak https to the engine and trust that certificate, or every
-  request through it fails. ([BACKLOG #1179](docs/BACKLOG.md))
+  request through it fails. (`BACKLOG #1179`)
+- **The password-policy refusal for a context word now names the list it checks.** Engine 0.4.0
+  said `not contain application or vendor terms`. The clause now reads `not contain a word from
+  the context-word deny-list`. It appears in at least the `400` detail from `POST /users` and
+  `POST /me/password`, after `password must`, and in the refusal from
+  `messagefoundry provision-admin`. The status code is unchanged. The list is unchanged too, so the
+  same passwords are refused. The old wording mis-described it, since the list also holds generic
+  default-credential words such as `admin` and `password`. `docs/SECURITY.md` now publishes the
+  list in full, and a test holds it equal to `CONTEXT_WORDS`. (`BACKLOG #1135`, `#1132`)
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
@@ -115,6 +137,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   aged past `max_age`. **Migration:** with OIDC on, confirm that the IdP returns `auth_time` when
   the request carries `max_age`, as OpenID Connect Core requires. No setting turns the check off.
   (`BACKLOG #296`)
+- **BREAKING — the OIDC token endpoint and JWKS legs now carry the posture-keyed revocation
+  guard.** Engine 0.4.0 checked no certificate revocation on either leg. Each leg is guarded on its
+  own host, so an off-box JWKS host is guarded even when the token endpoint is on loopback. With
+  OIDC on and `[security].enforcement = "enforce"`, the default, an off-box identity provider with
+  no `[auth].oidc_tls_crl_file` now stops `serve` from starting. The refusal comes after the
+  engine starts, when the API is built, and neither `messagefoundry check` nor `messagefoundry
+  verify` reports it ahead of time. See ADR 0173 section 4.3. **Migration:** with OIDC on, set
+  `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the token and
+  JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file becomes a
+  trusted root for this hop. Or run with `[security].enforcement = "warn"`, which logs a warning
+  for each leg instead. (`BACKLOG #1887`)
 - **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine
   0.4.0 set no content cipher, so the `cryptography` library chose its default, AES-128-CBC. The
   mode is still CBC, and the content key is still wrapped with RSAES-PKCS1-v1_5. Signing is
@@ -214,10 +247,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   generated files so the engine mints a new pair. Then restart the tray, which does not reload a
   pin that already loaded, and re-pin every other client that pinned the old certificate.
   (`BACKLOG #1276`)
-- **The OIDC token endpoint and JWKS legs now carry the posture-keyed revocation guard (BACKLOG
-  #1887, ADR 0173 section 4.3).** Each leg is guarded on its own host. An enforcing instance whose
-  off-box identity provider has no `[auth].oidc_tls_crl_file` would refuse to start on first
-  deployment.
 - **A keyed store now refuses an unmarked value in an encrypted column instead of reading it back
   as plaintext.** Once a store key is set, every covered column holds only `mfenc:` ciphertext, so
   a non-blank value without the marker is a stripped marker or a planted row. The cipher raises
@@ -227,7 +256,28 @@ All notable changes to MessageFoundry are documented here. The format follows
   under the subject `store-cipher`, naming the table and column but never the row or the value.
   **A planted `state` or `reference` value would stop the engine from starting**, because both
   caches load at open. The opt-out, `[store].allow_unmarked_ciphertext`, ships off and is reported
-  as a loosening when on. ([BACKLOG #1169](docs/BACKLOG.md))
+  as a loosening when on. (`BACKLOG #1169`)
+- **The DICOM deflate guard now bounds exactly the bytes `dcmread` inflates, and fails closed.**
+  Engine 0.4.0's guard found the deflated Data Set with its own walk of the file meta. It let
+  through any header it could not follow, and pydicom reads headers more leniently. So a crafted
+  Deflated Explicit VR Little Endian object could pass the guard and then inflate without bound in
+  `dcmread`, through `DicomPeek.parse`, `DicomDataset.parse` or the outbound C-STORE SCU.
+  (`BACKLOG #1926`)
+  - The guard now replays pydicom's own header readers, the ones `dcmread` runs just before it
+    inflates, and bounds that stream. That covers at least a missing or wrong group length, a
+    second transfer-syntax element, a forced read with no preamble, and a command set before the
+    Data Set.
+  - A header pydicom cannot read is refused the way `dcmread`'s own failure would be. A pydicom
+    that lacks one of the replayed readers makes DICOM parsing fail with an error naming it, rather
+    than parse unguarded.
+  - The bounded inflate now stops at the end of the deflate stream. In 0.4.0 it looped without end
+    on a Data Set that inflates past 64 KiB and has any byte after the stream's end. pydicom and
+    pynetdicom pad an odd-length deflated Data Set with one NUL byte, so an ordinary object could
+    hit it. The inbound C-STORE SCP ran the same loop.
+  - The `[dicom]` extra now requires `pydicom>=3.0.2,<3.1`, where 0.4.0 allowed `<4`. The guard
+    replays private pydicom readers, and its agreement test covers only the locked release, 3.0.2.
+    No pydicom 3.1 or later had been published when this changed, so the cap rules out no release
+    a 0.4.0 `[dicom]` install could have picked.
 
 ## [0.4.0] — 2026-09-23 — Early Access
 
