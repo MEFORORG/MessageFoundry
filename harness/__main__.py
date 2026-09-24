@@ -113,6 +113,10 @@ _INSECURE_HINT = (
     "carries no credential.)"
 )
 
+#: The engine API a bare `--scenario` / `--load` talks to. https because the engine always serves TLS
+#: (ADR 0172); the monitor tab's default is the same URL.
+_DEFAULT_ENGINE = "https://127.0.0.1:8765"
+
 
 def main(argv: list[str] | None = None) -> int:
     # Scenario text uses arrows (U+2192); a legacy Windows console (cp1252) would otherwise raise
@@ -206,7 +210,15 @@ def main(argv: list[str] | None = None) -> int:
         help="list built-in estate demo-shape profiles",
     )
     parser.add_argument("--list-profiles", action="store_true", help="list built-in load profiles")
-    parser.add_argument("--engine", default="http://127.0.0.1:8765", help="engine API base URL")
+    parser.add_argument("--engine", default=_DEFAULT_ENGINE, help="engine API base URL")
+    parser.add_argument(
+        "--cacert",
+        metavar="PEM",
+        help="scenario/load: trust ONLY this PEM for the engine API. A stock engine mints "
+        "api-generated-cert.pem beside its store database; pass that file. Without it the OS trust "
+        "store is used, which verifies an operator certificate but not a minted one. Applies to "
+        "every --engine and --shard-engine URL.",
+    )
     parser.add_argument("--token", help="bearer token for an auth-enabled engine")
     parser.add_argument(
         "--timeout", type=float, default=30.0, help="scenario: seconds to wait for the outcome"
@@ -281,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.load:
         return _run_load(args)
     if args.scenario:
-        return _run_scenario(args.scenario, args.engine, args.token, args.timeout)
+        return _run_scenario(args.scenario, args.engine, args.token, args.timeout, args.cacert)
     return _launch_gui()
 
 
@@ -293,7 +305,9 @@ def _list_scenarios() -> int:
     return 0
 
 
-def _run_scenario(name: str, engine_url: str, token: str | None, timeout: float) -> int:
+def _run_scenario(
+    name: str, engine_url: str, token: str | None, timeout: float, cacert: str | None = None
+) -> int:
     from harness.scenarios import SCENARIOS, run_scenario
     from messagefoundry.apiclient import ApiError, EngineClient
 
@@ -302,7 +316,7 @@ def _run_scenario(name: str, engine_url: str, token: str | None, timeout: float)
         print(f"unknown scenario {name!r}; choices: {', '.join(SCENARIOS)}", file=sys.stderr)
         return 2
     try:
-        with EngineClient(engine_url) as client:
+        with EngineClient(engine_url, cacert=cacert) as client:
             if token:
                 client.set_token(token)
             result = run_scenario(scenario, client, timeout=timeout)
@@ -355,6 +369,7 @@ def _run_load(args: argparse.Namespace) -> int:
                 db_backend=args.db_backend,
                 skip_preflight=args.skip_preflight,
                 shard_engines=tuple(args.shard_engine or ()),
+                cacert=args.cacert,
             )
         )
     except PreflightError as exc:

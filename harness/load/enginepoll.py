@@ -506,6 +506,7 @@ class EnginePoller:
         *,
         origin: float,
         allow_insecure: bool = False,
+        cacert: str | None = None,
     ) -> None:
         # Accept a single URL (back-compat) or a list. The first URL is the "primary" whose `client`
         # is exposed for one-off preflight reads (served-ports check). `allow_insecure` (default False)
@@ -535,6 +536,9 @@ class EnginePoller:
         self._token = token
         self._origin = origin
         self._allow_insecure = allow_insecure
+        # An explicit PEM wins over `_cacert_for` for every URL: the engine was started OUTSIDE this
+        # harness (the CLI's --cacert), so it serves its own minted pair, not the run's anchor.
+        self._cacert = cacert
         self._clients: list[EngineClient] = []
         self._samples: list[EngineSample] = []
 
@@ -635,9 +639,8 @@ class EnginePoller:
     def _open_sync(self) -> None:
         clients: list[EngineClient] = []
         for url in self._urls:
-            client = EngineClient(
-                url, allow_insecure=self._allow_insecure, cacert=self._cacert_for(url)
-            )
+            cacert = self._cacert if self._cacert is not None else self._cacert_for(url)
+            client = EngineClient(url, allow_insecure=self._allow_insecure, cacert=cacert)
             if self._token:
                 client.set_token(self._token)  # does a /me request to validate
             clients.append(client)

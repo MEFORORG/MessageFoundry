@@ -46,7 +46,9 @@ from harness._login import LoginDialog
 from messagefoundry.api.models import ConnectionRow, DeadLetterRow, PendingApprovalResponse
 from messagefoundry.apiclient import ApiError, EngineClient
 
-_DEFAULT_URL = "http://127.0.0.1:8765"
+# https because the engine always serves TLS (ADR 0172). A stock engine's certificate is one it minted
+# itself and no trust store holds it, so the bar beside the URL takes the PEM to pin.
+_DEFAULT_URL = "https://127.0.0.1:8765"
 _POLL_INTERVAL_MS = 1500
 
 _LIVE_COLUMNS = [
@@ -100,12 +102,14 @@ class MonitorPoller(QObject):
         interval_ms: int = _POLL_INTERVAL_MS,
         allow_insecure: bool = False,
         timeout: float = 3.0,
+        cacert: str | None = None,
     ) -> None:
         super().__init__()
         self._base_url = base_url
         self._token = token
         self._interval_ms = interval_ms
         self._allow_insecure = allow_insecure
+        self._cacert = cacert
         self._timeout = timeout
         self._client: EngineClient | None = None
         self._timer: QTimer | None = None
@@ -115,7 +119,10 @@ class MonitorPoller(QObject):
     def start(self) -> None:
         try:
             self._client = EngineClient(
-                self._base_url, timeout=self._timeout, allow_insecure=self._allow_insecure
+                self._base_url,
+                timeout=self._timeout,
+                allow_insecure=self._allow_insecure,
+                cacert=self._cacert,
             )
             if self._token:
                 self._client.set_token(self._token)
@@ -188,6 +195,12 @@ class MonitorPanel(QWidget):
         self._detail: MessageDetailPanel | None = None
 
         self._url = QLineEdit(_DEFAULT_URL)
+        self._cacert = QLineEdit()
+        self._cacert.setPlaceholderText("api-generated-cert.pem (blank = OS trust store)")
+        self._cacert.setToolTip(
+            "PEM to trust for the engine API. A stock engine mints api-generated-cert.pem beside "
+            "its store database."
+        )
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.clicked.connect(self._toggle_connect)
         self._reload_btn = QPushButton("Reload config")
@@ -198,6 +211,8 @@ class MonitorPanel(QWidget):
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Engine:"))
         bar.addWidget(self._url, stretch=1)
+        bar.addWidget(QLabel("Cert:"))
+        bar.addWidget(self._cacert, stretch=1)
         bar.addWidget(self._connect_btn)
         bar.addWidget(self._reload_btn)
 
@@ -221,8 +236,11 @@ class MonitorPanel(QWidget):
 
     def _connect(self) -> None:
         url = self._url.text().strip()
+        cacert = self._cacert_path()
         try:
-            client = EngineClient(url, timeout=4.0, allow_insecure=self._allow_insecure)
+            client = EngineClient(
+                url, timeout=4.0, allow_insecure=self._allow_insecure, cacert=cacert
+            )
             client.health()  # reachable?
         except ApiError as exc:
             self._set_status(str(exc), error=True)
@@ -240,6 +258,7 @@ class MonitorPanel(QWidget):
         self._connect_btn.setText("Disconnect")
         self._reload_btn.setEnabled(True)
         self._url.setEnabled(False)
+        self._cacert.setEnabled(False)
         user = client.current_user
         who = f"{user.username} ({', '.join(user.roles) or 'no roles'})" if user else "no-auth"
         self._set_status(f"connected to {url} as {who}")
@@ -285,7 +304,12 @@ class MonitorPanel(QWidget):
         self._connect_btn.setText("Connect")
         self._reload_btn.setEnabled(False)
         self._url.setEnabled(True)
+        self._cacert.setEnabled(True)
         self._set_status("disconnected")
+
+    def _cacert_path(self) -> str | None:
+        """The pinned PEM, or None (blank field) to verify against the OS trust store."""
+        return self._cacert.text().strip() or None
 
     def shutdown(self) -> None:
         """Stop the worker thread cleanly (called by the window on close)."""
@@ -305,6 +329,7 @@ class MonitorPanel(QWidget):
             self._client.token,
             allow_insecure=self._allow_insecure,
             timeout=1.5,
+            cacert=self._cacert_path(),
         )
         poller.moveToThread(thread)
         thread.started.connect(poller.start)
