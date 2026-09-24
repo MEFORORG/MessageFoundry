@@ -3571,6 +3571,45 @@ jobs:
         shell: powershell
         run: .\scripts\service\uninstall-service.ps1
 
+      # --- ADR 0183 Amendment A, Wave 0 (BACKLOG #1136): the AUTH-ON arm ------------------------------
+      # Everything above runs with sign-in OFF, so it cannot see the question these two steps ask:
+      # can the NSSM service account and the operator who runs `provision-admin` both open ONE SQLite
+      # store, in either order? ADR 0163 reads MessageStore.open as re-securing the store trio to the
+      # current user alone on every open, which would make whichever identity opens a fresh store
+      # first its only principal. These steps MEASURE that; they fix nothing, and a red here is the
+      # reading Wave 0 exists to produce -- do not weaken the check to turn it green. The fix is 0b.
+      #
+      # Each arm installs the service under the DEFAULT virtual account (NT SERVICE\MessageFoundry),
+      # with sign-in required, on its own fresh data directory, and uninstalls it afterwards. The helper
+      # asserts the SCM run-as account and the owner of each sampled service process, so an arm that
+      # silently ran as some other account goes red instead of measuring the wrong thing. Every red
+      # names the identity that could not open the store and the trio file(s) carrying no entry for it.
+      #
+      # `!cancelled()` rather than the default `success()`: both readings are wanted on every run, so
+      # the start-first arm still runs when the provision-first arm or the auth-off smoke went red.
+      # Windows PowerShell 5.1, matching the install step above. timeout-minutes bounds a hung arm.
+      - name: Store access, auth on -- provision first, then the service (ADR 0183 Wave 0)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: powershell
+        run: .\scripts\service\measure-store-access.ps1 -Order ProvisionFirst -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
+
+      - name: Store access, auth on -- the service first, then the operator (ADR 0183 Wave 0)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: powershell
+        run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -DataDir C:\ProgramData\MessageFoundry-w0-start-first
+
+      - name: Upload store-access logs (ADR 0183 Wave 0)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: store-access-logs-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            C:\ProgramData\MessageFoundry-w0-provision-first\logs\
+            C:\ProgramData\MessageFoundry-w0-start-first\logs\
+          if-no-files-found: ignore
+
       - name: Upload service logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

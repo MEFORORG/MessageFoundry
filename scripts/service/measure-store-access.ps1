@@ -1,0 +1,716 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+<#
+.SYNOPSIS
+    Measure whether the NSSM service account and the provisioning operator can both open one
+    SQLite store, in a given order. CI measurement for ADR 0183 Amendment A, Wave 0 (BACKLOG #1136).
+
+.DESCRIPTION
+    ADR 0163 consequences 1 and 2 read MessageStore.open as re-securing the SQLite trio (the .db
+    and its -wal/-shm sidecars) to the CURRENT user alone on every open, with inheritance removed.
+    If that reading holds, whichever identity opens a fresh store first becomes its only principal,
+    and the other identity is locked out. The bootstrap account hides this today, because the
+    service creates its own account inside its own process. ADR 0183 Amendment A retires that
+    account, which makes `provision-admin` the only way in, so Wave 0 measures FILE ACCESS in both
+    orders before anything is deleted. This script is that measurement. It fixes nothing.
+
+    -Order ProvisionFirst
+        1. The operator (the identity running this script) provisions a fresh store through
+           `messagefoundry provision-admin --email`, via _provision_admin's own open path. The
+           ONLY patch is the password reader: a hosted runner has no terminal.
+        2. The NSSM service starts under the default virtual account, NT SERVICE\<ServiceName>.
+        3. The operator signs in over https as the provisioned administrator and gets a session.
+
+    -Order StartFirst
+        1. The service starts on a fresh store. It creates the store, mints the bootstrap account
+           (still live before Wave 2), and is REFUSED by the ADR 0167 gate, because that account
+           has no notification address. The gate runs after the store is opened and its user table
+           read, so the refusal text in the service log is the proof that the service opened it.
+        2. The operator opens that store through the same CLI path. `provision-admin` then declines,
+           because the bootstrap account is an enabled Administrator. That decline is reached only
+           after the store opened, so it is the proof that the operator opened it.
+        3. The service is started again and must reach the same refusal, which proves it can still
+           open the store that the operator's open re-secured. If step 2 instead PROVISIONED (no
+           bootstrap account existed), the gate would pass, so the proof is /health and sign-in.
+
+    THE SERVICE IDENTITY IS CHECKED, NOT ASSUMED. The SCM's configured run-as account must be
+    NT SERVICE\<ServiceName>, and every process sampled under the service must run as it. Where the
+    engine is up (provision first), the sample must include the engine process itself.
+
+    WHAT A RED MEANS. Every red names the identity that could not open the store, says whether the
+    service log shows an open failure, and lists for each file of the trio the entries it carries and
+    whether any grants that identity read and write. That list is a READING of the DACL, not an
+    access check: it names the file, and the behaviour above says the open failed.
+
+    A GREEN CAN BE CONDITIONAL, and says so. store.py's _secure_file only logs when icacls fails,
+    so if it could not restrict the trio under some identity (for example, a %USERNAME% icacls
+    cannot resolve), both identities open the store because nothing was re-secured. That result is
+    true of this host and not of every host, so it prints GREEN (CONDITIONAL) with a warning
+    annotation naming what was not restricted, rather than a plain GREEN.
+
+    The start gates are satisfied with synthetic values: a store key minted by `gen-key`, an SMTP
+    relay on loopback that nothing listens on (the start gates read configuration only; nothing
+    connects at start), bounded retention, and deny-by-default egress. Sign-in stays REQUIRED.
+
+    Run elevated on a disposable Windows host, as the windows-service-smoke CI job does. It
+    installs and uninstalls the service and creates -DataDir from scratch.
+
+.PARAMETER Order
+    ProvisionFirst or StartFirst.
+
+.PARAMETER DataDir
+    A data directory this script owns for the run. It is DELETED first if it exists.
+
+.EXAMPLE
+    .\measure-store-access.ps1 -Order ProvisionFirst -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][ValidateSet("ProvisionFirst", "StartFirst")][string]$Order,
+    [Parameter(Mandatory)][string]$DataDir,
+    [string]$ServiceName = "MessageFoundry",
+    [string]$AppExe,
+    [int]$Port = 8765,
+    [int]$MllpPort = 2699,
+    [int]$WaitSeconds = 120
+)
+
+$ErrorActionPreference = "Stop"
+# Absolute before anything consumes it: install-service.ps1 resolves a relative -DataDir against
+# $PWD, while the operator's CLI runs from the repository root, so a relative path here would put
+# the two identities on two different stores.
+$DataDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DataDir)
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$ServiceIdentity = "NT SERVICE\$ServiceName"
+$Operator = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$DbPath = Join-Path $DataDir "messagefoundry.db"
+$LogDir = Join-Path $DataDir "logs"
+$CertPath = Join-Path $DataDir "api-generated-cert.pem"
+$Username = "w0admin"
+$Email = "w0-admin@example.invalid"
+# The ADR 0167 gate's own words (messagefoundry/api/app.py, _assert_security_notice_is_deliverable),
+# and the words provision_first_administrator declines with (messagefoundry/auth/service.py). If
+# either is reworded, the arm goes RED on a missing proof rather than passing on a stale one.
+$GateRefusal = "no enabled Administrator has a notification address"
+$ProvisionDecline = "already has an enabled Administrator"
+$OpenErrorPattern = "unable to open database file|Access is denied|PermissionError|OperationalError"
+# store.py logs these and carries on; each means the trio was NOT re-secured by that open.
+$RestrictFailPattern = "could not restrict|could not determine current user"
+$EngineImages = @("python.exe", "pythonw.exe", "messagefoundry.exe")
+
+$Failures = New-Object System.Collections.ArrayList
+$Readings = New-Object System.Collections.ArrayList
+$Conditions = New-Object System.Collections.ArrayList
+$OwnersSeen = @{}
+
+function Format-Annotation([string]$Text) {
+    # GitHub workflow-command data must escape these three, or a multi-line message is cut at the
+    # first newline and the rest prints as ordinary log lines nobody reads as part of the annotation.
+    return $Text.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+}
+
+function Add-Failure([string]$Message) {
+    [void]$Failures.Add($Message)
+    Write-Host "::error title=ADR 0183 Wave 0 ($Order)::$(Format-Annotation $Message)"
+}
+
+function Add-Reading([string]$Message) {
+    [void]$Readings.Add($Message)
+    Write-Host "READING: $Message"
+}
+
+function Add-Condition([string]$Message) {
+    [void]$Conditions.Add($Message)
+    Write-Host "CONDITION: $Message"
+}
+
+function Get-Excerpt([string]$Text, [int]$Max = 400) {
+    $flat = ($Text -replace "\s+", " ").Trim()
+    if ($flat.Length -gt $Max) { return $flat.Substring(0, $Max) + " ..." }
+    return $flat
+}
+
+function New-SyntheticPassword {
+    # Synthetic and per run: never a literal in the repository, never printed, never on argv.
+    $bytes = New-Object byte[] 48
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return (([Convert]::ToBase64String($bytes)) -replace "[^A-Za-z0-9]", "").Substring(0, 32)
+}
+
+function Get-Sid([string]$Account) {
+    try {
+        return ([Security.Principal.NTAccount]$Account).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+    } catch { return $null }
+}
+
+function Get-ServiceSids {
+    # The virtual account plus groups a service token carries that could appear on a DACL: Everyone,
+    # Authenticated Users, SERVICE, Users, LOCAL and NT SERVICE\ALL SERVICES.
+    $sids = @("S-1-1-0", "S-1-5-11", "S-1-5-6", "S-1-5-32-545", "S-1-2-0", "S-1-5-80-0")
+    $own = Get-Sid $ServiceIdentity
+    if ($own) { $sids += $own }
+    return $sids
+}
+
+function Get-OperatorSids {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $sids = @($id.User.Value)
+    foreach ($g in $id.Groups) { $sids += $g.Value }
+    return $sids
+}
+
+function Get-TrioReport {
+    <#
+      For each file of the trio: absent, or its owner, whether inheritance is removed (protected),
+      its entries, and whether the entries naming $Identity (through $IdentitySids) allow both read
+      and write data without a matching deny. A DACL the caller cannot read is reported as such,
+      because an identity refused READ_CONTROL on the file is itself the finding.
+    #>
+    param([string]$Identity, [string[]]$IdentitySids)
+    $need = [int]([Security.AccessControl.FileSystemRights]::ReadData -bor
+        [Security.AccessControl.FileSystemRights]::WriteData)
+    $lines = @()
+    $missing = @()
+    foreach ($suffix in "", "-wal", "-shm") {
+        $f = "$DbPath$suffix"
+        $name = Split-Path -Leaf $f
+        if (-not (Test-Path -LiteralPath $f)) { $lines += "$name absent"; continue }
+        try {
+            $acl = Get-Acl -LiteralPath $f
+        } catch {
+            $lines += "$name DACL unreadable by $Operator ($($_.Exception.Message))"
+            $missing += $name
+            continue
+        }
+        $aces = @()
+        $allowed = 0
+        $denied = 0
+        foreach ($rule in $acl.Access) {
+            $sid = "$($rule.IdentityReference)"
+            try {
+                $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+            } catch { }
+            $kind = if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) { "DENY " } else { "" }
+            $aces += "$kind$($rule.IdentityReference):$($rule.FileSystemRights)"
+            if ($IdentitySids -notcontains $sid) { continue }
+            if ($kind) { $denied = $denied -bor [int]$rule.FileSystemRights }
+            else { $allowed = $allowed -bor [int]$rule.FileSystemRights }
+        }
+        $grantsRw = (($allowed -band $need) -eq $need) -and (($denied -band $need) -eq 0)
+        $verdict = if ($grantsRw) { "grants $Identity read+write" }
+                   elseif ($allowed -ne 0) { "names $Identity WITHOUT read+write" }
+                   else { "NO entry for $Identity" }
+        $lines += ("$name owner=$($acl.Owner) protected=$($acl.AreAccessRulesProtected) " +
+            "aces=[$($aces -join '; ')] $verdict")
+        if (-not $grantsRw) { $missing += $name }
+    }
+    return New-Object PSObject -Property @{ Text = ($lines -join " | "); Missing = $missing }
+}
+
+function Get-LogMatches {
+    <#
+      Lines matching $Pattern in the service logs. Top level only by default: earlier phases are moved
+      into subdirectories, so a match there belongs to this phase. Read through Get-Content, which
+      opens with read-write sharing, because NSSM may still hold the file open for writing; a reader
+      that hit a sharing violation here would return nothing and turn a success into a timeout.
+    #>
+    param([string]$Pattern, [switch]$Recurse)
+    if (-not (Test-Path -LiteralPath $LogDir)) { return @() }
+    $files = @(Get-ChildItem -LiteralPath $LogDir -File -Filter "*.log" -Recurse:$Recurse)
+    $found = @()
+    foreach ($f in $files) {
+        $lines = @(Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue)
+        if ($lines.Count -gt 0) { $found += @($lines | Select-String -Pattern $Pattern) }
+    }
+    return $found
+}
+
+function Get-Attribution {
+    <#
+      One sentence for a red: which trio files carry no read+write grant for $Identity, whether the
+      log shows an open failure, and the trio itself. Stated as readings so a red caused by something
+      other than file access (a start gate, a port) is not dressed up as one.
+    #>
+    param([string]$Identity, [string[]]$IdentitySids, [string]$Output)
+    $trio = Get-TrioReport -Identity $Identity -IdentitySids $IdentitySids
+    $files = if ($trio.Missing.Count -gt 0) { "Trio file(s) granting $Identity no read+write: $($trio.Missing -join ', ')." }
+             else { "Every present trio file grants $Identity read+write, so the cause is probably NOT file access; read the output below." }
+    $hits = @(Get-LogMatches $OpenErrorPattern | Select-Object -First 3 | ForEach-Object { Get-Excerpt $_.Line 240 })
+    if ($Output -and $Output -match $OpenErrorPattern) { $hits += "operator CLI: " + (Get-Excerpt $Output 240) }
+    $log = if ($hits.Count -gt 0) { "Open-failure evidence: $($hits -join ' || ')." }
+           else { "No open-failure line was found in the service log or the CLI output." }
+    $out = if ($Output) { " Output: $(Get-Excerpt $Output)." } else { "" }
+    return "$files $log Trio: $($trio.Text).$out"
+}
+
+function Show-Trio([string]$Label) {
+    Write-Host "===== trio DACL after: $Label ====="
+    foreach ($suffix in "", "-wal", "-shm") {
+        $f = "$DbPath$suffix"
+        if (Test-Path -LiteralPath $f) { & icacls $f | Out-Host } else { Write-Host "$f (absent)" }
+    }
+}
+
+function Test-Resecured([string]$Identity, [string]$Output) {
+    <#
+      Did this identity's open re-secure the store? store.py strips inheritance when it succeeds, so
+      a .db still inheriting, or a restriction warning in the logs or the CLI output, means it did
+      not. A DACL this caller cannot read was restricted to somebody else, which counts as secured.
+    #>
+    $notes = @()
+    if (Test-Path -LiteralPath $DbPath) {
+        try {
+            if (-not (Get-Acl -LiteralPath $DbPath).AreAccessRulesProtected) {
+                $notes += "the .db still inherits its directory's entries"
+            }
+        } catch { }
+    }
+    foreach ($m in (Get-LogMatches -Pattern $RestrictFailPattern | Select-Object -First 2)) {
+        $notes += "service log: $(Get-Excerpt $m.Line 200)"
+    }
+    if ($Output -and $Output -match $RestrictFailPattern) { $notes += "CLI: $(Get-Excerpt $Output 200)" }
+    if ($notes.Count -gt 0) {
+        Add-Condition "$Identity's open did not re-secure the store: $($notes -join '; ')"
+    }
+}
+
+function Show-LogTail {
+    if (-not (Test-Path -LiteralPath $LogDir)) { Write-Host "(no log directory)"; return }
+    foreach ($f in (Get-ChildItem -LiteralPath $LogDir -File -Filter "*.log")) {
+        Write-Host "===== $($f.Name) (tail) ====="
+        Get-Content -LiteralPath $f.FullName -Tail 40 | Out-Host
+    }
+}
+
+function Move-PhaseLogs([string]$Phase) {
+    if (-not (Test-Path -LiteralPath $LogDir)) { return }
+    $dest = Join-Path $LogDir $Phase
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    Get-ChildItem -LiteralPath $LogDir -File | Move-Item -Destination $dest -Force
+}
+
+function Get-ServiceProcess {
+    <#
+      Every process under the service's root process, as {Name, Account}. A child must be at least as
+      new as its parent: a process whose parent id was merely REUSED by the root is not under it.
+    #>
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"
+    if (-not $svc -or [int]$svc.ProcessId -eq 0) { return @() }
+    $all = @(Get-CimInstance Win32_Process)
+    $root = $all | Where-Object { [int]$_.ProcessId -eq [int]$svc.ProcessId } | Select-Object -First 1
+    if (-not $root) { return @() }
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue($root)
+    $seen = @{}
+    $result = @()
+    while ($queue.Count -gt 0) {
+        $proc = $queue.Dequeue()
+        if ($seen.ContainsKey([int]$proc.ProcessId)) { continue }
+        $seen[[int]$proc.ProcessId] = $true
+        $account = "unreadable"
+        try {
+            $o = Invoke-CimMethod -InputObject $proc -MethodName GetOwner
+            if ($o.ReturnValue -eq 0) { $account = "$($o.Domain)\$($o.User)" }
+        } catch { }
+        $result += New-Object PSObject -Property @{ Name = "$($proc.Name)"; Account = $account }
+        foreach ($child in ($all | Where-Object {
+                    [int]$_.ParentProcessId -eq [int]$proc.ProcessId -and $_.CreationDate -ge $proc.CreationDate })) {
+            $queue.Enqueue($child)
+        }
+    }
+    return $result
+}
+
+function Update-OwnerSample([string]$When) {
+    # Record every sampled process's account. Any account other than the virtual account is a red:
+    # the arm would then not be measuring the default virtual account at all.
+    foreach ($p in @(Get-ServiceProcess)) {
+        $key = "$($p.Name)=$($p.Account)"
+        if ($OwnersSeen.ContainsKey($key)) { continue }
+        $OwnersSeen[$key] = $true
+        Add-Reading "service process $key ($When)"
+        if ($p.Account -eq "unreadable") { continue }
+        if ($p.Account -ne $ServiceIdentity) {
+            Add-Failure ("a process under service '$ServiceName' ($($p.Name)) runs as '$($p.Account)', " +
+                "not $ServiceIdentity ($When), so this arm is not measuring the default virtual account")
+        }
+    }
+}
+
+function Test-EngineSampled {
+    foreach ($k in $OwnersSeen.Keys) {
+        if ($EngineImages -contains (($k -split "=", 2)[0]).ToLowerInvariant()) { return $true }
+    }
+    return $false
+}
+
+function Stop-TheService {
+    <#
+      Stop the service and CONFIRM it: the SCM reports Stopped, and no process still names this store
+      on its command line (the SCM reports process id 0 once stopped, so it cannot name an orphaned
+      engine child). Throws when either fails, because every later phase would race a live engine
+      that re-secures the trio each time NSSM restarts it.
+    #>
+    $global:LASTEXITCODE = $null
+    & $Nssm stop $ServiceName | Out-Host
+    $deadline = (Get-Date).AddSeconds(60)
+    while ($true) {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -eq "Stopped") { break }
+        if ((Get-Date) -ge $deadline) {
+            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Stopped") {
+                throw "service '$ServiceName' is still '$($svc.Status)' 60 s after the stop"
+            }
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    $deadline = (Get-Date).AddSeconds(30)
+    while ($true) {
+        $alive = @(Get-CimInstance Win32_Process | Where-Object {
+            $_.CommandLine -and $_.CommandLine.IndexOf($DbPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            $EngineImages -contains $_.Name.ToLowerInvariant() })
+        if ($alive.Count -eq 0) { return }
+        if ((Get-Date) -ge $deadline) {
+            throw ("an engine process (pid $($alive[0].ProcessId)) still names $DbPath 30 s after the " +
+                "service stopped; the next open would race it")
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+function Invoke-OperatorCli {
+    <#
+      Run the Python probe as THIS identity. Start-Process with redirected files, because a native
+      stderr merge under Windows PowerShell 5.1 and ErrorActionPreference=Stop aborts the script.
+      Secrets reach the child through its inherited environment, never argv, and are cleared after.
+    #>
+    param([string[]]$Arguments, [hashtable]$Secrets)
+    $out = Join-Path $Work "cli.out.txt"
+    $err = Join-Path $Work "cli.err.txt"
+    foreach ($k in $Secrets.Keys) { Set-Item -Path "Env:$k" -Value $Secrets[$k] }
+    try {
+        $quoted = @("`"$Probe`"") + ($Arguments | ForEach-Object { "`"$_`"" })
+        $p = Start-Process -FilePath $Python -ArgumentList ($quoted -join " ") -WorkingDirectory $RepoRoot `
+            -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru
+        $code = $p.ExitCode
+    } finally {
+        foreach ($k in $Secrets.Keys) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
+    }
+    $text = ((Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue) + "`n" +
+        (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue)).Trim()
+    Write-Host "----- operator CLI ($($Arguments[0])) exit=$code -----"
+    Write-Host $text
+    return New-Object PSObject -Property @{ Code = $code; Text = $text }
+}
+
+function Wait-ForGateRefusal([string]$Phase) {
+    <#
+      Wait until the service logs the ADR 0167 refusal, which it reaches only after opening the store
+      and reading its users. Samples process owners throughout, since NSSM restarts the refused engine
+      and each restart is a new process. Returns $true on the refusal, $false on timeout.
+    #>
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Update-OwnerSample "during $Phase"
+        if ((Get-LogMatches ([regex]::Escape($GateRefusal))).Count -gt 0) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Test-ServiceServes([string]$Phase, [string]$StoreOrigin) {
+    <#
+      The engine is up on this store and a session can be had: /health over https pinned to the
+      engine's own certificate, then sign-in as the provisioned administrator. The engine process
+      itself must be among the sampled processes, so the identity check cannot pass on nssm.exe alone.
+    #>
+    $h = Invoke-OperatorCli -Arguments @("health", $BaseUrl, $CertPath, "$WaitSeconds") -Secrets @{}
+    for ($i = 0; $i -lt 3; $i++) { Update-OwnerSample "during $Phase"; Start-Sleep -Seconds 1 }
+    if ($h.Code -ne 0) {
+        Add-Failure ("$ServiceIdentity did not answer /health within $WaitSeconds s on $DbPath, which " +
+            "$StoreOrigin ($Phase). " + (Get-Attribution $ServiceIdentity (Get-ServiceSids) $h.Text))
+        Show-LogTail
+        return
+    }
+    if (-not (Test-EngineSampled)) {
+        Add-Failure ("the engine answered /health but no engine process ($($EngineImages -join ', ')) " +
+            "was found under service '$ServiceName' ($Phase), so its run-as account is unverified")
+    }
+    $l = Invoke-OperatorCli -Arguments @("login", $BaseUrl, $CertPath, $Username) `
+        -Secrets @{ MEFOR_W0_ADMIN_PASSWORD = $Password }
+    if ($l.Code -ne 0) {
+        Add-Failure ("$ServiceIdentity served /health on $DbPath ($Phase), but signing in as " +
+            "'$Username' did not yield a session. Output: $(Get-Excerpt $l.Text)")
+        return
+    }
+    Add-Reading "$ServiceIdentity opened $DbPath, which $StoreOrigin, and sign-in as '$Username' yielded a session ($Phase)"
+}
+
+# --- setup ------------------------------------------------------------------------------------------
+$principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "measure-store-access.ps1 installs a service and must run elevated."
+}
+if (-not $AppExe) { $AppExe = (Get-Command messagefoundry).Source }
+$Python = (Get-Command python).Source
+$Nssm = (Get-Command nssm).Source
+$TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+$Work = Join-Path $TempRoot "w0-store-access-$Order"
+$ConfigDir = Join-Path $TempRoot "w0-store-access-config"
+$Probe = Join-Path $Work "probe.py"
+
+if (Test-Path -LiteralPath $DataDir) { Remove-Item -LiteralPath $DataDir -Recurse -Force }
+Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $Work | Out-Null
+New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+
+# The smallest graph `serve` accepts: one loopback MLLP inbound whose router selects nothing. The
+# measurement is store access, so no connector the store question does not need is wired.
+$ConfigModule = @'
+from messagefoundry import MLLP, inbound, router
+
+inbound("IB_W0_STORE_ACCESS", MLLP(port=__MLLP_PORT__), router="w0_store_access_router")
+
+
+@router("w0_store_access_router")
+def route(msg):
+    return []
+'@
+Set-Content -LiteralPath (Join-Path $ConfigDir "IB_W0_STORE_ACCESS.py") -Encoding Ascii `
+    -Value ($ConfigModule -replace "__MLLP_PORT__", "$MllpPort")
+
+# The probe. `provision` replaces ONLY _read_new_password, then runs the real CLI entry point, so
+# settings, the at-rest gate, open_store(create=True) and provision_first_administrator are the
+# shipped code path. `health` and `login` speak https pinned to the engine's own minted certificate.
+$ProbeSource = @'
+import json
+import os
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+def _provision(argv):
+    import messagefoundry.__main__ as cli
+
+    password = os.environ.pop("MEFOR_W0_ADMIN_PASSWORD")
+
+    def _read_new_password(prompt):
+        return password
+
+    cli._read_new_password = _read_new_password
+    return cli.main(["provision-admin", *argv])
+
+
+def _call(method, url, cafile, body=None, token=None):
+    ctx = ssl.create_default_context(cafile=cafile)
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+
+
+def _health(base, cafile, seconds):
+    # Retries inside one process until the deadline; the certificate is minted during startup, so
+    # early misses are ordinary. Prints the last outcome only.
+    deadline = time.monotonic() + float(seconds)
+    last = "never tried"
+    while time.monotonic() < deadline:
+        try:
+            status, _ = _call("GET", base + "/health", cafile)
+        except (OSError, ssl.SSLError) as exc:
+            last = f"unreachable: {exc}"
+        else:
+            if status == 200:
+                print("health status=200")
+                return 0
+            last = f"status={status}"
+        time.sleep(2)
+    print(f"health never answered 200 in {seconds} s; last: {last}")
+    return 1
+
+
+def _login(base, cafile, username):
+    password = os.environ.pop("MEFOR_W0_ADMIN_PASSWORD")
+    status, text = _call(
+        "POST", base + "/auth/login", cafile, {"username": username, "password": password}
+    )
+    print(f"login status={status}")
+    if status != 200:
+        print(f"login body={text[:300]}")
+        return 1
+    token = json.loads(text).get("token") or ""
+    if not token:
+        print("login answered 200 with no session token")
+        return 1
+    status, text = _call("GET", base + "/auth/me", cafile, token=token)
+    print(f"me status={status}")
+    return 0 if status == 200 else 1
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1]
+    if mode == "provision":
+        sys.exit(_provision(sys.argv[2:]))
+    if mode == "health":
+        sys.exit(_health(sys.argv[2], sys.argv[3], sys.argv[4]))
+    if mode == "login":
+        sys.exit(_login(sys.argv[2], sys.argv[3], sys.argv[4]))
+    sys.exit("unknown mode " + mode)
+'@
+Set-Content -LiteralPath $Probe -Value $ProbeSource -Encoding Ascii
+
+$StoreKey = (& $AppExe gen-key).Trim()
+if (-not $StoreKey) { throw "messagefoundry gen-key produced no store key" }
+$Password = New-SyntheticPassword
+if ($env:GITHUB_ACTIONS -eq "true") {
+    # Both are synthetic and per run. Masked anyway, so no later echo can print either in clear.
+    Write-Host "::add-mask::$StoreKey"
+    Write-Host "::add-mask::$Password"
+}
+$BaseUrl = "https://127.0.0.1:$Port"
+
+Write-Host "===== ADR 0183 Wave 0: $Order, operator=$Operator, service=$ServiceIdentity ====="
+Write-Host "store: $DbPath"
+
+try {
+    # --- install under the DEFAULT virtual account (no -ServiceAccount, no -AllowLocalSystem) ------
+    & (Join-Path $PSScriptRoot "install-service.ps1") -ServiceName $ServiceName -AppExe $AppExe `
+        -Config $ConfigDir -DataDir $DataDir -Port $Port -LogLevel INFO -Environment prod -LockConfigDir
+    $startName = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").StartName
+    Add-Reading "SCM run-as account for '$ServiceName' is '$startName'"
+    if ($startName -ne $ServiceIdentity) {
+        throw ("the service is configured to run as '$startName', not $ServiceIdentity; this arm " +
+            "would not measure the default virtual account, so it measures nothing")
+    }
+    # The key reaches the service the way the auth-off smoke above passes its own: NSSM's
+    # AppEnvironmentExtra, which docs/SERVICE.md documents. It is synthetic, per run, and masked.
+    $global:LASTEXITCODE = $null
+    & $Nssm set $ServiceName AppEnvironmentExtra `
+        "MEFOR_STORE_ENCRYPTION_KEY=$StoreKey" `
+        "MEFOR_ALERTS_EMAIL_SMTP_HOST=127.0.0.1" `
+        "MEFOR_ALERTS_EMAIL_SMTP_PORT=2525" `
+        "MEFOR_ALERTS_EMAIL_FROM=mefor-w0@example.invalid" `
+        "MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30" `
+        "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
+        "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true" | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "nssm set AppEnvironmentExtra failed (exit $LASTEXITCODE)" }
+
+    $provisionArgs = @("provision", "--username", $Username, "--email", $Email, "--db", $DbPath, "--json")
+    $cliSecrets = @{ MEFOR_STORE_ENCRYPTION_KEY = $StoreKey; MEFOR_W0_ADMIN_PASSWORD = $Password }
+
+    if ($Order -eq "ProvisionFirst") {
+        # 1. The operator provisions the fresh store.
+        $r = Invoke-OperatorCli -Arguments $provisionArgs -Secrets $cliSecrets
+        Show-Trio "operator provisioned"
+        if ($r.Code -ne 0) {
+            Add-Failure ("$Operator could not provision the fresh store $DbPath through provision-admin " +
+                "(exit $($r.Code)). " + (Get-Attribution $Operator (Get-OperatorSids) $r.Text))
+        } else {
+            Test-Resecured $Operator $r.Text
+            # 2 and 3. The service starts on the store the operator created and secured, and serves.
+            Move-PhaseLogs "before-start"
+            & $Nssm start $ServiceName | Out-Host
+            Test-ServiceServes "the start" "$Operator provisioned"
+            Stop-TheService
+            Show-Trio "service started"
+            Test-Resecured $ServiceIdentity ""
+        }
+    } else {
+        # 1. The service starts first on a fresh store and is refused by the ADR 0167 gate.
+        Move-PhaseLogs "before-first-start"
+        & $Nssm start $ServiceName | Out-Host
+        $opened = Wait-ForGateRefusal "the first start"
+        Stop-TheService
+        Show-Trio "service first start"
+        if (-not $opened -or -not (Test-Path -LiteralPath $DbPath)) {
+            Add-Failure ("$ServiceIdentity never reached the account gate on a fresh store in " +
+                "$WaitSeconds s, so it did not create and open $DbPath. " +
+                (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
+            Show-LogTail
+        } else {
+            Add-Reading "$ServiceIdentity created and opened $DbPath, then the ADR 0167 gate refused it (expected)"
+            Test-Resecured $ServiceIdentity ""
+            # 2. The operator opens that store through the CLI's path.
+            $r = Invoke-OperatorCli -Arguments $provisionArgs -Secrets $cliSecrets
+            Show-Trio "operator open"
+            $provisioned = ($r.Code -eq 0)
+            $declined = ($r.Text -match [regex]::Escape($ProvisionDecline))
+            if (-not ($provisioned -or $declined)) {
+                Add-Failure ("$Operator could not open $DbPath, which $ServiceIdentity created and " +
+                    "secured, through provision-admin's open path (exit $($r.Code)). " +
+                    (Get-Attribution $Operator (Get-OperatorSids) $r.Text))
+                Add-Reading "the restart phase was not run: the operator never opened the store, so nothing re-secured it"
+            } else {
+                $how = if ($provisioned) { "and provisioned it (no bootstrap account existed)" }
+                       else { "and provision-admin declined on the bootstrap Administrator (expected)" }
+                Add-Reading "$Operator opened $DbPath $how"
+                Test-Resecured $Operator $r.Text
+                # 3. The service starts again on the store the operator's open re-secured.
+                Move-PhaseLogs "before-restart"
+                & $Nssm start $ServiceName | Out-Host
+                if ($provisioned) {
+                    # An addressed Administrator now exists, so the gate passes: prove the open by serving.
+                    Test-ServiceServes "the restart" "$Operator's open re-secured"
+                    Stop-TheService
+                } else {
+                    $reopened = Wait-ForGateRefusal "the restart"
+                    Stop-TheService
+                    if (-not $reopened) {
+                        Add-Failure ("$ServiceIdentity could not open $DbPath after $Operator's open " +
+                            "re-secured it: the restart never reached the account gate in $WaitSeconds s. " +
+                            (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
+                        Show-LogTail
+                    } else {
+                        Add-Reading "$ServiceIdentity reopened $DbPath after $Operator's open"
+                    }
+                }
+                Show-Trio "service restart"
+            }
+        }
+    }
+} catch {
+    $detail = if (Test-Path -LiteralPath $DbPath) { " Trio: $((Get-TrioReport -Identity $ServiceIdentity -IdentitySids (Get-ServiceSids)).Text)" } else { "" }
+    Add-Failure "the $Order arm stopped before its measurement finished: $($_.Exception.Message).$detail"
+    Show-LogTail
+} finally {
+    try {
+        if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+            & (Join-Path $PSScriptRoot "uninstall-service.ps1") -ServiceName $ServiceName -DataDir $DataDir
+        }
+    } catch {
+        Write-Host "::warning title=ADR 0183 Wave 0 ($Order)::$(Format-Annotation "uninstall after the arm failed, so the next arm may find this registration: $($_.Exception.Message)")"
+    }
+    Remove-Item -LiteralPath $Probe -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "===== ADR 0183 Wave 0 summary: $Order ====="
+foreach ($r in $Readings) { Write-Host "READING: $r" }
+foreach ($c in $Conditions) { Write-Host "CONDITION: $c" }
+if ($Failures.Count -gt 0) {
+    foreach ($f in $Failures) { Write-Host "RED: $f" }
+    throw "RED [$Order]: $($Failures.Count) failure(s); the first: $($Failures[0])"
+}
+if ($Conditions.Count -gt 0) {
+    $why = "both identities opened the store, but at least one open did not re-secure it, so this order did not test ADR 0163's reading on this host: $($Conditions -join ' / ')"
+    Write-Host "::warning title=ADR 0183 Wave 0 ($Order) GREEN (CONDITIONAL)::$(Format-Annotation $why)"
+    Write-Host "GREEN (CONDITIONAL) [$Order]: $why"
+} else {
+    Write-Host "GREEN [$Order]: both identities opened the store in this order, and each open re-secured it."
+}
+# The Actions wrapper exits with $LASTEXITCODE, which the last native command (nssm, icacls) set.
+exit 0
