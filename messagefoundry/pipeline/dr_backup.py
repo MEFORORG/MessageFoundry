@@ -1710,8 +1710,9 @@ def _restore_blocking(
         # destination's parent grants on Windows, and the two files staged inside it are the whole
         # decrypted archive and the whole store -- both full-body PHI at rest (docs/PHI.md section 3).
         # So each is locked to its owner with the store's own primitive the moment it exists and
-        # before its first byte is written, the same call `_place_restored_store` makes on the file it
-        # publishes. Best-effort and non-fatal, per that primitive's contract.
+        # before its first byte is written. Best-effort and non-fatal, per that primitive's contract.
+        # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b);
+        # these staging copies still grant the operator's user SID, a follow-up recorded in ADR 0163.
         with tempfile.TemporaryDirectory(
             prefix="mefor-restore-", dir=dest_store_path.parent
         ) as tmp:

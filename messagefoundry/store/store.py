@@ -2799,10 +2799,12 @@ _SERVICE_RIGHTS = "0x1301bf"
 @dataclass(frozen=True)
 class _SddlDacl:
     """A security descriptor read from SDDL: its owner (when requested), whether the DACL blocks
-    inheritance, and each ACE as (type, flags, sid) with SYSTEM/Administrators aliases resolved."""
+    inheritance, and each ACE as (type, flags, rights, sid) with SYSTEM/Administrators aliases
+    resolved. Rights are kept as SDDL writes them (``FA``, ``0x1301bf``), because the hardening test
+    and the exactness test both compare them."""
 
     protected: bool
-    aces: tuple[tuple[str, str, str], ...]
+    aces: tuple[tuple[str, str, str, str], ...]
     owner: str | None = None
 
 
@@ -2829,13 +2831,13 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
     flags = body if first < 0 else body[:first]
     if "NO_ACCESS_CONTROL" in flags:
         return None
-    aces: list[tuple[str, str, str]] = []
+    aces: list[tuple[str, str, str, str]] = []
     rest = body[first:] if first >= 0 else ""
     for match in _SDDL_ACE.finditer(rest):
         parts = match.group(1).split(";")
         if len(parts) != 6:
             return None
-        aces.append((parts[0], parts[1], _resolve_sid(parts[5])))
+        aces.append((parts[0], parts[1], parts[2].upper(), _resolve_sid(parts[5])))
     # Anything left over once the ACEs are removed is a shape this parser does not model.
     if _SDDL_ACE.sub("", rest).strip():
         return None
@@ -2845,26 +2847,31 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
 def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
     """The principals the trio is granted when ``directory`` is HARDENED, else ``None``.
 
-    Hardened means all of: inheritance blocked; every ACE an ALLOW ACE naming SYSTEM, Administrators,
-    or ONE per-service account (a second one is refused: the data directory has one run-as account);
-    no deny ACE, because the trio's DACL does not carry the directory's denies over, so honouring
-    them is only possible by refusing; an owner of SYSTEM, Administrators or that service account,
-    because an owner keeps WRITE_DAC over the directory; and at least one allow ACE.
+    Hardened means the directory is exactly what install-service.ps1's Set-SecureDataDirAcl writes:
+    inheritance blocked; every ACE an allow with the installer's own inheritance (``OICI``) and
+    rights -- full control (``FA``) for SYSTEM and Administrators, Modify (``0x1301bf``) for ONE
+    per-service account -- and nothing else; no deny ACE, because the trio's DACL does not carry
+    denies over; an owner of SYSTEM, Administrators or that service account, because an owner keeps
+    WRITE_DAC over the directory; and at least one ACE.
 
-    The answer names only principals the directory itself allows, never who happens to be opening.
-    RIGHTS are not derived: the trio always gets full control for SYSTEM and Administrators and
-    Modify for the service, which is what install-service.ps1 grants on the directory."""
+    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
+    written with FA/Modify: a directory granting Administrators read, or a service container-only,
+    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
+    but the installer's falls back to the owner-only rewrite. The answer names only principals the
+    directory allows, never who happens to be opening."""
     if not directory.protected or not directory.aces:
         return None
     named: set[str] = set()
     services: set[str] = set()
-    for ace_type, _flags, sid in directory.aces:
-        if ace_type != "A":
+    for ace_type, flags, rights, sid in directory.aces:
+        if ace_type != "A" or _sddl_flag_set(flags) != {"OI", "CI"}:
             return None
         if sid in _STORE_DIR_TRUSTED_SIDS:
+            if rights != _TRIO_RIGHTS[sid]:
+                return None
             named.add(sid)
             continue
-        if not _SERVICE_SID.fullmatch(sid):
+        if not _SERVICE_SID.fullmatch(sid) or rights != _SERVICE_RIGHTS.upper():
             return None
         services.add(sid)
     if len(services) > 1:
@@ -2876,20 +2883,28 @@ def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
     return (*(sid for sid in _STORE_DIR_TRUSTED_SIDS if sid in named), *sorted(services))
 
 
+def _sddl_flag_set(flags: str) -> set[str]:
+    """SDDL ACE flags are two-letter tokens run together (``OICI``, ``OICIID``); split them."""
+    return {flags[i : i + 2] for i in range(0, len(flags), 2)}
+
+
 def _trio_dacl_is_exact(dacl: _SddlDacl, grants: Sequence[str]) -> bool:
-    """Does this file already carry exactly ``grants``: a protected DACL of explicit allow ACEs, one
-    per principal, and an OWNER among them? The owner matters because an owner keeps READ_CONTROL and
-    WRITE_DAC whatever the DACL says, so a file owned by anyone else could be re-granted by that owner
-    (measured). ``dacl.owner`` is ``None`` when the owner was not read, which is never exact. Rights
-    are not compared; a weakened right fails the open loudly, not silently."""
+    """Does this file already carry exactly ``grants``: a protected DACL of explicit allow ACEs (no
+    inheritance flags), one per principal, each with exactly the right the trio writes, and an OWNER
+    among them? Rights are compared so a broadened entry (the service holding FA, say) is rewritten
+    rather than accepted. The owner matters because an owner keeps READ_CONTROL and WRITE_DAC
+    whatever the DACL says, so a file owned by anyone else could be re-granted by that owner
+    (measured). ``dacl.owner`` is ``None`` when the owner was not read, which is never exact."""
     if not dacl.protected or len(dacl.aces) != len(grants):
         return False
     if dacl.owner is None or dacl.owner not in grants:
         return False
-    for ace_type, flags, _sid in dacl.aces:
-        if ace_type != "A" or "ID" in flags:
+    for ace_type, flags, rights, sid in dacl.aces:
+        if ace_type != "A" or flags:
             return False
-    return {sid for _t, _f, sid in dacl.aces} == set(grants)
+        if rights != _TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS).upper():
+            return False
+    return {sid for _t, _f, _r, sid in dacl.aces} == set(grants)
 
 
 def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:

@@ -210,7 +210,8 @@ does resolve for `icacls`; the lockout is the design working as written, not a f
 reads the directory's owner and DACL as SDDL. The directory counts as HARDENED when all of these hold:
 inheritance is removed; every entry is an ALLOW naming SYSTEM, `BUILTIN\Administrators` or ONE
 per-service virtual account (`S-1-5-80-` plus five sub-authorities, which excludes `ALL SERVICES`), so
-a directory carrying any deny entry is refused; the owner is SYSTEM, Administrators or that service
+each with the installer's own inheritance (`OICI`) and rights (`FA` for SYSTEM and
+Administrators, `0x1301bf` for the service), so any other right, inheritance or deny entry is refused; the owner is SYSTEM, Administrators or that service
 account; and no component of the path is a reparse point (junction, symlink, mount point). There every
 open writes the same explicit, protected DACL on each file in one `SetNamedSecurityInfoW` call, naming
 only the principals the directory allows: full control for SYSTEM and Administrators, Modify for the
@@ -230,15 +231,36 @@ An earlier cut of this change let the files INHERIT the directory; adversarial c
 because a later edit to the directory then reached the store, and a file moved in kept stale entries
 still marked inherited (measured). The explicit, protected DACL closes both.
 
-**What it widens, stated plainly.** Before, a store file granted its last opener alone. Now, in a
-hardened directory, it grants SYSTEM, the one service account, and `BUILTIN\Administrators` when the
-directory grants that group. That is wider than "the service account plus the operator who provisioned
-it", and the group reaches more than elevated sessions: at least every elevated local session of a
-member, the built-in Administrator account (Admin Approval Mode is off for it by default), and domain
-members of the group over a network logon, which is not UAC-filtered. Those principals already hold
-Full Control on the data directory and on its logs, a PHI sink of the same class, and an Administrator
-can take ownership of any file, so no capability is new; but the DACL now says so, and this may be an
-owner question. Because the DACL is protected, a later edit to the directory does not reach the store.
+**What it widens and narrows, and the decision.** Before, a store file granted its last opener alone.
+Now, in a hardened directory, it grants SYSTEM, the one service account, and `BUILTIN\Administrators`,
+each with exactly the right the installer grants on the directory; a directory granting any other
+right or inheritance shape is not hardened (the parser pins `OICI` with `FA` and `0x1301bf`).
+
+- **Narrowing, the strongest fact.** A UAC-filtered session carries Administrators as a DENY-ONLY
+  group, so the Administrators entry grants it nothing. The old rewrite granted the opener's own user
+  SID, which stays enabled in a filtered token, so an operator's later non-elevated sessions could
+  read the store they provisioned. Under this change they cannot.
+- **Widening, in reach.** Administrators whose token carries the group ENABLED can now read the store
+  through an explicit entry: at least elevated sessions of a member, the built-in Administrator
+  account (Admin Approval Mode is off for it by default), and domain members of the group over a
+  network logon, which is not UAC-filtered. No capability is new: each of them could already take
+  ownership, and holds Full Control on the data directory and on its logs, a PHI sink of the same class.
+- **The audit difference, plainly.** Before, a non-owner administrator reaching a store the service
+  secured first had to take ownership, which raises event 4674 only where "Audit Sensitive Privilege
+  Use" is enabled. A read through the explicit entry now raises nothing. The backup-privilege route
+  (`SeBackupPrivilege`) was always silent, before and after.
+- **Decision: accepted,** at medium-high confidence on an independent adversarial pass, which found no
+  new capability and the narrowing above. **The one measurement that would reopen it:** a UAC-filtered
+  token successfully reading a file whose only matching entry is the Administrators allow. That would
+  mean the deny-only reading is wrong, and the change widens non-elevated sessions after all.
+- **Optional follow-up, not built:** an inheritable audit SACL on the data directory, set by
+  `install-service.ps1`, would restore a record of administrator reads.
+- **Pre-existing follow-up, not built:** restore staging in `messagefoundry/pipeline/dr_backup.py` (the
+  `TemporaryDirectory` with prefix `mefor-restore-` under `dest_store_path.parent`) still calls
+  `_secure_file`, which grants the operator's user SID. The published store is restricted by this
+  change; its staging copies are not.
+
+Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 
 **What it does not cover, at least.** Each of these falls back to the owner-only rewrite, so the
 Wave 0 lockout returns for it:

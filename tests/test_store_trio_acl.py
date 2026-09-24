@@ -94,6 +94,20 @@ def test_a_localsystem_install_grants_system_and_administrators_only() -> None:
         ("an empty DACL", "O:BAD:P"),
         ("no DACL section", "O:BAG:SY"),
         ("garbage", "not an sddl string"),
+        # C1, from the adversarial pass: right principals, wrong rights or inheritance. Each would
+        # otherwise have the trio written with FA/Modify the directory never granted.
+        (
+            "Administrators read-only, service read-only on containers only",
+            f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FR;;;BA)(A;CI;FR;;;{_TI})",
+        ),
+        (
+            "Administrators container-inherit-only",
+            f"O:BAD:PAI(A;OICI;FA;;;SY)(A;CIIO;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})",
+        ),
+        (
+            "LocalSystem install granting a different service read-only",
+            "O:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;S-1-5-80-9-9-9-9-9)",
+        ),
     ],
 )
 def test_a_directory_that_admits_anyone_else_is_not_hardened(label: str, sddl: str) -> None:
@@ -130,6 +144,9 @@ def test_an_exact_trio_dacl_is_recognised_and_nothing_else_is() -> None:
         f"O:S-1-5-21-1-2-3-1001D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_TI})"
     )
     assert user_owned is not None and not store_mod._trio_dacl_is_exact(user_owned, grants)
+    # C1: a broadened right is rewritten, not accepted as exact.
+    broadened = store_mod._parse_sddl_dacl(f"O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{_TI})")
+    assert broadened is not None and not store_mod._trio_dacl_is_exact(broadened, grants)
     for label, dacl in (
         ("inheriting", inheriting),
         ("extra", extra),
@@ -308,8 +325,8 @@ def test_a_store_file_gets_exactly_the_hardened_principals(tmp_path: Path) -> No
         store_mod._secure_store_file(db, dir_grants=(_SY, _BA, _TI))
         dacl = _read_back(db)
         assert dacl.protected, dacl
-        assert all(t == "A" and "ID" not in f for t, f, _s in dacl.aces), dacl
-        assert {sid for _t, _f, sid in dacl.aces} == {_SY, _BA, _TI}, dacl
+        assert all(t == "A" and not f for t, f, _r, _s in dacl.aces), dacl
+        assert {sid for _t, _f, _r, sid in dacl.aces} == {_SY, _BA, _TI}, dacl
         # The owner: an elevated token moves it to Administrators; a non-elevated one cannot, so the
         # file keeps its user owner and the step logs the refusal instead of passing as exact.
         if _elevated():
@@ -369,7 +386,7 @@ def test_a_store_outside_a_hardened_directory_stays_owner_only(tmp_path: Path) -
     assert grants is None
     store_mod._secure_store_file(db, dir_grants=grants)
     dacl = _read_back(db)
-    assert dacl.protected and {sid for _t, _f, sid in dacl.aces} == {me}, dacl
+    assert dacl.protected and {sid for _t, _f, _r, sid in dacl.aces} == {me}, dacl
 
 
 @_windows_only
