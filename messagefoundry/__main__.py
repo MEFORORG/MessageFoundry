@@ -2319,7 +2319,49 @@ def _serve(args: argparse.Namespace) -> int:
     # itself, and refusing would hard-stop working deployments on upgrade. The off-loopback arm keeps
     # refusing exactly as before, so this change is additive — it can only add a warning, never a new
     # refusal.
+    # ONE EXCEPTION, and it is not dial-governed: the BACKLOG #1179 plaintext-hop acknowledgement at the
+    # top of the block refuses in EVERY mode. Do not move it under `enforcing` to match the paragraphs
+    # above; the owner ruled that hop the deploying site's to secure, whatever the dial says.
     if settings.api.tls_terminated_upstream:
+        # BACKLOG #1179: with no operator certificate the engine mints nothing here (ADR 0172 decision
+        # 3 -- serving https would break the proxy's own hop), so the proxy-to-engine hop is PLAINTEXT
+        # by design and securing it is the deploying site's job. The operator must say they have taken
+        # it on. Keyed on api_tls_source, the same branch order that decides what the listener serves:
+        # an operator tls_cert_file wins over the no-mint branch, so with one the hop is TLS and there
+        # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
+        # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
+        # hop the engine leaves unprotected.
+        from messagefoundry.api.tls import api_tls_source
+
+        serves_plaintext = (
+            api_tls_source(
+                cert_file=settings.api.tls_cert_file,
+                tls_terminated_upstream=settings.api.tls_terminated_upstream,
+            )
+            == "upstream"
+        )
+        if serves_plaintext and not settings.api.plaintext_upstream_hop_acknowledged:
+            print(
+                "error: refusing to serve behind an upstream TLS terminator "
+                "([api].tls_terminated_upstream) without [api].plaintext_upstream_hop_acknowledged. "
+                "The reverse proxy terminates TLS and no [api].tls_cert_file is set, so the engine "
+                "serves the proxy-to-engine hop in PLAINTEXT by design and does nothing to protect "
+                "it. Securing that hop (for example a same-host loopback hop, an isolated network "
+                "segment, or a host firewall) is the deploying site's job. Set "
+                "[api].plaintext_upstream_hop_acknowledged = true to acknowledge that you have taken "
+                "it on. Or set [api].tls_cert_file so the engine serves that hop over TLS, and then "
+                "point the proxy at https and have it trust that certificate: a proxy still speaking "
+                "http to an https listener fails every request. See docs/SECURITY.md (ADR 0172).",
+                file=sys.stderr,
+            )
+            return 2
+        if serves_plaintext:
+            # The acknowledgement is the only record that someone took this hop on, so name it at
+            # every start rather than leaving it in the TOML alone.
+            logging.getLogger(__name__).info(
+                "[api].plaintext_upstream_hop_acknowledged: the proxy-to-engine hop is plaintext and "
+                "the operator has acknowledged that securing it is the deploying site's job."
+            )
         posture_b_missing = []
         if not settings.api.proxy_intra_service_declared:
             posture_b_missing.append(
@@ -3880,7 +3922,7 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
 
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, read_messages
+    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
     from messagefoundry.redaction import safe_error
 
     resolved = _resolve_offline_anchor(args)
@@ -3892,7 +3934,7 @@ def _dryrun(args: argparse.Namespace) -> int:
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     try:
-        messages = read_messages(args.messages)
+        messages = read_messages(args.messages, cap=fixture_cap(reg))
     except (FileNotFoundError, ValueError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
@@ -5511,7 +5553,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     try:
         count, uploads, (rolled_ok, rolled_msg) = asyncio.run(run())
     except CipherError as exc:
-        # A value couldn't be decrypted by any supplied key — the prior key is missing. Nothing is
+        # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
+        # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
         # corrupted: every pass is all-or-nothing per batch AND idempotent, so re-running with the
         # key supplied finishes the job. Note the command now spans TWO surfaces (the store, then
         # the uploaded-file store), so a failure in the second leaves the FIRST already committed

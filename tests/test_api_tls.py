@@ -374,7 +374,7 @@ def test_serve_allows_non_loopback_with_upstream_tls(
         "alerts.security_notifications_required = false\n"
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         'security.enforcement = "warn"\n'
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n'
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.7"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
     )
@@ -472,6 +472,8 @@ def _posture_b_toml(
     relax_phi_gates: bool = False,
     loopback: bool = False,
     public_origin: str | None = "https://mefor.example.org",
+    ack: bool = True,
+    cert: tuple[Path, Path] | None = None,
 ) -> None:
     """A non-loopback Posture-B bind (declared proxy) with every NON-Posture-B exposure gate satisfied
     (egress deny-by-default + secure retention + SMTP alerts), so only the intra-service-auth + KEX-floor
@@ -482,6 +484,17 @@ def _posture_b_toml(
         'trusted_proxies = ["10.0.0.9"]',
         f'proxy_intra_service_auth = "{intra}"',
     ]
+    # PRE-SATISFIED by default for the same reason as public_origin below: BACKLOG #1179 made the
+    # plaintext-hop acknowledgement a precondition of this topology in every mode. `ack=False`
+    # puts that precondition itself under test.
+    if ack:
+        lines.append("plaintext_upstream_hop_acknowledged = true")
+    # An operator certificate beside the terminator: the engine then serves the proxy-to-engine hop
+    # over TLS, so there is no plaintext hop to acknowledge. POSIX spelling because a TOML basic
+    # string would read a Windows backslash as an escape.
+    if cert is not None:
+        lines.append(f'tls_cert_file = "{cert[0].as_posix()}"')
+        lines.append(f'tls_key_file = "{cert[1].as_posix()}"')
     # PRE-SATISFIED, exactly like intra/floor above and for the same reason. Since BACKLOG #1026 a
     # PHI instance behind a declared terminator under `enforce` REFUSES without `public_origin` --
     # the ASVS 12.1.1 probe dials it, so leaving it unset silently disabled that check. Declaring it
@@ -662,6 +675,135 @@ def test_serve_posture_b_offloopback_refuses_on_dev_too(
     _posture_b_toml(tmp_path, intra="none", floor=None, relax_phi_gates=True)
     assert _run_posture_b(tmp_path, monkeypatch, env="dev", key=False) == 2
     assert "proxy_intra_service_auth" in capsys.readouterr().err
+
+
+# --- BACKLOG #1179: the plaintext proxy-to-engine hop must be acknowledged ------------------------
+# ADR 0172 decision 3: behind a declared terminator the engine mints nothing, so the proxy-to-engine
+# hop is plaintext by design and securing it is the deploying site's job. Unlike the attestations
+# above, the acknowledgement is required in EVERY mode -- enforce or warn, loopback or not -- so the
+# matrix below crosses both axes. The attestations are declared in every cell, so the acknowledgement
+# is the only thing that varies between the refusing and the starting arm.
+
+_ACK_MODES = pytest.mark.parametrize(
+    ("loopback", "enforcement"),
+    [(True, "enforce"), (True, "warn"), (False, "enforce"), (False, "warn")],
+    ids=["loopback-enforce", "loopback-warn", "offloopback-enforce", "offloopback-warn"],
+)
+
+
+@_ACK_MODES
+def test_serve_refuses_a_declared_terminator_without_the_hop_acknowledgement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    loopback: bool,
+    enforcement: str,
+) -> None:
+    _posture_b_toml(
+        tmp_path,
+        intra="network",
+        floor="1.2",
+        enforcement=enforcement,
+        loopback=loopback,
+        ack=False,
+    )
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
+    err = capsys.readouterr().err
+    # The exit code alone is not enough: other gates also return 2. The message is what pins it.
+    assert "without [api].plaintext_upstream_hop_acknowledged" in err
+    assert "PLAINTEXT by design" in err
+    assert "deploying site's job" in err
+    # The certificate remedy must say the proxy has to move to https too, or it breaks the hop.
+    assert "point the proxy at https" in err
+
+
+@_ACK_MODES
+def test_serve_starts_a_declared_terminator_once_the_hop_is_acknowledged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    loopback: bool,
+    enforcement: str,
+) -> None:
+    # The control arm: the same four cells, acknowledgement set, and every one starts. Without it the
+    # refusing arm above could be passing on some other gate's refusal in a cell it does not name.
+    _posture_b_toml(
+        tmp_path, intra="network", floor="1.2", enforcement=enforcement, loopback=loopback, ack=True
+    )
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+    captured = capsys.readouterr()
+    assert "plaintext_upstream_hop_acknowledged" not in captured.err
+    # The acknowledgement's only runtime record: named in the log at every start. serve's logging
+    # setup installs its own stdout handler, so the record is read from stdout, not caplog.
+    assert (
+        "INFO     messagefoundry.__main__: [api].plaintext_upstream_hop_acknowledged"
+        in captured.out
+    )
+
+
+@_ACK_MODES
+def test_serve_needs_no_hop_acknowledgement_when_an_operator_cert_serves_the_hop_over_tls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    loopback: bool,
+    enforcement: str,
+) -> None:
+    # The acknowledgement covers a PLAINTEXT hop. An operator tls_cert_file wins over the no-mint
+    # branch (api_tls_source), so serve builds a real TLS context for this listener and the hop is
+    # encrypted. Nothing to acknowledge, so it starts without one, in every mode. The SSL context is
+    # built for real here -- only uvicorn.run is stubbed -- so a cert the listener could not serve
+    # would fail this test rather than pass it.
+    cert, key = _self_signed(tmp_path)
+    _posture_b_toml(
+        tmp_path,
+        intra="mtls",
+        floor="1.2",
+        enforcement=enforcement,
+        loopback=loopback,
+        ack=False,
+        cert=(cert, key),
+    )
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+    assert "plaintext_upstream_hop_acknowledged" not in capsys.readouterr().err
+
+
+def test_serve_allows_the_hop_acknowledgement_alongside_an_operator_cert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Harmless and allowed: an operator who acknowledged the hop and then added a certificate has
+    # nothing to undo.
+    cert, key = _self_signed(tmp_path)
+    _posture_b_toml(tmp_path, intra="mtls", floor="1.2", ack=True, cert=(cert, key))
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+
+
+def test_hop_acknowledgement_without_a_declared_terminator_is_refused_at_load() -> None:
+    # Mirrors ad_session_recheck_seconds without ad_enabled: a stray acknowledgement reads as a
+    # decision about a hop that does not exist, so it is refused rather than ignored.
+    with pytest.raises(ValidationError, match="plaintext_upstream_hop_acknowledged requires"):
+        ApiSettings(plaintext_upstream_hop_acknowledged=True)
+    # The pairing itself loads, and the default is off.
+    assert ApiSettings(
+        tls_terminated_upstream=True,
+        trusted_proxies=["10.0.0.9"],
+        plaintext_upstream_hop_acknowledged=True,
+    ).plaintext_upstream_hop_acknowledged
+    assert ApiSettings().plaintext_upstream_hop_acknowledged is False
+
+
+def test_serve_refuses_a_stray_hop_acknowledgement_from_the_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The same refusal through the real loader: a messagefoundry.toml carrying the acknowledgement
+    # with no terminator does not start.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "[api]\nplaintext_upstream_hop_acknowledged = true\n", encoding="utf-8"
+    )
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
+    assert "plaintext_upstream_hop_acknowledged requires" in capsys.readouterr().err
 
 
 # --- BACKLOG #1181 (ASVS 12.3.5): the one attestation the engine can check against its own config --
