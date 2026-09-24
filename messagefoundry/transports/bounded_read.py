@@ -59,6 +59,16 @@ sets ``length = 0`` before the read, so an empty body is complete, not truncated
 
 A caller that DISCARDS the body wants :func:`drain_bounded` instead, which keeps the byte bound and
 refuses nothing about the reply's shape.
+
+**Framing comes before length, and** ``http.client`` **does not check it** (BACKLOG #1125, ASVS
+4.2.1). ``http.client`` reads the FIRST ``Transfer-Encoding`` field and treats the reply as chunked
+only when that one value, compared case-insensitively, is ``chunked``; otherwise it frames by the
+FIRST ``Content-Length``, parsed with :func:`int`. So ``Transfer-Encoding: gzip, chunked`` beside ``Content-Length: 3`` reads
+three bytes of raw chunk framing, two ``Content-Length`` fields of 3 and 5 read whichever came
+first, and ``Content-Length: 1_0`` reads ten bytes. Every one of those would hand a wrong body to
+the caller as the peer's answer, with no truncation for the checks above to see.
+:func:`reply_framing_fault` refuses them before any body byte is read, under RFC 9112 section 6.
+See its docstring for the shapes and for why each one is refused.
 """
 
 from __future__ import annotations
@@ -72,12 +82,14 @@ from messagefoundry.transports.base import DeliveryError
 __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
     "MAX_TOKEN_RESPONSE_BYTES",
+    "AmbiguousFramingError",
     "EgressReplyError",
     "ResponseTooLargeError",
     "TruncatedResponseError",
     "drain_bounded",
     "read_bounded",
     "read_bounded_text",
+    "reply_framing_fault",
 ]
 
 #: Ceiling on any response body the engine reads back off an egress hop.
@@ -143,6 +155,25 @@ class TruncatedResponseError(EgressReplyError):
     """
 
 
+class AmbiguousFramingError(EgressReplyError):
+    """An egress reply declared its body length in a way RFC 9112 does not allow, or that
+    ``http.client`` would read differently from the one legal reading.
+
+    Refused BEFORE any body byte is read. Most of the refused shapes make ``http.client`` hand
+    back the wrong bytes as the reply: raw chunk framing, the shorter of two lengths, or ten bytes
+    for ``1_0``. The rest happen to read the right bytes today, and are refused because RFC 9112
+    calls them an error: ``Transfer-Encoding`` beside ``Content-Length``, a ``+5`` or ``5, 5``
+    length, and ``Transfer-Encoding`` on HTTP/1.0. There, a correct read depends on which field
+    ``http.client`` happens to consult first. The shapes are listed on :func:`reply_framing_fault`.
+
+    A :class:`~messagefoundry.transports.base.DeliveryError`, therefore transient, like its two
+    siblings: the delivery worker records it on the row, retries under the connection's policy and
+    dead-letters it when the policy runs out. It is not a permanent
+    :class:`~messagefoundry.transports.base.NegativeAckError`, because a misframed reply may come
+    from an intermediary on one path rather than from the partner itself.
+    """
+
+
 class _SupportsRead(Protocol):
     """Anything with a byte-count-limited ``read``: an ``http.client.HTTPResponse``, the
     ``urllib.error.HTTPError`` that wraps one on a non-2xx, or a binary file handle.
@@ -175,6 +206,13 @@ def read_bounded(
     call site passes a redacted URL or a connection name, never a body, a token, or a query. The
     byte counts in the messages below are framing metadata, not content.
     """
+    fault = reply_framing_fault(reader)
+    if fault is not None:
+        # The reason is a closed-set string from reply_framing_fault, never a header value, so the
+        # message carries no peer-supplied bytes.
+        raise AmbiguousFramingError(
+            f"{connector} framed its response body ambiguously ({fault}); refusing to read it"
+        )
     body = _read_capped(reader, limit, connector)
     # AFTER the ceiling check inside _read_capped, never before: an over-cap reply also leaves bytes
     # outstanding (the read stopped at limit + 1 by design), so testing completeness first would
@@ -208,11 +246,98 @@ def drain_bounded(
     detected on TWO paths -- the declared-length comparison and the
     :class:`~http.client.IncompleteRead` translation -- and a boolean gating one of them silently
     left the other live. This form cannot be half-applied.
+
+    It does not apply :func:`reply_framing_fault` either, for the same reason. A misframed reply
+    changes WHICH bytes are read, and a drain uses none of them. ``urllib`` closes the connection
+    after each ``open()``, so no later reply shares the stream a misread could desynchronise. The
+    byte bound still applies to whatever the header framing selects. It does not reach a chunk-size
+    line inside a chunked body, which :func:`reply_framing_fault` never sees either.
     """
     try:
         _read_capped(reader, limit, connector)
     except TruncatedResponseError:
         return
+
+
+#: Statuses whose reply has no body whatever its headers say (RFC 9112 section 6.3, rule 1).
+#: ``http.client`` sets ``length = 0`` for these before any read, so their framing headers frame
+#: nothing. A ``304`` routinely carries the ``Content-Length`` of the representation it stands for.
+_BODYLESS_STATUSES = frozenset({204, 304})
+
+
+def reply_framing_fault(reader: object) -> str | None:
+    """Return why ``reader``'s body framing is refused, or ``None`` when it is unambiguous.
+
+    RFC 9112 section 6 allows one reading of a reply's length, and a recipient that picks another is
+    how a smuggled or split response gets through. Refused, at least:
+
+    * ``Transfer-Encoding`` on an HTTP/1.0 reply. Section 6.1 says the framing is then faulty.
+    * ``Transfer-Encoding`` beside ``Content-Length``. Section 6.1 calls this a possible smuggling
+      attempt that "ought to be handled as an error".
+    * ``Transfer-Encoding`` whose codings, across every field, are anything but the single coding
+      ``chunked``. If chunked is not the final coding, section 6.3 frames the body by connection
+      close, and ``http.client`` would instead frame it by a ``Content-Length`` or read raw chunk
+      framing. If chunked IS final behind another coding such as ``gzip, chunked``, the framing is
+      legal, but ``http.client`` recognises chunked only as the whole field value and decodes no
+      other transfer coding. It would return the raw framing, so the engine refuses a reply it
+      cannot read rather than misreading it.
+    * ``Transfer-Encoding: chunked`` that ``http.client`` did not take as chunked, which
+      trailing whitespace in the value is enough to cause. The rule is the reader's own
+      ``chunked`` flag, so the guard tracks what the read would actually do.
+    * A ``Content-Length`` that is not ``1*DIGIT``. :func:`int` accepts ``+5``, ``1_0`` and
+      ``5, 5`` fails it, and section 6.3 calls an invalid length an unrecoverable error.
+    * More than one ``Content-Length`` field with different values. ``http.client`` takes the
+      first; section 6.3 calls this an unrecoverable error. Identical repeats are allowed.
+    * A ``Content-Length`` that is all digits but that ``http.client`` could not parse, so it left
+      the length unset and would read to close. Past 4300 digits :func:`int` refuses the string.
+
+    A ``204``, a ``304``, any ``1xx`` and any reply to ``HEAD`` have no body, so their headers are
+    not checked. A reader with no parsed headers, such as a binary file handle, has no framing to
+    refuse and returns ``None``.
+
+    The reason strings are fixed text and never echo a header value.
+    """
+    headers = getattr(reader, "headers", None)
+    get_all = getattr(headers, "get_all", None)
+    if not callable(get_all):
+        return None
+    status = getattr(reader, "status", None)
+    if isinstance(status, int) and (status in _BODYLESS_STATUSES or 100 <= status < 200):
+        return None
+    # A private attribute, read defensively: HTTPResponse keeps the request method only there, and
+    # HTTPError delegates attribute reads to the response it wraps.
+    if getattr(reader, "_method", None) == "HEAD":
+        return None
+    te_fields: list[str] = [str(v) for v in (get_all("Transfer-Encoding") or [])]
+    cl_fields: list[str] = [str(v).strip(" \t") for v in (get_all("Content-Length") or [])]
+    if te_fields:
+        if getattr(reader, "version", None) == 10:
+            return "Transfer-Encoding on an HTTP/1.0 response"
+        if cl_fields:
+            return "Transfer-Encoding and Content-Length together"
+        codings = [c.strip(" \t").lower() for field in te_fields for c in field.split(",")]
+        codings = [c for c in codings if c]
+        if not codings or codings[-1] != "chunked":
+            return "Transfer-Encoding whose final coding is not chunked"
+        if "chunked" in codings[:-1]:
+            return "the chunked transfer coding applied more than once"
+        if codings != ["chunked"]:
+            return "a transfer coding other than chunked, which the engine does not decode"
+        if getattr(reader, "chunked", None) is False:
+            return "a chunked Transfer-Encoding value the HTTP reader did not recognise"
+        return None
+    if cl_fields:
+        if not all(v.isascii() and v.isdigit() for v in cl_fields):
+            return "a Content-Length that is not a plain decimal number"
+        # Compared as digit strings, not with int(): past 4300 digits int() raises ValueError, and a
+        # ValueError would reach the connectors' invalid-request-value arm as the wrong error.
+        if len({v.lstrip("0") or "0" for v in cl_fields}) > 1:
+            return "more than one Content-Length, with different values"
+        # The same int() limit inside http.client: a length it cannot parse leaves `length` None,
+        # and the reply is then read to close instead of to the length it declared.
+        if getattr(reader, "length", 0) is None:
+            return "a Content-Length the HTTP reader could not use"
+    return None
 
 
 def _read_capped(reader: _SupportsRead, limit: int, connector: str) -> bytes:
