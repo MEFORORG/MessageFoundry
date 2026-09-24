@@ -8,12 +8,17 @@ channel. Neither passed through the inbound's listener, so neither met its size 
 16 MiB default, or the inbound's own ``max_message_bytes``) or its declared-type sniff. Each test below
 drives one guard and was red on the code before this change: the resubmission was committed.
 
+The strict section at the end came later. PR 1490 left strict ``hl7apy`` validation unmirrored, so a
+``validation.strict`` inbound's resend admitted a body its listener would ``AE``-NAK; each refusing test
+there was red before the follow-up, and its conformant control was green.
+
 The refusal is a 4xx plus an audit row, and nothing is committed. That keeps count-and-log whole: no
 body is accepted and then dropped, because none is accepted.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -23,7 +28,7 @@ import pytest
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.models import ConnectorType, ContentType
+from messagefoundry.config.models import ConnectorType, ContentType, Validation
 from messagefoundry.config.settings import AuthSettings, StoreSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -54,6 +59,7 @@ def _inbound(
     *,
     content_type: ContentType = ContentType.HL7V2,
     max_message_bytes: int | None = None,
+    strict: bool = False,
 ) -> InboundConnection:
     (tmp_path / "in").mkdir(exist_ok=True)
     return InboundConnection(
@@ -65,6 +71,7 @@ def _inbound(
         router="r",
         content_type=content_type,
         max_message_bytes=max_message_bytes,
+        validation=Validation(strict=strict, hl7_version="2.5.1" if strict else None),
     )
 
 
@@ -440,3 +447,155 @@ def test_guard_holds_a_streaming_inbound_to_the_engine_ceiling() -> None:
     with pytest.raises(IngressGuardError) as exc:
         admit_resubmitted_body(big, _ic(ContentType.HL7V2, max_message_bytes=64 * 1024 * 1024))
     assert exc.value.phase == "size"
+
+
+# --- strict hl7apy validation (validation.strict) ---------------------------------------------------
+#
+# ADT and EDITED above pass Peek.parse and fail hl7apy: ADT^A01 requires EVN and PV1. So an inbound
+# with validation.strict set would AE-NAK either from a sender, and a resend must refuse it too. The
+# STRICT_* bodies are the conformant controls, so a red below is the strict check and not the route.
+
+STRICT_ADT = (
+    "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
+    "EVN|A01|20260101\rPID|1||MRN123^^^H^MR||DOE^JANE\rPV1|1|I\r"
+)
+STRICT_EDITED = STRICT_ADT.replace("DOE^JANE", "DOE^JOHN")
+#: Conformant except for one PV1 too many; the reroute body under test, carrying the PHI marker.
+STRICT_INVALID_EDIT = STRICT_EDITED + f"PV1|2|{PHI_MARKER}\r"
+
+
+def _strict_ic(**kwargs: object) -> InboundConnection:
+    return dataclasses.replace(
+        _ic(ContentType.HL7V2),
+        validation=Validation(strict=True, hl7_version="2.5.1"),
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+async def test_upload_resend_into_a_strict_inbound_refuses_a_strictly_invalid_body(
+    engine: Engine, tmp_path: Path
+) -> None:
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path, strict=True)))
+    r = await _upload_then_resend(engine, tmp_path, ADT)
+    assert r.status_code == 422, r.text
+    assert "strict-validation failed" in r.json()["detail"]
+    assert await _message_count(engine, "in1") == 0  # nothing committed
+    rejected = await _actions(engine, "upload.resend_reject")
+    assert len(rejected) == 1 and '"phase": "strict"' in str(rejected[0]["detail"])
+    assert not await _actions(engine, "upload.resend")
+
+
+async def test_upload_resend_into_a_strict_inbound_admits_a_conformant_body(
+    engine: Engine, tmp_path: Path
+) -> None:
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path, strict=True)))
+    r = await _upload_then_resend(engine, tmp_path, STRICT_ADT)
+    assert r.status_code == 200, r.text
+    assert await _message_count(engine, "in1") == 1
+
+
+async def test_upload_resend_into_a_tolerant_inbound_still_admits_a_strictly_invalid_body(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # Strict runs only where the inbound asks for it, as on the listener.
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path)))
+    r = await _upload_then_resend(engine, tmp_path, ADT)
+    assert r.status_code == 200, r.text
+
+
+async def test_upload_resend_past_the_strict_timeout_is_refused(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The listener AE-NAKs a validate that outruns validation.strict_timeout_s, so the resend refuses
+    # it as well, and the request does not wait on it.
+    import time
+
+    from messagefoundry.parsing.validate import ValidationResult
+    from messagefoundry.pipeline import ingress_guards
+
+    def slow_validate(raw: str, *, expected_version: str | None = None) -> ValidationResult:
+        time.sleep(0.5)
+        return ValidationResult(True, expected_version, [])
+
+    monkeypatch.setattr(ingress_guards, "validate", slow_validate)
+    ic = dataclasses.replace(
+        _inbound(tmp_path), validation=Validation(strict=True, strict_timeout_s=0.05)
+    )
+    engine.add_registry(_registry(tmp_path, ic))
+    r = await _upload_then_resend(engine, tmp_path, STRICT_ADT)
+    assert r.status_code == 422, r.text
+    assert "strict-validation timed out after 0.05s" in r.json()["detail"]
+    assert await _message_count(engine, "in1") == 0
+    rejected = await _actions(engine, "upload.resend_reject")
+    assert len(rejected) == 1 and '"phase": "strict"' in str(rejected[0]["detail"])
+
+
+async def test_edit_resend_reroute_into_a_strict_inbound_refuses_a_strictly_invalid_body(
+    engine: Engine, tmp_path: Path
+) -> None:
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path, strict=True)))
+    mid, r = await _edit_resend(engine, {"raw": STRICT_INVALID_EDIT, "idempotency_key": "k1"})
+    assert r.status_code == 422, r.text
+    await _assert_nothing_committed(engine, mid, r)
+
+
+async def test_edit_resend_reroute_into_a_strict_inbound_admits_a_conformant_body(
+    engine: Engine, tmp_path: Path
+) -> None:
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path, strict=True)))
+    _mid, r = await _edit_resend(engine, {"raw": STRICT_EDITED, "idempotency_key": "k1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "resubmitted"
+
+
+async def test_edit_resend_direct_is_not_strict_validated(engine: Engine, tmp_path: Path) -> None:
+    # The direct path writes an OUTBOUND row and meets no inbound, so no listener would validate it.
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path, strict=True)))
+    _mid, r = await _edit_resend(engine, {"raw": EDITED, "idempotency_key": "k1", "to": "OB2"})
+    assert r.status_code == 200, r.text
+
+
+def test_guard_runs_strict_validation_where_the_inbound_sets_it() -> None:
+    admit_resubmitted_body(STRICT_ADT, _strict_ic())
+    admit_resubmitted_body(ADT, _ic(ContentType.HL7V2))  # tolerant: Peek.parse is the whole check
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(ADT, _strict_ic())
+    assert exc.value.phase == "strict"
+    assert exc.value.reason.startswith("strict-validation failed: ")
+
+
+def test_guard_strict_refusal_scrubs_what_hl7apy_quotes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # hl7apy's error text can quote a field VALUE. The reason is returned and audited, so it carries
+    # the listener's persisted, safe_text-scrubbed form, not the raw error.
+    from messagefoundry.parsing.validate import ValidationResult
+    from messagefoundry.pipeline import ingress_guards
+
+    quoted = f"MSH|^~\\&|X\rPID|1||{PHI_MARKER}^^^H^MR||DOE^JANE"
+    monkeypatch.setattr(
+        ingress_guards,
+        "validate",
+        lambda raw, *, expected_version=None: ValidationResult(False, None, [quoted]),
+    )
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(STRICT_ADT, _strict_ic())
+    assert PHI_MARKER not in exc.value.reason
+
+
+def test_guard_checks_the_inbounds_declared_version() -> None:
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(
+            STRICT_ADT,
+            dataclasses.replace(
+                _ic(ContentType.HL7V2), validation=Validation(strict=True, hl7_version="2.3")
+            ),
+        )
+    assert exc.value.phase == "strict" and "version mismatch" in exc.value.reason
+
+
+def test_guard_downgrades_strict_over_the_streaming_threshold() -> None:
+    # The listener validates only the header of a streaming inbound's body at or over its threshold
+    # (#149, ADR 0105), so a body it would admit there must stay resendable. Below it, strict holds.
+    admit_resubmitted_body(ADT, _strict_ic(stream_threshold_bytes=len(ADT)))
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(ADT, _strict_ic(stream_threshold_bytes=len(ADT) + 1))
+    assert exc.value.phase == "strict"
