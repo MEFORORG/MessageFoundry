@@ -2737,6 +2737,37 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
         log.warning("could not restrict permissions on %s: %s", path, exc)
 
 
+def _grant_read(path: Path, principal: str) -> None:
+    """Grant ``principal`` READ on one file, ADDITIVELY -- Windows only, best-effort, logged.
+
+    The opposite direction from :func:`_secure_file`, and for a file that holds nothing secret: the
+    API certificate the engine mints is public (every TLS client receives it in the handshake), yet
+    it sits in a data directory locked to SYSTEM, Administrators and the service account, so a local
+    client that must pin it cannot read it (``api/tls.py`` ``_let_local_users_read_cert``). Existing
+    ACEs and inheritance are kept; only the one grant is added. ``principal`` is one argv token (a
+    ``*S-...`` SID), never a shell word. A failure is logged and never raised.
+    """
+    if os.name != "nt":
+        return
+    try:
+        result = subprocess.run(  # nosec B603 B607
+            [_system_exe("icacls.exe"), str(path), "/grant", f"{principal}:(R)"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        log.warning("could not grant read on %s: %s", path, exc)
+        return
+    if result.returncode != 0:
+        log.warning(
+            "icacls could not grant read on %s (exit %s): %s",
+            path,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
+
+
 async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
     """:func:`_secure_file` dispatched off the event loop — for the two callers that run ON one.
 
