@@ -293,9 +293,9 @@ SET (REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 0);
 
 ### 4.4 Database prerequisites (what the store needs from the DBA)
 
-The engine bootstraps its **schema, never the database**. There is no `CREATE DATABASE` in the
-store; the connection string pins `DATABASE=` and expects the database to exist already. Stand the
-database up in this order:
+`messagefoundry store provision-schema` builds the **schema, never the database**. There is no
+`CREATE DATABASE` in the store; the connection string pins `DATABASE=` and expects the database to
+exist already. Stand the database up in this order:
 
 1. **`CREATE DATABASE [mefor]` on R1** (the name must match `[store].database`; the engine will
    not create it).
@@ -304,21 +304,27 @@ database up in this order:
 3. **Take the initial full backup**; a database must have one before it can join an AG.
 4. **Add the database to the AG** (automatic seeding or backup/restore) and confirm it reports
    `SYNCHRONIZED` on R2.
-5. **First engine start.** The idempotent schema DDL runs on the primary and replicates to the
-   secondaries through the AG.
+5. **Provision the schema.** A DBA runs `messagefoundry store provision-schema` through the AG
+   listener, as a DDL-capable principal. The idempotent DDL runs on the primary and replicates to
+   the secondaries through the AG. Repeat this before the first start of any upgrade whose schema
+   moved ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §2).
+6. **First engine start**, as the runtime login. Under the default
+   `[store].schema_management = "external"` it runs no schema DDL, and it refuses to start if step 5 has
+   not run.
 
 The checklist behind those steps:
 
 - [ ] **Greenfield database.** There is no in-place migration from SQLite; drain and cut over
-      ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) "greenfield-only"). The schema is created on
-      first `open()` as idempotent DDL, so either give the engine login the bootstrap grants
-      (*Login grants* below) or pre-create the schema. With RCSI and `ALLOW_SNAPSHOT_ISOLATION`
-      pre-set per step 2 above, the engine login never needs `ALTER DATABASE` rights.
+      ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) "greenfield-only"). The schema is created by
+      `messagefoundry store provision-schema` (step 5), not by the engine login (*Login grants*
+      below). With RCSI and `ALLOW_SNAPSHOT_ISOLATION` pre-set per step 2 above, neither login
+      needs `ALTER DATABASE` rights.
 - [ ] **Pre-enable RCSI on the primary before first engine start:**
       `ALTER DATABASE [mefor] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;`
-      (the database name must match `[store].database`). The store auto-enables RCSI at open if the
-      login can `ALTER DATABASE`, and **degrades to a warning** if it cannot, which leaves the
-      claim/finalize paths more deadlock-prone under load. A typical low-privilege AG login cannot
+      (the database name must match `[store].database`). `provision-schema` enables RCSI if its
+      principal can `ALTER DATABASE`; the engine itself does so at open only under
+      `[store].schema_management = "auto"`. Either **degrades to a warning** if it cannot, which
+      leaves the claim/finalize paths more deadlock-prone under load. A typical low-privilege AG login cannot
       do this, and `WITH ROLLBACK IMMEDIATE` kicks other sessions, so run it once, deliberately, as
       a DBA. Do the same for `ALLOW_SNAPSHOT_ISOLATION ON` (an online change).
 - [ ] **FULL recovery model.** This is an AG membership requirement; the store itself does not
@@ -335,15 +341,17 @@ The checklist behind those steps:
       account on every instance. **Verify by connecting to each replica directly with the engine's
       credentials**, and make that check part of the pre-go-live failover drill; if it is missed,
       the very first failover to R2 leaves the engine in a login-failed retry loop.
-- [ ] **Login grants — least privilege, never `db_owner`.** The engine's database user needs
-      `db_datareader` + `db_datawriter` + `db_ddladmin` on `mefor` and **no server-level role**;
-      [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 carries the T-SQL and §2 the
-      bootstrap-vs-steady-state rule. `db_ddladmin` is a **schema-change-window** grant, not a
-      first-run-only one: the store skips its whole DDL batch whenever the `schema_meta` marker
-      already records the shipped batch, so DDL is issued only against a virgin database and on the
-      first start of a build whose schema moved — and a login without it **fails that start
-      outright**, it does not degrade. Re-grant it for an upgrade window rather than discovering the
-      gap mid-change. `EXECUTE` on a **user** procedure is **not** in the set: the only
+- [ ] **Login grants — least privilege, never `db_owner`.** Two principals, and **no
+      server-level role** for either. The engine's runtime database user needs `db_datareader` +
+      `db_datawriter` on `mefor`. The provisioning principal that runs
+      `messagefoundry store provision-schema` needs `db_ddladmin` + `db_datareader` +
+      `db_datawriter` on `mefor`, and the same default schema as the engine's user.
+      [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 carries the T-SQL and §2 the provisioning
+      steps. Only `[store].schema_management = "auto"` puts `db_ddladmin` on the runtime login, and
+      then it is a **schema-change-window** grant: the store skips its whole DDL batch whenever the
+      `schema_meta` marker already records the shipped batch, so DDL is issued only against a
+      virgin database and on the first start of a build whose schema moved, and a login without it
+      **fails that start outright**. `EXECUTE` on a **user** procedure is **not** in the set: the only
       user procedures the engine calls are the two lane-family claim procs, and only under
       `[store].fifo_claim_proc` ([`CONFIGURATION.md`](CONFIGURATION.md)), which is off by
       default. The `sp_getapplock` calls the APPLOCK bullet above describes are a **system**

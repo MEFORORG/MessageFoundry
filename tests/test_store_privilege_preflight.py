@@ -50,6 +50,7 @@ from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
+    SchemaManagement,
     SecretRotationSettings,
     SecuritySettings,
     SqlAuth,
@@ -65,6 +66,7 @@ from messagefoundry.store.privilege import (
     SQLSERVER_DOCUMENTED_DATABASE_ROLES,
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
+    SQLSERVER_RUNTIME_DATABASE_ROLES,
     PostgresRoleFacts,
     StorePrivilegeError,
     StorePrivilegeReport,
@@ -513,6 +515,10 @@ def _probe_row(
         "db_name": "MessageFoundry",
         "control_server": control_server,
         "control_db": control_db,
+        # #305: the directly-granted schema-DDL rights, read in both modes, counted under external.
+        "create_table": 0,
+        "default_schema": "dbo",
+        "alter_schema": 0,
     }
     for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
         row[f"srv_{i}"] = None if name in unread else int(name in server_roles)
@@ -526,6 +532,7 @@ def _sqlserver_probe(
     row: dict[str, Any] | None,
     *,
     user_defined: tuple[str, ...] = (),
+    schema_management: SchemaManagement | None = None,
 ) -> Any:
     """A real :class:`SqlServerStore` whose two read helpers are stubbed. No driver, no connection.
 
@@ -542,6 +549,7 @@ def _sqlserver_probe(
             auth=SqlAuth.INTEGRATED,
             server="db.invalid",
             database="MessageFoundry",
+            schema_management=schema_management,
         ),
     )
 
@@ -657,6 +665,8 @@ async def test_a_genuine_least_privilege_row_still_observes_clean(
         monkeypatch,
         _probe_row(database_roles=_DOCUMENTED_SQLSERVER),
         user_defined=("db_datareader", "mefor_app"),
+        # The three-role set is the AUTO-mode grant (#305); the external default is covered below.
+        schema_management=SchemaManagement.AUTO,
     )
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.OBSERVED
@@ -665,6 +675,30 @@ async def test_a_genuine_least_privilege_row_still_observes_clean(
     assert set(_DOCUMENTED_SQLSERVER) <= set(report.database_roles)
     assert report.principal == "CORP\\mefor-svc$"
     assert report.database == "MessageFoundry"
+
+
+async def test_external_mode_counts_db_ddladmin_as_excess_on_the_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#305: under the server-DB default (external) the runtime login holds row CRUD only, so the
+    same three-role login that is clean under auto carries ONE finding, and it is db_ddladmin."""
+    store = _sqlserver_probe(monkeypatch, _probe_row(database_roles=_DOCUMENTED_SQLSERVER))
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == ("database role db_ddladmin",)
+    assert "schema_management=external" in report.detail
+
+
+async def test_external_mode_runtime_grant_observes_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other direction for external mode: the runtime grant alone is silent."""
+    store = _sqlserver_probe(
+        monkeypatch, _probe_row(database_roles=tuple(sorted(SQLSERVER_RUNTIME_DATABASE_ROLES)))
+    )
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == ()
 
 
 async def test_a_zero_read_is_a_real_negative_and_is_not_confused_with_a_null(

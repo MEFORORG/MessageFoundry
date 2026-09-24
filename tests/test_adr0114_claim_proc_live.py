@@ -211,8 +211,8 @@ async def test_ac12_fenced_ex_leader_claims_zero_on_both_paths(
     lane = "IB_FENCE"
     await proc_store.enqueue_ingress(channel_id=lane, raw="MSH|^~\\&|FENCE")
     lease_key = "adr0114-fence-test"
-    # leader_lease is coordinator-created (cluster_sqlserver._ensure_tables), not store-schema —
-    # create it if this bench DB never ran clustered, with the coordinator's exact shape.
+    # leader_lease rides the store batch since #305 (store.sqlserver.CLUSTER_SCHEMA); this guarded
+    # CREATE is a no-op then, and is kept for a bench DB whose marker predates that.
     await proc_store._execute(
         "IF OBJECT_ID(N'leader_lease', N'U') IS NULL"
         " CREATE TABLE leader_lease ("

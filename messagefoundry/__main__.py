@@ -842,6 +842,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     rotate_key.add_argument("--db", default=None, help="store path (overrides [store].path)")
 
+    # BACKLOG #305 (ASVS 13.2.2): the provisioning half of the server-DB privilege split. Under the
+    # server-DB default [store].schema_management = "external" the engine runs no DDL at open, so a
+    # DBA runs this, as a DDL-capable principal, before the first start and before the first start
+    # of any build whose schema moved.
+    store_cmd = sub.add_parser(
+        "store",
+        help="server-DB store administration: provision-schema runs the schema DDL as a "
+        "provisioning principal, so the engine's runtime login needs no DDL rights (BACKLOG #305)",
+    )
+    store_sub = store_cmd.add_subparsers(dest="store_command", required=True)
+    provision_schema = store_sub.add_parser(
+        "provision-schema",
+        help="create or upgrade the sqlserver/postgres store schema as the CURRENT principal (run "
+        "by a DBA before the first serve and after an upgrade that moves the schema). On SQL "
+        "Server it also enables READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION",
+    )
+    provision_schema.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    provision_schema.add_argument(
+        "--username",
+        default=None,
+        help="connect as this provisioning principal instead of [store].username (auth = 'sql' "
+        "or postgres). Its password is read ONLY from MEFOR_STORE_PASSWORD, never an argument. "
+        "Under auth = 'integrated' the command connects as the Windows account running it",
+    )
+    provision_schema.add_argument("--json", action="store_true", help="emit JSON")
+
     backup = sub.add_parser(
         "backup",
         help="take an on-demand DR backup now: snapshot the store + bundle the config, encrypt to a "
@@ -4852,6 +4882,110 @@ def _read_new_password(prompt: str) -> str:
     return first
 
 
+def _store(args: argparse.Namespace) -> int:
+    """`store` command group (BACKLOG #305) — only `provision-schema` today."""
+    return _store_provision_schema(args)
+
+
+def _store_provision_schema(args: argparse.Namespace) -> int:
+    """Run the server-DB schema DDL as a provisioning principal (BACKLOG #305, ASVS 13.2.2).
+
+    Under ``[store].schema_management = external`` — the server-DB default — ``serve`` only reads the
+    ``schema_meta`` marker and refuses on a mismatch, so its login needs row access only. This command
+    is where the DDL went. It does DDL and nothing else: no store key, no audit row (the audit log is
+    one of the tables it may be creating). Safe to re-run: a current marker is a no-op.
+
+    Exit codes: 0 done; 1 could not load settings, wrong backend, or the DDL failed; 3 the schema is
+    applied but ``READ_COMMITTED_SNAPSHOT`` is still OFF. 3 is not 0 because the shipped pooled claim
+    mode refuses to start while it is off, so a job reading only the exit code must not see a success
+    it would find out about at the next ``serve``. ``ALLOW_SNAPSHOT_ISOLATION`` off is reported with
+    its statement but is not a partial result: nothing in the engine opens a SNAPSHOT transaction.
+    """
+    import asyncio
+
+    from messagefoundry.config.settings import SqlAuth, StoreBackend, hop_posture_from_ai
+    from messagefoundry.store.base import provision_store_schema
+    from messagefoundry.support.redact import redact_log_line
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.username is not None:
+        cli.setdefault("store", {})["username"] = args.username
+    # Rendered, never stringified: str(ValidationError) carries the section's input values, and the
+    # DBA running this has the provisioning password in MEFOR_STORE_PASSWORD. See the helper's note.
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        return _emit_error(detail or "could not load the service settings", as_json=args.json)
+    store = settings.store
+    if store.backend is StoreBackend.SQLITE:
+        # Checked here rather than caught from the call: a ValueError arm around the driver call would
+        # also swallow the driver's own ValueErrors, unredacted and without the database named.
+        return _emit_error(
+            "the sqlite store builds its own schema when `messagefoundry serve` first opens it; "
+            "`messagefoundry store provision-schema` applies to the sqlserver and postgres "
+            "backends only",
+            as_json=args.json,
+        )
+    if (
+        args.username is not None
+        and store.backend is StoreBackend.SQLSERVER
+        and store.auth is not SqlAuth.SQL
+    ):
+        # The ODBC string carries no UID under integrated/entra, so the name would be silently dropped
+        # and the DDL would run, and its objects land, as whatever identity runs this process.
+        return _emit_error(
+            f"--username applies to [store].auth = 'sql' only, and this store uses "
+            f"{store.auth.value!r}: run the command as the provisioning identity instead",
+            as_json=args.json,
+        )
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    try:
+        result = asyncio.run(provision_store_schema(store, posture=posture))
+    except Exception as exc:  # noqa: BLE001 - a driver/DDL failure; report it redacted, never a traceback
+        return _emit_error(
+            f"provision-schema failed on the {store.backend.value} database "
+            f"{store.database!r}: {type(exc).__name__}: {redact_log_line(str(exc))[:500]}",
+            as_json=args.json,
+        )
+    mode = store.resolved_schema_management().value
+    partial = "READ_COMMITTED_SNAPSHOT" in result.options_off
+    if args.json:
+        _print_json(
+            {
+                "ok": not partial,
+                "backend": store.backend.value,
+                "database": store.database,
+                "schema": result.schema,
+                "applied": result.applied,
+                "options_off": list(result.options_off),
+                "remedy": result.remedy,
+                "schema_management": mode,
+            },
+            compact=True,
+        )
+    else:
+        state = "applied" if result.applied else "already current"
+        # _safe_print: a database or schema name outside cp1252 must not turn a committed
+        # provisioning into a crash on a redirected Windows stdout.
+        _safe_print(
+            f"store schema {state}: {store.backend.value} database {store.database!r}, schema "
+            f"{result.schema!r} ([store].schema_management = {mode!r}). The runtime login must "
+            "resolve unqualified names in that schema"
+        )
+        if result.options_off:
+            print(
+                f"{'error' if partial else 'warning'}: {' and '.join(result.options_off)} is OFF "
+                "after this run: this principal could not ALTER DATABASE. Have a DBA run: "
+                f"{result.remedy}"
+                + (
+                    ". The pooled claim mode refuses to start while READ_COMMITTED_SNAPSHOT is off"
+                    if partial
+                    else ""
+                ),
+                file=sys.stderr,
+            )
+    return 3 if partial else 0
+
+
 #: The three conditions under which the at-rest gate refuses a store with no key. Values name the
 #: setting an operator changes, so a caller can say which one refused without restating the rule.
 _GATE_REQUIRE_ENCRYPTION = "[store].require_encryption"
@@ -6745,6 +6879,7 @@ _DISPATCH = {
     "protect-key": _protect_key,
     "admin-unlock": _admin_unlock,
     "provision-admin": _provision_admin,
+    "store": _store,
     "audit-verify": _audit_verify,
     "audit-anchor": _audit_anchor,
     "rekey-audit": _rekey_audit,
