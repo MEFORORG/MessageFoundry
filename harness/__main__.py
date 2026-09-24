@@ -88,6 +88,8 @@ import argparse
 import sys
 from datetime import UTC
 
+from messagefoundry.api_tls_source import GENERATED_CERT_NAME
+
 #: What `--insecure` actually does, printed beside the three two-box drives' ApiError exits.
 #:
 #: It replaced a one-line hint that simply told the operator to pass the flag, which promised a fix
@@ -214,10 +216,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--cacert",
         metavar="PEM",
-        help="scenario/load: trust ONLY this PEM for the engine API. A stock engine mints "
-        "api-generated-cert.pem beside its store database; pass that file. Without it the OS trust "
-        "store is used, which verifies an operator certificate but not a minted one. Applies to "
-        "every --engine and --shard-engine URL.",
+        help=f"scenario/load: trust ONLY this PEM for the engine API. A stock engine mints "
+        f"{GENERATED_CERT_NAME} beside its store database; pass that file. Applies to every "
+        "--engine and --shard-engine URL. Without it, --scenario uses the OS trust store, and "
+        "--load pins a loopback https engine to the harness's own certificate, which verifies "
+        "only an engine the harness started itself.",
     )
     parser.add_argument("--token", help="bearer token for an auth-enabled engine")
     parser.add_argument(
@@ -306,7 +309,7 @@ def _list_scenarios() -> int:
 
 
 def _run_scenario(
-    name: str, engine_url: str, token: str | None, timeout: float, cacert: str | None = None
+    name: str, engine_url: str, token: str | None, timeout: float, cacert: str | None
 ) -> int:
     from harness.scenarios import SCENARIOS, run_scenario
     from messagefoundry.apiclient import ApiError, EngineClient

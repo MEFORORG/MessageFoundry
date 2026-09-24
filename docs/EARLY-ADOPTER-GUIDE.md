@@ -150,17 +150,17 @@ version**, the same way you pin any other production dependency. Create a venv a
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install "messagefoundry==0.1.0"        # pin the exact engine version (core runtime only)
+pip install "messagefoundry==0.4.0"        # pin the exact engine version (core runtime only)
 ```
 
-`messagefoundry==0.1.0` pulls only the **core runtime** — what a headless engine needs. Add extras
+`messagefoundry==0.4.0` pulls only the **core runtime** — what a headless engine needs. Add extras
 (§4.2) for the PySide6 test harness, a server-DB backend, or SFTP; the browser web console installs
 as its own `messagefoundry-webconsole` wheel.
 
-> ⚠️ **Early access.** `0.1.0` is an **Early Access** release on public PyPI — feature-complete and
+> ⚠️ **Early access.** `0.4.0` is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
-> launch. The exact-pin command above (`==0.1.0`) resolves today; the earlier `0.1.0rc1` pre-release also
-> remains installable. You can equally install from the engine's **GitHub Release assets** or your
+> launch. The exact-pin command above (`==0.4.0`) resolves today; earlier releases, back to the `0.1.0rc1`
+> pre-release, remain installable. You can equally install from the engine's **GitHub Release assets** or your
 > organization's **private index**.
 
 **Verify the release before you install.** MessageFoundry ships one signed wheel to many PHI-bearing

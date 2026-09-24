@@ -10,6 +10,7 @@ delivered message with its disposition.
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import sys
 import threading
@@ -66,39 +67,43 @@ def handle(msg):
 
 @pytest.fixture
 def server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
-    yield from _serve(tmp_path)
+    with _serve(tmp_path) as served:
+        yield served
 
 
 @pytest.fixture
 def tls_server(tmp_path: Path) -> Iterator[tuple[str, Path, str]]:
-    """The same engine served over TLS with a pair minted the way a stock engine mints its own
-    (``pki.make_self_signed`` for the bind host, ADR 0172). Yields the cert path to pin."""
-    from messagefoundry import pki
+    """The same engine served over TLS with the pair a stock engine mints for itself (ADR 0172),
+    minted by the engine's own code. Yields the cert path to pin."""
+    from messagefoundry.api.tls import ensure_api_tls_material
+    from messagefoundry.config.settings import ApiSettings
 
-    cert_pem, key_pem = pki.make_self_signed("127.0.0.1", [], 1)
-    cert, key = tmp_path / "api-generated-cert.pem", tmp_path / "api-generated-key.pem"
-    cert.write_bytes(cert_pem)
-    key.write_bytes(key_pem)
-    gen = _serve(tmp_path, ssl_pair=(str(cert), str(key)))
-    url, inbox = next(gen)
-    try:
-        yield url, inbox, str(cert)
-    finally:
-        gen.close()
+    material = ensure_api_tls_material(ApiSettings(host="127.0.0.1"), state_dir=tmp_path)
+    assert material is not None and material[1] is not None
+    cert, key = material[0], material[1]
+    with _serve(tmp_path, cert=cert, key=key) as (url, inbox):
+        yield url, inbox, cert
 
 
-def _serve(tmp_path: Path, ssl_pair: tuple[str, str] | None = None) -> Iterator[tuple[str, Path]]:
+@contextlib.contextmanager
+def _serve(
+    tmp_path: Path, *, cert: str | None = None, key: str | None = None
+) -> Iterator[tuple[str, Path]]:
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     _write_config(tmp_path / "config", inbox, outdir)
     app = create_managed_app(
         db_path=tmp_path / "console.db", config_dir=tmp_path / "config", poll_interval=0.05
     )
     port = _free_port()
-    tls: dict[str, str] = {}
-    if ssl_pair is not None:
-        tls = {"ssl_certfile": ssl_pair[0], "ssl_keyfile": ssl_pair[1]}
     uv = uvicorn.Server(
-        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", **tls)
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            ssl_certfile=cert,
+            ssl_keyfile=key,
+        )
     )
     thread = threading.Thread(target=uv.run, daemon=True)
     thread.start()
@@ -121,7 +126,7 @@ def _serve(tmp_path: Path, ssl_pair: tuple[str, str] | None = None) -> Iterator[
                     f"(api_port={port})"
                 )
             time.sleep(min(0.05, remaining))
-        yield f"{'https' if ssl_pair else 'http'}://127.0.0.1:{port}", inbox
+        yield f"{'https' if cert else 'http'}://127.0.0.1:{port}", inbox
     finally:
         uv.should_exit = True
         thread.join(timeout=10)
@@ -225,9 +230,8 @@ def test_monitor_reaches_a_tls_engine_only_with_its_minted_cert_pinned(
     blank._connect_btn.click()
     try:
         assert blank._client is None
-        assert (
-            "certificate" in blank._status.text().lower() or "ssl" in blank._status.text().lower()
-        )
+        status = blank._status.text().lower()
+        assert "certificate" in status or "ssl" in status
     finally:
         blank.shutdown()
 

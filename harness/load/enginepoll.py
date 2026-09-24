@@ -639,8 +639,11 @@ class EnginePoller:
     def _open_sync(self) -> None:
         clients: list[EngineClient] = []
         for url in self._urls:
-            cacert = self._cacert if self._cacert is not None else self._cacert_for(url)
-            client = EngineClient(url, allow_insecure=self._allow_insecure, cacert=cacert)
+            client = EngineClient(
+                url,
+                allow_insecure=self._allow_insecure,
+                cacert=self._cacert or self._cacert_for(url),
+            )
             if self._token:
                 client.set_token(self._token)  # does a /me request to validate
             clients.append(client)

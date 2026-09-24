@@ -44,6 +44,7 @@ from harness._console_widgets import (
 )
 from harness._login import LoginDialog
 from messagefoundry.api.models import ConnectionRow, DeadLetterRow, PendingApprovalResponse
+from messagefoundry.api_tls_source import GENERATED_CERT_NAME
 from messagefoundry.apiclient import ApiError, EngineClient
 
 # https because the engine always serves TLS (ADR 0172). A stock engine's certificate is one it minted
@@ -196,9 +197,9 @@ class MonitorPanel(QWidget):
 
         self._url = QLineEdit(_DEFAULT_URL)
         self._cacert = QLineEdit()
-        self._cacert.setPlaceholderText("api-generated-cert.pem (blank = OS trust store)")
+        self._cacert.setPlaceholderText(f"{GENERATED_CERT_NAME} (blank = OS trust store)")
         self._cacert.setToolTip(
-            "PEM to trust for the engine API. A stock engine mints api-generated-cert.pem beside "
+            f"PEM to trust for the engine API. A stock engine mints {GENERATED_CERT_NAME} beside "
             "its store database."
         )
         self._connect_btn = QPushButton("Connect")
