@@ -3574,12 +3574,20 @@ def _serve(args: argparse.Namespace) -> int:
     # WP-15: trust X-Forwarded-For/-Proto ONLY from the declared reverse proxies, so the audit /
     # rate-limit source IP is the real client (not the proxy). Empty list = trust nothing (the secure
     # default — the direct TCP peer is used), overriding uvicorn's loopback default.
+    # BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py.
+    from messagefoundry.api.protocol_headers import (
+        floored_http_protocol_class,
+        floored_ws_protocol_class,
+    )
+
     run_kwargs: dict[str, Any] = {
         "log_config": None,
         "forwarded_allow_ips": settings.api.trusted_proxies,
         # WP-L3-07 (ASVS 13.4.6): drop the `Server: uvicorn` banner so a response doesn't advertise the
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
+        "http": floored_http_protocol_class(),
+        "ws": floored_ws_protocol_class(),
     }
     # BACKLOG #1276: THE ENGINE ALWAYS SERVES TLS. Owner ruling 2026-08-22 (option 3), which
     # SUPERSEDES ADR 0143's premise that the console is hardened "over a cleartext loopback
@@ -3614,11 +3622,12 @@ def _serve(args: argparse.Namespace) -> int:
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
         # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
-        # and every non-mTLS bind keep the stock protocol — no behaviour change without a client CA + map.
+        # and every non-mTLS bind keep the header-floored protocol without the shim.
         if settings.api.tls_client_ca_file and settings.api.tls_client_cert_identities:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
-            run_kwargs["http"] = client_cert_http_protocol_class()
+            # Stacked ON the floored protocol, never instead of it (BACKLOG #1120).
+            run_kwargs["http"] = client_cert_http_protocol_class(base=run_kwargs["http"])
 
     # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
     # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
