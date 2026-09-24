@@ -199,10 +199,22 @@ def build_authorization_url(
     nonce: str,
     code_challenge: str,
     scopes: Sequence[str],
+    max_age: int,
     acr_values: str | None = None,
     prompt: str | None = None,
 ) -> str:
-    """Build the front-channel authorization-code + PKCE (S256) redirect URL (``response_mode=query``)."""
+    """Build the front-channel authorization-code + PKCE (S256) redirect URL (``response_mode=query``).
+
+    ``max_age`` is REQUIRED, with no default, so a caller cannot build a URL that forgets it (ASVS
+    6.8.4 / 7.6.1, BACKLOG #1150). OIDC Core's authentication-request rules make the IdP
+    re-authenticate only IF its own authentication is older than ``max_age``, and make
+    ``auth_time`` REQUIRED in the ``id_token`` whenever ``max_age`` was sent. That second half is
+    what the claims ladder then verifies. A value of 0 or less is refused: 0 forces a fresh IdP
+    login every time, which is ``prompt=login`` under another name and throws away the single
+    sign-on federation exists to deliver.
+    """
+    if max_age <= 0:
+        raise ValueError("max_age must be a positive number of seconds")
     params: dict[str, str] = {
         "response_type": "code",
         "response_mode": "query",
@@ -213,6 +225,7 @@ def build_authorization_url(
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
+        "max_age": str(max_age),
     }
     if acr_values:
         params["acr_values"] = acr_values
@@ -240,7 +253,7 @@ def exchange_code(
 
     ``opener`` is injected (production supplies a hardened, CA-pinned, no-redirect opener). A
     confidential client sends ``client_secret_post``; a public client omits it and relies on PKCE.
-    Raises :class:`FlowError` on any non-2xx, oversized, or non-JSON response — PHI/secret-safe: the
+    Raises :class:`FlowError` on a non-2xx, misframed, oversized or non-JSON response — PHI/secret-safe: the
     secret, the ``code``, and the tokens never enter an exception message.
 
     The request line and header block are **measured before the POST** (ASVS 4.2.5, BACKLOG #1048).
@@ -287,15 +300,27 @@ def exchange_code(
         headers=headers,
         method="POST",
     )
+    # BACKLOG #1125 (ASVS 4.2.1): a reply whose length framing is ambiguous is refused before its
+    # body is read, by the rule read_bounded applies to connector replies. Imported here to match the
+    # length helper's import above; FlowError keeps it on the audited login-failure path.
+    from messagefoundry.transports.bounded_read import (  # noqa: PLC0415  (matches the import above)
+        reply_framing_fault,
+    )
+
     # Both raises sit OUTSIDE their handlers on purpose. `raise ... from None` clears `__cause__`
     # but leaves `__context__` populated, so the HTTPError — a readable response object whose body
     # may echo the request params, this POST's client secret among them — would still be reachable
     # by a chain-walking handler. See `encode_wire_body` in transports/base.py.
     http_status: int | None = None
     unreachable: str | None = None
+    misframed = False
+    body = b""
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
-            body = resp.read(_MAX_TOKEN_RESPONSE_BYTES + 1)
+            if reply_framing_fault(resp) is not None:
+                misframed = True
+            else:
+                body = resp.read(_MAX_TOKEN_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
         http_status = exc.code
@@ -305,6 +330,8 @@ def exchange_code(
         raise FlowError(f"token endpoint returned HTTP {http_status}")
     if unreachable is not None:
         raise FlowError(f"token endpoint unreachable: {unreachable}")
+    if misframed:
+        raise FlowError("token endpoint response framed its body length ambiguously")
     if len(body) > _MAX_TOKEN_RESPONSE_BYTES:
         raise FlowError("token endpoint response exceeds the size bound")
     try:

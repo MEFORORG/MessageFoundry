@@ -14,6 +14,7 @@ from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.auth_models import (
     PasswordChangeRequest,
 )
+from messagefoundry.api.security import pending_credential_deadline_for
 from messagefoundry.auth import Identity
 from messagefoundry.auth import webauthn as webauthn_mod
 from messagefoundry.auth.service import (
@@ -179,12 +180,42 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             service, identity, request, notice=_ACCOUNT_NOTICES.get(m or "")
         )
 
+    async def _factor_first(
+        request: Request, service: AuthService, identity: Identity
+    ) -> Response | None:
+        """The /ui twin of the JSON gate's refusal on ``POST /me/password`` (BACKLOG #1954).
+
+        ``allow_mfa_pending`` on these two routes serves an account with NO factor, which must be
+        able to rotate. A pending session on an account that HAS one goes to the factor page first,
+        and the refusal is audited like ``require_ui``'s own. The JSON handler this page delegates
+        to is reached in-process, past its ``Depends`` gate, so the check has to live here too."""
+        if not await service.password_change_owes_factor(session_token(request)):
+            return None
+        await service.audit_mfa_denied(identity, request.url.path, client=_client(request))
+        return RedirectResponse("/ui/mfa", status_code=303)
+
     @app.get("/ui/account/password", response_class=HTMLResponse)
     async def ui_account_password_form(
+        request: Request,
+        # identity BEFORE service: FastAPI resolves them in order, and require_ui's login redirect
+        # must answer a disabled-auth app before _service's bare 503 does.
         identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
-    ) -> HTMLResponse:
+        service: AuthService = Depends(_service),
+    ) -> Response:
+        if (refused := await _factor_first(request, service, identity)) is not None:
+            return refused
         # `forced` comes from the SERVER-side flag, never a query param (unspoofable).
-        return HTMLResponse(pages.password_page(forced=identity.must_change_password))
+        forced = identity.must_change_password
+        return HTMLResponse(
+            pages.password_page(
+                forced=forced,
+                credential_expires_at=(
+                    await pending_credential_deadline_for(service, identity.user_id)
+                    if forced
+                    else None
+                ),
+            )
+        )
 
     @app.post("/ui/account/password")
     async def ui_account_password(
@@ -193,18 +224,28 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
     ) -> Response:
         assert_same_origin(request)
+        if (refused := await _factor_first(request, service, identity)) is not None:
+            return refused
         # No throttle call here on purpose: this route DELEGATES to the JSON handler
         # (admin.change_password) below, which applies the per-actor ceremony budget and whose 429 is
         # re-raised intact. Charging here too would spend two tokens per submission.
         form = dict(await _form_pairs(request))
         forced = identity.must_change_password
 
-        def _retry(message: str, code: int = 400) -> HTMLResponse:
+        async def _retry(message: str, code: int = 400) -> HTMLResponse:
+            # BACKLOG #1141: a rejected forced change re-renders with the deadline it was shown. Read
+            # on the refusal path only, so a successful rotation costs no extra store read.
+            deadline = (
+                await pending_credential_deadline_for(service, identity.user_id) if forced else None
+            )
             # Passwords are NEVER echoed back — the re-rendered form is always empty.
-            return HTMLResponse(pages.password_page(forced=forced, error=message), status_code=code)
+            return HTMLResponse(
+                pages.password_page(forced=forced, error=message, credential_expires_at=deadline),
+                status_code=code,
+            )
 
         if form.get("new_password", "") != form.get("new_password2", ""):
-            return _retry("the new passwords do not match")
+            return await _retry("the new passwords do not match")
         try:
             body = PasswordChangeRequest(
                 current_password=form.get("current_password", ""),
@@ -214,11 +255,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 body=body, request=request, service=service, identity=identity
             )
         except ValidationError:
-            return _retry("invalid input")
+            return await _retry("invalid input")
         except HTTPException as exc:
             if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                 raise  # rate-limited — keep the Retry-After semantics
-            return _retry(str(exc.detail), exc.status_code)
+            return await _retry(str(exc.detail), exc.status_code)
         # Changed: the service revoked every session (incl. this cookie) — sign in again. This is the
         # WIDEST termination the console offers (every session for this user, the one an operator
         # reaches for after a suspected compromise), so it must drop the browser's cached PHI pages

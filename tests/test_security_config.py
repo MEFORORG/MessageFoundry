@@ -44,6 +44,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         (),
         (),
         None,
+        None,
     )
 
 
@@ -306,7 +307,7 @@ def test_loosening_warns_and_prod_phi_refuses(
         "security.require_mfa = false\n"
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
         '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n',

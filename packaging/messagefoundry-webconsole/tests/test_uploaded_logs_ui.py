@@ -1080,3 +1080,53 @@ async def test_resend_confirm_does_not_reflect_hostile_markup(
         # satisfy a bare "not in" assertion.
         assert hostile not in r.text
         assert "&lt;script&gt;" in r.text
+
+
+async def test_resend_refused_by_the_target_inbounds_guards_names_its_own_cause(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # BACKLOG #1911: the engine now refuses a resend the target inbound's listener would refuse
+    # (413 oversize, 415 wrong declared type, 422 undecodable). Those statuses must land on the list
+    # page as an allow-listed code, not escape as application/json inside the HTML console.
+    from messagefoundry.config.models import ContentType
+
+    for d in ("in", "o1"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.json", "poll_seconds": 0.05},
+            ),
+            router="r",
+            content_type=ContentType.JSON,  # an HL7 message from the upload contradicts it: 415
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB1", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o1")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB1", m))
+    engine.add_registry(reg)
+    await engine.start()
+
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+        refused = await c.post(
+            f"/ui/uploaded-logs/file/{fid}/resend",
+            params={"index": "0", "to": "in1"},
+            follow_redirects=False,
+        )
+        assert refused.status_code == 303, refused.text
+        assert "application/json" not in refused.headers.get("content-type", "")
+        assert refused.headers["location"] == "/ui/uploaded-logs?e=resend_refused"
+        landed = await c.get(refused.headers["location"], follow_redirects=False)
+        assert landed.status_code == 200 and "declared content type" in landed.text
+    assert await engine.store.list_messages(channel_id="in1") == []

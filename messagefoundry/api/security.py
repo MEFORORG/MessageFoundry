@@ -14,6 +14,7 @@ raising, so the caller can close the socket cleanly).
 
 from __future__ import annotations
 
+import datetime
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -23,7 +24,7 @@ from fastapi import HTTPException, Request, WebSocket, status
 
 from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
 from messagefoundry.config.tls_policy import HopDisposition
 
 # Re-imported, not redefined. The cert->principal mapping now lives in the neutral package-root leaf
@@ -34,6 +35,7 @@ from messagefoundry.config.tls_policy import HopDisposition
 from messagefoundry.credential import client_cert_principal
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
+from messagefoundry.store.store import UserRecord
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +68,14 @@ _SYSTEM_IDENTITY = Identity.build(
 )
 
 # While an account is flagged to rotate its password, only these self-service routes stay reachable.
-_MUST_CHANGE_EXEMPT_PATHS = frozenset({"/auth/logout", "/auth/me", "/me/password"})
+# /auth/mfa-verify is here for an account that is must-change AND has a factor (admin_reset_password
+# keeps factors): /me/password refuses its pending session until the factor is proven (BACKLOG
+# #1954), so the factor step has to be reachable or the account can do neither. What it adds for
+# every must-change session is that one ceremony: a call draws the sign-in rate budget and, on an
+# account with TOTP, a wrong code counts toward the lockout, exactly as it would unconfined.
+_MUST_CHANGE_EXEMPT_PATHS = frozenset(
+    {"/auth/logout", "/auth/me", "/auth/mfa-verify", "/me/password"}
+)
 
 # ASVS 6.3.3: while a session's second factor is PENDING, only these self-service routes stay
 # reachable. Keyed on (METHOD, path), NOT on path alone like the must-change set above: /me/mfa is
@@ -75,15 +84,20 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset({"/auth/logout", "/auth/me", "/me/password
 #
 # /auth/mfa-verify is HOW a session becomes satisfied, so it must gate itself out; /me/password and
 # /me/reauth are the binding deadlock carve-outs (a fresh account can be must_change AND mfa_pending
-# in the same instant). Enrollment (POST /me/mfa/enroll, /confirm) is NOT listed because it rides
-# require_reauth_only_action, which opts out via mfa_gate=False — an un-enrolled user could never
-# satisfy a gate that stands in front of the only route that enrolls them.
+# in the same instant). /me/password is exempt only for an account with NO factor: see
+# _PASSWORD_CHANGE_ROUTE below. Enrollment (POST /me/mfa/enroll, /confirm) is NOT listed
+# because it rides require_reauth_only_action, which opts out via mfa_gate=False — an un-enrolled
+# user could never satisfy a gate that stands in front of the only route that enrolls them.
 #
 # Deliberately NOT exempt: GET /me/sessions and GET /me/security-events. A pending session has proven
 # ONE factor, which is exactly the attacker-holds-the-password case; handing it the victim's session
 # inventory and client-IP history is reconnaissance. ASVS 7.5.2 self-service is a POST-authentication
 # clause, and neither route is on any deadlock-escape path (revocation still works: POST /me/reauth
 # then DELETE /me/sessions, both reachable).
+#
+# That revocation path serves an account with NO factor, which has nothing to prove at
+# /auth/mfa-verify. An account that HAS one proves it first before that path works (BACKLOG #1951;
+# see AuthService._PENDING_REFUSED_ACTIONS). /me/password is limited the same way (#1954).
 _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/auth/logout"),
@@ -94,6 +108,13 @@ _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/me/mfa"),
     }
 )
+
+# The one exempt route above whose exemption serves an account with NO factor only. A pending
+# session on a non-directory account that HAS one is refused here like anywhere else: a password change
+# revokes every session, so without this a caller holding only the password could lock the real
+# user out and sign them out everywhere (BACKLOG #1954, ASVS 6.3.3).
+# AuthService.password_change_owes_factor decides it; the console's password page asks it too.
+_PASSWORD_CHANGE_ROUTE = ("POST", "/me/password")
 
 # BACKLOG #195a (ASVS 16.3.2): the permissions whose authorization GRANT is worth an audit row when the
 # trail is NARROWED — the sensitive / state-changing / config / user-mgmt surface.
@@ -171,6 +192,62 @@ def get_auth(request: Request) -> AuthService | None:
     return auth
 
 
+def pending_credential_deadline(auth: AuthService, user: UserRecord | None) -> float | None:
+    """The instant this account's admin-issued must-change credential stops working, or ``None``.
+
+    BACKLOG #1141 (ASVS 6.4.5). Every route-layer surface that states the deadline of an unclaimed
+    credential reads it HERE, so each one states the instant the login gate refuses on. The gate
+    refuses when ``must_change_password`` is set and ``now`` is past
+    :meth:`AuthService.initial_credential_deadline` of the STORED ``password_changed_at``. This
+    mirrors both halves of that test and reads no clock of its own. ``None`` means the gate never
+    refuses this credential on time: no such user, a password the holder chose, or
+    ``[auth].initial_password_expiry_hours`` set to 0.
+
+    **The never-claimed first-run bootstrap account gets ``None`` here, on purpose.** WP-3 can retire
+    that ACCOUNT earlier than this CREDENTIAL bound (``bootstrap_expiry_hours`` set shorter), and it
+    is retired outright once a second administrator exists. ``bootstrap-admin.txt`` and the lifespan
+    reminder already state the earlier of the two. Stating the credential bound alone would name a
+    later instant than the real one. The recorded ``password_claimed_at`` stamp is the test, so an
+    ``admin`` account claimed long ago and then reset by another administrator still gets its
+    deadline. The complete answer, one service method that the gate itself calls and that takes the
+    earlier bound, belongs in ``AuthService``.
+    """
+    if user is None or not user.must_change_password:
+        return None
+    if user.username == BOOTSTRAP_USERNAME and user.password_claimed_at is None:
+        return None
+    return auth.initial_credential_deadline(user.password_changed_at)
+
+
+async def pending_credential_deadline_for(auth: AuthService, user_id: str) -> float | None:
+    """:func:`pending_credential_deadline` for an account named by id (one store read)."""
+    return pending_credential_deadline(auth, await auth.store.get_user(user_id))
+
+
+def initial_credential_window_hours(auth: AuthService) -> float | None:
+    """How long a newly issued must-change credential lives, in hours, or ``None`` for no expiry.
+
+    For text shown BEFORE the credential exists (the create-user form), when there is no stored stamp
+    to anchor an instant to yet. It asks :meth:`AuthService.initial_credential_deadline` for the
+    deadline of a credential stamped at the epoch, so the window comes from the same arithmetic the
+    gate uses rather than from a second read of the setting.
+    """
+    deadline = auth.initial_credential_deadline(0.0)
+    return None if deadline is None else deadline / 3600.0
+
+
+def deadline_utc(ts: float) -> str | None:
+    """A deadline instant as a UTC ISO-8601 stamp, for text a client shows to a person.
+
+    ``None`` when the instant cannot be rendered. The expiry setting has no upper bound, and
+    ``fromtimestamp`` raises past year 9999, or past year 3000 on Windows. A deadline that far out
+    is not worth a 500 on the refusal that states it, so the caller drops the sentence instead."""
+    try:
+        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _allow_no_auth(app_state: object) -> bool:
     """Whether this app explicitly opted out of auth (embedding/dev). Default: fail-closed."""
     return bool(getattr(app_state, "allow_no_auth", False))
@@ -230,6 +307,14 @@ def client_ip(conn: Request | WebSocket) -> str | None:
     return conn.client.host if conn.client else None
 
 
+def _password_change_required(deadline: float | None) -> str:
+    """The 403 detail for a must-change session, naming the credential's deadline when it has one."""
+    when = None if deadline is None else deadline_utc(deadline)
+    if when is None:
+        return "password change required"
+    return f"password change required; the temporary password stops working at {when}"
+
+
 def require(
     *permissions: Permission, mfa_gate: bool = True
 ) -> Callable[[Request], Awaitable[Identity]]:
@@ -258,18 +343,33 @@ def require(
         if identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
         if identity.must_change_password and request.url.path not in _MUST_CHANGE_EXEMPT_PATHS:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "password change required")
+            # BACKLOG #1141 (ASVS 6.4.5): this refusal is the renewal instruction every non-browser
+            # caller receives, so it states when the credential dies. The detail stays a string that
+            # STARTS with the old text, because clients match on it as a substring
+            # (``ide/src/engineStatusModel.ts`` ``classifyForbidden``).
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                _password_change_required(
+                    await pending_credential_deadline_for(auth, identity.user_id)
+                ),
+            )
         # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
-        # BOTH directions. must_change stays FIRST: a fresh account is must_change AND mfa_pending at
-        # the same instant, and GET /me/mfa is MFA-exempt but NOT must-change-exempt, so leading with
-        # MFA would point that account at /auth/mfa-verify, which it cannot satisfy until it has
-        # rotated — the brick. And this stays ABOVE the permission loop: refusing below it would tell
-        # an unverified caller whether it holds the permission, a free authorization oracle.
-        if (
-            mfa_gate
-            and (request.method, request.url.path) not in _MFA_EXEMPT_ROUTES
-            and not await auth.mfa_satisfied(bearer_token(request))
-        ):
+        # BOTH directions. must_change stays FIRST: a fresh account (new user, bootstrap admin) is
+        # must_change AND mfa_pending with NO factor, so leading with MFA would point it at
+        # /auth/mfa-verify with nothing to prove there — the brick. It rotates first instead, and
+        # /me/password lets it, because the factor refusal below skips an account with no factor.
+        # A must-change account that HAS a factor (an admin reset) is sent the other way: /me/password
+        # refuses it with X-MFA-Required, and /auth/mfa-verify is must-change-exempt so it can answer
+        # (BACKLOG #1954). And this stays ABOVE the permission loop: refusing below it would tell an
+        # unverified caller whether it holds the permission, a free authorization oracle.
+        route = (request.method, request.url.path)
+        if mfa_gate and route not in _MFA_EXEMPT_ROUTES:
+            pending = not await auth.mfa_satisfied(bearer_token(request))
+        elif mfa_gate and route == _PASSWORD_CHANGE_ROUTE:
+            pending = await auth.password_change_owes_factor(bearer_token(request))
+        else:
+            pending = False
+        if pending:
             await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
@@ -767,7 +867,11 @@ def require_reauth_only_action(
     from binding an attacker authenticator, and now that proof is tied to *this* action, not the login
     window (ADR 0077). Same ``X-Step-Up-Action`` header + org opt-out as :func:`require_step_up_action`.
 
-    Carries the same ``mfa_gate=False`` opt-out as :func:`require_reauth_only`, for the same reason."""
+    Carries the same ``mfa_gate=False`` opt-out as :func:`require_reauth_only`, for the same reason;
+    the session-terminate routes use it too. A pending session on an account that HAS a factor is
+    still refused (see ``AuthService._PENDING_REFUSED_ACTIONS``), with ``X-MFA-Required`` and not
+    a step-up header: a password re-proof mints it nothing, so pointing it at ``POST /me/reauth``
+    would loop a client that already typed the right password (BACKLOG #1951)."""
     base = require(*permissions, mfa_gate=False)
 
     async def dependency(request: Request) -> Identity:
@@ -776,6 +880,16 @@ def require_reauth_only_action(
         if auth is not None and auth.enabled:
             token = bearer_token(request)
             new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
+            # After the new-IP signal, so a refused request still records it, and before the grant
+            # check, which pops: a refusal here must not burn a grant. Audited like require()'s MFA
+            # gate, since this is the same refusal reached past that gate's carve-out.
+            if await auth.factor_binding_is_blocked(token, action):
+                await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "multi-factor verification required; POST /auth/mfa-verify then retry",
+                    headers={"X-MFA-Required": "1"},
+                )
             if new_ip or not await _action_step_up_ok(auth, token, action):
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,

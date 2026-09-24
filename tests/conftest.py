@@ -168,9 +168,11 @@ def _force_aad_bind_when_requested() -> Iterator[None]:
     orig_init = crypto.AesGcmCipher.__init__
 
     def _forced_init(  # type: ignore[no-untyped-def]
-        self, active_key, retired_keys=(), *, write_v2=False
+        self, active_key, retired_keys=(), *, write_v2=False, allow_unmarked=False
     ):
-        orig_init(self, active_key, retired_keys, write_v2=True)
+        # allow_unmarked passes through untouched (BACKLOG #1169): this flag forces the writer, not
+        # the unmarked-value policy, and dropping it would turn every opt-out test into a TypeError.
+        orig_init(self, active_key, retired_keys, write_v2=True, allow_unmarked=allow_unmarked)
 
     crypto.AesGcmCipher.__init__ = _forced_init  # type: ignore[method-assign]
     try:

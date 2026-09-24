@@ -261,8 +261,9 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > **refused at construction** (`messagefoundry check` / dry-run / reload / the `serve` pre-flight), not
 > merely warned. **At least nine** hops carry that gate — the connection-level ones are
 > **MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb (https), EMAIL/SMTP, and a connection's SMART token
-> endpoint**, plus two that are not connections at all: the **PostgreSQL store hop** and the
-> **`[logging]` TLS syslog forwarder**. Read it as "at least these" rather than as a covered estate
+> endpoint**, plus some that are not connections at all: the **PostgreSQL store hop**, the
+> **`[logging]` TLS syslog forwarder**, and the **OIDC token and JWKS legs**, which are checked when
+> `serve` builds the auth service rather than by `messagefoundry check`. Read it as "at least these" rather than as a covered estate
 > (SDS-3.6); the count moved from seven with [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
 > §4.3 and each gated hop names itself when it refuses. On a stock instance that means `MLLP(..., tls=True)`, an
 > `https://` `Rest()`/`Soap()`/`FHIR()`/`DICOMweb()` destination and an `Email()` STARTTLS relay are all
@@ -594,7 +595,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `encoding` | `utf-8` | charset the POSTed body is decoded with (non-binary content types) |
 | `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
-| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` (or a read past the cap) is refused `413` **before the body is buffered whole** (OOM guard). `None`/`0` = unlimited. |
+| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited. |
 | `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). A falsy value falls back to the 64 KiB default — this one cap can't be switched off. |
 | `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe and a refused request wait behind an outstanding debt but **charge nothing** — only a committed message spends budget, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so the listener can always make progress. |
@@ -641,9 +642,9 @@ HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery fai
 disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
-`max_header_bytes`), `400` (malformed request line / header, a bad or duplicated framing header), `503` (at
+`max_header_bytes`), `400` (a malformed request line or header, or framing this listener will not guess at -- including at least any `Transfer-Encoding`, a duplicated or non-digit `Content-Length`, whitespace before a header colon, a folded header line, a bare CR or LF, a control character in a header value, an HTTP version other than 1.x, and a non-zero body declared on a method other than `POST`/`PUT`/`PATCH`), `411` (a `POST`/`PUT`/`PATCH` with no `Content-Length`; the body is never read to EOF), `503` (at
 `max_connections` — the connection is accepted, then refused and closed at the application layer).
-`GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`.
+`GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`. Methods are case-sensitive (RFC 9110), so a lowercase `get` or `post` is not a probe or an intake request.
 
 **Synchronous captured-downstream reply (`reply_from`, ADR 0154 increment B).** Naming `reply_from` makes
 the HTTP turn **block** until the named outbound's reply has been captured **and committed to the store**,
@@ -775,27 +776,117 @@ at the source.
 
 #### File handling & quarantine policy (ASVS 5.1.1)
 
-MessageFoundry's file surface has **at least four** parts. This list is maintained by hand, so read it
-as the current inventory and not as a closed set. The **directory sources** (the local `File(...)` and
-remote `Sftp(...)`/`Ftp(...)` connectors) ingest drop-directory files into the pipeline; the
-**opt-in HTTP uploaded-logs upload** (POST `/uploads` + the web-console delegate POST
-`/ui/uploaded-logs/upload`, [ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md))
-carries operator diagnostic logs; the **attachment download** route (GET
-`/messages/{message_id}/attachments/{attachment_id}`, [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md))
-serves a detached document back out; and the **DICOM C-STORE SCP** (an inbound `DICOM(...)`,
-[ADR 0025](adr/0025-dicom-codec-store-connectors.md)) receives whole objects **pushed by a remote
-modality** over DIMSE. An earlier revision of this sentence said "three parts" and omitted the SCP;
-that enumeration was wrong — the SCP is a receiver of remote-pushed content on the same footing as the
-two HTTP routes. None of the drop-directory policy below applies to it: its size ceilings, peer
-controls and transport security are connector settings documented under
-[DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025),
-and a deploying site must set them there rather than assume this block covers them. **The embedded-document detach is a STAGE, not a fifth receiver, and its ceilings are stated here
+This block lists the file surfaces ASVS 5.1.1 asks about, one row each. Two rules decide what
+counts:
+
+- An **upload feature** is any shipped surface where a party other than the host operator, working at
+  the host, supplies content that the product persists or processes. Content means a file, a DICOM
+  object or a message body. A request body that only steers an operation, such as a search needle or a form
+  field, is a parameter and not content. One addition by owner ruling of 2026-09-23: the IDE
+  extension's local file pickers count too, although a developer at the host uses them.
+- A **download** is any response the product sends with `Content-Disposition: attachment`.
+
+How each part of the list is kept:
+
+- **Receiver rows** follow the `register_source(...)` calls in `messagefoundry/transports/`.
+- **Upload-route rows** follow `_UPLOAD_BODY_PATHS` in `api/app.py`, plus a hand-kept list of JSON
+  routes whose body is a message. No code marker tells a content body from a parameter body on a JSON
+  route, so that list cannot be derived.
+- **The IDE picker row** follows the `showOpenDialog` calls in `ide/src/`.
+- **Download rows** follow the code sites that write a `Content-Disposition` header or build a
+  `FileResponse`, and the API routes whose handler is such a site or calls one.
+- **Kept by hand:** the reply-capture row, the `/ui` delegates, the two limits after the upload table,
+  and the exclusions. For these the test pins each figure quoted beside a code constant, and checks
+  that the reply-capture setting and the transports that offer it still match. It does not check that
+  nothing is missing.
+
+`tests/test_asvs_file_surface_inventory.py` derives the first four parts from the code. It fails the
+build when a derived row is missing, when a row names a surface the code no longer has, or when a
+figure stops matching the constant named beside it.
+
+**Upload features.**
+
+| Surface | Permitted type | Extension | Maximum size | Unpacked size |
+|---|---|---|---|---|
+| `file`: local drop directory, `File(...)` | the inbound's declared `content_type` (default `hl7v2`), content-sniffed against that declaration; see the policy below | chosen by `pattern` (default `*.hl7`); the type check reads content, not the extension | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB (`transports/file.py`) | no unpacking unless `decompress="gzip"` is set; then `max_decompressed_bytes`, default `DEFAULT_MAX_DECOMPRESSED_BYTES` = 64 MiB |
+| `remotefile`: SFTP or FTP drop directory, `Sftp(...)` / `Ftp(...)` ([Remote file](#remote-file--sftp--ftp)) | as for `file` | chosen by `pattern` (default `*.hl7`) | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB, charged against the listed size and again against the bytes read | no unpacking on intake; the connector has no `decompress` setting |
+| `dimse`: DICOM C-STORE SCP, an inbound `DICOM(...)`; its size, peer and TLS settings are under [DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025) | DICOM objects in the SCP's accepted presentation contexts | not applicable; objects arrive over DIMSE | `max_object_bytes`, default `DEFAULT_MAX_OBJECT_BYTES` = 128 MiB (`transports/dicom.py`), charged before decode | a Deflated Explicit VR LE object is inflated in bounded memory before decode, capped at `max_object_bytes`. Setting `max_object_bytes` to `0` or `None` removes the object cap and drops this inflate cap to `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB |
+| `http`: web-service listener, `Http(...)` ([HTTP](#http-web-service-listener--http-inbound-only-adr-0023)) | the inbound's declared `content_type` | not applicable; a request body | `max_body_bytes`, default `DEFAULT_MAX_BODY_BYTES` = 16 MiB (`transports/http_listener.py`); headers `DEFAULT_MAX_HEADER_BYTES` = 64 KiB | no unpacking on intake. The listener decodes no `Content-Encoding` and no transfer coding. It refuses a body whose `Transfer-Encoding` is exactly `chunked`, and reads any other body as sent, up to the cap |
+| `mllp`: MLLP listener ([MLLP](#mllp--mllp)) | the inbound's declared `content_type` (default `hl7v2`) | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB (`transports/mllp.py`) | no unpacking on intake |
+| `tcp`: raw TCP listener ([Raw TCP](#raw-tcp--tcp)) | the inbound's declared `content_type` | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB | no unpacking on intake |
+| `x12`: X12 EDI listener ([X12 EDI](#x12-edi--x12)) | X12 interchanges | not applicable; a framed stream | `max_interchange_bytes`, default `DEFAULT_MAX_INTERCHANGE_BYTES` = 16 MiB (`parsing/x12/delimiters.py`) | no unpacking on intake |
+| `database`: database poller, `DatabasePoll(...)` ([Database source](#database-source--databasepoll)) | rows from `poll_statement`, each handed on as one body in the declared `content_type` | not applicable; table rows | no byte cap of its own; the engine's per-message ceiling below rejects an oversized row after it is read; `poll_max_rows`, default `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows per poll | no unpacking on intake |
+| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | off unless `[store].uploads_dir` is set. Plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file onto a chosen inbound's ingress stage. First it runs that inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; and a check that the inbound's charset can hold the text. A refusal answers 413, 415 or 422, writes an `upload.resend_reject` audit row, and writes no message. Strict `hl7apy` validation still does not run on a resend | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
+| `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | The edited body re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. A re-route first runs the origin inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; and a check that the inbound's charset can hold the text. A re-route whose origin inbound this engine does not hold answers 409. The direct path has no inbound, so only the NUL rule and that ceiling apply. A refusal answers 413, 415 or 422, writes a `message_edit_resend_reject` audit row, and writes no message. Strict `hl7apy` validation still does not run on either path | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
+| `ide/src/testBench.ts` (Load Message Set) and `ide/src/stepsView.ts` (Use for Live Values): the IDE extension's local file pickers, a 5.1.1 upload feature by owner ruling of 2026-09-23 | any file: each picked path goes to `messagefoundry dryrun`, which runs it against an inbound's declared `content_type` | the dialog offers `.hl7` first and also "All files", so no extension is enforced | `MAX_FIXTURE_FILE_BYTES` = 16 MiB per file (`pipeline/dryrun.py`), raised to the largest `max_message_bytes` an inbound in the graph sets; refused with a message naming the file, before it is read whole. `dryrun` then applies the per-message ceiling below itself. The Steps view also reads its picked sample inside the extension to list its segments, and that read has no cap. The live-debug sample choice (`liveDebug.ts`, a pick list of `.hl7` files) feeds the same `dryrun` read | no unpacking |
+| `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop. A re-ingressed reply does not pass the `Loopback()` inbound's listener checks, so the read bound in this row is its bound | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound, both checked only after the whole result set is fetched | no unpacking on capture |
+
+Two limits apply after intake. The first covers the rows keyed by a connector type, the first eight.
+The other rows skip the listener, so it does not reach them, except that `dryrun` applies the same
+ceiling to what the IDE row feeds it. The second covers content from any row:
+
+- **The engine's per-message ceiling.** The listener applies `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB
+  (`parsing/peek.py`) to each received body, measured in characters once a text body is decoded. A
+  body over it is kept as an `ERROR` message and never processed. An HL7 v2 inbound replaces it with
+  its own `max_message_bytes` when that is set. So a DICOM object between 16 MiB and the SCP's 128 MiB
+  object cap passes the connector and is then recorded as `ERROR` rather than routed.
+- **Unpacking a payload.** When a Router or Handler parses a Deflated DICOM Part-10 payload,
+  `guard_part10_deflate` caps the inflate at `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB, with no setting.
+  For a Handler that unpacks content itself, the engine offers `gzip_decompress`,
+  `deflate_decompress` and `zip_decompress` (`parsing/compression.py`, [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)).
+  Each takes `max_output_bytes` as a required keyword with no default, so the Handler author must
+  choose the ceiling. Passing `None` removes it, and has to be written out. `zip_decompress` also caps
+  the member count at `max_entries`, default 1024, and refuses the whole archive when one member's
+  name or content fails the checks in `parsing/sniff.py`. A Handler is ordinary Python, though, and
+  can unpack with any library instead, such as `gzip` or `zipfile` directly. The engine then sets no
+  bound, and the Handler author owns the unpacked-size limit.
+
+**Downloads.** The "Downloads are made safe at serve (ASVS 1.3.4)" clause below covers the attachment
+row only. The two export rows are made safe as their own row says.
+
+| Surface | What it serves | Type and file name | Maximum size | How it is made safe |
+|---|---|---|---|---|
+| `/messages/{message_id}/attachments/{attachment_id}` (GET) and its `/ui` delegate ([ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)) | one detached document, byte for byte | an allow-listed type or `application/octet-stream`; the extension comes from the same table, default `.bin` | the stored document, already bounded at intake by the rows above | the ASVS 1.3.4 clause below |
+| `/messages/export` (GET and POST) | stored message bodies, decrypted, one JSON object per line | `application/x-ndjson`, `messages-export.ndjson` | at most `limit` bodies per call, default 1000, ceiling 100,000 (the route's `limit` bound and `MessageExportRequest.limit`); an explicit id list is capped at `MAX_EXPORT_IDS` = 100,000 | `_export_ndjson_line` writes each body as a JSON string, so no body can break the one-object-per-line framing. The route needs step-up with `messages:export` and `messages:view_raw`, rechecks channel scope on each body, and writes one `messages_export` audit row before it streams ([SECURITY.md](SECURITY.md#route--permission-map-engine-api)) |
+| `/audit/export` (GET) | audit rows as CSV: metadata only, never a message body | `text/csv`, `audit-export.csv` | at most `limit` rows, default 10,000, ceiling 1,000,000 (the route's `limit` bound) | every cell passes through `_csv_safe`, which neutralizes spreadsheet formula injection ([PHI.md](PHI.md#logging-inventory-1611--1623)). The route needs `audit:export` and writes one `audit.export` row before it streams |
+
+**Excluded, with the reason.**
+
+- `loopback`, `passthrough` and `timer` are registered sources that read nothing from outside
+  themselves. `Loopback()` re-ingresses a captured reply, which has its own row above.
+  `PassThrough()` re-ingresses what a Handler produced, and `Timer(...)` fires on the clock.
+- A Handler's live lookup result is data it reads to shape its output, not content the product keeps
+  as a message ([ADR 0010](adr/0010-handler-callable-db-lookup.md),
+  [ADR 0043](adr/0043-fhir-read-lookup.md)). `fhir_lookup` reads are capped at
+  `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB. `db_lookup` returns every row its statement selects, and the
+  engine sets no row cap, so the Handler's statement is the bound.
+- `/ui/static` serves first-party assets that ship in the package. `AllowlistedStaticFiles` serves
+  only `ALLOWED_STATIC_EXTENSIONS` (`.css`, `.js`), and it sends no `Content-Disposition`.
+- The API routes not listed above that take a body are treated as parameter routes, capped by
+  `_MAX_REQUEST_BODY_BYTES` = 1 MiB. That classification is kept by hand. The route closest to the
+  line is the browser CSP report sink, `/ui/csp-report`: it takes an unauthenticated report, parses
+  it, logs a bounded summary and keeps nothing.
+- Local admin CLI commands run as the host operator at the host, which the rule above excludes. The
+  ones that read or write a file include: `restore` and `restore-verify` of a `.mfbak` archive,
+  which cap the store member at `_MAX_RESTORE_MEMBER_BYTES` = 16 GiB; `restore --config-to`, which
+  also caps the config bundle at `_MAX_CONFIG_MEMBERS` = 10,000 members and
+  `_MAX_CONFIG_BYTES` = 1 GiB; `import corepoint`; `cert import`; `dryrun` and `check` run by hand,
+  which read fixture files under the IDE row's cap (`check` reads each fixture's `.expect` sidecar
+  whole); and `support-bundle`, which
+  writes its archive to the local disk and serves nothing.
+- `/ai/chat` (POST) carries a prompt, not a file: a parameter that `AiChatRequest.prompt` caps at
+  200,000 characters, which the engine relays to the configured AI provider ([AI.md](AI.md)).
+- The test harness (`harness/`) is test tooling, excluded by Manager decision of 2026-09-23. It is
+  built as a separate distribution and attached to each release, and its MLLP receiver sets no frame
+  cap.
+
+**The embedded-document detach is a STAGE, not a receiver, and its ceilings are stated here
 because the requirement asks for unpacked size wherever content is accepted.** When an inbound sets
 `stream_threshold_bytes` (default `None`, so the whole path is OFF unless a feed asks for it), a body
 at or above that size has its opaque documents detached from the transformable skeleton
 ([ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md))
 and stored for the attachment-download route above. Nothing new arrives on the wire -- the bytes came
-in through one of the receivers already listed -- which is why the count above does not move. Two
+in through one of the receivers already listed -- which is why it has no row of its own. Two
 ceilings bound it, and they bound different things:
 
 - the inbound's own **`max_message_bytes`** bounds a SINGLE body, and applies whether or not a detach
@@ -837,7 +928,11 @@ its own policy block below):
   That inflate is bounded where the object is unpacked rather than at ingest: at **16 MiB**, with no
   per-connection knob, when a Router or Handler parses it (`guard_part10_deflate` in
   `parsing/dicom/_inflate.py`, called from `DicomPeek.parse` and `DicomDataset.parse`), and at
-  `max_object_bytes` when an outbound C-STORE SCU forwards it. A site dropping DICOM into a watch
+  `max_object_bytes` when an outbound C-STORE SCU forwards it. The guard finds the deflated Data Set
+  with pydicom's own header readers, the ones `dcmread` runs just before it inflates. So it bounds the
+  same bytes `dcmread` inflates, even behind a malformed file meta. That covers at least a missing or
+  wrong group length, a second transfer-syntax element, and a forced read with no preamble. A site
+  dropping DICOM into a watch
   directory should size those two ceilings deliberately rather than read this bullet as saying no
   unpacking happens. When
   `decompress="gzip"` is enabled it gunzips each drop **before** the content sniff, the AV scan, and the
@@ -1607,6 +1702,11 @@ the S/MIME message to `host:port` over STARTTLS SMTP. PHI is therefore protected
 of the transport TLS. Crypto is core `cryptography` (`serialization.pkcs7`) and SMTP is stdlib `smtplib` —
 **no new dependency, no extra**.
 
+The envelope encrypts the content under **AES-256-CBC**. That is fixed in code, not a setting
+(BACKLOG #1168). The content key is wrapped to the recipient's RSA key with RSAES-PKCS1-v1_5, which the
+library offers no way to change. A partner whose S/MIME stack cannot decrypt AES-256-CBC cannot read
+these messages, and the SMTP relay accepts them before anyone tries.
+
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `host` | — (required) | the SMTP / HISP relay host (the `[egress].allowed_direct` key; use `env()`) |
@@ -1842,7 +1942,7 @@ Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `
 `DicomDataset` + SR→HL7 helpers for transform), and a forwarding Handler re-emits the carried bytes to a SCU
 or STOW-RS destination. The codec is **headers and Structured Report only — no pixel data**. The DIMSE
 connectors need the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
-`pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
+`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
 extra** (it stores the object as opaque bytes over the shared `rest.py` HTTP plumbing). Still out of scope:
 MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 
@@ -1853,7 +1953,7 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `presentation_contexts` | `None` → SR + common image storage + Verification | the SOP classes the SCP negotiates (transfer syntaxes default to the standard set) |
 | `calling_ae_allowlist` | `None` → any (subject to the IP gate) | only these calling AE titles may associate (fail-closed when set) |
 | `require_called_ae_title` | `True` | a peer must address this engine's `ae_title` as the called AE |
-| `max_object_bytes` | `134217728` (128 MiB) | reject a single C-STORE object larger than this (OOM/DoS guard). It is charged **twice**: first against the **raw received Data Set**, before `pydicom` decodes it, so an over-cap object is refused without ever being decoded or re-encoded; then against the re-encoded Part-10 bytes, which the raw length cannot see (the preamble, `DICM` and file meta are added there). Both charges land **before** the durable commit. It is **also** the ceiling for the pre-decode **inflate** of a *Deflated Explicit VR LE* object, whose compressed raw length says nothing about how far it inflates: the SCP bound-inflates the raw received Data Set before pydicom touches it, so an over-cap deflate bomb is a DIMSE failure and is never decoded or committed. Note that `0`/`None` does not simply widen this — it removes the object-size check entirely **and tightens** the inflate ceiling to the codec default of **16 MiB**, which is what the guard falls back to when no object cap is configured |
+| `max_object_bytes` | `134217728` (128 MiB), **but the SCP never honours more than the engine's 16 MiB binary ingress ceiling** | reject a single C-STORE object larger than this (OOM/DoS guard). **The SCP's effective cap is the smaller of this value and 16 MiB**, because the engine records any larger object as `ERROR` and never processes it, and an SCP that accepted one would tell the sender Success for an object the engine dropped (BACKLOG #1910). So the shipped default resolves to 16 MiB on the SCP, and a larger value cannot raise it. It is charged **twice**: first against the **raw received Data Set**, before `pydicom` decodes it, so an over-cap object is refused without ever being decoded or re-encoded; then against the re-encoded Part-10 bytes, which the raw length cannot see (the preamble, `DICM` and file meta are added there). Both charges land **before** the durable commit. It is **also** the ceiling for the pre-decode **inflate** of a *Deflated Explicit VR LE* object, whose compressed raw length says nothing about how far it inflates: the SCP bound-inflates the raw received Data Set before pydicom touches it, so an over-cap deflate bomb is a DIMSE failure and is never decoded or committed. `0`/`None` does not remove the check on the SCP: it resolves to the same 16 MiB ceiling. An over-cap object is refused with **Out of Resources** (`0xA700`), before any commit, so nothing is recorded for it. If the engine's ingress still refuses an object the SCP passed, the engine records it `ERROR` and the SCP answers **Cannot Understand** (`0xC000`), never Success |
 | `max_associations` | `10` | cap on concurrent inbound associations (connection-flood guard) |
 | `max_associations_per_second` | **off** | sustained rate at which this SCP **accepts new associations** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). Over budget the SCP **waits before reading the association request**, so the peer is back-pressured by TCP and then served in full — **nothing is dropped, refused or answered differently**, and a rejected association charges nothing. **The unit is an association, not a message,** and that is a property of DIMSE: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object is already read and decoded, and pacing there would delay a message the count-and-log invariant has already obliged us to account for. **So an established association is NOT bounded in the objects it may push** — `max_object_bytes` and `timeout_seconds` bound those instead. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule, exactly as on the listen intakes: a guessed rate throttles a real modality, so the number has to come from your own feed profile. **Pair it with `max_associations`,** which must be large enough to hold the peers waiting behind a pace — and keep the resulting wait inside your senders' ACSE timeouts, or a paced modality aborts. |
 | `association_burst` | = the rate | tokens the bucket holds, i.e. how large a burst of associations passes unpaced before the sustained rate applies. Only meaningful with `max_associations_per_second` set. Floor of 1 so an SCP can always make progress. |
@@ -2735,7 +2835,7 @@ reading this page already applies to a file the scan never opened.
 | SOAP destination | as REST — indirect via the lane budget | as REST | as REST |
 | FHIR destination + `fhir_lookup` | as REST; `fhir_lookup` additionally runs off the event loop on the thread executor | as REST; a lookup that cannot run raises into the Handler | transient → retry; a `fhir_lookup` failure fails the message, never silently degrades |
 | DICOMweb STOW-RS destination | as REST — indirect via the lane budget | as REST | as REST |
-| DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB | over the association cap pynetdicom rejects the association; `max_pdu_size` bounds a fragment rather than an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit | the modality re-sends; nothing is half-committed |
+| DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` bounds a fragment rather than an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit | the modality re-sends; nothing is half-committed |
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
@@ -2950,7 +3050,7 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 3. *Transform:* v2 ↔ C‑CDA helpers (the high‑value, high‑effort part).
 
 **Dependency note.** A modeled lane means a new parser/validator dependency. The shipped lanes each ride an
-optional extra — `[dicom]` (`pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4`, pure‑Python, no numpy), `[fhir]`
+optional extra — `[dicom]` (`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<4`, pure‑Python, no numpy), `[fhir]`
 (`fhir.resources` + `fhirpathpy`), `[x12]` (`pyx12`), and `[xml]` (`lxml` + `xmlschema` + `signxml`) — all
 lazily imported, so an install that never touches a lane pays nothing. Still to be *evaluated*, not yet
 chosen: an **NCPDP** parser (the XML/CDA question is settled — `lxml` is in tree under `[xml]`). Per the

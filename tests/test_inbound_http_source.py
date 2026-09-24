@@ -529,22 +529,362 @@ async def test_read_body_rejects_incomplete_declared_body() -> None:  # BACKLOG 
     assert excinfo.value.status == 400 and excinfo.value.kind == "framing_error"
 
 
-async def test_read_body_keeps_the_get_before_chunked_ordering() -> None:
-    # Pins a quirk the split could silently "fix": the GET/HEAD short-circuit runs BEFORE the chunked
-    # refusal, so a GET carrying Transfer-Encoding: chunked is accepted with an empty body. Hoisting
-    # the refusal into the head phase would look like hardening and would change shipped behaviour.
+async def test_framing_is_decided_for_every_method_in_the_head_phase() -> None:
+    """THE ORDERING THIS ONCE PINNED WAS DELIBERATELY REVERSED (BACKLOG #1125, ASVS 4.2.1).
+
+    This test used to assert the opposite, and its comment warned that hoisting the refusal "would
+    look like hardening and would change shipped behaviour". That was a fair warning and it worked:
+    it turned an edit into a decision. The decision went to adversarial review, which measured that
+    a GET carrying framing headers left its declared bytes unread on the socket, and that the
+    authoring commit (`f2ef0ea92`, the ADR 0154 intake-auth increment) names no ruling and no
+    incident -- it was change-control caution, not a requirement.
+
+    RFC 9112 makes framing a property of the MESSAGE, not of the method, so it is now settled in
+    `_read_head` for every method before dispatch. Rewritten rather than deleted, so the reversal is
+    recorded where the next reader will look for it.
+    """
+    # A bodyless method carrying Transfer-Encoding is now REFUSED, in the head phase.
     reader = await _reader_from(
         b"GET /health HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
     )
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 400
+
+    # ... and so is a POST carrying it, now also in the head phase rather than the body phase.
+    reader = await _reader_from(b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n")
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 400
+
+    # REFUSE, NEVER CONSUME -- and this is the carve-out that keeps a health checker green.
+    # `Content-Length: 0` on a bodyless method declares no body, desyncs nothing, and is the one
+    # shape this tree actually exercises (test_read_request_allows_single_content_length_get).
+    reader = await _reader_from(b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n")
     head = await _read_head(reader, max_header_bytes=8192)
     assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b""
 
-    # ... while a POST carrying it is still refused, in the body phase.
-    reader = await _reader_from(b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n")
-    head = await _read_head(reader, max_header_bytes=8192)
+    # ... while a NON-ZERO length on the same method is refused: those are the declared bytes that
+    # would otherwise sit on the wire for a pooling front end to read as a second request.
+    reader = await _reader_from(
+        b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO"
+    )
     with pytest.raises(HttpRequestError) as excinfo:
-        await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES)
+        await _read_head(reader, max_header_bytes=8192)
     assert excinfo.value.status == 400
+
+
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        # Transfer-Encoding is refused by PRESENCE. Exact equality on "chunked" measurably missed
+        # all three of these, and they reached the POST path and were ingested as clinical payload.
+        (
+            "te gzip,chunked",
+            b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+        ),
+        ("te trailing comma", b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked,\r\n\r\n"),
+        ("te identity", b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: identity\r\n\r\n"),
+        # Content-Length is 1*DIGIT, not int(). int() takes a leading plus and PEP 515 underscores,
+        # so "1_0" framed TEN bytes against a proxy that would have read one.
+        ("cl leading plus", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: +3\r\n\r\nabc"),
+        ("cl underscore", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 1_0\r\n\r\n0123456789"),
+        # Whitespace before the colon is a MUST-reject: strip() turned this into valid framing,
+        # which is the shape a strict proxy drops and a lenient origin honours.
+        ("space before colon", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length : 3\r\n\r\nabc"),
+        # A bare LF fused two headers into one and the Content-Length VANISHED from the dict, so
+        # both framing guards inspected a request whose framing header they could no longer see.
+        ("bare lf in head", b"POST / HTTP/1.1\r\nHost: h\nContent-Length: 3\r\n\r\nabc"),
+        # ... and a bare LF in the request line left the header dict EMPTY while the body was read.
+        ("bare lf request line", b"POST /x HTTP/1.1\nHost: h\r\n\r\n"),
+        # HTTP-version is DIGIT "." DIGIT; a startswith("HTTP/") test accepted this.
+        ("non-token version", b"POST / HTTP/1.1x\r\nHost: h\r\n\r\n"),
+        # An obs-fold continuation line. `.strip()` read it as a real Content-Length, while a proxy
+        # that unfolds reads it as more of the Host value (RFC 9112 section 5.2).
+        (
+            "obs-fold framing header",
+            b"POST / HTTP/1.1\r\nHost: h\r\n Content-Length: 3\r\n\r\nabc",
+        ),
+        ("obs-fold with tab", b"POST / HTTP/1.1\r\nHost: h\r\n\tContent-Length: 3\r\n\r\nabc"),
+        # A bare CR hid the Content-Length inside the Host value here; a proxy that splits on CR
+        # sees it as its own header.
+        ("bare cr in head", b"POST / HTTP/1.1\r\nHost: h\rContent-Length: 3\r\n\r\nabc"),
+        # The method now selects the framing rule, so it must be a token.
+        ("non-token method", b"PO(ST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
+        ("non-token header name", b"POST / HTTP/1.1\r\nHost: h\r\nContent(Length: 3\r\n\r\nabc"),
+        # HEAD is bodyless like GET, so the same framing refusals apply to it.
+        ("head te", b"HEAD / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        ("head cl", b"HEAD / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO"),
+        # A method this listener reads no body for may not declare one either; it used to be
+        # buffered in full only to be answered 405.
+        ("delete cl", b"DELETE / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO"),
+        # str.strip() removed VT, FF, NBSP and NEL, so each of these framed three bytes.
+        ("cl trailing vt", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\x0b\r\n\r\nabc"),
+        ("cl leading ff", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length:\x0c3\r\n\r\nabc"),
+        ("cl trailing nbsp", b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\xa0\r\n\r\nabc"),
+        ("nul in a value", b"POST / HTTP/1.1\r\nHost: h\x00\r\nContent-Length: 3\r\n\r\nabc"),
+        # int() raises past 4300 digits, which escaped as a 500.
+        (
+            "cl too many digits",
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: " + b"9" * 4400 + b"\r\n\r\nabc",
+        ),
+        # The request-target must be visible ASCII; some recipients split a line on HTAB or VT.
+        ("target with tab", b"POST /a\tb HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
+        ("target with nul", b"POST /a\x00b HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
+        ("empty target", b"POST  HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
+        # Only HTTP/1.x is parsed with HTTP/1.1 framing.
+        ("http/2.0", b"POST / HTTP/2.0\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"),
+        ("http/0.9", b"GET / HTTP/0.9\r\nHost: h\r\n\r\n"),
+    ],
+)
+async def test_the_head_parse_refuses_the_rfc_9112_desync_grammar(label: str, raw: bytes) -> None:
+    """Shapes this parser accepted before BACKLOG #1125 and now refuses in the head phase.
+
+    Every one is a desync primitive: it parses one way here and another way in a fronting proxy.
+    The accept-controls live in the tests around this one -- a plain GET, a plain POST carrying a
+    Content-Length, and GET + `Content-Length: 0` -- so a parser that had gone refuse-everything
+    would redden those rather than pass here.
+    """
+    reader = await _reader_from(raw)
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 400, label
+    assert excinfo.value.kind == "framing_error", label
+
+
+_CHUNKED_BODY = b"3\r\nabc\r\n0\r\n\r\n"
+
+# The reason each framing guard in `_read_head` gives, so a case can name the guard it pins.
+_TE_REFUSED = "transfer-encoding is not supported; use Content-Length"
+_CL_TE_REFUSED = "ambiguous framing: Content-Length with Transfer-Encoding"
+_UNDERSCORE_REFUSED = "underscore in a framing header name"
+
+
+@pytest.mark.parametrize(
+    ("label", "request_line", "framing", "reason"),
+    [
+        ("exact", b"POST /ingest", b"Transfer-Encoding: chunked\r\n", _TE_REFUSED),
+        ("value title case", b"POST /ingest", b"Transfer-Encoding: Chunked\r\n", _TE_REFUSED),
+        ("value upper case", b"POST /ingest", b"Transfer-Encoding: CHUNKED\r\n", _TE_REFUSED),
+        ("name upper case", b"POST /ingest", b"TRANSFER-ENCODING: chunked\r\n", _TE_REFUSED),
+        ("name and value mixed", b"POST /ingest", b"transfer-Encoding: cHuNkEd\r\n", _TE_REFUSED),
+        (
+            "gzip then chunked",
+            b"POST /ingest",
+            b"Transfer-Encoding: gzip, chunked\r\n",
+            _TE_REFUSED,
+        ),
+        (
+            "gzip then upper chunked",
+            b"POST /ingest",
+            b"Transfer-Encoding: gzip, CHUNKED\r\n",
+            _TE_REFUSED,
+        ),
+        (
+            "no space after comma",
+            b"POST /ingest",
+            b"Transfer-Encoding: gzip,chunked\r\n",
+            _TE_REFUSED,
+        ),
+        (
+            "chunked then gzip",
+            b"POST /ingest",
+            b"Transfer-Encoding: chunked, gzip\r\n",
+            _TE_REFUSED,
+        ),
+        ("surrounding ows", b"POST /ingest", b"Transfer-Encoding: \t chunked \t\r\n", _TE_REFUSED),
+        ("coding parameter", b"POST /ingest", b"Transfer-Encoding: chunked;x=1\r\n", _TE_REFUSED),
+        ("quoted coding", b"POST /ingest", b'Transfer-Encoding: "chunked"\r\n', _TE_REFUSED),
+        ("gzip alone", b"POST /ingest", b"Transfer-Encoding: gzip\r\n", _TE_REFUSED),
+        ("deflate alone", b"POST /ingest", b"Transfer-Encoding: Deflate\r\n", _TE_REFUSED),
+        ("empty value", b"POST /ingest", b"Transfer-Encoding:\r\n", _TE_REFUSED),
+        (
+            "list with empty member",
+            b"POST /ingest",
+            b"Transfer-Encoding: ,chunked\r\n",
+            _TE_REFUSED,
+        ),
+        # A bodyless method gets the same refusal for a non-chunked coding.
+        ("get with gzip", b"GET /health", b"Transfer-Encoding: gzip\r\n", _TE_REFUSED),
+        ("delete with identity", b"DELETE /x", b"Transfer-Encoding: identity\r\n", _TE_REFUSED),
+        # `Transfer_Encoding` is a valid token, so it used to pass both guards and be framed by its
+        # Content-Length, while a front end that folds `_` into `-` reads it as chunked.
+        ("underscore te", b"POST /ingest", b"Transfer_Encoding: chunked\r\n", _UNDERSCORE_REFUSED),
+        (
+            "underscore te with cl",
+            b"POST /ingest",
+            b"Transfer_Encoding: chunked\r\nContent-Length: 3\r\n",
+            _UNDERSCORE_REFUSED,
+        ),
+        (
+            "underscore cl with te",
+            b"POST /ingest",
+            b"Content_Length: 3\r\nTransfer-Encoding: chunked\r\n",
+            _UNDERSCORE_REFUSED,
+        ),
+        # With a Content-Length beside it the OLDER ambiguity guard fires first, whatever the
+        # coding: RFC 9112 section 6.1 lets TE override CL, so the pair is the CL.TE shape.
+        (
+            "cl with gzip",
+            b"POST /ingest",
+            b"Content-Length: 3\r\nTransfer-Encoding: gzip\r\n",
+            _CL_TE_REFUSED,
+        ),
+        (
+            "cl with mixed-case chunked",
+            b"POST /ingest",
+            b"Content-Length: 3\r\nTransfer-Encoding: Chunked\r\n",
+            _CL_TE_REFUSED,
+        ),
+        (
+            "te before cl",
+            b"POST /ingest",
+            b"Transfer-Encoding: identity\r\nContent-Length: 3\r\n",
+            _CL_TE_REFUSED,
+        ),
+    ],
+)
+async def test_any_transfer_encoding_is_refused_whatever_its_spelling(
+    label: str, request_line: bytes, framing: bytes, reason: str
+) -> None:
+    """BACKLOG #1913. The listener decodes no transfer coding, so ANY Transfer-Encoding is refused
+    in the head phase, and the body is left unread.
+
+    Before #1125 the test was exact equality on the lowered value, so a coding list such as
+    `gzip, chunked` fell through and its body was read raw. The spellings here are at least these:
+    case in the name and the value, coding lists in either order, OWS, a parameter, a quoted
+    coding, empty lists, a bodyless method, and an underscore name. Each case names the guard it
+    pins, so deleting one guard reds its own rows. The accept-controls are the test below this one.
+    """
+    raw = request_line + b" HTTP/1.1\r\nHost: h\r\n" + framing + b"\r\n" + _CHUNKED_BODY
+    reader = await _reader_from(raw)
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 400, label
+    assert excinfo.value.kind == "framing_error", label
+    assert excinfo.value.reason == reason, label
+    # Refused from the head alone: not one body byte was consumed.
+    assert await reader.read() == _CHUNKED_BODY, label
+
+
+@pytest.mark.parametrize(
+    "lookalike",
+    [
+        b"",
+        # The hop-by-hop `TE` request header names codings the CLIENT accepts in a response. It
+        # frames nothing, and gRPC-style senders set it.
+        b"TE: trailers\r\n",
+        b"X-Transfer-Encoding: chunked\r\n",
+        b"Transfer-Encodings: chunked\r\n",
+        b"X_Custom_Header: 1\r\n",
+    ],
+)
+async def test_a_post_framed_by_content_length_alone_is_read(lookalike: bytes) -> None:
+    # Accept-controls for the refusals above: the same request framed by Content-Length alone,
+    # beside a header that only resembles a framing header, parses and yields its declared bytes.
+    # A guard that over-matches the header name reds here rather than passing there.
+    raw = b"POST /ingest HTTP/1.1\r\nHost: h\r\n" + lookalike + b"Content-Length: 3\r\n\r\nabc"
+    req = await _read_request(
+        await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
+    )
+    assert req.method == "POST" and req.body == b"abc"
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+async def test_a_body_method_with_no_framing_is_refused_411_not_read_to_eof(method: str) -> None:
+    """BACKLOG #1125. A body method with neither Content-Length nor Transfer-Encoding used to be
+    read to EOF, so the bytes after the head were ingested as this request's body. RFC 9112
+    section 6.3 gives such a request a ZERO-length body, so a proxy reads those same bytes as the
+    next request. It is refused in the head phase with 411, the RFC 9110 answer.
+    """
+    reader = await _reader_from(f"{method} / HTTP/1.1\r\nHost: h\r\n\r\nabc".encode("ascii"))
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 411
+    assert excinfo.value.kind == "framing_error"
+
+
+async def test_a_method_with_no_body_needs_no_framing() -> None:
+    # Accept-control for the 411 above: this listener reads no body for GET or DELETE, so neither
+    # needs framing, and a zero-length declaration written with leading zeros is still zero.
+    for raw in (
+        b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
+        b"DELETE / HTTP/1.1\r\nHost: h\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 00\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: " + b"0" * 4400 + b"\r\n\r\n",
+    ):
+        reader = await _reader_from(raw)
+        head = await _read_head(reader, max_header_bytes=8192)
+        assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b""
+
+
+async def test_a_long_but_valid_content_length_reads_normally() -> None:
+    # Accept-control for the digit cap: leading zeros do not count against it, and the value and
+    # its OWS are read exactly. 4400 zeros is past int()'s 4300-digit limit, which counts leading
+    # zeros, so this raised ValueError and escaped as a 500 until the head parse normalised it.
+    raw = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: \t" + b"0" * 4400 + b"3 \r\n\r\nabc"
+    req = await _read_request(
+        await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
+    )
+    assert req.body == b"abc"
+
+
+async def test_a_lowercase_method_is_not_folded_into_a_known_one() -> None:
+    # RFC 9110 section 9.1: methods are case-sensitive. `post` is not POST, so it gets no body
+    # rule of POST's; with no body declared it parses, and the listener answers it 405 later.
+    reader = await _reader_from(b"post / HTTP/1.1\r\nHost: h\r\n\r\n")
+    head = await _read_head(reader, max_header_bytes=8192)
+    assert head.method == "post"
+    assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b""
+
+
+@pytest.mark.parametrize(
+    ("raw", "status"),
+    [
+        (b"POST /ingest HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\nabc", 400),
+        # A non-chunked coding beside a Content-Length (the ambiguity guard, DELTA-06), and an
+        # underscore alias of Transfer-Encoding beside one (BACKLOG #1913).
+        (
+            b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n"
+            b"Transfer-Encoding: Gzip\r\n\r\nabc",
+            400,
+        ),
+        (
+            b"POST /ingest HTTP/1.1\r\nHost: h\r\nTransfer_Encoding: chunked\r\n"
+            b"Content-Length: 3\r\n\r\nabc",
+            400,
+        ),
+        (b"POST /ingest HTTP/1.1\r\nHost: h\r\n\r\nabc", 411),
+        (b"POST /ingest HTTP/1.1\r\nHost: h\r\n Content-Length: 3\r\n\r\nabc", 400),
+        (b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO", 400),
+    ],
+)
+async def test_a_framing_refusal_is_answered_logged_and_never_ingested(
+    store: MessageStore, raw: bytes, status: int
+) -> None:
+    """End to end over a socket (BACKLOG #1125): the refusal is a clean 4xx, the connection is
+    closed, a `framing_error` connection_event records it, and no ingress row is written. This is
+    the same record every other pre-ingress refusal on this listener leaves.
+    """
+    events: list[tuple] = []
+    ic = build_inbound_connection(
+        "IB_HTTP",
+        Http(port=0),
+        router="r",
+        content_type=ContentType.TEXT,
+        capture_connection_errors=True,
+    )
+    src = await _start_source(store, ic, events=events)
+    try:
+        # half_close so the old read-to-EOF path would have finished and ingested "abc".
+        resp = await _http(src.sockport, raw_override=raw, half_close=True)
+    finally:
+        await src.stop()
+    assert resp.status == status
+    assert resp.headers.get("connection") == "close"
+    assert any(kind == "framing_error" for kind, *_ in events)
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+    assert (await cur.fetchone())["n"] == 0
 
 
 def test_build_response_shape() -> None:
@@ -831,8 +1171,9 @@ async def test_max_connections_flood_refused_and_event(store: MessageStore) -> N
 
 
 async def test_body_flood_no_content_length_refused(store: MessageStore) -> None:
-    """A POST with NO Content-Length streams its body to EOF; a body past ``max_body_bytes`` is refused
-    with 413 + ``frame_oversize`` on the read-to-EOF path (complements the declared-CL socket test)."""
+    """A POST with NO Content-Length flooding past ``max_body_bytes`` is refused before one body byte
+    is read. It used to stream to EOF and trip the cap with 413; since BACKLOG #1125 the read-to-EOF
+    path is gone and the head parse refuses the missing framing with 411."""
     events: list[tuple] = []
     ic = build_inbound_connection(
         "IB_HTTP",
@@ -843,18 +1184,18 @@ async def test_body_flood_no_content_length_refused(store: MessageStore) -> None
     )
     src = await _start_source(store, ic, events=events)
     try:
-        # No Content-Length header -> the read-to-EOF path; body 64 bytes trips the 16-byte cap.
+        # No Content-Length header -> refused in the head phase; the 64 flood bytes are never read.
         resp = await _http(
             src.sockport,
             raw_override=b"POST /ingest HTTP/1.1\r\nHost: localhost\r\n\r\n" + b"x" * 64,
         )
         assert resp.status in (
-            413,
+            411,
             0,
-        )  # 413 when flushed; 0 = reset before flush (Windows Proactor)
-        assert await _wait_for(lambda: any(k == "frame_oversize" for k, *_ in events))
+        )  # 411 when flushed; 0 = reset before flush (Windows Proactor)
+        assert await _wait_for(lambda: any(k == "framing_error" for k, *_ in events))
         cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-        assert (await cur.fetchone())["n"] == 0  # oversize body refused before any ingress row
+        assert (await cur.fetchone())["n"] == 0  # refused before any ingress row
     finally:
         await asyncio.wait_for(src.stop(), timeout=8.0)
 

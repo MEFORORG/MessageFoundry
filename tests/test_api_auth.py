@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import pytest
 from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
+from messagefoundry.api.security import deadline_utc
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
@@ -1899,3 +1901,155 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
             "cross-user admin MFA reset broke. That is the always-available recovery for a "
             "locked-out passkey user (ADR 0068 section 2) and the self-exclusion must not touch it."
         )
+
+
+# --- BACKLOG #1141 (ASVS 6.4.5): every API surface states the deadline the gate enforces ----------
+#
+# Each test pins the SURFACED instant against the login gate itself, not merely against a field being
+# present. Two mutations must turn these red: a surface that reads a fresh clock instead of the stored
+# ``password_changed_at`` (the surfaced value moves off the stamp), and a gate that re-opens its own
+# arithmetic at twice the window (the credential still logs in after the surfaced instant).
+
+_EXPIRY_HOURS = 72
+
+
+def _expiring_service_settings() -> AuthSettings:
+    return AuthSettings(
+        require_mfa=False,
+        login_rate_limit_enabled=False,
+        initial_password_expiry_hours=_EXPIRY_HOURS,
+    )
+
+
+async def _move_deadline_to(engine: Engine, user_id: str, deadline: float) -> None:
+    """Move the stored ``password_changed_at`` so the 6.4.1 deadline lands on ``deadline``.
+
+    The gate reads the wall clock, so moving the stamp it measures from is the only way to drive it
+    to a chosen boundary on the engine's own arithmetic."""
+    await engine.store._db.execute(
+        "UPDATE users SET password_changed_at=? WHERE id=?",
+        (deadline - _EXPIRY_HOURS * 3600, user_id),
+    )
+    await engine.store._db.commit()
+
+
+async def _stored_deadline(engine: Engine, user_id: str) -> float:
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.password_changed_at is not None
+    return user.password_changed_at + _EXPIRY_HOURS * 3600
+
+
+async def test_login_and_the_must_change_refusal_state_the_deadline_the_gate_refuses_at(
+    engine: Engine,
+) -> None:
+    service = await _service(engine, _expiring_service_settings())
+    dana_id = await service.create_local_user(
+        username="dana", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    )
+    await _move_deadline_to(engine, dana_id, time.time() + 30)
+    expected = await _stored_deadline(engine, dana_id)
+    async with _client(engine, service) as c:
+        # POSITIVE CONTROL: before the surfaced instant the credential works.
+        login = await _login(c, "dana")
+        assert login.status_code == 200 and login.json()["must_change_password"] is True
+        # (c) the holder's own client is told the instant, off the stored stamp.
+        assert login.json()["credential_expires_at"] == expected
+        # (e) the refusal every non-browser caller meets states the same instant, and keeps the old
+        # text as its prefix so substring-matching clients still classify it.
+        blocked = await c.get("/users", headers=_auth(login.json()["token"]))
+        assert blocked.status_code == 403
+        detail = blocked.json()["detail"]
+        assert detail.startswith("password change required")
+        assert deadline_utc(expected) in detail
+
+        # One second past the surfaced instant, the gate refuses: the surfaces named the real bound.
+        await _move_deadline_to(engine, dana_id, time.time() - 1)
+        assert (await _login(c, "dana")).status_code == 401
+
+
+async def test_no_deadline_is_stated_on_login_when_none_is_owed(engine: Engine) -> None:
+    # The negative side: a holder who set their own password owes no change, and at expiry 0 the
+    # credential has no deadline. Both must say nothing, and the 403 keeps its old exact text.
+    service = await _service(engine)
+    await _add(service, "erin", Role.VIEWER)
+    zero = AuthService(
+        engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=0)
+    )
+    await zero.initialize()
+    await zero.create_local_user(
+        username="finn", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    )
+    async with _client(engine, service) as c:
+        assert (await _login(c, "erin")).json()["credential_expires_at"] is None
+    async with _client(engine, zero) as c:
+        login = await _login(c, "finn")
+        assert login.json()["must_change_password"] is True
+        assert login.json()["credential_expires_at"] is None
+        blocked = await c.get("/users", headers=_auth(login.json()["token"]))
+        assert blocked.json()["detail"] == "password change required"
+
+
+async def test_the_unclaimed_bootstrap_admin_is_told_no_credential_deadline(engine: Engine) -> None:
+    # WP-3 can retire the never-claimed bootstrap ACCOUNT before its CREDENTIAL bound, so the route
+    # layer states nothing for it rather than a later instant than the real one. bootstrap-admin.txt
+    # already carries the earlier of the two.
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False, bootstrap_expiry_hours=24, initial_password_expiry_hours=72
+        ),
+    )
+    boot = await service.initialize()
+    assert boot is not None
+    async with _client(engine, service) as c:
+        login = await _login(c, boot.username, boot.password)
+        assert login.json()["must_change_password"] is True
+        assert login.json()["credential_expires_at"] is None
+        blocked = await c.get("/users", headers=_auth(login.json()["token"]))
+        assert blocked.json()["detail"] == "password change required"
+
+
+async def test_a_deadline_too_far_out_to_render_still_refuses_with_a_403(engine: Engine) -> None:
+    # The expiry setting has no upper bound. A deadline past year 9999 cannot be formatted, and the
+    # refusal must stay a 403 with the old text rather than become a 500.
+    far = AuthService(
+        engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=100_000_000)
+    )
+    await far.initialize()
+    await far.create_local_user(
+        username="hugo", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    )
+    async with _client(engine, far) as c:
+        login = await _login(c, "hugo")
+        assert login.status_code == 200 and login.json()["credential_expires_at"] is not None
+        blocked = await c.get("/users", headers=_auth(login.json()["token"]))
+        assert blocked.status_code == 403
+        assert blocked.json()["detail"] == "password change required"
+
+
+async def test_the_create_user_response_states_the_initial_password_deadline(
+    engine: Engine,
+) -> None:
+    service = await _service(engine, _expiring_service_settings())
+    await _add(service, "root", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        admin = _auth((await _login(c, "root")).json()["token"])
+        created = await c.post(
+            "/users",
+            headers=admin,
+            json={"username": "gail", "password": PW, "roles": ["viewer"]},
+        )
+        assert created.status_code == 201, created.text
+        gail_id = created.json()["id"]
+        # (a) the response the issuing administrator reads carries the stored-stamp instant.
+        assert created.json()["credential_expires_at"] == await _stored_deadline(engine, gail_id)
+
+        # The gate agrees with that formula on both sides of it: stored stamp plus the window.
+        await _move_deadline_to(engine, gail_id, time.time() + 30)
+        assert (await _login(c, "gail")).status_code == 200  # before it: works
+        await _move_deadline_to(engine, gail_id, time.time() - 1)
+        assert (await _login(c, "gail")).status_code == 401  # after it: refused
+
+        # GET /users needs only users:read, so it does not list who holds a live temporary password.
+        listed = {u["username"]: u for u in (await c.get("/users", headers=admin)).json()}
+        assert listed["gail"]["credential_expires_at"] is None

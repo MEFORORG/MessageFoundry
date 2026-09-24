@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from _ui_clients import SAME_ORIGIN
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
@@ -365,3 +367,443 @@ async def test_a_correct_code_then_a_wrong_password_leaves_a_working_cookie(
         assert await service.identity_for_token(before) is None, (
             "the old cookie still authenticates"
         )
+
+
+# --- ending sessions from a pending session (ASVS 6.3.3 / 7.5.2, BACKLOG #1951) -------------
+
+_REVOKE_OTHERS = "/ui/account/sessions/revoke-others"
+
+
+@pytest.mark.parametrize("action_step_up", (True, False), ids=("enforced", "opted-out"))
+async def test_a_pending_session_cannot_end_an_enrolled_accounts_sessions(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, action_step_up: bool
+) -> None:
+    """The /ui twin of the engine's refusal. RED when: ``session_terminate`` leaves the set that
+    ``factor_binding_is_blocked`` refuses, as seen through ``_ui_action_step_up_ok``.
+
+    ``/ui/reauth`` already demands the code before it mints, so the console's own ceremony never
+    hands a pending session this grant. The reachable chain crosses planes: the password holder
+    replays the cookie token as a Bearer to the MFA-exempt ``POST /me/reauth``. So this stamps the
+    step-up state directly and asks one question: does the route open on it? ``enforced`` plants the
+    single-use grant; ``opted-out`` stamps the window, which is that branch's whole gate.
+    """
+    from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE
+
+    service = await _service(engine, require_action_step_up=action_step_up)
+    await _add(service, "op", Role.OPERATOR)
+    _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between making and checking a code
+    await _enroll_totp(service)
+    other = await service.login("op", PW)  # the real user's other device
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303  # the attacker knows the password only
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.mfa_satisfied(tok) is False
+
+        for path in (f"/ui/account/sessions/{hash_token(other.token)}/revoke", _REVOKE_OTHERS):
+            if action_step_up:
+                service._grant_action_step_up(hash_token(tok), STEP_UP_ACTION_SESSION_TERMINATE)
+            else:
+                await service.store.mark_session_reauthed(hash_token(tok))
+                # The positive control: without it a refusal for a stale window would pass.
+                assert await service.has_recent_step_up(tok) is True
+            r = await c.post(path, headers=SAME_ORIGIN)
+            # A SUCCESSFUL revoke also answers 303, so the location carries the verdict.
+            assert r.status_code == 303
+            assert r.headers["location"] == f"/ui/reauth?next={path}", (
+                f"{path} ended a session from an MFA-pending session on the password alone"
+            )
+
+        assert await service.identity_for_token(other.token) is not None
+
+    # Each refusal leaves a row, as the JSON twin's does: otherwise probing is silent.
+    denied = [
+        a["detail"] or ""
+        for a in await engine.store.list_audit()
+        if a["action"] == "auth.mfa_denied"
+    ]
+    assert sum("/ui/account/sessions/" in d for d in denied) == 2
+
+
+async def test_a_session_that_proved_its_code_at_reauth_can_end_sessions(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the refusal ignores ``mfa_satisfied`` and blocks every enrolled account.
+
+    The console's own path for an enrolled, pending session: ``/ui/reauth`` takes the code, then the
+    password, then mints. That must still end the other sessions.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    t0 = 1_000_000.0
+    _pin_totp_clock(monkeypatch, t0)
+    secret = await _enroll_totp(service)
+    other = await service.login("op", PW)
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        t1 = t0 + totp.DEFAULT_PERIOD  # a strictly later step: enrollment consumed its own
+        _pin_totp_clock(monkeypatch, t1)
+        minted = await c.post(
+            "/ui/reauth",
+            data={"next": _REVOKE_OTHERS, "code": totp.totp(secret, now=t1), "password": PW},
+            headers=SAME_ORIGIN,
+        )
+        assert minted.status_code == 200
+        r = await c.post(_REVOKE_OTHERS, headers=SAME_ORIGIN)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/account/sessions?m=signed_out_others"
+        assert await service.identity_for_token(other.token) is None
+
+
+async def test_an_account_with_no_factor_still_ends_sessions_from_a_pending_session(
+    engine: Engine,
+) -> None:
+    """RED when: the refusal over-reaches and blocks the un-enrolled case too.
+
+    A fresh account is pending under the default ``require_mfa`` and has no code to give. The
+    password-only re-proof is its only way to end a session it does not recognise.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    other = await service.login("op", PW)
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        tok = c.cookies.get("mf_session")
+        assert tok is not None and await service.mfa_satisfied(tok) is False
+        minted = await c.post(
+            "/ui/reauth", data={"next": _REVOKE_OTHERS, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert minted.status_code == 200
+        r = await c.post(_REVOKE_OTHERS, headers=SAME_ORIGIN)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/account/sessions?m=signed_out_others"
+        assert await service.identity_for_token(other.token) is None
+
+
+# --- changing the password from a pending session (ASVS 6.3.3 / 7.5.1, BACKLOG #1954) -------
+
+PW2 = "another-strong-test-passphrase"  # the rotated password; satisfies the same policy
+_PASSWORD = "/ui/account/password"
+
+
+async def _change_password(c: httpx.AsyncClient, *, current: str = PW) -> httpx.Response:
+    return await c.post(
+        _PASSWORD,
+        data={"current_password": current, "new_password": PW2, "new_password2": PW2},
+        headers=SAME_ORIGIN,
+    )
+
+
+async def _reset(service: AuthService, username: str = "op") -> str:
+    """Admin-reset ``username``'s password and return the one-time temp. The factors stay."""
+    user = await service.store.get_user_by_username(username)
+    assert user is not None
+    return (await service.admin_reset_password(user.id, actor="test")).password
+
+
+async def test_a_pending_session_cannot_change_an_enrolled_accounts_password(
+    engine: Engine,
+) -> None:
+    """The /ui twin of the engine's refusal. RED when: the password page lets a pending session on
+    an account WITH a factor through.
+
+    Changing the password revokes every session, so a password holder on a pending cookie could
+    lock the real user out and sign them out everywhere. Both the form and the POST send it to the
+    factor step instead, and each leaves a row.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+    other = await service.login("op", PW)  # the real user's other device
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).headers["location"] == "/ui/mfa"
+        form = await c.get(_PASSWORD)
+        assert form.status_code == 303 and form.headers["location"] == "/ui/mfa"
+        r = await _change_password(c)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/mfa", "a pending session changed the password"
+
+    assert await service.identity_for_token(other.token) is not None
+    assert (await service.login("op", PW)).ok  # the old password still works
+    denied = [
+        a["detail"] or ""
+        for a in await engine.store.list_audit()
+        if a["action"] == "auth.mfa_denied"
+    ]
+    assert sum(_PASSWORD in d for d in denied) == 2
+
+
+async def test_a_reset_account_with_a_code_proves_it_and_then_rotates(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``/ui/login`` or the ``/ui/mfa`` routes confine a must-change session that still
+    owes its factor.
+
+    ``admin_reset_password`` keeps the account's factors, so the next session is must-change AND
+    pending. The password page now wants the factor first, so sign-in has to lead to the factor
+    page and that page has to answer it. Otherwise the two pages send the session to each other.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    t0 = 1_000_000.0
+    _pin_totp_clock(monkeypatch, t0)
+    secret = await _enroll_totp(service)
+    temp = await _reset(service)
+
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "op", "password": temp})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+        # Any other page sends it straight to the factor page, not round through the password one,
+        # and so does the step-up page.
+        r = await c.get("/ui/messages")
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+        r = await c.get(f"/ui/reauth?next={_REVOKE_OTHERS}")
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+        denied = [
+            a["detail"] or ""
+            for a in await engine.store.list_audit()
+            if a["action"] == "auth.mfa_denied"
+        ]
+        assert any("/ui/messages" in d for d in denied), "the confinement refusal left no row"
+        page = await c.get("/ui/mfa")
+        assert page.status_code == 200 and 'name="code"' in page.text
+        t1 = t0 + totp.DEFAULT_PERIOD  # a strictly later step: enrollment consumed its own
+        _pin_totp_clock(monkeypatch, t1)
+        r = await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
+        assert r.status_code == 303 and r.headers["location"] == _PASSWORD
+        # Proven, so the must-change confinement applies again, on the gate page too.
+        r = await c.get("/ui/mfa")
+        assert r.status_code == 303 and r.headers["location"] == _PASSWORD
+        assert (await c.get(_PASSWORD)).status_code == 200
+        r = await _change_password(c, current=temp)
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=pwchanged"
+    assert (await service.login("op", PW2)).ok
+
+
+async def test_ui_reauth_webauthn_lets_a_reset_passkey_account_prove_it_and_rotate(
+    engine: Engine,
+) -> None:
+    """RED when: ``ui_reauth_webauthn`` refuses a must-change session that still owes its factor.
+
+    The one place a partial build strands someone. A passkey-only account has no code to type, so
+    the assertion is its only way to prove the factor. If that route kept its blanket must-change
+    refusal while the password page wants the factor first, this account could do neither.
+    """
+    pytest.importorskip("webauthn")
+    import html
+    import json
+    import re
+
+    from _soft_webauthn import SoftAuthenticator
+    from webauthn.helpers import base64url_to_bytes
+
+    service = await _service(engine)
+    user_id = await _add(service, "op", Role.OPERATOR)
+    identity = await service.identity_for_user_id(user_id)
+    assert identity is not None
+    setup = await service.login("op", PW)
+    assert setup.ok and setup.token is not None
+    options = json.loads(
+        await service.begin_webauthn_registration(
+            identity, token=setup.token, rp_id="t", rp_name="t"
+        )
+    )
+    key = SoftAuthenticator(rp_id="t", origin="http://t")
+    registered = await service.finish_webauthn_registration(
+        identity,
+        key.create_response(base64url_to_bytes(options["challenge"])),
+        label="key",
+        token=setup.token,
+        rp_id="t",
+        origin="http://t",
+    )
+    assert registered.ok
+    temp = await _reset(service)
+
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "op", "password": temp})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+        page = await c.get("/ui/mfa")
+        assert page.status_code == 200 and 'name="code"' not in page.text
+        hook = re.search('data-mf-webauthn-get="([^"]*)"', page.text)
+        assert hook is not None, "the gate page offered no passkey leg"
+        challenge = json.loads(html.unescape(hook.group(1)))["challenge"]
+        assertion = json.loads(key.get_response(base64url_to_bytes(challenge), sign_count=0))
+        r = await c.post("/ui/reauth/webauthn", json={"response": assertion}, headers=SAME_ORIGIN)
+        assert r.status_code == 200 and r.json() == {"ok": True}, r.text
+        # Proven, so the route confines it again: the other half of the old blanket refusal.
+        r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
+        assert r.status_code == 403 and r.json()["error"] == "password change required"
+        assert (await c.get(_PASSWORD)).status_code == 200
+        r = await _change_password(c, current=temp)
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=pwchanged"
+    assert (await service.login("op", PW2)).ok
+
+
+async def test_a_must_change_account_with_no_factor_still_rotates_first(engine: Engine) -> None:
+    """RED when: the refusal or the new sign-in order reaches an account with no factor.
+
+    The bootstrap administrator and an administrator-created user are must-change with nothing to
+    prove. Sending either to the factor page would bounce it to enroll, which the must-change
+    confinement refuses: the brick. Both must still land on the password page and rotate there.
+    """
+    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    boot = await service.initialize()  # the FIRST initialize mints the bootstrap admin
+    assert boot is not None
+    await service.create_local_user(
+        username="newbie",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    for username, password in ((boot.username, boot.password), ("newbie", PW)):
+        async with _client(engine, service) as c:
+            r = await c.post("/ui/login", data={"username": username, "password": password})
+            assert r.status_code == 303 and r.headers["location"] == _PASSWORD, username
+            r = await c.get("/ui/mfa")
+            assert r.status_code == 303 and r.headers["location"] == _PASSWORD, username
+            # Nothing to prove, so the passkey leg stays shut to it too.
+            r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
+            assert r.status_code == 403 and r.json()["error"] == "password change required"
+            r = await _change_password(c, current=password)
+            assert r.headers.get("location") == "/ui/login?e=pwchanged", username
+
+
+_VANISH_ROUTES = ("login", "gated-page", "get-mfa", "post-mfa", "reauth-webauthn")
+
+
+@pytest.mark.parametrize("vanish", ("session", "user"))
+@pytest.mark.parametrize("route", _VANISH_ROUTES)
+async def test_a_row_that_vanishes_mid_request_does_not_lift_the_confinement(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, vanish: str, route: str
+) -> None:
+    """RED when: ``rotation_comes_first`` negates ``password_change_owes_factor`` unguarded.
+
+    BACKLOG #1974. An unknown state must confine a must-change session, never release it. The
+    wrapper removes the row once, after the route has resolved the identity and before the check
+    runs: the race this guards. The account has no factor, so the only wrong answers are the ones
+    that release it: the factor page, the enroll bounce, the page itself, or a ceremony run. The
+    password page or a sign-in redirect both hold. ``gated-page`` is the ``require_ui`` path through
+    ``must_change_target``, which must also write no ``auth.mfa_denied`` row for an account with
+    nothing to deny. ``user`` hides only the user row: ``delete_user`` would take the sessions with
+    it, and this case would then test a missing session twice.
+    """
+    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    await service.initialize()
+    await service.create_local_user(
+        username="newbie",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    real_check = service.password_change_owes_factor
+    vanished: list[bool] = []
+
+    async def no_user(user_id: str) -> None:
+        return None
+
+    async def vanishing_check(token: str | None) -> bool:
+        assert token is not None
+        if not vanished:
+            vanished.append(True)
+            if vanish == "session":
+                # DELETE the row, as the expiry purge does. Revoking would not do: it only stamps
+                # ``revoked_at``, and the row still answers the lookup this test is about.
+                session = await service.store.get_session(hash_token(token))
+                assert session is not None
+                await service.store.purge_expired_sessions(now=session.expires_at + 1)
+                assert await service.store.get_session(hash_token(token)) is None
+            else:
+                monkeypatch.setattr(service.store, "get_user", no_user)
+        return await real_check(token)
+
+    async with _client(engine, service) as c:
+        if route != "login":
+            # The sign-in runs the real check, so it lands on the password page as it should.
+            r = await c.post("/ui/login", data={"username": "newbie", "password": PW})
+            assert r.status_code == 303 and r.headers["location"] == _PASSWORD
+        monkeypatch.setattr(service, "password_change_owes_factor", vanishing_check)
+        if route == "login":
+            r = await c.post("/ui/login", data={"username": "newbie", "password": PW})
+        elif route == "gated-page":
+            r = await c.get("/ui/messages")
+        elif route == "get-mfa":
+            r = await c.get("/ui/mfa")
+        elif route == "post-mfa":
+            r = await c.post("/ui/mfa", data={"code": "000000"}, headers=SAME_ORIGIN)
+        else:
+            r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
+        assert vanished, "the route never asked the check, so nothing vanished"
+        if route == "reauth-webauthn":
+            assert r.status_code in (401, 403), r.text  # refused before any ceremony ran
+            return
+        assert r.status_code == 303, r.text
+        location = r.headers["location"]
+        assert location == _PASSWORD or location.startswith("/ui/login"), location
+    if route == "gated-page":
+        denied = [a for a in await engine.store.list_audit() if a["action"] == "auth.mfa_denied"]
+        assert not denied, "an account with no factor was audited as refused one"
+
+
+async def test_a_satisfied_session_changes_the_password_as_before(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the refusal ignores ``mfa_satisfied`` and blocks every enrolled account."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    t0 = 1_000_000.0
+    _pin_totp_clock(monkeypatch, t0)
+    secret = await _enroll_totp(service)
+    async with _client(engine, service) as c:
+        await _login(c)
+        t1 = t0 + totp.DEFAULT_PERIOD
+        _pin_totp_clock(monkeypatch, t1)
+        verified = await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
+        assert verified.status_code == 303
+        r = await _change_password(c)
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=pwchanged"
+
+
+@pytest.mark.parametrize("enrolled", (False, True), ids=("no-factor", "with-a-factor"))
+async def test_a_directory_account_still_gets_the_directory_refusal(
+    engine: Engine, enrolled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the refusal pre-empts the directory 400.
+
+    A pending directory session is left to the handler whether or not it holds an engine factor, as
+    on the JSON plane: the 400 changes nothing and says where the password lives.
+    """
+    from messagefoundry.auth.ldap import AdPrincipal
+
+    service = await _service(engine)
+    principal = AdPrincipal(
+        username="aduser", display_name=None, email=None, dn="CN=aduser,DC=x", groups=frozenset()
+    )
+    if enrolled:
+        _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between code and check
+        setup = await service._complete_ad_login(principal, None, mfa_verified=False)
+        assert setup.identity is not None and setup.token is not None
+        enrollment = await service.begin_mfa_enrollment(setup.identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            setup.identity, totp.totp(enrollment.secret), token=setup.token
+        )
+        assert confirmed.ok
+    out = await service._complete_ad_login(principal, None, mfa_verified=False)
+    assert out.ok and out.token is not None
+    assert await service.mfa_satisfied(out.token) is False
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", out.token)
+        r = await _change_password(c)
+        assert r.status_code == 400 and "Active Directory" in r.text

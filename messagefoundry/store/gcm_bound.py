@@ -51,6 +51,7 @@ __all__ = [
     "GCM_RESERVE_BLOCK",
     "bounded_cipher",
     "checkpoint_invocations",
+    "reserve_invocations_ahead",
 ]
 
 log = logging.getLogger(__name__)
@@ -113,3 +114,36 @@ async def checkpoint_invocations(
         # hands over a fresh block.
         bound.grant_invocations(need, total)
     return bound.cumulative_invocations()
+
+
+async def reserve_invocations_ahead(cipher: Cipher | None, add: AddInvocations, count: int) -> None:
+    """Reserve enough of the persisted bound to cover a burst of ``count`` encrypts BEFORE it starts.
+
+    For a burst that cannot top the reserve up part-way. The at-open seal of one (table, column)
+    surface runs as ONE transaction (BACKLOG #1169), so a crash leaves the surface all sealed or all
+    unsealed. On SQLite a reservation commits the one writer connection, so reserving mid-surface would
+    commit the surface half-sealed -- exactly the mixed state the refusal would then reject as
+    tampering. Reserving the whole burst up front keeps the one invariant this bound rests on: the
+    persisted total leads every encrypt, so an unclean exit can only OVER-count. A crash mid-surface
+    forfeits the reservation for encrypts the rollback discarded, which is that same conservative bias.
+
+    Same failure contract as :func:`checkpoint_invocations`: a reservation that cannot reach the DB is
+    logged and the burst proceeds under the in-process ceiling, which still applies."""
+    bound = bounded_cipher(cipher)
+    if bound is None or count <= 0:
+        return
+    if not bound.invocation_bound_enabled:
+        bound.enable_invocation_bound()
+    need = bound.invocation_reserve_shortfall(ahead=count)
+    if not need:
+        return
+    try:
+        total = await add(bound.active_key_id, need)
+    except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
+        log.warning(
+            "could not reserve the AES-GCM invocation bound ahead of an at-rest seal; the "
+            "in-process ceiling still applies",
+            exc_info=True,
+        )
+        return
+    bound.grant_invocations(need, total)

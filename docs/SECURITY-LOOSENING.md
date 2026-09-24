@@ -63,18 +63,20 @@ section reference.
 | Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
 | Production tier | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
+| | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 
-**Six of these do not live in `[security]`.** `[store].aad_bind`,
-`[auth].ad_session_recheck_seconds` and `[secret_rotation].enforce_store_key_expiry` sit in their own
+**Seven of these do not live in `[security]`.** `[store].aad_bind`,
+`[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds` and
+`[secret_rotation].enforce_store_key_expiry` sit in their own
 sections for cohesion, and the last three are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
-first three are named by `security_loosenings()` from the loaded
+first four are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[secret_rotation]` sections; the last
 three are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
@@ -344,7 +346,7 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   **AUDIT** line + posture view keep the deviation visible.
 - **Still refused (even at `warn`):** the **no-auth-to-the-network** hard refuse (`require_sign_in = false` on
   an exposed instance — a non-loopback bind, or a loopback bind behind a declared TLS terminator) is
-  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. `enforcement` is **binary** (no `off`), and **nothing silences a
+  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
   per-connection `cleartext_accepted` declaration is the way to cross one, recorded per hop.
@@ -391,6 +393,26 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, in both directions. Legacy `v1` rows always decrypt (dual-read) and
   `messagefoundry rotate-key` upgrades them `v1`→`v2` in place, so turning it back on does not strand an
   existing store. See [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) (2026-07-28 amendment).
+
+### `[store].allow_unmarked_ciphertext = true` — an unmarked value in an encrypted column reads back as plaintext
+- **What you lose:** the refusal that protects an encrypted column against a **downgrade**. On a keyed
+  store, a non-blank value with no `mfenc:` marker is a stripped marker or a planted plaintext row, and
+  with this off it is refused (`CipherError`) and alerted (`integrity_drift`, subject `store-cipher`).
+  With it on, that value is returned as the row's content, and the next keyed open or `rotate-key`
+  seals it into genuine ciphertext, after which no evidence of the substitution survives. Cell binding
+  (`aad_bind`) does not cover this: a moved ciphertext has a tag to fail, and a plaintext value has none
+  (ASVS 11.3.3, BACKLOG #1169).
+- **When acceptable:** a store that holds legitimate unmarked values beside ciphertext in one column —
+  for example rows written by a keyless run of a store that was keyed before. Turn it on for one keyed
+  open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
+- **Compensating controls:** database-level access control, because planting a row needs store write
+  access. Nothing in the engine detects the plant once this is on.
+- **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
+  it sealed while on stays sealed.
+- **Uploads too:** on a keyed store a plaintext uploaded file is refused until `rotate-key` seals it
+  (owner ruling 2026-09-23), alerting under its own subject `upload-cipher`. With this on, it is served as plaintext instead. Under
+  `cipher_provider = "vault_transit"` uploads pass through either way; [PHI.md](PHI.md) §3 says why.
+- **Not covered either way:** the DIRECT S/MIME connector's enveloped body.
 
 ### `[secret_rotation].enforce_store_key_expiry = false` — the store DEK's calendar expiry stops the engine no more
 - **What you lose:** the **hard stop** on a calendar-expired data-encryption key. With it on, a DEK past
@@ -582,6 +604,30 @@ This section is kept rather than deleted, because the claim it used to make is t
   permanently-true warning is read as noise.
 - **How to refuse:** the same `[store].require_least_privilege = true` refuses on this condition too.
 
+### `audit_chain_unkeyed` — the store has a key, but its audit chain is keyless
+
+> **An OBSERVATION, not a switch.** Nobody sets this. The store reports it when it opens with a key
+> (or an isolated-module MAC) onto an audit chain that has rows but no keying watermark. BACKLOG #1905.
+- **What you lose:** tamper evidence against forgery. Every existing audit row is plain SHA-256, so
+  anyone who can write `audit_log` can rewrite a row and recompute the chain, and `audit-verify`
+  reports it clean. A keyed chain would need the store key to do that.
+- **How it happens:** rows were written while no key was in hand, then a key was added. Opening with
+  a key keys a store only when its `audit_log` is empty, and never re-keys rows that already exist,
+  because that would bless a forged row. The documented install order used to produce this: run
+  `provision-admin` with the key only in the service's environment, and the first audit row is
+  keyless. `provision-admin` now refuses under the same condition `serve` refuses to start.
+- **It is never silent:** a WARNING each time the store opens, naming `messagefoundry rekey-audit`,
+  and an `audit_chain_unkeyed` entry in `GET /security/posture`. It is not in the serve-time
+  settings warning or `messagefoundry security show`, because neither opens the store.
+- **How to clear it:** stop the engine, then run `messagefoundry rekey-audit` with the key
+  configured. A running engine keeps the watermark it read at open, so it would go on appending
+  keyless rows above the new one and the next verify would report a break. `rekey-audit` verifies the
+  existing chain first, refuses a broken one, and keys every row after it. The existing rows keep
+  their SHA-256 hashes, but the first keyed row folds in the last keyless hash, so a later edit to
+  any earlier row breaks the keyed suffix.
+- **On a store with no key at all this entry never fires.** That chain is keyless by the audited
+  at-rest opt-out, which `allow_unencrypted_phi` already reports.
+
 ---
 
 ## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)
@@ -611,11 +657,13 @@ carried from that drive-to-pass, not re-derived here.**
 | `production_instance` (production tier) | V13 Configuration (risk-based) | **RA-2** Security Categorization | §164.308(a)(1) Risk Analysis / Management |
 | `enforcement` (refuse/warn dial) | V13 Configuration (secure defaults) | **CM-6** Configuration Settings · **CM-7** Least Functionality (secure-by-default) | §164.308(a)(1) Risk Analysis / Management |
 | `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
+| `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |
+| `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific
