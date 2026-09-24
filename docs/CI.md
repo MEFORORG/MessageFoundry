@@ -42,6 +42,7 @@ The stable contexts required on `main` are — mirroring
 - `test (ubuntu-latest, py3.14)`
 - `test (windows-2022, py3.14)`
 - `test (windows-2025, py3.14)`
+- `crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)`
 - `repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)`
 - `dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`
