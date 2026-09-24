@@ -719,6 +719,86 @@ async def test_directory_id_comparison_follows_this_servers_collation(store) -> 
         )
 
 
+async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
+    """BACKLOG #1927 on SQL Server: a scope write records its writer, and the COL_LENGTH-gated ADD
+    restores a dropped ``users.channel_scope_source`` with NULL on the existing row (no backfill).
+
+    The column is dropped and the ``schema_meta`` marker cleared first, so the ADD branch really
+    runs; with either left in place deleting the migration statement would still pass."""
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    async def _col_length() -> int | None:
+        async with store._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("SELECT COL_LENGTH('users','channel_scope_source')")
+            row = await cur.fetchone()
+            await cur.close()
+        return None if row[0] is None else int(row[0])
+
+    await store.create_user(user_id="scope-src", username="scope-src", auth_provider="ad", now=1.0)
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+    await store.set_user_channel_scope("scope-src", None, source=SCOPE_SOURCE_MANUAL)
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_MANUAL)
+
+    # The compare-and-set (BACKLOG #1927): a manual scope and a changed value both refuse it.
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_MANUAL)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is False
+    await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_OLD"]') is False
+    assert (await store.get_user("scope-src")).channel_scope == '["IB_A"]'
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is True
+    got = await store.get_user("scope-src")
+    assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_AD)
+    assert await store.withdraw_ad_channel_scope("scope-src", '["IB_A"]') is False  # idempotent
+
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute("ALTER TABLE users DROP COLUMN channel_scope_source")
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    assert await _col_length() is None  # positive control: the column really is gone
+    assert await store._ensure_schema() is True
+    assert await _col_length() == 32  # NVARCHAR(16): the guarded ADD ran, at its declared width
+    assert (await store.get_user("scope-src")).channel_scope_source is None
+
+
+async def test_withdraw_ad_channel_scope_matches_a_scope_over_4000_characters(store) -> None:
+    """The compare-and-set must match a scope longer than 4000 characters (BACKLOG #1927).
+
+    ``channel_scope`` is NVARCHAR(MAX) and the withdrawal compares it with a bound parameter. A
+    string over 4000 characters is past the NVARCHAR(n) limit, so the driver binds it as a long
+    type. If it arrived as ``ntext``, SQL Server would refuse ``nvarchar(max) = ntext`` and the
+    withdrawal would raise instead of returning True. The statement CASTs the bound value to
+    NVARCHAR(MAX) so that cannot happen; this test is the measurement, on the ``sqlserver-store``
+    leg."""
+    from messagefoundry.store.store import SCOPE_SOURCE_AD
+
+    scope = json.dumps(sorted(f"IB_LONG_SCOPE_{n:04d}" for n in range(300)))
+    assert len(scope) > 4000  # positive control: really past the NVARCHAR(n) limit
+    await store.create_user(
+        user_id="long-scope", username="long-scope", auth_provider="ad", now=1.0
+    )
+    await store.set_user_channel_scope("long-scope", scope, source=SCOPE_SOURCE_AD)
+    assert (await store.get_user("long-scope")).channel_scope == scope  # stored whole
+
+    # Negative arms first. A newer scope sharing the first 4000+ characters must be refused, or a
+    # prefix-only compare would pass the match below. So must one differing only in case, which a
+    # case-insensitive collation would match.
+    newer = scope[:-1] + ', "IB_EXTRA"]'
+    assert newer[:4001] == scope[:4001]  # positive control: they share the long prefix
+    assert await store.withdraw_ad_channel_scope("long-scope", newer) is False
+    assert await store.withdraw_ad_channel_scope("long-scope", scope.lower()) is False
+    assert (await store.get_user("long-scope")).channel_scope == scope  # untouched
+
+    assert await store.withdraw_ad_channel_scope("long-scope", scope) is True
+    got = await store.get_user("long-scope")
+    assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_AD)
+
+
 async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
     """The COL_LENGTH-gated ADD for ``users.directory_object_id`` (BACKLOG #1471) on a pre-#1471
     database.
@@ -2080,6 +2160,57 @@ async def test_legacy_plaintext_error_detail_migrated_on_open(store) -> None:
         assert (await keyed.list_dead())[0]["last_error"] == fail
     finally:
         await keyed.close()
+
+
+async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -> None:
+    """BACKLOG #1169 (ASVS 11.3.3), the ``sqlserver-store`` twin of
+    ``tests/test_store_strict_ciphertext.py``. Once ``messages.raw`` holds ciphertext, a keyed reopen
+    must NOT seal a planted plaintext row (that launders it), and a read of it must be REFUSED with the
+    cell named to the refusal hook -- never returned as the row's content. Also pins the purged-blank
+    guard the first id-keyed loop used to lack: a ``raw=''`` stays blank through a keyed open."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher, CipherError
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    plant = "MSH|^~\\&|EVIL|F|R|RF|20260101||ADT^A01|PLANTED|P|2.5.1\r"
+    keyed = await SqlServerStore.open(settings, cipher=AesGcmCipher(bytearray(b"k" * 32)))
+    try:
+        good = await keyed.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0
+        )
+        planted = await keyed.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=101.0
+        )
+        blank = await keyed.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=102.0
+        )
+        row = (await keyed._fetchall("SELECT raw FROM messages WHERE id=?", (planted,)))[0]
+        assert row["raw"].startswith(MARKER_PREFIX)  # the surface IS sealed
+        await keyed._execute("UPDATE messages SET raw=? WHERE id=?", (plant, planted))
+        await keyed._execute("UPDATE messages SET raw='' WHERE id=?", (blank,))
+    finally:
+        await keyed.close()
+
+    cipher = AesGcmCipher(bytearray(b"k" * 32))
+    refused: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda t, c: refused.append((t, c)))
+    reopened = await SqlServerStore.open(settings, cipher=cipher)
+    try:
+        # The open's sweep visits the surface once and reports the planted row once (#1169 round 2);
+        # the read below adds one more report for its refusal. Two events, by design.
+        assert refused == [("messages", "raw")], "the open must report the surface exactly once"
+        row = (await reopened._fetchall("SELECT raw FROM messages WHERE id=?", (planted,)))[0]
+        assert row["raw"] == plant, "the keyed reopen sealed a planted row on a sealed surface"
+        row = (await reopened._fetchall("SELECT raw FROM messages WHERE id=?", (blank,)))[0]
+        assert row["raw"] == "", "a purged blank was sealed into ciphertext-of-empty"
+        assert (await reopened.get_message(good))["raw"] == RAW
+        assert (await reopened.get_message(blank))["raw"] == ""
+        with pytest.raises(CipherError, match=r"messages\.raw"):
+            await reopened.get_message(planted)
+        assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
+    finally:
+        await reopened.close()
 
 
 async def test_state_plaintext_migrated_on_keyed_reopen(store) -> None:

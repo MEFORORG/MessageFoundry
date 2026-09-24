@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import tomllib
@@ -126,17 +127,28 @@ def _introduced_banned(payload: str, live: str) -> tuple[str, int] | None:
     """
     if not payload:
         return None
-    live_counts = Counter(ch for ch in live if _BANNED.search(ch))
-    payload_counts = Counter(ch for ch in payload if _BANNED.search(ch))
+    # One C-level pass each. `_BANNED` is a single character class, so `findall` yields exactly the
+    # banned characters; the scan now runs over every surface of both cells, not five fields.
+    live_counts = Counter(_BANNED.findall(live))
+    payload_counts = Counter(_BANNED.findall(payload))
     for ch in payload:
         if ch in payload_counts and payload_counts[ch] > live_counts[ch]:
             return ch, payload_counts[ch] - live_counts[ch]
     return None
 
 
-def toml_str(s: str) -> str:
-    """A TOML basic string. JSON escaping is a strict subset of TOML's, so json.dumps is safe."""
-    return json.dumps(s, ensure_ascii=False)
+def toml_str(s: object) -> str:
+    """A TOML basic string, ALWAYS a string, whatever type it was handed.
+
+    The ``str()`` is load-bearing. The type guard in ``main`` excludes ``_ORDERED`` because this
+    writer COERCES those fields, and ``json.dumps`` alone does not: handed an int, a bool, a list or a
+    dict it emits a TOML int, bool or array, or a JSON object that does not parse at all (BACKLOG
+    #1883, #1884 limb 4). Coercing here makes that exclusion's premise true for every caller at once.
+
+    JSON escapes every control character TOML forbids except one: DEL (U+007F), which ``json.dumps``
+    leaves raw and ``tomllib`` rejects. So it is escaped by hand.
+    """
+    return json.dumps(str(s), ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 #: Scalar keys this writer knows how to emit. ANY OTHER scalar key found on the live cell is carried
@@ -148,24 +160,23 @@ def toml_str(s: str) -> str:
 #: A green gate cannot distinguish PRESERVED from DROPPED, so the writer must never enumerate what it
 #: keeps; it enumerates only what it ORDERS, and everything else survives by default.
 _ORDERED = ("id", "level", "verdict", "residual", "last_verified", "verified_at", "reviewed_by")
+#: The ordered fields `render` omits when empty. Every other ordered field is always written, which
+#: is why `main` requires them; `reviewed_by` is required too unless the run is an anchor repair.
+_OPTIONAL_ORDERED = ("residual", "reviewed_by")
 
 #: AT LEAST these top-level keys carry free text. **NOT every field that can** -- `posture`,
 #: `decision_closed_on`, anything a payload invents, and all sub-table text (`evidence[].expect`,
-#: `absence[].pattern`, and their siblings) are free text this tuple does not name and neither guard
-#: below covers. An enumeration that calls itself complete is the liability SDS-3.6 names, and this
-#: one said "every field" while covering none of that. Widening the guards to the whole emitted
-#: surface is a real defect and not this tuple's job to hide.
+#: `absence[].pattern`, and their siblings) are free text this tuple does not name. An enumeration
+#: that calls itself complete is the liability SDS-3.6 names.
 #:
-#: TWO guards read the tuple -- the `anchor_repair` byte-identity check and the banned-glyph
-#: introduction scan -- and BOTH must read all of it. Narrow either and the exemption becomes a
-#: bypass with a narrow mouth. That is not hypothetical: the scan read `residual` alone while this
-#: tuple named five, so a glyph could enter the other four unremarked (BACKLOG #1333). The two are
-#: coupled tighter still, because the scan skips itself under `anchor_repair` on the strength of the
-#: byte-identity loop, so narrowing THAT one silently opens the scan as well.
+#: ONE guard reads the tuple now: the `anchor_repair` byte-identity check. The banned-glyph scan
+#: read it until BACKLOG #1884, and before that read `residual` alone (#1333) -- a narrow mouth each
+#: time. It now scans everything the payload writes (`_written_text`), a superset of this tuple, and
+#: no longer skips itself under `anchor_repair`, so narrowing this tuple cannot open the scan.
 #:
-#: Tests pin all three edges -- each guard's loop, and the membership of this tuple itself. The
-#: tuple needs its own arm because the tests parametrize OVER it: shrink it and the parametrized
-#: arms shrink with it, reporting fewer passes rather than a failure.
+#: Tests still pin the scan on each of these five, the byte-identity loop, and the membership of
+#: this tuple itself. The tuple needs its own arm because the tests parametrize OVER it: shrink it
+#: and the parametrized arms shrink with it, reporting fewer passes rather than a failure.
 _PROSE_FIELDS = (
     "residual",
     "reviewed_by",
@@ -174,6 +185,34 @@ _PROSE_FIELDS = (
     "decision_permits_without_owner",
 )
 _SUBTABLES = ("evidence", "absence")
+
+#: The namespace an owner closure lives in. The closed-cell guard holds every key under it, on
+#: either side, rather than a list of today's pins (BACKLOG #1884 limb 1).
+_DECISION_PREFIX = "decision_"
+
+#: Stands for a key the record does not hold, so a payload's explicit null is not mistaken for it.
+_ABSENT = object()
+
+
+def _same(a: object, b: object) -> bool:
+    """Equal in value AND type, at every depth. Plain `==` says `1 == True` and `1 == 1.0`, inside a
+    table or array as much as at the top."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b, strict=True))
+    return a == b
+
+
+def _held(key: str, payload: dict[str, Any], live: dict[str, Any]) -> bool:
+    """Whether writing `payload` leaves `key` exactly as `live` holds it. An omitted key is CARRIED
+    by `render`, so it is held without comparing (a NaN never equals itself), and an explicit null
+    for a key the record lacks is a change, not a match."""
+    if key not in payload:
+        return True
+    return _same(payload[key], live.get(key, _ABSENT))
 
 
 #: Keys the WRITER CONSUMES AS INSTRUCTIONS rather than storing as record fields (BACKLOG #1369).
@@ -204,7 +243,7 @@ _SUBTABLES = ("evidence", "absence")
 #: the next write. Cheap and loud against expensive and silent.
 #:
 #: `anchor_repair` was the one it missed. The same function consumes it as an instruction -- it
-#: relaxes the glyph and `reviewed_by` guards for exactly one run -- and nothing reads it back, so it
+#: relaxes the `reviewed_by` guard for exactly one run -- and nothing reads it back, so it
 #: sat in the record FREEZING the cell: a later ordinary residual correction, authored from the live
 #: cell and therefore carrying the flag forward, is refused with "declared anchor_repair but
 #: 'residual' differs from the record". That is the #1333 freeze shape, reintroduced through a
@@ -225,6 +264,62 @@ def _control_keys() -> tuple[str, ...]:
     `_carried`'s docstring warns a name list invites. A mutation run proved that: a hand-written
     literal matching today's value passed every test, because there was no behaviour to differ on."""
     return tuple(f"retired_{name}" for name in _SUBTABLES) + _NAMED_CONTROLS
+
+
+def _flat_text(value: object) -> str:
+    """Every piece of text a value puts into the record, dict KEYS included, as one string."""
+    if isinstance(value, dict):
+        return " ".join(f"{k} {_flat_text(v)}" for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return " ".join(_flat_text(v) for v in value)
+    return str(value)
+
+
+def _printable(text: str) -> str:
+    """`text` safe for a cp1252 console. A refusal that echoes a character the console cannot encode
+    raises UnicodeEncodeError, and the traceback hides the refusal's own reason."""
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _surface_name(where: tuple[str, ...]) -> str:
+    """How a refusal names a `_written_text` surface: ``residual``, or ``evidence[].expect``."""
+    return _printable(where[0] if len(where) == 1 else f"{where[0]}[].{where[1]}")
+
+
+def _written_text(cell: dict[str, Any]) -> dict[tuple[str, ...], str]:
+    """``{where it lands: its text}`` for everything the PAYLOAD writes into the record (BACKLOG
+    #1884). Not quite everything the record gains: `render` also derives `anchor_repaired_at` from
+    `last_verified`, and that copy is not a separate surface here.
+
+    Surfaces are keyed by TUPLE -- ``(key,)`` or ``(subtable, key)`` -- so a top-level key that
+    happens to be spelled like a pooled sub-table name cannot overwrite that surface.
+
+    DERIVED FROM THE CELL, NOT FROM A LIST OF FIELD NAMES. The glyph scan used to read
+    `_PROSE_FIELDS`, so sub-table text, carried keys and anything a payload invented were written
+    unscanned -- the narrow-mouth shape #1333 and #1483 record, met again. Reading what the cell
+    actually carries means the next field anyone adds is scanned without anyone listing it.
+
+    Each top-level key is one surface, and its text includes the KEY: `_toml_key` quotes a key that
+    is not bare, so a banned character in a key is writable and must be scanned like a value.
+
+    Sub-table entries are POOLED per key -- ``evidence[].expect`` -- rather than compared entry by
+    entry. Entries are re-pointed, reordered and retired, and pooling keeps a glyph that is carried
+    or moved between entries writable, which is #1308's rule one level down.
+
+    Controls are skipped: `render` consumes them and never writes them.
+    """
+    controls = _control_keys()
+    parts: dict[tuple[str, ...], list[str]] = {}
+    for key, value in cell.items():
+        if key in controls:
+            continue
+        if key in _SUBTABLES and isinstance(value, list):
+            for entry in value:
+                for k, v in entry.items() if isinstance(entry, dict) else ():
+                    parts.setdefault((key, k), []).append(f"{k} {_flat_text(v)}")
+            continue
+        parts[(key,)] = [f"{key} {_flat_text(value)}"]
+    return {where: " ".join(texts) for where, texts in parts.items()}
 
 
 #: The keys each sub-table entry is ORDERED by. Exactly the same distinction as `_ORDERED` one level
@@ -273,6 +368,17 @@ _IDENTITY: dict[str, tuple[str, ...]] = {
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+def _toml_key(key: object) -> str:
+    """A key as TOML: bare when `_BARE_KEY` allows it, quoted otherwise. The ONE place a key is
+    written, so a dotted key cannot re-nest at any depth or through any writer (BACKLOG #1884 limb
+    3: `_scalar` used to write its key raw while the inline-table branch quoted, so the same payload
+    key was safe one level down and re-nested at the top level and inside sub-table entries)."""
+    k = str(key)
+    # `fullmatch`, not `match`: `$` also matches before a trailing newline, so `match` passed
+    # "abc\n" as bare and wrote it raw.
+    return k if _BARE_KEY.fullmatch(k) else toml_str(k)
+
+
 def _toml_value(value: object) -> str:
     """Render any value as TOML. Recurses, so the quoting rule above applies at EVERY depth and
     inside arrays of tables -- measured, not assumed: a dot at depth 3 re-nests exactly as one at
@@ -289,14 +395,11 @@ def _toml_value(value: object) -> str:
     if isinstance(value, float):
         return repr(value)
     if isinstance(value, dict):
-        inner = ", ".join(
-            f"{k if _BARE_KEY.match(str(k)) else toml_str(str(k))} = {_toml_value(v)}"
-            for k, v in value.items()
-        )
+        inner = ", ".join(f"{_toml_key(k)} = {_toml_value(v)}" for k, v in value.items())
         return "{ " + inner + " }" if inner else "{}"
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
-    return toml_str(str(value))
+    return toml_str(value)
 
 
 def _scalar(key: str, value: object) -> str:
@@ -307,7 +410,7 @@ def _scalar(key: str, value: object) -> str:
     file. Every carry path routes through here (the top-level union walk, the rewrite, and
     ``_carried``), which is why one branch closes all three.
     """
-    return f"{key} = {_toml_value(value)}"
+    return f"{_toml_key(key)} = {_toml_value(value)}"
 
 
 def _carried(entry: dict[str, Any], ordered: tuple[str, ...]) -> list[str]:
@@ -321,14 +424,24 @@ def _carried(entry: dict[str, Any], ordered: tuple[str, ...]) -> list[str]:
 
 
 def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
-    out = ["[[cell]]", f'id = "{cell["id"]}"', f"level = {int(cell['level'])}"]
-    out.append(f'verdict = "{cell["verdict"]}"')
-    if cell.get("residual"):
-        out.append(f"residual = {toml_str(cell['residual'])}")
-    out.append(f'last_verified = "{cell["last_verified"]}"')
-    out.append(f'verified_at = "{cell["verified_at"]}"')
-    if cell.get("reviewed_by"):
-        out.append(f"reviewed_by = {toml_str(cell['reviewed_by'])}")
+    # ONE EMISSION FOR EVERY ORDERED STRING, SO NO FIELD CAN CHOOSE ITS OWN QUOTING (BACKLOG #1883).
+    # Four of these were raw f-strings carrying their own quote marks, and two of them --
+    # `last_verified` (a date) and `verified_at` (a commit SHA) -- are constrained upstream only to
+    # be non-empty. A quote and a newline in either closed the string early and wrote the rest into
+    # the record as TOML: a payload could add any NEW key to the cell, `decision_closed` and its pins
+    # included, past every key-set and type guard below. A format check would not replace this; the
+    # next field added to `_ORDERED` has no format rule yet.
+    #
+    # `id` and `verdict` share the line, but `main`'s checks on them are STILL NEEDED: an id that
+    # `toml_str` had to escape would not be found again by `block_spans`'s plain regex, so the record
+    # could not be rewritten on the next run. Quoting keeps a bad id out of the TOML structure; it
+    # does not make one usable.
+    out = ["[[cell]]"]
+    for key in _ORDERED:
+        if key == "level":
+            out.append(f"level = {int(cell[key])}")
+        elif cell.get(key) or key not in _OPTIONAL_ORDERED:
+            out.append(f"{key} = {toml_str(cell[key])}")
     # Carry through every other scalar from BOTH SOURCES -- decision_closed and friends off the live
     # cell, and anything a future schema adds that this writer has never heard of, from either side.
     #
@@ -585,6 +698,14 @@ def main(argv: list[str] | None = None) -> int:
     # heading produces a payload this tool has no reason to doubt. `--scope` is the independent
     # channel that states the intent, so the two can disagree out loud.
     payload_ids = [str(c.get("id")) for c in payload]
+    # ONE ROW PER CELL. Two rows with one id both splice into the same span, the second with offsets
+    # the first already moved, so one row was silently dropped or the parse died on a traceback.
+    repeated = sorted(i for i, n in Counter(payload_ids).items() if n > 1)
+    if repeated:
+        print(
+            f"REFUSING: the payload writes these cell(s) more than once: {_printable(str(repeated))}"
+        )
+        return 1
     if args.scope is not None:
         declared = {s.strip() for s in args.scope.split(",") if s.strip()}
         written = set(payload_ids)
@@ -615,10 +736,9 @@ def main(argv: list[str] | None = None) -> int:
     for c in payload:
         live = live_cells.get(c.get("id"), {})
         # An ANCHOR REPAIR re-points citations after the code moved; it must not touch anything else.
-        # Declaring it lets two guards relax in a way that is strictly more conservative than the
-        # alternative: the residual passes through BYTE-IDENTICAL, so no retired glyph can enter the
-        # record that was not already in it, and an existing empty `reviewed_by` is preserved rather
-        # than invented. Any difference in verdict or residual takes it out of this mode immediately.
+        # Declaring it relaxes ONE guard -- `reviewed_by` need not be restated -- and buys that with
+        # byte-identity on every prose field, so an existing empty `reviewed_by` is preserved rather
+        # than invented. Any difference in verdict or prose refuses. The glyph scan still runs.
         anchor_repair = bool(c.get("anchor_repair"))
         if live.get("anchor_repair"):
             # GATED ON THE RECORD, NOT ON THE PAYLOAD, and that is the whole correction. Gating on
@@ -644,8 +764,8 @@ def main(argv: list[str] | None = None) -> int:
             # sound by argument -- the writer never rewrites the others -- but an argument is worth
             # less than a check, and it left the next reader to reconstruct why two were sufficient.
             #
-            # THIS is the guard on prose under `anchor_repair`; the glyph scan below skips itself
-            # and stays inert here. `_PROSE_FIELDS` carries the coupling.
+            # The glyph scan below runs here too, and finds nothing on these fields because they
+            # equal the record; it is what covers the evidence a repair DOES rewrite (#1884).
             for f in _PROSE_FIELDS:
                 if c.get(f, live.get(f, "")) != live.get(f, ""):
                     problems.append(
@@ -657,7 +777,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"{c.get('id')}: declared anchor_repair but the verdict differs from the "
                     "record; that is a rescore, not a repair"
                 )
-        required: tuple[str, ...] = ("id", "level", "verdict", "last_verified", "verified_at")
+        # Every field `render` always writes, derived so the two cannot drift apart.
+        required = tuple(k for k in _ORDERED if k not in _OPTIONAL_ORDERED)
         if not anchor_repair:
             required = required + ("reviewed_by",)
         for field in required:
@@ -681,12 +802,17 @@ def main(argv: list[str] | None = None) -> int:
                 "That is an assessor decision, not a mechanical edit. Re-run with "
                 "--allow-verdict-change if you mean it"
             )
-        if c.get("verdict") == "na" and not (c.get("residual") or "").strip():
-            problems.append(f"{c['id']}: verdict 'na' requires a written rationale in residual")
+        # The TEXT a residual carries, not its repr. A list here used to raise AttributeError on
+        # `.strip()`, a traceback in place of a refusal; and `str([""])` is not a rationale.
+        # `c.get('id')` for the reason the glyph refusal below gives.
+        if c.get("verdict") == "na" and not _flat_text(c.get("residual") or "").strip():
+            problems.append(f"{c.get('id')}: verdict 'na' requires a written rationale in residual")
         if c.get("verdict") in {"pass", "partial", "fail"} and not (
             c.get("evidence") or c.get("absence")
         ):
-            problems.append(f"{c['id']}: {c['verdict']} needs at least one anchor or absence claim")
+            problems.append(
+                f"{c.get('id')}: {c['verdict']} needs at least one anchor or absence claim"
+            )
         # SCAN WHAT THE PAYLOAD INTRODUCES, NOT WHAT THE RECORD ALREADY CARRIES (BACKLOG #1308).
         #
         # THE DEFECT THIS FIXES IS UNWRITABILITY, NOT UNTIDINESS -- read the other way round it
@@ -704,51 +830,48 @@ def main(argv: list[str] | None = None) -> int:
         #
         # FAIL-CLOSED WHERE THERE IS NO RECORD: a cell with no live counterpart has a live count of
         # zero for everything, so any banned character in a NEW cell is introduced and refused.
-        # EVERY `_PROSE_FIELDS` ENTRY, NOT `residual` ALONE (BACKLOG #1333). That tuple's comment
-        # carries the coupling and what these five names still leave uncovered.
         #
-        # PER FIELD ON BOTH SIDES: payload field against the live field of the SAME NAME. Comparing
-        # against the cell's prose as a whole would let one field that already carries a glyph
-        # launder new vocabulary into all the others. The cost is that a glyph MOVED between two
-        # prose fields now reads as an introduction, where `_introduced_banned`'s docstring promises
-        # a move is writable -- that promise holds within a field, not across them.
+        # EVERYTHING THE PAYLOAD WRITES, NOT A NAMED LIST (BACKLOG #1884 limbs 2 and 3). This read
+        # `residual` alone until #1333 and `_PROSE_FIELDS` after it; both left sub-table text and
+        # carried keys unscanned. `_written_text` derives the surfaces from the cell itself.
         #
-        # THE `anchor_repair` SKIP IS BELT-AND-BRACES AND INERT TODAY, kept deliberately and marked
-        # so nobody reads it as load-bearing. The byte-identity loop above already forces all five
-        # fields to equal the record, so `_introduced_banned(x, x)` finds nothing whether this runs
-        # or not: replacing the condition with `if True` leaves the suite green. It stays because it
-        # says the exemption out loud where the old spelling said it by feeding the scan a blanked
-        # payload, which reads like sanitisation rather than the decision it is.
+        # PER SURFACE ON BOTH SIDES: payload surface against the live surface of the SAME NAME.
+        # Comparing against the cell's text as a whole would let one field that already carries a
+        # glyph launder new vocabulary into all the others. The cost is that a glyph MOVED between
+        # two fields reads as an introduction -- `_introduced_banned`'s promise that a move is
+        # writable holds within a surface, not across them.
         #
-        # IT IS NOT A CLAIM ABOUT THE CELL. A repair rewrites `evidence` entries by definition, and
-        # no guard here scans sub-table text, under `anchor_repair` or without it.
-        if not anchor_repair:
-            for prose_field in _PROSE_FIELDS:
-                introduced = _introduced_banned(
-                    str(c.get(prose_field, "") or ""), str(live.get(prose_field, "") or "")
+        # NO `anchor_repair` SKIP ANY MORE. It rested on the prose byte-identity loop above, which
+        # makes the scan inert on those five fields -- and a repair rewrites `evidence` by
+        # definition, which that loop never covered. So a repair could introduce a glyph into an
+        # anchor unscanned. Running the scan always costs nothing on the prose fields and closes that.
+        live_written = _written_text(live)
+        for surface, surface_text in _written_text(c).items():
+            introduced = _introduced_banned(surface_text, live_written.get(surface, ""))
+            if introduced:
+                # Report the codepoint, never the character: echoing it to a cp1252 console
+                # raises UnicodeEncodeError and the refusal turns into a traceback that hides
+                # its own reason. The surface is escaped for the same reason, because a key can
+                # carry the glyph. NAME THE SURFACE too, so the author edits the right text.
+                #
+                # `c.get('id')`, not `c['id']`: a missing id is APPENDED to problems above
+                # rather than returned on, so a payload with no id reaches here and the
+                # subscript would raise KeyError -- a traceback in place of the refusal list
+                # that names the real problem.
+                ch, extra = introduced
+                problems.append(
+                    f"{_printable(str(c.get('id')))}: {_surface_name(surface)} INTRODUCES a banned glyph "
+                    f"U+{ord(ch):04X} ({extra} more than that field already carries)"
                 )
-                if introduced:
-                    # Report the codepoint, never the character: echoing it to a cp1252 console
-                    # raises UnicodeEncodeError and the refusal turns into a traceback that hides
-                    # its own reason. NAME THE FIELD too -- this said "residual" whatever carried
-                    # the glyph, which sends the author to edit prose that is fine.
-                    #
-                    # `c.get('id')`, not `c['id']`: a missing id is APPENDED to problems above
-                    # rather than returned on, so a payload with no id reaches here and the
-                    # subscript would raise KeyError -- a traceback in place of the refusal list
-                    # that names the real problem. The widening made four more fields reach it.
-                    ch, extra = introduced
-                    problems.append(
-                        f"{c.get('id')}: {prose_field} INTRODUCES a banned glyph "
-                        f"U+{ord(ch):04X} ({extra} more than that field already carries)"
-                    )
     if problems:
         print("REFUSING TO APPLY:")
         for p in problems:
             print("  " + p)
         return 1
 
-    text = SCORECARD.read_text(encoding="utf-8")
+    # THE SAME READ THE GUARDS ABOVE PARSED, not a second one. The vault tree is shared, so a
+    # re-read could splice into text another session changed after the guards looked at it.
+    text = live_text
     spans = block_spans(text)
 
     edits = []
@@ -757,27 +880,53 @@ def main(argv: list[str] | None = None) -> int:
             print(f"REFUSING: cell {c['id']} not present in the scorecard")
             return 1
         s, e = spans[c["id"]]
-        old = text[s:e]
-        if "decision_closed = true" in old:
+        live = live_cells.get(c["id"], {})
+        # READ FROM THE PARSED CELL, NOT THE BLOCK'S TEXT. A substring test on the text also matched
+        # the phrase quoted inside a value -- a residual mentioning it, or a hostile date #1883 now
+        # stores as a string -- and then refused every later ordinary write to an OPEN cell.
+        if live.get("decision_closed") is True:
             # The method permits exactly ONE change to a closed cell without the owner: repairing a
-            # broken evidence anchor, re-anchored by content. So allow it only when the verdict and
-            # the residual are byte-identical to what is already recorded -- i.e. anchors only.
-            import tomllib as _t
-
-            live = {x["id"]: x for x in _t.loads(text)["cell"]}[c["id"]]
-            if c["verdict"] != live["verdict"] or c.get("residual", "") != live.get("residual", ""):
+            # broken evidence anchor, re-anchored by content. So the verdict, the residual and the
+            # WHOLE closure must be identical to what is already recorded. That is AT LEAST what a
+            # repair must hold, not all of it: other fields such as `reviewed_by` are not held here.
+            #
+            # THE CLOSURE IS DERIVED, NOT LISTED: every `decision_*` key on EITHER side, so on a
+            # CLOSED cell a payload can neither change a pin nor add one. (An OPEN cell is not held
+            # here: a payload can still carry a whole closure onto one, an open question the row
+            # did not settle.) The next pin the schema grows is
+            # held without anyone naming it (BACKLOG #1884 limb 1). This compared verdict and
+            # residual alone, so a payload could un-close the cell or re-attribute the closure, exit
+            # 0, and print the note below saying the edit was anchors only.
+            #
+            # A MANAGER DECISION under the owner's /driver delegation, 2026-09-23, NOT an owner
+            # ruling: an anchor repair edits evidence and never needs a `decision_*` field, so
+            # holding them all narrows nothing a repair does. An omitted key is CARRIED by `render`,
+            # so omission counts as unchanged.
+            #
+            # SAME TYPE AND SAME VALUE, with absence distinct from null. Python's `==` says
+            # `1 == True`, so `decision_closed: 1` passed and wrote an int the next run's
+            # `is True` test reads as OPEN; and `null` for an absent pin equalled `.get()`'s None.
+            changed = [
+                k for k in ("verdict", "residual") if not _same(c.get(k, ""), live.get(k, ""))
+            ]
+            changed += sorted(
+                k for k in {*c, *live} if k.startswith(_DECISION_PREFIX) and not _held(k, c, live)
+            )
+            if changed:
                 print(
-                    f"REFUSING: cell {c['id']} is decision_closed and this edit changes its "
-                    "verdict or residual; only an anchor repair is permitted without the owner"
+                    f"REFUSING: cell {c['id']} is decision_closed and this edit changes "
+                    f"{_printable(str(changed))}; only an anchor repair is permitted without "
+                    "the owner"
                 )
                 return 1
             print(
-                f"  note: {c['id']} is decision_closed - anchor-only repair, verdict and residual unchanged"
+                f"  note: {c['id']} is decision_closed - verdict, residual and every decision_* "
+                "field unchanged"
             )
-        edits.append((s, e, render(c, live_cells.get(c["id"], {})), old))
+        edits.append((s, e, render(c, live)))
 
     new_text = text
-    for s, e, rendered, _old in sorted(edits, key=lambda t: -t[0]):
+    for s, e, rendered in sorted(edits, key=lambda t: -t[0]):
         new_text = new_text[:s] + rendered + new_text[e:]
 
     # Parse before writing: a scorecard that does not load is worse than one not updated.
@@ -978,6 +1127,15 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     return 1
 
+    # ENCODE BEFORE OPENING THE FILE, and before the dry-run exit so a dry run refuses too.
+    # `write_text` truncates first and encodes second, so a string that cannot be UTF-8 -- a lone
+    # surrogate, which JSON can carry and `tomllib` accepts -- left the shared record EMPTY.
+    try:
+        data = new_text.encode("utf-8")
+    except UnicodeEncodeError as err:
+        print(f"REFUSING: the rewritten record is not valid UTF-8 ({_printable(str(err))})")
+        return 1
+
     print(f"{len(edits)} cell blocks re-rendered; file parses; {len(parsed['cell'])} cells intact")
     for c in payload:
         print(
@@ -987,7 +1145,16 @@ def main(argv: list[str] | None = None) -> int:
     if dry:
         print("\nDRY RUN. Re-run with --apply to write.")
         return 0
-    SCORECARD.write_text(new_text, encoding="utf-8", newline="")
+    # THE RECORD MUST STILL BE THE TEXT THE GUARDS READ. The vault tree is shared, and a write over
+    # a peer's change landed since that read would revert it with exit 0.
+    if SCORECARD.read_text(encoding="utf-8") != live_text:
+        print(f"REFUSING: {SCORECARD} changed on disk during this run. Re-run against it.")
+        return 1
+    # WRITE A SIBLING, THEN REPLACE. Writing in place truncates first, so a failure partway -- a full
+    # disk, a lock, an interrupt -- left the shared record empty or partial.
+    tmp = SCORECARD.with_name(SCORECARD.name + ".apply-tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, SCORECARD)
     print(f"\nWROTE {SCORECARD}")
     return 0
 
