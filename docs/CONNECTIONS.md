@@ -1124,10 +1124,10 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `min_age_seconds` (above).
 - **Leader-gated.** The remote directory is a *shared* external resource, so in a cluster only the leader
   lists, downloads, or moves its files — otherwise two nodes would double-ingest the drop.
-- **No timeout knob.** Neither factory exposes one — the 30 s value is a hard-coded module fallback in
-  `transports/remotefile.py`, handed to `paramiko.SSHClient.connect(timeout=…)` (the **TCP connect only**;
-  the SFTP channel read/write is unbounded) and to `ftplib.FTP_TLS/FTP(timeout=…)` (the **whole socket**).
-  See [Table B](#table-b--per-service-resource-strategy-asvs-1313).
+- **No timeout knob.** Neither factory exposes one. The bounds these connections do have are hard-coded
+  in `transports/remotefile.py`. The "Timeouts are per-connector, not universal" paragraph under
+  [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each one
+  covers, and [Table B](#table-b--per-service-resource-strategy-asvs-1313) has the SFTP and FTP/FTPS rows.
 - **Egress allowlist.** `[egress].allowed_remote` gates the host in **both** directions — a poll dials out
   too, so the allowlist guards against polling an arbitrary server. Fail-closed once configured.
 - **At-least-once.** An upload may re-send, and a poll may re-emit a file that was handled but not yet
@@ -2729,7 +2729,7 @@ connection-count knob** (the stdlib opener exposes none) — the same framing 13
 **Timeouts are per-connector, not universal.** Only the MLLP/TCP/X12/DICOM families expose both a
 `connect_timeout` and a `timeout_seconds`; the REST/SOAP/FHIR/DICOMweb HTTP family exposes
 `timeout_seconds` only (a single per-request wall clock — there is no separate connect timeout);
-REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument, and its bounds are hard-coded module values in `transports/remotefile.py`, not operator-configurable: a 30 s connect value on all three protocols, applied on SFTP to the banner and authentication phases as well, plus a `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` bound on each read from an established SFTP channel (BACKLOG #1195) that FTP and FTPS do not have;
+REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument, and its bounds are hard-coded module values in `transports/remotefile.py`, not operator-configurable. All three protocols start from a 30 s value. On FTP and FTPS it is a whole-socket timeout, on the control and data connections alike. On SFTP it covers the TCP connect, the SSH banner exchange and authentication; a separate `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` (120 s, BACKLOG #1195) then covers each read from the established SFTP channel. That read bound is per read, not per transfer, so a slow transfer that keeps making progress never trips it. **Opening the SFTP session, between those two steps, carries no engine bound.** A server that authenticates and then never answers the SFTP subsystem request would hold its worker thread;
 DATABASE exposes `connect_timeout` + `acquire_timeout` and no statement timeout; local FILE exposes
 none (filesystem I/O is unbounded by design). The MLLP/TCP/X12/HTTP listeners expose
 `receive_timeout`; the DICOM SCP instead applies `timeout_seconds` to its three pynetdicom timers. For
@@ -2792,8 +2792,9 @@ store, and only one of the pools carries a knob.
    - **Bounded infrastructure hops** — `db_lookup`, `fhir_lookup`, the AI broker POST, every SMTP send,
      every LDAP bind, the DICOM association work. Each carries a finite timeout (Table B), so *these*
      workers are released by their timeout rather than by any pool cap.
-   - **Unbounded-by-design file I/O** — local FILE and SFTP/FTP/FTPS channel reads and writes, whose
-     "timeout" posture is stated honestly per row in Table B.
+   - **File I/O** — local FILE, which is unbounded by design, and SFTP/FTP/FTPS, whose bounds are
+     hard-coded, differ by protocol and leave at least one SFTP step unbounded. The "Timeouts are
+     per-connector, not universal" paragraph above says what each covers; Table B has the per-row detail.
    - **Inbound strict validation** — the listener runs `hl7apy` strict validate off-loop via
      `asyncio.to_thread` (`pipeline/wiring_runner.py:3259`, `:3543`), bounded by the per-inbound
      `validation.strict_timeout_s` (engine default `_STRICT_VALIDATE_TIMEOUT_SECONDS` = **5 s**,
@@ -2945,7 +2946,7 @@ reading this page already applies to a file the scan never opened.
 | HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408` | handler `finally` closes the connection with a shutdown grace | an over-size body is refused before buffering | n/a |
 | File endpoint — local filesystem | **none** — filesystem I/O is unbounded by design | file handles are context-managed; the source file is moved/deleted/left per `after_read` | an unreadable/oversize file is skipped or moved to `error_subdir` | `RetryPolicy` on the outbound write |
 | File endpoint — UNC / SMB share | **none engine-owned** — bounded only by the OS SMB redirector | the impersonation token is reverted (`RevertToSelf`) and the worker thread is per-endpoint isolated | a share failure surfaces as a transient poll/delivery error | `RetryPolicy` |
-| SFTP (remote-file) | 30 s on the **TCP connect only** — the hard-coded module fallback in `transports/remotefile.py` is passed to `paramiko.SSHClient.connect(timeout=…)`. The SSH banner and auth legs ride paramiko's own defaults (the engine sets neither `banner_timeout` nor `auth_timeout`), and the SFTP **channel read/write has no timeout at all**, so a server that stalls after connect blocks its `to_thread` worker until the engine restarts. `Sftp()` exposes no timeout argument, so none of this is operator-configurable | the `paramiko` session is closed in `finally` per poll or delivery | SSH failures map to transient | `RetryPolicy` |
+| SFTP (remote-file) | 30 s on the TCP connect, the SSH banner exchange and authentication (`timeout`, `banner_timeout` and `auth_timeout` on `paramiko.SSHClient.connect`), plus 120 s on **each read** from the established SFTP channel. All are hard-coded in `transports/remotefile.py`; `Sftp()` exposes no timeout argument, so none is operator-configurable. The bounds are **not complete**: the "Timeouts are per-connector, not universal" paragraph under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each covers and where the gap is | the `paramiko` session is closed in `finally` per poll or delivery | **Delivery:** at connect, any `paramiko.SSHException` is **permanent**. That covers a rejected host key, and also a banner timeout, which paramiko raises as `SSHException`. An authentication failure, a timeout included, is permanent and flagged as a credential fault. An `OSError`/`EOFError` at connect is transient. After connect, a missing remote path is permanent, and at least the read timeout is transient. With `validate_directory` on, the pre-upload directory check re-raises any failure as transient, these included. **Source:** the poller does not act on that split; a failed connect, listing or retrieve is logged and tried again on the next poll | `RetryPolicy` |
 | FTP / FTPS (remote-file) | 30 s **whole-socket** — the same hard-coded module fallback, handed to `ftplib.FTP_TLS(timeout=…)` / `ftplib.FTP(timeout=…)`, which sets it on the control **and** data connections. `Ftp()` exposes no timeout argument, so it is **not** operator-configurable | the `ftplib` session is closed in `finally` per poll or delivery | `ftplib.all_errors` maps to transient | `RetryPolicy` |
 | Reference-set sync (`FileRef`) | **none engine-owned** — filesystem / SMB-redirector I/O, the same posture as the File connector | the file handle is context-managed and closed per pass | a load error is logged and the previous encrypted snapshot is retained | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
