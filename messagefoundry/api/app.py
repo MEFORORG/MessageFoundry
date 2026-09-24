@@ -191,7 +191,6 @@ from messagefoundry.api.security import (
     deadline_utc,
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
-    initial_credential_window_hours,
     optional_identity,
     pending_credential_deadline,
     require,
@@ -6668,10 +6667,12 @@ def _initial_credential_warn_lead(auth: AuthService) -> float | None:
     short window. No setting, deliberately: the reminder is advisory and a knob would be one more
     loosening to inventory. ``None`` when ``[auth].initial_password_expiry_hours`` is 0, where
     nothing expires and there is nothing to remind about."""
-    window_hours = initial_credential_window_hours(auth)
-    if window_hours is None:
+    window = auth.initial_credential_deadline(
+        0.0
+    )  # the window in seconds, from the gate's arithmetic
+    if window is None:
         return None
-    return min(_INITIAL_CREDENTIAL_MAX_LEAD, window_hours * 3600.0 / 3)
+    return min(_INITIAL_CREDENTIAL_MAX_LEAD, window / 3)
 
 
 async def _remind_expiring_initial_credentials(
@@ -6714,7 +6715,7 @@ async def _remind_expiring_initial_credentials(
             hours_remaining=max(0, int((deadline - now) // 3600)),
         )
         warned[user.id] = deadline
-    for user_id in [uid for uid in warned if uid not in live]:
+    for user_id in warned.keys() - live:
         del warned[user_id]
 
 

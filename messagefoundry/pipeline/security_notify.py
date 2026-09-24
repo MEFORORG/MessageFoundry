@@ -16,7 +16,6 @@ Lives in ``pipeline/`` (next to the operator alert plumbing it reuses) and impor
 from __future__ import annotations
 
 import asyncio
-import datetime
 import logging
 
 from messagefoundry.auth.notifications import (
@@ -33,6 +32,7 @@ from messagefoundry.auth.notifications import (
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SecurityEvent,
+    deadline_utc,
 )
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AlertsSettings
@@ -79,21 +79,6 @@ _DESCRIPTIONS = {
 }
 
 
-def _utc_stamp(ts: object) -> str | None:
-    """A deadline instant in the format every other surface states it in, or ``None``.
-
-    Same format and same refusal as ``messagefoundry.api.security.deadline_utc``, which this module
-    cannot import (``pipeline`` sits below ``api``). ``tests/test_security_notify.py`` pins the two
-    to one string. ``None`` for a value that is not a number or cannot be rendered, so the caller
-    drops the sentence rather than failing the send."""
-    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
-        return None
-    try:
-        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
 def _build_body(event: SecurityEvent) -> str:
     """A short, PHI-free notice. The recipient is the account owner, so naming their own account /
     source IP / new email is appropriate; no message data or secrets ever appear here."""
@@ -108,7 +93,8 @@ def _build_body(event: SecurityEvent) -> str:
     if event.event_type == PASSWORD_RESET:
         # BACKLOG #1141 (ASVS 6.4.5): the renewal instruction for an expiring credential, sent to the
         # holder. `expires_at` is the instant the login gate refuses on, read off the stored stamp.
-        expires = _utc_stamp(event.detail.get("expires_at"))
+        stamp = event.detail.get("expires_at")
+        expires = deadline_utc(stamp) if isinstance(stamp, (int, float)) else None
         if expires is not None:
             lines.append(
                 f"The temporary password stops working at {expires}. Sign in with it and choose "

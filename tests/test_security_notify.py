@@ -14,13 +14,13 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.api.security import deadline_utc
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     EMAIL_CHANGED,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
     SecurityEvent,
+    deadline_utc,
 )
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.security_notify import (
