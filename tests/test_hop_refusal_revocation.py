@@ -29,6 +29,7 @@ import ssl
 
 import pytest
 
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import (
@@ -47,17 +48,20 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.logging_setup import SyslogForward, _build_tls_context
 from messagefoundry.store.postgres import _build_ssl
+from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.dicom import _client_ssl_context as _dicom_client_ssl_context
 from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.remotefile import _ftps_ssl_context
-from messagefoundry.transports.rest import http_family_trust_anchor
+from messagefoundry.transports.rest import http_family_trust_anchor, opener_tls_context
 from messagefoundry.transports.smart import (
     SmartAuthError,
     SmartBackendTokenProvider,
     token_provider_from_settings,
 )
+from tests.test_auth_oidc_service import _FakeLdap
+from tests.test_auth_oidc_service import _settings as _oidc_settings
 
 # The postures the gradient keys on. `is_phi` went with BACKLOG #1279 -- only the dial is left.
 PROD_PHI = HopPosture(enforcing=True)
@@ -793,8 +797,8 @@ def test_a_loopback_hop_gets_no_crl_and_still_crosses(crl_bundle: str) -> None:
 #
 # The cells above carried the guard; three verifying hops did not, and two of those carry
 # authentication material. This section closes two of the three -- the SMART token endpoint and the
-# [logging] syslog TLS forwarder. The OIDC token and JWKS legs are NOT built; the ADR's AC-4 records
-# why and names the change that would close them.
+# [logging] syslog TLS forwarder. The third, the OIDC token and JWKS legs, was held out of #1498 and
+# is built under BACKLOG #1887; its arms are the last section of this file.
 #
 # The two reach the guard by different seams, so they get separate arms rather than one
 # parametrisation: SMART goes through the https-scheme-keyed refuse_unrevoked_verified_hop wrapper
@@ -1049,3 +1053,138 @@ def test_the_verifying_forwarder_context_asserts_strict_path_validation(crl_bund
     arrives with ``create_default_context`` before ``tls_verify`` is consulted, so such an arm would
     assert a falsehood."""
     assert _build_tls_context(_forward(LOOPBACK, crl_bundle)).verify_flags & ssl.VERIFY_X509_STRICT
+
+
+# --- BACKLOG #1887 (ADR 0173 section 4.3, AC-4): the OIDC token and JWKS legs -----------------------
+#
+# The third hop of the rider. Both legs share ONE opener and ONE context, built in
+# auth/oidc_http.py:build_idp_opener, and AuthService guards them just after that opener exists. The
+# posture is threaded through AuthService(hop_posture=), because the service is built in the API
+# lifespan outside every active_hop_posture scope -- so every arm below passes it as the lifespan
+# does, and none stamps the contextvar.
+#
+# TWO GUARDS, NOT ONE. The legs may be different hosts with different loopback status. The
+# independence arms are the only ones here that can tell two guards from one keyed on a single host;
+# nothing inherited from the syslog set exercises that, because that hop has one host.
+#
+# As above, THE NOT-REFUSED ARMS ARE THE LOAD-BEARING HALF: loopback, a CRL that really loaded, and
+# no posture must all construct.
+
+
+async def _oidc_service(
+    *,
+    token_host: str = REMOTE,
+    jwks_host: str = REMOTE,
+    posture: HopPosture | None = PROD_PHI,
+    **over: object,
+) -> AuthService:
+    """Construct AuthService with OIDC on, the way the API lifespan does: posture passed, not ambient.
+
+    Returning means BOTH guards allowed their leg, because the guards run inside ``__init__`` and no
+    earlier construction check can stand in for their verdict. The opener opens no socket, so an
+    unreachable host is fine here. The directory is the OIDC suite's fake: a real LdapAuthenticator
+    would bring its own LDAPS hop into these arms, a second guard that could fire in place of these."""
+    settings = _oidc_settings(
+        oidc_issuer=f"https://{REMOTE}",
+        oidc_authorization_endpoint=f"https://{REMOTE}/authorize",
+        oidc_token_endpoint=f"https://{token_host}:8443/token",
+        oidc_jwks_uri=f"https://{jwks_host}:8443/jwks",
+        oidc_allowed_endpoints=[REMOTE, LOOPBACK],
+        **over,
+    )
+    store = await MessageStore.open(":memory:")
+    try:
+        return AuthService(store, settings, ldap=_FakeLdap(), hop_posture=posture)  # type: ignore[arg-type]
+    finally:
+        await store.close()
+
+
+async def test_the_oidc_legs_are_refused_when_they_check_no_revocation() -> None:
+    # THE CONTROL for this hop, and the proof the posture is threaded through AuthService at all: if
+    # the seam dropped it, the guard would read the ambient posture, which is None here, and no-op.
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        await _oidc_service()
+
+
+async def test_the_oidc_legs_on_loopback_still_cross() -> None:
+    # The on-box carve-out: an identity provider on this host is not a network exposure.
+    await _oidc_service(token_host=LOOPBACK, jwks_host=LOOPBACK)
+
+
+async def test_the_oidc_legs_cross_on_a_crl_that_really_loaded(crl_bundle: str) -> None:
+    """The FINISHED context reaches both guards. ``[auth].oidc_tls_crl_file`` (#299) closes the gap
+    this gate refuses on, so each guard must read ``VERIFY_CRL_CHECK_LEAF`` off the opener's context
+    rather than refusing because a setting it cannot see was absent. Both hosts are off-box, so this
+    crosses on the CRL alone."""
+    service = await _oidc_service(oidc_tls_crl_file=crl_bundle)
+    ctx = opener_tls_context(service._oidc_opener, connector="test")
+    assert context_checks_revocation(ctx) is True  # the line above passed for the RIGHT reason
+
+
+async def test_the_oidc_legs_with_no_posture_are_unchanged() -> None:
+    """The shipped ``posture is None`` no-op every hop guard has. The lifespan passes None when the
+    instance declares no ``[ai]``, and every direct construction in the OIDC suite passes nothing."""
+    await _oidc_service(posture=None)
+
+
+@pytest.mark.parametrize(
+    ("token_host", "jwks_host", "refused_leg"),
+    [
+        pytest.param(LOOPBACK, REMOTE, "OIDC JWKS endpoint", id="off-box-jwks"),
+        pytest.param(REMOTE, LOOPBACK, "OIDC token endpoint", id="off-box-token"),
+    ],
+)
+async def test_each_oidc_leg_is_guarded_on_its_own_host(
+    token_host: str, jwks_host: str, refused_leg: str
+) -> None:
+    """THE INDEPENDENCE ARM. One leg on-box and the other off it: the off-box leg must still refuse.
+    A single guard keyed on the token host would let the ``off-box-jwks`` case cross, and one keyed on
+    the JWKS host would let ``off-box-token`` cross, so each case catches a different wrong shape.
+    Matching the leg's own cell is what makes it discriminating: a type-only assertion would pass if
+    the wrong leg had refused."""
+    with pytest.raises(InsecureHopRefused, match=refused_leg):
+        await _oidc_service(token_host=token_host, jwks_host=jwks_host)
+
+
+async def test_a_non_enforcing_oidc_instance_warns_on_both_legs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The WARN rung. A ``warn``-dialled instance crosses, and not silently -- and it warns ONCE PER
+    LEG, which is a second view of the independence above: two guards, two warnings.
+
+    The warning call is recorded on the module logger itself rather than through ``caplog``. Measured
+    2026-09-23: a ``caplog`` version passed alone and failed once under ``-n 8`` beside the rest of the
+    auth suite. The cause was not isolated; logger state left by another test in the same worker is
+    the likely one. Recording the call does not depend on any handler or level being in place."""
+    from messagefoundry.config import tls_policy
+
+    warned: list[str] = []
+    monkeypatch.setattr(
+        tls_policy.logger, "warning", lambda msg, *args: warned.append(msg % args if args else msg)
+    )
+    await _oidc_service(posture=STAGING_PHI)
+    assert any("OIDC token endpoint" in m and "revocation" in m for m in warned)
+    assert any("OIDC JWKS endpoint" in m and "revocation" in m for m in warned)
+
+
+async def test_the_blanket_env_does_not_cross_the_enforcing_oidc_legs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #299 clamp reaches these legs too. They have no per-hop revocation attestation at all, so
+    under an enforcing posture loopback or a real CRL are the only ways across."""
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        await _oidc_service()
+    # NEGATIVE CONTROL: on a non-enforcing posture the same env DOES cross, so the refusal above is
+    # the clamp firing rather than the env never being read.
+    await _oidc_service(posture=STAGING_PHI)
+
+
+async def test_the_oidc_refusal_names_a_lever_that_exists_for_it() -> None:
+    """SDS-3.7 applied to the refusal TEXT. The default remediation names ``[tls].crl_file`` and a
+    connection's ``tls_revocation_attested``, and neither reaches this opener: it resolves no trust
+    anchor, and there is no connection to carry the flag. The legs name their own CRL key instead."""
+    with pytest.raises(InsecureHopRefused) as exc:
+        await _oidc_service()
+    assert "[auth].oidc_tls_crl_file" in str(exc.value)
+    assert "tls_revocation_attested=true on this connection" not in str(exc.value)
