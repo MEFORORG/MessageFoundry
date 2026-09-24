@@ -146,6 +146,30 @@ All notable changes to MessageFoundry are documented here. The format follows
   owner refused at every passkey sign-in; a passkey-only user would stay refused until an admin
   runs `admin_reset_mfa`.** **Migration:** register an ES256 passkey on P-256 or an EdDSA
   passkey, or use TOTP. ([BACKLOG #1166](docs/BACKLOG.md))
+- **BREAKING: the Windows trust-anchor ACL check no longer reads what it cannot parse as
+  owner-only, and it knows more broad principals.** This is the ACL check on
+  `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and `[api].tls_client_ca_file`, run
+  at startup and on a config deploy that re-checks the anchors. 0.4.0 passed an anchor whose
+  `icacls` output was empty or was not `icacls` output. It also passed a write grant to a bare
+  name it did not know, such as the German `Jeder` for Everyone, and a line-1 write grant it could
+  not split from the echoed path. Those now read as indeterminate. The engine logs a warning,
+  writes a new `acl_indeterminate` row under the `auth.trust_anchor` audit action, and still
+  starts, under `enforce` as under `warn`. 0.4.0 wrote no row for an ACL it could not read.
+  Under the default `[security].enforcement = enforce`, the check now refuses a write or DELETE
+  grant to broad principals 0.4.0 missed. They include at least `NT AUTHORITY\INTERACTIVE`,
+  `SERVICE`, `BATCH`, `NETWORK`, `ANONYMOUS LOGON` and `Local account`, `Guests`, `Domain
+  Guests`, a bare `Users`, and an unresolved Domain Users or Domain Guests SID
+  (`S-1-5-21-...-513` or `-514`). A DELETE-only grant to any broad principal now refuses too. A
+  file created under `C:\Users\Public` inherits modify rights for `INTERACTIVE`, `SERVICE` and
+  `BATCH`, so such an anchor started under 0.4.0 and now refuses. At `warn` it starts with an
+  `acl_insecure` row. Two cases 0.4.0 refused now pass. Names match whole, so an account such as
+  `DESKTOP-A\usersync` no longer reads as `BUILTIN\Users`. A non-ASCII anchor path is now decoded
+  in the OEM code page and matched to its echo, so its own characters no longer read as a
+  principal. **Migration:** before you upgrade, run `icacls <anchor>` and look for write grants
+  to those principals. Copy an anchor out of `C:\Users\Public` into a folder that grants them no
+  write, rather than moving it: a move keeps the inherited grants. Or run `icacls <anchor> /reset`
+  after the move.
+  ([BACKLOG #1142](docs/BACKLOG.md))
 ### Changed
 - **BREAKING — the web console engine UI seam moved, so this engine no longer pairs with web
   console 0.3.0.** Engine 0.4.0 shipped `75c4117d21fd0b98`. The seam moved because the console now
