@@ -9,16 +9,36 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [0.4.0] — 2026-09-23 — Early Access
 
 This section lists every breaking change since 0.3.2, each marked BREAKING, and summarizes the
-non-breaking fixes rather than listing them all; the git history is the full record.
+non-breaking fixes rather than listing them all; the git history is the full record. A `BACKLOG #N`
+number cites the project's private planning ledger, so it has no public page.
 
 ### Added
+- **`messagefoundry audit-anchor`, and `audit-verify --expected-anchor` / `--expected-anchor-file` to
+  check one back.** The audit hash chain links each row to its predecessor, so deleting the *newest*
+  rows leaves a shorter chain that still walks cleanly — `audit-verify` on its own reports OK after a
+  tail-truncation, which is the shape an attacker hiding what they just did leaves behind. The store
+  could always compare against an external anchor; nothing exposed it, so the capability was
+  unreachable. `audit-anchor` prints `COUNT:HEAD` (a row count plus a digest — no PHI, no secret, safe
+  to hold in a ticket or an object store); passing it back reports `truncated or rewritten` when the
+  live chain differs.
+  **Know what it is before you build a job on it: an EXACT point-in-time seal**, comparing the count
+  *and* the head hash. The head half is not redundant — an attacker who cuts the newest rows and forges
+  the same number of replacements restores the count and leaves a chain that walks cleanly, so the head
+  is the only thing that differs. The cost of that detection is that a chain which merely **grew** also
+  reports `truncated or rewritten`. So it seals a chain **at rest across a gap in custody**: quiesce the
+  engine, anchor, hold the value off-box, re-verify while the chain is still quiesced — around a
+  maintenance window, a database move, a backup/restore, a hand-off. Anchoring and immediately
+  re-verifying compares a value to itself; re-checking a held anchor against a **running** engine alarms
+  on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
+  the control. `[integrity].audit_verify_on_start` on its own is still a bare walk and stays blind to a
+  truncated tail; `[integrity].audit_anchor_file`, also in Added, gives it an anchor.
+  (BACKLOG #328)
 - **`[integrity].audit_anchor_file` — the startup audit check can now hold an anchor, so it can see a
-  truncated tail.** `audit-anchor` / `audit-verify --expected-anchor`, also new in this release (under
-  Changed below), landed first and recorded, accurately at the time, that
-  `[integrity].audit_verify_on_start` "is unchanged — it is a bare walk and stays blind to a truncated
-  tail". **With this key and `audit_verify_on_start = true` both set, that sentence no longer describes
-  the engine.** Point the new key at the `COUNT:HEAD` file `messagefoundry audit-anchor` writes, and
-  every startup that runs the check compares against it. The key alone arms nothing: with
+  truncated tail.** `audit-anchor` / `audit-verify --expected-anchor`, also in Added, landed first.
+  It left `[integrity].audit_verify_on_start` a bare walk, blind to a truncated tail. **With this key
+  and `audit_verify_on_start = true` both set, that is no longer true.** Point the new key at the
+  `COUNT:HEAD` file `messagefoundry audit-anchor` writes, and every startup that runs the check
+  compares against it. The key alone arms nothing: with
   `audit_verify_on_start` left at its default of `false`, startup logs a WARNING that the anchor is
   never read. Leave the key empty (the default) and the walk is byte-identical to before.
   **It consumes the anchor as a PREFIX, not as the CLI's exact seal, and that is the whole reason a
@@ -37,7 +57,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   reported *before* the anchor comparison runs, so a break should be read as *at least* a break.
   **Scope.** It fires at startup and only at startup, so it detects a cut made since the last boot and
   says nothing about the window between two boots. For continuous coverage the off-box log forward /
-  tee remains the control. ([BACKLOG #328](docs/BACKLOG.md))
+  tee remains the control. (BACKLOG #328)
 - **A startup preflight that reads the store principal's *effective* privileges, so the least-privilege
   grant the runbooks prescribe stops being a claim the engine cannot check.**
   [`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) told operators exactly which grant the engine's
@@ -65,7 +85,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   SQLite reports `not_applicable` and says why: a local file has no server principal, and the control
   there is the filesystem ACL. The PostgreSQL least-privilege grant is now documented
   ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.2), which it previously was not.
-  ([BACKLOG #1008](docs/BACKLOG.md))
+  (BACKLOG #1008)
 - **Three new alert events: `approval_stale_requester`, `ad_session_revoked` and
   `ad_reconcile_aborted`.** The first fires when a dual-control release is refused because the
   requester no longer holds the authority it needs (under Security below). The other two come from
@@ -74,7 +94,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   matching audit row: `approval.stale_requester`, `auth.ad_session_revoked` and
   `auth.ad_reconcile_aborted`. A pass that stops because the whole directory is unreachable raises
   no alert, and neither does a pass that fails part-way. An `[[alerts.rules]]` `event_type` can now
-  name all three, and `any` matches them too. ([BACKLOG #289](docs/BACKLOG.md))
+  name all three, and `any` matches them too. (BACKLOG #289)
 
 ### Removed
 - **BREAKING: `[security].handles_real_patient_data` is gone, and with it the whole data-class axis.**
@@ -111,7 +131,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   **Migration:** delete the key from `messagefoundry.toml`. Move each flat query to `params=`, so
   `fhir_lookup("epic", "Patient?identifier=MRN|" + mrn)` becomes
   `fhir_lookup("epic", "Patient", params={"identifier": FhirToken("MRN", mrn)})`.
-  ([BACKLOG #1243](docs/BACKLOG.md), [ADR 0043](docs/adr/0043-fhir-read-lookup.md))
+  (BACKLOG #1243, [ADR 0043](docs/adr/0043-fhir-read-lookup.md))
 - **BREAKING — the Active Directory password sign-in (LDAP simple bind) is gone.** `POST
   /auth/login` with the `ad` provider now answers `401` and writes an audit row with the reason
   `pathway_retired`. `GET /auth/providers` reports `ad: false`, and the web console no longer offers
@@ -126,7 +146,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   `ws_password_type="text"` over TLS; the partner must accept PasswordText. (BACKLOG #1171)
 - **BREAKING — `messagefoundry.apiclient` drops the `audit_summary` keyword from `list_messages` and
   `list_dead_letters`.** No route ever read it. A call that passes it raises `TypeError`.
-  **Migration:** drop the keyword. ([BACKLOG #1645](docs/BACKLOG.md))
+  **Migration:** drop the keyword. (BACKLOG #1645)
 
 ### Changed
 - **Setting `[integrity].fail_closed_on_drift` on an editable install now says so at startup, and two
@@ -163,10 +183,10 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   **Who this bites:** every AD account row that 0.3.2 created has no stored id. Its first 0.4.0
   sign-in through a directory that returns `objectGUID` is therefore refused as
   `directory_identity_conflict`. **Migration:** an administrator deletes each such MessageFoundry
-  user row (`DELETE /users/{user_id}`; on a store created by 0.3.2 this first needs the saved-search
-  fix under the second Changed heading), and the person's next directory sign-in creates a new row
-  bound to the id. Uploaded files, saved search presets and a per-user channel scope keyed to the old
-  row do not carry over. ([BACKLOG #1471](docs/BACKLOG.md))
+  user row (`DELETE /users/{user_id}`; on a store created by 0.3.2, first apply the migration in the
+  BREAKING saved-search entry below, which runs before the first 0.4.0 start), and the person's next
+  directory sign-in creates a new row bound to the id. Uploaded files, saved search presets and a
+  per-user channel scope keyed to the old row do not carry over. (BACKLOG #1471)
 - **The directory session reconciler is keyed on that same immutable id, and the stored username is
   now a cache the directory refreshes.** Identifying a login by `objectGUID` while
   `reconcile_directory_sessions` went on probing `resolve_principal(<the stored name>)` left a renamed
@@ -185,7 +205,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   probes by name, unchanged. **`set_user_username` is engine-internal and reachable from no API route,
   deliberately** -- an operator able to set it could point a row at a directory account it is not bound
   to, which is the privilege transfer #1471 closes; there is still no setter for
-  `directory_object_id`. ([BACKLOG #1532](docs/BACKLOG.md))
+  `directory_object_id`. (BACKLOG #1532)
 - **BREAKING — web console engine UI seam: this release ships `75c4117d21fd0b98`.** 0.3.2 shipped the integer seam
   `14`. The seam is now a digest of the surface the console uses (BACKLOG #1220), and it moved several
   times in this release. One move, `93ba1f10b9dccfc8` -> `b93f38d097f97a45`, came when `SecurityPosture`
@@ -199,26 +219,6 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   records the current batch, and on PostgreSQL `CREATE TABLE IF NOT EXISTS` against an existing table
   is still refused for a role holding only `USAGE` (the schema ACL is checked before the existence
   skip, measured on 16.14). Bootstrap once with a DDL-capable principal, then hand over.
-- **`messagefoundry audit-anchor`, and `audit-verify --expected-anchor` / `--expected-anchor-file` to
-  check one back.** The audit hash chain links each row to its predecessor, so deleting the *newest*
-  rows leaves a shorter chain that still walks cleanly — `audit-verify` on its own reports OK after a
-  tail-truncation, which is the shape an attacker hiding what they just did leaves behind. The store
-  could always compare against an external anchor; nothing exposed it, so the capability was
-  unreachable. `audit-anchor` prints `COUNT:HEAD` (a row count plus a digest — no PHI, no secret, safe
-  to hold in a ticket or an object store); passing it back reports `truncated or rewritten` when the
-  live chain differs.
-  **Know what it is before you build a job on it: an EXACT point-in-time seal**, comparing the count
-  *and* the head hash. The head half is not redundant — an attacker who cuts the newest rows and forges
-  the same number of replacements restores the count and leaves a chain that walks cleanly, so the head
-  is the only thing that differs. The cost of that detection is that a chain which merely **grew** also
-  reports `truncated or rewritten`. So it seals a chain **at rest across a gap in custody**: quiesce the
-  engine, anchor, hold the value off-box, re-verify while the chain is still quiesced — around a
-  maintenance window, a database move, a backup/restore, a hand-off. Anchoring and immediately
-  re-verifying compares a value to itself; re-checking a held anchor against a **running** engine alarms
-  on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
-  the control. `[integrity].audit_verify_on_start` on its own is still a bare walk and stays blind to a
-  truncated tail; `[integrity].audit_anchor_file` (under Added above) gives it an anchor.
-  ([BACKLOG #328](docs/BACKLOG.md))
 - **The advisory `raise-fstring` lint in `messagefoundry check` now reads three more spellings of the
   same risk.** It matched only an f-string, so `raise ValueError("bad " + x)`, the `%` form and
   `.format(...)` carried an interpolated message past it — the identical free-text PHI payload, in the
@@ -229,9 +229,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   line, never the message text. The check keeps the name `raise-fstring`. It stays a nudge rather
   than a boundary: it reads only the first positional argument of the `raise`, so a message assigned
   to a local first, passed as a keyword or a later positional, or wrapped in a call is still
-  unflagged. ([BACKLOG #1676](docs/BACKLOG.md))
-
-### Changed
+  unflagged. (BACKLOG #1676)
 - **BREAKING — an API request body with an unknown or misspelled key is now refused with HTTP 422
   instead of being accepted and silently dropped.** Pydantic's default is `extra="ignore"`, and in
   0.3.2 no model in `messagefoundry/api/models.py` or `messagefoundry/api/auth_models.py`
@@ -249,8 +247,9 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   field. Five shapes (`AdGroupMap`, `AdGroupMapEntry`, `AdGroupScopeEntry`, `AdGroupScopeMap`,
   `ChannelScope`) travel in both directions; they carry the request rule because a dropped key on the
   RBAC writes is a mis-grant, so adding a field to one of them needs the client bump in the same
-  release. ([BACKLOG #1109](docs/BACKLOG.md))
-
+  release. **Migration:** send only the keys each route defines. The `422` lists every refused key
+  as its own `detail` entry, of type `extra_forbidden`. The key sits in `loc`, as in
+  `["body", "limt"]`. Fix its spelling or drop it. (BACKLOG #1109)
 - **BREAKING — a `fhir_lookup` search value now states its KIND, and a plain string carrying one of
   FHIR's value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer
   control: it stops one value becoming two search parameters, and it cannot help at the FHIR value
@@ -276,7 +275,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   the escape, so a server that implements the unescape reads a bare `\` as an introducer. Widening a
   refusal is a behaviour change that should be ruled, so it is recorded on
   `messagefoundry/fhirsearch.py` rather than folded in here.
-  ([BACKLOG #1243](docs/BACKLOG.md), [ADR 0043](docs/adr/0043-fhir-read-lookup.md))
+  (BACKLOG #1243, [ADR 0043](docs/adr/0043-fhir-read-lookup.md))
 - **The authorization-grant audit trail now defaults ON, so a deployment records every authorization
   grant rather than only the state-changing ones.** `[security].audit_all_authorization_decisions` and
   the internal `[diagnostics].audit_all_authz` it desugars to both default `true`. Until now only a
@@ -300,7 +299,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   Set `[security].audit_all_authorization_decisions = false` to restore the previous
   narrow trail; that is now reported as a loosening at `serve` and on `GET /security/posture`. PHI-view
   grants stay excluded at either value, because the PHI-access audit path already records them.
-  ([BACKLOG #1277](docs/BACKLOG.md), [ADR 0118](docs/adr/0118-secure-by-default-security-configuration-section.md) §5 amended)
+  (BACKLOG #1277, [ADR 0118](docs/adr/0118-secure-by-default-security-configuration-section.md) §5 amended)
 - **BREAKING — a PHI instance reached through a declared reverse proxy with `[security].require_mfa`
   explicitly off would refuse to start on first deployment, where it previously would not have.** The
   MFA-at-exposure gate derived "is this instance exposed?" from `[api].serve_ui`, a field the ADR 0143
@@ -322,7 +321,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   is byte-identical. An **undeclared** proxy (`web_console_public_address` set, no
   `tls_terminated_upstream`) deliberately still does not refuse — exposure there would be an inference —
   but it no longer passes in silence: a new warning names single-factor admin directly on a PHI instance
-  with `require_mfa` off. ([BACKLOG #326](docs/BACKLOG.md), [ADR 0140](docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment)
+  with `require_mfa` off. (BACKLOG #326, [ADR 0140](docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment)
 - **BREAKING — an `[[alerts.rules]]` block that routes to an unconfigured transport now refuses at
   startup instead of being silently ignored.** `notifier_from_settings` returned early when **no**
   transport was configured, *before* the loop that cross-checks each rule's `transports` against the
@@ -409,25 +408,25 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   the sender wrote is refused: a value with no time field keeps its 0.3.2 result, and a timestamp that
   carries its own offset is unaffected.
   **Migration:** pass `on_dst_edge="earlier"` to keep the 0.3.2 result exactly, or `"later"` for the
-  other offset. Better, have the sender include its offset. ([BACKLOG #1686](docs/BACKLOG.md))
+  other offset. Better, have the sender include its offset. (BACKLOG #1686)
 - **BREAKING — `gzip_decompress`, `deflate_decompress` and `zip_decompress` now require
   `max_output_bytes`.** In 0.3.2 it defaulted to `None`, which meant no ceiling, so a Handler that
   forgot it could be handed a decompression bomb. It is now keyword-only with no default, so a 0.3.2
   call such as `gzip_decompress(data)` raises `TypeError` and the message fails. **Migration:** pass
   a byte ceiling, for example `gzip_decompress(data, max_output_bytes=64 * 1024 * 1024)`, or pass
   `max_output_bytes=None` to keep the 0.3.2 behaviour on input you have already bounded.
-  ([BACKLOG #1237](docs/BACKLOG.md))
+  (BACKLOG #1237)
 - **BREAKING — three smaller changes to the helpers a Router or Handler calls.** Each one makes a
   0.3.2 call raise, so the message goes to `ERROR` instead of being processed.
   - An HL7 field path with an index below 1, such as `PID-5.0` or `PID-0`, now raises
     `HL7PeekError`. In 0.3.2 index 0 wrapped to the *last* item, so a read returned a value nobody
     asked for and a write overwrote the last component or the segment id. **Migration:** use
-    1-based indexes. ([BACKLOG #1089](docs/BACKLOG.md))
+    1-based indexes. (BACKLOG #1089)
   - `XmlMessage.find`, `get`, `get_all`, `exists`, `set` and `set_attribute` now take their
     expression, value and attribute name positionally only, because the keyword slots now carry
     `$variable` bindings for safe XPath. A 0.3.2 call such as `msg.get(expression="//x")` raises
     `TypeError`. **Migration:** pass those arguments by position, and bind message data as a
-    `$variable` rather than formatting it into the expression. ([BACKLOG #1049](docs/BACKLOG.md))
+    `$variable` rather than formatting it into the expression. (BACKLOG #1049)
   - `messagefoundry.parsing.validate()` no longer takes `profile=`. It was accepted and never read.
     **Migration:** drop the argument.
 - **BREAKING — a Handler that returns anything but `Send`, `SetState`, `SetMeta`, an iterable of
@@ -438,14 +437,14 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   one bad item delivers nothing. A `None` *inside* a list counts as a bad item. The reverse also
   changed: a tuple or generator of `Send`s used to deliver nothing and now delivers. **Migration:**
   return only those types, and filter `None` out of a list you build conditionally (for example
-  `[s for s in (a, b) if s is not None]`). ([BACKLOG #1687](docs/BACKLOG.md))
+  `[s for s in (a, b) if s is not None]`). (BACKLOG #1687)
 - **BREAKING — a network intake now checks a non-HL7 body against the connection's declared content
   type.** In 0.3.2 only the File and remote-file sources checked it. Now a body on any listener or
   poller that contradicts its declared type is stored as `ERROR` and never routed: `json` or `fhir`
   must start with `{` or `[`, `xml` with `<`, `x12` with `ISA`, and `dicom` needs `DICM` at byte
   128. `text`, `binary` and `hl7v2` are not checked. An HTTP sender still gets `202`, but with no
   `message_id`. **Migration:** declare the content type the feed really sends, or `text` / `binary`.
-  ([BACKLOG #1109](docs/BACKLOG.md))
+  (BACKLOG #1109)
 - **BREAKING — an `Http()` inbound bound off loopback now needs a peer control, or it refuses to
   start.** 0.3.2 checked only that an exposed HTTP listener used TLS, so an off-loopback intake with
   TLS and no caller identity passed. Under `[security].enforcement = enforce`, the default, the
@@ -461,7 +460,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   address, so 32 becomes the whole listener's capacity. A large frame on a slow link (below about
   2.2 Mbit/s for the 16 MiB frame cap) never completes, and the sender resends it. **Migration:**
   set `MLLP(max_connections_per_host=None)` behind NAT, and raise `max_frame_seconds` whenever you
-  raise `max_frame_bytes` or serve a slow link. ([BACKLOG #1725](docs/BACKLOG.md))
+  raise `max_frame_bytes` or serve a slow link. (BACKLOG #1725)
 - **BREAKING — `DatabasePoll` now reads at most 500 rows per poll (`poll_max_rows`).** In 0.3.2 a poll
   fetched every row. Rows past the 500th wait for the next poll, which picks them up only if
   `mark_statement` takes each handled row out of `poll_statement`'s result. With no
@@ -469,18 +468,18 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   rest are never read. A mark keyed on a column that is not unique to one row can mark unread rows
   as done. The File, FTP and SFTP pollers' new `poll_max_files` (500) only delays unread files.
   **Migration:** key the mark on one row, or set `poll_max_rows=None` to fetch every row as before.
-  ([BACKLOG #1114](docs/BACKLOG.md))
+  (BACKLOG #1114)
 - **BREAKING — at startup, the backlog of an inbound connection that is no longer configured is
   dead-lettered.** In 0.3.2 its ingress, routed and response rows stayed pending, and resumed if the
   connection came back. Now each is marked dead ("inbound removed from registry"), the message
   becomes `ERROR`, and dead-letter retention applies. **Migration:** before removing or renaming a
   busy inbound, let it drain. After a restart, replay the dead-lettered messages once the inbound is
-  back. ([BACKLOG #1612](docs/BACKLOG.md))
+  back. (BACKLOG #1612)
 - **BREAKING — `zip_decompress` refuses more archives.** An archive with two members of the same
   name, an unsafe member name, or a member whose content contradicts its file extension (`.hl7`,
   `.json`, `.xml`, `.pdf` and others) now raises `CompressionError`. In 0.3.2 the last duplicate
   won and any member was accepted. **Migration:** fix the archive at its source.
-  ([BACKLOG #1128](docs/BACKLOG.md), [#1581](docs/BACKLOG.md))
+  (BACKLOG #1128, #1581)
 - **BREAKING — an HTTP-family reply over 16 MiB now fails.** 0.3.2 read a partner's response with no
   size limit. A REST, SOAP, FHIR or DICOMweb delivery whose reply is larger than 16 MiB now raises
   `ResponseTooLargeError`, which is retried and then dead-lettered. A `fhir_lookup` reply over the cap
@@ -490,20 +489,20 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   configuration; the partner must send a smaller reply. (ASVS 15.2.2)
 - **BREAKING — `File(sort=)` accepts only `"name"` or `"mtime"`.** In 0.3.2 any other string, such as
   `"Name"` or `"size"`, silently gave name order. It now fails the connection at build.
-  **Migration:** `sort="name"`. ([BACKLOG #1655](docs/BACKLOG.md))
+  **Migration:** `sort="name"`. (BACKLOG #1655)
 - **BREAKING — an `env()` value that `connections.toml` reads with `cast = "bool"` now honours its
   spelling.** When the value arrives as text (a `MEFOR_VALUE_*` variable, or a quoted value in
   `environments/<env>.toml`), 0.3.2 cast it with Python's `bool()`, so `"false"`, `"0"`, `"no"` and
   `"off"` all became `true`, and only an empty string became `false`. Those four spellings now give
   `false`, and an empty or unrecognised value refuses at load. **Migration:** use one of `true`,
   `1`, `yes`, `on`, `false`, `0`, `no` or `off`, and check each such value still means what you
-  intended. ([BACKLOG #1651](docs/BACKLOG.md))
+  intended. (BACKLOG #1651)
 - **BREAKING — `serve` refuses a config directory that declares no connections.** In 0.3.2 a
   directory with no inbound and no outbound loaded, served an idle engine, and passed
   `messagefoundry check`. `serve` now refuses it, with no opt-out, and `check` fails on it unless
   given the new `--allow-empty-config`. **Migration:** declare at least one connection before
   `serve`; pass `--allow-empty-config` to a `check` run over an intentionally empty directory.
-  ([BACKLOG #1648](docs/BACKLOG.md))
+  (BACKLOG #1648)
 - **BREAKING — the engine API always serves HTTPS, and mints a self-signed certificate on first run
   when none is configured.** 0.3.2 served plain `http://127.0.0.1:8765` unless `[api].tls_cert_file`
   was set. 0.4.0 serves `https://` on the same address. With no certificate configured, it writes
@@ -519,7 +518,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   trust `api-generated-cert.pem` (for example `curl --cacert`, or `EngineClient(url, cacert=...)`),
   or set `[api].tls_cert_file` and `[api].tls_key_file` to a certificate your clients already trust.
   ([ADR 0172](docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md),
-  [BACKLOG #1276](docs/BACKLOG.md), [#1179](docs/BACKLOG.md))
+  BACKLOG #1276, #1179)
 - **BREAKING — search criteria that can carry patient data left the query string, and the old form
   now returns more, not less.** `GET /messages/search`, `GET /messages/export` and
   `GET /uploads/{file_id}/messages` no longer declare `content` or `field_value`, and an undeclared
@@ -527,51 +526,51 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   with `field_path` and `field_value` matches every message that merely has that field (and export
   streams them), and the uploads browse lists the whole file unfiltered. **Migration:** send the
   criteria in the JSON body of `POST /messages/search`, `POST /messages/export` or
-  `POST /uploads/{file_id}/messages/search`. ([BACKLOG #1184](docs/BACKLOG.md))
+  `POST /uploads/{file_id}/messages/search`. (BACKLOG #1184)
 - **BREAKING — list and search responses mask the message summary and metadata.** `GET /messages`,
   both message searches, `GET /dead-letters` and the layered search now return `summary` and
   `metadata` masked for display (for example `MRN ****0001`). Only `GET /messages/{id}` reveals them,
   which needs `messages:view_raw` and spends the PHI-read budget. No setting turns the mask off.
   **Migration:** fetch each message you need in full with `GET /messages/{id}`.
-  ([BACKLOG #1187](docs/BACKLOG.md))
+  (BACKLOG #1187)
 - **BREAKING — `GET /uploads` is paged and owner-scoped, and files uploaded under 0.3.2 are visible
   only to administrators.** It now returns at most `limit` files (default 50, up to 500) from
   `offset`, with `total` counting the whole visible set. A caller sees only its own uploads unless it
   holds `files:access_any` (Administrator). A 0.3.2 upload's metadata has no owner id, so it matches
   no ordinary user, and browsing, resending or deleting it answers `404` for them. **Migration:** page
   with `offset` until you reach `total`, and have an administrator handle files uploaded before the
-  upgrade. ([BACKLOG #1152](docs/BACKLOG.md))
+  upgrade. (BACKLOG #1152)
 - **BREAKING — a connection name that does not match `^[A-Za-z][A-Za-z0-9_-]{0,255}$` can no longer
   be named through the API.** Such a name still loads and runs, but every `/connections/{name}/...`
   route, the connection filters on message, dead-letter and event queries, resend targets and
   channel-scope grants now answer `422` for it. So `ADT.In`, `Lab Results` or `2ndLab` cannot be
   started, stopped, tested, purged or filtered on. **Migration:** rename such connections to fit the
-  pattern; stored history stays under the old name. ([BACKLOG #1108](docs/BACKLOG.md))
+  pattern; stored history stays under the old name. (BACKLOG #1108)
 - **BREAKING — three storage fields in the status response can now be `null`.**
   `DbInfo.disk_free_bytes`, `LogInfo.disk_free_bytes` and `LogInfo.size_bytes` were `int`. They are
   now `null` when the engine cannot measure them, which is always the case for `disk_free_bytes` on
   PostgreSQL and SQL Server, where 0.3.2 reported `0`. A 0.3.2 `messagefoundry.apiclient` fails to
   parse that response. **Migration:** treat the fields as optional, and upgrade API clients with the
-  engine. ([BACKLOG #1563](docs/BACKLOG.md))
+  engine. (BACKLOG #1563)
 - **BREAKING — a request that has not started its response after 120 seconds now answers `503`.**
   0.3.2 had no request deadline. A long integrity check, deep search or export on a large store can
   now hit it, and no setting raises it. **Migration:** narrow the request, for example with a smaller
-  `limit` or `scan_limit`. ([BACKLOG #1044](docs/BACKLOG.md))
+  `limit` or `scan_limit`. (BACKLOG #1044)
 - **BREAKING — in `messagefoundry.apiclient`, a JSON dump of a result withholds its patient-data
   fields.** Message, dead-letter, event and response models the client parses now emit `null` for
   `summary`, `error` and `metadata` under `model_dump_json()` or `model_dump(mode="json")`. Reading
   the attributes still works. **Migration:** read the attributes, or use a Python-mode
-  `model_dump()`. ([BACKLOG #1045](docs/BACKLOG.md))
+  `model_dump()`. (BACKLOG #1045)
 - **BREAKING — a dual-control approval still pending from 0.3.2 cannot be approved.** Its row has no
   requester id, so approving it answers `409`. **Migration:** settle pending approvals before the
-  upgrade, or reject and request them again after. ([BACKLOG #1540](docs/BACKLOG.md))
+  upgrade, or reject and request them again after. (BACKLOG #1540)
 - **BREAKING — on a store created by 0.3.2, saved searches and user deletion fail.** The
   `search_presets.owner` column was renamed `owner_user_id`, and the store upgrade does not rename it,
   so every preset call and `DELETE /users/{user_id}` fails with `no such column: owner_user_id`.
   Measured on SQLite: a store created by 0.3.2 fails both calls under 0.4.0, and a store 0.4.0
   created passes both. 0.3.2 also keyed presets on the username, where 0.4.0 keys them on the user id.
   **Migration:** until the upgrade handles it, drop the `search_presets` table before the first 0.4.0
-  start; 0.4.0 creates it again, empty. Saved presets are lost. ([BACKLOG #1232](docs/BACKLOG.md))
+  start; 0.4.0 creates it again, empty. Saved presets are lost. (BACKLOG #1232)
 - **BREAKING — the default retry limit is now 100 attempts, not unlimited.**
   `[delivery].retry_max_attempts` and `RetryPolicy.max_attempts` defaulted to `None` (retry forever)
   in 0.3.2. At 100, with the default backoff, a destination that stays down for about 7 hours 50 minutes
@@ -579,59 +578,57 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   replayable. A global or environment value of `0` now refuses at load. **Migration:** set
   `retry_max_attempts = "forever"` (or `MEFOR_DELIVERY_RETRY_MAX_ATTEMPTS=forever`,
   `max_attempts = "forever"` in `[outbound.retry]`, or `RetryPolicy(max_attempts=None)` in code) to
-  keep 0.3.2's behaviour, and replace `0` with `1`. ([BACKLOG #1051](docs/BACKLOG.md))
+  keep 0.3.2's behaviour, and replace `0` with `1`. (BACKLOG #1051)
 - **BREAKING — if the application log cannot be written, the engine now stops its connections.** In
   0.3.2 a failed log write was reported to stderr and processing went on. Under the new default,
   `[logging].on_write_failure = "stop"`, the engine first rolls the log aside; if the replacement is
   unwritable too, it stops every connection the process owns, and delivery stays halted until the log
   is writable and the lanes are restarted. **Migration:** set `[logging].on_write_failure =
   "continue"` to keep running without a log record, which is reported as a loosening.
-  ([BACKLOG #122](docs/BACKLOG.md))
+  (BACKLOG #122)
 - **BREAKING — an expired store encryption key now stops the engine from starting.** In 0.3.2 an
   overdue store key only raised an alert. Under `enforce`, an encrypted store whose key is older than
   `store_key_max_age_days` plus `enforce_grace_days` (365 + 30 by default), or whose age cannot be
   determined, now refuses to start. Age runs from `[secret_rotation].store_key_last_rotated` if set,
   otherwise from the date the engine first saw that key. **Migration:** run `messagefoundry
   rotate-key`, correct `store_key_last_rotated`, or set `[secret_rotation].enforce_store_key_expiry =
-  false`, which is reported as a loosening. ([BACKLOG #1004](docs/BACKLOG.md))
+  false`, which is reported as a loosening. (BACKLOG #1004)
 - **BREAKING — message bodies are purged after 30 days on every instance that sets no retention
   window.** 0.3.2 kept bodies forever on an instance it did not treat as carrying patient data.
   Every instance does now, so each unset window among `[security].delete_message_bodies_after_days`,
   `[retention].dead_letter_days` and `[retention].reference_snapshot_days` defaults to 30 days, and
   the purge runs. `dead_letter_days` now also purges a dead row at the ingress and routed stages. An
   explicit `0` refuses to start under `enforce`. **Migration:** set each window explicitly, or set
-  `[security].allow_keeping_phi_indefinitely = true` to keep bodies. ([BACKLOG #1279](docs/BACKLOG.md),
-  [#1188](docs/BACKLOG.md))
+  `[security].allow_keeping_phi_indefinitely = true` to keep bodies. (BACKLOG #1279, #1188)
 - **BREAKING — behind a declared TLS-terminating proxy under `enforce`, startup now measures the
   proxy.** With `[api].tls_terminated_upstream` on, `serve` refuses to start without
   `[security].web_console_public_address`. It then connects to that address at startup and refuses
   unless the proxy is reachable, refuses TLS 1.0 and 1.1, and negotiates TLS 1.3. An IP-literal
   address is refused. **Migration:** set the address to the DNS origin browsers use, enable TLS 1.3 on
-  the proxy, and start the proxy before the engine. ([BACKLOG #1026](docs/BACKLOG.md))
+  the proxy, and start the proxy before the engine. (BACKLOG #1026)
 - **BREAKING — on Windows, the config directory's owner is now checked.** 0.3.2 trusted the owner
   unconditionally. The owner must now be the service's run-as account, a well-known administrator
   identity, or a direct member of the local Administrators group, and an owner whose membership
   cannot be resolved is refused. A directory owned by an operator who is an administrator only
   through a domain group no longer loads. **Migration:** `icacls <config dir> /setowner
   "*S-1-5-32-544" /T /C`, or re-run the service installer with `-LockConfigDir`.
-  ([BACKLOG #1647](docs/BACKLOG.md))
+  (BACKLOG #1647)
 - **BREAKING — `connections.toml` `[settings]` values must match their parameter's type.** A quoted
   number or boolean such as `port = "2575"` or `persistent = "yes"` loaded in 0.3.2 and is now
   refused, naming the connection and setting. So is an `env()` default of the wrong type, such as
   `{ env = "port", cast = "int", default = "16" }`. **Migration:** write numbers and booleans
-  unquoted. ([BACKLOG #1650](docs/BACKLOG.md))
+  unquoted. (BACKLOG #1650)
 - **BREAKING — two settings that 0.3.2 silently ignored now take effect.** `validate_directory =
   true` on a File or remote-file *outbound* now refuses to start the lane when the directory is
   missing, and nothing creates it; 0.3.2 created it on first write. `MEFOR_SANDBOX_MODE` is now read,
   so `subprocess` there runs Routers and Handlers in the sandbox, with its time and memory caps.
   **Migration:** create the directory first, or drop the setting; unset the variable if you did not
-  mean it. ([BACKLOG #114](docs/BACKLOG.md), [#1365](docs/BACKLOG.md))
+  mean it. (BACKLOG #114, #1365)
 - **BREAKING — more settings are range-checked at load.** `[ai].provider` must be `"claude"`, the only
   provider the engine can serve. `[cluster]` timings now refuse a leader fence and lease TTL pair that
   leaves no detection margin (roughly, keep the TTL more than 2 seconds above the fence), whether or
   not clustering is on. `[store].db_schema` is refused on a backend other than PostgreSQL.
-  **Migration:** correct each value the error names. ([BACKLOG #95](docs/BACKLOG.md),
-  [#1497](docs/BACKLOG.md))
+  **Migration:** correct each value the error names. (BACKLOG #95, #1497)
 - **BREAKING — a rolling upgrade of a SQL Server cluster can elect two leaders, and a 0.3.2 node
   cannot verify a 0.4.0 backup.** The SQL Server lease key changed from
   `<db_schema, or dbo>:mefor_cluster_leader` to `mefor_cluster_leader`, so a 0.3.2 node and a
@@ -647,35 +644,34 @@ non-breaking fixes rather than listing them all; the git history is the full rec
 - **BREAKING — several CLI commands now fail where 0.3.2 reported success, or print differently.**
   - `messagefoundry check` exits 1 when fixtures exist but no dry-run ran, when a pinned `.expect`
     now reads `NOT_DEPLOYED`, and when a `messagefoundry.toml` is found but fails to load (0.3.2
-    skipped that leg). ([BACKLOG #1671](docs/BACKLOG.md), [#1318](docs/BACKLOG.md))
+    skipped that leg). (BACKLOG #1671, #1318)
   - `messagefoundry verify` fails, not skips, an unknown `--inbound` or a config with no inbound. It
     fails a missing SQLite store and a missing writable directory, which 0.3.2 created and then
-    passed. The `host.console` check is gone. ([BACKLOG #1708](docs/BACKLOG.md),
-    [#1713](docs/BACKLOG.md))
+    passed. The `host.console` check is gone. (BACKLOG #1708, #1713)
   - `messagefoundry backup`, and any caller of `open_store()`, no longer creates a missing SQLite
     store; `backup` exits 2 and `open_store` raises `StoreNotFoundError`. `serve` still creates it,
-    and code that provisions a store passes `create=True`. ([BACKLOG #1780](docs/BACKLOG.md))
+    and code that provisions a store passes `create=True`. (BACKLOG #1780)
   - `messagefoundry rotate-key` on a `vault_transit` store exits 2 instead of printing "re-encrypted
-    0 value(s)" and exiting 0. ([BACKLOG #1165](docs/BACKLOG.md))
+    0 value(s)" and exiting 0. (BACKLOG #1165)
   - Text-mode error lines now go to stderr, not stdout, for `alert`, `backup`, `codeset`,
     `connection`, `dryrun`, `graph`, `impact`, `import`, `init`, `lens`, `restore-verify` and
-    `security`. ([BACKLOG #1673](docs/BACKLOG.md))
+    `security`. (BACKLOG #1673)
   - `messagefoundry dryrun` prints the disposition `not_deployed` where 0.3.2 printed `filtered` for
-    a message whose only destinations are not deployed. ([BACKLOG #1690](docs/BACKLOG.md))
+    a message whose only destinations are not deployed. (BACKLOG #1690)
   - `messagefoundry --version` prints a second line, `package: <path>`.
-    ([BACKLOG #1677](docs/BACKLOG.md))
+    (BACKLOG #1677)
   **Migration:** read each new failure as the real result it is; capture stderr (`2>&1`) or use
   `--json`; run `serve` once before `backup` or `verify` on a new install.
 - **BREAKING — with `[integrity].fail_closed_on_drift = true`, an install the engine cannot attest
   now refuses to start.** In 0.3.2 an install with no `RECORD`, a stripped one, or code loaded from
   outside the install root was silently skipped even under fail-closed. It now raises
   `IntegrityError`. The default (`false`) is unchanged. **Migration:** install the non-editable wheel,
-  or leave `fail_closed_on_drift` off. ([BACKLOG #1679](docs/BACKLOG.md))
+  or leave `fail_closed_on_drift` off. (BACKLOG #1679)
 - **BREAKING — the forward proxy and the OAuth2 token host must now be on an egress allow-list.**
   A `proxy_url` other than `"default"` now needs its host in the new `[egress].allowed_proxy`, and an
   `oauth2_token_url` host must be in `[egress].allowed_http`; otherwise the graph refuses to load.
   **Migration:** add `[egress] allowed_proxy = ["proxy.example.org:3128"]` and the token host to
-  `allowed_http`. ([BACKLOG #1659](docs/BACKLOG.md))
+  `allowed_http`. (BACKLOG #1659)
 - **BREAKING — the MLLP listener's automatic ACK now stamps MSH-7 with a UTC offset.** 0.3.2 wrote
   local time as 14 digits (`YYYYMMDDHHMMSS`). The ACK now writes `YYYYMMDDHHMMSS±ZZZZ`, which HL7
   allows and which pins the instant across a daylight-saving change. **Migration:** none in
@@ -690,14 +686,14 @@ non-breaking fixes rather than listing them all; the git history is the full rec
 - **BREAKING — a few narrower refusals.** Each worked in 0.3.2:
   - `db_lookup` refuses a statement carrying a write keyword anywhere outside a literal, so a read
     with a `MERGE JOIN` hint, or an unquoted column named `merge`, is now refused. **Migration:**
-    drop the hint or quote the name. ([BACKLOG #1574](docs/BACKLOG.md))
+    drop the hint or quote the name. (BACKLOG #1574)
   - `anonymize_checked()` and the anonymizer tooling refuse a salt with too little entropy, not just
     a short one. **Migration:** use a random salt; a new salt changes every pseudonym.
   - Under a pinned `[tls]` trust anchor, every off-loopback HTTP-family hop now uses it: REST,
     SOAP, FHIR and DICOMweb deliveries, `fhir_lookup`, and the SMART and OAuth2 token requests. In
     0.3.2 none of them read the anchor, so a partner or token endpoint on a public CA outside it now
     fails. **Migration:** add that CA to the anchor, or leave `[tls].trust_anchor_mode` at `system`.
-    ([BACKLOG #1180](docs/BACKLOG.md), [#1660](docs/BACKLOG.md), [#1794](docs/BACKLOG.md))
+    (BACKLOG #1180, #1660, #1794)
   - The 8 KiB limits on an outbound URL and header value are now checked at send time as well as at
     build, and a header name over 256 characters is refused. A per-message header or token that
     grows past them now fails the delivery; a `fhir_lookup` URL that does fails the Handler's
@@ -707,12 +703,12 @@ non-breaking fixes rather than listing them all; the git history is the full rec
     hand.
   - DR activation on SQLite refuses a seed that restored nothing: a config-only seed, which 0.3.2
     activated, and a drill seeded from an empty primary. **Migration:** seed from a full backup of
-    a primary that holds data. ([BACKLOG #1717](docs/BACKLOG.md))
+    a primary that holds data. (BACKLOG #1717)
 - **BREAKING — the `[vault]` clients no longer follow HTTP redirects.** 0.3.2 let the Vault client
   follow a redirect, carrying its token to the new location. A Vault address that answers with a
   redirect, such as a standby node pointing at the active one, now fails. **Migration:** point the
   `[vault]` address at the active node or at a load balancer that forwards rather than redirects.
-  ([BACKLOG #1042](docs/BACKLOG.md))
+  (BACKLOG #1042)
 
 ### Security
 - **BREAKING — raising a session's authority now re-keys it: each of the five elevation steps
@@ -766,14 +762,14 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   account's email no longer stops them. `UserSummary` gains a read-only `notify_email`.
   **Migration:** when a directory account's address changes, also set it with `PATCH
   /users/{user_id}`, and read `notify_email`, not `email`, to see where notices go.
-  ([BACKLOG #1139](docs/BACKLOG.md), [ADR 0182](docs/adr/0182-split-the-account-mirror-address-from-the-engine-owned-notification-address.md))
+  (BACKLOG #1139, [ADR 0182](docs/adr/0182-split-the-account-mirror-address-from-the-engine-owned-notification-address.md))
 - **BREAKING — under `enforce`, the engine refuses to start unless an enabled Administrator has a
   notification address.** 0.3.2 checked only that an SMTP transport was configured, so notices about
   the most privileged accounts could go nowhere. With `[auth].notify_security_events` and
   `[alerts].security_notifications_required` on, both defaults, startup now fails if no enabled
   Administrator has a `notify_email`. **Migration:** before upgrading, give at least one enabled
   Administrator an email address (0.4.0 copies it into `notify_email` at upgrade), or set
-  `[alerts].security_notifications_required = false`. ([BACKLOG #1020](docs/BACKLOG.md))
+  `[alerts].security_notifications_required = false`. (BACKLOG #1020)
 - **BREAKING — three sensitive actions now need a re-authentication bound to that one action.**
   `DELETE /me/sessions` and `DELETE /me/sessions/{id}`, `POST /users/{user_id}/reset-password` and
   `POST /users/{user_id}/reset-mfa` were satisfied in 0.3.2 by any recent step-up. Each now needs a
@@ -781,7 +777,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   action. `reset-mfa` on the caller's own account now answers `400`. **Migration:** before each call,
   send `POST /me/reauth` with `purpose` set to that header's value (`session_terminate`,
   `admin_reset_password` or `admin_reset_mfa`), and adopt the new token it returns. Another
-  Administrator resets your own MFA. ([BACKLOG #1148](docs/BACKLOG.md), [#1149](docs/BACKLOG.md))
+  Administrator resets your own MFA. (BACKLOG #1148, #1149)
 - **BREAKING — revocation checking reaches more hops, and the blanket attestation no longer waives
   it under `enforce`.** In 0.3.2 the process-wide `MEFOR_TLS_REVOCATION_ATTESTED=1` let every verified
   outbound TLS hop through the revocation refusal. Under `enforce` it now does not, and no
@@ -792,7 +788,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   as well. **Migration:** set `[tls].crl_file` (a PEM with the CA and its CRL) for outbound hops,
   `[logging].forward_tls_crl_file` for the syslog forwarder, `[store].ssl_crl_file` for PostgreSQL,
   and `tls_crl_file=` on each mTLS listener; or run with `[security].enforcement = "warn"`.
-  ([BACKLOG #299](docs/BACKLOG.md), [#1005](docs/BACKLOG.md))
+  (BACKLOG #299, #1005)
 - **BREAKING — SMTP connections now verify the server certificate.** 0.3.2 called `starttls()` with
   no TLS context, which checks neither the certificate nor the host name. `Email()`, `SMTP()`,
   `Direct()` and the alert and security-notice mailer now verify both by default (`tls_verify`,
@@ -843,7 +839,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   verify and are strong enough. It follows the pairing RFC 9053 recommends, SHA-256 with P-256
   only, which is also how the WebAuthn specification describes ES256. A passkey already registered
   on another curve still signs in. **Migration:** register an ES256 passkey on P-256 or an EdDSA
-  passkey, or use TOTP. ([BACKLOG #1166](docs/BACKLOG.md))
+  passkey, or use TOTP. (BACKLOG #1166)
 - **BREAKING — directory sessions are now rechecked every 5 minutes by default.** In 0.3.2
   `[auth].ad_session_recheck_seconds` defaulted to `0`, so a signed-in AD user's session was never
   checked against the directory again. The default is now `300`: each pass looks the signed-in AD
@@ -854,17 +850,17 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   change to `PUT /ad-group-map` or `PUT /ad-group-scope-map` took effect at each AD user's next
   sign-in. Both now revoke every live directory session at once, as the other authorization setters
   already did. **Migration:** a script that edits a map as an AD user signs in again before its next
-  call. ([BACKLOG #1154](docs/BACKLOG.md))
+  call. (BACKLOG #1154)
 - **BREAKING — `DELETE /me/mfa` refuses to remove the last second factor while MFA is required.**
   0.3.2 allowed it. It now answers `400`. **Migration:** enrol another factor first, or have another
-  administrator reset it. ([BACKLOG #1022](docs/BACKLOG.md))
+  administrator reset it. (BACKLOG #1022)
 - **BREAKING — an unclaimed bootstrap administrator now expires under
   `[auth].initial_password_expiry_hours` too.** 0.3.2 exempted it from that clock and left it to
   `bootstrap_expiry_hours`, so `bootstrap_expiry_hours = 0` kept it alive indefinitely. It now also
   dies 72 hours after it was issued, by default. **Migration:** claim the bootstrap account before
   the upgrade, or set `[auth].initial_password_expiry_hours = 0`. (`messagefoundry provision-admin`
   helps only on a fresh store: it refuses once an enabled Administrator exists.)
-  ([BACKLOG #1245](docs/BACKLOG.md))
+  (BACKLOG #1245)
 - **BREAKING — the OIDC id_token is checked more strictly.** A token whose `typ` header is present
   and is not `JWT`, a token without `iat` or `sub`, and a token carrying an `events` claim are now
   refused. `[auth].oidc_flow_ttl_seconds` must be between 30 and 1800. **Migration:** correct the
@@ -878,7 +874,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   permission check first, so the refusal would also have shown which of those permissions the account
   holds, and it spent the account's admin-write budget before refusing. The gate now refuses, audits
   and orders its checks as it does on every other `/ui` route. Only where it sends the browser
-  differs. The JSON API was never affected. ([BACKLOG #1542](docs/BACKLOG.md))
+  differs. The JSON API was never affected. (BACKLOG #1542)
 - **The web console's message editor would have opened the raw body to a custom role holding
   `messages:edit` without `messages:view_raw`.** `GET /ui/messages/{id}/edit` and
   `POST /ui/messages/{id}/edit-resend` gated on `messages:edit` alone, while the JSON handler they
@@ -891,7 +887,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   displays the body it edits. **Who this would bite:** a deploying org whose admin had minted such a
   custom role; that role would have exceeded its stated scope (HIPAA minimum-necessary) on first
   deployment. No built-in role reaches it — `ADMINISTRATOR` and `OPERATOR` grant both permissions —
-  and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
+  and every such read was already audited. (BACKLOG #324)
 - **A dual-control release now re-checks the person who asked for it (ASVS 8.3.2).** A held
   request can wait hours for its second approver, and the requester's authority can be withdrawn in
   that time. `POST /approvals/{approval_id}/approve` now answers `409` when the requester's account
@@ -900,14 +896,14 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   refusal writes an `approval.stale_requester` audit row and raises the `approval_stale_requester`
   alert. The request stays pending, so an approver can reject it. The check reads the engine's own
   copy of the account, so a change made only in Active Directory counts once it reaches that copy.
-  ([BACKLOG #289](docs/BACKLOG.md))
+  (BACKLOG #289)
 - **Three more admin writes now count against the per-account write limit (ASVS 2.4.2).**
   `PATCH /logging/level`, `DELETE /search/presets/{preset_id}` and `POST /alerts/test-email` were
   not rate-limited. They now share the budget the other paced admin writes draw on: past 12
   writes a second from one account, each answers `429` with `Retry-After: 1`. A client that stays
   under the limit sees no change. `[auth].admin_write_rate_limit_per_actor` and
   `admin_write_rate_limit_window_seconds` set the limit, and `admin_write_rate_limit_enabled =
-  false` turns it off for every paced write. ([BACKLOG #287](docs/BACKLOG.md))
+  false` turns it off for every paced write. (BACKLOG #287)
 
 ### Fixed
 - **The load harness's no-loss reconcile failed a run for being SLOW, and ejected pull requests from
@@ -951,7 +947,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   sent 18`) is the exact-shortfall arm, which is untouched here, so its cause is a different one —
   either genuinely absent rows or a short `engine_read` sample, which is the question
   `harness/load/connscale/intake_audit.py` exists to settle per message.
-  ([BACKLOG #1866](docs/BACKLOG.md))
+  (BACKLOG #1866)
 - **BREAKING — `audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a
   clean chain of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit`
   only asked whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite
@@ -962,14 +958,19 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   scheduled compliance job reads the exit code, so a first deployment with one would have reported
   OK forever while the real audit log went unchecked. All three subcommands now probe the path over
   a **read-only** SQLite handle before the store opens — it can neither create the file nor migrate
-  it — and exit **2** when there is no `audit_log` table, naming which of absent, zero-byte or
-  not-a-database it found.
+  it — and exit **2** when there is no `audit_log` table. The message tells the cases apart: no file,
+  a database with no `audit_log` table, or a file that is not a database.
   **`audit-verify` also splits "verified nothing" out of its success code:** a clean walk over an
   empty log is now exit **3**, and `--allow-empty` (new) turns that back into 0, as does an expected
   anchor of `0:`, which asserts emptiness and is checked. Exit 1 stays a BROKEN CHAIN, so a job can
   no longer read an empty log as detected tamper. `audit-anchor` keeps exit 0 on a real store whose
   log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
-  only the non-audit-database paths. ([BACKLOG #1669](docs/BACKLOG.md))
+  only the non-audit-database paths.
+  **Migration:** on an empty log, a scheduled `audit-verify` job now gets exit 3 where 0.3.2 gave
+  it 0. If an empty log is expected, as on a new instance, pass `--allow-empty` or
+  `--expected-anchor 0:`. Anywhere else, treat 3 as a finding. `audit-verify` and `rekey-audit` now
+  exit 2 on a SQLite `--db` with no `audit_log` table, a zero-byte file included. A file that is not
+  a database also gets exit 2. Check that each job names the live store. (BACKLOG #1669)
 - **BREAKING — `verify --smoke self` reported PASS on a synthetic message the config would have
   dropped.**
   `smoke_self` failed only on `DryRunResult.error`, which `dry_run` sets for a parse failure, a
@@ -986,7 +987,7 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   row, and the failure text says to point `--inbound` at a connection that takes one. The happy-path
   test asserted `"deliveries=" in detail`, which `deliveries=0` also satisfies, so neither the defect
   nor the `FAIL` branch had a covering test; both do now.
-  ([BACKLOG #1707](docs/BACKLOG.md))
+  (BACKLOG #1707)
 - **The shipped VS Code snippet generated a FHIR lookup the engine now refuses.** The
   `meforfhirlookup` snippet built its search by concatenating a message field into a flat `?`-query —
   the form removed along with `[egress].fhir_require_structured_params` — so the snippet emitted a
@@ -1061,12 +1062,16 @@ non-breaking fixes rather than listing them all; the git history is the full rec
   matched: both `Path.exists` and `Path.glob` swallow `OSError`, so a directory the process cannot
   read is indistinguishable here from one that is absent, and a message guessing between them would
   send an operator after the wrong cause.
+  **Migration:** `--adr-dir` defaults to `docs/adr` under the current directory. The installed
+  package carries no ADRs, so run the command from the root of a source checkout, or pass
+  `--adr-dir`. Exit 2 is also argparse's usage-error code. To tell them apart, run with `--json`: a
+  missing corpus prints JSON with `error` set, and a usage error prints no JSON.
 - **A passkey that could never sign in is now refused when it is registered.** A credential whose
   curve was unknown, whose point was not on its curve, or whose key type did not match its algorithm
   used to enrol and then fail at every sign-in. Registration now builds the key the way sign-in
   does, and refuses it there. A malformed key at either step used to answer `500`; it now lands on
   the audited invalid-input path. A passkey that can sign in is not affected.
-  ([BACKLOG #1166](docs/BACKLOG.md))
+  (BACKLOG #1166)
 
 ## [0.3.2] — 2026-07-28 — Early Access
 
