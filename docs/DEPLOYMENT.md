@@ -201,7 +201,9 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
 
 1. **API** — set `[security].local_access_only = false` + `[security].listen_address`, then either
    `[api].tls_cert_file` + `[api].tls_key_file` (in-process TLS) *or* `[api].tls_terminated_upstream = true`
-   + `[api].trusted_proxies` (front it with a TLS terminator). Keep `[security].require_sign_in = true`
+   + `[api].trusted_proxies` + `[api].plaintext_upstream_hop_acknowledged = true` (front it with a TLS
+   terminator; unless you also set `[api].tls_cert_file`, the acknowledgement is required because the
+   proxy-to-engine hop is plaintext and yours to secure). Keep `[security].require_sign_in = true`
    (a non-loopback bind with sign-in disabled is refused, and no flag covers it). The legacy `[api].host`
    / `[auth].enabled` keys are **rejected at load** — they moved to `[security]` (ADR 0118).
 
@@ -539,12 +541,13 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
   `[security].require_sign_in = false`, which no flag covers. Override (dev only):
   `serve --allow-insecure-bind` — **clamped inert on an enforcing PHI instance**, i.e. on the shipped
   default.
-  **This is not the whole API gate.** Two further `return 2` refusals layer on top of that ladder, and
-  **neither is covered by `--allow-insecure-bind`**: an in-process-TLS off-loopback bind also needs
+  **This is not the whole API gate.** At least three further `return 2` refusals layer on top of that
+  ladder, and **none is covered by `--allow-insecure-bind`**: an in-process-TLS off-loopback bind also needs
   `MEFOR_TLS_REVOCATION_ATTESTED=1` ([ADR 0078](adr/0078-certificate-revocation-posture.md) — see
   [Revocation-guard behavior](#revocation-guard-behavior)), and a PHI instance behind a **declared**
   terminator also needs `[api].proxy_intra_service_auth` + `[api].proxy_tls_min_version` (off-loopback:
-  refuse; loopback-behind-proxy: warn).
+  refuse; loopback-behind-proxy: warn). A declared terminator with no `[api].tls_cert_file` also needs
+  `[api].plaintext_upstream_hop_acknowledged` in every mode, loopback or not (BACKLOG #1179).
 - **MLLP inbound** ([`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py),
   `check_mllp_tls_exposure`): a non-loopback MLLP source without `tls=true` raises a `WiringError` at
   wiring time (before the engine starts). Override (dev only): `serve --allow-insecure-bind`, under the
@@ -665,7 +668,8 @@ refuses regardless), and they are the realistic failure mode — a mislabelled b
 attestation:
 
 1. **Prove revocation in front — API gate only.** Terminate at a revocation-checking reverse proxy:
-   `[api].tls_terminated_upstream` + `[api].trusted_proxies`, after which the engine terminates no TLS
+   `[api].tls_terminated_upstream` + `[api].trusted_proxies` (+ `[api].plaintext_upstream_hop_acknowledged`,
+   see [CONFIGURATION.md](CONFIGURATION.md)), after which the engine terminates no TLS
    itself and the listener gate never fires. **There is no outbound equivalent you can configure.** The
    authority has a "declared revocation-checking egress terminator" input, but no call site ever sets it
    — routing your egress through such a proxy is good practice and does not change the engine's
