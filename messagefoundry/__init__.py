@@ -2,9 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """messagefoundry — an open-source integration engine for healthcare.
 
-The engine is an importable library. The PySide6 console (and any other client)
-drives it over a localhost HTTP + WebSocket API, so the same code path serves
-in-process, local-daemon, and remote deployments.
+The engine is an importable library. Clients such as the VS Code extension and the test
+harness drive it over a localhost HTTP + WebSocket API, and the engine serves the browser web
+console at ``/ui`` from its own app, so the same code path serves in-process, local-daemon,
+and remote deployments.
 
 Config modules define the message graph against this surface::
 
