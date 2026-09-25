@@ -736,8 +736,8 @@ def _enforce_admin_write_pacing(request: Request, auth: AuthService, identity: I
 
 def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus **step-up re-verification** (ASVS 7.5.3): the caller's session must
-    have re-proved its credential — at login or via ``POST /me/reauth`` — within
-    ``[auth].step_up_max_age_seconds``. Gates the highly sensitive admin / replay / config flows; a
+    have re-proved its credential -- at a local login that owes no factor, or via ``POST /me/reauth``
+    -- within ``[auth].step_up_max_age_seconds``. A directory login opens no window (BACKLOG #1144). Gates the highly sensitive admin / replay / config flows; a
     stale session is refused with 403 (the console then prompts to re-authenticate and retries). The
     embedding/no-auth path is unaffected (there is no session to step up)."""
     base = require(*permissions)

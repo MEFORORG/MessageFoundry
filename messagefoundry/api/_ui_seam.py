@@ -202,6 +202,11 @@ from typing import Any
 #: field refuses it (``RequestModel`` forbids unknown keys), so every save that changes the address
 #: would render "invalid input". An older engine must fail the handshake instead.
 #:
+#: BACKLOG #1144 step 5 (ASVS 6.8.4): ``AuthService.authenticate_kerberos`` dropped its
+#: ``seed_reauth`` keyword, because the engine now withholds the step-up window on every directory
+#: login itself. ``GET /ui/sso`` passed ``seed_reauth=False``, so a console that still passes it
+#: gets a ``TypeError`` on every SSO sign-in. A signature the console calls, so it forces a bump.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

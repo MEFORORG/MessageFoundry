@@ -124,11 +124,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   `[auth].require_action_step_up` is off: factor enrollment and session termination. The console's
   `GET /ui/sso` never opened the window, so one sign-in method had two postures. Now no directory
   sign-in opens it: Kerberos by either route, and the federated (OIDC) callback, which already did
-  not. **What a client now sees:** its first step-up-gated action returns `403` with
-  `X-Step-Up-Required: 1`.
-  It answers with `POST /me/reauth` and the account's directory password, which the engine checks
-  by a live bind. A TOTP or recovery code at `POST /auth/mfa-verify` also opens the window. Local
-  password sign-in is unchanged. `AuthService.authenticate_kerberos` and
+  not. **What a client now sees** depends on the second factor. A session that still owes one
+  meets `403` with `X-MFA-Required: 1` first, as before; the code it then sends to
+  `POST /auth/mfa-verify` opens the window, so nothing changes for it. The change shows on the
+  paths the window used to cover: with `require_mfa` off, and on factor enrollment and session
+  termination with `require_action_step_up` off. There the first step-up-gated action now returns
+  `403` with `X-Step-Up-Required: 1`. The client answers with `POST /me/reauth` and the account's
+  directory password, which the engine checks by a live bind. **A directory account with no
+  password it can bind with**, such as a smart-card-only account, cannot step up on either route.
+  ADR 0068 accepted that for `GET /ui/sso`, and it now holds for `POST /auth/negotiate` too.
+  Local password sign-in is unchanged. `AuthService.authenticate_kerberos` and
   `AuthService.authenticate_oidc` no longer take a `seed_reauth` argument, so no caller can open
   the window at sign-in. The web console seam moved with it. (`BACKLOG #1144`, step 5)
 - **BREAKING: a federated (OIDC) sign-in no longer links itself to an account. An administrator

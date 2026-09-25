@@ -23,6 +23,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _ast_sites import call_sites
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -69,12 +70,16 @@ class _FakeLdap:
         return _principal(username)
 
 
-async def _service(engine: Engine) -> AuthService:
-    """``require_mfa`` OFF, so the step-up gate is the ONLY thing between a session and ``GATED``.
+async def _service(
+    engine: Engine, *, require_mfa: bool = False, require_action_step_up: bool = True
+) -> AuthService:
+    """``require_mfa`` OFF by default, so the step-up gate is the ONLY thing between a session and
+    ``GATED``.
 
     With it on, an un-enrolled directory session is refused at the MFA gate first, and a test of the
     window would pass whatever the seeding did. Off, a directory account with no factor owes none,
-    so the login stamp is exactly what decides the gated call."""
+    so the login stamp is exactly what decides the gated call. The enrollment test turns it on,
+    because that route skips the MFA gate."""
     settings = AuthSettings(
         ad_enabled=True,
         kerberos_enabled=True,
@@ -83,7 +88,8 @@ async def _service(engine: Engine) -> AuthService:
         ad_bind_dn="CN=svc,DC=x",
         ad_bind_password="x",
         login_rate_limit_enabled=False,
-        require_mfa=False,
+        require_mfa=require_mfa,
+        require_action_step_up=require_action_step_up,
     )
     service = AuthService(engine.store, settings, ldap=_FakeLdap())  # type: ignore[arg-type]
     await service.initialize()
@@ -149,8 +155,9 @@ async def test_a_federated_shaped_login_is_born_without_a_window_even_when_mfa_v
     """RED when: ``_complete_ad_login`` lets ``mfa_verified`` decide the seeding again.
 
     The federated leg passes ``mfa_verified=True`` when the IdP asserted a factor, and
-    ``_issue_session``'s own fallback seeds from ``mfa_verified``. So this is the case a missing
-    constant would seed, and the Kerberos test above (always ``mfa_verified=False``) could not see."""
+    ``_issue_session`` used to fall back to seeding from ``mfa_verified``. So this is the case a
+    missing constant would seed, and the Kerberos test above (always ``mfa_verified=False``) could
+    not see."""
     service = await _service(engine)
     out = await service._complete_ad_login(_principal("fed"), None, mfa_verified=True, mech="oidc")
     assert out.ok and out.token is not None
@@ -162,12 +169,14 @@ async def test_a_federated_shaped_login_is_born_without_a_window_even_when_mfa_v
 
 
 def test_no_directory_entry_point_lets_a_caller_choose_the_seeding() -> None:
-    """RED when: ``seed_reauth`` comes back as a parameter on any directory entry point, or
-    ``_complete_ad_login`` stops passing the constant ``False``.
+    """RED when: ``seed_reauth`` comes back as a parameter on any directory entry point,
+    ``_complete_ad_login`` stops passing the constant ``False``, or ``_issue_session`` regains a
+    default for it.
 
     A parameter is how the two Kerberos routes came to disagree, so its absence IS the single
-    posture. The source read is paired with the two behavioural tests above rather than trusted
-    alone."""
+    posture. The default matters too: ``_issue_session`` used to fall back to ``mfa_verified``, so a
+    new directory caller that named nothing would seed whenever it granted the factor. The source
+    read is paired with the behavioural tests in this module rather than trusted alone."""
     for method in (
         AuthService.authenticate_kerberos,
         AuthService._authenticate_kerberos,
@@ -176,20 +185,52 @@ def test_no_directory_entry_point_lets_a_caller_choose_the_seeding() -> None:
     ):
         assert "seed_reauth" not in inspect.signature(method).parameters, method.__name__
 
+    param = inspect.signature(AuthService._issue_session).parameters["seed_reauth"]
+    assert param.default is inspect.Parameter.empty, "_issue_session gives seed_reauth a default"
+
     tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService._complete_ad_login)))
     seeds = [
         kw.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_issue_session"
-        for kw in node.keywords
+        for call in call_sites(tree, "_issue_session")
+        for kw in call.keywords
         if kw.arg == "seed_reauth"
     ]
-    # Empty means the call moved or stopped naming the argument, and then _issue_session would fall
-    # back to seeding from mfa_verified. That is a failure, not a pass.
+    # Empty means the call moved or stopped naming the argument. That is a failure, not a pass.
     assert len(seeds) == 1, "_complete_ad_login no longer passes seed_reauth to _issue_session"
     assert isinstance(seeds[0], ast.Constant) and seeds[0].value is False
+
+
+async def test_a_pending_directory_session_cannot_ride_the_login_to_enroll_a_factor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a directory login seeds the window again, on the shipped ``require_mfa`` default.
+
+    This is where the seeded window reached with ``require_mfa`` ON. The session owes a factor, so
+    every ordinary gate refuses it at the MFA gate first. But factor enrollment skips that gate, so
+    an account with no factor can bootstrap one. With ``require_action_step_up`` off (the documented
+    opt-out) that route falls back to the session window. So a seeded window let a stolen ticket
+    session bind an attacker's authenticator with no re-proof: the WP-14 hazard."""
+    monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda t, s: "jdoe")
+    service = await _service(engine, require_mfa=True, require_action_step_up=False)
+    async with _client(engine, service) as c:
+        r = await c.post(
+            "/auth/negotiate",
+            headers={"Authorization": "Negotiate " + base64.b64encode(b"tok").decode()},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["mfa_required"] is True
+        token = r.json()["token"]
+
+        refused = await c.post("/me/mfa/enroll", headers=_bearer(token))
+        assert refused.status_code == 403
+        assert refused.headers.get("X-Step-Up-Required") == "1"
+
+        # Not a lockout: the directory re-bind opens the window, and enrollment proceeds.
+        stepped = await c.post("/me/reauth", json={"password": AD_PW}, headers=_bearer(token))
+        assert stepped.status_code == 200, stepped.text
+        fresh = stepped.json()["token"]
+        enrolled = await c.post("/me/mfa/enroll", headers=_bearer(fresh))
+        assert enrolled.status_code == 200, enrolled.text
 
 
 async def test_the_local_password_leg_still_counts_login_as_the_first_verification(
