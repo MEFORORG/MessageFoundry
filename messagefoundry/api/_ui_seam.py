@@ -196,12 +196,17 @@ from typing import Any
 #: an older engine passed the handshake and then failed the console's import. A METHOD the console
 #: calls, so it forces a bump for the reason the ``factor_binding_is_blocked`` entry above gives.
 #:
+#: BACKLOG #1139, slice 3 (ADR 0182 Amendment A): ``UserUpdateRequest`` gained ``notify_email``, the
+#: one field that moves the notification address. Saving the profile ``email`` no longer moves it.
+#: The console's user page posts the new field, and an engine without it refuses the body with a
+#: 422 (``RequestModel`` forbids unknown keys), so an older engine must fail the handshake instead.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "f26d3fff5f3fdec8"
+ENGINE_UI_SEAM: str = "63e2790a9a4b0854"
 
 
 @dataclass(frozen=True, slots=True)

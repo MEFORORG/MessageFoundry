@@ -1886,7 +1886,12 @@ Users are notified of security-relevant changes to their account through **two**
   alert distribution list). Fired on: account **lockout** and the **first successful login after ≥3
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, and **account disable** (credential changes, 6.3.7). An email-change notice goes to the
-  **old** address so the legitimate owner is alerted even if the change was hostile. With no `[alerts]`
+  **old** address so the legitimate owner is alerted even if the change was hostile. **Only an
+  administrator's explicit `notify_email` moves the notification address** (`PATCH /users/{id}`, or
+  the console user page's Notification address field; BACKLOG #1139, ADR 0182 Amendment A). Saving
+  the profile `email` never moves it, so an unrelated save cannot copy the directory's `mail` into
+  it or fill a missing one from it. A move writes `user.notify_email_changed` and notifies the old
+  address, or the new one when there was none. With no `[alerts]`
   SMTP configured, or for an account with no `notify_email`, the email is skipped and each skipped
   notice logs a WARNING naming the event and the username. Emission is **best-effort** — a
   notification failure is logged and never blocks a login or an admin action.

@@ -4961,27 +4961,69 @@ class AuthService:
         email: str | None,
         disabled: bool | None,
         actor: str,
+        notify_email: str | None = None,
     ) -> None:
+        """Apply an administrator's edit to an account's profile, disabled flag and notification
+        address.
+
+        **THE NOTIFICATION ADDRESS MOVES ONLY WHEN ``notify_email`` NAMES IT (BACKLOG #1139, ADR 0182
+        Amendment A).** ``None`` leaves it alone, and the profile ``email`` never touches it. It used
+        to: any non-blank ``email`` was copied in, and both admin surfaces post the stored profile
+        email back on every save. So a display-name edit copied the directory's ``mail`` into the
+        engine-owned column with no notice, and filled a blank one from it.
+
+        A named address is checked before anything is written, so a refusal leaves the whole save
+        undone. It must be one plain mailbox (:func:`_is_single_mailbox`) and cannot be blank, because
+        the address can be repointed but never cleared (:func:`require_notify_email`). Raises
+        :class:`ValueError` for either.
+
+        A profile ``email`` that goes blank still falls through to the durability rule: the profile
+        clears and the notification address stands.
+        """
+        new_notify: str | None = None
+        if notify_email is not None:
+            new_notify = require_notify_email(notify_email)
+            if not _is_single_mailbox(new_notify):
+                raise ValueError("enter one email address, such as name@example.org")
         before = await self._store.get_user(user_id)  # capture old email/disabled for notifications
         await self._store.update_user_profile(user_id, display_name=display_name, email=email)
-        # THE ENGINE-OWNED NOTIFICATION ADDRESS MOVES ONLY HERE, AND ONLY UPWARDS (BACKLOG #1139).
-        # This is an administrator acting on the engine's own surface, so it is the one write allowed
-        # to repoint where notices go — the directory sync above (`update_user_profile`, which
-        # `_upsert_ad_user` also calls) is not.
-        #
-        # A BLANK ADDRESS FALLS THROUGH DELIBERATELY, and that is the durability rule in force: the
-        # profile mirror clears, and the notification address stands. Requiring an address at creation
-        # would not have achieved this on its own, because an explicit null still strips it afterwards
-        # — and an account with no address is excluded from every later notice, which is exactly the
-        # structural exclusion this item was filed against. `set_user_notify_email` takes `str`, so
-        # there is no way to spell the clear even by mistake.
-        if email is not None and email.strip():
-            await self._store.set_user_notify_email(user_id, email=email)
+        # THE ENGINE-OWNED NOTIFICATION ADDRESS MOVES ONLY HERE, AND ONLY ON AN EXPLICIT VALUE
+        # (BACKLOG #1139). This is an administrator acting on the engine's own surface, so it is the
+        # one write allowed to repoint where notices go. The profile write above is not: it is the
+        # same call `_upsert_ad_user` makes, and on a directory account `email` is the directory's.
+        moved_from: str | None = None
+        moved = before is not None and new_notify is not None and new_notify != before.notify_email
+        if moved and before is not None and new_notify is not None:
+            moved_from = (before.notify_email or "").strip() or None
+            await self._store.set_user_notify_email(user_id, email=new_notify)
         if disabled is not None:
             await self._store.set_user_disabled(user_id, disabled=disabled)
             if disabled:
                 await self._store.revoke_user_sessions(user_id)
         await self._audit("user.updated", actor=actor, detail=_json({"user_id": user_id}))
+        if moved:
+            # The address stays out of the row, as every other write of the column records it.
+            await self._audit(
+                "user.notify_email_changed",
+                actor=actor,
+                detail=_json({"user_id": user_id, "had_address": moved_from is not None}),
+            )
+        if before is not None and moved:
+            if moved_from is not None:
+                # Tell the address notices are moving AWAY from. It is the one the legitimate holder
+                # still reads when the move was hostile or mistaken (ADR 0182, option 3).
+                await self._notify_security(
+                    EMAIL_CHANGED,
+                    username=before.username,
+                    email=moved_from,
+                    detail={"new_email": new_notify, "field": "notify_email"},
+                )
+            else:
+                # No earlier address, so nobody else to tell: the notice goes to the one just set,
+                # as the holder's own fill does (`fill_own_notify_email`).
+                await self._notify_security(
+                    NOTIFY_EMAIL_SET, username=before.username, email=new_notify
+                )
         if before is not None:
             if email != before.email:
                 # Notify the OLD address — so the legitimate owner is alerted even if an attacker (or a

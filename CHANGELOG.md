@@ -86,6 +86,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
+  `PATCH /users/{id}` copied any non-blank `email` into `users.notify_email`, and sent no notice
+  unless the profile email changed. The route fills an omitted `email` from the stored profile, and
+  the web console's user form posts it back on every save. So a display-name edit or a disable
+  copied the profile address into the notification address. On a directory account that address is
+  the directory's `mail`, so the save did the directory repoint ADR 0182 blocks. On an account with
+  no notification address it filled one from the directory. Now `email` sets the profile address
+  only. A new `notify_email` field on `PATCH /users/{id}` is the one way an administrator moves
+  the notification address. Omitted, it leaves the address as it is. A new value must be one plain
+  mailbox, and `null` or a blank value is refused with `400`, because the address can be changed
+  but not cleared. A move writes a `user.notify_email_changed` audit row that holds no address. It
+  sends an `email_changed` notice to the old address, which names the new one, or a
+  `notify_email_set` notice to the new address when there was none. The console's user page has a
+  Notification address field for it. **What changes for a client:** a `PATCH` that sets `email` to
+  repoint notices now moves only the profile address. Send `notify_email` too. (`BACKLOG #1139`,
+  ADR 0182 Amendment A)
 - **BREAKING: an account with no notification address must set one at sign-in, whenever this
   instance sends security notices.** A security notice goes to the account's engine-owned address,
   `users.notify_email`. An account without one was told nothing about a password reset or any other

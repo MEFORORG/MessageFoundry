@@ -140,7 +140,15 @@ def _build_body(event: SecurityEvent) -> str:
         # arm reports WHAT CHANGED and states the one thing the schema does guarantee, rather than
         # forecasting what the address will or will not receive.
         new_email = event.detail.get("new_email")
-        if new_email:
+        if new_email and event.detail.get("field") == "notify_email":
+            # BACKLOG #1139, ADR 0182 Amendment A: an administrator moved the NOTIFICATION address,
+            # not the profile one. Say which, because this is the last notice this address gets.
+            lines.append(
+                "An administrator changed the address that receives security notices for your "
+                "account. Later notices go to the new address, not to this one."
+            )
+            lines.append(f"New notification address: {new_email}")
+        elif new_email:
             lines.append(f"New email on file: {new_email}")
         else:
             lines.append(

@@ -1486,7 +1486,11 @@ async def test_clearing_the_profile_address_leaves_the_account_still_notifiable(
 
 async def test_an_admin_can_still_repoint_where_notices_go() -> None:
     """Negative control for the test above: the address is durable, not frozen. Without this, making
-    ``set_user_notify_email`` a no-op would pass every other test in this block."""
+    ``set_user_notify_email`` a no-op would pass every other test in this block.
+
+    ADR 0182 Amendment A (BACKLOG #1139, slice 3): the repoint is the explicit ``notify_email``
+    value now. Setting the profile ``email`` no longer moves it; ``tests/test_admin_notify_email_update.py``
+    holds that half."""
     store = await _store()
     try:
         notifier = _FakeNotifier()
@@ -1494,7 +1498,12 @@ async def test_an_admin_can_still_repoint_where_notices_go() -> None:
         await _local_user(store, email="old@example.org")
 
         await service.update_user(
-            "u1", display_name=None, email="new@example.org", disabled=None, actor="admin"
+            "u1",
+            display_name=None,
+            email="old@example.org",
+            disabled=None,
+            notify_email="new@example.org",
+            actor="admin",
         )
         moved = await store.get_user("u1")
         assert moved is not None and moved.notify_email == "new@example.org"

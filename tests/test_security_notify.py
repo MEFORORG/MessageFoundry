@@ -225,6 +225,34 @@ def test_body_omits_the_directory_line_for_a_console_change() -> None:
     assert "directory" not in body.lower()
 
 
+def test_body_names_a_moved_notification_address_as_such() -> None:
+    """BACKLOG #1139, ADR 0182 Amendment A: an administrator moving the NOTIFICATION address sends
+    this notice to the old one, and it is the last that address gets. It must say which address
+    moved, and that later notices go elsewhere. The profile-change body is the control."""
+    moved = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            detail={"new_email": "new@example.org", "field": "notify_email"},
+        )
+    )
+    assert "New notification address: new@example.org" in moved
+    assert "Later notices go to the new address" in moved
+    assert "New email on file" not in moved
+
+    profile = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            detail={"new_email": "new@example.org"},
+        )
+    )
+    assert "New email on file: new@example.org" in profile
+    assert "Later notices go to the new address" not in profile
+
+
 def test_body_states_the_remaining_recovery_code_count() -> None:
     """BACKLOG #1139 (ASVS 6.3.7): spending a recovery code permanently deletes a stored credential.
     The count is what makes the notice actionable; the code and its hash never appear."""

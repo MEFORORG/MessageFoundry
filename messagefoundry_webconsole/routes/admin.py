@@ -226,11 +226,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # An HTML form always posts the full profile picture, so every field is set explicitly
             # ("" clears to None; an absent checkbox means enabled) — the PATCH partial semantics of
             # the JSON handler don't apply to a form submit.
-            body = UserUpdateRequest(
-                display_name=form.get("display_name", "").strip() or None,
-                email=form.get("email", "").strip() or None,
-                disabled="disabled" in form,
-            )
+            #
+            # BACKLOG #1139, ADR 0182 Amendment A: the notification address is the exception. It
+            # cannot be cleared, so a blank field is left OUT of the body and means "leave it". A
+            # filled one is sent as is; the service moves the address only when it differs from the
+            # stored one, so the pre-filled value posted back by an unrelated save moves nothing.
+            fields: dict[str, object] = {
+                "display_name": form.get("display_name", "").strip() or None,
+                "email": form.get("email", "").strip() or None,
+                "disabled": "disabled" in form,
+            }
+            notify = form.get("notify_email", "").strip()
+            if notify:
+                fields["notify_email"] = notify
+            body = UserUpdateRequest.model_validate(fields)
             await admin.update_user(user_id, body=body, service=service, identity=identity)
         except (ValidationError, HTTPException) as exc:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:

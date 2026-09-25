@@ -856,13 +856,31 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
         supplied = body.model_fields_set
-        await service.update_user(
-            user_id,
-            display_name=body.display_name if "display_name" in supplied else current.display_name,
-            email=body.email if "email" in supplied else current.email,
-            disabled=body.disabled if "disabled" in supplied else None,
-            actor=identity.username,
-        )
+        # BACKLOG #1139: notify_email is NOT filled from the stored row when omitted. Omitted means
+        # "leave it", and the service moves it only on an explicit value. Filling `email` above is
+        # harmless for that reason: the profile address no longer reaches the notification one.
+        # An explicit null is refused rather than read as "leave it", because a client sending it
+        # asked for a clear, and the address can be repointed but never cleared.
+        if "notify_email" in supplied and body.notify_email is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "the notification address can be changed but not cleared",
+            )
+        try:
+            await service.update_user(
+                user_id,
+                display_name=(
+                    body.display_name if "display_name" in supplied else current.display_name
+                ),
+                email=body.email if "email" in supplied else current.email,
+                disabled=body.disabled if "disabled" in supplied else None,
+                notify_email=body.notify_email,
+                actor=identity.username,
+            )
+        except ValueError as exc:
+            # The service checks the address before it writes anything, so this refuses the whole
+            # save. Its messages name the rule and never echo the value.
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="updated")
 
     @app.delete("/users/{user_id}", response_model=SimpleMessage)

@@ -61,6 +61,16 @@ under Changed says why engine 0.4.0 does not work with this console.
   instead, and so do the new deadline sentences under Added.
 
 ### Security
+- **The user page sets the notification address in its own field** (`BACKLOG #1139`, ADR 0182
+  Amendment A). The page's Email field is pre-filled with the stored profile address and posted
+  back on every save, and the engine copied it into the notification address. So saving a display
+  name or a disable moved where security notices go, or filled a missing address from the
+  directory. The engine no longer does that. The page now shows a Notification address field,
+  pre-filled with the stored value. Posting it back unchanged moves nothing. A blank field is left
+  out of the request and leaves the address as it is, because it cannot be cleared. A new value
+  moves it and notifies the old address. **Requires an engine whose `UserUpdateRequest` carries
+  `notify_email`**, which moved the engine UI seam. An older engine would refuse the field with a
+  `422`, so this console refuses that engine at startup with `UiSeamMismatch` instead.
 - **The notification-address page suggests the address already on the account** (`BACKLOG #1139`).
   Engine PR 1522 added `/ui/account/notify-address`, where an account with no notification address
   is confined while the engine sends security notices. Its input now starts with the account's
