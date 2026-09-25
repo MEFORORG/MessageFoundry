@@ -284,7 +284,8 @@ def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
     build_asserted_https_handler` returns that same default handler with its context asserted forward-
     secret (ASVS 12.1.2). It substitutes nothing: see that function for why replacing the context
     would have changed the handshake. Handler-for-handler identical to the previous
-    ``build_opener(_NoRedirectHandler)``.
+    ``build_opener(_NoRedirectHandler)``. The suite list is the one deliberate change: it takes the
+    approved AEAD default every engine-built hop takes (BACKLOG #300).
 
     A named function, not an inline module-level expression, so a test can call the exact construction
     the shared opener is built from instead of reloading this module.

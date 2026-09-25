@@ -90,8 +90,8 @@ properties are the point of it, and each is pinned by a test in
   names it.
 
 This is a *randomness* inventory, and that is the whole claim it supports. The other first-party
-crypto in the non-Python roots (the TLS floor ``ide/src/engineClient.ts`` applies to every https
-request, and the console's WebAuthn ceremony in ``static/app.js``) is found by a THIRD arm,
+crypto in the non-Python roots (the TLS floor and suite pin ``ide/src/engineClient.ts`` applies to
+every https request, and the console's WebAuthn ceremony in ``static/app.js``) is found by a THIRD arm,
 :func:`check_non_python_operations` (BACKLOG #1164). A FOURTH arm,
 :func:`check_powershell_operations`, reads the ``.ps1`` and ``.psm1`` files under ``scripts/``,
 including the
@@ -139,8 +139,8 @@ import crypto_operations  # noqa: E402
 # NOT a finding that ``ide/`` is crypto-free. Zero ``.py`` files is a fact about the LANGUAGE, and the
 # question this gate exists to answer is whether a tree contains cryptography. ``ide/`` does:
 # ``ide/src/cspNonce.ts`` imports ``randomBytes`` from ``node:crypto`` and draws CSPRNG bytes consumed
-# across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor it applies to every https
-# request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from the
+# across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor and suite list it applies to
+# every https request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from the
 # Python walk. The non-Python arms below find both.
 #
 # ADDING ``ide/`` TO WALK_ROOTS WOULD STILL BE A NO-OP THAT LOOKS LIKE A FIX, and that has not
@@ -342,7 +342,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # engine-client verifies the engine API server cert — the OS trust store (truststore.SSLContext,
     # a CRYPTO_LIBRARY_MODULES trigger) by default, or a pinned PEM via --cacert
     # (ssl.create_default_context), plus opt-in client-cert mTLS (load_cert_chain). Builds the
-    # client-side TLS verification context.
+    # client-side TLS verification context, and on either branch pins the TLS 1.2 suites to
+    # _APPROVED_TLS12_SUITES with set_ciphers (BACKLOG #300), so it offers nothing wider than
+    # the engine listener's AEAD default.
     "messagefoundry/apiclient/client.py": frozenset({"ssl", "truststore"}),
     # BACKLOG #1276 part A: the engine always serves TLS now and mints a self-signed placeholder when
     # no operator cert is configured. This harness supplies its own certificate instead — one pair
@@ -835,6 +837,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/apiclient/client.py": frozenset(
         {
             "tls_context:.load_cert_chain()",
+            "tls_context:.set_ciphers()",
             "tls_context:ssl.create_default_context",
             "tls_context:truststore.SSLContext",
         }
@@ -1692,15 +1695,20 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # The single source of CSP nonces for every webview the extension builds (see the randomness
     # arm's row for the same file, which is where the entropy argument lives).
     "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
-    # The TLS floor the extension applies to every https request it makes to the engine:
-    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION }` (TLSv1.2), plus the operator-pinned
+    # The TLS floor and suite pin the extension applies to every https request it makes to the engine:
+    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS }`, plus the pinned
     # engine CA as `ca` when one is configured. Certificate verification is never switched off. The
-    # value is a named constant, not a literal, so the token does not carry it.
-    "ide/src/engineClient.ts": frozenset({"tls_context:minVersion"}),
-    # Not a TLS use: the extension test that PINS the floor above, by asserting the options object
-    # `tlsOptions` returns. Listed rather than excluded, because pruning test directories from the
-    # walk would be a scope cut the randomness arm does not make either.
-    "ide/src/test/suite/engine-trust.test.ts": frozenset({"tls_context:minVersion[TLSv1.2]"}),
+    # floor is a named constant, not a literal, so the token does not carry it. `ciphers` is the
+    # BACKLOG #300 suite pin; `TLS_12_SUITES` in that file says which suites and what holds them.
+    # Its token is bare for ANY value, a colon-joined literal included, because the pattern captures
+    # no `:`. So this row records that a pin exists, not which suites it names.
+    "ide/src/engineClient.ts": frozenset({"tls_context:minVersion", "tls_context:ciphers"}),
+    # Not a TLS use: the extension test that PINS the floor and the suite list above, by asserting
+    # the options object `tlsOptions` returns. Listed rather than excluded, because pruning test
+    # directories from the walk would be a scope cut the randomness arm does not make either.
+    "ide/src/test/suite/engine-trust.test.ts": frozenset(
+        {"tls_context:minVersion[TLSv1.2]", "tls_context:ciphers"}
+    ),
     # The operator console's WebAuthn ceremonies (ADR 0068): navigator.credentials.create enrolls a
     # passkey and navigator.credentials.get asks the authenticator to SIGN the server's challenge.
     # The signature is checked server-side in auth/webauthn.py; this row records where the browser

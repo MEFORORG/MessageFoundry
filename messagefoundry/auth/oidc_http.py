@@ -42,7 +42,11 @@ from typing import Any
 
 from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
 from messagefoundry.auth.trust_anchors import AnchorSpec, enforce_anchor
-from messagefoundry.config.tls_policy import harden_cipher_suites, harden_crl_check
+from messagefoundry.config.tls_policy import (
+    harden_cipher_suites,
+    harden_crl_check,
+    narrow_to_approved_suites,
+)
 from messagefoundry.transports.bounded_read import reply_framing_fault
 
 __all__ = ["build_idp_opener", "jwks_fetcher"]
@@ -121,6 +125,7 @@ def build_idp_opener(
     # Assert forward secrecy on the FINAL context (ASVS 12.1.2): this hop carries the client secret,
     # the authorization code and the identity assertion, so a recorded session that a future key
     # compromise could decrypt is an authentication-material exposure, not just a confidentiality one.
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="OIDC identity provider (token + JWKS)")
     return urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx))
 

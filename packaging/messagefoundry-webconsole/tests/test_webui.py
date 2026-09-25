@@ -6454,7 +6454,7 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     from messagefoundry.config.models import SignatureAlgorithm as _Alg
     from messagefoundry.transports.signing import CompactJwtSigner as _Signer
 
-    key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = _rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
     def _b64u_uint(v: int) -> str:
         import base64 as _b64
