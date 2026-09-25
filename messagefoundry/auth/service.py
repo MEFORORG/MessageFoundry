@@ -431,18 +431,6 @@ def _is_single_mailbox(address: str) -> bool:
     )
 
 
-def suggested_notify_email(profile_email: str | None) -> str | None:
-    """The profile ``email`` to offer on the console's address form, or ``None`` (BACKLOG #1139).
-
-    Stripped, and only when it passes the shape check :meth:`AuthService.fill_own_notify_email`
-    applies, so the form never offers a value its own submit refuses. On a directory account the
-    profile address is the last ``mail`` the directory supplied, which is why this is a suggestion
-    only. It writes nothing; the holder's submit is the only thing that fills ``notify_email``.
-    """
-    address = (profile_email or "").strip()
-    return address if address and _is_single_mailbox(address) else None
-
-
 class NotifyEmailAlreadySet(RuntimeError):
     """:meth:`AuthService.fill_own_notify_email` declined: the account already has a different
     notification address. The self-service route only fills a missing one (BACKLOG #1139)."""
@@ -3446,6 +3434,28 @@ class AuthService:
         """
         return self._security_notifier is not None and not (user.notify_email or "").strip()
 
+    @staticmethod
+    def suggested_notify_email(profile_email: str | None) -> str | None:
+        """The profile ``email`` to offer on the console's address form, or ``None`` (BACKLOG #1139).
+
+        Stripped, and only when it passes the shape check :meth:`fill_own_notify_email` applies, so
+        the form never offers a value its own submit refuses. On a directory account the profile
+        address is the last ``mail`` the directory supplied, which is why this is a suggestion only.
+        It writes nothing; the holder's submit is the only thing that fills ``notify_email``.
+
+        **ONLY A PURE-ASCII ADDRESS IS OFFERED.** A directory writer could store a homoglyph
+        lookalike of the holder's real address, such as a Cyrillic ``a`` for a Latin one, and a
+        pre-filled lookalike is the one thing this suggestion must not carry. The submit is not
+        narrowed: a holder may still type any address :meth:`fill_own_notify_email` accepts.
+
+        A method rather than a module function so the console reaches it through the service it
+        already holds, where seam discovery sees it and moves ``ENGINE_UI_SEAM``.
+        """
+        address = (profile_email or "").strip()
+        if not address or not _is_single_mailbox(address) or not address.isascii():
+            return None
+        return address
+
     async def fill_own_notify_email(
         self, identity: Identity, email: str, *, client: str | None = None
     ) -> bool:
@@ -3462,9 +3472,10 @@ class AuthService:
 
         **THE FIRST ADDRESS IS TRUSTED AS SUBMITTED.** Whoever holds this session (password, and the
         factor where one is enrolled) chooses where notices go. Nothing checks that the holder
-        receives mail there. The console form may start with :func:`suggested_notify_email`, which a
-        directory writer can influence; the holder still has to submit it. The audit row names the change in the holder's own
-        ``/me/security-events`` feed, and the notice goes to the address just set.
+        receives mail there. The console form may start with :meth:`suggested_notify_email`, which a
+        directory writer can influence; the holder still has to submit it. The audit row names the
+        change in the holder's own ``/me/security-events`` feed, and the notice goes to the address
+        just set.
 
         The fill-only check is a read, then an unconditional write. Two concurrent calls from the
         same account can both pass it; the later write wins and both are audited.

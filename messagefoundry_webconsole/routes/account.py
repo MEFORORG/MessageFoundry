@@ -27,7 +27,6 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_WEBAUTHN_ENROLL,
     AuthService,
     NotifyEmailAlreadySet,
-    suggested_notify_email,
 )
 from messagefoundry.auth.tokens import hash_token
 
@@ -300,7 +299,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not identity.must_set_notify_email:
             return RedirectResponse("/ui/account", status_code=303)
         user = await service.store.get_user(identity.user_id)
-        suggested = suggested_notify_email(user.email if user is not None else None)
+        suggested = service.suggested_notify_email(user.email if user is not None else None)
         if suggested is not None:
             try:
                 NotifyEmailRequest(email=suggested)  # the POST's length bound

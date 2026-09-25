@@ -68,7 +68,11 @@ under Changed says why engine 0.4.0 does not work with this console.
   directory account that is the last `mail` the directory supplied. A line under the input names
   the source and asks the holder to change it if it is not theirs. A pre-filled input is not
   focused on load. Opening the page writes nothing; the address is set only when the holder
-  submits the form.
+  submits the form. Only a pure-ASCII address is suggested, so a directory writer cannot pre-fill
+  a homoglyph lookalike of the holder's real address. The submit still accepts what it did.
+  **Requires an engine with `AuthService.suggested_notify_email`**, which moved the engine UI seam
+  again. An engine at PR 1522 lacks that method and ships the older seam, so this console refuses
+  it at startup with `UiSeamMismatch` rather than failing on the page.
 - **Ending a session or enrolling a factor from an MFA-pending session now needs the existing
   factor first, on an account that has one** (`BACKLOG #1951`, PR 1469).
   `require_ui_reauth_only_action` skips the MFA check, so that an account with no factor can still

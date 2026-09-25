@@ -232,6 +232,30 @@ async def test_a_profile_address_the_submit_would_refuse_is_not_suggested(engine
             assert SUGGESTED_LINE not in page.text, value
 
 
+async def test_a_non_ascii_profile_address_is_not_suggested(engine: Engine) -> None:
+    """A directory writer could store a homoglyph lookalike of the holder's real address, such as a
+    Cyrillic ``a`` (U+0430) for a Latin one. A pre-filled lookalike is the attack the suggestion must
+    not carry, so only a pure-ASCII address is offered. The POST is unchanged: the holder may still
+    type any address the submit accepts."""
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        for value in (
+            "\u0430lice@example.org",  # Cyrillic a in the local part
+            "alice@ex\u0430mple.org",  # Cyrillic a in the domain
+            "alice\u00e9@example.org",  # a Latin-1 letter, not a lookalike, still refused
+        ):
+            await engine.store.update_user_profile(user_id, display_name=None, email=value)
+            page = await c.get(PAGE)
+            assert page.status_code == 200, ascii(value)
+            assert "value=" not in _email_input(page.text), ascii(value)
+            assert SUGGESTED_LINE not in page.text, ascii(value)
+            assert service.suggested_notify_email(value) is None, ascii(value)
+    # The ASCII original of the same address is still offered.
+    assert service.suggested_notify_email("alice@example.org") == "alice@example.org"
+
+
 async def test_a_suggested_address_is_escaped_in_the_route(engine: Engine) -> None:
     """``&`` and ``'`` pass the mailbox check, so they reach the attribute and must arrive escaped."""
     service = await _service(engine, notifier=_FakeNotifier())
