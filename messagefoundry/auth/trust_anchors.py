@@ -31,6 +31,13 @@ runs, no audit rows, no new settings effects):
 3. An **anchor-changed audit event**: when a configured anchor's SHA-256 differs from the previously
    observed load's, a first-class ``auth.trust_anchor`` audit row is written (reusing
    :meth:`~messagefoundry.store.base.Store.record_audit`, mirroring the ``config_reload`` fingerprint row).
+4. A **path check** (BACKLOG #1142, the directory arm): every object from the volume root down to the
+   anchor, links included, read in-process by SID on Windows and by ``lstat`` on POSIX
+   (:mod:`messagefoundry.auth.anchor_path`). A directory that lets an untrusted principal delete or
+   rename an entry lets it replace the anchor without any right on the file itself. ``path_ok`` is
+   ``False`` then, and it refuses at ``enforce`` and warns at ``warn``, as ``acl_ok`` does. A chain
+   that could not be read is ``path_indeterminate``: audited and warned, not refused. The file arm
+   (1) still runs beside it, so the combined verdict is never weaker than the file arm alone.
 """
 
 from __future__ import annotations
@@ -41,12 +48,19 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from messagefoundry.auth.anchor_path import (
+    LINK,
+    ChainFinding,
+    PathVerdict,
+    anchor_path_verdict,
+)
 from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
@@ -57,8 +71,9 @@ log = logging.getLogger(__name__)
 
 #: The audit action for every trust-anchor observation. One action so an operator can filter the whole
 #: family, and so :func:`_last_fingerprint` can find the prior load. The ``event`` field in the detail
-#: carries which one: ``observed`` (baseline), ``changed``, ``pin_mismatch``, ``acl_insecure``, and
-#: ``acl_indeterminate`` (the ACL could not be determined — BACKLOG #1142).
+#: carries which one: ``observed`` (baseline), ``changed``, ``pin_mismatch``, ``acl_insecure``,
+#: ``acl_indeterminate`` (the ACL could not be determined, BACKLOG #1142), and ``path_insecure`` and
+#: ``path_indeterminate`` (the path check, BACKLOG #1142 directory arm).
 AUDIT_ACTION = "auth.trust_anchor"
 
 
@@ -90,6 +105,9 @@ class AnchorVerdict:
     fingerprint: str
     acl_ok: bool | None  # None = the DACL could not be determined (degrade, don't refuse)
     pin_ok: bool | None  # None = no pin configured
+    # False = another principal can replace the anchor through its path; None = could not tell.
+    path_ok: bool | None = None
+    path_check: PathVerdict | None = None  # the findings behind path_ok, for messages and audit
 
 
 # --- fingerprint --------------------------------------------------------------------------------
@@ -483,8 +501,13 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     pin_ok: bool | None = None
     if spec.pin is not None:
         pin_ok = fingerprint == _normalize_pin(spec.pin)
+    path_check = anchor_path_verdict(spec.path)
     return AnchorVerdict(
-        fingerprint=fingerprint, acl_ok=dacl_is_owner_only(spec.path), pin_ok=pin_ok
+        fingerprint=fingerprint,
+        acl_ok=dacl_is_owner_only(spec.path),
+        pin_ok=pin_ok,
+        path_ok=path_check.ok,
+        path_check=path_check,
     )
 
 
@@ -503,9 +526,102 @@ def _acl_message(spec: AnchorSpec) -> str:
     )
 
 
+def _findings(verdict: AnchorVerdict, *, insecure: bool) -> list[ChainFinding]:
+    check = verdict.path_check
+    return [f for f in (check.findings if check else ()) if f.insecure is insecure]
+
+
+def _ps_quote(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _path_fix(verdict: AnchorVerdict) -> list[str]:
+    """The fix, as commands, for each insecure finding that a command can fix. The message must
+    carry its own fix: the document the file arm's message cites ships in neither a checkout nor a
+    wheel.
+
+    Every command is narrow. It removes the grants or write bits the check named, or hands
+    ownership to Administrators or root, and leaves every other entry alone. A blanket reset such as
+    ``/inheritance:r /grant:r`` would strip the engine's own modify grant from its data folder,
+    or the user's rights from a profile folder."""
+    check = verdict.path_check
+    bad = _findings(verdict, insecure=True)
+    objects: dict[str, str] = {}
+    for f in bad:
+        objects.setdefault(f.path, f.kind)
+    move = "Fix: move the anchor into a folder that only administrators and the engine's account "
+    if check is not None and check.platform == "windows":
+        lines = [
+            move + "can change, such as the engine's data folder under C:\\ProgramData. Or, "
+            "from an elevated PowerShell, for each object named above:"
+        ]
+        for obj, kind in objects.items():
+            q = _ps_quote(obj) + (" /L" if kind == LINK else "")
+            here = [f for f in bad if f.path == obj]
+            granted = sorted({sid for f in here if not f.owner for sid in f.sids})
+            if granted:
+                # /inheritance:d turns inherited entries into explicit ones, so /remove:g reaches them.
+                lines.append(f"  icacls {q} /inheritance:d")
+                lines.append(
+                    f"  icacls {q} /remove:g " + " ".join(_ps_quote("*" + s) for s in granted)
+                )
+            if any(f.owner for f in here):
+                lines.append(f"  icacls {q} /setowner '*S-1-5-32-544'")
+        lines.append("Then read each one back with: icacls <path>")
+        return lines
+    # Each finding gets only its own command. A mode finding gets the chmod that drops the group and
+    # other write bits, never a chown: the object may be the engine's own data folder, such as the
+    # container's /config, and a chown to root would take it away from the engine.
+    #
+    # An owner finding gets a chown to root, the owner an anchor's folder wants: the engine only
+    # reads an anchor. It names no group, because root:root would also take the group, and with it
+    # any access the engine holds through that group. The finding says the account the check ran
+    # as is not the owner, and the message says to run the check as the service account, so
+    # handing ownership to root takes nothing from the engine.
+    #
+    # Always -h: on a link it re-owns the link and not its target, and on anything else it acts
+    # the same. The owner the finding names can swap its entry for a link before root runs this.
+    cmds: list[str] = []
+    for obj in objects:
+        q = shlex.quote(obj)
+        here = [f for f in bad if f.path == obj]
+        if any(f.owner for f in here):
+            cmds.append(f"  chown -h root {q}")
+        if any(f.writable for f in here):
+            cmds.append(f"  chmod go-w {q}")
+    lead = move + "can change, such as a root-owned 755 folder like /etc/messagefoundry/."
+    return [lead + " Or, to fix it in place:", *cmds] if cmds else [lead]
+
+
+def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    lines = [
+        f"{spec.setting}: the trust anchor '{spec.path}' can be replaced through its path, and "
+        "anyone who replaces it can substitute the CA and defeat authentication:"
+    ]
+    lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=True)]
+    check = verdict.path_check
+    if check is not None and check.engine:
+        lines.append(
+            f"The check trusted the account it ran as ({check.engine}) as the engine's own. Run "
+            "it as the account the service runs as, or it can answer differently."
+        )
+    return "\n".join(lines + _path_fix(verdict))
+
+
+def _path_indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    lines = [
+        f"{spec.setting}: could not settle whether the trust anchor '{spec.path}' can be replaced "
+        "through its path, so it is loaded without that check:"
+    ]
+    lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=False)]
+    return "\n".join(lines)
+
+
 def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: bool) -> None:
-    """Apply the owner fork to a verdict: a pin mismatch always refuses; a group/world-writable DACL
-    refuses at ``enforce`` and warns at ``warn``. Raises :class:`TrustAnchorError` on a fatal violation."""
+    """Apply the owner fork to a verdict: a pin mismatch always refuses; a group/world-writable DACL,
+    or a path another principal can replace the anchor through, refuses at ``enforce`` and warns at
+    ``warn``. A path that could not be judged warns at both. Raises :class:`TrustAnchorError` on a
+    fatal violation."""
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
@@ -514,6 +630,18 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
                 _acl_message(spec) + " — [security].enforcement=enforce refuses to start"
             )
         log.warning("%s — [security].enforcement=warn, starting anyway", _acl_message(spec))
+    if verdict.path_ok is False:
+        if enforcing:
+            raise TrustAnchorError(
+                _path_message(spec, verdict) + "\n[security].enforcement=enforce refuses to start"
+            )
+        log.warning(
+            "%s\n[security].enforcement=warn, starting anyway", _path_message(spec, verdict)
+        )
+    elif verdict.path_ok is None:
+        # Not fatal, as acl_ok None is not: a refusal here must wait until the verified bytes are the
+        # bytes the consumer loads (BACKLOG #1142, slice 3).
+        log.warning("%s", _path_indeterminate_message(spec, verdict))
 
 
 def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
@@ -569,22 +697,38 @@ def collect_anchor_specs(auth: AuthSettings, api: ApiSettings) -> list[AnchorSpe
 # --- central preflight (store-backed: audit the load, detect changes, then enforce) -------------
 
 
+#: How far back :func:`_last_fingerprint` pages. One page used to be the whole look-back, and every
+#: preflight of an anchor whose path cannot be judged writes a row, so one noisy anchor could push a
+#: quiet anchor's baseline out of the window. Its next swap would then read as a first observation.
+_FINGERPRINT_PAGE = 200
+_FINGERPRINT_PAGES = 50
+
+
 async def _last_fingerprint(store: Store, label: str) -> str | None:
     """The most-recently audited fingerprint for ``label``, or ``None`` if this anchor has never been
-    observed. Reads the ``auth.trust_anchor`` audit rows (most-recent-first) and returns the first
-    matching label's fingerprint."""
-    rows = await store.list_audit(action=AUDIT_ACTION, limit=200)
-    for row in rows:
-        detail_raw = row["detail"]
-        if not detail_raw:
-            continue
-        try:
-            detail = json.loads(detail_raw)
-        except (ValueError, TypeError):
-            continue
-        if detail.get("label") == label:
-            fp = detail.get("fingerprint")
-            return fp if isinstance(fp, str) else None
+    observed. Reads the ``auth.trust_anchor`` audit rows (most-recent-first), a page at a time, and
+    returns the first matching label's fingerprint. Each page ends at the oldest timestamp of the one
+    before, inclusively, so a row at that instant is read twice and never skipped."""
+    until: float | None = None
+    for _page in range(_FINGERPRINT_PAGES):
+        rows = await store.list_audit(action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, until=until)
+        for row in rows:
+            detail_raw = row["detail"]
+            if not detail_raw:
+                continue
+            try:
+                detail = json.loads(detail_raw)
+            except (ValueError, TypeError):
+                continue
+            if detail.get("label") == label:
+                fp = detail.get("fingerprint")
+                return fp if isinstance(fp, str) else None
+        if len(rows) < _FINGERPRINT_PAGE:
+            return None
+        oldest = float(rows[-1]["ts"])
+        if until is not None and oldest >= until:
+            return None  # a whole page at one instant: nothing older can be reached this way
+        until = oldest
     return None
 
 
@@ -619,6 +763,20 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
         # opener actually loads: until then a refusal would attest a file that is re-read afterwards.
         await _record(
             store, spec, "acl_indeterminate", fingerprint=verdict.fingerprint, enforcing=enforcing
+        )
+    if verdict.path_ok is not True:
+        # Each row names every object that failed, with the principal and the right, or the cause.
+        insecure = verdict.path_ok is False
+        await _record(
+            store,
+            spec,
+            "path_insecure" if insecure else "path_indeterminate",
+            fingerprint=verdict.fingerprint,
+            enforcing=enforcing,
+            components=[
+                {"path": f.path, "kind": f.kind, "reason": f.reason}
+                for f in _findings(verdict, insecure=insecure)
+            ],
         )
     _enforce_verdict(spec, verdict, enforcing=enforcing)
 

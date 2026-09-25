@@ -128,6 +128,46 @@ All notable changes to MessageFoundry are documented here. The format follows
   - any HTTP version other than 1.x.
 
   **A deploying sender relying on any of these would be refused.** ([BACKLOG #1125](docs/BACKLOG.md))
+- **BREAKING: a trust anchor that another account can replace through its folder now refuses to
+  start.** This covers `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and
+  `[api].tls_client_ca_file`. 0.4.0 checked only the anchor file's own permissions. An account with
+  delete-child on the anchor's folder could delete it and plant its own CA, and the engine trusted
+  the copy. The engine now also checks the path. It reads every folder from the drive root or `/`
+  down to the anchor, each link on the way, and the file itself. On Windows it reads each owner and
+  DACL by SID, in process. On POSIX it reads each owner and mode. Under the default
+  `[security].enforcement = enforce`, an object an untrusted account can delete, rename,
+  re-permission or own refuses. At `warn` the engine starts and writes a `path_insecure` row under
+  `auth.trust_anchor`. The message names each object, the account and the right, and gives the
+  `icacls` or `chown` and `chmod` commands that fix it. On a folder, only removing or renaming an
+  entry counts. Adding files does not, so `C:\`, `C:\ProgramData` and a new folder under it pass as
+  Windows ships them. The trusted accounts include at least SYSTEM, Administrators,
+  TrustedInstaller, direct members of local Administrators, and the account the check runs as.
+  LocalService and NetworkService are not trusted as the engine's own. An owner is also trusted
+  when its SID ends in a well-known admin RID (500, 512, 518 or 519) in any domain, as the config
+  guard trusts it. On POSIX, root and the engine's uid are trusted, and only root when the engine
+  runs as root. The verdict depends on the account the check runs as, so run
+  `mefor verify federation` as the service account. Some paths the engine cannot judge: an unreadable folder, a network
+  share or mapped drive, a FAT volume, or a Linux mount other than ext2/3/4, xfs, btrfs, tmpfs or
+  overlay. They write a `path_indeterminate` row and a warning, and the engine still starts. The
+  file check still runs beside the path check. **These placements, at least, started under 0.4.0
+  and now refuse:**
+  - a Windows anchor whose own permissions are locked, in a new folder under `C:\Users\Public`;
+  - an anchor under a folder where a named account or local group can delete or rename entries.
+    0.4.0 caught only broad groups. One Windows 11 host's `%TEMP%` refuses this way;
+  - an anchor whose file or any folder above it is owned by an account that is neither an
+    administrator nor the engine's own, such as a folder a standard user made under
+    `C:\ProgramData`;
+  - on POSIX, an anchor or any folder above it owned by a uid other than root or the engine's;
+  - on POSIX, a group- or world-writable folder in the path, unless it is sticky and the entry
+    below it belongs to root or the engine. A link to a good bundle, kept in such a folder, refuses
+    too.
+
+  **Migration:** keep each anchor in a folder that only administrators and the engine's account can
+  change. On Windows that is the engine's data folder under `C:\ProgramData`. On POSIX it is a
+  root-owned `755` folder such as `/etc/messagefoundry/`. The container's `/config`, owned by uid
+  10001 as `docker/README.md` requires, passes when it sits on one of the mount types above. A
+  Docker Desktop bind mount does not, so there it answers indeterminate and starts with a warning.
+  ([BACKLOG #1142](docs/BACKLOG.md))
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
