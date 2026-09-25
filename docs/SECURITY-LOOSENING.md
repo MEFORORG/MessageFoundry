@@ -493,13 +493,8 @@ This section is kept rather than deleted, because the claim it used to make is t
   the segment is genuinely isolated, that is a different claim entirely — `tls_hop_attested`, which ALLOWs
   the hop silently. The two are deliberately separate so the audit trail can tell a proxy-terminated hop
   from plaintext on a flat network. Writing an attestation about a hop that is not secure puts a false
-  statement into the one field that exists to be trustworthy when audited.
-  **Note (accurate as of 2026-07-28):** `tls_hop_attested` has **no authoring surface on a connection**
-  today — no transport factory takes it and it is not a `connections.toml` key, so an inbound/outbound
-  cannot set it (the `[logging].forward_hop_attested` sibling *is* settable). `cleartext_accepted` is
-  therefore the only per-connection declaration an operator can currently write. Giving attestation an
-  authoring surface would add a **silent-ALLOW** loosening and needs its own registry entry here first;
-  it is owed, not shipped.
+  statement into the one field that exists to be trustworthy when audited. The attestation has its own
+  entry, [next](#tls_hop_attested--true-on-a-connection--a-hop-attested-secure-by-means-the-engine-cannot-see).
 - **Compensating controls:** network segmentation and physical/link-layer controls on that specific path;
   narrow the blast radius by declaring it on the single connection that needs it rather than broadly.
 - **It is never silent:** WARN + a dedicated record at **every** connector construction, naming the
@@ -527,6 +522,38 @@ This section is kept rather than deleted, because the claim it used to make is t
   (its construction sits outside the posture scope the clamp reads), so "the clamped escape" is not a
   universal statement about verify-off hops and should not be read as one. Nor does this declaration
   reach an SMTP `AUTH` over cleartext, which is refused outright.
+
+### `tls_hop_attested = true` on a connection — a hop attested secure by means the engine cannot see
+> **Connection-scoped**, like `cleartext_accepted` above, and settable in both directions: a keyword on
+> `inbound(...)`, `outbound(...)` or `FhirLookup(...)`, or a top-level key on a `connections.toml`
+> `[[inbound]]` / `[[outbound]]` table. It needs a mandatory `tls_hop_attested_reason`. Owner ruling
+> 2026-09-24; the attestation itself is [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
+> It is **not** a transport setting: writing it into a factory's `settings` dict is refused at load.
+- **What you lose:** the engine stops protecting that hop and takes your word that something else does.
+  A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
+  declaration that yields ALLOW rather than WARN. The crossing is logged with the reason, but the hop is
+  recorded as secure, not as an accepted risk. That covers at least a non-loopback
+  inbound bind without TLS, a cleartext egress hop, a verify-off egress hop and a weakened database TLS
+  hop. If the claim is false, the payload and any credential the connection carries cross in the clear,
+  and nothing about the hop looks wrong afterwards.
+- **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
+  sidecar in front of the connection is the usual case (see `samples/ech-sidecar/`). An isolated,
+  point-to-point segment with its own link-layer encryption is the other.
+- **Do not use it for a hop that is not secure.** That is `cleartext_accepted`, which WARNs every time. An
+  attestation about a plaintext hop on a flat network puts a false statement into the one field that
+  exists to be trusted when audited.
+- **Compensating controls:** whatever the reason names. Keep it true: when the proxy or the segment
+  changes, the attestation has to change with it.
+- **It is never silent:** every enforcing refusal the attestation suppresses logs a WARNING naming the
+  connection, the cell and the reason. `messagefoundry check` prints a `tls-hop-attested` line listing
+  the **whole** attested set, and `GET /security/posture` carries a `tls_hop_attested` loosening naming
+  every attesting connection (inbound, outbound and `FhirLookup`). The gate and both reports read the
+  same typed field, so a hop cannot be crossed on an attestation the reports do not name.
+- **Where it is NOT reported, and why:** the same two gaps as `cleartext_accepted` above.
+  `messagefoundry security show` never loads the connection graph, and the `serve`-time warning fires
+  before the graph loads. Both say so in their scope text.
+- **What it cannot do:** it does not reach a revocation refusal. That is `tls_revocation_attested`, a
+  different claim. It does not permit SMTP `AUTH` over cleartext, which is refused outright.
 
 ### `tls_allow_expired = true` on a connection — an expired certificate accepted indefinitely
 > **Connection-scoped**, like `cleartext_accepted` above: a parameter on one outbound connection —
