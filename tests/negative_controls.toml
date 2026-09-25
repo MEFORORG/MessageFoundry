@@ -521,6 +521,39 @@ green = [
 observed = "Each planted shape is reported and the real tree is clean, in this suite."
 
 [[control]]
+# BACKLOG #1164, owner decision 2026-09-24. The TypeScript/JavaScript and PowerShell operation arms,
+# run by ci.yml's own `crypto-operations` job. Fixture-only on both halves by design: the real-tree
+# verdict is the job's own report, not a pytest assertion.
+context = "crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)"
+plants = """
+An undocumented `createHash('md5')` in a TypeScript file, an undocumented `[MD5]::Create()` in a
+PowerShell script, an inventory row the tree no longer backs, and a walk that reaches zero files.
+Each must be reported.
+"""
+ci = "python scripts/security/crypto_inventory_check.py --non-python-operations"
+workflow = "ci.yml"
+red = [
+  "tests/test_crypto_inventory_scanner.py::test_a_planted_ts_operation_reds_the_non_python_arm",
+  "tests/test_crypto_inventory_scanner.py::test_a_planted_powershell_operation_reds_and_an_unbacked_row_is_stale",
+  "tests/test_crypto_inventory_scanner.py::test_the_non_python_arm_refuses_an_empty_walk_and_reports_stale_rows",
+  "tests/test_crypto_inventory_scanner.py::test_the_powershell_arm_refuses_an_empty_walk",
+]
+holds = """
+A comment or a help block that NAMES an operation is prose, not an operation, and must not be
+reported. A pattern gate that flagged its own documentation would be silenced by the first person
+it inconvenienced.
+"""
+green = [
+  "tests/test_crypto_inventory_scanner.py::test_a_comment_naming_an_operation_is_not_an_operation",
+  "tests/test_crypto_inventory_scanner.py::test_powershell_help_blocks_and_comments_are_not_operations",
+]
+observed = """
+2026-09-24, locally on Windows: all six node ids passed, so each planted shape was reported and
+neither prose shape was. The real-tree run of the job's command exited 0 over 117 TS/JS files and
+68 PowerShell files.
+"""
+
+[[control]]
 # RE-POINTED 2026-09-16 from `forbidden-content (customer/PHI leak guard)`, which branch protection no longer
 # requires. The scan itself did not move: `forbidden-content` still runs in security.yml AND as a
 # byte-identical copy inside this composite, which is the required context now. The `observed`
