@@ -112,8 +112,12 @@ _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 # BACKLOG #1139 (ASVS 6.3.7): while an account has no notification address and a notice channel is
 # wired (``Identity.must_set_notify_email``), only these routes stay reachable. Keyed on (METHOD,
 # path) for the reason the MFA set above is. /me/notify-email is the way out. The rest are the ways
-# out of the two gates that run first, so neither can deadlock behind this one: rotation, the factor
-# proof, and enrolment for an account that ``require_mfa`` covers but that has no factor yet.
+# out of the two gates that run first, so neither can deadlock behind this one.
+#
+# THE ``mfa_gate=False`` ROUTES ARE EXEMPT TOO, and they are not listed. Those are the reauth-only
+# factories (TOTP enrolment and confirm, session termination): the escapes an account under
+# ``require_mfa`` with no factor needs. Keying on the flag rather than on a copy of their paths is
+# what keeps this plane and the console's (which exempts every ``allow_mfa_pending`` route) the same.
 #
 # /me/notify-email is deliberately NOT in the MFA set above. A session still owing its factor has
 # proven only the password, and letting that caller choose where the account's notices go would hand
@@ -126,8 +130,6 @@ _NOTIFY_EMAIL_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/me/password"),
         ("POST", "/me/reauth"),
         ("GET", "/me/mfa"),
-        ("POST", "/me/mfa/enroll"),
-        ("POST", "/me/mfa/confirm"),
         ("POST", "/me/notify-email"),
     }
 )
@@ -395,7 +397,7 @@ def require(
         # BACKLOG #1139 (ASVS 6.3.7): an account with no notification address sets one first. BELOW
         # the factor gate, so a password-only session is sent to prove its factor before it can
         # choose where notices go. ABOVE the permission loop, for the oracle reason given there.
-        if identity.must_set_notify_email and route not in _NOTIFY_EMAIL_EXEMPT_ROUTES:
+        if identity.must_set_notify_email and mfa_gate and route not in _NOTIFY_EMAIL_EXEMPT_ROUTES:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 NOTIFY_EMAIL_REQUIRED_DETAIL,
@@ -986,8 +988,6 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
         return None
     if identity.must_change_password:
         return None  # a not-yet-rotated account is locked out of the WS too (mirrors require())
-    if identity.must_set_notify_email:
-        return None  # so is one that owes a notification address (BACKLOG #1139, mirrors require())
     # ASVS 6.3.3: an MFA-pending session does not stream either. No exempt set here — every WS route
     # is a data feed, none is part of the enroll/verify escape path. Audited for the same reason as
     # require(): the refusal sits above the permission loop, so nothing else would record it.
@@ -995,6 +995,10 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     # not tear down an established socket; the connection's own revalidation is the backstop.
     if not await auth.mfa_satisfied(ws_token(websocket)):
         await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
+        return None
+    # BACKLOG #1139: an account that owes a notification address does not stream either. BELOW the
+    # factor check, as in require(), so a password-only probe still leaves its auth.mfa_denied row.
+    if identity.must_set_notify_email:
         return None
     for permission in permissions:
         if not identity.has(permission):

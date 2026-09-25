@@ -609,6 +609,40 @@ async def test_removing_a_passkey_notifies_even_when_another_factor_remains() ->
         await store.close()
 
 
+async def test_a_racing_removal_of_the_other_passkey_does_not_claim_a_factor_remains() -> None:
+    """The notice names the state AFTER the delete, not the one the method read before it.
+
+    Two passkeys, and a concurrent caller removes the second one between this removal's read and its
+    own delete. The read saw one left, so the old choice sent "at least one other factor remains" to
+    an account that now has none. Simulated deterministically by removing the other row inside the
+    store's delete, which is exactly the window a real race lands in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = await _service(store, notifier=notifier)  # require_mfa off
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token, label="first key")
+        _, token = await _enroll(service, identity, token, label="second key")
+        creds = await store.list_webauthn_credentials(identity.user_id)
+        assert len(creds) == 2
+
+        real_delete = store.delete_webauthn_credential
+
+        async def racing_delete(user_id: str, credential_id_hash: str) -> bool:
+            await real_delete(user_id, creds[1].credential_id_hash)  # the other caller wins first
+            return await real_delete(user_id, credential_id_hash)
+
+        store.delete_webauthn_credential = racing_delete  # type: ignore[method-assign]
+        assert (
+            await service.delete_webauthn_credential(identity, creds[0].credential_id_hash) is True
+        )
+        assert await store.has_webauthn_credentials(identity.user_id) is False
+        assert [e for e in notifier.events if e.event_type == MFA_CREDENTIAL_REMOVED] == []
+        assert len([e for e in notifier.events if e.event_type == MFA_DISABLED]) == 1
+    finally:
+        await store.close()
+
+
 async def test_admin_reset_mfa_clears_webauthn_credentials() -> None:
     store = await MessageStore.open(":memory:")
     try:

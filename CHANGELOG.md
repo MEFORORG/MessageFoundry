@@ -77,13 +77,13 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **BREAKING: an account with no notification address must set one at sign-in, whenever this
   instance sends security notices.** A security notice goes to the account's engine-owned address,
   `users.notify_email`. An account without one was told nothing about a password reset or any other
-  change to how it signs in. Four paths create such an account: the first-run `admin` account, a user
+  change to how it signs in. At least four paths create such an account: the first-run `admin` account, a user
   created with no email, `provision-admin` without `--email`, and a directory sign-in where the
   directory returns no `mail`. Now, while `[auth].notify_security_events` is on and an `[alerts]` SMTP
   relay is configured, that account is confined at sign-in. The JSON API answers other routes with
   `403` `notification address required` and `X-Notify-Email-Required: 1`. The web console sends other
-  pages to `/ui/account/notify-address`. `POST /me/notify-email` sets the address. It only fills a
-  missing one and answers `409` when one is set, so an administrator still changes an existing
+  pages to `/ui/account/notify-address`. `POST /me/notify-email` sets the address, which must read as one
+  plain mailbox. It only fills a missing one and answers `409` when one is set, so an administrator still changes an existing
   address. It stays behind the second-factor gate, so a session that has proven only the password
   cannot choose the address. Setting it writes `auth.notify_email_set` and sends a `notify_email_set`
   notice to the new address. A site with no mail relay is not confined. **Who is confined:** every

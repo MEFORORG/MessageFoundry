@@ -1293,6 +1293,28 @@ async def test_missing_notifier_reports_the_drop_rather_than_swallowing_it(
         await store.close()
 
 
+async def test_a_deliberate_notices_off_setting_is_not_reported_as_a_drop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``[auth].notify_security_events = false`` is a documented choice, and the lifespan wires no
+    notifier for it. A warning per event there would report the setting working as a fault."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(notify_security_events=False))
+        await _local_user(store)
+        with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
+            await service.update_user(
+                "u1",
+                display_name=None,
+                email="repointed@example.net",
+                disabled=None,
+                actor="admin",
+            )
+        assert [r for r in caplog.records if r.name == _AUTH_LOGGER] == []
+    finally:
+        await store.close()
+
+
 async def test_notifier_fires_on_ad_driven_role_change() -> None:
     # WP-L3-05 follow-up (ASVS 6.3.7): a role change pushed from the directory on login notifies the
     # affected user out-of-band, just like the local set_roles() path — not only the local one.

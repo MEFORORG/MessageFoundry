@@ -309,12 +309,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         try:
             await service.fill_own_notify_email(identity, body.email, client=_client(request))
-        except NotifyEmailAlreadySet:
-            # Nothing to fill: the account is not confined, so there is nothing to do here.
-            return RedirectResponse("/ui/account", status_code=303)
+        except NotifyEmailAlreadySet as exc:
+            # Say so rather than redirect: a second tab that submitted a different address must not
+            # read a quiet redirect as its address having been saved.
+            return HTMLResponse(pages.notify_address_page(error=str(exc)), status_code=409)
         except ValueError:
             return HTMLResponse(
-                pages.notify_address_page(error="enter an email address"), status_code=400
+                pages.notify_address_page(
+                    error="enter one email address, such as name@example.org"
+                ),
+                status_code=400,
             )
         return RedirectResponse("/ui", status_code=303)
 

@@ -3,8 +3,8 @@
 """BACKLOG #1139 (ASVS 6.3.7): an account with no notification address sets one before anything else.
 
 The notifier drops a notice for an account with no ``notify_email``, so such an account is told
-nothing out of band about a change to its authentication details. Four paths give birth to one. This
-file drives each of them to the confinement, the way out of it, and the two conditions that keep the
+nothing out of band about a change to its authentication details. At least four paths give birth
+to one. This file drives the four known ones to the confinement, the way out of it, and the two conditions that keep the
 confinement from doing harm: it applies only while a notice channel is wired, and it never lets a
 session that still owes its second factor choose the address.
 """
@@ -179,8 +179,13 @@ async def test_filling_the_address_ends_it_audits_and_notifies_the_new_address()
         out = await service.login("bare", PW)
         assert out.identity is not None and out.identity.must_set_notify_email is True
 
-        with pytest.raises(ValueError):
-            await service.fill_own_notify_email(out.identity, "   ")
+        # Blank, not a mailbox at all, two mailboxes, and a display name: each refused, nothing
+        # written. The comma list would fan every later notice out to both addresses.
+        for bad in ("   ", "x", "a@b.org, c@d.org", "Ops <a@b.org>", "a b@c.org", "a@localhost"):
+            with pytest.raises(ValueError):
+                await service.fill_own_notify_email(out.identity, bad)
+        user = await store.get_user(out.identity.user_id)
+        assert user is not None and user.notify_email is None
         assert await service.fill_own_notify_email(out.identity, f"  {ADDRESS} ") is True
         assert await _flag_after_login(service, "bare") is False
         user = await store.get_user(out.identity.user_id)
@@ -252,9 +257,17 @@ async def test_the_api_confines_a_session_until_it_sets_an_address(engine: Engin
         # The way out and the harmless self-service reads stay reachable.
         assert (await c.get("/auth/me", headers=_auth(tok))).status_code == 200
         assert (await c.get("/me/mfa", headers=_auth(tok))).status_code == 200
+        # Ending one's own sessions is a factor-gate escape (mfa_gate=False), exempt here as it is on
+        # the console. Whatever else it answers, it is not the address refusal.
+        ended = await c.delete("/me/sessions", headers=_auth(tok))
+        assert ended.headers.get("X-Notify-Email-Required") is None, ended.text
 
         blank = await c.post("/me/notify-email", json={"email": " "}, headers=_auth(tok))
         assert blank.status_code == 400
+        two = await c.post(
+            "/me/notify-email", json={"email": "a@b.org, c@d.org"}, headers=_auth(tok)
+        )
+        assert two.status_code == 400
         ok = await c.post("/me/notify-email", json={"email": ADDRESS}, headers=_auth(tok))
         assert ok.status_code == 200, ok.text
         assert (await c.get("/users", headers=_auth(tok))).status_code == 200
@@ -372,6 +385,26 @@ async def test_the_websocket_refuses_a_confined_session(engine: Engine) -> None:
     assert allowed is not None and allowed.username == "bare"
 
 
+async def test_a_password_only_websocket_probe_is_still_audited(engine: Engine) -> None:
+    """The address refusal sits BELOW the factor check on the socket too.
+
+    ``require_mfa`` covers this Administrator, it has no factor and no address. A handshake with its
+    password-only token must be refused AND leave the ``auth.mfa_denied`` row, which is the trail a
+    stolen-password probe is meant to leave. Refusing on the address first would drop that row."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(login_rate_limit_enabled=False),  # require_mfa on, the default
+        security_notifier=_FakeNotifier(),
+    )
+    await service.initialize()
+    await _add_local(service, "adm")
+    out = await service.login("adm", PW)
+    assert out.token is not None and out.mfa_required is True
+    assert await authorize_ws(_FakeWS(service, out.token), Permission.MONITORING_READ) is None  # type: ignore[arg-type]
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "auth.mfa_denied"]
+    assert len(rows) == 1 and rows[0]["actor"] == "adm"
+
+
 # --- the three store backends ---------------------------------------------------------------------
 # The confinement reads `users.notify_email` and writes it through `set_user_notify_email`, both of
 # which each backend already carries. No backend gained a column. So the server legs prove the
@@ -417,10 +450,14 @@ async def test_the_confinement_holds_on_every_store_backend(backend_store: Any) 
     name = f"confine-{uuid4().hex[:12]}"
     user_id = uuid4().hex
     await backend_store.create_user(user_id=user_id, username=name, auth_provider="local")
-    identity = await service.identity_for_user_id(user_id)
-    assert identity is not None and identity.must_set_notify_email is True
-    assert await service.fill_own_notify_email(identity, ADDRESS) is True
-    after = await service.identity_for_user_id(user_id)
-    assert after is not None and after.must_set_notify_email is False
-    with pytest.raises(NotifyEmailAlreadySet):
-        await service.fill_own_notify_email(identity, "other@example.org")
+    try:
+        identity = await service.identity_for_user_id(user_id)
+        assert identity is not None and identity.must_set_notify_email is True
+        assert await service.fill_own_notify_email(identity, ADDRESS) is True
+        after = await service.identity_for_user_id(user_id)
+        assert after is not None and after.must_set_notify_email is False
+        with pytest.raises(NotifyEmailAlreadySet):
+            await service.fill_own_notify_email(identity, "other@example.org")
+    finally:
+        # The server databases outlive the run, so the row this test wrote goes with it.
+        await backend_store.delete_user(user_id)

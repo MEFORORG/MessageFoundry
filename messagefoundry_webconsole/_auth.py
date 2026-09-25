@@ -201,11 +201,11 @@ _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
 #: the in-flight OIDC flow cookie), and ``"storage"`` would wipe the deliberately-persistent, PHI-free
 #: ``mfcols:v2`` column preferences (14.3.3), which are not session state. Defense-in-depth against
 #: Back/bfcache resurrection of a terminated session's rendered PHI page.
-#: Where ``require_ui`` sends a session that owes a notification address (BACKLOG #1139).
-NOTIFY_ADDRESS_PAGE = "/ui/account/notify-address"
-
 CLEAR_SITE_DATA_HEADER = "Clear-Site-Data"
 CLEAR_SITE_DATA_VALUE = '"cache"'
+
+#: Where ``require_ui`` sends a session that owes a notification address (BACKLOG #1139).
+NOTIFY_ADDRESS_PAGE = "/ui/account/notify-address"
 
 
 def _login_redirect(note: str = "") -> HTTPException:
@@ -914,7 +914,7 @@ async def authorize_ui_ws(
     # activity=False (ASVS 14.3.1): app.js now re-opens this socket on a TIMER after a drop, and a
     # timer is not user activity. The page load that opened the first socket already counted.
     identity = await auth.identity_for_token(token, activity=False)
-    if identity is None or identity.must_change_password or identity.must_set_notify_email:
+    if identity is None or identity.must_change_password:
         return None, None
     # ASVS 6.3.3, mirroring authorize_ws on the header path: an MFA-pending session does not stream.
     # No exempt set — every /ui socket is a data feed, none is part of the enroll/verify escape path.
@@ -936,6 +936,10 @@ async def authorize_ui_ws(
         # Same shape as ``require_ui`` above and ``api/security.py``: the PATH, never the full URL,
         # because the query string is where an operator's search terms live.
         await auth.audit_mfa_denied(identity, websocket.url.path)
+        return None, None
+    # BACKLOG #1139: an account that owes a notification address does not stream. BELOW the factor
+    # check, as in ``require_ui``, so a password-only probe still leaves its ``auth.mfa_denied`` row.
+    if identity.must_set_notify_email:
         return None, None
     for permission in permissions:
         if not identity.has(permission):

@@ -405,6 +405,32 @@ class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
 
 
+# Characters that let one address field name more than one mailbox, or smuggle a display name or a
+# header, when ``send_plain_email`` joins the recipients into ``To``. Checked by hand, not by a regex.
+_ADDRESS_FORBIDDEN_CHARS = frozenset(',;<>"()[]:\\')
+
+
+def _is_single_mailbox(address: str) -> bool:
+    """Whether ``address`` reads as exactly one plain ``local@domain`` mailbox (BACKLOG #1139).
+
+    A shape check, not proof of delivery: nothing here can tell that the holder reads it. It exists so
+    the self-service fill cannot be satisfied by ``x``, and cannot fan every later notice out to two
+    mailboxes with ``a@b.org, c@d.org``. The address cannot be changed again without an administrator,
+    so a typo caught here is one the holder can still fix.
+    """
+    local, at, domain = address.partition("@")
+    return (
+        bool(at)
+        and bool(local)
+        and "@" not in domain
+        and "." in domain.strip(".")
+        and not domain.startswith(".")
+        and not domain.endswith(".")
+        and all(ch.isprintable() and not ch.isspace() for ch in address)
+        and not any(ch in _ADDRESS_FORBIDDEN_CHARS for ch in address)
+    )
+
+
 class NotifyEmailAlreadySet(RuntimeError):
     """:meth:`AuthService.fill_own_notify_email` declined: the account already has a different
     notification address. The self-service route only fills a missing one (BACKLOG #1139)."""
@@ -3393,7 +3419,7 @@ class AuthService:
 
         BACKLOG #1139 (ASVS 6.3.7). An account with no ``notify_email`` is told nothing out of band
         about a change to its authentication details, because the notifier drops a notice with no
-        address. Four paths give birth to such an account: the first-run bootstrap administrator,
+        address. At least four paths give birth to such an account: the first-run bootstrap administrator,
         ``create_local_user`` with no email, ``provision-admin`` with no ``--email``, and a directory
         sign-in whose directory returns no ``mail``. So the first sign-in sets one, in the shape of
         the ``must_change_password`` confinement.
@@ -3414,7 +3440,8 @@ class AuthService:
         """Set the caller's own notification address where it has none (BACKLOG #1139).
 
         This is the way out of the confinement :meth:`notify_email_required` describes. Returns
-        ``True`` when it wrote, ``False`` when the same address was already on file.
+        ``True`` when it wrote, ``False`` when the same address was already on file. The value must
+        read as one plain mailbox (:func:`_is_single_mailbox`).
 
         **IT FILLS A MISSING ADDRESS AND NOTHING ELSE**, like ``admin-set-notify-email``. Changing an
         existing one here would move where notices go without telling the old address, and a
@@ -3430,6 +3457,8 @@ class AuthService:
         same account can both pass it; the later write wins and both are audited.
         """
         address = require_notify_email(email)
+        if not _is_single_mailbox(address):
+            raise ValueError("enter one email address, such as name@example.org")
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such account")
@@ -4816,7 +4845,16 @@ class AuthService:
         # about the resulting state. MFA_DISABLED asserts the account has no second factor left;
         # emitting it while another passkey stands would be false, and consumers already read it as
         # that state change. The last-factor arm is therefore untouched.
-        if last_second_factor:
+        #
+        # WHICH ARM IS DECIDED BY A READ TAKEN AFTER THE DELETE, not by ``last_second_factor``. That
+        # flag comes from the read above, so two concurrent removals of an account's only two
+        # passkeys would each see one left and each send the "another factor remains" wording to an
+        # account that now has none. The flag still gates the refusal above, which is about intent.
+        after = await self._store.get_user(identity.user_id)
+        factor_remains = bool(
+            await self._store.list_webauthn_credentials(identity.user_id)
+        ) or bool(after is not None and after.totp_enabled)
+        if not factor_remains:
             await self._notify_security(
                 MFA_DISABLED,
                 username=user.username,
@@ -5468,6 +5506,12 @@ class AuthService:
             # instance.
             #
             # **Never ``detail``** — an EMAIL_CHANGED carries the new address in it.
+            #
+            # NOT when the operator turned notices off: ``[auth].notify_security_events = false`` is a
+            # documented choice, and the lifespan wires no notifier for it, so a warning per event
+            # there would report the setting working as a fault.
+            if not self._settings.notify_security_events:
+                return
             _log.warning(
                 "security notice %s for %s dropped: no security-event notifier is configured, so "
                 "the account was not told out of band (the /me/security-events feed still records "
