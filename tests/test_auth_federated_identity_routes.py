@@ -76,6 +76,36 @@ async def _audit(engine: Engine, action: str) -> list[dict[str, object]]:
     return [dict(a) for a in await engine.store.list_audit() if a["action"] == action]
 
 
+async def _audit_mark(engine: Engine) -> int:
+    """The newest audit row's id, or 0 on an empty log. Rows after it are the ones written since."""
+    newest = await engine.store.list_audit(limit=1)
+    return int(newest[0]["id"]) if newest else 0
+
+
+async def _federated_rows_since(engine: Engine, mark: int) -> list[dict[str, object]]:
+    """Every ``auth.federated_subject_*`` audit row written after ``mark``, selected by id.
+
+    By id rather than by position: ``list_audit`` returns NEWEST FIRST, so a slice past the old
+    length picks the OLDEST rows. That slice passed only while the bootstrap admin's rows were the
+    oldest; once #1526 retired that account, the setup bind became the oldest row and the slice
+    reported it as written by the refusal."""
+    rows = await engine.store.list_audit(limit=100_000)
+    return [
+        dict(a)
+        for a in rows
+        if int(a["id"]) > mark and str(a["action"]).startswith("auth.federated_subject_")
+    ]
+
+
+async def _pairs(engine: Engine, *user_ids: str) -> dict[str, tuple[str | None, str | None]]:
+    """Each account's stored ``(issuer, sub)``; an absent account reads as unbound."""
+    out: dict[str, tuple[str | None, str | None]] = {}
+    for user_id in user_ids:
+        user = await engine.store.get_user(user_id)
+        out[user_id] = (None, None) if user is None else (user.oidc_issuer, user.oidc_subject)
+    return out
+
+
 async def test_bind_refuses_without_a_grant_bound_to_this_action(
     engine: Engine,
 ) -> None:
@@ -213,6 +243,7 @@ async def test_bind_refusals(
     the pair already held would otherwise sign the account out for nothing."""
     service = await _service(engine)
     target = await _ad_account(engine)
+    holder = target
     subject = "S-1-a"
     if case == "unknown user":
         target = ABSENT_USER_ID
@@ -237,18 +268,41 @@ async def test_bind_refusals(
     async with _client(engine, service) as c:
         tok = await _admin(c, service)
         _r, tok = await _reauth(c, tok, purpose=ACTION)
-        rows_before = len(await engine.store.list_audit())
+        mark = await _audit_mark(engine)
+        pairs_before = await _pairs(engine, target, holder)
         r = await c.put(
             f"/users/{target}/federated-identity", json={"subject": subject}, headers=_auth(tok)
         )
     assert r.status_code == status, r.text
     assert fragment in r.json()["detail"]
-    written = [
-        a
-        for a in (await engine.store.list_audit())[rows_before:]
-        if str(a["action"]).startswith("auth.federated_subject_")
-    ]
+    assert await _pairs(engine, target, holder) == pairs_before, "a refused bind moved a binding"
+    written = await _federated_rows_since(engine, mark)
     assert written == [], f"a refused bind wrote {written!r}"
+
+
+async def test_the_refusal_checks_catch_a_bind_written_after_the_mark(engine: Engine) -> None:
+    """CONTROL for ``test_bind_refusals``: its two checks fire on a planted bind, and ignore one
+    written before the mark.
+
+    The older bind is what the position slice misread once #1526 retired the bootstrap admin: it is
+    the oldest row in the log, and ``list_audit`` returns newest first."""
+    service = await _service(engine)
+    older = await _ad_account(engine, "bsmith")
+    target = await _ad_account(engine)
+    await service.bind_federated_subject(older, "S-1-a", actor="setup")
+
+    mark = await _audit_mark(engine)
+    pairs_before = await _pairs(engine, target, older)
+    assert await _federated_rows_since(engine, mark) == [], "a row from before the mark was counted"
+
+    # PLANTED: the write a defective refusal would make.
+    await service.bind_federated_subject(target, "S-1-b", actor="planted")
+
+    assert await _pairs(engine, target, older) != pairs_before, "the pair check missed a bind"
+    written = await _federated_rows_since(engine, mark)
+    assert [(a["action"], a["actor"]) for a in written] == [
+        ("auth.federated_subject_bound", "planted")
+    ], "the audit check missed a bind"
 
 
 async def test_bind_refuses_when_no_issuer_is_configured(engine: Engine) -> None:
