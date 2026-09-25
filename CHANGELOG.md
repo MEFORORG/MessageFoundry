@@ -43,6 +43,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   generated connection name that would fail it. **Migration:** rename such connections to fit the pattern;
   stored history stays under the old name. ([BACKLOG #1107](docs/BACKLOG.md))
 ### Fixed
+- **On Windows, the service account and the operator who runs `provision-admin` can now each open
+  the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
+  `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other
+  out. A provisioned store stopped the service starting, and a store the service created refused
+  `provision-admin`. In a data directory hardened the way `install-service.ps1` leaves it, each open
+  now writes one protected ACL on those files naming SYSTEM, Administrators and the one service
+  account. It is the same whoever opens, and it reaches every member of Administrators whose token
+  carries the group enabled, not only the operator who provisioned. `install-service.ps1` now also
+  makes Administrators the owner of the data directory, because the engine requires that. Outside a
+  hardened directory, the old owner-only behaviour is unchanged. What this widens and narrows is
+  stated in the ADR 0163 note of 2026-09-24; the measurement is ADR 0183 Wave 0 and 0b.
+  (`BACKLOG #1136`)
 - **The DICOM C-STORE SCP no longer answers Success for an object the engine does not accept.**
   The SCP's `max_object_bytes` defaults to 128 MiB, but the engine's binary ingress records any
   object over 16 MiB as `ERROR` and never processes it. So an object between 16 and 128 MiB was
