@@ -656,10 +656,13 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
     risk = named["tls_revocation_attested"]
     assert "OB_PARTNER" in risk and "inbound:IB_LAB" in risk
     assert "2 connection(s)" in risk
-    # BOTH halves. The engine does not check revocation on these hops, and the chain is still verified,
-    # so this is not verify-off. Either half alone would mislead an operator weighing the attestation.
+    # BOTH halves: the refusal it lifts, and the cleartext/verify-off refusals it never lifts. Either
+    # half alone would mislead an operator weighing the attestation.
     assert "revocation" in risk and "outside the engine" in risk
-    assert "still verified" in risk
+    assert "never lifts a cleartext or verify-off refusal" in risk
+    # It must NOT claim a verified chain: authoring checks only the flag/reason pair, so an attested
+    # hop may verify nothing, and a mitigation resting on that premise would be false (SDS-3.7).
+    assert "chain" not in risk
 
 
 def test_revocation_attested_hops_walks_all_three_tables() -> None:

@@ -258,6 +258,7 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
         ConnectionSpec,
         Database,
         Registry,
+        build_inbound_connection,
         build_outbound_connection,
     )
 
@@ -297,16 +298,35 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
             tls_revocation_attested_reason="partner PKI runs OCSP at the edge",
         )
     )
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_MTLS",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={
+                    "port": 15099,
+                    "tls": True,
+                    "tls_cert_file": "c.pem",
+                    "tls_key_file": "k.pem",
+                    "tls_ca_file": "ca.pem",
+                },
+            ),
+            router="r",
+            tls_revocation_attested=True,
+            tls_revocation_attested_reason="site CA publishes a CRL the edge enforces",
+        )
+    )
     engine.add_registry(reg)
     switches = {e["switch"]: e["risk"] for e in _loosenings(await _posture(engine))}
     assert "OB_BRIDGE" in switches["tls_allow_expired"]
     assert "OB_PG_RESULTS" in switches["generic_odbc_tls_unenforced"]
     assert "OB_ATTESTED" in switches["tls_revocation_attested"]
+    assert "inbound:IB_MTLS" in switches["tls_revocation_attested"]
 
 
-async def test_posture_route_scope_names_all_three_connection_deviations(engine: Engine) -> None:
-    """With no graph the route cannot see ANY per-connection declaration, and the marker must name all
-    three. Naming only ``cleartext_accepted`` made the DECLARED scope itself incomplete — the same
+async def test_posture_route_scope_names_every_connection_deviation(engine: Engine) -> None:
+    """With no graph the route cannot see ANY per-connection declaration, and the marker must name
+    each of them. Naming only ``cleartext_accepted`` made the DECLARED scope itself incomplete — the same
     defect one level up from the one this item fixes."""
     scope = str((await _posture(engine))["loosenings_scope"])
     assert "cleartext_accepted" in scope

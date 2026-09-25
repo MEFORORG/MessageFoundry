@@ -4550,8 +4550,9 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     different sets. Sorted by name for a stable, diffable list.
 
     The attestation says a revocation-checking PKI covers the hop OUTSIDE the engine, so the posture-
-    keyed revocation refusal does not fire there. That suppression is audited with the reason at each
-    construction where it happens, and a log line is not the surface anyone queries later -- this is.
+    keyed revocation refusal is lifted wherever it would apply there. That suppression is logged as a
+    WARNING with the reason where it happens, and a log line is not the surface anyone queries later
+    -- this is. It lists what is DECLARED, not only hops where a refusal was actually lifted.
 
     It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
     ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and

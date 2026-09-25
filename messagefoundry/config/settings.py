@@ -5600,18 +5600,19 @@ def security_loosenings(
         )
     if revocation_attested_hops:
         named = ", ".join(sorted(revocation_attested_hops))
-        # BOTH halves, for the reason tls_allow_expired gives above: the engine skips ONE check here
-        # (revocation), and the certificate chain is still verified. Saying only the risk would read
-        # as verify-off; saying only the mitigation would hide that the whole revocation control now
-        # rests on a PKI the engine never sees. Hostname and expiry are deliberately not claimed: an
-        # inbound mTLS listener checks no client hostname, and tls_allow_expired can relax expiry.
+        # BOTH halves, for the reason tls_allow_expired gives above, and each stated only as far as
+        # it is true. The attestation relaxes ONE refusal (revocation) wherever it would apply; it
+        # does not claim the hop verifies a chain, because authoring checks only the flag/reason
+        # pair and cannot know the hop's TLS shape. What it cannot do is reach a cleartext or
+        # verify-off hop, whose own refusals it never lifts -- that is the true mitigation.
         out.append(
             (
                 "tls_revocation_attested",
                 f"{len(revocation_attested_hops)} connection(s) attest that certificate revocation "
-                f"is checked outside the engine ({named}) — the posture-keyed revocation refusal does "
-                "not fire on those hops, so a revoked certificate is caught only if that external PKI "
-                "control works; the certificate chain is still verified by the engine",
+                f"is checked outside the engine ({named}) — wherever the posture-keyed revocation "
+                "refusal would apply to those hops it is lifted, so a revoked certificate is caught "
+                "only if that external PKI control works; the attestation never lifts a cleartext "
+                "or verify-off refusal",
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like
