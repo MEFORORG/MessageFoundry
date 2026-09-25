@@ -686,19 +686,25 @@ def time_reload(client: EngineClient, config_dir: str | None) -> float | None:
     return time_reload_outcome(client, config_dir)[0]
 
 
-def time_reload_outcome(client: EngineClient, config_dir: str | None) -> tuple[float | None, bool]:
-    """:func:`time_reload`, plus whether dual-control HELD the reload.
+#: The HTTP statuses with which the engine REFUSES a reload before touching anything: a directory
+#: outside the allowed reload roots (403), one that does not exist (404), a config that does not
+#: validate (422). A refused reload swapped no graph and closed no connection (BACKLOG #1292).
+RELOAD_REFUSED_STATUSES = frozenset({403, 404, 422})
 
-    The two ``None`` cases mean different things to a caller that cares about the connections. A
-    held reload swapped nothing and closed nothing. An errored one may have swapped: the client's
-    5 s timeout raises ``ApiError`` while the engine is still stopping and restarting every
-    listener, which is the slow reload BACKLOG #1292 is about. So ``held`` is reported, not folded
-    into the ``None``."""
+
+def time_reload_outcome(client: EngineClient, config_dir: str | None) -> tuple[float | None, bool]:
+    """:func:`time_reload`, plus whether the reload certainly CLOSED NOTHING.
+
+    That is true when dual-control HELD the reload, or when the engine REFUSED it with a status in
+    :data:`RELOAD_REFUSED_STATUSES`. Either way no graph was swapped and every connection is still
+    up. Any other failure may have swapped: the client's 5 s timeout raises ``ApiError`` while the
+    engine is still stopping and restarting every listener, which is the slow reload BACKLOG #1292 is
+    about. So the flag is reported, not folded into the ``None`` reading."""
     t0 = time.perf_counter()
     try:
         result = client.reload_config(config_dir)
-    except ApiError:
-        return None, False
+    except ApiError as exc:
+        return None, exc.status in RELOAD_REFUSED_STATUSES
     if isinstance(result, PendingApprovalResponse):
         # Dual-control held the reload (ASVS 2.3.5): no graph was swapped, so the elapsed time is
         # the cost of parking an approval, not the O(connections) reload this wall measures. Report

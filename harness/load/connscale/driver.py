@@ -75,10 +75,14 @@ class ConnScaleDriver:
                 expect_ack=True,
                 queue_max=queue_max,
                 ledger=ledger,
+                on_strand=self._on_strand,
             )
             for i in range(count)
         ]
         self._rr = 0  # round-robin cursor across connections
+        # The send times of the sends a close left unconfirmed, collected only while a caller is
+        # watching (the reload probe's window, BACKLOG #1292). None when nobody is.
+        self._strand_log: list[int] | None = None
 
     @property
     def count(self) -> int:
@@ -145,6 +149,27 @@ class ConnScaleDriver:
         Unlike the ``sent`` counter it moves at emit time, so it counts a send still queued behind a
         reconnect."""
         return self._rr
+
+    @property
+    def slowest_ack_s(self) -> float:
+        """The longest send-to-ACK time this step has recorded so far, in seconds. 0.0 before the
+        first ACK."""
+        return self._m.ack.max / 1e9
+
+    def _on_strand(self, send_ns: int) -> None:
+        if self._strand_log is not None:
+            self._strand_log.append(send_ns)
+
+    def watch_strands(self) -> None:
+        """Start collecting the send time of every send a close leaves unconfirmed."""
+        self._strand_log = []
+
+    def end_strand_watch(self) -> list[int]:
+        """Stop collecting, and return the send times (``perf_counter_ns``) collected since
+        :meth:`watch_strands`. One entry per send, so its length is how far ``timeouts`` moved."""
+        log = self._strand_log if self._strand_log is not None else []
+        self._strand_log = None
+        return log
 
     def generations(self) -> list[int]:
         """Each connection's open count, in port order. Snapshot it before an event that closes the

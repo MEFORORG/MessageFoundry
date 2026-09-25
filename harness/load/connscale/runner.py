@@ -66,6 +66,7 @@ from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.sender import _BACKOFF_MAX
 from harness.load.sink import CorrelationSink
 
 # The engine-side env gate for the executor boot-shim (messagefoundry.pipeline.connscale_shim.SHIM_ENV).
@@ -98,8 +99,21 @@ _SETTLE = 0.5  # let final ACKs/arrivals settle before the truly-final engine sa
 #: doubles up to `harness.load.sender._BACKOFF_MAX` (5 s), so a connection can sleep that long
 #: after the engine listens again. Twice that leaves room for the listeners still coming up when the
 #: request gave up (the client's own timeout is 5 s) and one full backoff sleep after. It is spent in
-#: full only when a connection never returns, and that fails the step.
+#: full only when a connection never returns, and that fails the step. It is the FLOOR of the wait:
+#: see `_reconnect_timeout`, which scales it with N and with the measured reload.
 _RECONNECT_TIMEOUT = 10.0
+#: The reconnect wait each connection adds, so the wait grows with N. The engine stops and restarts
+#: one listener per connection and each client then reconnects on its own backoff, so the time to
+#: bring every connection back is O(N). A fixed 10 s could fail N=1500 on the operator rig. At 20 ms
+#: a connection the floor still governs up to N=500, and N=1500 gets 30 s.
+_RECONNECT_PER_CONNECTION_S = 0.02
+#: How long before the reload request a send may have been written and still be excused as the
+#: reload's when the close strands it (BACKLOG #1292). A send already in flight when the request goes
+#: out legitimately has no ACK yet only if it was written within about one ACK time of it. So the
+#: window reaches back by the slowest ACK the step has seen, never less than this floor and never
+#: more than `_STOP_GRACE`, which is the longest the step itself waits for an in-flight ACK. A send
+#: older than that which still has no ACK is a no-ACK fault, and the budget judges it.
+_RELOAD_LOOKBACK_FLOOR_S = 0.25
 #: The least offered time a step keeps AFTER every connection is back from the reload probe, as a
 #: fraction of `hold_seconds`. The probe fires at half the hold, so a quick reload leaves about half
 #: a hold behind it and this adds nothing. A slow one used to leave none: the step then had no send
@@ -1097,8 +1111,9 @@ async def _probe_loop(
 
 
 async def _time_reload(poller: EnginePoller) -> tuple[float | None, bool]:
-    """Wall #5's reading, and whether dual-control HELD the reload (see `time_reload_outcome`).
-    With no client there was no request, so nothing was swapped: reported as held."""
+    """Wall #5's reading, and whether the reload certainly closed nothing: dual-control held it, or
+    the engine refused it (see `time_reload_outcome`). With no client there was no request, so
+    nothing was closed."""
     client = poller.client
     if client is None:
         return None, True
@@ -1122,9 +1137,15 @@ class _ReloadAccount:
     when they all closed at once. The reconcile charged the gap to the engine as "lost N on intake",
     while the per-message audit found every accept-ACKed send in the store.
 
-    `stranded` counts the `timeouts` that moved from the moment the probe fired until every
-    connection was back. Nothing else closes a connection mid-hold, so those are the reload's.
-    `after` is a counter snapshot taken at that same moment, so the reconcile can ask whether the
+    THE WINDOW. `stranded` counts the sends a close left unconfirmed while the probe was watching
+    (from the request until every connection was back) AND whose send time falls inside the reload
+    window: from `lookback_s` before the request until every connection was back. Nothing else closes
+    a connection mid-hold, so those are the reload's. `aged` counts the rest of what the watch saw:
+    sends the close found still unACKed after waiting longer than any ACK the step had seen. The
+    reload did not cause that wait, so they are NOT excused and the budget judges them. Excusing
+    them let a reproduced no-ACK fault, 28 of 36 sends unconfirmed, pass as reload stranding.
+
+    `after` is a counter snapshot taken when every connection was back, so the reconcile can ask whether the
     engine did any work AFTER the reload: `sent - after.sent` and the replies likewise. A reply
     counted after the snapshot can answer a send made just before it, but only on a socket opened
     after the reload, since the reload's close already settled every send older than that. So it is
@@ -1132,11 +1153,16 @@ class _ReloadAccount:
     """
 
     seconds: float | None  # wall #5, as `_time_reload` returned it
-    stranded: int
+    stranded: int  # sends made inside the window that the reload's close left unconfirmed; excused
     not_reconnected: int  # connections still down when the wait gave up; 0 means all came back
     extra_hold_s: float  # offered time added after the hold, so traffic follows the reload
     after: Counters
-    held: bool = False  # dual-control held the reload, so nothing was swapped or closed
+    # The reload was held by dual-control or refused (403/404/422), so nothing was swapped or
+    # closed. Nothing was waited for, and nothing is excused as stranded.
+    closed_nothing: bool = False
+    aged: int = 0  # sends the close stranded that were made BEFORE the window; not excused
+    lookback_s: float = _RELOAD_LOOKBACK_FLOOR_S  # how far before the request the window opened
+    reconnect_timeout_s: float = _RECONNECT_TIMEOUT  # the reconnect wait this step allowed
 
     def sent_after(self, final: Counters) -> int:
         return final.sent - self.after.sent
@@ -1159,9 +1185,10 @@ async def _reload_mid_hold(
 
     Three steps, in order:
 
-    1. Snapshot `timeouts` and each connection's open count, then fire the reload.
-    2. Wait until every connection is serving a NEW socket. The `timeouts` that moved in between
-       are the sends the reload stranded.
+    1. Snapshot each connection's open count, start watching strands, then fire the reload.
+    2. Wait until every connection is serving a NEW socket, for `_reconnect_timeout`. Of the sends
+       a close left unconfirmed in between, those written after the window opened are the ones the
+       reload stranded (see `_ReloadAccount`).
     3. Let the hold finish. Then offer more if the hold left less than `_POST_RELOAD_HOLD_FRACTION`
        of itself after the connections came back, or if it offered no send at all after that
        point. Without this a slow reload leaves the step with no send it did not strand, and
@@ -1169,8 +1196,9 @@ async def _reload_mid_hold(
 
     The wait runs whenever the reload may have swapped, which includes a reload that returned no
     reading: the client gives up after 5 s while the engine is still restarting its listeners, and
-    that slow reload is the case this exists for. Only a reload dual-control HELD skips it, since
-    nothing was closed and the wait would spend its whole timeout on connections that never dropped.
+    that slow reload is the case this exists for. Only a reload dual-control HELD, or the engine
+    REFUSED, skips it: nothing was closed, and the wait would spend its whole timeout on connections
+    that never dropped and then fail the step as "never came back".
 
     `hold_task` is cancelled if anything here raises, so a failed probe cannot leave the token
     bucket emitting into a driver the step is tearing down.
@@ -1178,15 +1206,20 @@ async def _reload_mid_hold(
     loop = asyncio.get_running_loop()
     try:
         await asyncio.sleep(hold_seconds * 0.5)
-        timeouts_before = counters.timeouts
         generations = driver.generations()
-        seconds, held = await reload()
-        not_reconnected = 0
-        if not held:
-            not_reconnected = await driver.await_reconnected(
-                generations, timeout=_RECONNECT_TIMEOUT
-            )
-        stranded = counters.timeouts - timeouts_before
+        lookback = _reload_lookback(driver.slowest_ack_s)
+        window_opens_ns = time.perf_counter_ns() - int(lookback * 1e9)
+        driver.watch_strands()
+        try:
+            seconds, closed_nothing = await reload()
+            not_reconnected = 0
+            timeout = _reconnect_timeout(driver.count, seconds)
+            if not closed_nothing:
+                not_reconnected = await driver.await_reconnected(generations, timeout=timeout)
+        finally:
+            strand_sends = driver.end_strand_watch()
+        stranded = 0 if closed_nothing else sum(1 for ns in strand_sends if ns >= window_opens_ns)
+        aged = 0 if closed_nothing else len(strand_sends) - stranded
         after = counters.snapshot()
         back_at = loop.time()
         emitted_at_back = driver.emitted
@@ -1202,7 +1235,41 @@ async def _reload_mid_hold(
         extra = floor
     if extra > 0.0:
         await run_hold(extra)
-    return _ReloadAccount(seconds, stranded, not_reconnected, extra, after, held)
+    return _ReloadAccount(
+        seconds,
+        stranded,
+        not_reconnected,
+        extra,
+        after,
+        closed_nothing=closed_nothing,
+        aged=aged,
+        lookback_s=lookback,
+        reconnect_timeout_s=timeout,
+    )
+
+
+def _reload_lookback(slowest_ack_s: float) -> float:
+    """How far before the reload request the stranding window opens, in seconds.
+
+    ``min(_STOP_GRACE, max(_RELOAD_LOOKBACK_FLOOR_S, slowest_ack_s))``: the slowest ACK the step has
+    recorded, floored so a fast host still covers a send written just before the request, and capped
+    at the step's own ACK wait so one pathological ACK cannot excuse the whole hold.
+    """
+    return min(_STOP_GRACE, max(_RELOAD_LOOKBACK_FLOOR_S, slowest_ack_s))
+
+
+def _reconnect_timeout(count: int, reload_seconds: float | None) -> float:
+    """How long the reload probe waits for every connection to come back, in seconds.
+
+    ``max(_RECONNECT_TIMEOUT, count * _RECONNECT_PER_CONNECTION_S, 2 * reload_seconds + 5.0)``:
+    10 s at least, 20 ms a connection above N=500, and never less than twice the measured reload
+    plus one full reconnect backoff (`harness.load.sender._BACKOFF_MAX`, 5 s) when the reload
+    returned a reading. The wait is spent in full only when a connection never returns.
+    """
+    scaled = max(_RECONNECT_TIMEOUT, count * _RECONNECT_PER_CONNECTION_S)
+    if reload_seconds is not None:
+        scaled = max(scaled, 2.0 * reload_seconds + _BACKOFF_MAX)
+    return scaled
 
 
 def _build_record(
@@ -1338,7 +1405,8 @@ def _build_record(
         # not. `stranded` is clamped exactly as `_excusal` clamps it, so the record and the detail
         # text can never disagree about the count.
         reload_stranded=(None if ra is None else max(0, min(ra.stranded, c.timeouts, c.sent))),
-        reload_not_reconnected=None if ra is None else ra.not_reconnected,
+        # None, not 0, when nothing was closed: the wait did not run, so there is no reading.
+        reload_not_reconnected=None if ra is None or ra.closed_nothing else ra.not_reconnected,
         post_reload_extra_hold_s=None if ra is None else ra.extra_hold_s,
     )
 
@@ -1548,7 +1616,8 @@ def _reconcile(
         parts.append(f"backlog {backlog} not drained")
     if not_back and reload is not None:
         parts.append(
-            f"{reload.not_reconnected} connection(s) never came back {_RECONNECT_TIMEOUT:g}s after "
+            f"{reload.not_reconnected} connection(s) never came back "
+            f"{reload.reconnect_timeout_s:g}s after "
             f"the reload probe -- sends routed to them were never written, so the counts cannot "
             f"see them"
         )
@@ -1584,6 +1653,11 @@ def _reconcile(
         parts.append(
             f"{stranded} send(s) stranded by the reload probe, which closes every connection -- "
             f"never ACKed, so excused and not counted as loss"
+        )
+    if reload is not None and reload.aged:
+        parts.append(
+            f"{reload.aged} send(s) the reload's close found already waiting more than "
+            f"{reload.lookback_s:.3g}s for an ACK -- not excused as stranding, counted as unconfirmed"
         )
     detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
     return NoLoss(ok, sent, read, written, sink_received, backlog, detail)

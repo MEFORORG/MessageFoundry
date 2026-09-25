@@ -68,6 +68,7 @@ class PersistentConnection:
         queue_max: int = 1000,
         tracker: FailoverTracker | None = None,
         ledger: IntakeLedger | None = None,
+        on_strand: Callable[[int], None] | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -97,6 +98,10 @@ class PersistentConnection:
         # reload probe, BACKLOG #1292) can wait until the connection is back rather than guess.
         self._generation = 0
         self._up = False  # True from a successful open until that socket's serve loop ends
+        # Called with the SEND time (perf_counter_ns) of each send a close left unconfirmed, so the
+        # connscale reload probe can tell a send made inside its window from one that had already
+        # waited too long for an ACK (BACKLOG #1292). None by default: the hot path is unchanged.
+        self._on_strand = on_strand
 
     # --- public API ----------------------------------------------------------
 
@@ -265,8 +270,10 @@ class PersistentConnection:
         """On disconnect, count outstanding (sent, no ACK seen) as timeouts and release their slots."""
         if not self._inflight:
             return
-        for _seq, _send_ns, _cid, on_done in self._inflight:
+        for _seq, send_ns, _cid, on_done in self._inflight:
             self._m.counters.timeouts += 1
+            if self._on_strand is not None:
+                self._on_strand(send_ns)
             if self._ledger is not None:
                 self._ledger.record_unconfirmed(_cid, _seq)
             if on_done is not None:
