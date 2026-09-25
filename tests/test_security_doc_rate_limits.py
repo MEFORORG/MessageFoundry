@@ -1416,7 +1416,8 @@ def test_reauth_surface_feeds_the_lockout_and_the_doc_says_so() -> None:
     reproof = named_func(source, "_reproof_serialized")
     assert calls_to(reproof, {"_register_failure"})
     assert calls_to(reproof, {"_live_lock"}), "a failure during a live lock must not extend it"
-    assert calls_to(reproof, {"revoke_session"}), "the per-session cap no longer revokes"
+    assert calls_to(reproof, {"_revoke_for_budget"}), "the per-session cap no longer revokes"
+    assert calls_to(named_func(source, "_revoke_for_budget"), {"revoke_session"})
     block = " ".join(_section(_H_BRUTE).split())
     assert "bounded by a per-session cap" in block, (
         "the SEC-024 caveat must state how POST /me/reauth and POST /me/password are bounded."
