@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import textwrap
 import typing
 from collections.abc import Callable
 from pathlib import Path
@@ -32,7 +33,7 @@ from messagefoundry.api import security as api_security
 from messagefoundry.api.security import _PHI_VIEW_PERMISSIONS, require_service_cert
 from messagefoundry.auth.permissions import Permission, Role
 from messagefoundry.auth.policy import PasswordPolicy
-from messagefoundry.auth.service import AuthProvider, AuthService
+from messagefoundry.auth.service import AuthProvider, AuthService, _directory_login_refusal
 from messagefoundry.config.settings import ApiSettings, AuthSettings
 from messagefoundry.config.wiring import Http
 
@@ -436,9 +437,11 @@ def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> N
     """6.1.3 asks whether the strongest pathway is undermined by the weakest.
 
     ``[auth].login_rate_limit_enabled = false`` builds no ``_login_limiter``, so ``allow_login_attempt``
-    returns True unconditionally: the AD, Kerberos and OIDC rows lose their ONLY engine-side control,
-    while Local keeps a lockout the 6.1.1 table records as having no dedicated off switch. Stating the
-    limiter unconditionally overstates the directory pathways' floor.
+    returns True unconditionally, and ``_reauth_limiter`` goes with it. The Kerberos ticket leg and the
+    OIDC federated leg lose their ONLY engine-side control; the AD step-up bind loses its per-actor
+    budget and keeps the lockout feed and per-session cap (BACKLOG #1138); Local keeps a lockout the
+    6.1.1 table records as having no dedicated off switch. Stating the limiter unconditionally
+    overstates the directory pathways' floor.
     """
     assert AuthSettings.model_fields["login_rate_limit_enabled"].default is True, (
         "login_rate_limit_enabled no longer defaults on; restate the comparative-strength rows."
@@ -448,14 +451,102 @@ def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> N
         row = next(r for r in _primary_table()[1:] if r[0].startswith(prefix))
         assert token in row[2], (
             f"the {prefix} row's Brute-force-defense cell states the sign-in window without naming "
-            f"`[auth].{token}` — the one flag that removes it entirely, leaving that pathway with no "
-            "engine-side control at all."
+            f"`[auth].{token}` — the one flag that removes it and the per-actor budget together."
         )
     block = _section()
     paragraph = block[block.index("ASVS 6.1.3") :]
     assert token in paragraph, (
-        "the ASVS 6.1.3 paragraph must name the switch that flattens three of the six pathways to "
-        "directory-only defense — that is the comparative-strength answer the requirement wants."
+        "the ASVS 6.1.3 paragraph must name the switch that strips three of the six pathways of "
+        "their engine-side throttles — that is the comparative-strength answer the requirement wants."
+    )
+
+
+def _reads_auth_provider(func: Callable[..., Any]) -> bool:
+    """True when ``func``'s body reads ``.auth_provider``. Docstrings are constants, so they never match."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    return any(isinstance(n, ast.Attribute) and n.attr == "auth_provider" for n in ast.walk(tree))
+
+
+def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> None:
+    """ASVS 6.1.3 fell to partial (BACKLOG #1133) on three self-contradictions in this section.
+
+    Two drew the directory pathways weaker than the code: the Local row claimed it was the only
+    pathway the engine can lock out and the only one with a phishing-resistant factor. The code has
+    no provider filter on the TOTP leg or on passkey enrolment, and a locked row refuses a directory
+    sign-in (BACKLOG #1144, #1638). The third said the AD step-up bind keeps its per-actor budget
+    with the rate-limit flag off; that flag builds neither limiter, which
+    ``tests/test_security_doc_rate_limits.py::test_one_flag_disables_both_limiters`` derives from the
+    constructor, so it is not re-derived here. The other premises are, so a code change that makes
+    an old sentence true again reds this test instead of passing it. A provider check added at the
+    ROUTE layer would slip past this AST read; the service methods are what it covers.
+    """
+    for func in (
+        AuthService.verify_mfa,
+        AuthService.begin_mfa_enrollment,
+        AuthService.confirm_mfa_enrollment,
+        AuthService.begin_webauthn_registration,
+        AuthService.finish_webauthn_registration,
+    ):
+        assert not _reads_auth_provider(func), (
+            f"{func.__qualname__} now reads auth_provider. The pathway rows say a directory account "
+            "can enrol TOTP or a passkey and that its TOTP leg feeds the lockout; re-derive both."
+        )
+    verify_tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService.verify_mfa)))
+    assert any(
+        isinstance(n, ast.Attribute) and n.attr == "_register_failure"
+        for n in ast.walk(verify_tree)
+    ), "verify_mfa no longer feeds the lockout; the rows say a wrong TOTP code does."
+    locked = SimpleNamespace(disabled=False, locked_until=float("inf"))
+    assert _directory_login_refusal(locked, 0.0) == "locked", (  # type: ignore[arg-type]
+        "a directory sign-in no longer refuses a locked row; the Kerberos and OIDC rows say it does."
+    )
+    for sign_in_path in (AuthService._complete_ad_login, AuthService._upsert_ad_user):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(sign_in_path)))
+        assert any(
+            isinstance(n, ast.Name) and n.id == "_directory_login_refusal" for n in ast.walk(tree)
+        ), f"{sign_in_path.__qualname__} no longer checks a locked row; re-derive the rows."
+    # ...and both directory sign-ins still reach that check.
+    for entry in (AuthService._authenticate_kerberos, AuthService.authenticate_oidc):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(entry)))
+        assert any(
+            isinstance(n, ast.Attribute) and n.attr == "_complete_ad_login" for n in ast.walk(tree)
+        ), f"{entry.__qualname__} no longer routes through _complete_ad_login; re-derive the rows."
+
+    text = _doc_text()
+    # The first and fifth phrases are main's pre-BACKLOG #1138 wording; the rest were on this
+    # branch's base. All five are false against the code above.
+    for retired in (
+        "the only pathway the engine itself can lock out",
+        "the only pathway whose sign-in feeds the engine lockout",
+        "the only one with a phishing-resistant factor",
+        "no longer strips this pathway bare",
+        "the AD step-up bind keeps its per-actor budget",
+    ):
+        assert retired not in text, (
+            f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
+        )
+    rows = _primary_table()[1:]
+    local_notes = next(r for r in rows if r[0].startswith("**Local**"))[3]
+    assert "directory accounts included" in local_notes and "passkey" in local_notes, (
+        "the Local Notes cell must say the TOTP leg feeds the lockout on directory accounts too, and "
+        "that a directory account can hold a passkey."
+    )
+    ad_defense = next(r for r in rows if r[0].startswith("**AD**"))[2]
+    assert "removes the per-actor budget" in ad_defense, (
+        "the AD row must say login_rate_limit_enabled=false removes its per-actor budget."
+    )
+    companion = next(
+        t for t in _tables(_section()) if t[0][:2] == ["Pathway", "Phishing resistance"]
+    )
+    kerb_phish = next(r for r in companion[1:] if r[0].startswith("**Kerberos"))[1]
+    assert "passkey" in kerb_phish, (
+        "the companion Kerberos phishing cell must name the engine passkey the session can meet."
+    )
+    block = _section()
+    asymmetry = " ".join(block[block.index("**Lockout asymmetry") :].split())[:400]
+    assert "directory accounts included, **feed**" in asymmetry, (
+        "the lockout-asymmetry paragraph must open by saying the TOTP leg feeds the lock on "
+        "directory accounts too."
     )
 
 
