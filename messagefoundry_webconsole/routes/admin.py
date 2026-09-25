@@ -496,8 +496,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # session window stands in for the grant and no re-auth is asked.
     changed = (
         "The link changed after this page was opened, so nothing was changed. The page now shows "
-        "the current link. Check it before you try again. Each change needs its own fresh "
-        "re-authentication, so the console may ask you to re-authenticate first."
+        "the current link. Check it before you try again. A retry may ask you to re-authenticate "
+        "first."
     )
 
     @app.get("/ui/users/{user_id}/federated-identity", response_class=HTMLResponse)

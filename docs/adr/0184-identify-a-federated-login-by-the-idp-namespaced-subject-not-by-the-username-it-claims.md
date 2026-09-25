@@ -31,11 +31,11 @@
   the checks, audit rows and notices are the API's own. Each re-asserts the action-bound step-up
   `admin_federated_identity`, because a direct call skips the handler's own gate. Each form posts
   back the pair it showed, and the console refuses the submit when the stored pair has changed
-  since. That check reads the pair before the handler runs and does not serialise against a
-  concurrent bind or unbind, so it narrows the race and does not close it. Moving the
-  expected-pair check into the service's bind and unbind is a later slice. The pair reaches the console through a
-  `FederatedIdentityView` that no JSON route returns, so `GET /users` is unchanged. Pinned in the
-  console suite's `test_ui_federated_identity.py`.
+  since. That check runs before the handler and does not serialise against a concurrent bind or
+  unbind, so it narrows the race and does not close it. A later slice would move the check into
+  the service's bind and unbind. The pair reaches the console through a `FederatedIdentityView`
+  that no JSON route returns, so `GET /users` is unchanged. Pinned in the console suite's
+  `test_ui_federated_identity.py`.
 - **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session

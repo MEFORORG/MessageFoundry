@@ -40,7 +40,7 @@ ISSUER = "https://idp.example"
 CHANGED = "The link changed after this page was opened"
 
 #: What that refusal says about a retry: the POST already spent its single-use grant.
-RETRY = "the console may ask you to re-authenticate first"
+RETRY = "A retry may ask you to re-authenticate first."
 
 
 async def _service(engine: Engine, **over: object) -> AuthService:
@@ -317,10 +317,16 @@ async def test_a_link_from_a_stale_page_is_refused_and_keeps_the_other_binding(
     assert "S-1-theirs" in r.text, "the refusal page must show the current link"
     assert await _pair(engine, target) == (ISSUER, "S-1-theirs")
 
+    # The premise RETRY rests on: the 409 already spent the grant, so a retry bounces.
+    fresh = await _shown(engine, target, subject="S-1-mine")
+    again = await c.post(f"{_screen(target)}/link", data=fresh, headers=SAME_ORIGIN)
+    assert again.status_code == 303 and "/ui/reauth" in again.headers["location"]
+    assert await _pair(engine, target) == (ISSUER, "S-1-theirs")
+
     # A POST carrying no shown pair at all is refused the same way.
     await _mint(c, _screen(target))
     bare = await c.post(f"{_screen(target)}/link", data={"subject": "S-1-x"}, headers=SAME_ORIGIN)
-    assert bare.status_code == 409 and CHANGED in bare.text
+    assert bare.status_code == 409 and CHANGED in bare.text and RETRY in bare.text
     assert await _pair(engine, target) == (ISSUER, "S-1-theirs")
 
 
@@ -335,7 +341,7 @@ async def test_an_unlink_from_a_stale_confirm_page_is_refused(
 
     await _mint(c, f"{_screen(target)}/unlink-confirm")
     r = await c.post(f"{_screen(target)}/unlink", data=stale, headers=SAME_ORIGIN)
-    assert r.status_code == 409 and CHANGED in r.text
+    assert r.status_code == 409 and CHANGED in r.text and RETRY in r.text
     assert await _pair(engine, target) == (ISSUER, "S-1-p2"), "a stale page removed a binding"
 
 

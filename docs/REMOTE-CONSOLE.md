@@ -253,7 +253,7 @@ then held for a second, *distinct* approver holding `approvals:approve` instead 
 | Delete an uploaded file | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | step-up |
 | Save / delete a message-search preset | `/ui/messages/search/presets`, `/presets/{preset_id}/delete` | `messages:read` | step-up on save |
 | Create / update / delete a user; set roles or channel scope; reset password or MFA; revoke their sessions | `/ui/users`, `/ui/users/{user_id}/update`, `/roles`, `/channel-scope`, `/reset-password`, `/reset-mfa`, `/revoke-sessions`, `/delete` | `users:manage` | step-up |
-| Link, relink or unlink a user's federated (OIDC) identity | `/ui/users/{user_id}/federated-identity/link`, `/federated-identity/unlink` | `users:manage` | step-up bound to the action `admin_federated_identity`: a fresh re-authentication for each change |
+| Link, relink or unlink a user's federated (OIDC) identity | `/ui/users/{user_id}/federated-identity/link`, `/federated-identity/unlink` | `users:manage` | step-up bound to the action `admin_federated_identity`: a fresh re-authentication for each change, unless `[auth].require_action_step_up = false` |
 | Create / update / delete a custom role | `/ui/roles/custom`, `/ui/roles/custom/{role_id}/update`, `/delete` | `users:manage` | step-up |
 | Map AD groups to roles, and to channel scopes | `/ui/ad-groups/map`, `/ui/ad-groups/scope-map` | `users:manage` | step-up |
 | The operator's **own** account: change password, enrol / confirm / disable TOTP, add or remove a passkey, revoke own sessions | `/ui/account/password`, `/ui/account/mfa/*`, `/ui/account/webauthn/*`, `/ui/account/sessions/*` | none — self-scoped, authorized by session ownership | password re-proof; full step-up to disable MFA or remove a passkey |

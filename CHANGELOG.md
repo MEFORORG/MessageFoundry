@@ -149,11 +149,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   is not enough, unless the site set `[auth].require_action_step_up = false`, which the API honours
   the same way. An administrator cannot change their own link here either. Each form posts back
   the link its page showed, and the console refuses the submit when the stored link has changed
-  since. That check reads the link before the engine's handler runs and does not serialise against
-  a concurrent write, so two administrators acting at the same moment can still replace each
-  other's change. Moving the expected-link check into the service's bind and unbind is a later
-  slice. The screen offers no Link form on a local account or when `[auth].oidc_issuer` is
-  unset, and shows the engine's refusals in words. The engine gains the `AuthService.oidc_issuer`
+  since. That check runs before the engine's handler and does not serialise against a concurrent
+  write. So a stale page can still replace or remove a link another administrator set at the same
+  moment. A later slice would move the check into the service's bind and unbind. The screen
+  offers no Link form on a local account or when `[auth].oidc_issuer` is unset, and shows the engine's refusals in words. The engine gains the `AuthService.oidc_issuer`
   property and a `FederatedIdentityView` model the console renders; no JSON route returns it, and
   `GET /users` is unchanged. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184 slice B)
 - **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
