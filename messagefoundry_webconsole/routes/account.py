@@ -252,13 +252,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 new_password=form.get("new_password", ""),
             )
             await admin.change_password(
-                body=body, request=request, service=service, identity=identity
+                body=body,
+                request=request,
+                service=service,
+                identity=identity,
+                # The cookie session a wrong current password is charged to (BACKLOG #1138).
+                session=session_token(request),
             )
         except ValidationError:
             return await _retry("invalid input")
         except HTTPException as exc:
             if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                 raise  # rate-limited — keep the Retry-After semantics
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                # The session is gone: this failure spent its re-proof budget (BACKLOG #1138), or
+                # it was revoked by other means while the request waited.
+                return login_redirect_response()
             return await _retry(str(exc.detail), exc.status_code)
         # Changed: the service revoked every session (incl. this cookie) — sign in again. This is the
         # WIDEST termination the console offers (every session for this user, the one an operator

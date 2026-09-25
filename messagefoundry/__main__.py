@@ -3133,8 +3133,9 @@ def _serve(args: argparse.Namespace) -> int:
                         "error: no out-of-band security-notification channel is configured on a "
                         f"{'production ' if production else ''}PHI instance ({env_name!r}); refusing to "
                         "start — account-security events (lockout, password/roles change, new-IP admin "
-                        "action) would have no push channel, only the pull-only /me/security-events feed "
-                        "(ASVS 6.3.5/6.3.7). Configure the [alerts] SMTP transport (email_smtp_host + "
+                        "action) would have no push channel. The pull-only /me/security-events feed "
+                        "carries the user's own events but not an administrator's change to their "
+                        "account (ASVS 6.3.5/6.3.7). Configure the [alerts] SMTP transport (email_smtp_host + "
                         'email_from; add email_to as well if any [[alerts.rules]] routes to "email" — '
                         "the alert email transport requires all three) and keep "
                         "[auth].notify_security_events on; or, to rely on the "
@@ -3145,7 +3146,8 @@ def _serve(args: argparse.Namespace) -> int:
                 print(
                     "warning: no out-of-band security-notification channel is configured in a "
                     f"PHI-carrying environment ({env_name!r}) — account-security events have no push "
-                    "channel, only the pull-only /me/security-events feed. Configure the [alerts] SMTP "
+                    "channel; the pull-only /me/security-events feed carries the user's own events but "
+                    "not an administrator's change to their account. Configure the [alerts] SMTP "
                     "transport (email_smtp_host + email_from) with [auth].notify_security_events on "
                     "(ASVS 6.3.5/6.3.7).",
                     file=sys.stderr,
@@ -3154,8 +3156,9 @@ def _serve(args: argparse.Namespace) -> int:
                 logging.getLogger(__name__).warning(
                     "AUDIT: starting a %sPHI instance (environment %r) with no security-"
                     "notification channel ([alerts].security_notifications_required=false) — "
-                    "account-security events are recorded only in the pull-only /me/security-events "
-                    "feed (out-of-band-notification opt-out override).",
+                    "a user sees their own account-security events only in the pull-only "
+                    "/me/security-events feed, and an administrator's change to their account not at "
+                    "all (out-of-band-notification opt-out override).",
                     "production " if production else "",
                     env_name,
                 )

@@ -1232,7 +1232,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=True,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error="Invalid code.",
+                        error=(
+                            "Account locked. Try again later."
+                            if code_elevation.locked
+                            else "Invalid code."
+                        ),
                     )
                 )
         # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action. action.action

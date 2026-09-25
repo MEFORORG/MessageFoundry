@@ -96,6 +96,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_ENROLL,
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
+    CurrentPasswordCheck,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
@@ -368,7 +369,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
+        session: str | None = Depends(bearer_token),
     ) -> SimpleMessage:
+        """``session`` is the caller's session token, which a wrong current password is charged to
+        (BACKLOG #1138). The JSON plane resolves it from the bearer header; the web console, which
+        delegates here with a cookie session, passes it explicitly."""
         # Post-session ceremony: per-ACTOR budget, not the shared unauthenticated sign-in one.
         if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "password-change")
@@ -376,7 +381,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD passwords are managed in Active Directory"
             )
-        if not await service.verify_current_password(identity, body.current_password):
+        # Counts toward the account lockout and against this session's re-proof budget; the failure
+        # that exhausts the budget revokes the session (BACKLOG #1138).
+        check = await service.verify_current_password(
+            identity,
+            body.current_password,
+            token=session if isinstance(session, str) else None,
+            client=_client(request),
+        )
+        if check is CurrentPasswordCheck.SESSION_ENDED:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
+        if check is not CurrentPasswordCheck.OK:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "current password is incorrect")
         # ASVS 6.4.1: a "change" that reuses the current password is not a change — it would leave an
         # expired/temp credential in place (and defeats the must_change_password claim step).
@@ -403,7 +418,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> ElevatedResponse:
         """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
         session's step-up window so it may perform highly sensitive operations for the configured
-        period. Rate-limited like the password change; a failure is a 403 and performs nothing.
+        period. Rate-limited like the password change; a failure is a 403 that counts against this
+        session's re-proof budget, and toward the account lockout unless a lock is already live. The
+        failure that exhausts the budget ends the session with a 401 (BACKLOG #1138). The account lock
+        does not refuse it.
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""
@@ -424,9 +442,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             purpose=body.purpose,
         )
         if elevation.token is None:
-            # session_lost is a good password on a session revoked mid-ceremony: 401, not the 403 a
-            # wrong password gets, so the client re-authenticates instead of re-prompting for a
-            # password that was already correct.
+            # session_lost: the session is gone -- revoked mid-ceremony under a good password, or
+            # revoked for spending its re-proof budget (BACKLOG #1138). 401, not the 403 a wrong
+            # password gets, so the client signs in again instead of re-prompting.
             if elevation.session_lost:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")

@@ -6390,7 +6390,8 @@ class PostgresStore:
 
     async def security_events_for_user(self, username: str, *, limit: int = 100) -> Sequence[Row]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
-        /me/security-events`` (ASVS 6.3.5/6.3.7); admin-initiated changes go out-of-band by email."""
+        /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
+        user only by email, when one can be sent. ``auth/notifications.py`` states the rule."""
         return await self._fetchall(
             "SELECT ts, action, detail FROM audit_log "
             "WHERE actor = $1 AND action LIKE 'auth.%' ORDER BY id DESC LIMIT $2",

@@ -3441,8 +3441,9 @@ class AlertsSettings(_Section):
     # security-notification channel exists — SMTP transport (the settings above) configured AND the
     # [auth].notify_security_events kill-switch on (both are what api/app.py needs to wire the notifier)
     # — so account-security events (lockout, password/roles change, new-IP admin action) always have a
-    # push channel, not just the pull-only /me/security-events feed. Set false to accept the pull-only
-    # feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
+    # push channel, not just the pull-only /me/security-events feed. That feed carries the user's own
+    # events, not an administrator's change to their account (auth/notifications.py states the rule).
+    # Set false to accept the pull-only feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
     # messagefoundry/__main__.py.
     security_notifications_required: bool = True
 
