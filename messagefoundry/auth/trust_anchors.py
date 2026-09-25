@@ -31,6 +31,13 @@ runs, no audit rows, no new settings effects):
 3. An **anchor-changed audit event**: when a configured anchor's SHA-256 differs from the previously
    observed load's, a first-class ``auth.trust_anchor`` audit row is written (reusing
    :meth:`~messagefoundry.store.base.Store.record_audit`, mirroring the ``config_reload`` fingerprint row).
+4. A **path check** (BACKLOG #1142, the directory arm): every object from the volume root down to the
+   anchor, links included, read in-process by SID on Windows and by ``lstat`` on POSIX
+   (:mod:`messagefoundry.auth.anchor_path`). A directory that lets an untrusted principal delete or
+   rename an entry lets it replace the anchor without any right on the file itself. ``path_ok`` is
+   ``False`` then, and it refuses at ``enforce`` and warns at ``warn``, as ``acl_ok`` does. A chain
+   that could not be read is ``path_indeterminate``: audited and warned, not refused. The file arm
+   (1) still runs beside it, so the combined verdict is never weaker than the file arm alone.
 """
 
 from __future__ import annotations
@@ -47,6 +54,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from messagefoundry.auth.anchor_path import (
+    DIRECTORY,
+    LINK,
+    ChainFinding,
+    PathVerdict,
+    anchor_path_verdict,
+)
 from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
@@ -57,8 +71,9 @@ log = logging.getLogger(__name__)
 
 #: The audit action for every trust-anchor observation. One action so an operator can filter the whole
 #: family, and so :func:`_last_fingerprint` can find the prior load. The ``event`` field in the detail
-#: carries which one: ``observed`` (baseline), ``changed``, ``pin_mismatch``, ``acl_insecure``, and
-#: ``acl_indeterminate`` (the ACL could not be determined — BACKLOG #1142).
+#: carries which one: ``observed`` (baseline), ``changed``, ``pin_mismatch``, ``acl_insecure``,
+#: ``acl_indeterminate`` (the ACL could not be determined, BACKLOG #1142), and ``path_insecure`` and
+#: ``path_indeterminate`` (the path check, BACKLOG #1142 directory arm).
 AUDIT_ACTION = "auth.trust_anchor"
 
 
@@ -90,6 +105,9 @@ class AnchorVerdict:
     fingerprint: str
     acl_ok: bool | None  # None = the DACL could not be determined (degrade, don't refuse)
     pin_ok: bool | None  # None = no pin configured
+    # False = another principal can replace the anchor through its path; None = could not tell.
+    path_ok: bool | None = None
+    path_check: PathVerdict | None = None  # the findings behind path_ok, for messages and audit
 
 
 # --- fingerprint --------------------------------------------------------------------------------
@@ -483,8 +501,13 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     pin_ok: bool | None = None
     if spec.pin is not None:
         pin_ok = fingerprint == _normalize_pin(spec.pin)
+    path_check = anchor_path_verdict(spec.path)
     return AnchorVerdict(
-        fingerprint=fingerprint, acl_ok=dacl_is_owner_only(spec.path), pin_ok=pin_ok
+        fingerprint=fingerprint,
+        acl_ok=dacl_is_owner_only(spec.path),
+        pin_ok=pin_ok,
+        path_ok=path_check.ok,
+        path_check=path_check,
     )
 
 
@@ -503,9 +526,82 @@ def _acl_message(spec: AnchorSpec) -> str:
     )
 
 
+def _findings(verdict: AnchorVerdict, *, insecure: bool) -> list[ChainFinding]:
+    check = verdict.path_check
+    return [f for f in (check.findings if check else ()) if f.insecure is insecure]
+
+
+def _ps_quote(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _sh_quote(text: str) -> str:
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def _path_fix(verdict: AnchorVerdict) -> list[str]:
+    """The fix, as commands, for every insecure object. The message must carry its own fix: the
+    document the file arm's message cites ships in neither a checkout nor a wheel."""
+    check = verdict.path_check
+    bad = _findings(verdict, insecure=True)
+    objects: dict[str, str] = {}
+    for f in bad:
+        objects.setdefault(f.path, f.kind)
+    if check is not None and check.platform == "windows":
+        account = f"*{check.engine_sid}" if check.engine_sid else "<the engine's account>"
+        lines = [
+            "Fix: move the anchor into a directory that only administrators and the engine's "
+            "account can change, such as the engine's data directory under C:\\ProgramData. Or, "
+            "from an elevated PowerShell, for each object named above:"
+        ]
+        for obj, kind in objects.items():
+            q = _ps_quote(obj)
+            inherit = "(OI)(CI)" if kind == DIRECTORY else ""
+            link = " /L" if kind == LINK else ""
+            grants = " ".join(
+                _ps_quote(f"{sid}:{inherit}{right}")
+                for sid, right in (("*S-1-5-18", "F"), ("*S-1-5-32-544", "F"), (account, "RX"))
+            )
+            lines.append(f"  icacls {q}{link} /inheritance:r /grant:r {grants}")
+            sids = sorted({sid for f in bad if f.path == obj for sid in f.sids})
+            if sids:
+                removed = " ".join(_ps_quote("*" + sid) for sid in sids)
+                lines.append(f"  icacls {q}{link} /remove:g {removed}")
+            lines.append(f"  icacls {q}{link} /setowner '*S-1-5-32-544'")
+        lines.append("Then read each one back with: icacls <path>")
+        return lines
+    lines = [
+        "Fix: move the anchor under a root-owned 755 directory such as /etc/messagefoundry/. Or, "
+        "for each object named above:"
+    ]
+    for obj in objects:
+        lines.append(f"  chown root:root {_sh_quote(obj)} && chmod go-w {_sh_quote(obj)}")
+    return lines
+
+
+def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    lines = [
+        f"{spec.setting}: the trust anchor '{spec.path}' can be replaced through its path, and "
+        "anyone who replaces it can substitute the CA and defeat authentication:"
+    ]
+    lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=True)]
+    return "\n".join(lines + _path_fix(verdict))
+
+
+def _path_indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    lines = [
+        f"{spec.setting}: could not settle whether the trust anchor '{spec.path}' can be replaced "
+        "through its path, so it is loaded without that check:"
+    ]
+    lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=False)]
+    return "\n".join(lines)
+
+
 def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: bool) -> None:
-    """Apply the owner fork to a verdict: a pin mismatch always refuses; a group/world-writable DACL
-    refuses at ``enforce`` and warns at ``warn``. Raises :class:`TrustAnchorError` on a fatal violation."""
+    """Apply the owner fork to a verdict: a pin mismatch always refuses; a group/world-writable DACL,
+    or a path another principal can replace the anchor through, refuses at ``enforce`` and warns at
+    ``warn``. A path that could not be judged warns at both. Raises :class:`TrustAnchorError` on a
+    fatal violation."""
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
@@ -514,6 +610,18 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
                 _acl_message(spec) + " — [security].enforcement=enforce refuses to start"
             )
         log.warning("%s — [security].enforcement=warn, starting anyway", _acl_message(spec))
+    if verdict.path_ok is False:
+        if enforcing:
+            raise TrustAnchorError(
+                _path_message(spec, verdict) + "\n[security].enforcement=enforce refuses to start"
+            )
+        log.warning(
+            "%s\n[security].enforcement=warn, starting anyway", _path_message(spec, verdict)
+        )
+    elif verdict.path_ok is None:
+        # Not fatal, as acl_ok None is not: a refusal here must wait until the verified bytes are the
+        # bytes the consumer loads (BACKLOG #1142, slice 3).
+        log.warning("%s", _path_indeterminate_message(spec, verdict))
 
 
 def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
@@ -619,6 +727,20 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
         # opener actually loads: until then a refusal would attest a file that is re-read afterwards.
         await _record(
             store, spec, "acl_indeterminate", fingerprint=verdict.fingerprint, enforcing=enforcing
+        )
+    if verdict.path_ok is not True:
+        # Each row names every object that failed, with the principal and the right, or the cause.
+        insecure = verdict.path_ok is False
+        await _record(
+            store,
+            spec,
+            "path_insecure" if insecure else "path_indeterminate",
+            fingerprint=verdict.fingerprint,
+            enforcing=enforcing,
+            components=[
+                {"path": f.path, "kind": f.kind, "reason": f.reason}
+                for f in _findings(verdict, insecure=insecure)
+            ],
         )
     _enforce_verdict(spec, verdict, enforcing=enforcing)
 
