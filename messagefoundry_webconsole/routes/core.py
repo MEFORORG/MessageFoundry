@@ -405,7 +405,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # AD-password sign-in is RETIRED (BACKLOG #1137): the login page renders no provider
         # selector, and "ad" stays in the allow-list only so the ENGINE (_dispatch_login) is the
         # single point that refuses and audits it. Directory accounts sign in by Windows SSO or
-        # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth.
+        # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
+        # (and the JSON /me/reauth).
         provider_value = form.get("provider", "local")
         if provider_value not in ("local", "ad"):
             return RedirectResponse("/ui/login?e=bad", status_code=303)

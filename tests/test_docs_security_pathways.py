@@ -604,25 +604,49 @@ def test_the_retired_directory_password_sign_in_is_not_described_as_live() -> No
     assert any(
         isinstance(n, ast.Constant) and n.value == "pathway_retired" for n in ast.walk(dispatch)
     ), "_dispatch_login no longer refuses provider=ad; the retired-sign-in prose is stale."
-    assert "ad=False," in inspect.getsource(auth_routes), (
+    routes = ast.parse(inspect.getsource(auth_routes))
+    assert any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "ProvidersInfo"
+        and any(
+            k.arg == "ad" and isinstance(k.value, ast.Constant) and k.value.value is False
+            for k in n.keywords
+        )
+        for n in ast.walk(routes)
+    ), (
         "GET /auth/providers no longer reports ad as a constant false; re-derive the providers prose."
     )
-    form = str(pages.login(None, sso_enabled=True, oidc_enabled=True))
+    # Every keyword-only switch is turned ON, so a revived selector gated on a new flag (the old one
+    # was ``ad_enabled: bool = False``) still renders here and reds the check.
+    switches = {
+        name: True
+        for name, p in inspect.signature(pages.login).parameters.items()
+        if p.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    form = str(pages.login(None, **switches))
     assert 'name="provider"' not in form and "<select" not in form, (
         "/ui/login renders a provider selector again; the L5b paragraph says it does not."
     )
-    satisfied = inspect.getsource(AuthService.mfa_satisfied)
-    assert "AuthProvider.AD.value and self._settings.require_mfa" in satisfied, (
-        "mfa_satisfied lost its directory floor; the signal-table AD row says when the gate fires."
-    )
+    # The directory floor: one BoolOp naming both the AD provider and require_mfa. Behaviour is
+    # pinned in tests/test_mfa_access_gate.py; this only ties the signal-table AD row to it.
+    satisfied = ast.parse(textwrap.dedent(inspect.getsource(AuthService.mfa_satisfied)))
+    assert any(
+        isinstance(n, ast.BoolOp)
+        and {"AD", "require_mfa"} <= {a.attr for a in ast.walk(n) if isinstance(a, ast.Attribute)}
+        for n in ast.walk(satisfied)
+    ), "mfa_satisfied lost its directory floor; the signal-table AD row says when the gate fires."
 
     # Whitespace-normalised: a phrase that wraps across a source line must still be caught.
     text = " ".join(_doc_text().split())
     for retired in (
-        "offers a provider selector",
+        "`/ui/login` offers a provider selector",
         "the engine MFA gate never fires for it",
         "and `ad` (`[auth].ad_enabled`) are pure config",
         "(LDAP bind + optional Windows SSO)",
+        "local, LDAPS or Kerberos sign-in",
+        # Unscoped, this says every sign-in seeds a step-up window; browser SSO and OIDC do not.
+        "`reauth_at` is stamped at login and refreshed by",
     ):
         assert retired not in text, (
             f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
