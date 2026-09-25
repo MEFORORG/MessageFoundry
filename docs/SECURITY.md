@@ -1013,8 +1013,9 @@ once its window lapses. `POST /me/reauth` re-checks the **local** password (argo
 Active Directory re-bind** for AD accounts, so AD operators can still step up. It is rate-limited like the
 password change and audited (`auth.reauth`). A wrong password or a rejected re-bind **counts toward the
 engine's per-account lockout**, and each session may fail `lockout_threshold` re-proofs before it is
-revoked. The account lock itself gates sign-in only, so a live session keeps step-up during a lock
-(BACKLOG #1138; see the [protection set](#the-documented-protection-set-asvs-611)).
+revoked. The account lock does not refuse this password re-proof, so a live session that has
+already met its second factor keeps step-up during a lock (BACKLOG #1138; see the
+[protection set](#the-documented-protection-set-asvs-611)).
 
 **Gated operations — 28 route objects** (26 `require_step_up` + 2 action-bound `require_step_up_action`).
 The complete set, as enumerated in the [route map](#route--permission-map-engine-api) above:
@@ -1440,7 +1441,7 @@ slack.
 | Client-address monoculture | the set of distinct observed client addresses | allow-list in use **and** no trusted proxy declared **and** ≥ 50 observations **and** all resolved to the same loopback address | **LOG** — one-shot WARNING + `client_address_monoculture` on `GET /security/posture` | n/a | (derived; no knob) |
 | Login attempt rate, per client IP **and** globally | `request.client.host` (or the literal `"unknown"`) | > 10 attempts per IP (`login_rate_limit_per_ip`), or > 60 across all clients (`login_rate_limit_global`), in a rolling 60 s window (`login_rate_limit_window_seconds`); a refused attempt is not itself counted | **THROTTLE** — 429 `too many attempts` with **no** `Retry-After` on the three JSON routes; 429 + `Retry-After: 30` on `POST /ui/login`; a **303** redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`) on `GET /ui/sso`, `GET /ui/oidc/start` and `GET /ui/oidc/callback`. WARNING-logged, deliberately **not** audited | on, 10 / 60 / 60 s | `[auth].login_rate_limit_enabled` |
 | Credential-ceremony rate, per **actor** | `identity.user_id` (**not** an IP) | > `login_rate_limit_per_ip` (10) ceremonies per actor per 60 s; **no** global dimension (`glob=0`, deliberately) | **THROTTLE** 429, logged | on with the row above | *gated by the same* `[auth].login_rate_limit_enabled` |
-| Consecutive credential failures on one account | the account's failure counter | ≥ 5 consecutive failures locks for 15 minutes; a lapsed window restarts the counter | **DENY** before any verify + an audit row whose name is leg-specific — `auth.login_locked` on the password path, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs, (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The post-session re-proofs, `POST /me/reauth` and `POST /me/password`, **feed** the counter but are **not** refused by the lock; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes` |
+| Consecutive credential failures on one account | the account's failure counter | ≥ 5 consecutive failures locks for 15 minutes; a lapsed window restarts the counter | **DENY** before any verify + an audit row whose name is leg-specific — `auth.login_locked` on the password path, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The post-session re-proofs, `POST /me/reauth` and `POST /me/password`, **feed** the counter but are **not** refused by the lock; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes` |
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **off** | `[auth].admin_new_ip_step_up` |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
 | Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
@@ -1989,13 +1990,20 @@ they like. If that lock also refused re-proofs, the owner's live sessions would 
 password change and session termination for as long as the campaign ran, which is the harm the separate
 per-actor ceremony budget exists to prevent. So a re-proof failure counts on the account, where it can
 lock sign-in and raise `ACCOUNT_LOCKED`, and is also charged to its own **session**: the failure that
-brings a session to `lockout_threshold` revokes it. A stolen session therefore gets that many guesses
-**in total**, not that many per lock window. During a live lock a failure is charged to the session only,
-so a re-proof never re-arms or extends the lock, and a good re-proof during a lock succeeds without
-clearing it. **The per-session count is process-local**, like the per-action step-up grants: a restart
+brings a session to `lockout_threshold` revokes it. A stolen session therefore gets that many
+**password** guesses in total, not that many per lock window. The count travels with the session when
+its token rotates. During a live lock a failure is charged to the session only, so a re-proof does not
+re-arm or extend the lock, except when another leg sets the lock in the moment between the re-proof's
+read of the account and its failure write. A good re-proof during a lock succeeds without clearing it.
+**The cap covers the password re-proofs only.** A wrong TOTP or recovery code still counts on the
+account alone, and the lock still refuses the code leg, so a live session that has not yet met its
+second factor cannot complete it, or reach the password change, while the account is locked.
+**The per-session count is process-local**, like the per-action step-up grants: a restart
 resets it, and a topology that serves the API from several processes, such as `serve --shard` engine
 shards with their own API ports over one store, gives each process its own count, so a session reachable
-on K ports gets up to K times the budget. That matters for AD, because since the AD sign-in was retired
+on K ports gets up to K times the budget. The count is also held in a bounded map: when it fills,
+entries older than the absolute session lifetime go first, and only then the oldest live one, whose
+session starts over. That matters for AD, because since the AD sign-in was retired
 the step-up re-auth route is the **only** place an AD password is still bound: a rejected re-bind counts
 on the engine's own row and against the session. The engine never writes a lock to the directory
 account. Each rejected re-bind still reaches the DC, though, up to `lockout_threshold` per session. So a
@@ -2145,7 +2153,8 @@ check takes.) The event name differs per leg:
 (`AuthService.verify_mfa`), `auth.webauthn_failed` with `reason=locked` on the assertion leg
 (`AuthService.finish_webauthn_assertion`). The attempt that crosses the threshold, on any feeding leg,
 also writes `auth.account_locked`. The re-proofs are not refused by the lock; the failure that spends a
-session's cap revokes it, answers **401**, and is audited as `auth.reauth` with `session_revoked=true`
+session's cap revokes it, answers **401** on the JSON routes (the console sends the browser to
+sign in), and is audited as `auth.reauth` with `session_revoked=true`
 (`AuthService.reauth`) or `auth.password_change_failed` with `reason=session_revoked`
 (`AuthService.verify_current_password`). They are cited by method rather than line because the line
 numbers drifted. Controls 2 and 3
@@ -2259,8 +2268,8 @@ second-factor paths, so guessing of a specific *local* account stays well-bounde
 route**. The credential re-proof surface is bounded by a per-session cap instead (BACKLOG #1138), and
 the global ceiling does **not** reach it: `POST /me/reauth` and `POST /me/password` feed the lockout
 without being refused by it, draw the per-actor ceremony budget, which has no global dimension, and
-revoke a session at `lockout_threshold` failures. At the defaults a stolen session gets 5 guesses in
-total. That count is per engine process: a restart resets it, and each engine shard serving its own
+revoke a session at `lockout_threshold` failures. At the defaults a stolen session gets 5 password
+guesses in total. That count is per engine process: a restart resets it, and each engine shard serving its own
 API port keeps a separate one. The default
 `127.0.0.1` bind makes IP rotation moot; for an off-loopback bind without a fronting WAF, deploy a
 global limiter / WAF in front (a modest unconditional global login/second-factor ceiling independent of

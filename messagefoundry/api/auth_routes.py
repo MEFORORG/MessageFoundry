@@ -429,9 +429,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             purpose=body.purpose,
         )
         if elevation.token is None:
-            # session_lost is a good password on a session revoked mid-ceremony: 401, not the 403 a
-            # wrong password gets, so the client re-authenticates instead of re-prompting for a
-            # password that was already correct.
+            # session_lost: the session is gone -- revoked mid-ceremony under a good password, or
+            # revoked for spending its re-proof budget (BACKLOG #1138). 401, not the 403 a wrong
+            # password gets, so the client signs in again instead of re-prompting.
             if elevation.session_lost:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")

@@ -72,9 +72,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   holding a stolen session could keep guessing, bounded only by the per-actor ceremony budget. A
   failure now counts on the account's sign-in counter, so it can lock sign-in and raise the lockout
   notice. It is also charged to the session, and the failure that reaches `lockout_threshold` (5 by
-  default) revokes that session, so a stolen session gets 5 guesses in total. The account lock does
-  not refuse a live session's re-proofs, so an attacker who locks the account from the sign-in page
-  cannot take step-up or the password change away from the owner's live sessions. A rejected
+  default) revokes that session, so a stolen session gets 5 password guesses in total. The account
+  lock does not refuse a live session's password re-proofs, so an attacker who locks the account from
+  the sign-in page cannot take step-up or the password change away from the owner's live sessions,
+  once those sessions have met their second factor. Wrong TOTP or recovery codes still count on the
+  account alone. A rejected
   directory (AD) re-bind counts too. The engine never writes a lock to the directory, but each
   rejected re-bind still reaches the domain controller, so the domain's own lockout policy can still
   lock the domain account. A directory the engine cannot reach, or one with no such account, is not

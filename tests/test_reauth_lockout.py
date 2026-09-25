@@ -251,7 +251,7 @@ async def test_a_reproof_failure_does_not_extend_a_live_lock() -> None:
         assert not out.ok and not out.locked, "checked as a wrong password, not refused as locked"
         assert await _lock_state(store, "u-bob") == before, "the lock must not be re-armed"
         # It is still charged to the session.
-        assert service._reproof_session_failures[hash_token(token)] == 1
+        assert service._reproof_session_failures[hash_token(token)][0] == 1
     finally:
         await store.close()
 
@@ -329,6 +329,60 @@ async def test_a_parallel_burst_on_one_session_is_capped_at_the_threshold() -> N
         assert await _session_revoked(store, token)
         assert service._reproof_locks == {}, "the per-account lock entry must not leak"
         assert hash_token(token) not in service._reproof_session_failures
+    finally:
+        await store.close()
+
+
+async def test_a_failed_revoke_keeps_the_session_at_its_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The count is dropped only after the revoke commits. If the revoke write fails, the next
+    attempt must revoke again without verifying, not start the session on a fresh budget."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        for _ in range(2):
+            await service.reauth(identity, WRONG, token=token)
+        real_revoke = store.revoke_session
+
+        async def failing_revoke(token_hash: str, *, now: float | None = None) -> None:
+            raise RuntimeError("synthetic: store write failed")
+
+        monkeypatch.setattr(store, "revoke_session", failing_revoke)
+        with pytest.raises(RuntimeError):
+            await service.reauth(identity, WRONG, token=token)
+        assert not await _session_revoked(store, token)
+        monkeypatch.setattr(store, "revoke_session", real_revoke)
+
+        verifies = 0
+        real_argon2 = service._argon2
+
+        async def counting(fn: Any, *args: Any) -> Any:
+            nonlocal verifies
+            verifies += 1
+            return await real_argon2(fn, *args)
+
+        monkeypatch.setattr(service, "_argon2", counting)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.session_lost and verifies == 0, "a session at its cap must not be verified again"
+        assert await _session_revoked(store, token)
+    finally:
+        await store.close()
+
+
+async def test_the_password_change_leg_does_not_reset_the_budget_on_a_refused_change() -> None:
+    """A good current password followed by a change the policy refuses rotates nothing, so it must
+    not wipe the session's failure count either."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        await service.reauth(identity, WRONG, token=token)
+        await service.verify_current_password(identity, GOOD, token=token)
+        assert service._reproof_session_failures[hash_token(token)][0] == 1
     finally:
         await store.close()
 
