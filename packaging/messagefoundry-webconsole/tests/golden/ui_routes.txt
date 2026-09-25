@@ -46,6 +46,8 @@ GET /ui/uploaded-logs/upload-form
 GET /ui/users
 GET /ui/users/new
 GET /ui/users/{user_id}
+GET /ui/users/{user_id}/federated-identity
+GET /ui/users/{user_id}/federated-identity/unlink-confirm
 MOUNT /ui/static
 POST /ui/account/mfa/disable
 POST /ui/account/mfa/enroll
@@ -104,6 +106,8 @@ POST /ui/uploaded-logs/upload
 POST /ui/users
 POST /ui/users/{user_id}/channel-scope
 POST /ui/users/{user_id}/delete
+POST /ui/users/{user_id}/federated-identity/link
+POST /ui/users/{user_id}/federated-identity/unlink
 POST /ui/users/{user_id}/reset-mfa
 POST /ui/users/{user_id}/reset-password
 POST /ui/users/{user_id}/revoke-sessions

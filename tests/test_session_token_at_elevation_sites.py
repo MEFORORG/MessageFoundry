@@ -239,10 +239,11 @@ async def test_the_step_up_reauth_elevates_the_token_in_place() -> None:
     """
     store, service = await _service()
     try:
-        # An MFA-pending session is born with NO step-up freshness (seed_reauth follows
-        # mfa_verified), so the window opening below is the elevation and not login's own seed. The
-        # local admin is already MFA-pending under the require_mfa default, so no enrollment is
-        # needed to reach that state — see the enrollment arm above, which asserts exactly that.
+        # An MFA-pending session is born with NO step-up freshness (the local leg seeds only a
+        # login that owes no factor, WP-14), so the window opening below is the elevation and not
+        # login's own seed. The local admin is already MFA-pending under the require_mfa default,
+        # so no enrollment is needed to reach that state — see the enrollment arm above, which
+        # asserts exactly that.
         identity, token, password = await login_admin(service)
         assert await service.has_recent_step_up(token) is False
 

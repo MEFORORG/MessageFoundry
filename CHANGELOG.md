@@ -176,6 +176,36 @@ All notable changes to MessageFoundry are documented here. The format follows
   The AD anchor is the exception: `ldap3` loads a `TRUSTED CERTIFICATE` block, so the reload does
   not refuse one there either.
   ([BACKLOG #1142](docs/BACKLOG.md))
+- **BREAKING: a Windows SSO (Kerberos) sign-in through `POST /auth/negotiate` no longer opens a
+  step-up window.** Now no directory sign-in opens it: Kerberos by either route, and the federated
+  (OIDC) callback, which already did not. Local password sign-in is unchanged.
+  (`BACKLOG #1144`, step 5)
+  - **What it was.** The engine stamped the new session as freshly re-verified, so its own sign-in
+    stamp passed the step-up check for `[auth].step_up_max_age_seconds` (300 seconds by default).
+    Nothing checked with the directory again. The console's `GET /ui/sso` never opened the window,
+    so one sign-in method had two postures.
+  - **Who it reached.** An account with no engine second factor. With `[security].require_mfa`
+    off, it owed no factor. A bearer client could then run the step-up-gated actions that use the
+    session window on the ticket alone, such as purge, export, replay, config deploy and user admin.
+  - **With `require_mfa` on, it reached further than it looked.** The session owed a factor first,
+    so the window reached only the routes that skip that gate, and only with
+    `[auth].require_action_step_up` off: at least factor enrollment and session termination. But
+    enrollment let the session bind its own TOTP and clear the MFA gate with it. The seeded window
+    then covered every window-gated action until it closed.
+  - **Accounts that hold an engine factor see no change.** The session meets `403` with
+    `X-MFA-Required: 1` first, as before. A TOTP or recovery code sent to `POST /auth/mfa-verify`
+    opens the window. That route takes no passkey.
+  - **Accounts with no engine factor now step up.** On the paths above, the first step-up-gated
+    action returns `403` with `X-Step-Up-Required: 1`. The client answers with `POST /me/reauth` and
+    the account's directory password, which the engine checks by a live bind.
+  - **A session from `POST /auth/negotiate` on an account with no engine factor and no password the
+    engine can bind with cannot step up.** A smart-card-only or passwordless AD account is one. ADR
+    0068 accepted the same limit for `GET /ui/sso`. An engine TOTP opens the session window at the
+    MFA gate, but a route that needs an action-bound proof still needs a bindable password. No
+    shipped client calls `POST /auth/negotiate`.
+  - `AuthService.authenticate_kerberos` and `AuthService.authenticate_oidc` no longer take a
+    `seed_reauth` argument, so no caller can open the window at sign-in. The web console seam moved
+    with it.
 - **BREAKING: the OIDC and API client-CA trust anchors now load the bytes their check read, not a
   second read of the file.** `[auth].oidc_tls_ca_cert_file` and `[api].tls_client_ca_file` were
   checked once, for the SHA-256 pin, the ACL and the path, and then opened again by path. A file
@@ -225,8 +255,24 @@ All notable changes to MessageFoundry are documented here. The format follows
   (`auth.federated_subject_bound`, `auth.federated_subject_rebound` or
   `auth.federated_subject_unbound`) naming the administrator. Linking and unlinking each notify
   the account holder; unlinking sends the new notice `federated_identity_unbound`. An
-  administrator cannot change their own link. **Linking works only through the API for now.** The web console gets its own screen in
-  a later change. Federation still ships off. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184)
+  administrator cannot change their own link. The web console has a screen for this too; see the
+  next entry. Federation still ships off. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184)
+- **The web console can now link, relink and unlink a federated (OIDC) identity.** A user's page
+  shows the account's link, its issuer and `sub`, or says it has none. The new screen
+  `/ui/users/{user_id}/federated-identity` links the account to a `sub`, or moves the link to a
+  new one. Unlinking goes through a confirm page that states the consequence first. Each change
+  calls the same code as `PUT` and `DELETE /users/{user_id}/federated-identity`, so the checks,
+  the audit rows and the notices to the holder are the same. Each needs `users:manage` and a fresh
+  re-authentication for the action `admin_federated_identity`, as the API does. A recent sign-in
+  is not enough, unless the site set `[auth].require_action_step_up = false`, which the API honours
+  the same way. An administrator cannot change their own link here either. Each form posts back
+  the link its page showed, and the console refuses the submit when the stored link has changed
+  since. That check runs before the engine's handler and does not serialise against a concurrent
+  write. So a stale page can still replace or remove a link another administrator set at the same
+  moment. A later slice would move the check into the service's bind and unbind. The screen
+  offers no Link form on a local account or when `[auth].oidc_issuer` is unset, and shows the engine's refusals in words. The engine gains the `AuthService.oidc_issuer`
+  property and a `FederatedIdentityView` model the console renders; no JSON route returns it, and
+  `GET /users` is unchanged. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184 slice B)
 - **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
   `PATCH /users/{id}` copied any non-blank `email` into `users.notify_email`, and sent no notice
   unless the profile email changed. The route fills an omitted `email` from the stored profile, and

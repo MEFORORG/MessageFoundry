@@ -5214,8 +5214,8 @@ async def test_sso_session_not_reauth_seeded(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # AC-14: the SSO proof is AMBIENT — the session is born WITHOUT a step-up window (a step_up
-    # action 303s to /ui/reauth), and the directory-password reauth then completes it. The
-    # AD-password login and the JSON /auth/negotiate keep seeding (the recorded asymmetry pins).
+    # action 303s to /ui/reauth), and the directory-password reauth then completes it. BACKLOG
+    # #1144 step 5 closed the recorded asymmetry: the JSON /auth/negotiate leg is born the same way.
     from messagefoundry.auth.tokens import hash_token
 
     service = _sso_service(engine)
@@ -5230,8 +5230,9 @@ async def test_sso_session_not_reauth_seeded(
         # BACKLOG #1144: the ticket asserts no factor strength the engine can read, so the leg grants
         # nothing and the session is born MFA-pending. This assertion used to read `is not None`,
         # under the delegated-directory relaxation that is now retired. The two stamps are
-        # INDEPENDENT and both must be pinned: reauth_at is the step-up window (seeding is ADR 0068
-        # §9 and unchanged here), mfa_verified_at is the second-factor grant.
+        # INDEPENDENT and both must be pinned: reauth_at is the step-up window (ADR 0068 s9; since
+        # BACKLOG #1144 step 5 the engine withholds it on every directory login), mfa_verified_at
+        # is the second-factor grant.
         assert sessions[0].mfa_verified_at is None
 
         # The directory-password step-up completes at /ui/reauth (auth.reauth live-rebinds AD).
@@ -5242,18 +5243,19 @@ async def test_sso_session_not_reauth_seeded(
         )
         assert r.status_code == 200 and 'action="/ui/account/webauthn/enroll"' in r.text
 
-    # The asymmetry this pins LOST ITS OTHER HALF: AD-password login is retired (BACKLOG #1137), so
-    # the surviving comparison is the /ui/sso leg above (seed_reauth=False) against the JSON
-    # negotiate leg below (default True). Both still reach _complete_ad_login; only the seeding
-    # differs, which is the property under test.
+    # The asymmetry this used to pin is GONE (BACKLOG #1144 step 5). AD-password login is retired
+    # (BACKLOG #1137). The JSON negotiate route called authenticate_kerberos with no seeding
+    # argument and took the default True, while /ui/sso passed False. The method takes no such
+    # argument now, so this bare call is exactly what that route makes, and it must be born with
+    # no window. The ROUTE itself is driven in tests/test_directory_login_step_up_seed.py.
     out = await service.login("jdoe", "pw", provider=AuthProvider.AD)
     assert out.ok is False and out.token is None  # the retired pathway, refused
 
     out = await service.authenticate_kerberos(b"tok")
     assert out.ok and out.token is not None
     session = await service.store.get_session(hash_token(out.token))
-    assert session is not None and session.reauth_at is not None
-    # The grant is the same on BOTH Kerberos legs -- only the step-up seeding differs (BACKLOG #1144).
+    assert session is not None and session.reauth_at is None
+    # The grant is the same on BOTH Kerberos legs, and so is the seeding now (BACKLOG #1144).
     assert session.mfa_verified_at is None
 
 

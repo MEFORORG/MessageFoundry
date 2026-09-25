@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-63e2790a9a4b0854
+500b98c2d593db80
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -83,6 +83,8 @@ set_user_roles
 set_channel_scope
 reset_user_password
 reset_user_mfa
+bind_user_federated_identity
+unbind_user_federated_identity
 admin_revoke_user_sessions
 delete_user
 create_custom_role
@@ -100,6 +102,7 @@ list_audit
 my_security_events
 user_summary
 current_user
+federated_identity_view
 
 ## api.security surface (imported directly by the console, outside UiDeps)
 client_ip: (conn: 'Request | WebSocket') -> 'str | None'
@@ -119,7 +122,7 @@ audit_kerberos_reject: (self, reason: 'str') -> 'None'
 audit_mfa_denied: (self, identity: 'Identity', path: 'str', *, client: 'str | None' = None) -> 'None'
 audit_oidc_reject: (self, reason: 'str') -> 'None'
 audit_permission_denied: (self, identity: 'Identity', permission: 'Permission', path: 'str', *, client: 'str | None' = None) -> 'None'
-authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, seed_reauth: 'bool' = True, supersedes: 'str | None' = None) -> 'LoginOutcome'
+authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, supersedes: 'str | None' = None) -> 'LoginOutcome'
 begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str', prior_session: 'str | None' = None) -> 'tuple[str, str]'
 begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str | None'
 begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'
@@ -172,6 +175,8 @@ messagefoundry.api.auth_models.ChannelScope: channels
 messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, user_id, username
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
 messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
+messagefoundry.api.auth_models.FederatedIdentityRequest: subject
+messagefoundry.api.auth_models.FederatedIdentityView: auth_provider, bind_issuer, issuer, subject, user_id, username
 messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
 messagefoundry.api.auth_models.NotifyEmailRequest: email
 messagefoundry.api.auth_models.PasswordChangeRequest: current_password, new_password

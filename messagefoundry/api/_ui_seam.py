@@ -202,12 +202,26 @@ from typing import Any
 #: field refuses it (``RequestModel`` forbids unknown keys), so every save that changes the address
 #: would render "invalid input". An older engine must fail the handshake instead.
 #:
+#: BACKLOG #1143 / #295, ADR 0184 slice B: ``AdminHandlers`` gained the REQUIRED
+#: ``bind_user_federated_identity`` and ``unbind_user_federated_identity``, the handlers behind
+#: ``PUT`` and ``DELETE /users/{id}/federated-identity`` that the console's federated-identity screen
+#: calls, and the sync ``federated_identity_view`` projection its pages render, a new
+#: ``FederatedIdentityView`` DTO. ``AuthService`` gained the ``oidc_issuer`` property that view reads.
+#: The console also imports ``FederatedIdentityRequest``. New required fields on a frozen dataclass,
+#: so a skew fails at the ``UiDeps`` construction; the digest moves and the handshake refuses it
+#: first. Unnumbered, as above.
+#:
+#: BACKLOG #1144 step 5 (ASVS 6.8.4): ``AuthService.authenticate_kerberos`` dropped its
+#: ``seed_reauth`` keyword, because the engine now withholds the step-up window on every directory
+#: login itself. ``GET /ui/sso`` passed ``seed_reauth=False``, so a console that still passes it
+#: gets a ``TypeError`` on every SSO sign-in. A signature the console calls, so it forces a bump.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "63e2790a9a4b0854"
+ENGINE_UI_SEAM: str = "500b98c2d593db80"
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +322,11 @@ class AdminHandlers:
     set_channel_scope: Callable[..., Awaitable[Any]]
     reset_user_password: Callable[..., Awaitable[Any]]
     reset_user_mfa: Callable[..., Awaitable[Any]]
+    # BACKLOG #1143 / #295 (ADR 0184 slice B): PUT and DELETE /users/{id}/federated-identity. Their
+    # JSON gate is require_step_up_action(admin_federated_identity, USERS_MANAGE), so the /ui route in
+    # front of each must be require_ui_step_up_action with that same action.
+    bind_user_federated_identity: Callable[..., Awaitable[Any]]
+    unbind_user_federated_identity: Callable[..., Awaitable[Any]]
     admin_revoke_user_sessions: Callable[..., Awaitable[Any]]
     delete_user: Callable[..., Awaitable[Any]]
     create_custom_role: Callable[..., Awaitable[Any]]
@@ -327,6 +346,9 @@ class AdminHandlers:
     # ``user`` arg stays opaque/Any across the seam).
     user_summary: Callable[..., Any]
     current_user: Callable[..., Any]
+    # BACKLOG #1143 (ADR 0184 slice B): one account's stored (issuer, sub) plus the issuer a bind
+    # would use, for the federated-identity screen. Takes the store row and the AuthService.
+    federated_identity_view: Callable[..., Any]
 
 
 @dataclass(frozen=True, slots=True)
