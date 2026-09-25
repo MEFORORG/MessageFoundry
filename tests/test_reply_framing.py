@@ -449,7 +449,46 @@ _BAD_HEADERS: dict[str, bytes] = {
     "nul-in-value": _OK + b"X-A: a\x00b\r\nContent-Length: 5\r\n\r\nhello",
     # read b"hello": a DEL inside a field value
     "del-in-value": _OK + b"X-A: a\x7fb\r\nContent-Length: 5\r\n\r\nhello",
+    # read b"5\r\nhello\r\n0\r\n\r\n" to close: CR CR LF read as the blank line that ends the
+    # block, so the Transfer-Encoding after it was lost, with no defect recorded
+    "crcrlf-hides-chunked": _OK + b"X-A: a\r\r\nTransfer-Encoding: chunked\r\n\r\n" + _CHUNKS,
+    # the same, under message/rfc822: the lost lines were parsed as a nested message
+    "message-type-hides-chunked": _OK
+    + b"Content-Type: message/rfc822\r\nX-A: a\r\r\nTransfer-Encoding: chunked\r\n\r\n"
+    + _CHUNKS,
+    # read b"helloEXTRA": a hidden Content-Length under message/http
+    "message-type-hides-length": _OK
+    + b"Content-Type: message/http\r\nX-A: a\r\r\nContent-Length: 5\r\n\r\nhelloEXTRA",
+    # read b"hello": a closing "From " line under message/rfc822 became the nested envelope
+    "message-type-mbox-line-last": _OK
+    + b"Content-Type: message/rfc822\r\nContent-Length: 5\r\nFrom nobody\r\n\r\nhello",
 }
+
+#: Header blocks that are legal, though the email parser records defects or nests parts for them.
+_HEADER_CONTROLS: dict[str, bytes] = {
+    "multipart-related-mtom": _OK
+    + b'Content-Type: multipart/related; type="application/xop+xml"; boundary=abc\r\n'
+    + b"Content-Length: 5\r\n\r\nhello",
+    "multipart-no-boundary": _OK
+    + b"Content-Type: multipart/mixed\r\nContent-Length: 5\r\n\r\nhello",
+    "message-rfc822": _OK + b"Content-Type: message/rfc822\r\nContent-Length: 5\r\n\r\nhello",
+    "obs-fold": _OK + b"X-Folded: a\r\n b\r\nContent-Length: 5\r\n\r\nhello",
+    "obs-text-value": _OK + b"X-A: caf\xe9\tb\r\nContent-Length: 5\r\n\r\nhello",
+}
+
+
+@pytest.mark.parametrize("shape", list(_HEADER_CONTROLS), ids=list(_HEADER_CONTROLS))
+def test_read_bounded_reads_a_legal_header_block(shape: str) -> None:
+    with _serve(_HEADER_CONTROLS[shape]) as url, _open(url) as resp:
+        assert read_bounded(resp, connector="c") == b"hello"
+
+
+@pytest.mark.parametrize("shape", list(_HEADER_CONTROLS), ids=list(_HEADER_CONTROLS))
+def test_soap_captured_reply_reads_a_legal_header_block(shape: str) -> None:
+    with _serve(_HEADER_CONTROLS[shape]) as url:
+        reply = asyncio.run(_soap(url).send("<soap:Envelope/>"))
+    assert reply is not None
+    assert reply.body == "hello"
 
 
 def _assert_header_refusal(exc: BaseException) -> None:
@@ -493,13 +532,6 @@ def test_a_header_defect_is_refused_even_on_a_bodyless_reply() -> None:
     raw = b"HTTP/1.1 204 No Content\r\nNOT A FIELD LINE\r\n\r\n"
     assert reply_framing_fault(_wire(raw)) is not None
     assert reply_framing_fault(_wire(_BAD_HEADERS["space-before-colon"], method="HEAD")) is not None
-
-
-def test_an_obs_fold_is_not_a_header_defect() -> None:
-    """RFC 9112 section 5.2 lets a user agent accept a folded field value in a response. The control
-    for the defect arm: a legal but unusual header block must still read."""
-    raw = _OK + b"X-Folded: a\r\n b\r\nContent-Length: 5\r\n\r\nhello"
-    assert read_bounded(_wire(raw), connector="c") == b"hello"
 
 
 # --- the chunked body grammar (BACKLOG #1979 and #1125) ------------------------------------------
@@ -789,6 +821,16 @@ def test_oidc_token_exchange_refuses_a_body_short_of_its_content_length() -> Non
     raw = _json_reply(b"Content-Length: %d\r\n" % (len(_TOKEN_JSON) + 40))
     with _serve(raw) as url, pytest.raises(oidc.FlowError, match="part-way"):
         _exchange(url)
+
+
+def test_oidc_jwks_fetch_refuses_a_body_short_of_its_content_length() -> None:
+    """Before, the fragment reached JwksCache as invalid JSON, and the login was audited as an
+    unknown key rather than an unavailable IdP."""
+    from messagefoundry.auth.oidc_http import jwks_fetcher
+
+    raw = _json_reply(b"Content-Length: %d\r\n" % (len(_TOKEN_JSON) + 40))
+    with _serve(raw) as url, pytest.raises(http.client.HTTPException, match="declared length"):
+        jwks_fetcher(url, urllib.request.build_opener())()
 
 
 def test_both_oidc_reads_retype_the_whole_refusal_family(monkeypatch: pytest.MonkeyPatch) -> None:

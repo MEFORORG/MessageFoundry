@@ -166,11 +166,20 @@ def jwks_fetcher(
             # JwksCache judges the length and expects the extra byte. Refusals are retyped to
             # HTTPException for the reason above, outside the handler so nothing chains to them.
             try:
-                return read_reply_body(resp, _MAX_JWKS_BYTES + 1, connector="OIDC JWKS endpoint")
+                body = read_reply_body(resp, _MAX_JWKS_BYTES + 1, connector="OIDC JWKS endpoint")
             except AmbiguousFramingError:
                 failure = "JWKS response framed its body length ambiguously"
             except EgressReplyError:  # the family, so a later sibling is retyped too
                 failure = "JWKS response could not be read whole"
+            else:
+                # The declared-length check read_bounded makes, which read_reply_body leaves to its
+                # caller. Skipped past the bound, where JwksCache refuses the size itself.
+                remaining = getattr(resp, "length", None)
+                if len(body) > _MAX_JWKS_BYTES or not (
+                    isinstance(remaining, int) and remaining > 0
+                ):
+                    return body
+                failure = "JWKS response ended before its declared length"
             raise http.client.HTTPException(failure)
 
     return fetch

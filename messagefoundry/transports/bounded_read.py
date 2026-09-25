@@ -85,6 +85,7 @@ and so do the OIDC token and JWKS reads.
 
 from __future__ import annotations
 
+import email.errors
 import email.message
 import http.client
 import logging
@@ -195,8 +196,10 @@ class AmbiguousFramingError(EgressReplyError):
     from an intermediary on one path rather than from the partner itself.
     """
 
-    #: The fixed reason text, never a peer byte, so a caller can word its own message.
-    reason: str = ""
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        #: The fixed reason text, never a peer byte, so a caller can word its own message.
+        self.reason = reason
 
 
 class _SupportsRead(Protocol):
@@ -319,10 +322,10 @@ def reply_framing_fault(reader: object) -> str | None:
       colon, is silently lost, and the body is framed by what came before it or read to close.
       Also refused: an mbox ``From `` line, which that parser takes silently, a field name
       that is not an RFC 9110 token, and a field value holding a control character. This check
-      runs first, on every status and on ``HEAD``. **It cannot see a bare CR inside a header
-      line:** the email parser splits the line there and records nothing, so what follows reads
-      as a header of its own. Catching that needs the raw header lines, which ``http.client``
-      discards before this function runs.
+      runs first, on every status and on ``HEAD``. **It misses one bare-CR shape.** When a
+      bare CR is followed by text that reads as a field line, the email parser splits the line
+      there and records nothing. That text then counts as a header of its own. Catching it needs
+      the raw header lines, and ``http.client`` discards them before this function runs.
     * ``Transfer-Encoding`` on an HTTP/1.0 reply. Section 6.1 says the framing is then faulty.
     * ``Transfer-Encoding`` beside ``Content-Length``. Section 6.1 calls this a possible smuggling
       attempt that "ought to be handled as an error".
@@ -467,11 +470,10 @@ def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes
 def _framing_error(connector: str, reason: str) -> AmbiguousFramingError:
     # The reason is always a fixed string from this module, never a header value or a body byte, so
     # the message carries nothing the peer supplied.
-    err = AmbiguousFramingError(
-        f"{connector} framed its response body ambiguously ({reason}); refusing to read it"
+    return AmbiguousFramingError(
+        f"{connector} framed its response body ambiguously ({reason}); refusing to read it",
+        reason=reason,
     )
-    err.reason = reason
-    return err
 
 
 def _truncated_error(connector: str) -> TruncatedResponseError:
@@ -496,21 +498,51 @@ def _header_block_fault(headers: email.message.Message) -> str | None:
 
     Each reason is a fixed string that names the header block, and never echoes a field value.
     """
-    if headers.defects:
+    if any(not isinstance(d, _BODY_STRUCTURE_DEFECTS) for d in headers.defects):
         return "a header line the HTTP reader could not parse"
-    # Lines the parser kept as payload. Usually a defect was recorded too, but not at least for a
-    # "From " line that ends the block, which the parser pushes back with no defect.
-    payload = headers.get_payload()
-    if isinstance(payload, str) and payload:
+    if _has_leftover(headers):
         return "header lines the HTTP reader left unparsed"
-    if headers.get_unixfrom() is not None:
-        return "an mbox envelope line in the header block"
     for name, value in headers.raw_items():
         if not _FIELD_NAME.fullmatch(name):
             return "a header field name that is not a token"
         if _VALUE_CTL.search(_OBS_FOLD.sub(" ", value)):
             return "a header field value holding a control character"
     return None
+
+
+#: Defects about a MIME body's structure. The email parser records them for any ``multipart/*``
+#: header block, because the body it parses is always empty here. They say nothing about a header
+#: line, so a clean MTOM reply must not be refused for them.
+_BODY_STRUCTURE_DEFECTS = (
+    email.errors.StartBoundaryNotFoundDefect,
+    email.errors.MultipartInvariantViolationDefect,
+    email.errors.NoBoundaryInMultipartDefect,
+    email.errors.CloseBoundaryNotFoundDefect,
+)
+
+
+def _has_leftover(msg: email.message.Message) -> bool:
+    """Whether the parser kept anything after the header block's end, or an mbox envelope line.
+
+    ``http.client`` hands the parser the header lines only, so a clean block leaves an empty body.
+    Lines pushed back after a malformed one land in that body. Under a ``message/*`` type they are
+    parsed as a nested message, so the check walks the parts. A "From " line is kept as an
+    envelope, with no defect, when it opens the block or a nested part.
+    """
+    if msg.get_unixfrom() is not None:
+        return True
+    payload = msg.get_payload()
+    if isinstance(payload, str):
+        return bool(payload)
+    if isinstance(payload, list):
+        return any(
+            not isinstance(part, email.message.Message)
+            or bool(part.keys())
+            or bool(part.defects)
+            or _has_leftover(part)
+            for part in payload
+        )
+    return payload is not None
 
 
 # --- the chunked body -----------------------------------------------------------------------------
@@ -611,15 +643,16 @@ def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
     for _ in range(_MAX_TRAILER_FIELDS + 1):
         line = _read_chunk_line(fp, connector)
         if not line:
-            # An empty line ends the trailer section. So does a clean end of stream between lines:
-            # the last chunk has arrived, so which bytes are the body is settled, and http.client
-            # accepts this ending too because some servers send it.
+            # An empty line ends the trailer section. A clean end of stream between lines ends it
+            # too. The last chunk has arrived by then, so the body is settled. http.client accepts
+            # this ending as well, because some servers send it.
             return bytes(body)
         if _TRAILER_LINE.fullmatch(line) is not None:
             field_seen = True
         elif not (field_seen and _TRAILER_FOLD.fullmatch(line)):
             raise _framing_error(connector, "a trailer line that is not a header field")
-    raise _framing_error(connector, "more trailer fields than the reader allows")
+    # Folded continuation lines count toward the limit too, which keeps the loop bounded.
+    raise _framing_error(connector, "more trailer lines than the reader allows")
 
 
 def _read_chunk_line(fp: _SupportsReadline, connector: str) -> bytes | None:
