@@ -32,7 +32,7 @@ from typing import Any
 import hl7
 from hl7.containers import Component, Field, Repetition
 
-from messagefoundry.auth.trust_anchors import inbound_ca_cadata
+from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
@@ -654,6 +654,9 @@ def _mllp_ssl_context(
     exactly as before.
 
     ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
+    refuse_an_unread_ca_pin(
+        s, inbound=server, connector="MLLP listener" if server else "MLLP destination"
+    )
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")

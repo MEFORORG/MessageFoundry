@@ -67,7 +67,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
 from typing import Any, ClassVar, cast
 
-from messagefoundry.auth.trust_anchors import inbound_ca_cadata
+from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
@@ -166,6 +166,7 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
     default) loads an unencrypted key exactly as before.
 
     ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
+    refuse_an_unread_ca_pin(s, inbound=True, connector="DICOM listener")
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
@@ -643,6 +644,7 @@ def _client_ssl_context(
     CA per the resolved anchor. ``None`` (a direct test build) keeps the historical
     ``create_default_context(cafile=…)`` behaviour, byte-identical. It only selects WHICH roots verify the
     peer — verification is never disabled — so the internal CA never weakens a refusal."""
+    refuse_an_unread_ca_pin(s, inbound=False, connector="DICOM destination")
     if not s.get("tls"):
         return None
     ca = s.get("tls_ca_file")

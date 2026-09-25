@@ -124,7 +124,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   its SHA-256, after checking it is the CA you mean to trust. The engine loads the exact bytes it
   hashed, so a matching pin rules out a swapped file. It then starts with a warning, and the audit
   row carries `"pinned": true`. At `warn`, the engine starts with a warning, as before. A pin does
-  not excuse an anchor that another account CAN replace; that still refuses. **At least these
+  not excuse an anchor that another account CAN replace; that still refuses. **The AD anchor has
+  no pin escape:** `ldap3` reads `[auth].ad_tls_ca_cert_file` by path on every bind, so its pin
+  cannot vouch for the bytes loaded. An AD anchor the engine cannot judge must move. **At least these
   placements started under 0.4.0 and now refuse under `enforce` with no pin:**
   - on Windows, an anchor under `C:\Windows\Temp` when the engine's account cannot read that
     folder's permissions. Measured on one Windows 11 host, as a non-elevated user;
@@ -139,8 +141,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   **Migration:** move the anchor into a folder the engine can read and only administrators and the
   engine's account can change. On Windows that is the engine's data folder under `C:\ProgramData`.
   On POSIX it is a root-owned `755` folder such as `/etc/messagefoundry/`. Both pass with no pin.
-  Or set the pin: `[auth].oidc_tls_ca_cert_pin`, `[auth].ad_tls_ca_cert_pin`,
-  `[api].tls_client_ca_pin`, or the new `tls_ca_pin` on the connection.
+  Or set the pin: `[auth].oidc_tls_ca_cert_pin`, `[api].tls_client_ca_pin`, or the new
+  `tls_ca_pin` on the connection. For the AD anchor, only the move works.
   ([BACKLOG #1142](docs/BACKLOG.md))
 - **BREAKING: the mTLS CA of every inbound MLLP, HTTP and DICOM connection now gets the same
   checks as the auth anchors.** This is any inbound connection with `tls=True` and a
@@ -154,12 +156,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   0.4.0 and now refuse under `enforce`:** an inbound CA another account can replace, as the
   directory-arm entry below lists, and an inbound CA the engine cannot judge, as the entry above
   lists. An inbound CA with no PEM block, or with a `TRUSTED CERTIFICATE` block, refuses at both
-  dials. The client-side CAs of outbound connections are not covered.
+  dials. `tls_ca_pin` set on an outbound connection, or on one without `tls` and `tls_ca_file`,
+  refuses, because nothing would check it. Not covered: the CAs of outbound connections, and an
+  inbound `tls_crl_file`, which is still read by path, so a certificate inside it is trusted
+  unchecked.
   ([BACKLOG #1142](docs/BACKLOG.md))
 - **A config reload now refuses a trust anchor that the next start would refuse.** The reload
   check ran the pin, ACL and path checks, but not the check that the file holds a loadable PEM
   block. So a reload accepted an anchor with no PEM block, or a `TRUSTED CERTIFICATE` block, and
   the next start refused it. The reload now applies every check and writes a `pem_refused` row.
+  The AD anchor is the exception: `ldap3` loads a `TRUSTED CERTIFICATE` block, so the reload does
+  not refuse one there either.
   ([BACKLOG #1142](docs/BACKLOG.md))
 - **BREAKING: the OIDC and API client-CA trust anchors now load the bytes their check read, not a
   second read of the file.** `[auth].oidc_tls_ca_cert_file` and `[api].tls_client_ca_file` were

@@ -989,7 +989,9 @@ async def test_preflight_path_indeterminate_with_a_matching_pin_loads_and_says_s
     monkeypatch.setattr(ta, "anchor_path_verdict", _unknown_path)
     p = _pem(tmp_path)
     pin = hashlib.sha256(p.read_bytes()).hexdigest()
-    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(p), pin, "[auth].ad_tls_ca_cert_pin")
+    spec = AnchorSpec(
+        "api_client", "[api].tls_client_ca_file", str(p), pin, "[api].tls_client_ca_pin"
+    )
     await ta.run_anchor_preflight([spec], store, enforcing=True)
     row = next(r for r in await _events(store) if r["event"] == "path_indeterminate")
     assert row["pinned"] is True

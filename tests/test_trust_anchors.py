@@ -979,11 +979,6 @@ def test_registry_anchor_specs_collects_the_three_inbound_listeners(tmp_path: Pa
         "inbound:ADT_IN",
         "inbound:PACS_IN",
     }
-    # And collect_anchor_specs takes the same pairs beside the settings anchors.
-    pairs = [("ADT_IN", {"tls": True, "tls_ca_file": str(ca)})]
-    assert [s.label for s in collect_anchor_specs(AuthSettings(), ApiSettings(), pairs)] == [
-        "inbound:ADT_IN"
-    ]
 
 
 def _one_listener_graph(cfg: Path, ca: Path | None) -> None:
@@ -1040,3 +1035,133 @@ async def test_the_graph_preflight_is_dormant_without_an_inbound_ca(
     _one_listener_graph(cfg, None)
     await ta.make_registry_anchor_preflight(store, enforcing=True)(load_config(cfg), {})
     assert await _rows(store) == []
+
+
+# --- QA round one (BACKLOG #1142, slice 3) ---------------------------------------------------------
+
+
+def test_the_ad_anchor_has_no_pin_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ldap3 reads [auth].ad_tls_ca_cert_file by path on every bind, so the bytes a pin matched are
+    not the bytes loaded, and the pin cannot stand in for an unreadable ACL or path. Red under: the
+    escape keyed on pin_ok alone."""
+    body = _block(b"body")
+    p = _pem(tmp_path, body)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    auth = AuthSettings(
+        ad_tls_ca_cert_file=str(p), ad_tls_ca_cert_pin=hashlib.sha256(body).hexdigest()
+    )
+    (spec,) = collect_anchor_specs(auth, ApiSettings())
+    assert spec.label == "ad" and spec.loads_verified_bytes is False
+    with pytest.raises(TrustAnchorError) as err:
+        enforce_anchor(spec, enforcing=True)
+    text = str(err.value)
+    assert "A pin does not help here" in text and "tls_ca_cert_pin to" not in text
+    # The control: the same verdict and pin on an anchor whose consumer loads the checked bytes.
+    api = AnchorSpec("api_client", "[x]", str(p), hashlib.sha256(body).hexdigest())
+    enforce_anchor(api, enforcing=True)
+
+
+async def test_the_reload_does_not_refuse_an_ad_trusted_certificate_block(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The AD consumer reads cafile=, which loads a TRUSTED CERTIFICATE block, so the reload must not
+    refuse what the start accepts there. The same file on a cadata= anchor refuses."""
+    p = _pem(tmp_path, b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n")
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    (ad,) = collect_anchor_specs(AuthSettings(ad_tls_ca_cert_file=str(p)), ApiSettings())
+    await run_anchor_preflight([ad], store, enforcing=True)
+    api = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
+    with pytest.raises(TrustAnchorError, match="TRUSTED CERTIFICATE"):
+        await run_anchor_preflight([api], store, enforcing=True)
+
+
+@pytest.mark.parametrize(
+    ("settings", "inbound"),
+    [
+        ({"tls": True, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32}, False),  # outbound
+        ({"tls": True, "tls_ca_pin": "ab" * 32}, True),  # inbound, no CA to pin
+        ({"tls": False, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32}, True),  # no TLS
+    ],
+)
+def test_a_ca_pin_nothing_reads_is_refused(settings: dict, inbound: bool) -> None:
+    """A tls_ca_pin set where no check reads it would read as a pin and enforce nothing."""
+    with pytest.raises(ValueError, match="tls_ca_pin is set on"):
+        ta.refuse_an_unread_ca_pin(settings, inbound=inbound, connector="x")
+    # The control: the one place it is read, and every place it is absent.
+    ta.refuse_an_unread_ca_pin(
+        {"tls": True, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32}, inbound=True, connector="x"
+    )
+    ta.refuse_an_unread_ca_pin({**settings, "tls_ca_pin": None}, inbound=inbound, connector="x")
+
+
+def test_the_builders_refuse_a_ca_pin_nothing_reads() -> None:
+    """Wired into both MLLP directions and both DICOM directions, before the tls check."""
+    from messagefoundry.transports.dicom import _client_ssl_context, _server_ssl_context
+    from messagefoundry.transports.mllp import _mllp_ssl_context
+
+    pinned = {"tls": True, "tls_ca_file": "ca.pem", "tls_ca_pin": "ab" * 32}
+    with pytest.raises(ValueError, match="MLLP destination: tls_ca_pin"):
+        _mllp_ssl_context(pinned, server=False)
+    with pytest.raises(ValueError, match="DICOM destination: tls_ca_pin"):
+        _client_ssl_context(pinned)
+    with pytest.raises(ValueError, match="MLLP listener: tls_ca_pin"):
+        _mllp_ssl_context({"tls_ca_pin": "ab" * 32}, server=True)
+    with pytest.raises(ValueError, match="DICOM listener: tls_ca_pin"):
+        _server_ssl_context({"tls_ca_pin": "ab" * 32})
+
+
+async def test_a_nul_in_an_inbound_ca_path_is_a_refused_config_not_a_crash(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """Path.read_bytes raises ValueError on a NUL. The hook turns it into a WiringError, which the
+    reload route answers with a 422 and an audit row rather than an unaudited 500."""
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import MLLP, File, Send, handler, inbound, outbound, router\n"
+        "inbound('ADT_IN', MLLP(port=21575, tls=True, tls_cert_file='c.pem', "
+        "tls_ca_file='bad\\x00path.pem'), router='r')\n"
+        f"outbound('OUT', File(directory={str(tmp_path / 'out')!r}))\n" + _GRAPH_TAIL,
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="an inbound trust anchor was refused"):
+        await ta.make_registry_anchor_preflight(store, enforcing=True)(load_config(cfg), {})
+
+
+async def test_the_reload_route_audits_an_inbound_anchor_refusal_as_trust_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One audit filter, reason="trust_anchor", sees an inbound CA refusal as it sees a settings
+    anchor's. The control is the route's own invalid_config row for an empty graph."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.pipeline import Engine
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    cfg = tmp_path / "cfg"
+    _one_listener_graph(cfg, _pem(tmp_path, _block(b"ca")))
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "cfg.py").write_text("x = 1  # declares no connections\n", encoding="utf-8")
+
+    store = await MessageStore.open(tmp_path / "e.db")
+    engine = Engine(
+        store, registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True)
+    )
+    try:
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            for target in (cfg, empty):
+                r = await client.post("/config/reload", json={"config_dir": str(target)})
+                assert r.status_code == 422, r.text
+        rows = await store.list_audit(action="config_reload_failed", limit=10)
+        reasons = sorted(json.loads(r["detail"])["reason"] for r in rows)
+        assert reasons == ["invalid_config", "trust_anchor"]
+    finally:
+        await engine.stop()
