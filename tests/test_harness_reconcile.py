@@ -264,7 +264,9 @@ def _reload(
     stranded: int, *, sent: int, acked: int, timeouts: int, not_reconnected: int = 0
 ) -> _ReloadAccount:
     """A reload account whose `after` snapshot holds the counters at the moment every connection was
-    back. Counters obey `sent == acked + nak + timeouts` at that moment, as the sender guarantees."""
+    back. The helpers set no send in flight at that moment. The sender does not promise that, but a
+    send in flight then was written on a socket opened after the reload, so its reply still counts
+    as the engine answering after the reload (see `_ReloadAccount`)."""
     return _ReloadAccount(
         seconds=0.5,
         stranded=stranded,
@@ -302,7 +304,8 @@ def test_connscale_reconcile_stranding_the_reload_did_not_cause_still_fails() ->
         c, _BASE, _sample(read=18, written=18), unconfirmed_budget=12, reload=partial
     )
     assert not result2.ok
-    assert "not counting 10 the reload probe stranded" in result2.detail
+    # The budget is named over the base it was computed on, 26 sends, so a reader can redo it.
+    assert "(19 = max(connections, three quarters of the 26 send(s)" in result2.detail
 
 
 def test_connscale_reconcile_an_absent_acked_message_fails_despite_the_reload_excusal() -> None:
@@ -333,15 +336,47 @@ def test_connscale_reconcile_a_reload_the_engine_never_answered_after_fails() ->
 
 def test_connscale_reconcile_no_traffic_after_the_reload_cannot_pass_on_the_excusal() -> None:
     # The CI shape of 2026-09-25 exactly, had the step offered nothing after the reload: 33 of 36
-    # stranded and not one send after it. Excusing the 33 alone would leave 3 sends to judge, so
-    # "nothing was measured after the reload" fails the step instead of passing it on trust.
+    # stranded and not one send after it, though every connection came back. Excusing the 33 alone
+    # would leave 3 sends to judge, so "nothing was measured after the reload" fails the step
+    # instead of passing it on trust. No other guard fires here: the reconnect one is quiet.
     c = Counters(sent=36, acked=3, timeouts=33, sink_received=15)
-    reload = _reload(33, sent=36, acked=3, timeouts=33, not_reconnected=12)
+    reload = _reload(33, sent=36, acked=3, timeouts=33)
     result = connscale_reconcile(
         c, _BASE, _sample(read=15, written=15), unconfirmed_budget=12, reload=reload
     )
     assert not result.ok
-    assert "nothing was sent after the reload probe (12 connection(s)" in result.detail
+    assert "nothing was sent after the reload probe" in result.detail
+    assert "never came back" not in result.detail
+    # With the connections down as well, both signatures are named.
+    down = _reload(33, sent=36, acked=3, timeouts=33, not_reconnected=12)
+    result2 = connscale_reconcile(
+        c, _BASE, _sample(read=15, written=15), unconfirmed_budget=12, reload=down
+    )
+    assert "nothing was sent after the reload probe" in result2.detail
+    assert "12 connection(s) never came back" in result2.detail
+
+
+def test_connscale_reload_that_left_a_listener_down_fails_though_the_counts_pass() -> None:
+    # 4 of 12 connections never came back. Sends routed to them were queued and never written, so
+    # they are in no counter: the other 8 carried 6 answered sends and every count arm passes. Only
+    # the reconnect signature can fail this, and it must.
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=18)
+    reload = _reload(30, sent=30, acked=0, timeouts=30, not_reconnected=4)
+    result = connscale_reconcile(
+        c, _BASE, _sample(read=18, written=18), unconfirmed_budget=12, reload=reload
+    )
+    assert not result.ok
+    assert "4 connection(s) never came back" in result.detail
+
+
+def test_connscale_reload_guards_leave_a_step_that_offered_nothing_alone() -> None:
+    # A zero-rate lane sends nothing before or after the reload. There is no intake to measure, so
+    # the reload guards do not fail it; the old reconcile passed it too.
+    reload = _reload(0, sent=0, acked=0, timeouts=0)
+    result = connscale_reconcile(
+        Counters(), _BASE, _sample(read=0, written=0), unconfirmed_budget=12, reload=reload
+    )
+    assert result.ok, result.detail
 
 
 def test_connscale_reconcile_a_reload_that_stranded_nothing_changes_nothing() -> None:

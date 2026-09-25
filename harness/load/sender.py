@@ -96,6 +96,7 @@ class PersistentConnection:
         # so a caller that snapshots it before an event that closes the socket (the connscale
         # reload probe, BACKLOG #1292) can wait until the connection is back rather than guess.
         self._generation = 0
+        self._up = False  # True from a successful open until that socket's serve loop ends
 
     # --- public API ----------------------------------------------------------
 
@@ -103,6 +104,12 @@ class PersistentConnection:
     def generation(self) -> int:
         """The count of successful opens so far. It changes only when a NEW socket is up."""
         return self._generation
+
+    @property
+    def up(self) -> bool:
+        """True while the current socket is open and being served. A socket the peer has closed
+        reads True until this side notices, so pair it with :attr:`generation`, never alone."""
+        return self._up
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"loadconn-{self._host}:{self._port}")
@@ -149,11 +156,13 @@ class PersistentConnection:
                 continue
             backoff = _BACKOFF_START
             self._generation += 1
+            self._up = True
             try:
                 await self._serve(reader, writer)
             except (OSError, ConnectionError):
                 pass
             finally:
+                self._up = False
                 self._fail_inflight()
                 writer.close()
                 with contextlib.suppress(ConnectionError, OSError):

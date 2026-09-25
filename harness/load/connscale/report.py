@@ -218,11 +218,11 @@ class ConnScaleRecord:
     # close left unconfirmed; the reconcile excuses them and says so. `reload_not_reconnected` is how
     # many connections were still down when the step stopped waiting for them. And
     # `post_reload_extra_hold_s` is the offered time the step added so traffic followed the reload;
-    # it is 0.0 whenever the reload was quick. All default so an older artifact deserializes
-    # unchanged, and 0 there means "not recorded".
-    reload_stranded: int = 0
-    reload_not_reconnected: int = 0
-    post_reload_extra_hold_s: float = 0.0
+    # it is 0.0 whenever the reload was quick. All three are None when no reload probe ran, and
+    # default to None so an older artifact deserializes as "not measured" rather than as a clean 0.
+    reload_stranded: int | None = None
+    reload_not_reconnected: int | None = None
+    post_reload_extra_hold_s: float | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -313,7 +313,7 @@ class ConnScaleRecord:
                 "seconds": self.reload_seconds,
                 "stranded": self.reload_stranded,
                 "not_reconnected": self.reload_not_reconnected,
-                "extra_hold_s": round(self.post_reload_extra_hold_s, 3),
+                "extra_hold_s": _round_or_none(self.post_reload_extra_hold_s, 3),
             },
             "wall6_ack_ms": {
                 "p50": round(self.ack_p50_ms, 3),

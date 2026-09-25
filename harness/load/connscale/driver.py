@@ -139,18 +139,26 @@ class ConnScaleDriver:
                 next_due = now + interval
             await asyncio.sleep(max(0.0, min(next_due - loop.time(), _MAX_TICK_SLEEP)))
 
+    @property
+    def emitted(self) -> int:
+        """How many sends the token bucket has offered to a connection so far, queued or deferred.
+        Unlike the ``sent`` counter it moves at emit time, so it counts a send still queued behind a
+        reconnect."""
+        return self._rr
+
     def generations(self) -> list[int]:
         """Each connection's open count, in port order. Snapshot it before an event that closes the
         engine side of every socket, then hand it to :meth:`await_reconnected`."""
         return [conn.generation for conn in self._conns]
 
     async def await_reconnected(self, since: Sequence[int], *, timeout: float) -> int:
-        """Wait until every connection has opened a NEW socket since ``since`` was taken.
+        """Wait until every connection is serving a NEW socket opened since ``since`` was taken.
 
-        Returns how many connections had NOT reconnected when the wait ended, so 0 means all of them
-        are back. Bounded by ``timeout``: a connection in the sender's reconnect backoff can take up
-        to ``_BACKOFF_MAX`` to try again, and an engine that never listens again must not hang the
-        step. The caller reports a non-zero result rather than treating it as reconnected.
+        Returns how many connections were NOT back when the wait ended, so 0 means all of them are.
+        A connection counts as back only while that new socket is still up, so one that reconnected
+        and was closed again (the reload reached it late) is waited for once more. Bounded by
+        ``timeout``: an engine that never listens again must not hang the step. The caller treats a
+        non-zero result as a failure to report, never as reconnected.
         """
         if len(since) != self._count:
             raise ValueError(f"expected {self._count} generations, got {len(since)}")
@@ -158,7 +166,9 @@ class ConnScaleDriver:
         deadline = loop.time() + timeout
         while True:
             behind = sum(
-                1 for conn, gen in zip(self._conns, since, strict=True) if conn.generation <= gen
+                1
+                for conn, gen in zip(self._conns, since, strict=True)
+                if conn.generation <= gen or not conn.up
             )
             if behind == 0 or loop.time() >= deadline:
                 return behind

@@ -683,14 +683,25 @@ def time_reload(client: EngineClient, config_dir: str | None) -> float | None:
     reload errors or was held. Synchronous — the runner calls it in ``run_in_executor`` (off the
     event loop, like the rest of the engine polling). ``config_dir=None`` reloads the server's
     startup --config dir."""
+    return time_reload_outcome(client, config_dir)[0]
+
+
+def time_reload_outcome(client: EngineClient, config_dir: str | None) -> tuple[float | None, bool]:
+    """:func:`time_reload`, plus whether dual-control HELD the reload.
+
+    The two ``None`` cases mean different things to a caller that cares about the connections. A
+    held reload swapped nothing and closed nothing. An errored one may have swapped: the client's
+    5 s timeout raises ``ApiError`` while the engine is still stopping and restarting every
+    listener, which is the slow reload BACKLOG #1292 is about. So ``held`` is reported, not folded
+    into the ``None``."""
     t0 = time.perf_counter()
     try:
         result = client.reload_config(config_dir)
     except ApiError:
-        return None
+        return None, False
     if isinstance(result, PendingApprovalResponse):
         # Dual-control held the reload (ASVS 2.3.5): no graph was swapped, so the elapsed time is
         # the cost of parking an approval, not the O(connections) reload this wall measures. Report
         # no sample rather than a fast one that would read as a reload getting cheaper.
-        return None
-    return time.perf_counter() - t0
+        return None, True
+    return time.perf_counter() - t0, False
