@@ -306,6 +306,7 @@ def exchange_code(
     # keeps each refusal on the audited login-failure path.
     from messagefoundry.transports.bounded_read import (  # noqa: PLC0415  (matches the import above)
         AmbiguousFramingError,
+        EgressReplyError,
         ResponseTooLargeError,
         TruncatedResponseError,
         read_bounded,
@@ -333,6 +334,9 @@ def exchange_code(
         refusal = "token endpoint response exceeds the size bound"
     except TruncatedResponseError:
         refusal = "token endpoint closed the connection part-way through its response"
+    except EgressReplyError:
+        # The family, so a refusal added to bounded_read later still lands on FlowError.
+        refusal = "token endpoint response could not be read"
     if refusal is not None:
         raise FlowError(refusal)
     try:

@@ -45,7 +45,7 @@ from messagefoundry.auth.trust_anchors import AnchorSpec, enforce_anchor
 from messagefoundry.config.tls_policy import harden_cipher_suites, harden_crl_check
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
-    TruncatedResponseError,
+    EgressReplyError,
     read_reply_body,
     reply_framing_fault,
 )
@@ -169,8 +169,8 @@ def jwks_fetcher(
                 return read_reply_body(resp, _MAX_JWKS_BYTES + 1, connector="OIDC JWKS endpoint")
             except AmbiguousFramingError:
                 failure = "JWKS response framed its body length ambiguously"
-            except TruncatedResponseError:
-                failure = "JWKS endpoint closed the connection part-way through its response"
+            except EgressReplyError:  # the family, so a later sibling is retyped too
+                failure = "JWKS response could not be read whole"
             raise http.client.HTTPException(failure)
 
     return fetch

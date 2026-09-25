@@ -102,16 +102,18 @@ All notable changes to MessageFoundry are documented here. The format follows
     colon. 0.4.0 dropped every header after that line, then framed the body without them. It could
     read three bytes of raw chunk framing as the answer, or read to close and take a second
     response as part of the body;
-  - a header line with no name, a first line that is a continuation, a `From ` line, or a field
-    name that is not an RFC 9110 token;
-  - a chunk-size line that is not plain hex digits, such as `-5`, `1_0`, `+5`, `0x5` or ` 5`.
+  - a header line with no name, a first line that is a continuation, a `From ` line, a field
+    name that is not an RFC 9110 token, or a field value holding a control character such as NUL;
+  - a chunk-size line that is not plain hex digits, such as `-5`, `1_0`, `+5`, `0x5`, ` 5` or
+    `5 ` (whitespace before or after the size).
     0.4.0 parsed these with `int()`. On a negative size it read to the end of the stream, past
     the reply's byte bound, and only then failed;
   - a chunk line ended by a bare LF, or holding a bare CR, and chunk data not followed by CRLF;
-  - a trailer line that is not a field line, or more than 100 trailer fields;
-  - a chunked body that stops before its final CRLF. This is a truncation, and 0.4.0 accepted it.
+  - a trailer line that is not a field line, or more than 100 trailer fields.
 
-  Chunk extensions, trailer fields, upper-case hex and leading zeros still read. Connection probes
+  Chunk extensions, trailer fields (folded or not), upper-case hex and leading zeros still read. So
+  does a chunked body whose stream ends cleanly after the last chunk, with no final CRLF, as 0.4.0
+  read it. A bare CR inside a header line is not detected yet. Connection probes
   and the alert webhook discard the body and are not refused. They stop reading at the first bad
   chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
   send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),

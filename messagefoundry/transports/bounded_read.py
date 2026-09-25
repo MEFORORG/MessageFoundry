@@ -195,6 +195,9 @@ class AmbiguousFramingError(EgressReplyError):
     from an intermediary on one path rather than from the partner itself.
     """
 
+    #: The fixed reason text, never a peer byte, so a caller can word its own message.
+    reason: str = ""
+
 
 class _SupportsRead(Protocol):
     """Anything with a byte-count-limited ``read``: an ``http.client.HTTPResponse``, the
@@ -286,7 +289,12 @@ def drain_bounded(
     except TruncatedResponseError:
         return
     except AmbiguousFramingError as exc:
-        logger.warning("stopped draining a reply: %s", exc)
+        logger.warning(
+            "%s sent a malformed reply body (%s); the drain stopped there, and the call is not "
+            "failed because the body is discarded",
+            connector,
+            exc.reason,
+        )
 
 
 #: Statuses whose reply has no body (RFC 9112 section 6.3, rule 1). See reply_framing_fault.
@@ -309,8 +317,12 @@ def reply_framing_fault(reader: object) -> str | None:
       defect, and keeps every later line as unparsed payload. So a ``Content-Length`` or
       ``Transfer-Encoding`` after a malformed line, or after a name with whitespace before its
       colon, is silently lost, and the body is framed by what came before it or read to close.
-      Also refused: an mbox ``From `` line, which that parser takes silently, and a field name
-      that is not an RFC 9110 token. This check runs first, on every status and on ``HEAD``.
+      Also refused: an mbox ``From `` line, which that parser takes silently, a field name
+      that is not an RFC 9110 token, and a field value holding a control character. This check
+      runs first, on every status and on ``HEAD``. **It cannot see a bare CR inside a header
+      line:** the email parser splits the line there and records nothing, so what follows reads
+      as a header of its own. Catching that needs the raw header lines, which ``http.client``
+      discards before this function runs.
     * ``Transfer-Encoding`` on an HTTP/1.0 reply. Section 6.1 says the framing is then faulty.
     * ``Transfer-Encoding`` beside ``Content-Length``. Section 6.1 calls this a possible smuggling
       attempt that "ought to be handled as an error".
@@ -419,8 +431,9 @@ def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes
     :func:`reply_framing_fault` either; the caller does that first where it wants the header checks.
 
     A chunked ``http.client.HTTPResponse``, or the ``HTTPError`` that wraps one, is decoded by
-    :func:`_read_chunked_strict` rather than by ``http.client``, and the response is closed after.
-    Anything else is read with ``reader.read(amt)``.
+    :func:`_read_chunked_strict` rather than by ``http.client``. Anything else is read with
+    ``reader.read(amt)``. **Call it once per response, not in a loop:** a chunked response is closed
+    after the call, so a second call returns ``b""`` as if the body had ended.
 
     Raises :class:`TruncatedResponseError` when the peer closed part-way through the body, and
     :class:`AmbiguousFramingError` when a chunked body breaks the RFC 9112 section 7.1 grammar.
@@ -454,9 +467,11 @@ def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes
 def _framing_error(connector: str, reason: str) -> AmbiguousFramingError:
     # The reason is always a fixed string from this module, never a header value or a body byte, so
     # the message carries nothing the peer supplied.
-    return AmbiguousFramingError(
+    err = AmbiguousFramingError(
         f"{connector} framed its response body ambiguously ({reason}); refusing to read it"
     )
+    err.reason = reason
+    return err
 
 
 def _truncated_error(connector: str) -> TruncatedResponseError:
@@ -470,6 +485,10 @@ def _truncated_error(connector: str) -> TruncatedResponseError:
 #: An RFC 9110 section 5.6.2 token, the grammar of a field name and of a chunk extension name.
 _TCHARS = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
 _FIELD_NAME = re.compile(f"[{_TCHARS}]+")
+#: A folded line break inside a raw field value, which RFC 9112 section 5.2 lets a user agent
+#: accept in a response, and the controls RFC 9110 section 5.5 forbids in a value (HTAB allowed).
+_OBS_FOLD = re.compile(r"\r?\n[ \t]")
+_VALUE_CTL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
 
 def _header_block_fault(headers: email.message.Message) -> str | None:
@@ -477,15 +496,20 @@ def _header_block_fault(headers: email.message.Message) -> str | None:
 
     Each reason is a fixed string that names the header block, and never echoes a field value.
     """
-    # Every line the email parser leaves unparsed also records a defect, so the defect list covers
-    # the headers lost after a malformed line as well as the malformed line itself.
     if headers.defects:
         return "a header line the HTTP reader could not parse"
+    # Lines the parser kept as payload. Usually a defect was recorded too, but not at least for a
+    # "From " line that ends the block, which the parser pushes back with no defect.
+    payload = headers.get_payload()
+    if isinstance(payload, str) and payload:
+        return "header lines the HTTP reader left unparsed"
     if headers.get_unixfrom() is not None:
         return "an mbox envelope line in the header block"
-    names = headers.keys()  # the stored names; items() would also re-parse every value
-    if not all(_FIELD_NAME.fullmatch(name) for name in names):
-        return "a header field name that is not a token"
+    for name, value in headers.raw_items():
+        if not _FIELD_NAME.fullmatch(name):
+            return "a header field name that is not a token"
+        if _VALUE_CTL.search(_OBS_FOLD.sub(" ", value)):
+            return "a header field value holding a control character"
     return None
 
 
@@ -507,6 +531,8 @@ _CHUNK_EXT = (
 _CHUNK_SIZE_LINE = re.compile(rb"([0-9A-Fa-f]+)" + _CHUNK_EXT)
 #: A trailer field line. It is discarded unread, but a line that is not one is a framing fault.
 _TRAILER_LINE = re.compile(_TOKEN + rb":[\t\x20-\x7e\x80-\xff]*")
+#: A folded continuation of the trailer line before it, accepted as a header fold is.
+_TRAILER_FOLD = re.compile(rb"[ \t][\t\x20-\x7e\x80-\xff]*")
 
 #: The line and field-count limits ``http.client`` applies to header lines, applied here to chunk
 #: lines and trailer fields. Neither is a new number.
@@ -552,45 +578,59 @@ _READ_PIECE = 1024 * 1024
 
 
 def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
-    parts: list[bytes] = []
-    got = 0
+    # One bytearray rather than a list of chunks: a peer sending many tiny chunks would otherwise
+    # cost an object per chunk, far past the byte bound.
+    body = bytearray()
     while True:
         line = _read_chunk_line(fp, connector)
+        if line is None:
+            raise _truncated_error(connector)
         match = _CHUNK_SIZE_LINE.fullmatch(line)
         if match is None:
             raise _framing_error(connector, "a chunk-size line that is not plain hexadecimal")
         size = int(match.group(1), 16)
         if size == 0:
             break
-        want = min(size, amt - got)
+        want = min(size, amt - len(body))
         while want:
             data = fp.read(min(want, _READ_PIECE))
             if not data:
                 raise _truncated_error(connector)
-            parts.append(data)
-            got += len(data)
+            body += data
             want -= len(data)
-        if got >= amt:
+        if len(body) >= amt:
             # The caller's count is reached. The rest of the stream is left unread, and the
             # response is closed by the caller of this function.
-            return b"".join(parts)
+            return bytes(body)
         after = fp.read(2)
         if len(after) < 2:
             raise _truncated_error(connector)
         if after != b"\r\n":
             raise _framing_error(connector, "chunk data not followed by CRLF")
+    field_seen = False
     for _ in range(_MAX_TRAILER_FIELDS + 1):
         line = _read_chunk_line(fp, connector)
         if not line:
-            return b"".join(parts)
-        if _TRAILER_LINE.fullmatch(line) is None:
+            # An empty line ends the trailer section. So does a clean end of stream between lines:
+            # the last chunk has arrived, so which bytes are the body is settled, and http.client
+            # accepts this ending too because some servers send it.
+            return bytes(body)
+        if _TRAILER_LINE.fullmatch(line) is not None:
+            field_seen = True
+        elif not (field_seen and _TRAILER_FOLD.fullmatch(line)):
             raise _framing_error(connector, "a trailer line that is not a header field")
     raise _framing_error(connector, "more trailer fields than the reader allows")
 
 
-def _read_chunk_line(fp: _SupportsReadline, connector: str) -> bytes:
-    """One CRLF-terminated line of the chunked framing, without its CRLF."""
+def _read_chunk_line(fp: _SupportsReadline, connector: str) -> bytes | None:
+    """One CRLF-terminated line of the chunked framing, without its CRLF.
+
+    ``None`` when the stream ended cleanly before the line began. A line cut part-way is a
+    truncation.
+    """
     line = fp.readline(_MAX_LINE + 1)
+    if not line:
+        return None
     if len(line) > _MAX_LINE:
         raise _framing_error(connector, "a chunked-body line longer than the reader allows")
     if not line.endswith(b"\n"):

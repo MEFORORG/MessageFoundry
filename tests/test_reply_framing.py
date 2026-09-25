@@ -443,6 +443,12 @@ _BAD_HEADERS: dict[str, bytes] = {
     "mbox-envelope-line": _OK + b"From nobody\r\nContent-Length: 5\r\n\r\nhello",
     # read b"hello": a field name that is not an RFC 9110 token
     "name-not-a-token": _OK + b"X(Y): 1\r\nContent-Length: 5\r\n\r\nhello",
+    # read b"hello": a "From " line that ENDS the block is pushed back with no defect at all
+    "mbox-line-last": _OK + b"Content-Length: 5\r\nFrom nobody\r\n\r\nhello",
+    # read b"hello": a NUL inside a field value
+    "nul-in-value": _OK + b"X-A: a\x00b\r\nContent-Length: 5\r\n\r\nhello",
+    # read b"hello": a DEL inside a field value
+    "del-in-value": _OK + b"X-A: a\x7fb\r\nContent-Length: 5\r\n\r\nhello",
 }
 
 
@@ -528,6 +534,8 @@ _BAD_CHUNKS: dict[str, bytes] = {
     "negative-size": _TE + b"-5\r\n" + b"A" * 20_000,
     # read b"hello": a trailer line that is not a field line was discarded unread
     "trailer-not-a-field": _TE + b"5\r\nhello\r\n0\r\nnot a field\r\n\r\n",
+    # read b"hello": a fold with no field line before it
+    "trailer-fold-first": _TE + b"5\r\nhello\r\n0\r\n b\r\n\r\n",
 }
 
 #: Chunked framings that are legal and must still read as b"hello".
@@ -538,6 +546,7 @@ _CHUNK_CONTROLS: dict[str, bytes] = {
     "extension-quoted": _TE + b'5 ; n="a \\" b"; flag\r\nhello\r\n0;done\r\n\r\n',
     "leading-zeros": _TE + b"0005\r\nhello\r\n000\r\n\r\n",
     "trailer-section": _TE + b"5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Other: 1\r\n\r\n",
+    "trailer-folded": _TE + b"5\r\nhello\r\n0\r\nX-A: 1\r\n b\r\n\r\n",
 }
 
 
@@ -618,11 +627,15 @@ def test_a_chunked_body_with_no_last_chunk_is_a_truncation() -> None:
         read_bounded(_wire(_TE + b"5\r\nhello\r\n"), connector="c")
 
 
-def test_a_chunked_body_cut_before_the_final_crlf_is_a_truncation() -> None:
-    """http.client accepted this, because "a vanishingly small number of sites" do it. The body is
-    whole, but the peer broke its own framing, and the refusal is the same retryable one."""
+def test_a_chunked_body_ending_cleanly_after_its_last_chunk_still_reads() -> None:
+    """http.client accepts a stream that ends after the last chunk with no final CRLF, because some
+    servers send it. Which bytes are the body is settled by then, so refusing would only turn a
+    delivered POST into a retry. A trailer line cut part-way is still a truncation."""
+    assert read_bounded(_wire(_TE + b"5\r\nhello\r\n0\r\n"), connector="c") == b"hello"
+    raw = _TE + b"5\r\nhello\r\n0\r\nX-T: 1\r\n"
+    assert read_bounded(_wire(raw), connector="c") == b"hello"
     with pytest.raises(TruncatedResponseError):
-        read_bounded(_wire(_TE + b"5\r\nhello\r\n0\r\n"), connector="c")
+        read_bounded(_wire(_TE + b"5\r\nhello\r\n0\r\nX-T"), connector="c")
 
 
 def test_the_chunk_refusal_names_no_body_or_line_bytes() -> None:
@@ -689,6 +702,8 @@ def test_drain_bounded_stops_at_malformed_chunk_framing(
         drain_bounded(resp, limit=1000, connector="probe-c")
     assert stream.tell() <= min(len(raw), len(_TE) + 40)
     assert "probe-c" in caplog.text
+    assert "is not failed" in caplog.text
+    assert "refusing" not in caplog.text
 
 
 @pytest.mark.parametrize("shape", list(_CHUNK_CONTROLS), ids=list(_CHUNK_CONTROLS))
@@ -774,3 +789,21 @@ def test_oidc_token_exchange_refuses_a_body_short_of_its_content_length() -> Non
     raw = _json_reply(b"Content-Length: %d\r\n" % (len(_TOKEN_JSON) + 40))
     with _serve(raw) as url, pytest.raises(oidc.FlowError, match="part-way"):
         _exchange(url)
+
+
+def test_both_oidc_reads_retype_the_whole_refusal_family(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refusal added to bounded_read later must still land on FlowError or HTTPException. Caught
+    by member instead of by family, it would escape the login as an unhandled DeliveryError."""
+    from messagefoundry.auth import oidc, oidc_http
+    from messagefoundry.transports import bounded_read
+
+    def refuse(*_a: object, **_k: object) -> bytes:
+        raise EgressReplyError("a future sibling")
+
+    monkeypatch.setattr(bounded_read, "read_bounded", refuse)
+    monkeypatch.setattr(oidc_http, "read_reply_body", refuse)
+    raw = _json_reply(b"Content-Length: %d\r\n" % len(_TOKEN_JSON))
+    with _serve(raw) as url, pytest.raises(oidc.FlowError):
+        _exchange(url)
+    with _serve(raw) as url, pytest.raises(http.client.HTTPException):
+        oidc_http.jwks_fetcher(url, urllib.request.build_opener())()
