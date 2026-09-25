@@ -401,6 +401,42 @@ def test_text_that_cafile_reads_also_loads_as_cadata(
     assert _subjects(by_data) == ["good-ca"]
 
 
+def test_two_concatenated_files_each_with_a_byte_order_mark_load_both_certificates(
+    tmp_path: Path, cas: tuple[_Ca, _Ca]
+) -> None:
+    """``copy a.pem+b.pem`` puts the second file's byte-order mark in front of its BEGIN line.
+    ``cafile=`` loads both certificates, so the conversion must not drop the second."""
+    good, evil = cas
+    data = b"\xef\xbb\xbf" + good.pem + b"\xef\xbb\xbf" + evil.pem
+    anchor = tmp_path / "bundle.pem"
+    anchor.write_bytes(data)
+    by_file = ssl.create_default_context(cafile=str(anchor))
+    by_data = ssl.create_default_context(cadata=anchor_cadata(data, _SPEC))
+    assert sorted(_subjects(by_file)) == ["evil-ca", "good-ca"]  # the control: cafile= reads both
+    assert by_data.get_ca_certs() == by_file.get_ca_certs()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(b"", id="empty file"),
+        pytest.param(b"\xef\xbb\xbf", id="byte-order mark only"),
+        pytest.param(b"# M\xc3\xbcller\n", id="non-ASCII comment only"),
+        pytest.param(b"no certificate here\n", id="ASCII text only"),
+    ],
+)
+def test_an_anchor_with_no_pem_block_refuses(data: bytes, tmp_path: Path) -> None:
+    """``create_default_context`` tests ``cadata`` for truth, so an empty string would load the whole
+    OS store: an empty anchor file would fail OPEN. ``cafile=`` refused one, and so must this."""
+    assert len(ssl.create_default_context(cadata="").get_ca_certs()) > 1  # the hazard, measured
+    with pytest.raises(TrustAnchorError, match="holds no PEM block"):
+        anchor_cadata(data, _SPEC)
+    anchor = tmp_path / "idp-ca.pem"
+    anchor.write_bytes(data)
+    with pytest.raises(TrustAnchorError, match="holds no PEM block"):
+        build_idp_opener(str(anchor), enforcing=False)
+
+
 def test_a_non_ascii_byte_inside_a_block_refuses(cas: tuple[_Ca, _Ca]) -> None:
     good, _ = cas
     lines = good.pem.split(b"\n")
@@ -428,7 +464,9 @@ def test_a_trusted_certificate_block_refuses_rather_than_vanishing(cas: tuple[_C
 # --- the verify row, anchored -------------------------------------------------------------------------
 
 
-def _fed_settings(anchor: Path | None, pin: str | None = None, **security: Any) -> ServiceSettings:
+def _fed_settings(
+    anchor: Path | None, pin: str | None = None, crl: str | None = None, **security: Any
+) -> ServiceSettings:
     auth: dict[str, Any] = {
         "oidc_enabled": True,
         "oidc_issuer": "https://idp.example",
@@ -449,6 +487,8 @@ def _fed_settings(anchor: Path | None, pin: str | None = None, **security: Any) 
         auth["oidc_tls_ca_cert_file"] = str(anchor)
     if pin is not None:
         auth["oidc_tls_ca_cert_pin"] = pin
+    if crl is not None:
+        auth["oidc_tls_crl_file"] = crl
     return ServiceSettings.model_validate(
         {"auth": auth, "api": {"public_origin": "https://ops.example"}, "security": security}
     )
@@ -519,3 +559,27 @@ def test_verify_fails_a_pin_mismatch(
     row = _tls_row(_fed_settings(anchored, pin=hashlib.sha256(cas[1].pem).hexdigest()))
     assert row.status is Status.FAIL
     assert "pin" in row.detail
+
+
+def test_verify_fails_an_empty_anchor_rather_than_passing_the_os_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty anchor built an opener over the whole OS store in round one of this slice, and the
+    row called it PASS, pinned. It must refuse, as the engine does."""
+    _verdicts(monkeypatch, acl=True, path=True)
+    anchor = tmp_path / "empty.pem"
+    anchor.write_bytes(b"")
+    row = _tls_row(_fed_settings(anchor))
+    assert row.status is Status.FAIL
+    assert "holds no PEM block" in row.detail
+
+
+def test_verify_fails_a_crl_file_the_engine_refuses(
+    anchored: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row passes [auth].oidc_tls_crl_file, as AuthService does. It used to leave it out, so a
+    CRL file that refuses engine startup read as PASS here."""
+    _verdicts(monkeypatch, acl=True, path=True)
+    row = _tls_row(_fed_settings(anchored, crl=str(tmp_path / "absent-crl.pem")))
+    assert row.status is Status.FAIL
+    assert "does not exist" in row.detail

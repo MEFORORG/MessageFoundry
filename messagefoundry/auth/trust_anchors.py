@@ -41,7 +41,9 @@ runs, no audit rows, no new settings effects):
 5. **The checked bytes are the loaded bytes** (BACKLOG #1142, slice 2). :func:`evaluate_anchor` reads
    the file once and keeps the bytes it hashed. :func:`verified_anchor_cadata` hands those bytes to the
    TLS context as ``cadata=``, so the OIDC opener and the API client-CA never open the file a second
-   time. Before this, a file swapped between the check and the load was trusted unchecked.
+   time. Before this, a file swapped between the check and the load was trusted unchecked. **Not
+   covered:** the AD anchor, which ``ldap3`` still reads by path on every bind, and the audit row of
+   the central preflight, which records its own read rather than the consumer's.
 """
 
 from __future__ import annotations
@@ -143,35 +145,47 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     ``cadata=`` takes ASCII text only, while ``cafile=`` reads a file with any bytes between its PEM
     blocks. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a ``cafile`` with a UTF-8 comment above the
     block (a PKCS#12 export's ``friendlyName``) or a UTF-8 byte-order mark loads, and the same bytes
-    as ``cadata`` raise. So this drops a leading byte-order mark and every non-ASCII line OUTSIDE a
-    block. OpenSSL skips those lines anyway, so the certificates loaded are the same.
+    as ``cadata`` raise. So this drops a byte-order mark at the start of ANY line, since two
+    concatenated files put one before the second block, and every non-ASCII line OUTSIDE a block.
+    OpenSSL skips those lines anyway, so the certificates loaded are the same.
 
     Every line from ``-----BEGIN`` to ``-----END`` is kept exactly. A non-ASCII byte there refuses,
     as ``cafile=`` refuses it (``PEM lib``). The text is derived from ``data`` alone and nothing here
     opens a file, which is the point.
 
+    **No PEM block refuses.** ``create_default_context`` tests ``cadata`` for truth, so an empty
+    string loads the WHOLE OS trust store: measured, 87 anchors on one Windows host. ``cafile=``
+    refused an empty file, and so does this, before an empty string can reach a context.
+
     **A ``TRUSTED CERTIFICATE`` block refuses.** ``cafile=`` reads one with its OpenSSL trust
     settings, and ``cadata=`` skips it without a word: measured, the lone block raises ``no start
     line``, and beside a plain block it would be dropped silently. Rewriting it as a plain block
-    would drop a ``reject`` setting and so widen trust. Re-export it with ``openssl x509 -in <file>
-    -out <plain.pem>``, which writes a plain ``CERTIFICATE`` block."""
-    if data.startswith(_UTF8_BOM):
-        data = data[len(_UTF8_BOM) :]
+    would drop a ``reject`` setting and so widen trust. ``openssl x509 -in <one cert> -out
+    <plain.pem>`` writes a plain ``CERTIFICATE`` block, one certificate per run."""
     kept: list[bytes] = []
     inside = False
-    for line in data.splitlines(keepends=True):
+    blocks = 0
+    for raw in data.splitlines(keepends=True):
+        line = raw[len(_UTF8_BOM) :] if not inside and raw.startswith(_UTF8_BOM) else raw
         if line.startswith(_PEM_TRUSTED):
             raise TrustAnchorError(
                 f"{spec.setting}: the trust anchor '{spec.path}' holds a TRUSTED CERTIFICATE block, "
-                "which the engine does not load. Re-export it as a plain CERTIFICATE block: "
-                f"openssl x509 -in '{spec.path}' -out <plain.pem>"
+                "which the engine does not load. Re-export each certificate in it as a plain "
+                "CERTIFICATE block; openssl x509 -in <one cert> -out <plain.pem> converts one "
+                "certificate per run"
             )
         if line.startswith(_PEM_BEGIN):
             inside = True
+            blocks += 1
         if inside or line.isascii():
             kept.append(line)
         if line.startswith(_PEM_END):
             inside = False
+    if not blocks:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor '{spec.path}' holds no PEM block, so it names no "
+            "certificate to trust"
+        )
     try:
         return b"".join(kept).decode("ascii")
     except UnicodeDecodeError as exc:
@@ -710,8 +724,9 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
 
 def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
     """Construction-site preflight (no store/audit): evaluate + enforce one anchor, returning its
-    fingerprint. Used by ``build_idp_opener`` / ``build_api_ssl_context`` so a pinned or exposed anchor
-    fails fast at the point the CA is loaded into an opener/context."""
+    fingerprint. It loads nothing. A consumer that loads the anchor into a context calls
+    :func:`verified_anchor_cadata` instead and loads what that returns: calling this and then loading
+    the file by path reopens the check-then-load gap BACKLOG #1142, slice 2 closed."""
     verdict = evaluate_anchor(spec)
     _enforce_verdict(spec, verdict, enforcing=enforcing)
     return verdict.fingerprint
@@ -725,11 +740,16 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     a file swapped between the two reads would be trusted without its pin, ACL or path check. That
     was the case for both consumers until BACKLOG #1142, slice 2.
 
-    ``cadata=`` and ``cafile=`` set the same trust on a plain stdlib context. Measured on Windows
-    (CPython 3.14.6 / OpenSSL 3.5.7) over a localhost socket, client and server side: each verifies
-    the right CA, each refuses a wrong one, and each holds exactly one anchor. The one difference is
-    that ``cadata=`` loads no CRL from the anchor file. A CRL reaches a context only through its own
-    CRL setting (:func:`~messagefoundry.config.tls_policy.harden_crl_check`)."""
+    **This is where the cadata=/cafile= measurement lives; other sites point here.** Measured on
+    Windows, CPython 3.14.6 / OpenSSL 3.5.7, with a real TCP socket to a localhost server, client side
+    and server side: over a valid PEM, ``cadata=`` and ``cafile=`` each verify the right CA, each
+    refuse a wrong one, and each hold exactly one anchor. ``tests/test_trust_anchor_byte_binding.py``
+    repeats the handshakes over memory BIOs. :func:`anchor_cadata` covers the inputs where the two
+    differ.
+
+    ``cadata=`` loads no CRL from the anchor file. **A CRL file is still loaded by path**
+    (:func:`~messagefoundry.config.tls_policy.harden_crl_check`, ``cafile=``), and any certificate in
+    it enters the trust store unchecked. That residual is not closed here."""
     verdict = evaluate_anchor(spec)
     _enforce_verdict(spec, verdict, enforcing=enforcing)
     return anchor_cadata(verdict.data, spec)

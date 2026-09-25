@@ -238,9 +238,10 @@ _PATH_WORDS = {
 
 
 def _tls_row(settings: ServiceSettings) -> CheckResult:
-    """Build the real IdP TLS context, with the pin and the enforcement dial the engine uses, and say
-    what it trusts. A bad/unreadable CA path, a pin mismatch, or an anchor ``enforce`` refuses fails
-    here rather than at the last hop of a live login. No socket is opened.
+    """Build the real IdP TLS context, with the pin, the CRL file and the enforcement dial the engine
+    uses, and say what it trusts. A bad/unreadable CA path, a pin mismatch, a CRL file the engine
+    refuses, or an anchor ``enforce`` refuses fails here rather than at the last hop of a live login.
+    No socket is opened.
 
     **No anchor is MANUAL, never PASS** (BACKLOG #1142). The context then trusts every root in the
     host's OS store, so any of those CAs can issue a certificate the engine accepts for the IdP.
@@ -259,9 +260,10 @@ def _tls_row(settings: ServiceSettings) -> CheckResult:
     pin = settings.auth.oidc_tls_ca_cert_pin
     enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
     try:
-        build_idp_opener(ca, pin=pin, enforcing=enforcing)
+        build_idp_opener(ca, pin=pin, enforcing=enforcing, crl_file=settings.auth.oidc_tls_crl_file)
         # A second read of the file, for the report only: the opener above loaded its own checked
-        # bytes, and this verdict is what the row prints.
+        # bytes, and this verdict is what the row prints. Taking the opener's own verdict would
+        # widen build_idp_opener's signature for a diagnostic.
         spec = AnchorSpec("oidc", "[auth].oidc_tls_ca_cert_file", ca, pin) if ca else None
         verdict = evaluate_anchor(spec) if spec is not None else None
     except OSError as exc:
@@ -270,6 +272,8 @@ def _tls_row(settings: ServiceSettings) -> CheckResult:
         )
     except TrustAnchorError as exc:
         return CheckResult(rid, title, Status.FAIL, f"the engine refuses this anchor: {exc}")
+    except ValueError as exc:  # harden_crl_check: a missing, expired or empty CRL file
+        return CheckResult(rid, title, Status.FAIL, f"the engine refuses this CRL file: {exc}")
     except Exception as exc:
         return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")
     if verdict is None:

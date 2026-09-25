@@ -14,9 +14,8 @@ Trust model, mirroring ``ad_tls_ca_cert_file``:
   is loaded from the bytes the anchor check read, never by a second open of the file (BACKLOG #1142,
   slice 2). This used to say the OS verifier would not treat a ``load_verify_locations`` cert as an
   anchor on Windows. No OS verifier runs on the plain stdlib context built here, and that claim was
-  not re-measured for ``truststore``. What was measured, on Windows with CPython 3.14.6 / OpenSSL
-  3.5.7: ``cadata=`` and ``cafile=`` each verify the right CA over a localhost socket, each refuse a
-  wrong one, and each load exactly one anchor.
+  not re-measured for ``truststore``. The ``cadata=`` measurement that replaces it is stated once, at
+  :func:`~messagefoundry.auth.trust_anchors.verified_anchor_cadata`.
 * ``ca_cert_file`` **unset** → ``ssl.create_default_context()``, whose ``load_default_certs`` DOES
   consult the Windows machine store (CPython iterates ``('CA', 'ROOT')`` on win32 — measured: 79
   anchors on a stock domain-joined box), so a group-policy-published AD-CS enterprise root is honoured.
@@ -113,8 +112,10 @@ def build_idp_opener(
     if ca_cert_file:
         # BACKLOG #1142, slice 2: load the bytes the pin, ACL and path check just read, as cadata=.
         # cafile= here would open the file a second time, and a swap between the two reads would be
-        # trusted unchecked. Any cadata= makes create_default_context skip the OS store, exactly as
-        # cafile= does, so the anchor stays the ENTIRE trust set.
+        # trusted unchecked. A non-empty cadata= makes create_default_context skip the OS store, as
+        # cafile= does. An EMPTY one would load the whole OS store, because it tests cadata for
+        # truth, so anchor_cadata refuses an anchor with no PEM block before it gets here. A
+        # certificate inside crl_file still joins the store, by path: see verified_anchor_cadata.
         cadata = verified_anchor_cadata(
             AnchorSpec("oidc", "[auth].oidc_tls_ca_cert_file", ca_cert_file, pin),
             enforcing=enforcing,

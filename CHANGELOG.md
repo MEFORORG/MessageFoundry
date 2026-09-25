@@ -110,23 +110,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   checked once, for the SHA-256 pin, the ACL and the path, and then opened again by path. A file
   swapped between the two reads was trusted unchecked, under a pin that had matched. Both now load
   the checked bytes as `cadata=`. Measured on Windows, CPython 3.14.6 with OpenSSL 3.5.7, over a
-  localhost socket: `cadata=` and `cafile=` verify the same CA, refuse the same wrong one, and each
-  load exactly one anchor, on the client side and the server side. A UTF-8 byte-order mark and
-  non-ASCII text outside the PEM blocks still load. **These anchors loaded under 0.4.0 and now
-  refuse or change:**
+  localhost socket: for a valid PEM, `cadata=` and `cafile=` verify the same CA, refuse the same
+  wrong one, and each load exactly one anchor, on the client side and the server side. A UTF-8
+  byte-order mark, at the start of the file or of a later block, and non-ASCII text outside the
+  PEM blocks still load. **At least these anchors loaded under 0.4.0 and now refuse or change:**
   - an anchor holding a `TRUSTED CERTIFICATE` block, as `openssl x509 -trustout` writes, refuses at
-    startup. Re-export it with `openssl x509 -in <anchor> -out <plain.pem>`;
+    startup. Re-export each certificate in it as a plain `CERTIFICATE` block. `openssl x509 -in
+    <one cert> -out <plain.pem>` converts one certificate per run;
   - a CRL inside the anchor file is no longer loaded. A CRL reaches these contexts only through
     `[auth].oidc_tls_crl_file` or `[api].tls_client_crl_file`. With revocation checking on, an
     issuer whose CRL sat only in the anchor file now fails every handshake with `unable to get
-    certificate CRL`. Move that CRL into the CRL file;
-  - an anchor file with no certificate in it refuses at startup. It never verified a handshake.
+    certificate CRL`. Put that CRL, and no certificate, in the CRL file. The CRL file is still read
+    by path, and a certificate in it is trusted with no pin, ACL or path check;
+  - an anchor file that holds a CRL and no certificate refuses at startup. It never verified a
+    handshake.
 
   `verify --section federation` no longer reports the `fed.idp_tls` row as PASS with no anchor set.
   The IdP hop then trusts every root in the OS trust store, so the row is MANUAL. With an anchor
-  set, the row passes the pin and the `[security].enforcement` dial the engine uses, and it prints
-  the ACL and path verdict. It names the account that ran the check, because that is not the
-  service account. The AD anchor, `[auth].ad_tls_ca_cert_file`, still loads by path.
+  set, the row passes the pin, the CRL file and the `[security].enforcement` dial the engine uses,
+  and it prints the ACL and path verdict. It names the account that ran the check, because that is
+  not the service account. The AD anchor, `[auth].ad_tls_ca_cert_file`, still loads by path.
   ([BACKLOG #1142](docs/BACKLOG.md))
 - **BREAKING: an account with no notification address must set one at sign-in, whenever this
   instance sends security notices.** A security notice goes to the account's engine-owned address,
