@@ -233,10 +233,12 @@ async def test_a_profile_address_the_submit_would_refuse_is_not_suggested(engine
 
 
 async def test_a_non_ascii_profile_address_is_not_suggested(engine: Engine) -> None:
-    """A directory writer could store a homoglyph lookalike of the holder's real address, such as a
-    Cyrillic ``a`` (U+0430) for a Latin one. A pre-filled lookalike is the attack the suggestion must
-    not carry, so only a pure-ASCII address is offered. The POST is unchanged: the holder may still
-    type any address the submit accepts."""
+    """A directory writer could store a homoglyph lookalike of the holder's real address, such as
+    a Cyrillic ``a`` (U+0430) for a Latin one, or the same domain in Punycode. A pre-filled
+    lookalike is the attack the suggestion must not carry, so neither is offered. The POST is
+    unchanged: the holder may still type any address the submit accepts."""
+    from messagefoundry.auth.service import _is_single_mailbox
+
     service = await _service(engine, notifier=_FakeNotifier())
     user_id = await provision(service, "bare", [Role.OPERATOR.value])
     async with _client(engine, service) as c:
@@ -245,7 +247,11 @@ async def test_a_non_ascii_profile_address_is_not_suggested(engine: Engine) -> N
             "\u0430lice@example.org",  # Cyrillic a in the local part
             "alice@ex\u0430mple.org",  # Cyrillic a in the domain
             "alice\u00e9@example.org",  # a Latin-1 letter, not a lookalike, still refused
+            "alice@xn--exmple-4nf.org",  # the Cyrillic-a domain above, IDNA-encoded
+            "alice@mail.XN--exmple-4nf.org",  # the same, upper case and not the first label
         ):
+            # The control: the shape check passes each one, so the refusal below is the new rule's.
+            assert _is_single_mailbox(value), ascii(value)
             await engine.store.update_user_profile(user_id, display_name=None, email=value)
             page = await c.get(PAGE)
             assert page.status_code == 200, ascii(value)

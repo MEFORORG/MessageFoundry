@@ -1884,7 +1884,9 @@ Users are notified of security-relevant changes to their account through **two**
   an administrator changes an existing one, which notifies the old address. **The first address is
   trusted as submitted:** nothing checks that the holder receives mail there. The console form starts
   with the account's profile `email` when that passes the same shape check. On a directory account
-  that is the last `mail` the directory supplied, so a directory writer chooses the SUGGESTION. The
+  that is the last `mail` the directory supplied, so a directory writer chooses the SUGGESTION. It
+  is offered only when it is pure ASCII with no Punycode (`xn--`) domain label, so a non-ASCII
+  lookalike is never pre-filled; an all-ASCII one such as `examp1e.org` still can be. The
   page says where it came from, and nothing is written until the holder submits it. The
   `auth.notify_email_set` row puts the change in the holder's own feed, and a `notify_email_set`
   notice goes to the new address. A site with no mail relay notifies nobody, so it is not confined.

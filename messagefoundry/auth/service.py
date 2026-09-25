@@ -3436,23 +3436,29 @@ class AuthService:
 
     @staticmethod
     def suggested_notify_email(profile_email: str | None) -> str | None:
-        """The profile ``email`` to offer on the console's address form, or ``None`` (BACKLOG #1139).
+        """The profile ``email`` to offer on the console's address form, or ``None``.
 
-        Stripped, and only when it passes the shape check :meth:`fill_own_notify_email` applies, so
-        the form never offers a value its own submit refuses. On a directory account the profile
-        address is the last ``mail`` the directory supplied, which is why this is a suggestion only.
-        It writes nothing; the holder's submit is the only thing that fills ``notify_email``.
+        BACKLOG #1139. Stripped, and only when it passes the shape check
+        :meth:`fill_own_notify_email` applies, so the form never offers a value its own submit
+        refuses. On a directory account the profile address is the last ``mail`` the directory
+        supplied, which is why this is a suggestion only. It writes nothing; the holder's submit is
+        the only thing that fills ``notify_email``.
 
-        **ONLY A PURE-ASCII ADDRESS IS OFFERED.** A directory writer could store a homoglyph
-        lookalike of the holder's real address, such as a Cyrillic ``a`` for a Latin one, and a
-        pre-filled lookalike is the one thing this suggestion must not carry. The submit is not
-        narrowed: a holder may still type any address :meth:`fill_own_notify_email` accepts.
+        **ONLY A PURE-ASCII ADDRESS IS OFFERED, AND NO PUNYCODE DOMAIN.** A directory writer could
+        store a homoglyph lookalike of the holder's real address, such as a Cyrillic ``a`` for a
+        Latin one. An ``xn--`` label is the same lookalike in ASCII form, and a browser may show it
+        decoded. This refuses both. It does NOT refuse an all-ASCII lookalike such as ``examp1e``;
+        the line under the input asks the holder to check the value. The submit is not narrowed: a
+        holder may still type any address :meth:`fill_own_notify_email` accepts.
 
         A method rather than a module function so the console reaches it through the service it
         already holds, where seam discovery sees it and moves ``ENGINE_UI_SEAM``.
         """
         address = (profile_email or "").strip()
-        if not address or not _is_single_mailbox(address) or not address.isascii():
+        if not _is_single_mailbox(address) or not address.isascii():
+            return None
+        domain = address.rpartition("@")[2]
+        if any(label.lower().startswith("xn--") for label in domain.split(".")):
             return None
         return address
 

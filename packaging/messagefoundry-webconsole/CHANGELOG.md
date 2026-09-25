@@ -68,8 +68,10 @@ under Changed says why engine 0.4.0 does not work with this console.
   directory account that is the last `mail` the directory supplied. A line under the input names
   the source and asks the holder to change it if it is not theirs. A pre-filled input is not
   focused on load. Opening the page writes nothing; the address is set only when the holder
-  submits the form. Only a pure-ASCII address is suggested, so a directory writer cannot pre-fill
-  a homoglyph lookalike of the holder's real address. The submit still accepts what it did.
+  submits the form. Only a pure-ASCII address with no Punycode (`xn--`) domain label is suggested.
+  So a directory writer cannot pre-fill a lookalike built from non-ASCII letters, such as a Cyrillic
+  `a`. An all-ASCII lookalike such as `examp1e.org` is still offered, and the line under the input
+  is what asks the holder to check it. The submit still accepts what it did.
   **Requires an engine with `AuthService.suggested_notify_email`**, which moved the engine UI seam
   again. An engine at PR 1522 lacks that method and ships the older seam, so this console refuses
   it at startup with `UiSeamMismatch` rather than failing on the page.
