@@ -50,10 +50,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   only after the password passes the policy, so a refusal leaves no new SQLite store file behind.
   Its `--username`, `--email` and `--display-name` are limited to 256 characters, as in the web
   console.
-  `[auth].bootstrap_expiry_hours` and `[auth].bootstrap_warn_hours` still load but do nothing now; a
-  later change removes them. **Migration:** run `provision-admin` once at the host, as the account
-  that installs the service, against the store and service config the service uses. ADR 0183
-  Amendment A, Wave 2. (`BACKLOG #1136`)
+  The two settings that timed the first-run account are removed as well; see the next entry.
+  **Migration:** run `provision-admin` once at the host, as the account that installs the service,
+  against the store and service config the service uses. ADR 0183 Amendment A, Wave 2. (`BACKLOG #1136`)
+- **BREAKING — `[auth].bootstrap_expiry_hours`, `[auth].bootstrap_warn_hours` and the
+  `bootstrap_admin_expiring` alert event are gone.** They timed and announced the first-run account,
+  which the engine no longer creates. A service config file that sets either key now fails to load,
+  with the same "unrecognized config key" error as a typo. An `[[alerts.rules]]` rule whose `event_type`
+  is `bootstrap_admin_expiring` also fails to load. Nothing emitted that event after the account was
+  retired, so such a rule could never match. The environment variables
+  `MEFOR_AUTH_BOOTSTRAP_EXPIRY_HOURS` and `MEFOR_AUTH_BOOTSTRAP_WARN_HOURS` are now ignored without
+  an error, as the environment layer ignores any variable that names no setting. **Migration:**
+  delete both keys from `[auth]`, unset the two variables, and delete or retarget any rule that
+  names the event. ADR 0183 Amendment A, Wave 3. (`BACKLOG #1136`)
 - **BREAKING — the config loader refuses a connection name that does not match
   `^[A-Za-z][A-Za-z0-9_-]{0,255}$`.** In 0.4.0 such a name still loaded and ran, and only the API
   refused it. Now a code-first `inbound()` or `outbound()` call, or a `connections.toml` entry,

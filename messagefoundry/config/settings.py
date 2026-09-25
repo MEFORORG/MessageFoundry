@@ -2170,7 +2170,7 @@ class AuthSettings(_Section):
     # secure default over back-compat. It cannot lock a fresh admin out: a required-but-unenrolled
     # Administrator can still reach the factor-enrollment routes (they are gated by a fresh PASSWORD
     # step-up bound to the enroll/confirm action, never by the MFA gate — see
-    # api/security.py:require_reauth_only_action), so the bootstrap admin enrolls TOTP then satisfies
+    # api/security.py:require_reauth_only_action), so a newly provisioned admin enrolls TOTP then satisfies
     # it. Set ``require_mfa = false`` (the documented opt-out) to revert to the single-factor default.
     # An off-loopback bind that serves local accounts MUST keep this on; ``serve`` makes that posture
     # explicit (sec-mfa-on) — on an exposed (non-loopback) PHI bind with this **explicitly opted out**
@@ -2240,28 +2240,13 @@ class AuthSettings(_Section):
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
-    # First-run bootstrap admin: auto-disabled once a second administrator exists, and (if still
-    # unclaimed — never password-changed) disabled this many hours after creation. 0 = no time expiry
-    # OF THE ACCOUNT, which is not the same as no expiry of its CREDENTIAL (BACKLOG #1245): the
-    # printed first-run password is separately bounded by `initial_password_expiry_hours`, so at 0 the
-    # account survives indefinitely while the credential still dies on that other clock. Setting this
-    # LONGER than that value has the same shape. The deadline surfaced in `bootstrap-admin.txt` is the
-    # EARLIER of the two for exactly this reason.
-    bootstrap_expiry_hours: int = 72
-    # ASVS 6.4.5 arm 2: how many hours BEFORE that auto-disable to start reminding an operator (via the
-    # `bootstrap_admin_expiring` AlertSink event) that the unclaimed first-run credential is about to be
-    # retired. The API-lifespan reminder fires once per process while now sits inside
-    # [expires_at - bootstrap_warn_hours, expires_at). Only meaningful when bootstrap_expiry_hours > 0.
-    bootstrap_warn_hours: int = 24
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
     # password, i.e. account takeover. Keyed on `password_changed_at`; a user who set their own password
-    # has `must_change_password=False` and is unaffected. THE BOOTSTRAP ADMIN IS NOT EXEMPT (BACKLOG
-    # #1245): it used to be, on the premise that `bootstrap_expiry_hours` covered it, but WP-3 retires
-    # an ACCOUNT while this expires a CREDENTIAL, and WP-3 cannot bound the credential at all when
-    # `bootstrap_expiry_hours = 0` or is set longer than this value. 0 = no expiry (not recommended on
-    # a PHI instance) — and note that setting THIS to 0 now also unbounds the first-run credential.
+    # has `must_change_password=False` and is unaffected. Every local account holding such a temporary
+    # password is in scope: the engine creates no default account (ADR 0183 Amendment A), so there is
+    # no carve-out to reason about. 0 = no expiry (not recommended on a PHI instance).
     initial_password_expiry_hours: int = 72
 
     # Active Directory / LDAP. The bind password is a secret: MEFOR_AUTH_AD_BIND_PASSWORD.
@@ -3150,9 +3135,6 @@ _ALERT_EVENT_TYPES = frozenset(
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         "content_match",  # #81 (ADR 0133): a code-first Handler ("Action Point") matched message content (PHI-free)
-        # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
-        # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
-        "bootstrap_admin_expiring",
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
         # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)
         "initial_credential_expiring",
@@ -5360,12 +5342,11 @@ def security_loosenings(
     load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
     It is not a ``[security]`` field, so the completeness floor (which iterates
     ``SecuritySettings.model_fields``) never covered it and its absence is not a floor-test gap. What
-    changed is the consequence: since #1245 removed the bootstrap's carve-out from the ASVS 6.4.1
-    gate, this value is the ONLY bound on the printed first-run administrator credential whenever
-    ``bootstrap_expiry_hours`` is 0 or longer than it. So setting it to 0 unbounds that credential,
-    and nothing in this registry says so. Reporting it needs a new REQUIRED parameter (every one here
-    is required by design, so an optional detector cannot be added quietly), which is a larger change
-    than the item that exposed it — filed as content rather than folded in.
+    matters is the consequence: it is the ONLY bound on an admin-issued temporary password, so
+    setting it to 0 unbounds every such credential, and nothing in this registry says so. Reporting it
+    needs a new REQUIRED parameter (every one here is required by design, so an optional detector
+    cannot be added quietly), which is a larger change than the item that exposed it — filed as
+    content rather than folded in.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
