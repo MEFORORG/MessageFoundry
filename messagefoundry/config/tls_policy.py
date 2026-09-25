@@ -1285,18 +1285,33 @@ def cleartext_acceptance_audit_sink(
 
     The marker is deliberately **lower-case**: the PHI redaction filter (``redaction._NAME_RUN``) treats
     two or more adjacent ALL-CAPS tokens as a possible name run and replaces them with ``[redacted]``,
-    so a shouted marker would be scrubbed out of the very record it exists to make findable."""
+    so a shouted marker would be scrubbed out of the very record it exists to make findable. The name
+    is rendered by :func:`_audit_connection`, which says why it is quoted."""
 
     def _record(detail: str) -> None:
         logger.warning(
-            "cleartext hop crossed on an operator acceptance — connection %s: %s "
-            "(cleartext_accepted; reason: %s)",
-            connection or "(unnamed)",
+            "cleartext hop crossed on an operator acceptance — %s "
+            "(cleartext_accepted on connection %s; reason: %s)",
             detail,
+            _audit_connection(connection),
             reason or "(none provided)",
         )
 
     return _record
+
+
+def _audit_connection(connection: str | None) -> str:
+    """Render a declaring connection's name for an audit record, or ``(unnamed)`` for a hop that is not
+    a connection.
+
+    Quoted with ``repr`` so a control character in a code-first name is escaped, not passed raw to a
+    handler that lacks the control-character scrub.
+
+    **Callers must not follow the name with ``:`` or ``=``.** ``CredentialScrubFilter`` reads
+    ``LABEL: value`` as a credential pair when the label ends in a credential word, and it allows a
+    quote between the two. So ``connection 'IB_LAB_PASS': MLLP inbound`` ships as
+    ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``."""
+    return "(unnamed)" if connection is None else repr(connection)
 
 
 def log_revocation_attestation(
@@ -1311,26 +1326,16 @@ def log_revocation_attestation(
     """Record one hop that crossed an enforcing revocation refusal on an operator declaration (ADR 0173).
 
     The ONE record builder for both directions: :meth:`RevocationHopGuard.enforce_construction` for a
-    verifying outbound hop and ``check_inbound_revocation`` for an mTLS listener. Shared for the reason
-    :func:`cleartext_acceptance_audit_sink` is shared -- a record forked per direction drifts, and an
-    auditor searching one marker then misses the other half.
-
-    ``connection`` names the declaring connection, and it is what makes the record actionable. The
-    outbound ``cell`` is a static family label and ``detail`` names a host, so two destinations to one
-    host produce the same line without it. ``None`` (a hop that is not a connection) renders as
-    ``(unnamed)`` rather than a blank. ``reason`` is operator-authored text: it is passed as a logging
-    parameter, never interpolated into the format string.
-
-    The marker is **lower-case** for the reason the cleartext sink's is: the PHI redaction filter
-    (``redaction._NAME_RUN``) scrubs two or more adjacent ALL-CAPS tokens, so a shouted marker would be
-    scrubbed out of the record it exists to make findable. The colon after the name keeps an upper-case
-    connection name from joining an upper-case token after it, since the run needs whitespace."""
+    verifying outbound hop and ``check_inbound_revocation`` for an mTLS listener, so the two halves
+    cannot drift apart. Why the record names its connection, why the marker is lower-case, and why
+    ``reason`` is a logging parameter are all stated once, on :func:`cleartext_acceptance_audit_sink`,
+    and hold here unchanged."""
     log.warning(
-        "%s on operator attestation — connection %s: %s (%s; reason: %s)",
+        "%s on operator attestation — %s (%s on connection %s; reason: %s)",
         crossing,
-        connection or "(unnamed)",
         detail,
         declaration,
+        _audit_connection(connection),
         reason or "(none provided)",
     )
 

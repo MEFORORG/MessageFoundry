@@ -7649,6 +7649,16 @@ def _dest_config(
     # reads it -- the SMART token-endpoint provider (transports/smart.py). Written only when set. The
     # name rides with it for the same reason `cleartext_connection` does: the audit line that seam
     # logs must name the declaring connection.
+    #
+    # The keys are cleared first, because only the top-level declaration may write them. A code-first
+    # spec could otherwise carry them as raw transport settings: that crosses the refusal with no
+    # reason check, and names whatever connection the spec chose in the audit line.
+    for key in (
+        "tls_revocation_attested",
+        "tls_revocation_attested_reason",
+        "tls_revocation_attested_connection",
+    ):
+        settings.pop(key, None)
     if oc.tls_revocation_attested:
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = oc.tls_revocation_attested_reason
