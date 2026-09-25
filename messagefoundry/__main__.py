@@ -696,11 +696,10 @@ def main(argv: list[str] | None = None) -> int:
     cert_self_signed.add_argument("--json", action="store_true", help="emit JSON")
 
     # BACKLOG #1236 (ASVS availability). A sole-administrator deployment had NO recovery from account
-    # lockout: the bootstrap account is named `admin` so it is the one an attacker guesses first, it is
-    # created with no email so the ACCOUNT_LOCKED notice never leaves the process, self-reset is
-    # refused, an admin reset needs ANOTHER admin, re-bootstrap only fires on an EMPTY users table, and
-    # no CLI managed users. Every exit is individually deliberate; they close SIMULTANEOUSLY for a
-    # deployment with one administrator. This is the offline exit.
+    # lockout: self-reset is refused, an admin reset needs ANOTHER admin, `provision-admin` refuses
+    # while that administrator is still enabled (a lockout is not a disable), and without an address
+    # the ACCOUNT_LOCKED notice never leaves the process. Every exit is individually deliberate; they
+    # close SIMULTANEOUSLY for a deployment with one administrator. This is the offline exit.
     admin_unlock = sub.add_parser(
         "admin-unlock",
         help="clear a local account's lockout from the host (offline sole-administrator recovery)",
@@ -714,12 +713,18 @@ def main(argv: list[str] | None = None) -> int:
     admin_unlock.add_argument("--db", default=None, help="store path (overrides [store].path)")
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
-    # BACKLOG #1136 (ASVS 6.3.2). Run before the first `serve` and the engine never mints a default
-    # account: `_ensure_bootstrap_admin` seeds only an EMPTY user table. There is deliberately no
-    # --password and no --password-file -- see `_provision_admin`.
+    # BACKLOG #1136 (ASVS 6.3.2). The engine creates no account on its own (ADR 0183 Amendment A), so
+    # this is how an install gets its first administrator. There is deliberately no --password and no
+    # --password-file -- see `_provision_admin`.
     provision_admin = sub.add_parser(
         "provision-admin",
-        help="create the first administrator offline, so no default account is ever minted",
+        help="create the first administrator offline (the engine creates no account on its own)",
+        description="Create the first Administrator from the host, against the store the service "
+        "uses. The engine creates no account on its own, so an install has no way to sign in until "
+        "this runs. It refuses, before asking for a password, when an enabled Administrator already "
+        "exists or an argument is out of range, and it creates the store only once the password "
+        "has passed the policy, so a refusal leaves no new SQLite store file behind. Run it with the "
+        "engine stopped.",
     )
     provision_admin.add_argument(
         "--username", required=True, help="the administrator to create (no default, on purpose)"
@@ -4929,21 +4934,32 @@ def _keyless_store_gate(settings: ServiceSettings, *, enforcing: bool) -> str | 
 def _provision_admin(args: argparse.Namespace) -> int:
     """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
 
-    Run before the first ``serve`` and the engine never creates the account named ``admin``: the
-    seeding path fires only on an EMPTY user table, so an operator-named administrator pre-empts it.
-    That is the "not present" arm of the verb, reached by an operator action rather than by a
-    configuration knob. The shipped default is unchanged and still mints one -- retiring the
-    auto-create is the remaining half of the item, and it is not this command.
+    The engine creates no account on its own since ADR 0183 Amendment A, Wave 2, so this is the "not
+    present" arm of the verb and the way every install gets its first administrator. It works in
+    either order: before the first ``serve``, or after a ``serve`` that was refused for want of one.
 
     The gate is host access, argued once on :func:`_admin_unlock` and in ADR 0171. What differs is
     the refusal: this one declines when an ENABLED ADMINISTRATOR exists rather than when the table is
     non-empty, because a directory sign-in can fill the table without producing an administrator.
+
+    **It refuses before it prompts wherever it can, and it creates the store last (AC-15).** The
+    length limits, the keyless gate and the "an Administrator exists" answer all come before the
+    password prompt; the password policy comes before the store is created. Two reasons. A refusal
+    that created the store first left a new store behind, and on a Windows service that store is
+    secured to whoever opened it. And a scripted install step, like the IDE's Start flow, reads "an
+    enabled Administrator exists" as go-ahead, which it can only do if no password is asked for first.
+    Answering that opens an EXISTING store the way ``serve`` does; an absent SQLite store is not
+    created by asking. ``provision_first_administrator`` repeats the blank-name, Administrator and
+    policy checks itself, so for those this ordering is a courtesy and not the control. The length
+    limits are this command's alone: the service method does not apply them.
     """
     import asyncio
     import getpass
 
     from pydantic import ValidationError
 
+    from messagefoundry.api.auth_models import _NAME_MAX
+    from messagefoundry.auth.policy import BreachCorpusUnavailable, PasswordPolicy
     from messagefoundry.auth.service import (
         AuthService,
         FirstAdministratorRefused,
@@ -4959,6 +4975,24 @@ def _provision_admin(args: argparse.Namespace) -> int:
         settings = load_settings(config_path=args.service_config, cli=cli)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         return _emit_error(str(exc), as_json=args.json)
+
+    # AC-15: the argument checks, before the prompt and before any open. The limits are the web
+    # console's (`UserCreateRequest`), so this offline surface admits nothing the console refuses,
+    # and the address limit is the one `admin-set-notify-email` applies. A blank address is still no
+    # address rather than a refusal (AC-9), so only its length is checked here.
+    username = args.username.strip()
+    if not username:
+        return _emit_error("a username is required and must not be blank", as_json=args.json)
+    if len(username) > _NAME_MAX:
+        return _emit_error(f"the username is longer than {_NAME_MAX} characters", as_json=args.json)
+    if args.email is not None and len(args.email) > _NAME_MAX:
+        return _emit_error(
+            f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
+        )
+    if args.display_name is not None and len(args.display_name) > _NAME_MAX:
+        return _emit_error(
+            f"the display name is longer than {_NAME_MAX} characters", as_json=args.json
+        )
 
     # BACKLOG #1905: the same at-rest gate `serve` applies, and BEFORE the password prompt and the
     # store open, so a refusal leaves no store behind. This command writes the store's FIRST audit row,
@@ -4992,12 +5026,60 @@ def _provision_admin(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    async def administrator_exists() -> bool:
+        from messagefoundry.store.base import StoreNotFoundError
+
+        # Opened WITHOUT create, so asking cannot make a SQLite store: an absent one holds no
+        # Administrator, and the write below creates it. An EXISTING store is opened as `serve`
+        # opens it, migrations and file permissions included. The answer is asked of AuthService,
+        # the one definition `provision_first_administrator` itself refuses on. It comes before the
+        # terminal check on purpose: a scripted re-run with no terminal still gets this answer.
+        try:
+            store = await open_store(settings.store)
+        except StoreNotFoundError:
+            return False
+        try:
+            return await AuthService(store, settings.auth).has_enabled_administrator()
+        finally:
+            await store.close()
+
+    from messagefoundry.store.crypto import StoreKeylessError
+
+    try:
+        exists = asyncio.run(administrator_exists())
+    except StoreKeylessError as exc:
+        return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if exists:
+        return _emit_error(
+            "this store already has an enabled Administrator, so there is nothing to provision "
+            "-- create further accounts from the web console, and use `admin-unlock` if the "
+            "administrator is locked out",
+            as_json=args.json,
+        )
+
     try:
         password = _read_new_password("New administrator password: ")
     except _PasswordEntryRefused as exc:
-        # Read BEFORE the store is opened, so a refusal cannot leave a SQLite file behind that the
-        # next `serve` would find non-empty.
+        # Read BEFORE the store is opened for writing, so a refusal cannot create a SQLite file.
         return _emit_error(str(exc), as_json=args.json)
+    # The policy `provision_first_administrator` applies, asked before the open (AC-15). An
+    # unusable bundled corpus refuses here in words rather than as a traceback, since this is the
+    # one command that can create an install's first administrator.
+    try:
+        violations = PasswordPolicy.from_settings(settings.auth).violations(
+            password, username=username
+        )
+    except BreachCorpusUnavailable as exc:
+        return _emit_error(
+            f"{exc}; the password cannot be screened, so it is refused (ASVS 6.2.4). Reinstall the "
+            "messagefoundry wheel to repair the corpus, or set [auth].password_check_breached = "
+            "false in the service config to accept unscreened passwords deliberately",
+            as_json=args.json,
+        )
+    if violations:
+        return _emit_error("; ".join(violations), as_json=args.json)
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
@@ -5023,7 +5105,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # `admin-unlock` is deliberate: the ordinary sequence is install, provision, serve, so on
             # a first run the SQLite store legitimately does NOT exist and creating it is correct.
             # The typo hazard M-31 covers is real all the same -- a mistyped --db provisions into a
-            # store `serve` will never open, and `serve` then mints the default account after all.
+            # store `serve` will never open, and `serve` then starts with no Administrator at all.
             # The substitute is naming the target below. It is read off the OPENED store rather than
             # off `[store].path`, which is the SQLite field and would name a file that was never
             # touched on the two server backends.
@@ -5058,7 +5140,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # UnicodeEncodeError on a legacy Windows console would traceback AFTER the account was created.
     _safe_print(f"OK: {verb} Administrator {outcome.username!r} in {store_path}")
     _safe_print(
-        "The engine will NOT create a default 'admin' account: the user table is no longer empty."
+        f"Sign in as {outcome.username!r} once the engine is running; it creates no account itself."
     )
     if not (args.email and args.email.strip()):
         _safe_print(

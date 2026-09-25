@@ -3639,6 +3639,21 @@ jobs:
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -DataDir C:\ProgramData\MessageFoundry-w0-start-first
 
+      # ADR 0183 Amendment A, Wave 2: the engine creates no account on its own now, so the start-first
+      # order is the one an operator who starts the service before provisioning meets. This third arm
+      # runs it end to end across the two identities with no outcome left open: the first start MUST be
+      # refused for want of an Administrator and name provision-admin (AC-11), with no
+      # bootstrap-admin.txt written (AC-13); the operator's provision-admin --email MUST succeed; the
+      # restart MUST serve and sign the new administrator in. A refusal for a missing address, or a
+      # provision-admin that finds an Administrator already there, means a start created an account
+      # nobody named -- the retired default coming back -- and reds the arm. It reds the way the two
+      # arms above do: an ::error annotation per failure, then RED lines and a throw.
+      - name: Store access, auth on -- start first, then provision, end to end (ADR 0183 Wave 2)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: powershell
+        run: .\scripts\service\measure-store-access.ps1 -Order StartFirstEndToEnd -DataDir C:\ProgramData\MessageFoundry-w2-start-first-e2e
+
       - name: Upload store-access logs (ADR 0183 Wave 0)
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -3647,6 +3662,7 @@ jobs:
           path: |
             C:\ProgramData\MessageFoundry-w0-provision-first\logs\
             C:\ProgramData\MessageFoundry-w0-start-first\logs\
+            C:\ProgramData\MessageFoundry-w2-start-first-e2e\logs\
           if-no-files-found: ignore
 
       - name: Upload service logs

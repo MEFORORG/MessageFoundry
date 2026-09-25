@@ -22,18 +22,32 @@
         3. The operator signs in over https as the provisioned administrator and gets a session.
 
     -Order StartFirst
-        1. The service starts on a fresh store. It creates the store, mints the bootstrap account
-           (still live before Wave 2), and is REFUSED by the ADR 0167 gate, because that account
-           has no notification address. The gate runs after the store is opened and its user table
-           read, so the refusal text in the service log is the proof that the service opened it.
-        2. The operator opens that store through the same CLI path. `provision-admin` then declines,
-           because the bootstrap account is an enabled Administrator. That decline is reached only
-           after the store opened, so it is the proof that the operator opened it.
+        1. The service starts on a fresh store. It creates the store and is REFUSED by the ADR 0167
+           gate: before Wave 2 because the bootstrap account it minted had no notification address,
+           and since Wave 2 because no Administrator exists at all. The gate runs after the store is
+           opened and its user table read, so the refusal text in the service log is the proof that
+           the service opened it. Either refusal counts here; this arm measures file access.
+        2. The operator opens that store through the same CLI path. Before Wave 2 `provision-admin`
+           declined, because the bootstrap account was an enabled Administrator; since Wave 2 it
+           provisions. Either outcome is reached only after the store opened, so it is the proof
+           that the operator opened it.
         3. The service is started again and must reach the same refusal, which proves it can still
            open the store that the operator's open re-secured. If step 2 instead PROVISIONED (no
            bootstrap account existed), the gate would pass, so the proof is /health and sign-in. If
            step 2 FAILED, the service is restarted anyway as a control: reopening the store it
            created itself tells "restricted to the service" apart from "restricted to nobody usable".
+
+    -Order StartFirstEndToEnd (ADR 0183 Amendment A, Wave 2: AC-11 and AC-13 across two identities)
+        The start-first flow an operator now meets, with no outcome left open.
+        1. The service starts on a fresh store and MUST be refused for want of an Administrator,
+           and the refusal MUST name `provision-admin`. A refusal for a missing address instead means
+           the start created an account nobody named, which is the retired default coming back.
+           The data directory must hold no bootstrap-admin.txt.
+        2. The operator runs `provision-admin --email` against that store and MUST succeed. A
+           decline there means an enabled Administrator was already in a store no operator had
+           provisioned, which is the same regression seen from the other side.
+        3. The service is started again and must serve, and the operator must sign in as the
+           administrator just provisioned.
 
     THE SERVICE IDENTITY IS CHECKED, NOT ASSUMED. The SCM's configured run-as account must be
     NT SERVICE\<ServiceName>, and every process sampled under the service must run as it. Where the
@@ -61,7 +75,7 @@
     installs and uninstalls the service and creates -DataDir from scratch.
 
 .PARAMETER Order
-    ProvisionFirst or StartFirst.
+    ProvisionFirst, StartFirst or StartFirstEndToEnd.
 
 .PARAMETER DataDir
     A data directory this script owns for the run. It is DELETED first if it exists.
@@ -71,7 +85,7 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet("ProvisionFirst", "StartFirst")][string]$Order,
+    [Parameter(Mandatory)][ValidateSet("ProvisionFirst", "StartFirst", "StartFirstEndToEnd")][string]$Order,
     [Parameter(Mandatory)][string]$DataDir,
     [string]$ServiceName = "MessageFoundry",
     [string]$AppExe,
@@ -96,7 +110,15 @@ $Email = "w0-admin@example.invalid"
 # The ADR 0167 gate's own words (messagefoundry/api/app.py, _assert_security_notice_is_deliverable),
 # and the words provision_first_administrator declines with (messagefoundry/auth/service.py). If
 # either is reworded, the arm goes RED on a missing proof rather than passing on a stale one.
-$GateRefusal = "no enabled Administrator has a notification address"
+# $GateRefusal is the clause BOTH of the gate's branches open with, so the file-access arms prove the
+# service read the user table whichever branch fired. $NoAdminRefusal and $ProvisionHint are the
+# no-Administrator branch alone, which StartFirstEndToEnd requires (ADR 0183 Wave 2, AC-11).
+$GateRefusal = "no enabled Administrator"
+$NoAdminRefusal = "no enabled Administrator exists"
+$ProvisionHint = "provision-admin --username"
+# The words that make it a REFUSAL. The skipped-gate WARNING and the warn-mode line carry the two
+# phrases above too, so without this an engine that started and served would pass step 1.
+$StartRefused = "refusing to start"
 $ProvisionDecline = "already has an enabled Administrator"
 $OpenErrorPattern = "unable to open database file|Access is denied|PermissionError|OperationalError"
 # store.py logs these and carries on; each means that open did not restrict the trio as it tried to
@@ -740,6 +762,67 @@ try {
                 Test-Resecured -Identity $ServiceIdentity -FromServiceLog
             }
         }
+    } elseif ($Order -eq "StartFirstEndToEnd") {
+        # 1. The service starts first on a fresh store. No account exists, so the ADR 0167 gate must
+        #    refuse for want of an Administrator, and name provision-admin.
+        Start-TheService "first start"
+        $opened = Wait-ForGateRefusal "the first start"
+        Stop-TheService
+        Show-Trio "service first start"
+        $credentialFile = Join-Path $DataDir "bootstrap-admin.txt"
+        if (Test-Path -LiteralPath $credentialFile) {
+            Add-Failure ("$ServiceIdentity wrote $credentialFile on its first start; since ADR 0183 " +
+                "Wave 2 no path writes a bootstrap credential file (AC-13)")
+        }
+        $noAdmin = @(Get-LogMatches ([regex]::Escape($NoAdminRefusal)) |
+            Where-Object { $_.Line -match [regex]::Escape($StartRefused) })
+        if (-not $opened) {
+            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but never reached the account gate, so its open is unproven" }
+                    else { "never created $DbPath" }
+            Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
+                (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
+            Show-LogTail
+        } elseif ($noAdmin.Count -eq 0) {
+            $line = @(Get-LogMatches ([regex]::Escape($GateRefusal)) | Select-Object -First 1 |
+                ForEach-Object { Get-Excerpt $_.Line 300 })
+            Add-Failure ("$ServiceIdentity reached the ADR 0167 gate on a fresh store, but no line said " +
+                "both '$StartRefused' and '$NoAdminRefusal'. Either the start was not refused, or it " +
+                "was refused for a missing address, which means the first start created an account no " +
+                "operator named. Gate line: $($line -join ' ')")
+            Show-LogTail
+        } elseif (@($noAdmin | Where-Object { $_.Line -match [regex]::Escape($ProvisionHint) }).Count -eq 0) {
+            Add-Failure ("$ServiceIdentity was refused for want of an Administrator, but the refusal " +
+                "does not name '$ProvisionHint', so it does not lead to the fix (AC-11). Gate line: " +
+                "$(Get-Excerpt $noAdmin[0].Line 300)")
+            Show-LogTail
+        } else {
+            Add-Reading "$ServiceIdentity created and opened $DbPath, then the ADR 0167 gate refused it for want of an Administrator and named provision-admin (expected)"
+            Test-Resecured -Identity $ServiceIdentity -FromServiceLog
+            # 2. The operator provisions the store the service created and was refused on.
+            $CurrentPhase = "operator provision"
+            $r = Invoke-OperatorCli -Arguments $provisionArgs -Secrets $cliSecrets
+            Show-Trio "operator provisioned"
+            if ($r.Code -ne 0) {
+                $why = if ($r.Text -match [regex]::Escape($ProvisionDecline)) {
+                    "provision-admin found an enabled Administrator already in a store no operator had provisioned, so a start created one. "
+                } else { "" }
+                Add-Failure ("$Operator could not provision $DbPath, which $ServiceIdentity created and " +
+                    "was refused on (exit $($r.Code)). " + $why +
+                    (Get-Attribution $Operator (Get-OperatorSids) $r.Text))
+            } else {
+                Add-Reading "$Operator provisioned '$Username' into $DbPath after the refused start"
+                Test-Resecured -Identity $Operator -Output $r.Text
+                # 3. The service starts again on the store the operator provisioned, and serves.
+                Start-TheService "restart"
+                $failed = $Failures.Count
+                Test-ServiceServes "the restart" "$ServiceIdentity created and $Operator provisioned"
+                Stop-TheService
+                Show-Trio "service restart"
+                if ($Failures.Count -eq $failed) {
+                    Test-Resecured -Identity $ServiceIdentity -FromServiceLog
+                }
+            }
+        }
     } else {
         # 1. The service starts first on a fresh store and is refused by the ADR 0167 gate.
         Start-TheService "first start"
@@ -780,8 +863,8 @@ try {
                     Show-LogTail
                 }
             } else {
-                $how = if ($provisioned) { "and provisioned it (no bootstrap account existed)" }
-                       else { "and provision-admin declined on the bootstrap Administrator (expected)" }
+                $how = if ($provisioned) { "and provisioned it (no account existed, as since ADR 0183 Wave 2)" }
+                       else { "and provision-admin declined on an existing Administrator (the pre-Wave 2 bootstrap shape)" }
                 Add-Reading "$Operator opened $DbPath $how"
                 Test-Resecured -Identity $Operator -Output $r.Text
                 # 3. The service starts again on the store the operator's open re-secured.
