@@ -28,6 +28,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_admin
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 NEW_USER = {"username": "newbie", "password": PW, "roles": ["viewer"]}
@@ -220,9 +221,8 @@ async def test_verify_mfa_reanchors_session_to_the_new_ip(
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
-        boot = await service.initialize()
-        assert boot is not None
-        out = await service.login("admin", boot.password, client="10.1.1.1")
+        admin = await create_admin(service)
+        out = await service.login(admin.username, admin.password, client="10.1.1.1")
         assert out.ok and out.identity is not None and out.token is not None
         identity, token = out.identity, out.token
         enroll = await service.begin_mfa_enrollment(identity)

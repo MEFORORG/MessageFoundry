@@ -31,6 +31,7 @@ from messagefoundry.config.settings import (
     SecuritySettings,
 )
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_admin
 
 _ENFORCE = SecuritySettings(enforcement=SecurityEnforcement.ENFORCE)
 _WARN = SecuritySettings(enforcement=SecurityEnforcement.WARN)
@@ -39,23 +40,23 @@ _WARN = SecuritySettings(enforcement=SecurityEnforcement.WARN)
 async def _store_with_admin(*, email: str | None, disabled: bool = False) -> MessageStore:
     """A store holding exactly one Administrator, with or without an address.
 
-    Built through ``AuthService.initialize()`` rather than a raw ``create_user`` + ``set_user_roles``.
-    Two reasons, the second learned the hard way:
+    Built through ``tests._admin_account.create_admin`` rather than a raw ``create_user`` +
+    ``set_user_roles``. Two reasons, the second learned the hard way:
 
-    1. It mints the REAL first-run bootstrap administrator -- which is created with NO email, so the
-       unaddressed case here is the genuine #1020 state rather than a synthetic row that resembles it.
+    1. It is the account shape the #1020 state needs: an enabled Administrator created with NO email.
+       It is not the first-run bootstrap account, which ADR 0183 Amendment A retires (BACKLOG #1136).
     2. ``set_user_roles`` on a bare store raises ``FOREIGN KEY constraint failed``, because the roles
        table is seeded by ``initialize()`` and not by ``MessageStore.open()``. **That failure HANGS
        rather than reporting**: the exception escapes before ``store.close()``, aiosqlite's
        non-daemon connection-worker thread stays alive, and the process never exits -- so pytest
        produced zero output and no traceback until the call was driven outside the runner.
+       ``create_admin`` runs ``initialize()`` before it assigns the role, so it avoids this.
     """
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
-        boot = await service.initialize()
-        assert boot is not None
-        admin = await store.get_user_by_username("admin")
+        created = await create_admin(service)
+        admin = await store.get_user(created.user_id)
         assert admin is not None and admin.notify_email is None  # the defect's own starting state
         if email is not None:
             # ``set_user_notify_email``, NOT ``update_user_profile`` (BACKLOG #1139). The profile
@@ -113,8 +114,8 @@ async def _call(
 
 
 async def test_phi_enforce_refuses_when_no_admin_has_an_address() -> None:
-    # The #1020 scenario exactly: first run, bootstrap administrator created with no email, SMTP
-    # transport perfectly configured. The transport gate passes; nothing is deliverable.
+    # The #1020 scenario exactly: the only Administrator has no email, and the SMTP transport is
+    # perfectly configured. The transport gate passes; nothing is deliverable.
     store = await _store_with_admin(email=None)
     try:
         with pytest.raises(RuntimeError) as exc:

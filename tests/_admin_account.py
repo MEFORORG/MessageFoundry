@@ -3,8 +3,8 @@
 """Give a test an enabled Administrator without leaning on the first-run bootstrap account.
 
 ADR 0183 Amendment A retires the bootstrap account that ``AuthService.initialize()`` mints on an
-empty store (BACKLOG #1136). Wave 1a moves the tests that merely NEEDED an administrator off it,
-before Wave 2 deletes it, so this helper must behave the same with and without the bootstrap.
+empty store (BACKLOG #1136). Waves 1a and 1b move the tests that merely NEEDED an administrator
+off it, before Wave 2 deletes it, so this helper must behave the same with and without the bootstrap.
 
 **Why the store and not a service method.** The moved tests were written against the bootstrap's
 credential state: admin-issued, must change, never claimed. ``provision_first_administrator``
