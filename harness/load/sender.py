@@ -102,6 +102,10 @@ class PersistentConnection:
         # The connscale reload probe reads it after every connection is back, so a second close
         # that took the replies can be told from an engine that never answered (BACKLOG #1292).
         self._drops = 0
+        # Called on every reply (ACK or NAK) while set, and None otherwise. The connscale reload probe
+        # sets it only while it waits for the first reply after the reload, and clears it on that
+        # reply, so the steady-state read path pays one None check (BACKLOG #1292).
+        self._on_reply: Callable[[], None] | None = None
         # Called with the SEND time (perf_counter_ns) of each send a close left unconfirmed, so the
         # connscale reload probe can tell a send made inside its window from one that had already
         # waited too long for an ACK (BACKLOG #1292). None by default. It runs only on a close, never
@@ -125,6 +129,10 @@ class PersistentConnection:
     def drops(self) -> int:
         """How many sockets ended without this side stopping them: the peer closed or reset each."""
         return self._drops
+
+    def set_on_reply(self, callback: Callable[[], None] | None) -> None:
+        """Call ``callback`` on every reply from now on, or stop calling anything with None."""
+        self._on_reply = callback
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"loadconn-{self._host}:{self._port}")
@@ -172,13 +180,18 @@ class PersistentConnection:
             backoff = _BACKOFF_START
             self._generation += 1
             self._up = True
+            # Only the two ends a PEER causes count as a drop: `_serve` returning while this side is
+            # not stopping (the read loop saw EOF), or a socket error. A harness exception or a
+            # cancellation is not the engine closing anything, so it is not counted.
+            dropped = False
             try:
                 await self._serve(reader, writer)
+                dropped = not self._stop.is_set()
             except (OSError, ConnectionError):
-                pass
+                dropped = not self._stop.is_set()
             finally:
                 self._up = False
-                if not self._stop.is_set():
+                if dropped:
                     self._drops += 1
                 self._fail_inflight()
                 writer.close()
@@ -275,6 +288,8 @@ class PersistentConnection:
                 self._tracker.on_ack(_seq)
         else:
             self._m.counters.nak += 1
+        if self._on_reply is not None:
+            self._on_reply()
         if on_done is not None:
             on_done()
 

@@ -26,17 +26,19 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from dataclasses import replace
 
 import pytest
 
 from harness.load.connscale import probe, runner
 from harness.load.connscale.driver import ConnScaleDriver
+from harness.load.connscale.profile import ConnScaleProfile
 from harness.load.connscale.report import ConnScaleRecord, NoLoss
 from harness.load.corpus import Outgoing
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.metrics import Counters, Histogram, LiveMetrics
+from harness.load.sender import PersistentConnection
 from messagefoundry.apiclient.client import ApiError
 from messagefoundry.transports.mllp import MLLPDecoder, frame
 
@@ -58,6 +60,13 @@ class _FakeDriver:
         self.up = [True] * count
         self.required_new: bool | None = None
         self.drops = 0
+        self.watching_replies = False
+
+    def watch_first_reply(self) -> None:
+        self.watching_replies = True
+
+    def end_reply_watch(self) -> None:
+        self.watching_replies = False
 
     def strand(self, send_ns: int) -> None:
         """A close left a send written at ``send_ns`` unconfirmed, as the sender reports it."""
@@ -104,7 +113,6 @@ async def _window(
     emits_after: int = 1,
     during_hold: int = 0,
     aged: int = 0,
-    reply_wait_s: float = 0.0,
 ) -> tuple[runner._ReloadAccount, list[float]]:
     """Run ``_reload_mid_hold`` with a reload that strands ``strands`` sends.
 
@@ -113,9 +121,6 @@ async def _window(
     remainder, and ``during_hold`` timeouts land in it: the stop-grace or unrelated close that must
     NOT be attributed to the reload. ``aged`` more sends are stranded by the same close, but were
     written ten seconds before it, far past any lookback.
-
-    ``reply_wait_s`` is 0 here: this fake offers sends that no writer ever sends or answers, so the
-    real wait would always run out. The wait has its own tests, against a real sender, below.
     """
     extra_holds: list[float] = []
 
@@ -155,7 +160,6 @@ async def _window(
         hold_task=hold_task,
         hold_seconds=_HOLD,
         hold_started=started,
-        reply_wait_s=reply_wait_s,
     )
     return account, extra_holds
 
@@ -486,7 +490,7 @@ def test_the_record_carries_the_same_clamped_count_the_reconcile_prints() -> Non
         "not_reconnected": 0,
         "extra_hold_s": 0.0,
         "reply_s": None,
-        "drops_after": 0,
+        "drops_after": None,
     }
 
 
@@ -771,7 +775,10 @@ async def _post_reload_step(
             hold_task=hold_task,
             hold_seconds=hold,
             hold_started=started,
-            reply_wait_s=reply_wait_s,
+        )
+        # The runner's order: the samplers stop, then this wait, then the driver's stop grace.
+        account = await runner._await_post_reload_reply(
+            driver, counters, account, timeout=reply_wait_s
         )
     finally:
         await driver.stop(0.05)
@@ -818,7 +825,10 @@ async def test_an_engine_silent_after_the_reload_still_fails() -> None:
     account, result = await _post_reload_step(_AfterReloadEngine("silent"), reply_wait_s=0.3)
     assert not result.ok
     assert "drew no reply at all (no ACK, no NAK) in 0.3s of waiting" in result.detail
-    assert "the engine closed no socket after every connection was back" in result.detail
+    assert (
+        "the engine closed no socket after every connection was back, up to the end of that wait"
+        in result.detail
+    )
     assert account.reply_s is None
     assert account.drops_after == 0
 
@@ -829,104 +839,213 @@ async def test_a_second_close_after_the_reload_is_named() -> None:
     account, result = await _post_reload_step(_AfterReloadEngine("close"), reply_wait_s=0.3)
     assert not result.ok
     assert "drew no reply" in result.detail
-    assert account.drops_after >= 1, account
-    assert f"the engine closed {account.drops_after} socket(s)" in result.detail
+    assert account.drops_after is not None and account.drops_after >= 1, account
+    assert f"the engine closed {account.drops_after} socket(s) after every connection" in (
+        result.detail
+    )
+    assert "the reload's own close may be among them" not in result.detail  # every one was back
 
 
-async def _reply_wait(
-    counters: Counters, *, offered: bool, timeout: float
-) -> tuple[float | None, float]:
-    """Run the probe's reply wait from a snapshot of ``counters``; return its reading and how long
-    it took."""
+def _queued_driver(queued: int) -> ConnScaleDriver:
+    """A driver whose one connection was never started, holding ``queued`` sends not yet written."""
+    driver = _real_driver(1)
+    for seq in range(queued):
+        driver._emit_one(_outgoing(seq))
+    return driver
+
+
+def _back(*, not_reconnected: int = 0) -> runner._ReloadAccount:
+    return runner._ReloadAccount(
+        seconds=0.01,
+        stranded=0,
+        not_reconnected=not_reconnected,
+        extra_hold_s=0.0,
+        after=Counters(),
+    )
+
+
+async def _timed_wait(
+    driver: ConnScaleDriver, account: runner._ReloadAccount, *, timeout: float | None
+) -> tuple[runner._ReloadAccount, float]:
     loop = asyncio.get_running_loop()
     began = loop.time()
-    after = counters.snapshot()
-    watcher = asyncio.create_task(runner._first_reply_after(counters, after, began))
-    try:
-        got = await runner._await_post_reload_reply(
-            watcher, counters, after, offered=lambda: offered, timeout=timeout
-        )
-    finally:
-        watcher.cancel()
+    got = await runner._await_post_reload_reply(
+        driver, driver._m.counters, account, timeout=timeout
+    )
     return got, loop.time() - began
 
 
 async def test_the_reply_wait_returns_at_once_when_nothing_was_offered() -> None:
-    # A zero-rate lane offers nothing after the reload. There is no reply to wait for, so a long
-    # timeout must not be spent; the reconcile's "nothing was sent" guard judges that step.
-    got, took = await _reply_wait(Counters(), offered=False, timeout=30.0)
-    assert got is None
+    # A zero-rate lane writes and queues nothing after the reload. There is no reply to wait for,
+    # so a long timeout must not be spent; the reconcile's "nothing was sent" guard judges it.
+    driver = _queued_driver(0)
+    driver.watch_first_reply()
+    got, took = await _timed_wait(driver, _back(), timeout=30.0)
     assert took < 1.0
+    assert (got.reply_s, got.reply_wait_s, got.drops_after) == (None, 0.0, 0)
 
 
 async def test_the_reply_wait_waits_for_a_send_still_queued() -> None:
-    # THE CONTROL for the test above: offered but not yet written is still waited for, until the
+    # THE CONTROL for the test above: a send queued but not yet written is waited for, until the
     # timeout, so a writer that is merely behind does not end the wait early.
-    got, took = await _reply_wait(Counters(), offered=True, timeout=0.2)
-    assert got is None
+    driver = _queued_driver(1)
+    driver.watch_first_reply()
+    got, took = await _timed_wait(driver, _back(), timeout=0.2)
     assert took >= 0.2
+    assert (got.reply_s, got.reply_wait_s) == (None, 0.2)
 
 
-async def test_the_reply_wait_times_the_first_reply_from_the_snapshot() -> None:
-    # The reading is when the reply came, not when the wait began: a reply counted 0.15 s after the
-    # snapshot reads as about 0.15 s, however long the wait was allowed to run.
-    counters = Counters(sent=1)
+async def test_the_reply_wait_is_skipped_where_a_connection_never_came_back() -> None:
+    # That step already fails on "never came back", so waiting cannot change the verdict and would
+    # spend the smoke's module budget on top of the reconnect wait.
+    driver = _queued_driver(1)
+    driver.watch_first_reply()
+    got, took = await _timed_wait(driver, _back(not_reconnected=1), timeout=30.0)
+    assert took < 1.0
+    assert got.reply_wait_s == 0.0
+
+
+async def test_the_reply_wait_times_the_first_reply_from_the_watch() -> None:
+    # The reading is when the reply came, measured from the watch, not when the wait began: a reply
+    # read 0.15 s after the watch reads as about 0.15 s, however long the wait was allowed.
+    driver = _queued_driver(1)
+    driver.watch_first_reply()
+
+    conn = driver._conns[0]
+    conn._inflight.append((0, time.perf_counter_ns(), "C0", None))  # one send awaiting its ACK
 
     async def answer() -> None:
         await asyncio.sleep(0.15)
-        counters.acked += 1
+        conn._on_ack(_ACK.encode())  # through the sender's own reply path
 
     task = asyncio.create_task(answer())
-    got, _ = await _reply_wait(counters, offered=True, timeout=5.0)
+    got, _ = await _timed_wait(driver, _back(), timeout=5.0)
     await task
-    assert got is not None
-    assert 0.15 <= got < 1.0
+    assert got.reply_s is not None
+    assert 0.15 <= got.reply_s < 1.0
+
+
+async def test_a_reply_before_the_wait_returns_it_at_once() -> None:
+    # The healthy case: the engine answered during the post-reload traffic, so the wait costs
+    # nothing and still reports when the reply came.
+    driver = _queued_driver(1)
+    driver.watch_first_reply()
+    await asyncio.sleep(0.05)
+    driver._on_reply()
+    got, took = await _timed_wait(driver, _back(), timeout=30.0)
+    assert took < 1.0
+    assert got.reply_s is not None and 0.05 <= got.reply_s < 1.0
 
 
 async def test_the_runner_waits_the_shipped_reply_wait_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The runner's own call passes no wait, so the constant is what CI gets. Pin that wiring: with no
-    # argument the probe allows `_POST_RELOAD_REPLY_WAIT_S`, here shrunk so the fake's unanswered
-    # send runs it out quickly.
+    # The runner's own call passes no timeout, so the constant is what CI gets. Pin that wiring,
+    # with the constant shrunk so the unanswered queued send runs it out quickly.
     monkeypatch.setattr(runner, "_POST_RELOAD_REPLY_WAIT_S", 0.05)
-    driver = _FakeDriver(1)
-    counters = Counters()
-    hold_task = asyncio.create_task(_emit_after_snapshot(driver))
-    account = await runner._reload_mid_hold(
-        driver=driver,  # type: ignore[arg-type]
-        counters=counters,
-        reload=_reconnecting_reload(driver),
-        run_hold=_no_extra_hold,
-        hold_task=hold_task,
-        hold_seconds=_HOLD,
-        hold_started=asyncio.get_running_loop().time(),
-    )
-    assert account.reply_wait_s == 0.05
-    assert account.reply_s is None
+    driver = _queued_driver(1)
+    driver.watch_first_reply()
+    got, _ = await _timed_wait(driver, _back(), timeout=None)
+    assert got.reply_wait_s == 0.05
 
 
 def test_the_shipped_reply_wait_fits_the_smokes_module_timeout() -> None:
-    # The constant's own comment sizes it: the fixture's setup took 40.8 s on the failing runner, and
-    # four steps each waiting in full must still finish inside the module's 120 s timeout.
-    assert 40.8 + 4 * runner._POST_RELOAD_REPLY_WAIT_S < 120.0
+    # The constant's comment sizes it against the smoke: every step waiting in full must still fit
+    # the module timeout beside the 40.8 s the fixture's setup took on the failing runner. Read from
+    # the smoke module itself, so adding a count, a mode or a trial, or cutting the timeout, fails
+    # here. What it cannot see is a runner slower than that one.
+    import tests.test_connscale_smoke as smoke
+
+    profile = smoke._smoke_profile(30000)
+    assert isinstance(profile, ConnScaleProfile)
+    steps = (
+        len(profile.counts)
+        * len(profile.modes())
+        * len(profile.claim_modes)
+        * len(profile.fuse_modes)
+        * len(profile.batch_modes)
+        * profile.trials
+    )
+    (module_timeout,) = smoke.pytestmark.args
+    assert steps == 4  # the control: the count the constant's comment was written against
+    assert 40.8 + steps * runner._POST_RELOAD_REPLY_WAIT_S < module_timeout
     assert runner._POST_RELOAD_REPLY_WAIT_S > runner._STOP_GRACE  # it must add to the grace
 
 
-async def _emit_after_snapshot(driver: _FakeDriver) -> None:
-    await driver.window_closed.wait()
-    driver.emitted_count += 1  # offered after every connection was back, never written or answered
+def _no_reply_account(**fields: object) -> runner._ReloadAccount:
+    return replace(
+        runner._ReloadAccount(
+            seconds=0.01, stranded=0, not_reconnected=0, extra_hold_s=0.0, after=Counters()
+        ),
+        **fields,  # type: ignore[arg-type]
+    )
 
 
-def _reconnecting_reload(
-    driver: _FakeDriver,
-) -> Callable[[], Awaitable[tuple[float | None, bool]]]:
-    async def reload() -> tuple[float | None, bool]:
-        driver.gens = [g + 1 for g in driver.gens]
-        return 0.01, False
-
-    return reload
+def test_the_no_reply_text_names_no_reading_nobody_took() -> None:
+    # An account the reply wait never saw: the text is the plain one, with no wait and no close
+    # count, because a 0 there would be a reading nobody took.
+    text = runner._no_reply_detail(_no_reply_account(), 3)
+    assert "before the stop grace ended" in text
+    assert "closed" not in text
 
 
-async def _no_extra_hold(seconds: float) -> None:
-    return None
+def test_closes_are_the_engines_only_where_every_connection_was_seen_back() -> None:
+    # Every connection was confirmed on a new socket, so a close after that is a second close.
+    back = runner._no_reply_detail(_no_reply_account(reply_wait_s=10.0, drops_after=2), 3)
+    assert "in 10s of waiting plus the stop grace" in back
+    assert "closed 2 socket(s) after every connection was back" in back
+    assert "the reload's own close may be among them" not in back
+    # A reload that was not applied waited only for each connection to be UP, so a close the
+    # reload itself made can be noticed late. The text says so rather than blaming a second close.
+    for fields in ({"not_applied": True}, {"not_reconnected": 1}):
+        unsure = runner._no_reply_detail(
+            _no_reply_account(reply_wait_s=10.0, drops_after=2, **fields), 3
+        )
+        assert "closed 2 socket(s) after the reconnect wait ended" in unsure
+        assert "the reload's own close may be among them" in unsure
+
+
+async def test_a_harness_error_that_ends_a_connection_is_not_a_drop() -> None:
+    # Only a peer close or a socket error is the engine closing something. A harness bug that
+    # escapes the serve loop must not be counted as a close by the engine.
+    server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    conn = PersistentConnection("127.0.0.1", port, Correlator(10, metrics), metrics)
+
+    async def broken_serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        raise RuntimeError("a harness bug")
+
+    conn._serve = broken_serve  # type: ignore[method-assign]
+    try:
+        conn.start()
+        assert conn._task is not None
+        with pytest.raises(RuntimeError, match="a harness bug"):
+            await asyncio.wait_for(conn._task, timeout=5.0)
+        assert conn.generation == 1  # the control: the socket did open, and then the bug ended it
+        assert conn.drops == 0
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_a_connection_this_side_stops_is_not_a_drop() -> None:
+    # The step's own stop closes every socket. That is not the engine closing anything, so a count
+    # read across the stop must not move.
+    async def hold_open(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(hold_open, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    driver = _real_driver(port)
+    try:
+        await driver.open(connect_batch=1, batch_pause_s=0.0)
+        while driver.generations()[0] < 1:
+            await asyncio.sleep(0.01)
+    finally:
+        await driver.stop(0.05)
+        server.close()
+        await server.wait_closed()
+    assert driver.generations() == [1]  # the control: one socket opened, and this side closed it
+    assert driver.drops == 0

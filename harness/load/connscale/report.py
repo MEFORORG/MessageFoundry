@@ -225,11 +225,11 @@ class ConnScaleRecord:
     reload_stranded: int | None = None
     reload_not_reconnected: int | None = None
     post_reload_extra_hold_s: float | None = None
-    # When the probe first SAW a reply to a send made after every connection was back, in seconds
-    # from that moment (an upper bound), and how many sockets the engine closed over the same span.
-    # A slow engine shows a large `post_reload_reply_s`; one that never answered shows None beside a
-    # post-reload send; a close that took the replies shows `post_reload_drops` above 0. Both are
-    # None when no reload probe ran, and `post_reload_reply_s` is also None when no reply came.
+    # Seconds from every connection being back after the reload to the first reply the sender read,
+    # and how many sockets the engine closed from then to the end of the step's wait for that reply.
+    # A slow engine shows a large `post_reload_reply_s`; a silent one shows None beside a post-reload
+    # send; a close that took the replies shows `post_reload_drops` above 0. Both are None when no
+    # reload probe ran, and `post_reload_reply_s` is also None when no reply came inside the wait.
     post_reload_reply_s: float | None = None
     post_reload_drops: int | None = None
 
@@ -666,14 +666,16 @@ DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
     DiagnosticField(
         "post_reload_reply_s",
         lambda r: r.post_reload_reply_s,
-        "slow engine vs silent engine after the reload: seconds until the first reply to a send "
-        "made after every connection was back; a dash beside a post-reload send means none came",
+        "slow engine vs silent engine after the reload: seconds from every connection being back "
+        "to the first reply; a dash means no reply inside the wait (one can still come in the stop "
+        "grace) or no reload probe",
     ),
     DiagnosticField(
         "post_reload_drops",
         lambda r: r.post_reload_drops,
-        "a second close vs no answer: sockets the engine closed after every connection was back; "
-        "above 0 means a close took the replies, 0 means the sockets stayed open unanswered",
+        "a second close vs no answer: sockets the engine closed from every connection being back "
+        "to the end of that wait; above 0 on a no-reply step means a close may have taken the "
+        "replies, 0 means none was closed",
     ),
     DiagnosticField(
         "fd_probe_ticks",
