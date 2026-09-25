@@ -934,10 +934,23 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
 **`[BUILT]`** (one cleanup)
 
 Every PHI access is recorded in the append-only `audit_log` with the **acting user**:
-`message_view` (raw body), `summary_search_display` / `dead_letter_display` (patient summaries),
-plus the auth and admin events listed in [SECURITY.md](SECURITY.md). Each row carries actor,
-action, timestamp, channel, the caller's `client` address, and a JSON `detail` (filters, counts,
-exposed control IDs — **not** the bodies). Read the trail via `GET /audit` (`audit:read`).
+`message_view` (raw body), `summary_access` (patient summaries), plus the auth and admin events
+listed in [SECURITY.md](SECURITY.md). Each row carries actor, action, timestamp, channel, the
+caller's `client` address, and a JSON `detail` (filters, counts, exposed control IDs — **not** the
+bodies). Read the trail via `GET /audit` (`audit:read`).
+
+`summary_access` rows differ from a single-request row like `message_view`:
+
+- It is coalesced: one row per actor, channel scope and hour, carrying the count. Its sources
+  include at least the message list, its content search, the dead-letter list and the message
+  detail view.
+- It is written late. The engine keeps the open hour's count in memory. It writes the row when a
+  later access rolls into a new hour, or when the engine stops cleanly, so a crash would lose the
+  open hour's count.
+- It has no `client`. One row stands for many requests, so it records no single caller address.
+  A few other writers leave `client` empty too; [ADR 0150](adr/0150-client-address-on-audit-entries.md)
+  lists them.
+
 **Credentials, tokens, and PHI bodies are never written to the audit log.**
 
 **Attribution:** with auth built, the `audit_log.actor` is always populated — a real username, or
@@ -1414,10 +1427,11 @@ Note: encryption-at-rest (§3) and log redaction (§7) are **not** de-identifica
 
 **`[BUILT]`** (code-only) / **`[ROADMAP]`** (anything beyond)
 
-The IDE AI assistant **never sends message bodies in the MVP.** It is bounded to the `code_only`
-data scope — the graph's connection/router/handler names and the active editor's code — and the chat
-path carries an explicit guard against attaching anything more, **regardless of mode or provider**.
-No patient data leaves the workstation through the assistant.
+The IDE AI assistant attaches no message body **on its own** in the MVP; it builds prompts at the
+`code_only` data scope. **That is the IDE's behaviour, not an engine guarantee**, and nothing stops a
+person from putting a message body into a prompt. What the IDE sends, and what the engine checks,
+are stated once, in
+[AI.md](AI.md#the-ide-decides-what-the-assistant-sends-and-the-engine-checks-only-a-label).
 
 The `phi` scope is **future** and only reachable over the planned **engine broker** with a **BAA +
 zero-data-retention** provider connection; the `deidentified` scope builds on the de-id framework

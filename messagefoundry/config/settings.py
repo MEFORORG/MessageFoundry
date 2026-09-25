@@ -19,11 +19,13 @@ silently-dropped key leaves the setting it was meant to apply un-applied, with n
 reporting a problem. An unknown top-level **section** is still tolerated.
 
 The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
-oversight: the **env** and **CLI** layers still drop an unrecognized key silently. Env cannot be
-checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read straight from
-``os.environ`` by their consuming module and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``,
-``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership test would refuse a
-correctly-configured deployment; CLI keys are engine-written, never operator-spelled. The one
+oversight: the **env** layer and the ``cli`` mapping still drop an unrecognized key silently. Env
+cannot be checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read
+straight from ``os.environ`` by their consuming module and are not fields on any section
+(``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership
+test would refuse a correctly-configured deployment. ``cli`` keys are engine-written from parsed
+arguments, never operator-spelled; an operator's unknown flag never reaches them, because argparse
+refuses it first with exit 2. The one
 exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
 Anything stated to an operator about this refusal must carry that scope — see
 ``docs/CONFIGURATION.md``.

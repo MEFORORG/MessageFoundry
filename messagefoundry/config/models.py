@@ -8,8 +8,8 @@ wiring layer (:mod:`messagefoundry.config.wiring`) builds these from a connectio
 ``ConnectionSpec`` to resolve connectors via the registry; routing/filtering/transforming
 is done in code-first Router/Handler scripts, not here.
 
-These models are intentionally transport-agnostic: adding a new transport never requires
-touching this file.
+These models are intentionally transport-agnostic: a transport's settings stay free-form here.
+Adding a new transport still touches this file, for at least its :class:`ConnectorType` member.
 """
 
 from __future__ import annotations
@@ -26,7 +26,8 @@ from messagefoundry.config.tls_policy import TrustAnchorPolicy
 
 
 class ConnectorType(str, Enum):  # noqa: UP042
-    """Built-in transport connectors. Plugins may register additional values."""
+    """Built-in transport connectors. A closed set: a new transport is a new member here, and no
+    plugin can add a value at runtime. Whether to open it is BACKLOG #1624."""
 
     MLLP = "mllp"
     TCP = "tcp"  # raw TCP with configurable delimiter framing (X12 over TCP, ADR 0003)
