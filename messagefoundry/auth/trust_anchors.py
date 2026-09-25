@@ -38,6 +38,10 @@ runs, no audit rows, no new settings effects):
    ``False`` then, and it refuses at ``enforce`` and warns at ``warn``, as ``acl_ok`` does. A chain
    that could not be read is ``path_indeterminate``: audited and warned, not refused. The file arm
    (1) still runs beside it, so the combined verdict is never weaker than the file arm alone.
+5. **The checked bytes are the loaded bytes** (BACKLOG #1142, slice 2). :func:`evaluate_anchor` reads
+   the file once and keeps the bytes it hashed. :func:`verified_anchor_cadata` hands those bytes to the
+   TLS context as ``cadata=``, so the OIDC opener and the API client-CA never open the file a second
+   time. Before this, a file swapped between the check and the load was trusted unchecked.
 """
 
 from __future__ import annotations
@@ -51,7 +55,7 @@ import re
 import shlex
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -108,6 +112,9 @@ class AnchorVerdict:
     # False = another principal can replace the anchor through its path; None = could not tell.
     path_ok: bool | None = None
     path_check: PathVerdict | None = None  # the findings behind path_ok, for messages and audit
+    # The exact bytes ``fingerprint`` was computed over. A consumer loads THESE, never the file again
+    # (BACKLOG #1142, slice 2). Kept out of repr and equality: a verdict is compared by what it found.
+    data: bytes = field(default=b"", repr=False, compare=False)
 
 
 # --- fingerprint --------------------------------------------------------------------------------
@@ -120,6 +127,58 @@ def anchor_fingerprint(path: str | os.PathLike[str]) -> str:
     start on a missing/unreadable CA (``build_idp_opener`` / ``load_verify_locations`` do), and this
     preserves that fail-closed contract rather than masking it as a softer error."""
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+# --- the verified bytes as the text a TLS context loads (BACKLOG #1142, slice 2) -----------------
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+_PEM_BEGIN = b"-----BEGIN "
+_PEM_END = b"-----END "
+_PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
+
+
+def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
+    """The verified anchor bytes as the PEM text ``SSLContext.load_verify_locations(cadata=)`` takes.
+
+    ``cadata=`` takes ASCII text only, while ``cafile=`` reads a file with any bytes between its PEM
+    blocks. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a ``cafile`` with a UTF-8 comment above the
+    block (a PKCS#12 export's ``friendlyName``) or a UTF-8 byte-order mark loads, and the same bytes
+    as ``cadata`` raise. So this drops a leading byte-order mark and every non-ASCII line OUTSIDE a
+    block. OpenSSL skips those lines anyway, so the certificates loaded are the same.
+
+    Every line from ``-----BEGIN`` to ``-----END`` is kept exactly. A non-ASCII byte there refuses,
+    as ``cafile=`` refuses it (``PEM lib``). The text is derived from ``data`` alone and nothing here
+    opens a file, which is the point.
+
+    **A ``TRUSTED CERTIFICATE`` block refuses.** ``cafile=`` reads one with its OpenSSL trust
+    settings, and ``cadata=`` skips it without a word: measured, the lone block raises ``no start
+    line``, and beside a plain block it would be dropped silently. Rewriting it as a plain block
+    would drop a ``reject`` setting and so widen trust. Re-export it with ``openssl x509 -in <file>
+    -out <plain.pem>``, which writes a plain ``CERTIFICATE`` block."""
+    if data.startswith(_UTF8_BOM):
+        data = data[len(_UTF8_BOM) :]
+    kept: list[bytes] = []
+    inside = False
+    for line in data.splitlines(keepends=True):
+        if line.startswith(_PEM_TRUSTED):
+            raise TrustAnchorError(
+                f"{spec.setting}: the trust anchor '{spec.path}' holds a TRUSTED CERTIFICATE block, "
+                "which the engine does not load. Re-export it as a plain CERTIFICATE block: "
+                f"openssl x509 -in '{spec.path}' -out <plain.pem>"
+            )
+        if line.startswith(_PEM_BEGIN):
+            inside = True
+        if inside or line.isascii():
+            kept.append(line)
+        if line.startswith(_PEM_END):
+            inside = False
+    try:
+        return b"".join(kept).decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor '{spec.path}' has a non-ASCII byte inside a PEM "
+            "block, so it is not a readable certificate"
+        ) from exc
 
 
 def _normalize_pin(pin: str) -> str:
@@ -496,8 +555,12 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
 def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     """Inspect one anchor file: compute its fingerprint, its DACL verdict, and (if pinned) whether the
     fingerprint matches the pin. Pure inspection — no enforcement, no audit. Reads the file + the DACL,
-    so callers on the event loop should dispatch it via :func:`asyncio.to_thread`."""
-    fingerprint = anchor_fingerprint(spec.path)
+    so callers on the event loop should dispatch it via :func:`asyncio.to_thread`.
+
+    The file is read ONCE, and the verdict carries those bytes as ``data``, so a consumer can load
+    what was hashed rather than open the file again (BACKLOG #1142, slice 2)."""
+    data = Path(spec.path).read_bytes()
+    fingerprint = hashlib.sha256(data).hexdigest()
     pin_ok: bool | None = None
     if spec.pin is not None:
         pin_ok = fingerprint == _normalize_pin(spec.pin)
@@ -508,6 +571,7 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
         pin_ok=pin_ok,
         path_ok=path_check.ok,
         path_check=path_check,
+        data=data,
     )
 
 
@@ -651,6 +715,24 @@ def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
     verdict = evaluate_anchor(spec)
     _enforce_verdict(spec, verdict, enforcing=enforcing)
     return verdict.fingerprint
+
+
+def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
+    """Evaluate and enforce one anchor as :func:`enforce_anchor` does, then return the bytes it
+    checked as ``cadata=`` text (:func:`anchor_cadata`).
+
+    **Load the return value, never ``spec.path``.** Loading by path reads the file a second time, and
+    a file swapped between the two reads would be trusted without its pin, ACL or path check. That
+    was the case for both consumers until BACKLOG #1142, slice 2.
+
+    ``cadata=`` and ``cafile=`` set the same trust on a plain stdlib context. Measured on Windows
+    (CPython 3.14.6 / OpenSSL 3.5.7) over a localhost socket, client and server side: each verifies
+    the right CA, each refuses a wrong one, and each holds exactly one anchor. The one difference is
+    that ``cadata=`` loads no CRL from the anchor file. A CRL reaches a context only through its own
+    CRL setting (:func:`~messagefoundry.config.tls_policy.harden_crl_check`)."""
+    verdict = evaluate_anchor(spec)
+    _enforce_verdict(spec, verdict, enforcing=enforcing)
+    return anchor_cadata(verdict.data, spec)
 
 
 # --- spec collection ----------------------------------------------------------------------------
