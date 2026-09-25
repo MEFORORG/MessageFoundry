@@ -511,9 +511,10 @@ async def _run_one_step(
             # would only compound a genuine failure across sweep steps into the pytest watchdog.
             final = await poller.sample_once()
         if final is not None:
-            # `in_hold_samples` was read BEFORE this append and must stay that way: this line is what
-            # makes `samples` the rate window rather than the hold, and a count taken after it would
-            # report the tail as in-hold. The smoke asserts a FLOOR, so an inflated count would pass.
+            # `in_hold_samples` was read BEFORE this append and must stay that way. `_build_record`
+            # cuts the rate window as `samples[:in_hold_samples]`, so a count taken after this line
+            # would put the post-drain final back inside every rate AND report it as in-hold. The
+            # smoke asserts a FLOOR, so an inflated count would pass it (BACKLOG #1420).
             samples.append(final)
 
         # --- BACKLOG #1292: the intake audit, at its TWO moments -------------------------------
@@ -958,10 +959,12 @@ def _count_inbound_rows(poller: EnginePoller) -> int:
 #: The floor on engine samples one sweep step's in-hold sampler must produce (BACKLOG #1430).
 #:
 #: TWO, because two is what a WINDOW needs and nothing here needs a third. `_empty_claim_rates` and
-#: `_throughput_rates` each read a first and a last reading; both currently reach two only by counting
-#: the post-drain final, which is why #1420's fix (a) -- excluding that final -- cannot be built until
-#: the hold itself yields two. Raising the floor higher would buy no property and would push a starved
-#: host further past the hold, so it stays at the number the arithmetic actually asks for.
+#: `_throughput_rates` each read a first and a last reading, and since BACKLOG #1420's fix (a) they
+#: read them from the rate window alone, which EXCLUDES the post-drain final. So this floor is now the
+#: only thing that GUARANTEES those rates two endpoints: under it, wall #3 has no window and goes
+#: ungraded.
+#: Raising the floor higher would buy no property and would push a starved host further past the
+#: hold, so it stays at the number the arithmetic actually asks for.
 _MIN_IN_HOLD_SAMPLES = 2
 
 
@@ -1110,7 +1113,8 @@ def _build_record(
     exec_qd = _peak_int([s.executor_queue_depth for s in samples])
     exec_busy = _peak_int([s.executor_busy for s in samples])
 
-    # Wall #2: pool wait (PRIMARY percentiles = the max over the hold; occupancy = min idle seen).
+    # Wall #2: pool wait (PRIMARY percentiles = the max over `samples`, which includes the post-drain
+    # final; occupancy = min idle seen).
     pool_p50 = _peak_float([s.pool_wait_p50_ms for s in samples])
     pool_p95 = _peak_float([s.pool_wait_p95_ms for s in samples])
     pool_p99 = _peak_float([s.pool_wait_p99_ms for s in samples])
@@ -1118,14 +1122,19 @@ def _build_record(
     pool_idle_min = _min_int([s.pool_idle for s in samples])
     pool_size_max = _peak_int([s.pool_size for s in samples])
 
-    # Wall #3: empty-claim RATES over the step's sample window (Δcount / Δt), SEPARATED into
-    # idle-poll vs wake-fanout. That window is the hold PLUS the post-drain tail; `_empty_claim_rates`
-    # defines it once and this comment does not restate it (BACKLOG #1420).
-    total_per_s, idle_per_s, wake_per_s = _empty_claim_rates(samples)
+    # The RATE WINDOW, cut once and handed to BOTH rate functions below, so the numerator and the
+    # denominator of `empty_claims_per_msg` cover the same readings. It stops before the post-drain
+    # final; `_empty_claim_rates` defines it and this comment does not restate it (BACKLOG #1420).
+    # The final stays in `samples` for the peaks above; the no-loss reconcile reads `poller.final`.
+    rate_window = samples[:in_hold_samples]
+
+    # Wall #3: empty-claim RATES over the rate window (Δcount / Δt), SEPARATED into idle-poll vs
+    # wake-fanout.
+    total_per_s, idle_per_s, wake_per_s = _empty_claim_rates(rate_window)
 
     # Achieved throughput = engine read/written deltas over the SAME window as the empty-claim rates
     # (msg/s actually absorbed/delivered vs the OFFERED aggregate rate) — the A/B non-regression guard.
-    achieved_read_per_s, achieved_written_per_s = _throughput_rates(samples)
+    achieved_read_per_s, achieved_written_per_s = _throughput_rates(rate_window)
 
     # Wall #3, the ASSERTED form: empty claims per MESSAGE ABSORBED (BACKLOG #1101). Both rates above
     # are Δ/span over that same window, so dividing them cancels the span exactly and leaves
@@ -1358,30 +1367,41 @@ def _reconcile(
 
 
 def _empty_claim_rates(samples: list[EngineSample]) -> tuple[float, float, float]:
-    """Empty-claim rates over the sweep step's sample window: (total/s, idle_poll/s, wake_fanout/s),
-    from ``samples[0]`` to ``samples[-1]``. SEPARATED — never summed into one number (critic
-    must-change #3).
+    """Empty-claim rates over the sweep step's RATE WINDOW: (total/s, idle_poll/s, wake_fanout/s),
+    from ``samples[0]`` to ``samples[-1]`` of the list it is handed. SEPARATED — never summed into
+    one number (critic must-change #3).
 
-    **THE WINDOW IS NOT THE HOLD, AND THIS IS THE ONE PLACE THAT SAYS SO** (BACKLOG #1420). Every
-    other description of it points here rather than restating it. ``samples[0]`` is the first in-hold
-    reading, but ``samples[-1]`` is NOT in-hold: the step appends one final engine sample after
-    ``sampler_stop.set()``, after ``driver.stop(_STOP_GRACE)``, after ``poller.await_drain(...)`` and
-    after ``asyncio.sleep(_SETTLE)`` — and, on the drained path, after ``sample_until_reconciled``
-    has spent up to a second ``drain_timeout_s``. So the span is the hold PLUS that whole tail,
-    bounded under the shipped ``connscale-smoke`` profile by 5.0 + 30.0 + 0.5 + 30.0 = 65.5 s against
-    a 3.0 s hold. **Five sites called this window "first to last in-hold samples"**, and the last
-    sample is not in-hold, so all five described a window the code does not compute. Scope, because
-    the count depends on it: needle ``in-hold``, corpus ``harness/load/connscale/`` plus
-    ``tests/test_connscale_empty_claims_per_msg.py``. Three of the five are in this file. All five
-    now point here instead of restating it.
+    **THE RATE WINDOW IS DEFINED HERE, ONCE** (BACKLOG #1420). Every other description of it points
+    here rather than restating it. ``_build_record`` hands this function and :func:`_throughput_rates`
+    the SAME slice, ``samples[:in_hold_samples]``, which holds:
 
-    **WHAT THAT COSTS THE METRIC.** Through the tail the engine keeps polling an emptying queue, so
-    ``empty_claims`` can keep rising while ``read`` stops — an idle-drain regime the rates do not
-    intend to cover. The algebra in :func:`_empty_claims_per_msg` is unaffected (the span still
-    cancels); what the tail changes is which regime both deltas cover. **The tail is currently INSIDE
-    the number.** Narrowing the window to exclude the final sample would change what the number
-    MEANS, so readings either side of such a change would not be comparable — that is BACKLOG #1420's
-    candidate fix (a), and it is not taken here.
+    * every reading ``_sample_loop`` started before ``sampler_stop.set()``, plus
+    * up to ``_MIN_IN_HOLD_SAMPLES`` make-up floor ticks the loop took AFTER that stop, when the hold
+      alone did not reach the floor (BACKLOG #1430; ``in_hold_floor_ticks`` counts them).
+
+    It EXCLUDES the post-drain final. ``_run_one_step`` counts ``in_hold_samples`` first, then appends
+    that final after ``driver.stop(_STOP_GRACE)``, after ``poller.await_drain(...)`` and after
+    ``asyncio.sleep(_SETTLE)``. **The window is still not "the hold"**, because a make-up tick can
+    land after the hold ends. Call it the in-hold readings plus make-up floor ticks.
+
+    **WHY THE DRAIN TAIL IS OUT.** Through the tail the engine keeps polling an emptying queue, so
+    ``empty_claims`` can keep rising while ``read`` stops. That idle-drain regime is not what wall #3
+    measures, so the tail is now OUTSIDE the number. The no-loss reconcile still reads the post-drain
+    final, through ``poller.final``; that is the job the final sample was added for.
+
+    **READINGS FROM BEFORE THIS CHANGE ARE NOT COMPARABLE WITH READINGS AFTER IT.** Until fix (a),
+    the window ran to the post-drain final, so the tail was inside every rate this module derives
+    from it: the three returned here, ``empty_claims_per_msg``, and both achieved-throughput rates.
+    The readings payload carries ``rate_window`` so a harvest can tell the two populations apart; a
+    payload without that field was computed over the old window.
+
+    **THE HISTORY, kept because seats still quote it.** Five sites once called this window "first to
+    last in-hold samples" while it ended at the post-drain final. Fix (b) corrected the words and
+    kept the tail in. Fix (a) took the tail out, and it had to wait for BACKLOG #1430's floor: with a
+    single reading in the window this function returns zeros, ``empty_claims_per_msg`` is ``None``,
+    and ``_empty_claims_base_reading_slo`` reports NOT GRADED with ``ok=True``. The smoke catches
+    that silent green twice: its per-step floor assertion on ``in_hold_samples``, and ``assert graded``
+    as the run-level backstop when every lane goes ungraded.
     """
     if len(samples) < 2:
         return 0.0, 0.0, 0.0
@@ -1398,11 +1418,11 @@ def _empty_claim_rates(samples: list[EngineSample]) -> tuple[float, float, float
 def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> float | None:
     """Empty claims per message absorbed — the wall-clock-free form of wall #3 (BACKLOG #1101).
 
-    Both inputs are Δ/span over the SAME window — ``samples[0]`` to ``samples[-1]``, defined once in
-    :func:`_empty_claim_rates` — so ``span`` cancels and this is exactly ``Δempty_claims / Δread``.
-    That removes the per-SECOND form's defect, which keeps ``span`` in the denominator so a slow arm
-    reads as an improvement (#1101). **That window is the hold PLUS the post-drain tail, not the hold
-    alone**; read :func:`_empty_claim_rates` for what the tail is and what it costs (BACKLOG #1420).
+    Both inputs are Δ/span over the SAME rate window, defined once in :func:`_empty_claim_rates`, so
+    ``span`` cancels and this is exactly ``Δempty_claims / Δread``. That removes the per-SECOND
+    form's defect, which keeps ``span`` in the denominator so a slow arm reads as an improvement
+    (#1101). **That window EXCLUDES the post-drain final**, so the drain tail is outside this ratio;
+    read :func:`_empty_claim_rates` for exactly what the window holds (BACKLOG #1420).
 
     **IT IS NOT CONTENTION-IMMUNE, AND THIS DOCSTRING USED TO SAY IT WAS** (BACKLOG #1211). The old
     wording — *"that is why it survives runner contention: slowing the run scales numerator and
@@ -1457,14 +1477,15 @@ def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> flo
 
 
 def _throughput_rates(samples: list[EngineSample]) -> tuple[float, float]:
-    """Achieved (read/s, written/s) over the window, first→last sample (same span as the empty-claim
-    rates), so both arms are measured identically for the A/B non-regression guard.
+    """Achieved (read/s, written/s) over the rate window, first→last reading of the list it is handed
+    (the same slice as the empty-claim rates), so both arms are measured identically for the A/B
+    non-regression guard.
 
-    That span is the hold PLUS the step's post-drain tail, not the hold alone; it is defined once, in
+    That window EXCLUDES the step's post-drain final; it is defined once, in
     :func:`_empty_claim_rates`, and this docstring points there rather than restating it (BACKLOG
     #1420). ``achieved_read_per_s`` is the DENOMINATOR of :func:`_empty_claims_per_msg`, so the two
-    must be read over the same window for the span to cancel -- which is why this reads ``samples[-1]``
-    rather than the last in-hold sample.
+    must be read over the same window for the span to cancel -- which is why ``_build_record`` cuts
+    that slice once and hands the same list to both functions.
     """
     if len(samples) < 2:
         return 0.0, 0.0
@@ -1767,8 +1788,9 @@ def _empty_claims_base_reading_slo(
 #:
 #: The empty-claims emitters still PASS this value as their recorded band width (`render_readings_markdown`
 #: / `readings_payload`), but nothing grades against it there -- the rows are recorded, and the width is
-#: held fixed so they stay comparable with the payloads already harvested for #1211. Changing it would
-#: break that comparability silently, on top of retuning the FD gate.
+#: held fixed so the band stays the one the payloads harvested for #1211 were rendered under. Changing
+#: it would break that silently, on top of retuning the FD gate. The VALUES are a separate matter: they
+#: changed window at BACKLOG #1420, which `report.RATE_WINDOW` marks in the payload.
 _MONOTONIC_TOLERANCE = 0.25
 
 
