@@ -491,9 +491,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         shown = (form.get("shown_issuer"), form.get("shown_subject"))
         return shown == (view.issuer or "", view.subject or "")
 
+    # The dependency already spent this POST's single-use grant, so a retry bounces through
+    # /ui/reauth first. "May", not "will": under [auth].require_action_step_up = false a fresh
+    # session window stands in for the grant and no re-auth is asked.
     changed = (
         "The link changed after this page was opened, so nothing was changed. The page now shows "
-        "the current link. Check it, then submit again."
+        "the current link. Check it before you try again. Each change needs its own fresh "
+        "re-authentication, so the console may ask you to re-authenticate first."
     )
 
     @app.get("/ui/users/{user_id}/federated-identity", response_class=HTMLResponse)

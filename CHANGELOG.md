@@ -147,9 +147,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   the audit rows and the notices to the holder are the same. Each needs `users:manage` and a fresh
   re-authentication for the action `admin_federated_identity`, as the API does. A recent sign-in
   is not enough, unless the site set `[auth].require_action_step_up = false`, which the API honours
-  the same way. An administrator cannot change their own link here either. A page opened before
-  another administrator changed the link is refused, so nobody replaces or removes a link they
-  did not see. The screen offers no Link form on a local account or when `[auth].oidc_issuer` is
+  the same way. An administrator cannot change their own link here either. Each form posts back
+  the link its page showed, and the console refuses the submit when the stored link has changed
+  since. That check reads the link before the engine's handler runs and does not serialise against
+  a concurrent write, so two administrators acting at the same moment can still replace each
+  other's change. Moving the expected-link check into the service's bind and unbind is a later
+  slice. The screen offers no Link form on a local account or when `[auth].oidc_issuer` is
   unset, and shows the engine's refusals in words. The engine gains the `AuthService.oidc_issuer`
   property and a `FederatedIdentityView` model the console renders; no JSON route returns it, and
   `GET /users` is unchanged. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184 slice B)

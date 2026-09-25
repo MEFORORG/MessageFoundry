@@ -41,7 +41,10 @@ under Changed says why engine 0.4.0 does not work with this console.
     page shows the reason in words and keeps the typed `sub`, and trying again asks for the
     password first.
   - Each form posts back the link it showed. If another administrator changed the link since
-    the page opened, the POST is refused and the page shows the current link.
+    the page opened, the POST is refused, and the page shows the current link and says a retry
+    may ask for re-authentication first. The check reads the link before the engine's handler
+    runs and does not serialise against a concurrent write, so a change made at the same moment
+    can still be replaced. Moving the check into the service's bind and unbind is a later slice.
   - An administrator's own account shows no form, and the engine refuses a POST on it. A local
     account, or an engine with no `[auth].oidc_issuer`, shows no Link form.
   - Needs the new engine seam: `AdminHandlers` gained the two handlers and the

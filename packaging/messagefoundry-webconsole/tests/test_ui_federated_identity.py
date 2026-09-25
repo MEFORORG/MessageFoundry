@@ -39,6 +39,9 @@ ISSUER = "https://idp.example"
 #: The route's refusal for a page that no longer shows the stored pair.
 CHANGED = "The link changed after this page was opened"
 
+#: What that refusal says about a retry: the POST already spent its single-use grant.
+RETRY = "the console may ask you to re-authenticate first"
+
 
 async def _service(engine: Engine, **over: object) -> AuthService:
     """MFA off, as the other console suites run, and the issuer the bind requires set."""
@@ -309,6 +312,8 @@ async def test_a_link_from_a_stale_page_is_refused_and_keeps_the_other_binding(
     await _mint(c, _screen(target))
     r = await c.post(f"{_screen(target)}/link", data=stale, headers=SAME_ORIGIN)
     assert r.status_code == 409 and CHANGED in r.text
+    assert RETRY in r.text, "the refusal must say a retry may re-authenticate first"
+    assert "submit again" not in r.text, "the spent grant means a retry is not one submit"
     assert "S-1-theirs" in r.text, "the refusal page must show the current link"
     assert await _pair(engine, target) == (ISSUER, "S-1-theirs")
 
