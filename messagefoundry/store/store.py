@@ -1230,6 +1230,16 @@ WITHDRAW_AD_SCOPE_SQL: Final = (
     " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
 )
 
+#: ``set_user_federated_subject``'s two statements on SQLite: unconditional, and conditional on the
+#: row holding no pair (``expect_unbound``, BACKLOG #1143). Both literal, so no SQL is assembled.
+_SET_FEDERATED_SQL: Final = (
+    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
+)
+_SET_FEDERATED_IF_UNBOUND_SQL: Final = (
+    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
+    " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
+)
+
 
 @dataclass(frozen=True)
 class UserRecord:
@@ -1263,10 +1273,11 @@ class UserRecord:
     totp_enrolled_at: float | None = None
     # Federated-account identity (BACKLOG #1015, ADR 0142): the verified OIDC ``(issuer, sub)`` this
     # AD-backed account's federated identity is PINNED to. Non-reassignable, unlike the display username.
-    # The account is still resolved by its username; this binding only refuses a login whose username
-    # resolves here but carries a different subject. NULL on a local account and on an AD account that
-    # has never completed a federated login. Set on the first federated login and enforced on every
-    # subsequent one, so a reassigned username cannot hand the account to a new subject.
+    # Since BACKLOG #1143 (ADR 0184) a federated login SELECTS its account by this pair, before any
+    # username is read, and an unbound pair is refused. NULL on a local account and on an AD account
+    # nobody has bound. Written only by the administrative bind (``AuthService.bind_federated_subject``),
+    # never by a login. Until #1143 the account was resolved by its username, this pair only vetoed a
+    # mismatch, and it was set on the account's first federated login.
     oidc_issuer: str | None = None
     oidc_subject: str | None = None
     # THE DIRECTORY'S IMMUTABLE IDENTIFIER FOR THIS ACCOUNT (BACKLOG #1471): the normalised AD
@@ -10755,21 +10766,29 @@ class MessageStore:
             return int(cur.rowcount) > 0
 
     async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the first
-        federated login so a later login carrying a different ``sub`` for a reassigned username is
-        refused rather than handed the prior subject's account."""
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Written only by the
+        administrative bind since BACKLOG #1143; see :meth:`AuthStore.set_user_federated_subject`."""
         now = time.time() if now is None else now
         # _writer_txn, not a bare lock: ux_users_federated_subject refusing this UPDATE is EXPECTED
         # (the #1256 race loser), and the unwind rolls back the transaction the refusal would
         # otherwise leave open for the next writer's BEGIN to fail on (BACKLOG #1801).
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
-                (issuer, subject, now, user_id),
-            )
+            if expect_unbound:
+                cur = await self._db.execute(
+                    _SET_FEDERATED_IF_UNBOUND_SQL, (issuer, subject, now, user_id)
+                )
+            else:
+                cur = await self._db.execute(_SET_FEDERATED_SQL, (issuer, subject, now, user_id))
             await self._commit()
+            return int(cur.rowcount) > 0
 
     async def clear_user_federated_subject(
         self, user_id: str, *, now: float | None = None

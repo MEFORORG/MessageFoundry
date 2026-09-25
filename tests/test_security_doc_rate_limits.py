@@ -405,8 +405,8 @@ def test_business_logic_limit_table_states_both_dimensions_for_every_row() -> No
 
 #: Enforcement-scope vocabulary the Scope cell must declare, per row. The blanket claim this
 #: replaces ("All are in-process, per API process — N engine shards multiply every budget by N") was
-#: false for three of the table's own rows: two API processes share ONE lockout counter, ONE session
-#: cap and ONE bootstrap timer, because all three are written through the store.
+#: false for the table's store-backed rows: two API processes share ONE lockout counter and ONE
+#: session cap, because both are written through the store.
 _SCOPE_TOKENS = ("**in-process**", "**store-backed**", "**stateless**", "**n/a**")
 
 #: Limits whose state lives in the STORE, mapped to the ``self._store`` method that proves it. If a
@@ -414,7 +414,6 @@ _SCOPE_TOKENS = ("**in-process**", "**store-backed**", "**stateless**", "**n/a**
 _STORE_BACKED_LIMITS: dict[str, str] = {
     "lockout_threshold": "increment_login_failure",
     "max_sessions_per_user": "enforce_session_cap",
-    "bootstrap_expiry_hours": "set_user_disabled",
 }
 
 #: Reject-when-full caches that are plain in-process objects, mapped to the class ``_bounded_caches``
@@ -463,9 +462,9 @@ def test_business_logic_limit_scope_is_stated_per_row() -> None:
 
     RULE (2.1.3): "N engine shards multiply every budget by N" is a claim an assessor tests. It is
     true of the sliding-window limiters and the two pending-flow caches and FALSE of the account
-    lockout, the session cap and the bootstrap timer, which are written through the one unified
-    store. Blanket-scoping the table inverts exactly the distinction that separates a per-process
-    limiter from a durable one.
+    lockout and the session cap, which are written through the one unified store. Blanket-scoping
+    the table inverts exactly the distinction that separates a per-process limiter from a durable
+    one.
     """
     table = next(t for t in _tables(_section(_H_LIMITS)) if t[0][0] == "Limit")
     scope = table[0].index("Scope")
@@ -1443,6 +1442,12 @@ def test_console_entry_route_breach_shape_is_documented_per_route() -> None:
     Only ``POST /ui/login`` raises 429 + ``Retry-After: 30``; the other three console entry routes
     return a 303 redirect to ``/ui/login?e=rate_limited``. Derived from the AST of each route's
     rate-limit branch, so the split cannot rot back into one blanket sentence.
+
+    The doc token carries the VERB the derivation found (BACKLOG #1133). The walk used to drop it,
+    so it pinned `GET /ui/oidc/start` for a branch that lives in the POST handler, and three doc
+    passages kept saying the GET is rate-limited unconditionally. The GET charges only when it
+    skips its interstitial and runs the POST leg; that condition is pinned in
+    ``tests/test_docs_security_pathways.py``.
     """
     shapes: dict[str, str] = {}
     for module in sorted(_CONSOLE_ROUTES.rglob("*.py")):
@@ -1450,9 +1455,20 @@ def test_console_entry_route_breach_shape_is_documented_per_route() -> None:
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
-            route = _decorated_path(node)
-            if route is None:
+            path = _decorated_path(node)
+            if path is None:
                 continue
+            # The verb comes from the SAME decorator ``_decorated_path`` matched, not the first one.
+            method = next(
+                deco.func.attr.upper()
+                for deco in node.decorator_list
+                if isinstance(deco, ast.Call)
+                and isinstance(deco.func, ast.Attribute)
+                and deco.args
+                and isinstance(deco.args[0], ast.Constant)
+                and deco.args[0].value == path
+            )
+            route = f"{method} {path}"
             for branch in ast.walk(node):
                 # `if not auth.allow_login_attempt(...):` — inspect what that branch does.
                 if not (
@@ -1467,18 +1483,25 @@ def test_console_entry_route_breach_shape_is_documented_per_route() -> None:
     assert shapes, "no console entry route has an allow_login_attempt branch any more"
     redirecting = sorted(r for r, s in shapes.items() if s == "303")
     throttling = sorted(r for r, s in shapes.items() if s == "429")
-    assert throttling == ["/ui/login"], (
+    assert throttling == ["POST /ui/login"], (
         f"the console routes answering a sign-in throttle with 429 changed: {throttling}"
     )
-    assert redirecting == ["/ui/oidc/callback", "/ui/oidc/start", "/ui/sso"], (
+    assert redirecting == ["GET /ui/oidc/callback", "GET /ui/sso", "POST /ui/oidc/start"], (
         f"the console routes answering with a 303 redirect changed: {redirecting}"
     )
     text = _doc_text()
     assert "429 + `Retry-After: 30` on `POST /ui/login`" in text, (
         "the doc must state the 429 + Retry-After: 30 shape of the POST /ui/login sign-in throttle"
     )
-    for route in redirecting:
-        assert f"`GET {route}`" in text, f"{route}'s 303 breach shape is not documented"
+    # Pinned inside the two rows that state the breach shape, not anywhere in the file: a token
+    # elsewhere (a route table, a prose aside) would satisfy a file-wide search with the row wrong.
+    shape_rows = [
+        next(line for line in text.splitlines() if line.startswith(prefix))
+        for prefix in ("| Login attempt rate, per client IP", "| Sign-in attempts |")
+    ]
+    for row in shape_rows:
+        for route in redirecting:
+            assert f"`{route}`" in row, f"{route}'s 303 breach shape is not stated in {row[:40]!r}"
     assert "no 429, no `Retry-After`" in text, (
         "the doc must state that the three redirecting console routes send neither a 429 nor a "
         "Retry-After — a browser navigation cannot render a 429 usefully."
@@ -1633,7 +1656,6 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
         ("admin_write_rate_limit_per_actor", 12),
         ("admin_write_rate_limit_window_seconds", 1.0),
         ("max_sessions_per_user", 5),
-        ("bootstrap_expiry_hours", 72),
     ],
 )
 def test_limit_defaults_quoted_in_the_table_match_the_code(field: str, pinned: object) -> None:

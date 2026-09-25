@@ -155,18 +155,6 @@ class AlertSink(Protocol):
         :meth:`cert_expiry`) so an operator can route a rotation reminder apart from a cert-expiry alert."""
         ...
 
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
-        """The first-run **bootstrap admin** is still UNCLAIMED (never password-changed) and now sits
-        inside its retirement warn window — an operator must sign in and change the password (or stand
-        up a second administrator) before the unclaimed credential is auto-disabled (ASVS 6.4.5). ``name``
-        labels the credential (``"bootstrap-admin"``); ``expires_at`` is the ISO instant it is disabled;
-        ``hours_remaining`` is the whole hours left (``0`` in the final hour). Carries **only** the
-        deadline + hours — **never** the password or any secret, and no message content (no PHI). Emitted
-        once per process (an in-memory latch on :class:`~messagefoundry.auth.service.AuthService`) by the
-        API-lifespan reminder task. Dedicated (not reusing :meth:`secret_rotation_due`) so an operator can
-        route a first-run-credential reminder apart from a long-lived-secret rotation reminder."""
-        ...
-
     def initial_credential_expiring(
         self, name: str, *, expires_at: str, hours_remaining: int
     ) -> None:
@@ -188,9 +176,7 @@ class AlertSink(Protocol):
         alert does not resolve itself when the holder claims it, so check the account before a
         reset. Carries **only** the
         username, the deadline and the hours: never the password, and no message content (no PHI).
-        Emitted once per credential per process by the API-lifespan reminder task. Dedicated (not
-        reusing :meth:`bootstrap_admin_expiring`) because that one retires with the bootstrap account
-        under ADR 0183, and this credential outlives it."""
+        Emitted once per credential per process by the API-lifespan reminder task."""
         ...
 
     def approval_stale_requester(self, approval_id: str, *, operation: str, reason: str) -> None:
@@ -464,15 +450,6 @@ class LoggingAlertSink:
                 -days_overdue,
                 last_rotated,
             )
-
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
-        log.warning(
-            "ALERT bootstrap_admin_expiring: %r is UNCLAIMED and is auto-disabled in %d hour(s) "
-            "(expires %s) — sign in and change the password, or add a second admin, before then",
-            name,
-            hours_remaining,
-            expires_at,
-        )
 
     def initial_credential_expiring(
         self, name: str, *, expires_at: str, hours_remaining: int

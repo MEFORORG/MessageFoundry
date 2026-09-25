@@ -50,10 +50,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   only after the password passes the policy, so a refusal leaves no new SQLite store file behind.
   Its `--username`, `--email` and `--display-name` are limited to 256 characters, as in the web
   console.
-  `[auth].bootstrap_expiry_hours` and `[auth].bootstrap_warn_hours` still load but do nothing now; a
-  later change removes them. **Migration:** run `provision-admin` once at the host, as the account
-  that installs the service, against the store and service config the service uses. ADR 0183
-  Amendment A, Wave 2. (`BACKLOG #1136`)
+  The two settings that timed the first-run account are removed as well; see the next entry.
+  **Migration:** run `provision-admin` once at the host, as the account that installs the service,
+  against the store and service config the service uses. ADR 0183 Amendment A, Wave 2. (`BACKLOG #1136`)
+- **BREAKING — `[auth].bootstrap_expiry_hours`, `[auth].bootstrap_warn_hours` and the
+  `bootstrap_admin_expiring` alert event are gone.** They timed and announced the first-run account,
+  which the engine no longer creates. A service config file that sets either key now fails to load,
+  with the same "unrecognized config key" error as a typo. An `[[alerts.rules]]` rule whose `event_type`
+  is `bootstrap_admin_expiring` also fails to load. Nothing emitted that event after the account was
+  retired, so such a rule could never match. The environment variables
+  `MEFOR_AUTH_BOOTSTRAP_EXPIRY_HOURS` and `MEFOR_AUTH_BOOTSTRAP_WARN_HOURS` are now ignored without
+  an error, as the environment layer ignores any variable that names no setting. **Migration:**
+  delete both keys from `[auth]`, unset the two variables, and delete or retarget any rule that
+  names the event. ADR 0183 Amendment A, Wave 3. (`BACKLOG #1136`)
 - **BREAKING — the config loader refuses a connection name that does not match
   `^[A-Za-z][A-Za-z0-9_-]{0,255}$`.** In 0.4.0 such a name still loaded and ran, and only the API
   refused it. Now a code-first `inbound()` or `outbound()` call, or a `connections.toml` entry,
@@ -131,6 +140,48 @@ All notable changes to MessageFoundry are documented here. The format follows
   and it prints the ACL and path verdict. It names the account that ran the check, because that is
   not the service account. The AD anchor, `[auth].ad_tls_ca_cert_file`, still loads by path.
   ([BACKLOG #1142](docs/BACKLOG.md))
+- **BREAKING: a federated (OIDC) sign-in no longer links itself to an account. An administrator
+  links it first, through the API.** The engine now picks the account by the identity provider's
+  verified issuer and `sub`, before it reads any username. Before, it picked the account by the
+  username the token claimed. On that account's first federated sign-in it then linked whatever
+  `sub` arrived. So a token that claimed the name of a directory account that had never signed in
+  this way could take over that account and its roles. Now a sign-in whose `sub` is linked to no
+  account is refused and links nothing. Its audit row names the issuer and `sub` that arrived, so
+  an administrator can link it, and is filed under `<oidc>` rather than the name the token claimed.
+  The refusal reason is `federated_subject_not_bound`. The web
+  console's login page tells the person to ask an administrator. Roles come from the directory
+  entry of the linked account, never from the name in the token. A link on a local (non-directory)
+  account is refused as `local_account_conflict`. The refusal `federated_subject_conflict` is no
+  longer emitted. **What an operator must do before turning on `[auth].oidc_enabled`:** link each
+  account with `PUT /users/{user_id}/federated-identity` and a body of `{"subject": "<the IdP
+  sub>"}`. The issuer is always `[auth].oidc_issuer`, which must be set. The account must already
+  exist as a directory account; a Windows SSO (Kerberos) sign-in creates one. Nothing else creates
+  one yet, so a site with no Kerberos sign-in cannot link anyone until a later change adds that.
+  The same route with a new `sub` moves the link and signs the account out. `DELETE` on the same
+  path removes the link and signs the account out. Both routes need `users:manage` and a fresh
+  re-authentication for the action `admin_federated_identity`. Each write leaves an audit row
+  (`auth.federated_subject_bound`, `auth.federated_subject_rebound` or
+  `auth.federated_subject_unbound`) naming the administrator. Linking and unlinking each notify
+  the account holder; unlinking sends the new notice `federated_identity_unbound`. An
+  administrator cannot change their own link. **Linking works only through the API for now.** The web console gets its own screen in
+  a later change. Federation still ships off. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184)
+- **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
+  `PATCH /users/{id}` copied any non-blank `email` into `users.notify_email`, and sent no notice
+  unless the profile email changed. The route fills an omitted `email` from the stored profile, and
+  the web console's user form posts it back on every save. So a display-name edit or a disable
+  copied the profile address into the notification address. On a directory account that address is
+  the directory's `mail`, so the save did the directory repoint ADR 0182 blocks. On an account with
+  no notification address it filled one from the directory. Now `email` sets the profile address
+  only. A new `notify_email` field on `PATCH /users/{id}` is the one way an administrator moves
+  the notification address. Omitted, it leaves the address as it is. Sending the stored address
+  back changes nothing. A new value must be one plain mailbox, and `null` or a blank value is
+  refused with `400`, because the address can be changed but not cleared. A move writes a
+  `user.notify_email_changed` audit row that holds no address. It sends an `email_changed` notice
+  to the old address, which names the new one, or a `notify_email_set` notice to the new address
+  when there was none. Both say an administrator made the change. The console's user page has a
+  Notification address field for it. **What changes for a client:** a `PATCH` that sets `email` to
+  repoint notices now moves only the profile address. Send `notify_email` too. (`BACKLOG #1139`,
+  ADR 0182 Amendment A)
 - **BREAKING: an account with no notification address must set one at sign-in, whenever this
   instance sends security notices.** A security notice goes to the account's engine-owned address,
   `users.notify_email`. An account without one was told nothing about a password reset or any other

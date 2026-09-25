@@ -36,6 +36,7 @@ from messagefoundry.api.auth_models import (
     CustomRoleInfo,
     CustomRoleRequest,
     ElevatedResponse,
+    FederatedIdentityRequest,
     LoginRequest,
     LoginResponse,
     MfaConfirmRequest,
@@ -89,6 +90,7 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
+    STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
@@ -98,6 +100,8 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
     CurrentPasswordCheck,
+    FederatedSubjectHeld,
+    InvalidNotifyEmail,
     NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -856,13 +860,29 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
         supplied = body.model_fields_set
-        await service.update_user(
-            user_id,
-            display_name=body.display_name if "display_name" in supplied else current.display_name,
-            email=body.email if "email" in supplied else current.email,
-            disabled=body.disabled if "disabled" in supplied else None,
-            actor=identity.username,
-        )
+        # BACKLOG #1139, ADR 0182 Amendment A (the rule is on AuthService.update_user): notify_email
+        # is NOT filled from the stored row when omitted, and an explicit null is refused, because a
+        # client sending it asked for a clear the address does not allow.
+        if "notify_email" in supplied and body.notify_email is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "the notification address can be changed but not cleared",
+            )
+        try:
+            await service.update_user(
+                user_id,
+                display_name=(
+                    body.display_name if "display_name" in supplied else current.display_name
+                ),
+                email=body.email if "email" in supplied else current.email,
+                disabled=body.disabled if "disabled" in supplied else None,
+                notify_email=body.notify_email,
+                actor=identity.username,
+            )
+        except InvalidNotifyEmail as exc:
+            # Raised before any write, so this refuses the whole save. The message names the rule
+            # and never echoes the value.
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="updated")
 
     @app.delete("/users/{user_id}", response_model=SimpleMessage)
@@ -1001,6 +1021,82 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
             raise HTTPException(code, detail) from exc
         return SimpleMessage(detail="MFA reset")
+
+    # --- federated identity binding (BACKLOG #1143 / #295, ADR 0184) ---------------------------------
+    #
+    # THE ONLY PATH THAT CREATES A FEDERATED BINDING. Owner ruling 2026-09-06: a federated login never
+    # binds, and an unbound one is refused (ADR 0184 AC-4). Both routes ship in the same change as
+    # that refusal, never before it: while login still bound on first presentation, an unbind here
+    # would have let the next login bind whatever subject then presented.
+    #
+    # Action-bound, single-use and MFA-gated, like the password reset: which IdP identity may sign in
+    # as an account is an attribute that affects authentication (ASVS 7.5.1). The console leg is
+    # ADR 0184 slice B; until it lands these two routes are the whole surface.
+
+    @app.put("/users/{user_id}/federated-identity", response_model=SimpleMessage)
+    async def bind_user_federated_identity(
+        user_id: ResourceId,
+        body: FederatedIdentityRequest,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
+        ),
+    ) -> SimpleMessage:
+        """Bind the account to an IdP ``sub`` under the configured issuer, or rebind it. A rebind
+        revokes the account's sessions with the old binding. 404 for an unknown user, 409 on a
+        conflict, 400 for every other refusal, including the caller's own account."""
+        # SELF-EXCLUSION, as the two reset routes above do. Re-pointing or removing your own
+        # federated identity ends every session you hold, the calling one included, and on a site
+        # where you sign in only through the IdP it can leave the last administrator locked out.
+        if user_id == identity.user_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
+            )
+        try:
+            bound = await service.bind_federated_subject(
+                user_id, body.subject, actor=identity.username
+            )
+        except FederatedSubjectHeld as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            detail = str(exc)
+            code = (
+                status.HTTP_404_NOT_FOUND
+                if detail == "no such user"
+                else status.HTTP_400_BAD_REQUEST
+            )
+            raise HTTPException(code, detail) from exc
+        if bound.previous_subject is None and bound.previous_issuer is None:
+            return SimpleMessage(detail="federated identity bound")
+        return SimpleMessage(
+            detail=f"federated identity rebound; revoked {bound.sessions_revoked} session(s)"
+        )
+
+    @app.delete("/users/{user_id}/federated-identity", response_model=SimpleMessage)
+    async def unbind_user_federated_identity(
+        user_id: ResourceId,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
+        ),
+    ) -> SimpleMessage:
+        """Remove the account's federated binding and revoke its sessions (BACKLOG #1474's service
+        method). Its next federated login is refused until it is bound again."""
+        if user_id == identity.user_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
+            )
+        try:
+            revoked = await service.unbind_federated_subject(user_id, actor=identity.username)
+        except ValueError as exc:
+            detail = str(exc)
+            code = (
+                status.HTTP_404_NOT_FOUND
+                if detail == "no such user"
+                else status.HTTP_400_BAD_REQUEST
+            )
+            raise HTTPException(code, detail) from exc
+        return SimpleMessage(detail=f"federated identity unbound; revoked {revoked} session(s)")
 
     @app.get("/users/{user_id}/channel-scope", response_model=ChannelScope)
     async def get_channel_scope(

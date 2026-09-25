@@ -813,6 +813,169 @@ def test_non_interactive_authentication_planes_are_enumerated_too() -> None:
     )
 
 
+_CONSOLE_ROUTES = _ROOT / "messagefoundry_webconsole" / "routes"
+
+
+def _console_route_funcs() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """``{"<METHOD> <path>": function}`` for every decorated console route function."""
+    out: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for module in sorted(_CONSOLE_ROUTES.rglob("*.py")):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for deco in node.decorator_list:
+                if (
+                    isinstance(deco, ast.Call)
+                    and isinstance(deco.func, ast.Attribute)
+                    and deco.func.attr in {"get", "post", "put", "patch", "delete"}
+                    and deco.args
+                    and isinstance(deco.args[0], ast.Constant)
+                    and isinstance(deco.args[0].value, str)
+                ):
+                    out[f"{deco.func.attr.upper()} {deco.args[0].value}"] = node
+    return out
+
+
+def _called(node: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(n, ast.Call)
+        and (
+            (isinstance(n.func, ast.Name) and n.func.id == name)
+            or (isinstance(n.func, ast.Attribute) and n.func.attr == name)
+        )
+        for n in ast.walk(node)
+    )
+
+
+def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
+    """ASVS 6.1.3 was held at partial a third time (BACKLOG #1133) on passages older than both fixes.
+
+    Each earlier pass fixed the sentences it was pointed at and left older ones that said the
+    opposite. This pass swept the whole file, so it pins three code facts and every retired phrasing:
+
+    1. ``GET /ui/oidc/start`` is not simply "rate-limited" or simply "free". It renders the ASVS 3.7.3
+       interstitial and charges nothing, unless ``_interstitial_needed()`` is false, when it runs the
+       POST leg itself: limiter, flow and all.
+    2. A browser SSO or OIDC session's first sensitive action does not always force a step-up.
+       ``verify_mfa`` stamps ``reauth_at``, and neither code route asks whether the session already
+       met its factor, so a TOTP or recovery code opens a fresh window at any time. A passkey does not.
+    3. Four console routes charge the per-actor ceremony budget, ``POST /ui/mfa`` among them.
+
+    The code premises come first, so a change that makes a retired sentence true again reds here.
+    """
+    routes = _console_route_funcs()
+
+    interstitial = routes["GET /ui/oidc/start"]
+    delegates = [
+        n
+        for n in ast.walk(interstitial)
+        # Polarity pinned too: `if not _interstitial_needed(): return await ui_oidc_start(...)`.
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.UnaryOp)
+        and isinstance(n.test.op, ast.Not)
+        and _called(n.test.operand, "_interstitial_needed")
+        and any(_called(stmt, "ui_oidc_start") for stmt in n.body)
+    ]
+    assert delegates, (
+        "GET /ui/oidc/start no longer runs the POST leg when the interstitial is skipped; restate "
+        "the Route -> limiter map's OIDC row and every passage that links to it."
+    )
+    assert not _called(interstitial, "allow_login_attempt"), (
+        "GET /ui/oidc/start now charges the sign-in window itself; the doc says it charges only by "
+        "delegating to the POST leg."
+    )
+
+    service_tree = ast.parse(inspect.getsource(AuthService))
+    verify = next(
+        n
+        for n in ast.walk(service_tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "verify_mfa"
+    )
+    assertion = next(
+        n
+        for n in ast.walk(service_tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "finish_webauthn_assertion"
+    )
+    assert _called(verify, "mark_session_reauthed"), (
+        "verify_mfa no longer stamps reauth_at; the step-up paragraph says a TOTP opens a window."
+    )
+    assert not _called(assertion, "mark_session_reauthed"), (
+        "a passkey assertion now stamps reauth_at; the doc says it marks the factor only."
+    )
+    assert not _called(verify, "mfa_satisfied") and not any(
+        isinstance(n, ast.Attribute) and n.attr == "mfa_verified_at" for n in ast.walk(verify)
+    ), "verify_mfa now asks whether the factor was met; the doc says a code renews at any time."
+    from messagefoundry.api import auth_routes
+
+    json_verify = next(
+        n
+        for n in ast.walk(ast.parse(inspect.getsource(auth_routes)))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "mfa_verify"
+    )
+    for label, handler in (("POST /ui/mfa", routes["POST /ui/mfa"]), ("JSON", json_verify)):
+        assert _called(handler, "verify_mfa") and not _called(handler, "mfa_satisfied"), (
+            f"the {label} MFA route now checks whether the session already met its factor; the "
+            "doc says a TOTP refreshes the step-up window at any time."
+        )
+
+    ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
+    assert ceremony == [
+        "POST /ui/account/mfa/verify",
+        "POST /ui/mfa",
+        "POST /ui/reauth",
+        "POST /ui/reauth/webauthn",
+    ], f"the console routes charging the per-actor ceremony budget changed: {ceremony}"
+
+    text = " ".join(_doc_text().split())
+    for retired in (
+        # Item 1 of the vault re-read: the console sign-in section named an AD form.
+        "shows a sign-in form (Local / Active Directory)",
+        # Item 2: GET /ui/oidc/start stated as always rate-limited, or as never charging.
+        "on `GET /ui/sso`, `GET /ui/oidc/start` and `GET /ui/oidc/callback`",
+        "**in-process** — `GET /ui/oidc/start` — reject-when-full",
+        "the GET renders the 3.7.3 interstitial and stages nothing, so it is not a lever",
+        '`GET /ui/oidc/start` now renders the "you are leaving this site" page and mints **no** flow',
+        "the two `GET /ui/oidc/*` routes",
+        # Item 3: the unqualified first-sensitive-action claims.
+        "so their first sensitive action forces a step-up",
+        "so its first sensitive action forces an explicit credential step-up",
+        "proof is ambient, so the first sensitive action forces the directory-password step-up",
+        "mints with no step-up window, so the first sensitive action forces a step-up",
+        "born without step-up freshness, so its first sensitive action forces one",
+        "these routes carry both a recent password re-verify",
+        "so a disabled AD account cannot refresh its window.",
+        "presents a TOTP/recovery code, not a re-prompt of the same password",
+        # Item 4: the configuration section's single-section claim.
+        "All knobs live in the `[auth]` section",
+        # Item 5: the ceremony-route count and its Retry-After split.
+        "3 JSON + 3 console ceremony routes",
+        "`Retry-After: 30` on the two `/ui/reauth*` routes, none on the other four",
+        "the two `/ui/reauth*` **ceremony** routes send it too",
+        # Found by the sweep: POST /ui/mfa counted among the routes that charge nothing.
+        "the remaining three charge nothing",
+        "limiter 3 on the assertion **finish** leg only",
+    ):
+        assert retired not in text, (
+            f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
+        )
+
+    raw = _doc_text()
+    oidc_row = next(
+        line for line in raw.splitlines() if line.startswith("| `POST /ui/oidc/start`, `GET /ui")
+    )
+    for token in ("_interstitial_needed()", "external_link_interstitial", "organization_domains"):
+        assert token in oidc_row, (
+            f"the limiter map's OIDC row must state the GET's condition and name {token!r}."
+        )
+    assert "3 JSON + 4 console ceremony routes" in text, (
+        "the 2.1.3 Credential ceremonies row must count the four console routes above."
+    )
+    assert "`verify_mfa` calls `mark_session_reauthed`" in text, (
+        "the step-up paragraph must say why a TOTP proved at the MFA gate opens a window."
+    )
+
+
 # NOTE: test_the_mtls_runbook_and_the_table_cannot_diverge moved to tests/test_off_loopback_runbook.py (2026-07-26). They asserted against
 # the deny-listed off-loopback runbook, so on the public mirror they failed at runtime and took
 # this whole module's required test leg red — while the rest of this file guards shipped

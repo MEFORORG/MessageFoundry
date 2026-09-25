@@ -24,6 +24,7 @@ from messagefoundry.auth.notifications import (
     ADMIN_NEW_IP,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
+    FEDERATED_IDENTITY_UNBOUND,
     LOGIN_AFTER_FAILURES,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
@@ -51,6 +52,7 @@ _SUBJECTS = {
     EMAIL_CHANGED: "Your MessageFoundry account email was changed",
     ROLES_CHANGED: "Your MessageFoundry account roles were changed",
     FEDERATED_IDENTITY_BOUND: "An external sign-in identity was linked to your MessageFoundry account",
+    FEDERATED_IDENTITY_UNBOUND: "An external sign-in identity was removed from your MessageFoundry account",
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
@@ -68,6 +70,7 @@ _DESCRIPTIONS = {
     EMAIL_CHANGED: "Your account's email address was changed.",
     ROLES_CHANGED: "Your account's roles were changed by an administrator.",
     FEDERATED_IDENTITY_BOUND: "An external identity provider sign-in was linked to your account. From now on that provider can sign you in.",
+    FEDERATED_IDENTITY_UNBOUND: "An administrator removed the external identity provider sign-in from your account, and your sessions were ended. That provider can no longer sign you in.",
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",
@@ -99,10 +102,31 @@ _DESCRIPTIONS = {
 def _build_body(event: SecurityEvent) -> str:
     """A short, PHI-free notice. The recipient is the account owner, so naming their own account /
     source IP / new email is appropriate; no message data or secrets ever appear here."""
+    # BACKLOG #1139, ADR 0182 Amendment A: an administrator moved or set the NOTIFICATION address.
+    # The generic wording fits neither: EMAIL_CHANGED names the profile address, NOTIFY_EMAIL_SET
+    # assumes the holder set it, and "if this was you" cannot apply to an administrator's act.
+    moved_by_admin = (
+        event.event_type == EMAIL_CHANGED and event.detail.get("field") == "notify_email"
+    )
+    set_by_admin = (
+        event.event_type == NOTIFY_EMAIL_SET and event.detail.get("set_by") == "administrator"
+    )
+    if moved_by_admin:
+        description = (
+            "An administrator changed the address that receives security notices for your account."
+        )
+    elif set_by_admin:
+        description = (
+            "An administrator set this address to receive security notices about your account."
+        )
+    else:
+        description = _DESCRIPTIONS.get(
+            event.event_type, "A security event occurred on your account."
+        )
     lines = [
         f"A security-relevant change occurred on your MessageFoundry account ({event.username}).",
         "",
-        _DESCRIPTIONS.get(event.event_type, "A security event occurred on your account."),
+        description,
     ]
     failed = event.detail.get("failed_attempts")
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
@@ -140,7 +164,12 @@ def _build_body(event: SecurityEvent) -> str:
         # arm reports WHAT CHANGED and states the one thing the schema does guarantee, rather than
         # forecasting what the address will or will not receive.
         new_email = event.detail.get("new_email")
-        if new_email:
+        if new_email and moved_by_admin:
+            # Other notices from the same save still come here, so "later changes", not "later
+            # notices".
+            lines.append(f"New notification address: {new_email}")
+            lines.append("Notices about later changes go to the new address, not to this one.")
+        elif new_email:
             lines.append(f"New email on file: {new_email}")
         else:
             lines.append(
@@ -171,6 +200,8 @@ def _build_body(event: SecurityEvent) -> str:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
         # would contradict the deadline line above it (BACKLOG #1141).
         closing = "If you did not expect this reset, contact your MessageFoundry administrator."
+    elif moved_by_admin or set_by_admin:
+        closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."
     lines += ["", closing]
