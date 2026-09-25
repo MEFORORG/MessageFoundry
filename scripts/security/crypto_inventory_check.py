@@ -90,8 +90,8 @@ properties are the point of it, and each is pinned by a test in
   names it.
 
 This is a *randomness* inventory, and that is the whole claim it supports. The other first-party
-crypto in the non-Python roots (the TLS floor ``ide/src/engineClient.ts`` applies to every https
-request, and the console's WebAuthn ceremony in ``static/app.js``) is found by a THIRD arm,
+crypto in the non-Python roots (the TLS floor and suite pin ``ide/src/engineClient.ts`` applies to
+every https request, and the console's WebAuthn ceremony in ``static/app.js``) is found by a THIRD arm,
 :func:`check_non_python_operations` (BACKLOG #1164). A FOURTH arm,
 :func:`check_powershell_operations`, reads the ``.ps1`` and ``.psm1`` files under ``scripts/``,
 including the
@@ -139,8 +139,8 @@ import crypto_operations  # noqa: E402
 # NOT a finding that ``ide/`` is crypto-free. Zero ``.py`` files is a fact about the LANGUAGE, and the
 # question this gate exists to answer is whether a tree contains cryptography. ``ide/`` does:
 # ``ide/src/cspNonce.ts`` imports ``randomBytes`` from ``node:crypto`` and draws CSPRNG bytes consumed
-# across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor it applies to every https
-# request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from the
+# across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor and suite list it applies to
+# every https request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from the
 # Python walk. The non-Python arms below find both.
 #
 # ADDING ``ide/`` TO WALK_ROOTS WOULD STILL BE A NO-OP THAT LOOKS LIKE A FIX, and that has not
@@ -1695,12 +1695,13 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # The single source of CSP nonces for every webview the extension builds (see the randomness
     # arm's row for the same file, which is where the entropy argument lives).
     "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
-    # The TLS floor the extension applies to every https request it makes to the engine:
+    # The TLS floor and suite pin the extension applies to every https request it makes to the engine:
     # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS }`, plus the pinned
-    # engine CA as `ca` when one is configured. Certificate verification is never switched off. Both
-    # values are named constants, not literals, so the tokens do not carry them. `ciphers` pins the
-    # TLS 1.2 suites to a copy of the engine's approved AEAD list, which
-    # tests/test_tls_default_suites.py holds to config/tls_policy.py (BACKLOG #300).
+    # engine CA as `ca` when one is configured. Certificate verification is never switched off. The
+    # floor is a named constant, not a literal, so the token does not carry it. `ciphers` is the
+    # BACKLOG #300 suite pin; `TLS_12_SUITES` in that file says which suites and what holds them.
+    # Its token is bare for ANY value, a colon-joined literal included, because the pattern captures
+    # no `:`. So this row records that a pin exists, not which suites it names.
     "ide/src/engineClient.ts": frozenset({"tls_context:minVersion", "tls_context:ciphers"}),
     # Not a TLS use: the extension test that PINS the floor and the suite list above, by asserting
     # the options object `tlsOptions` returns. Listed rather than excluded, because pruning test

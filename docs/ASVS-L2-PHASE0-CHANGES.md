@@ -149,7 +149,7 @@ for, not how it is protected before it gets there.
 > by pattern and diffs them against `NON_PYTHON_INVENTORY` the same bidirectional way. A weak source
 > (`Math.random()`) fails with no inventory row to hide behind, and an empty walk is a violation
 > rather than a clean result. **Randomness is the whole claim that arm supports.** A third arm
-> (BACKLOG #1164) reads the same roots for every operation class. It finds the TLS floor
+> (BACKLOG #1164) reads the same roots for every operation class. It finds the TLS floor and suite pin
 > `ide/src/engineClient.ts` applies to every https request, and the console's WebAuthn ceremony in
 > `static/app.js`. A fourth arm reads the PowerShell under `scripts/`. That includes
 > `scripts/service/import-db-ca.ps1`, which installs a trust anchor into the machine root store. It
