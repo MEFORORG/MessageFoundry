@@ -228,6 +228,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
+    make_registry_anchor_preflight,
     run_anchor_preflight,
 )
 from messagefoundry.config.ai_policy import (
@@ -7261,6 +7262,13 @@ def create_managed_app(
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
             registry_guard=registry_guard,
+            # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
+            # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
+            # every real reload. Each connector's own build then enforces again and loads the bytes
+            # it read. Dormant when no inbound names a CA: no store call, no audit row.
+            registry_preflight=make_registry_anchor_preflight(
+                store, enforcing=trust_anchors_enforcing
+            ),
         )
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
@@ -7277,6 +7285,8 @@ def create_managed_app(
                 # re-applied on every reload inside the engine). None = the whole graph.
                 if registry_filter is not None:
                     loaded = registry_filter(loaded)
+                # After the filter, as the reload path does: the anchors this process will load.
+                await engine.preflight_registry(loaded)
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()

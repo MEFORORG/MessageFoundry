@@ -32,6 +32,7 @@ from typing import Any
 import hl7
 from hl7.containers import Component, Field, Repetition
 
+from messagefoundry.auth.trust_anchors import inbound_ca_cadata
 from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
@@ -630,6 +631,7 @@ def _mllp_ssl_context(
     *,
     server: bool,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    name: str = "",
 ) -> ssl.SSLContext | None:
     """Build the per-connection MLLP ``SSLContext`` (WP-13b, ADR 0002), or ``None`` when ``tls`` is off.
 
@@ -649,7 +651,9 @@ def _mllp_ssl_context(
 
     ``tls_key_password`` decrypts a passphrase-encrypted private key (``env()``-sourced, mirroring the
     API listener's ``MEFOR_API_TLS_KEY_PASSWORD``); ``None`` (the default) loads an unencrypted key
-    exactly as before."""
+    exactly as before.
+
+    ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
@@ -667,7 +671,13 @@ def _mllp_ssl_context(
             raise ValueError("MLLP inbound tls=true requires tls_cert_file (the server identity)")
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
         if ca:  # opt-in mTLS: require + verify a client cert against this trust anchor
-            ctx.load_verify_locations(cafile=ca)
+            # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then load the bytes
+            # they read. cafile= would open the file again, and a file swapped between the two
+            # reads would admit a forged client certificate. Outside the construction gate (no
+            # posture stamped) the check enforces, as every posture-keyed cell here fails closed.
+            posture = current_hop_posture()
+            cadata = inbound_ca_cadata(name, s, enforcing=posture is None or posture.enforcing)
+            ctx.load_verify_locations(cadata=cadata)
             ctx.verify_mode = ssl.CERT_REQUIRED
             # Opt-in revocation (#1005). AFTER the CA load, because the CRL goes into the same
             # trust store. Only meaningful under mTLS -- with no client cert required there is
@@ -1769,7 +1779,7 @@ class MLLPSource(SourceConnector):
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # WP-13b: per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file). Built
         # once here so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
-        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True)
+        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True, name=config.name or "")
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0

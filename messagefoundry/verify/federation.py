@@ -252,7 +252,11 @@ def _tls_row(settings: ServiceSettings) -> CheckResult:
     The verdict belongs to the account that ran ``verify``, not the service account, and the row says
     so: the path check trusts its own account as the engine's."""
     from messagefoundry.auth.oidc_http import build_idp_opener
-    from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, evaluate_anchor
+    from messagefoundry.auth.trust_anchors import (
+        TrustAnchorError,
+        evaluate_anchor,
+        oidc_anchor_spec,
+    )
     from messagefoundry.config.settings import SecurityEnforcement
 
     rid, title = "fed.idp_tls", "IdP TLS trust"
@@ -264,7 +268,7 @@ def _tls_row(settings: ServiceSettings) -> CheckResult:
         # A second read of the file, for the report only: the opener above loaded its own checked
         # bytes, and this verdict is what the row prints. Taking the opener's own verdict would
         # widen build_idp_opener's signature for a diagnostic.
-        spec = AnchorSpec("oidc", "[auth].oidc_tls_ca_cert_file", ca, pin) if ca else None
+        spec = oidc_anchor_spec(ca, pin) if ca else None
         verdict = evaluate_anchor(spec) if spec is not None else None
     except OSError as exc:
         return CheckResult(

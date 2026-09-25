@@ -67,11 +67,13 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
 from typing import Any, ClassVar, cast
 
+from messagefoundry.auth.trust_anchors import inbound_ca_cadata
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     apply_connection_tls_ciphers,
     build_verifying_client_context,
+    current_hop_posture,
     harden_cipher_suites,
     harden_crl_check,
     harden_kex_groups,
@@ -153,7 +155,7 @@ _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
 
-def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
+def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext | None:
     """Build the SCP's server ``SSLContext`` for DICOM-over-TLS, or ``None`` when ``tls`` is off. Built
     once at construction so a bad cert/key fails at build (dry-run/``check``), not at bind. TLS 1.2+
     floor; ``tls_ca_file`` opts into mTLS (require + verify a calling peer's client cert). Mirrors the
@@ -161,7 +163,9 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
 
     ``tls_key_password`` decrypts a passphrase-encrypted private key (``env()``-sourced, mirroring
     MLLP's ``tls_key_password`` / the API listener's ``MEFOR_API_TLS_KEY_PASSWORD``); ``None`` (the
-    default) loads an unencrypted key exactly as before."""
+    default) loads an unencrypted key exactly as before.
+
+    ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
@@ -182,7 +186,13 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
     )
     ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
     if ca:  # opt-in mTLS: require + verify a calling peer's client cert against this trust anchor
-        ctx.load_verify_locations(cafile=str(ca))
+        # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then the bytes they read,
+        # never a second read of the file. This CA is the SCP's whole peer authentication decision
+        # (the CONNECTIONS.md DICOM section), so a swapped file would admit any peer. Outside the
+        # construction gate the check enforces, as mllp.py's does.
+        posture = current_hop_posture()
+        cadata = inbound_ca_cadata(name, s, enforcing=posture is None or posture.enforcing)
+        ctx.load_verify_locations(cadata=cadata)
         ctx.verify_mode = ssl.CERT_REQUIRED
         # Opt-in revocation (#1005), after the CA load and inside the mTLS branch -- see mllp.py.
         # An HTTP proxy can terminate neither DIMSE nor MLLP, so for this listener the documented
@@ -263,7 +273,7 @@ class DicomScpSource(SourceConnector):
         #: Set by stop() so a paced connection's wait is cut short instead of holding up shutdown.
         self._stopping = threading.Event()
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
-        self._ssl = _server_ssl_context(s)
+        self._ssl = _server_ssl_context(s, name=config.name or "")
         # Fail-closed peer controls (SEC-012, deny-by-default; tightened by BACKLOG #316):
         # a non-loopback SCP with no VERIFIABLE peer control is refused at construction. DIMSE has no
         # transport auth of its own, so a remotely-reachable SCP must gate peers by the per-connection
