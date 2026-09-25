@@ -376,6 +376,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # to identify the current session and drive the SERVICE directly (the ui_mfa_verify pattern).
     _SESSION_NOTICES = {
         "revoked": "Session revoked.",
+        "revoke_missed": (
+            "Nothing was revoked: that session is no longer listed under the id this page showed. "
+            "It may have ended, or it signed in again or re-verified and now has a new id. "
+            "Check the list below and revoke it again if it is still there."
+        ),
         "signed_out_others": "Signed out of your other sessions.",
     }
 
@@ -411,11 +416,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        # Ownership-checked in the service; an unknown/foreign id is a silent no-op (never
-        # confirms another user's session id). Revoking the CURRENT session logs the caller
-        # out — the next request finds no session and 303s to login.
-        await service.revoke_own_session(identity, session_id, actor=identity.username)
-        return RedirectResponse("/ui/account/sessions?m=revoked", status_code=303)
+        # Ownership-checked in the service; an unknown/foreign id revokes nothing and never confirms
+        # another user's session id. Revoking the CURRENT session logs the caller out — the next
+        # request finds no session and 303s to login.
+        #
+        # ASVS 7.2.4: the notice follows the RESULT. A session's id is its token hash, and rotation
+        # changes the hash at every re-verification, so an id this page rendered can be dead by the
+        # time the POST lands: the target may have completed MFA or a step-up on its own device in
+        # between. Reporting "revoked" then would tell the operator a session had ended while it was
+        # still live under its new id. An unknown id and a foreign id
+        # read the same, so the notice discloses nothing the JSON twin's 404 does not.
+        revoked = await service.revoke_own_session(identity, session_id, actor=identity.username)
+        outcome = "revoked" if revoked else "revoke_missed"
+        return RedirectResponse(f"/ui/account/sessions?m={outcome}", status_code=303)
 
     @app.post("/ui/account/sessions/revoke-others")
     async def ui_revoke_other_sessions(

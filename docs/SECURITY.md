@@ -1833,6 +1833,26 @@ a property of the **page**, not of the API — `DELETE /me/sessions/{id}` checks
 accepts the caller's own current session id and revokes it. The **Users** page has a **Revoke
 sessions** action for admin force-sign-out.
 
+**Signing in again ends the session the browser held (ASVS 7.2.4).** Each console sign-in leg (the
+password form, Windows SSO and federated sign-in) answers with a cookie that replaces the browser's
+session cookie. Once the new sign-in succeeds, the engine revokes the session the browser presented
+and audits `auth.session_revoked` with scope `superseded`, under the name of the user who owned
+that session. The supersession itself ends only that one session and runs only when the sign-in
+succeeds; other controls at sign-in, such as a directory role change, can end more. It runs before
+the per-user session cap, so the cap does not push out another device's oldest session to make
+room for the one being replaced.
+Federated sign-in reads the cookie on its start leg, because the identity provider's redirect back
+is cross-site and the browser withholds the Strict cookie there. Windows SSO has no such hop, so a
+cross-site link straight into `/ui/sso` presents no cookie. That prior session is then not ended
+and stays valid until it expires. The two bearer sign-in routes, `POST /auth/login` and `POST /auth/negotiate`,
+revoke nothing: they return a token and replace none, so ending a client's old token is the
+client's own act. The VS Code extension does this when it signs in again.
+
+A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
+step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
+revoked" when the id no longer matches, rather than reporting a revoke that did not happen, and
+`DELETE /me/sessions/{id}` answers 404.
+
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 
 Users are notified of security-relevant changes to their account through **two** channels:
