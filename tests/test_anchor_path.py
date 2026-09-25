@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -567,9 +568,9 @@ def test_posix_sticky_tmp_with_another_uids_entry_refuses() -> None:
     table = {"/tmp/r": (1000, D755), "/tmp/r/anchor.pem": (1000, F644)}
     v = _posix("/tmp/r/anchor.pem", table, euid=10001)
     assert v.ok is False
-    assert any(
-        f.path == "/tmp" and "not owned by root or the engine" in f.reason for f in v.findings
-    )
+    # The entry is named, never the shared sticky folder: the fix belongs on the entry.
+    bad = [f.path for f in v.findings if f.insecure]
+    assert "/tmp/r" in bad and "/tmp" not in bad
 
 
 def test_posix_world_writable_directory_refuses() -> None:
@@ -689,6 +690,130 @@ def test_mountinfo_parses_escapes_and_the_longest_point_wins() -> None:
     assert ap.mount_of("/mntx", mounts) == ("/", "ext4")
 
 
+# --- fixes from the first code-review round -------------------------------------------------------
+
+
+def test_a_subst_drive_is_walked_from_the_folder_it_stands_for() -> None:
+    """`subst X: C:\\ProgramData\\foo\\certs` makes X:\\ look like a volume root, but the folders
+    above `certs` can still be renamed. Red under: treating every drive letter as a root."""
+    objects = {
+        "C:\\": (DIRECTORY, ROOT),
+        "C:\\ProgramData": (DIRECTORY, PROGRAMDATA),
+        "C:\\ProgramData\\foo": (DIRECTORY, _dir(owner=OTHER)),  # a standard user made it
+        "C:\\ProgramData\\foo\\certs": (DIRECTORY, CLEAN_DIR),
+        "C:\\ProgramData\\foo\\certs\\ca.pem": (FILE, LOCKED_FILE),
+    }
+    lower = {k.lower(): v for k, v in objects.items()}
+    v = windows_path_verdict(
+        "X:\\ca.pem",
+        cwd="C:\\cwd",
+        probe=lambda p: (lower[p.lower()][0], None),
+        read_security=lambda p, _k: lower[p.lower()][1],
+        volume_cause=lambda _r: None,
+        trust=_trust(),
+        drive_target=lambda d: "C:\\ProgramData\\foo\\certs" if d.upper() == "X:" else None,
+    )
+    assert v.ok is False
+    assert [f.path for f in v.findings if f.insecure] == ["C:\\ProgramData\\foo"]
+
+
+def test_a_volume_that_cannot_be_judged_is_never_walked() -> None:
+    """A mapped network drive answers indeterminate before any folder on it is probed, so it costs
+    no round trip per folder."""
+    probed: list[str] = []
+
+    def probe(p: str) -> tuple[str, str | None]:
+        probed.append(p)
+        return DIRECTORY, None
+
+    chain, cause = windows_chain(
+        "Z:\\certs\\ca.pem", "C:\\cwd", probe, volume_cause=lambda r: "it is a network drive"
+    )
+    assert chain == [] and probed == []
+    assert cause is not None and "network drive" in cause
+
+
+def test_another_name_surrogate_reparse_point_is_indeterminate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container layer link (0xA0000027) stands for another path, like a junction, but the probe
+    cannot read its target. Red under: probing it as a plain folder."""
+
+    class Stat:
+        st_reparse_tag = 0xA0000027
+        st_mode = stat.S_IFDIR | 0o755
+
+    monkeypatch.setattr(os, "lstat", lambda _p: Stat())
+    with pytest.raises(OSError, match="reparse point"):
+        ap._win_probe("C:\\layer")
+    Stat.st_reparse_tag = 0x9000001A  # a cloud-files placeholder is not a name surrogate
+    assert ap._win_probe("C:\\layer") == (DIRECTORY, None)
+
+
+def test_unreadable_engine_sid_never_softens_a_non_account_sid() -> None:
+    """With no engine SID, only an account-shaped SID might be the engine. NetworkService is
+    never self-trusted, and an AppContainer SID is never a token's user."""
+    trust = _trust(engine=None)
+    assert _verdict(_dir((0, 0, 0x40, "S-1-5-20")), trust=trust) is False
+    assert _verdict(_dir((0, 0, 0x40, "S-1-15-2-1")), trust=trust) is False
+    assert _verdict(_dir((0, 0, 0x40, SERVICE)), trust=trust) is None
+
+
+def test_posix_sticky_folder_finding_names_the_link_not_the_shared_folder() -> None:
+    """Red under: reporting the sticky folder itself, whose printed fix would strip world-write
+    from /tmp for every user on the host."""
+    table = {"/tmp/ca.pem": (1000, LNK)}
+    links = {"/tmp/ca.pem": "/etc/ssl/certs/ca-certificates.crt"}
+    v = _posix("/tmp/ca.pem", table, links=links, euid=10001)
+    assert v.ok is False
+    assert [(f.path, f.kind) for f in v.findings if f.insecure] == [("/tmp/ca.pem", LINK)]
+
+
+def test_posix_findings_keep_case() -> None:
+    table = {
+        "/data": (0, D755),
+        "/data/Certs": (0, D777),
+        "/data/Certs/certs": (0, D777),
+        "/data/Certs/certs/ca.pem": (0, F644),
+    }
+    v = _posix("/data/Certs/certs/ca.pem", table)
+    assert [f.path for f in v.findings if f.insecure] == ["/data/Certs", "/data/Certs/certs"]
+
+
+def test_a_lost_working_directory_is_indeterminate_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def gone() -> str:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(os, "getcwd", gone)
+    v = ap.anchor_path_verdict("relative-anchor.pem")
+    assert v.ok is None
+    assert "could not" in v.findings[0].reason
+
+
+async def test_a_noisy_anchor_cannot_push_a_quiet_baseline_out_of_reach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red under: reading only one page of audit rows. One anchor on a mount the check cannot judge
+    writes a row on every reload; after a page of them, a quiet anchor's baseline must still count,
+    or its next swap reads as a first observation instead of a change."""
+    s = await MessageStore.open(tmp_path / "audit.db")
+    try:
+        monkeypatch.setattr(ta, "_FINGERPRINT_PAGE", 5)
+        await s.record_audit(
+            AUDIT_ACTION, actor=None, detail=json.dumps({"label": "oidc", "fingerprint": "f1"})
+        )
+        for i in range(23):
+            await s.record_audit(
+                AUDIT_ACTION, actor=None, detail=json.dumps({"label": "ad", "n": i})
+            )
+        assert await ta._last_fingerprint(s, "oidc") == "f1"
+        assert await ta._last_fingerprint(s, "api_client") is None
+    finally:
+        await s.close()
+
+
 # --- the verdict reaches evaluate_anchor and enforcement ------------------------------------------
 
 
@@ -718,7 +843,12 @@ def test_path_false_refuses_at_enforce_and_warns_at_warn(
         ta.enforce_anchor(spec, enforcing=True)
     text = str(err.value)
     assert "can be replaced through its path" in text and "C:\\certs" in text
-    assert "/remove:g '*S-1-5-32-545'" in text and f"'*{SERVICE}:(OI)(CI)RX'" in text
+    assert "icacls 'C:\\certs' /inheritance:d" in text
+    assert "icacls 'C:\\certs' /remove:g '*S-1-5-32-545'" in text
+    # The fix removes only what the check named. A blanket reset would strip the engine's own
+    # modify grant from its data folder; no grant finding here is about the owner, so no setowner.
+    assert "/inheritance:r" not in text and "/grant" not in text and "/setowner" not in text
+    assert f"account it ran as ({SERVICE})" in text
     assert "enforce refuses to start" in text
     assert text.isascii()
     ta.enforce_anchor(spec, enforcing=False)
@@ -750,14 +880,34 @@ def test_path_arm_runs_beside_the_file_arm(tmp_path: Path, monkeypatch: pytest.M
         ta.enforce_anchor(spec, enforcing=True)
 
 
-def test_posix_fix_text_names_each_object(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    p = _pem(tmp_path)
-    finding = ap.ChainFinding("/srv/it's", DIRECTORY, True, "group or others can write to it")
+def _refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: ap.PathVerdict) -> str:
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
-    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: ap.PathVerdict(False, (finding,)))
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: verdict)
     with pytest.raises(TrustAnchorError) as err:
-        ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), None), enforcing=True)
-    assert "chown root:root '/srv/it'\\''s' && chmod go-w '/srv/it'\\''s'" in str(err.value)
+        ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=True)
+    return str(err.value)
+
+
+def test_posix_fix_text_names_each_object(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = ap.ChainFinding("/srv/it's", DIRECTORY, True, "group or others can write to it")
+    link = ap.ChainFinding("/tmp/ca.pem", LINK, True, "it is owned by uid 1000")
+    text = _refusal(tmp_path, monkeypatch, ap.PathVerdict(False, (folder, link), "posix", "uid 7"))
+    q = shlex.quote("/srv/it's")
+    assert f"chown root:root {q} && chmod go-w {q}" in text
+    # A link is re-owned with -h, so the command acts on the link and not on what it points at.
+    assert "chown -h root:root /tmp/ca.pem" in text and "chmod go-w /tmp/ca.pem" not in text
+    assert "account it ran as (uid 7)" in text
+
+
+def test_windows_fix_text_for_an_owner_and_a_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owned = ap.ChainFinding("C:\\d", DIRECTORY, True, "it is owned by X", (OTHER,), owner=True)
+    link = ap.ChainFinding("C:\\d\\jn", LINK, True, "X can write to it", (OTHER,))
+    text = _refusal(tmp_path, monkeypatch, ap.PathVerdict(False, (owned, link), "windows"))
+    assert "icacls 'C:\\d' /setowner '*S-1-5-32-544'" in text
+    assert "icacls 'C:\\d' /remove:g" not in text  # the owner finding names no grant to remove
+    assert f"icacls 'C:\\d\\jn' /L /remove:g '*{OTHER}'" in text
 
 
 @pytest.fixture

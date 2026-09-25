@@ -30,6 +30,7 @@ ctypes.
 
 from __future__ import annotations
 
+import logging
 import ntpath
 import os
 import posixpath
@@ -37,6 +38,8 @@ import stat
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 #: The kernel's own limit is 40 on Linux (``MAXSYMLINKS``); Windows allows 63 reparse hops. The walk
 #: stops at 40 on both and answers indeterminate, which also ends a link cycle.
@@ -54,23 +57,28 @@ class ChainFinding:
     """One object in the chain that is insecure, or that could not be judged.
 
     ``insecure`` is ``True`` for a definite finding and ``False`` for an indeterminate one. ``sids``
-    names the Windows principals the finding is about, so the fix text can remove them."""
+    names the Windows principals the finding is about, so the fix text can remove them. ``owner``
+    marks a finding about who owns the object rather than about a grant."""
 
     path: str
     kind: str
     insecure: bool
     reason: str
     sids: tuple[str, ...] = ()
+    owner: bool = False
 
 
 @dataclass(frozen=True)
 class PathVerdict:
-    """The result of checking an anchor's resolution chain. ``platform`` picks the fix text."""
+    """The result of checking an anchor's resolution chain. ``platform`` picks the fix text.
+
+    ``engine`` names the account the check trusted as the engine's own, for the message: the
+    verdict depends on it, so a check run by another account can answer differently."""
 
     ok: bool | None
     findings: tuple[ChainFinding, ...] = ()
     platform: str = "posix"
-    engine_sid: str | None = field(default=None, compare=False)
+    engine: str | None = field(default=None, compare=False)
 
 
 def _combine(findings: Iterable[ChainFinding]) -> bool | None:
@@ -81,12 +89,13 @@ def _combine(findings: Iterable[ChainFinding]) -> bool | None:
     return None if found else True
 
 
-def _dedupe(findings: Iterable[ChainFinding]) -> tuple[ChainFinding, ...]:
-    """Drop repeats, keeping the first, so a directory reached twice is reported once."""
+def _dedupe(findings: Iterable[ChainFinding], *, fold_case: bool) -> tuple[ChainFinding, ...]:
+    """Drop repeats, keeping the first, so a directory reached twice is reported once. Paths are
+    compared without case only on Windows: on POSIX, ``Certs`` and ``certs`` are two folders."""
     seen: set[tuple[str, str, bool, str]] = set()
     out: list[ChainFinding] = []
     for f in findings:
-        key = (f.path.lower(), f.kind, f.insecure, f.reason)
+        key = (f.path.lower() if fold_case else f.path, f.kind, f.insecure, f.reason)
         if key not in seen:
             seen.add(key)
             out.append(f)
@@ -188,6 +197,13 @@ _WELL_KNOWN_NAMES = {
 }
 
 
+#: The SID shapes a process token's user can take: a machine or domain account, a service's
+#: virtual account, an IIS app pool, or an Entra ID account. When the engine's own SID cannot be
+#: read, only a SID of one of these shapes might be the engine. LocalService and NetworkService are
+#: left out on purpose, as self-trust never applies to them.
+_ACCOUNT_SID_PREFIXES = ("S-1-5-21-", "S-1-5-80-", "S-1-5-82-", "S-1-12-1-")
+
+
 def describe_sid(sid: str) -> str:
     """``NAME (SID)`` for a well-known SID, else the SID alone. No lookup, so nothing can block."""
     name = _WELL_KNOWN_NAMES.get(sid)
@@ -229,7 +245,7 @@ class WinTrust:
         member = self.admin_member(sid)
         if member is True:
             return True
-        if self.engine_sid is None and not sid.startswith("S-1-5-32-"):
+        if self.engine_sid is None and sid.startswith(_ACCOUNT_SID_PREFIXES):
             return None  # it might be the engine's own account, which could not be read
         return member
 
@@ -341,6 +357,7 @@ def evaluate_windows_object(
                     True,
                     f"it is owned by {describe_sid(sec.owner)}, which can change its permissions",
                     (sec.owner,),
+                    owner=True,
                 )
             )
         elif owned is None:
@@ -352,6 +369,7 @@ def evaluate_windows_object(
                     f"it is owned by {describe_sid(sec.owner)}, and whether that is an "
                     "administrator could not be settled",
                     (sec.owner,),
+                    owner=True,
                 )
             )
     return insecure + unsure
@@ -380,28 +398,45 @@ def _strip_win_prefix(path: str) -> str | None:
     return path
 
 
-def _is_volume_root(path: str) -> bool:
-    drive, rest = ntpath.splitdrive(path)
-    return bool(drive) and rest in ("\\", "")
-
-
 #: A probe answers ``(kind, link target or None)`` for one path, without following a final link.
 WinProbe = Callable[[str], tuple[str, str | None]]
 
 
-def windows_chain(path: str, cwd: str, probe: WinProbe) -> tuple[list[tuple[str, str]], str | None]:
+def _no_volume_cause(_root: str) -> str | None:
+    return None
+
+
+def _no_drive_target(_drive: str) -> str | None:
+    return None
+
+
+def windows_chain(
+    path: str,
+    cwd: str | Callable[[], str],
+    probe: WinProbe,
+    *,
+    volume_cause: Callable[[str], str | None] = _no_volume_cause,
+    drive_target: Callable[[str], str | None] = _no_drive_target,
+) -> tuple[list[tuple[str, str]], str | None]:
     """The chain of ``(object path, kind)`` from the volume root to the anchor, and a cause when the
     walk could not finish.
 
     Win32 collapses ``.`` and ``..`` in the text before any link is followed, so each pass
     normalizes first. A link's target is spliced in: a relative one against the directory holding
     the link, an absolute one from its own root. Every pass then restarts from the root of the new
-    path, which re-reads a shared prefix but keeps the walk simple. The hop limit ends a cycle."""
+    path, which re-reads a shared prefix but keeps the walk simple. The hop limit ends a cycle.
+
+    ``drive_target`` answers the folder a ``subst`` drive letter stands for, or ``None`` for a real
+    volume. Such a letter is spliced in like a link, because its ``X:\\`` is not a volume root:
+    the folders above the substituted one can still be renamed. ``volume_cause`` answers why a
+    volume cannot be judged, and is asked before anything on that volume is read. So a mapped
+    network drive costs no round trip per folder, and a FAT volume's missing DACL is never read as
+    everyone-full-control. ``cwd`` is called only for a relative path."""
     full = _strip_win_prefix(path)
     if full is None:
         return [], "the path is a device path this check does not read"
     if not ntpath.isabs(full) and not full.startswith("\\\\"):
-        full = ntpath.join(cwd, full)
+        full = ntpath.join(cwd() if callable(cwd) else cwd, full)
     chain: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -419,7 +454,20 @@ def windows_chain(path: str, cwd: str, probe: WinProbe) -> tuple[list[tuple[str,
         drive, rest = ntpath.splitdrive(norm)
         if not drive:
             return chain, "the path has no drive or volume"
+        substituted = drive_target(drive) if len(drive) == 2 else None
+        if substituted is not None:
+            hops += 1
+            if hops > MAX_LINK_HOPS:
+                return chain, f"the path passes through more than {MAX_LINK_HOPS} links"
+            target = _strip_win_prefix(substituted)
+            if not target:
+                return chain, f"the drive {drive} stands for a path this check does not read"
+            pending = target + rest
+            continue
         root = drive + "\\"
+        why = volume_cause(root)
+        if why is not None:
+            return chain, f"'{root}': {why}"
         add(root, DIRECTORY)
         parts = [c for c in rest.split("\\") if c]
         cur = root
@@ -459,33 +507,25 @@ def windows_chain(path: str, cwd: str, probe: WinProbe) -> tuple[list[tuple[str,
 def windows_path_verdict(
     path: str,
     *,
-    cwd: str,
+    cwd: str | Callable[[], str],
     probe: WinProbe,
     read_security: Callable[[str, str], WinSecurity],
     volume_cause: Callable[[str], str | None],
     trust: WinTrust,
+    drive_target: Callable[[str], str | None] = _no_drive_target,
 ) -> PathVerdict:
     """Evaluate the whole Windows chain. Pure: every input that touches the host is injected.
-
-    ``volume_cause`` answers why a volume root cannot be judged (a network drive, or a file system
-    that keeps no DACL), or ``None``. Objects on such a volume are not read: a FAT volume's missing
-    DACL would otherwise read as everyone-full-control."""
-    chain, cause = windows_chain(path, cwd, probe)
+    :func:`windows_chain` says what ``volume_cause`` and ``drive_target`` answer. Every object the
+    walk reached is evaluated, even when the walk stopped early."""
+    chain, cause = windows_chain(
+        path, cwd, probe, volume_cause=volume_cause, drive_target=drive_target
+    )
     findings: list[ChainFinding] = []
     if cause is not None:
         findings.append(ChainFinding(path, PATH, False, cause))
-    judged: dict[str, bool] = {}
     for obj, kind in chain:
-        drive = ntpath.splitdrive(obj)[0].lower()
-        if drive not in judged:
-            why = volume_cause(drive + "\\")
-            judged[drive] = why is None
-            if why is not None:
-                findings.append(ChainFinding(drive + "\\", DIRECTORY, False, why))
-        if not judged[drive]:
-            continue
         findings.extend(evaluate_windows_object(obj, kind, read_security(obj, kind), trust))
-    found = _dedupe(findings)
+    found = _dedupe(findings, fold_case=True)
     return PathVerdict(_combine(found), found, "windows", trust.engine_sid)
 
 
@@ -510,7 +550,7 @@ POSIX_TRUSTED_FS = frozenset({"ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "
 def posix_path_verdict(
     path: str,
     *,
-    cwd: str,
+    cwd: str | Callable[[], str],
     euid: int,
     lstat_fn: Callable[[str], PosixStat],
     readlink_fn: Callable[[str], str],
@@ -527,10 +567,12 @@ def posix_path_verdict(
     write bit. A link's own mode means nothing, and its owner counts only through the sticky rule.
 
     ``..`` is the parent of the directory already reached, which holds no link, as the kernel does.
-    POSIX ACLs need no extra read: with an ACL present, the group bits show the ACL mask."""
+    POSIX ACLs need no extra read: with an ACL present, the group bits show the ACL mask. ``cwd``
+    is called only for a relative path."""
     trusted = {0} if euid == 0 else {0, euid}
+    engine = f"uid {euid}"
     if not path.startswith("/"):
-        path = posixpath.join(cwd, path)
+        path = posixpath.join(cwd() if callable(cwd) else cwd, path)
     findings: list[ChainFinding] = []
     fs_seen: set[str] = set()
 
@@ -569,7 +611,7 @@ def posix_path_verdict(
         cur_st = lstat_fn(cur)
     except OSError as exc:
         unread = ChainFinding("/", DIRECTORY, False, f"it could not be read: {exc}")
-        return PathVerdict(None, (unread,), "posix")
+        return PathVerdict(None, (unread,), "posix", engine)
     visit(cur, cur_st, DIRECTORY)
     while todo:
         name = todo.pop(0)
@@ -593,14 +635,22 @@ def posix_path_verdict(
         sticky = bool(cur_st.mode & stat.S_ISVTX)
         if cur_st.mode & 0o022 and not sticky:
             findings.append(ChainFinding(cur, DIRECTORY, True, "group or others can write to it"))
-        elif cur_st.mode & 0o022 and child_st is not None and child_st.uid not in trusted:
+        elif (
+            cur_st.mode & 0o022
+            and child_st is not None
+            and child_st.uid not in trusted
+            and stat.S_ISLNK(child_st.mode)
+        ):
+            # In a sticky folder the entry's owner decides who can replace it, so the finding
+            # names the entry, never the shared folder: the fix belongs on the entry. A folder or
+            # file entry gets the same finding from its own owner test when it is visited.
             findings.append(
                 ChainFinding(
-                    cur,
-                    DIRECTORY,
+                    child,
+                    LINK,
                     True,
-                    f"group or others can write to it, and the entry '{name}' below it is not "
-                    "owned by root or the engine",
+                    f"it is owned by uid {child_st.uid}, not root or the engine, and sits in "
+                    f"'{cur}', which others can write to",
                 )
             )
         if child_st is None:
@@ -644,8 +694,8 @@ def posix_path_verdict(
         findings.append(
             ChainFinding(cur, DIRECTORY, True, "the path names a directory, not a file")
         )
-    found = _dedupe(findings)
-    return PathVerdict(_combine(found), found, "posix")
+    found = _dedupe(findings, fold_case=False)
+    return PathVerdict(_combine(found), found, "posix", engine)
 
 
 # =================================================================================================
@@ -697,7 +747,7 @@ def _posix_host_verdict(path: str) -> PathVerdict:
     geteuid = getattr(os, "geteuid", None)
     return posix_path_verdict(
         path,
-        cwd=os.getcwd(),
+        cwd=os.getcwd,
         euid=geteuid() if geteuid is not None else -1,
         lstat_fn=lstat_fn,
         readlink_fn=os.readlink,
@@ -707,14 +757,22 @@ def _posix_host_verdict(path: str) -> PathVerdict:
 
 _IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # a junction or a volume mount point
 _IO_REPARSE_TAG_SYMLINK = 0xA000000C
+_NAME_SURROGATE_BIT = 0x20000000  # IsReparseTagNameSurrogate: the tag stands for another name
 
 
 def _win_probe(path: str) -> tuple[str, str | None]:
-    """Kind of one path, without following it. Only name-surrogate reparse points are links; Python's
-    ``lstat`` follows the others, as the file system does."""
+    """Kind of one path, without following it.
+
+    Python's ``lstat`` does not follow a name-surrogate reparse point, and follows every other kind,
+    as the file system does. Junctions and symbolic links are read and spliced in. Any other name
+    surrogate, such as a container layer link, raises, and the walk answers indeterminate: it stands
+    for another path this check cannot read, so the folders around that path would go unchecked."""
     st = os.lstat(path)
-    if getattr(st, "st_reparse_tag", 0) in (_IO_REPARSE_TAG_MOUNT_POINT, _IO_REPARSE_TAG_SYMLINK):
+    tag = getattr(st, "st_reparse_tag", 0)
+    if tag in (_IO_REPARSE_TAG_MOUNT_POINT, _IO_REPARSE_TAG_SYMLINK):
         return LINK, os.readlink(path)
+    if tag & _NAME_SURROGATE_BIT:
+        raise OSError(f"it is a reparse point (tag 0x{tag:08x}) this check does not follow")
     return (DIRECTORY if stat.S_ISDIR(st.st_mode) else FILE), None
 
 
@@ -726,6 +784,7 @@ class WinHost:
     volume_cause: Callable[[str], str | None]
     engine_sid: str | None
     admin_member: Callable[[str], bool | None]
+    drive_target: Callable[[str], str | None]
 
 
 def windows_host_readers() -> WinHost:
@@ -760,6 +819,8 @@ def windows_host_readers() -> WinHost:
     kernel32.GetCurrentProcess.restype = wintypes.HANDLE
     kernel32.GetDriveTypeW.restype = wintypes.UINT
     kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    kernel32.QueryDosDeviceW.restype = wintypes.DWORD
+    kernel32.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
     kernel32.GetVolumeInformationW.restype = wintypes.BOOL
     kernel32.GetVolumeInformationW.argtypes = [
         wintypes.LPCWSTR,
@@ -959,14 +1020,25 @@ def windows_host_readers() -> WinHost:
             if sid_ptr:
                 kernel32.LocalFree(sid_ptr)
 
+    def unresolved(members: set[str], why: str) -> tuple[frozenset[str], bool]:
+        # Every early exit comes through here, so the operator sees WHY a grantee or owner came
+        # out "could not be settled". The SIDs already read still answer yes: membership is
+        # monotone, so only a no is withheld.
+        log.warning(
+            "the trust-anchor path check could not read the local Administrators members (%s); a "
+            "principal it cannot place is reported as indeterminate",
+            why,
+        )
+        return frozenset(members), False
+
     def administrators_members() -> tuple[frozenset[str], bool]:
         """Direct member SIDs of local Administrators, and whether the read was complete. Level 0
         returns SIDs only, so the lookup stays on the local SAM and never waits on a domain
         controller. A nested domain group is therefore not seen, as in the config guard."""
         try:
             netapi32 = ctypes.WinDLL("netapi32", use_last_error=True)
-        except OSError:
-            return frozenset(), False
+        except OSError as exc:
+            return unresolved(set(), f"netapi32 could not be loaded: {exc}")
         netapi32.NetLocalGroupGetMembers.restype = wintypes.DWORD
         netapi32.NetLocalGroupGetMembers.argtypes = [
             wintypes.LPCWSTR,
@@ -982,7 +1054,7 @@ def windows_host_readers() -> WinHost:
         netapi32.NetApiBufferFree.argtypes = [ctypes.c_void_p]
         group = administrators_name()
         if group is None:
-            return frozenset(), False
+            return unresolved(set(), "BUILTIN\\Administrators could not be resolved to its name")
         members: set[str] = set()
         resume = ctypes.c_void_p(0)
         for _page in range(64):  # a termination guard, not a size limit
@@ -1000,23 +1072,32 @@ def windows_host_readers() -> WinHost:
                 ctypes.byref(resume),
             )
             if rc not in (0, 234):  # NERR_Success, ERROR_MORE_DATA
-                return frozenset(members), False
+                return unresolved(members, f"NetLocalGroupGetMembers returned status {rc}")
             try:
                 entries = ctypes.cast(buf, pvoid_p)
                 for i in range(read.value):
                     member = sid_text(entries[i])
                     if member is None:
-                        return frozenset(members), False
+                        return unresolved(members, "a member SID could not be read")
                     members.add(member)
             finally:
                 if buf:
                     netapi32.NetApiBufferFree(buf)
             if rc == 234:
                 if read.value == 0:
-                    return frozenset(members), False
+                    return unresolved(members, "NetLocalGroupGetMembers made no progress")
                 continue
             return frozenset(members), read.value >= total.value
-        return frozenset(members), False
+        return unresolved(members, "the enumeration did not finish in 64 pages")
+
+    def drive_target(drive: str) -> str | None:
+        """The folder a ``subst`` drive stands for, or ``None``. QueryDosDeviceW answers
+        ``\\??\\C:\\...`` for a substituted drive and ``\\Device\\...`` for a real volume or a
+        network redirector."""
+        buf = ctypes.create_unicode_buffer(1024)
+        if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
+            return None
+        return buf.value[4:] if buf.value.startswith("\\??\\") else None
 
     cache: list[tuple[frozenset[str], bool]] = []
 
@@ -1028,18 +1109,19 @@ def windows_host_readers() -> WinHost:
             return True  # a SID found in a partial read is still a member
         return False if complete else None
 
-    return WinHost(read_security, volume_cause, engine_sid(), admin_member)
+    return WinHost(read_security, volume_cause, engine_sid(), admin_member, drive_target)
 
 
 def _windows_host_verdict(path: str) -> PathVerdict:
     host = windows_host_readers()
     return windows_path_verdict(
         path,
-        cwd=os.getcwd(),
+        cwd=os.getcwd,
         probe=_win_probe,
         read_security=host.read_security,
         volume_cause=host.volume_cause,
         trust=WinTrust(host.engine_sid, host.admin_member),
+        drive_target=host.drive_target,
     )
 
 
@@ -1047,6 +1129,15 @@ def anchor_path_verdict(path: str | os.PathLike[str]) -> PathVerdict:
     """Check the resolution chain of the anchor at ``path`` on this host. READ-ONLY: it opens each
     object for READ_CONTROL on Windows and calls ``lstat`` on POSIX, and changes nothing."""
     text = os.fspath(path)
-    if sys.platform == "win32":
-        return _windows_host_verdict(text)
-    return _posix_host_verdict(text)
+    try:
+        if sys.platform == "win32":
+            return _windows_host_verdict(text)
+        return _posix_host_verdict(text)
+    except OSError as exc:
+        # Per-object read failures are findings already. What reaches here stopped the check as a
+        # whole: a working directory that was deleted, for a relative anchor, or a system DLL that
+        # would not load. That is "could not tell", which warns and audits; it must not crash a
+        # startup or a reload the file arm would have let through.
+        platform = "windows" if sys.platform == "win32" else "posix"
+        unrun = ChainFinding(text, PATH, False, f"the path check could not run: {exc}")
+        return PathVerdict(None, (unrun,), platform)

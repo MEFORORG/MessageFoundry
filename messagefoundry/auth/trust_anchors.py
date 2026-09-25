@@ -48,6 +48,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -55,7 +56,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry.auth.anchor_path import (
-    DIRECTORY,
     LINK,
     ChainFinding,
     PathVerdict,
@@ -535,47 +535,49 @@ def _ps_quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def _sh_quote(text: str) -> str:
-    return "'" + text.replace("'", "'\\''") + "'"
-
-
 def _path_fix(verdict: AnchorVerdict) -> list[str]:
     """The fix, as commands, for every insecure object. The message must carry its own fix: the
-    document the file arm's message cites ships in neither a checkout nor a wheel."""
+    document the file arm's message cites ships in neither a checkout nor a wheel.
+
+    Every command is narrow. It removes the grants the check named, or hands ownership to
+    Administrators or root, and leaves every other entry alone. A blanket reset such as
+    ``/inheritance:r /grant:r`` would strip the engine's own modify grant from its data folder,
+    or the user's rights from a profile folder."""
     check = verdict.path_check
     bad = _findings(verdict, insecure=True)
     objects: dict[str, str] = {}
     for f in bad:
         objects.setdefault(f.path, f.kind)
+    move = "Fix: move the anchor into a folder that only administrators and the engine's account "
     if check is not None and check.platform == "windows":
-        account = f"*{check.engine_sid}" if check.engine_sid else "<the engine's account>"
         lines = [
-            "Fix: move the anchor into a directory that only administrators and the engine's "
-            "account can change, such as the engine's data directory under C:\\ProgramData. Or, "
+            move + "can change, such as the engine's data folder under C:\\ProgramData. Or, "
             "from an elevated PowerShell, for each object named above:"
         ]
         for obj, kind in objects.items():
-            q = _ps_quote(obj)
-            inherit = "(OI)(CI)" if kind == DIRECTORY else ""
-            link = " /L" if kind == LINK else ""
-            grants = " ".join(
-                _ps_quote(f"{sid}:{inherit}{right}")
-                for sid, right in (("*S-1-5-18", "F"), ("*S-1-5-32-544", "F"), (account, "RX"))
-            )
-            lines.append(f"  icacls {q}{link} /inheritance:r /grant:r {grants}")
-            sids = sorted({sid for f in bad if f.path == obj for sid in f.sids})
-            if sids:
-                removed = " ".join(_ps_quote("*" + sid) for sid in sids)
-                lines.append(f"  icacls {q}{link} /remove:g {removed}")
-            lines.append(f"  icacls {q}{link} /setowner '*S-1-5-32-544'")
+            q = _ps_quote(obj) + (" /L" if kind == LINK else "")
+            here = [f for f in bad if f.path == obj]
+            granted = sorted({sid for f in here if not f.owner for sid in f.sids})
+            if granted:
+                # /inheritance:d turns inherited entries into explicit ones, so /remove:g reaches them.
+                lines.append(f"  icacls {q} /inheritance:d")
+                lines.append(
+                    f"  icacls {q} /remove:g " + " ".join(_ps_quote("*" + s) for s in granted)
+                )
+            if any(f.owner for f in here):
+                lines.append(f"  icacls {q} /setowner '*S-1-5-32-544'")
         lines.append("Then read each one back with: icacls <path>")
         return lines
     lines = [
-        "Fix: move the anchor under a root-owned 755 directory such as /etc/messagefoundry/. Or, "
-        "for each object named above:"
+        move + "can change, such as a root-owned 755 folder like /etc/messagefoundry/. Or, for "
+        "each object named above:"
     ]
-    for obj in objects:
-        lines.append(f"  chown root:root {_sh_quote(obj)} && chmod go-w {_sh_quote(obj)}")
+    for obj, kind in objects.items():
+        q = shlex.quote(obj)
+        if kind == LINK:
+            lines.append(f"  chown -h root:root {q}")  # -h: the link itself, not its target
+        else:
+            lines.append(f"  chown root:root {q} && chmod go-w {q}")
     return lines
 
 
@@ -585,6 +587,12 @@ def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
         "anyone who replaces it can substitute the CA and defeat authentication:"
     ]
     lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=True)]
+    check = verdict.path_check
+    if check is not None and check.engine:
+        lines.append(
+            f"The check trusted the account it ran as ({check.engine}) as the engine's own. Run "
+            "it as the account the service runs as, or it can answer differently."
+        )
     return "\n".join(lines + _path_fix(verdict))
 
 
@@ -677,22 +685,38 @@ def collect_anchor_specs(auth: AuthSettings, api: ApiSettings) -> list[AnchorSpe
 # --- central preflight (store-backed: audit the load, detect changes, then enforce) -------------
 
 
+#: How far back :func:`_last_fingerprint` pages. One page used to be the whole look-back, and every
+#: preflight of an anchor whose path cannot be judged writes a row, so one noisy anchor could push a
+#: quiet anchor's baseline out of the window. Its next swap would then read as a first observation.
+_FINGERPRINT_PAGE = 200
+_FINGERPRINT_PAGES = 50
+
+
 async def _last_fingerprint(store: Store, label: str) -> str | None:
     """The most-recently audited fingerprint for ``label``, or ``None`` if this anchor has never been
-    observed. Reads the ``auth.trust_anchor`` audit rows (most-recent-first) and returns the first
-    matching label's fingerprint."""
-    rows = await store.list_audit(action=AUDIT_ACTION, limit=200)
-    for row in rows:
-        detail_raw = row["detail"]
-        if not detail_raw:
-            continue
-        try:
-            detail = json.loads(detail_raw)
-        except (ValueError, TypeError):
-            continue
-        if detail.get("label") == label:
-            fp = detail.get("fingerprint")
-            return fp if isinstance(fp, str) else None
+    observed. Reads the ``auth.trust_anchor`` audit rows (most-recent-first), a page at a time, and
+    returns the first matching label's fingerprint. Each page ends at the oldest timestamp of the one
+    before, inclusively, so a row at that instant is read twice and never skipped."""
+    until: float | None = None
+    for _page in range(_FINGERPRINT_PAGES):
+        rows = await store.list_audit(action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, until=until)
+        for row in rows:
+            detail_raw = row["detail"]
+            if not detail_raw:
+                continue
+            try:
+                detail = json.loads(detail_raw)
+            except (ValueError, TypeError):
+                continue
+            if detail.get("label") == label:
+                fp = detail.get("fingerprint")
+                return fp if isinstance(fp, str) else None
+        if len(rows) < _FINGERPRINT_PAGE:
+            return None
+        oldest = float(rows[-1]["ts"])
+        if until is not None and oldest >= until:
+            return None  # a whole page at one instant: nothing older can be reached this way
+        until = oldest
     return None
 
 
