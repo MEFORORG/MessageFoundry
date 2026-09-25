@@ -21,6 +21,7 @@ thundering-herd polluting the steady-state measurement; stop is cooperative + gr
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 
 from harness.load.connscale.intake_audit import IntakeLedger
 from harness.load.corpus import Corpus, Outgoing
@@ -32,6 +33,7 @@ from harness.load.sender import PersistentConnection
 _BATCH_CAP = 4096  # max sends emitted in one token-bucket tick (bounds catch-up after a stall)
 _MAX_TICK_SLEEP = 0.05
 _IDLE_SLEEP = 0.02
+_RECONNECT_POLL = 0.02  # how often await_reconnected re-reads the connection generations
 
 
 class ConnScaleDriver:
@@ -136,6 +138,31 @@ class ConnScaleDriver:
                 self._m.counters.deferred += behind
                 next_due = now + interval
             await asyncio.sleep(max(0.0, min(next_due - loop.time(), _MAX_TICK_SLEEP)))
+
+    def generations(self) -> list[int]:
+        """Each connection's open count, in port order. Snapshot it before an event that closes the
+        engine side of every socket, then hand it to :meth:`await_reconnected`."""
+        return [conn.generation for conn in self._conns]
+
+    async def await_reconnected(self, since: Sequence[int], *, timeout: float) -> int:
+        """Wait until every connection has opened a NEW socket since ``since`` was taken.
+
+        Returns how many connections had NOT reconnected when the wait ended, so 0 means all of them
+        are back. Bounded by ``timeout``: a connection in the sender's reconnect backoff can take up
+        to ``_BACKOFF_MAX`` to try again, and an engine that never listens again must not hang the
+        step. The caller reports a non-zero result rather than treating it as reconnected.
+        """
+        if len(since) != self._count:
+            raise ValueError(f"expected {self._count} generations, got {len(since)}")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            behind = sum(
+                1 for conn, gen in zip(self._conns, since, strict=True) if conn.generation <= gen
+            )
+            if behind == 0 or loop.time() >= deadline:
+                return behind
+            await asyncio.sleep(_RECONNECT_POLL)
 
     async def stop(self, grace: float) -> None:
         """Stop offering, grace in-flight ACKs, cancel — identical discipline to ``ConnectionPool.stop``."""

@@ -15,7 +15,9 @@ each ``(sweep_mode, N)`` step it:
    and waits until the engine's ``/connections`` reports N inbound rows;
 4. HOLDS a steady aggregate rate for ``hold_seconds``, sampling the engine on one task and the OS
    probe on another (they shared a tick until BACKLOG #1430, which cost the step its samples);
-5. optionally fires a grow-reload mid-hold and times it (wall #5);
+5. optionally fires a reload mid-hold and times it (wall #5). The reload closes every connection, so
+   the step counts the sends it strands, waits for the connections to come back and keeps offering
+   after it (``_reload_mid_hold``, BACKLOG #1292);
 6. stops offering, drains, takes a final sample, and appends a :class:`ConnScaleRecord`.
 
 Each N gets a FRESH engine (its own DB + ports) so a prior N's residue can't bleed into the next
@@ -30,7 +32,7 @@ import logging
 import os
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -91,6 +93,16 @@ _SQLSERVER_PIPELINE_TABLES = (
 _CONFIG_DIR = "harness/config/connscale"
 _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let final ACKs/arrivals settle before the truly-final engine sample
+#: How long a step waits for every connection to come back after the reload probe closed it
+#: (BACKLOG #1292). While the engine's listeners are down, the sender's reconnect backoff doubles up
+#: to `harness.load.sender._BACKOFF_MAX` (5 s), so a connection can sleep that long after the engine
+#: listens again. Twice that, so one full backoff sleep plus the reload itself fits.
+_RECONNECT_TIMEOUT = 10.0
+#: The least offered time a step keeps AFTER every connection is back from the reload probe, as a
+#: fraction of `hold_seconds`. The probe fires at half the hold, so a quick reload leaves about half
+#: a hold behind it and this adds nothing. A slow one used to leave none: the step then had no send
+#: the reload did not touch. At the smoke's 1.5 s hold this is 0.375 s, 4 to 9 sends by lane.
+_POST_RELOAD_HOLD_FRACTION = 0.25
 _HEALTH_TIMEOUT = 30.0
 # One spelling, because both audit moments report it and they must not drift into disagreeing about
 # why nothing ran -- a reader comparing the two moments of a disabled step reads the difference as
@@ -455,6 +467,8 @@ async def _run_one_step(
                 )
             )
         reload_seconds: float | None = None
+        reload_account: _ReloadAccount | None = None
+        hold_started = asyncio.get_running_loop().time()
         hold_task = asyncio.create_task(
             driver.run_hold(
                 corpus=corpus,
@@ -466,9 +480,21 @@ async def _run_one_step(
         if profile.reload_probe:
             # Fire a no-op reload of the running --config dir mid-hold and time it (wall #5). A grow-
             # reload (the connections.toml path) is a separate operator experiment; the in-place reload
-            # of the N-inbound graph already costs O(connections) to quiesce-and-swap.
-            await asyncio.sleep(min(profile.hold_seconds * 0.5, profile.hold_seconds))
-            reload_seconds = await _time_reload(poller)
+            # of the N-inbound graph already costs O(connections) to quiesce-and-swap. That reload
+            # CLOSES EVERY INBOUND CONNECTION, so `_reload_mid_hold` also accounts for the sends the
+            # close strands and keeps traffic flowing after it (BACKLOG #1292).
+            reload_account = await _reload_mid_hold(
+                driver=driver,
+                counters=metrics.counters,
+                reload=lambda: _time_reload(poller),
+                run_hold=lambda seconds: driver.run_hold(
+                    corpus=corpus, mix=_MIX, aggregate_rate=aggregate_rate, hold_seconds=seconds
+                ),
+                hold_task=hold_task,
+                hold_seconds=profile.hold_seconds,
+                hold_started=hold_started,
+            )
+            reload_seconds = reload_account.seconds
         await hold_task
 
         # Stop offering; drain the pipeline; final sample.
@@ -527,7 +553,11 @@ async def _run_one_step(
         # step will actually REPORT. The two diverge on the drain-timeout path, where the local
         # `final` can be None while the poller still holds an earlier sample.
         read_short = _read_shortfall(
-            metrics.counters, poller.baseline, poller.final, unconfirmed_budget=count
+            metrics.counters,
+            poller.baseline,
+            poller.final,
+            unconfirmed_budget=count,
+            reload_stranded=reload_account.stranded if reload_account is not None else 0,
         )
         # The part no excusal forgives, computed HERE because only this side knows whether the
         # excusal was clamped. The audit must not re-derive it -- see `_unexplained_shortfall`.
@@ -595,6 +625,7 @@ async def _run_one_step(
             reload_seconds=reload_seconds,
             audit_live=audit_live,
             audit_final=audit_final,
+            reload_account=reload_account,
         )
     finally:
         for task in sampler_tasks:
@@ -1071,6 +1102,84 @@ async def _time_reload(poller: EnginePoller) -> float | None:
     return await loop.run_in_executor(None, time_reload, client, None)
 
 
+@dataclass(frozen=True)
+class _ReloadAccount:
+    """What the mid-hold reload probe did to the step's traffic (BACKLOG #1292).
+
+    THE RELOAD CLOSES EVERY INBOUND CONNECTION, BY DESIGN. The engine's quiesce-and-swap stops each
+    listener, and `MLLPSource.stop` closes every established client. A message mid-handler still
+    commits, so its row exists, but its ACK is never sent. A frame the engine had not read yet is
+    dropped with the socket. The sender counts both as `timeouts`. Neither was ever accepted, so
+    neither is a count-and-log failure: a real MLLP sender resends a frame it got no ACK for.
+
+    On a fast host that strands one or two sends a step. On a loaded windows-2025 runner on
+    2026-09-25, two steps left 33 of 36 and 36 of 36 sends unconfirmed, and in each the rows present
+    for unconfirmed sends equalled the connection count: one message mid-commit on every connection
+    when they all closed at once. The reconcile charged the gap to the engine as "lost N on intake",
+    while the per-message audit found every accept-ACKed send in the store.
+
+    `stranded` counts the `timeouts` that moved from the moment the probe fired until every
+    connection was back. Nothing else closes a connection mid-hold, so those are the reload's.
+    `after` is a counter snapshot taken at that same moment, so the reconcile can ask whether the
+    engine did any work AFTER the reload: `sent - after.sent` and the replies likewise.
+    """
+
+    seconds: float | None  # wall #5, as `_time_reload` returned it
+    stranded: int
+    not_reconnected: int  # connections still down when the wait gave up; 0 means all came back
+    extra_hold_s: float  # offered time added after the hold, so traffic follows the reload
+    after: Counters
+
+    def sent_after(self, final: Counters) -> int:
+        return final.sent - self.after.sent
+
+    def replies_after(self, final: Counters) -> int:
+        return (final.acked + final.nak) - (self.after.acked + self.after.nak)
+
+
+async def _reload_mid_hold(
+    *,
+    driver: ConnScaleDriver,
+    counters: Counters,
+    reload: Callable[[], Awaitable[float | None]],
+    run_hold: Callable[[float], Awaitable[None]],
+    hold_task: asyncio.Task[None],
+    hold_seconds: float,
+    hold_started: float,
+) -> _ReloadAccount:
+    """Fire the reload at half the hold, account for what it strands, and keep traffic after it.
+
+    Three steps, in order:
+
+    1. Snapshot `timeouts` and each connection's open count, then fire the reload.
+    2. Wait until every connection has opened a NEW socket. The `timeouts` that moved in between
+       are the sends the reload stranded.
+    3. Let the hold finish. If less than `_POST_RELOAD_HOLD_FRACTION` of a hold was offered after
+       the connections came back, offer the difference. Without this a slow reload leaves the step
+       with no send it did not strand, and nothing to judge intake by.
+
+    The wait is skipped when the reload returned no reading, because then it may not have swapped
+    and closed anything. Waiting would spend the whole timeout on connections that never dropped.
+    """
+    loop = asyncio.get_running_loop()
+    await asyncio.sleep(hold_seconds * 0.5)
+    timeouts_before = counters.timeouts
+    generations = driver.generations()
+    seconds = await reload()
+    not_reconnected = 0
+    if seconds is not None:
+        not_reconnected = await driver.await_reconnected(generations, timeout=_RECONNECT_TIMEOUT)
+    stranded = counters.timeouts - timeouts_before
+    after = counters.snapshot()
+    back_at = loop.time()
+    await hold_task
+    offered_after = max(0.0, hold_started + hold_seconds - back_at)
+    extra = max(0.0, hold_seconds * _POST_RELOAD_HOLD_FRACTION - offered_after)
+    if extra > 0.0:
+        await run_hold(extra)
+    return _ReloadAccount(seconds, stranded, not_reconnected, extra, after)
+
+
 def _build_record(
     *,
     claim_mode: str,
@@ -1090,6 +1199,7 @@ def _build_record(
     reload_seconds: float | None,
     audit_live: IntakeAudit | None = None,
     audit_final: IntakeAudit | None = None,
+    reload_account: _ReloadAccount | None = None,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -1098,7 +1208,7 @@ def _build_record(
     # rate x ACK-latency): `_reconcile` treats the count only as a small-run FLOOR under its
     # half-the-run fraction, and its separate intake floor keeps `read >= sent // 2` required here
     # even when `count` exceeds half the step's sends (the short-hold smoke cells).
-    no_loss = _reconcile(c, base, final, unconfirmed_budget=count)
+    no_loss = _reconcile(c, base, final, unconfirmed_budget=count, reload=reload_account)
     live = audit_live if audit_live is not None else intake_audit.not_run("audit not wired")
     post = audit_final if audit_final is not None else intake_audit.not_run("audit not wired")
     # BACKLOG #1292: ATTRIBUTE the reconcile's own failure text, never soften it. `ok` is untouched --
@@ -1198,6 +1308,13 @@ def _build_record(
         batch_handoff_statements=batch_mode,
         intake_audit=post,
         intake_audit_live=live,
+        reload_stranded=reload_account.stranded if reload_account is not None else 0,
+        reload_not_reconnected=(
+            reload_account.not_reconnected if reload_account is not None else 0
+        ),
+        post_reload_extra_hold_s=(
+            reload_account.extra_hold_s if reload_account is not None else 0.0
+        ),
     )
 
 
@@ -1205,30 +1322,39 @@ def _build_record(
 class _Excusal:
     """How many unconfirmed sends the intake bound forgives this step, and whether that broke."""
 
-    unconfirmed: int
+    unconfirmed: int  # the unconfirmed sends the reload probe did NOT strand
     budget: int
     excused: int
     over_budget: bool
+    reload_stranded: int = 0  # clamped to the unconfirmed count; always excused
+    population: int = 0  # the sends the budget and the intake floor judge: sent - reload_stranded
 
 
-def _excusal(c: Counters, *, unconfirmed_budget: int) -> _Excusal:
+def _excusal(c: Counters, *, unconfirmed_budget: int, reload_stranded: int = 0) -> _Excusal:
     """THE definition of the unconfirmed-send excusal, extracted so ``_reconcile`` and the BACKLOG
     #1292 intake audit compute the SAME ``sent - excused``.
 
     The audit exists to explain the ``engine_read {read} < confirmed sent {sent - excused}`` message,
     so it has to be triggered by that exact quantity. A second copy of this arithmetic beside it
     would let the audit fire on a shortfall the reconcile does not report, or stay silent on one it
-    does -- either way attributing the wrong failure. Behaviour is verbatim what ``_reconcile``
-    computed inline before the extraction.
+    does -- either way attributing the wrong failure.
+
+    ``reload_stranded`` is the count :class:`_ReloadAccount` measured: sends the harness's own reload
+    probe stranded by closing every connection. They are excused outright and taken out of the
+    population the budget and the floor judge, because the harness caused them. With it at 0, the
+    default, the behaviour is verbatim what ``_reconcile`` computed inline before the extraction.
     """
-    unconfirmed = c.timeouts
+    stranded = max(0, min(reload_stranded, c.timeouts, c.sent))
+    unconfirmed = c.timeouts - stranded
+    population = c.sent - stranded
     # Three quarters, not half — half was sized against a 16% worst-observed and windows-2025 has
     # since produced 51% on a lossless run, failing `main` at 9b03057f by ONE message. `excused` is
     # clamped rather than zeroed so an over-budget failure stops claiming intake loss it cannot show.
     # `ok` still requires `not over_budget`, so the verdict is unchanged. Full rationale: report.py.
-    budget = max(unconfirmed_budget, 3 * c.sent // 4)
+    budget = max(unconfirmed_budget, 3 * population // 4)
     over_budget = unconfirmed > budget
-    return _Excusal(unconfirmed, budget, 0 if over_budget else unconfirmed, over_budget)
+    excused = stranded + (0 if over_budget else unconfirmed)
+    return _Excusal(unconfirmed, budget, excused, over_budget, stranded, population)
 
 
 def _read_shortfall(
@@ -1237,17 +1363,15 @@ def _read_shortfall(
     final: EngineSample | None,
     *,
     unconfirmed_budget: int,
+    reload_stranded: int = 0,
 ) -> int:
     """``confirmed sent - engine_read`` -- the shortfall ``_reconcile`` reports as intake loss, and
     the trigger for the LIVE intake audit. 0 when the engine gauges are unavailable (there is then no
     shortfall to attribute; ``_reconcile`` fails the step on its own for that)."""
     if base is None or final is None:
         return 0
-    return (
-        c.sent
-        - _excusal(c, unconfirmed_budget=unconfirmed_budget).excused
-        - (final.read - base.read)
-    )
+    ex = _excusal(c, unconfirmed_budget=unconfirmed_budget, reload_stranded=reload_stranded)
+    return c.sent - ex.excused - (final.read - base.read)
 
 
 def _unexplained_shortfall(
@@ -1279,6 +1403,7 @@ def _reconcile(
     final: EngineSample | None,
     *,
     unconfirmed_budget: int,
+    reload: _ReloadAccount | None = None,
 ) -> NoLoss:
     sent = c.sent
     sink_received = c.sink_received
@@ -1316,51 +1441,108 @@ def _reconcile(
     # message per connection — connscale-smoke's N=100 cell is ~105 sends against budget
     # max(100, 52) = 100 — so the count wins the max() and the bound collapses to `read >= 5`. So the
     # guarantee is enforced SEPARATELY below as an intake floor the excusal cannot lower. See
-    # harness/load/report.py's copy for the full rationale; the three copies are kept in step
-    # deliberately.
-    ex = _excusal(c, unconfirmed_budget=unconfirmed_budget)
+    # harness/load/report.py's copy for the full rationale. The load copy in report.py has since
+    # PARTED from this one (BACKLOG #1866); tests/test_harness_reconcile.py pins where.
+    #
+    # THE RELOAD PROBE IS THE ONE STRANDING CAUSE THE HARNESS OWNS, SO IT IS NOT BUDGETED (BACKLOG
+    # #1292). `reload` is what `_reload_mid_hold` measured. Its `stranded` sends are excused outright
+    # and taken out of the population the budget and the floor judge, so the guards keep their full
+    # strength over every send the reload did not touch. What stops that excusal hiding a reload that
+    # broke intake is `reload_blind` below: after the reload, sends must go out AND draw a reply.
+    ex = _excusal(
+        c,
+        unconfirmed_budget=unconfirmed_budget,
+        reload_stranded=reload.stranded if reload is not None else 0,
+    )
     unconfirmed, budget, excused, over_budget = (
         ex.unconfirmed,
         ex.budget,
         ex.excused,
         ex.over_budget,
     )
+    stranded, population = ex.reload_stranded, ex.population
     read_short = sent - excused - read
     # The anti-vacuity guarantee, independent of the excusal: at least half the sends must be
     # observed at intake whatever the budget forgives (nothing clamps `excused` to `sent`, so without
     # this a `timeouts > sent` run would pass at `read >= 0`). Zero at sent == 0, rounds DOWN on an
-    # odd `sent`, so it is never stricter than the documented bound.
-    floor_short = sent // 2 - read
+    # odd `sent`, so it is never stricter than the documented bound. Judged over `population`, which
+    # is `sent` whenever the reload probe stranded nothing.
+    #
+    # KNOWN LOOSENESS, stated rather than hidden: `read` also counts rows for reload-stranded sends
+    # that committed before the close, so it can clear this floor with help from sends the floor no
+    # longer counts. Counts cannot separate them. The per-message audit can, and it is what
+    # `test_no_accept_acked_message_is_absent_from_the_stopped_engines_store` asserts.
+    floor_short = population // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    ok = read_short <= 0 and floor_short <= 0 and deliver_short <= 0 and drained and not over_budget
+    sent_after = reload.sent_after(c) if reload is not None else 0
+    replies_after = reload.replies_after(c) if reload is not None else 0
+    reload_blind = reload is not None and (sent_after == 0 or replies_after == 0)
+    ok = (
+        read_short <= 0
+        and floor_short <= 0
+        and deliver_short <= 0
+        and drained
+        and not over_budget
+        and not reload_blind
+    )
     parts: list[str] = []
     if read_short > 0:
         parts.append(
             f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
         )
     if floor_short > 0:
-        parts.append(
-            f"engine_read {read} < intake floor {sent // 2} (half of {sent} sent) — "
-            f"the unconfirmed-send excusal cannot lower this floor"
-        )
+        if stranded:
+            parts.append(
+                f"engine_read {read} < intake floor {population // 2} (half of the {population} "
+                f"send(s) the reload probe did not strand) -- the unconfirmed-send excusal cannot "
+                f"lower this floor"
+            )
+        else:
+            parts.append(
+                f"engine_read {read} < intake floor {sent // 2} (half of {sent} sent) — "
+                f"the unconfirmed-send excusal cannot lower this floor"
+            )
     if deliver_short > 0:
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
     if not drained:
         parts.append(f"backlog {backlog} not drained")
+    if reload is not None and reload_blind:
+        if sent_after == 0:
+            parts.append(
+                f"nothing was sent after the reload probe ({reload.not_reconnected} "
+                f"connection(s) never reconnected), so intake after the reload was not measured "
+                f"and the {stranded} send(s) it stranded cannot be excused on trust"
+            )
+        else:
+            parts.append(
+                f"{sent_after} send(s) after the reload probe drew no reply at all (no ACK, no "
+                f"NAK) -- the engine stopped answering after the reload"
+            )
     if over_budget:
+        suffix = f" (not counting {stranded} the reload probe stranded)" if stranded else ""
         parts.append(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
-            f"({budget} = max(connections, three quarters of the run)) — systemic no-ACK fault "
-            f"(possible accepted-and-dropped); nothing excused"
+            f"({budget} = max(connections, three quarters of the run)){suffix} — systemic no-ACK "
+            f"fault (possible accepted-and-dropped); nothing excused"
         )
     elif unconfirmed > 0 and read < sent:
         # Honest reporting either way: the gap is attributed to unconfirmed sends, not silently absorbed.
         parts.append(
             f"{unconfirmed} unconfirmed send(s) (no ACK before connection close) "
             f"not observed at intake — not counted as loss"
+        )
+    if stranded:
+        parts.append(
+            f"{stranded} send(s) stranded by the reload probe, which closes every connection -- "
+            f"never ACKed, so excused and not counted as loss"
+        )
+    if reload is not None and reload.not_reconnected and not reload_blind:
+        parts.append(
+            f"{reload.not_reconnected} connection(s) had not reconnected "
+            f"{_RECONNECT_TIMEOUT:g}s after the reload probe"
         )
     detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
     return NoLoss(ok, sent, read, written, sink_received, backlog, detail)

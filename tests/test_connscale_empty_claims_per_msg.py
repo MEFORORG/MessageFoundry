@@ -1120,6 +1120,9 @@ _EXPECTED_DIAGNOSTIC_LABELS = frozenset(
         "fd_probe_ticks",
         "fd_probe_degraded_ticks",
         "cpu_util_cores_mean",
+        # BACKLOG #1292, added 2026-09-25. The reload probe closes every connection, and on a loaded
+        # runner what it strands was read as intake loss. This separates the two on every run.
+        "reload_stranded",
     }
 )
 

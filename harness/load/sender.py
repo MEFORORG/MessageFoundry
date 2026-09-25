@@ -92,8 +92,17 @@ class PersistentConnection:
             2.0  # seconds to wait for in-flight ACKs at graceful stop (set by stop())
         )
         self._task: asyncio.Task[None] | None = None
+        # How many times this connection has been ESTABLISHED. It moves only on a successful open,
+        # so a caller that snapshots it before an event that closes the socket (the connscale
+        # reload probe, BACKLOG #1292) can wait until the connection is back rather than guess.
+        self._generation = 0
 
     # --- public API ----------------------------------------------------------
+
+    @property
+    def generation(self) -> int:
+        """The count of successful opens so far. It changes only when a NEW socket is up."""
+        return self._generation
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"loadconn-{self._host}:{self._port}")
@@ -139,6 +148,7 @@ class PersistentConnection:
                 backoff = min(backoff * 2, _BACKOFF_MAX)
                 continue
             backoff = _BACKOFF_START
+            self._generation += 1
             try:
                 await self._serve(reader, writer)
             except (OSError, ConnectionError):
