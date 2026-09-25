@@ -1265,3 +1265,14 @@ async def test_a_blank_env_pin_refuses_the_graph_load(store: MessageStore, tmp_p
     ):
         await preflight(load_config(cfg), {"adt_pin": ""})
     assert await _rows(store) == []
+
+
+def test_a_blank_pin_without_mtls_fails_its_own_lane_not_the_graph() -> None:
+    """Without tls and tls_ca_file the graph preflight does not collect the connection, so a blank
+    pin there fails that connection's build alone, as an unused real pin does."""
+    from messagefoundry.transports.mllp import _mllp_ssl_context
+
+    plain = {"port": 2575, "tls_ca_pin": ""}
+    assert ta.connection_anchor_spec("PLAIN", plain) is None
+    with pytest.raises(ValueError, match="MLLP listener: tls_ca_pin is set but empty"):
+        _mllp_ssl_context(plain, server=True)

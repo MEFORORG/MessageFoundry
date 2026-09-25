@@ -157,14 +157,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   directory-arm entry below lists, and an inbound CA the engine cannot judge, as the entry above
   lists. An inbound CA with no PEM block, or with a `TRUSTED CERTIFICATE` block, refuses at both
   dials. `tls_ca_pin` set on an outbound connection, or on one without `tls` and `tls_ca_file`,
-  refuses, because nothing would check it. A `tls_ca_pin`, `[api].tls_client_ca_pin`,
-  `[auth].oidc_tls_ca_cert_pin` or `[auth].ad_tls_ca_cert_pin` that is set but empty or
-  whitespace also refuses, naming the setting, such as an `env()` value or environment variable
-  set to nothing. Leave the pin out for no pin. The connection test (`POST
-  /connections/{name}/test`) builds an inbound under the same dial as the live listener, so under
-  `warn` it no longer fails a CA the listener loads. A refused CA answers it with `trust anchor
-  refused; see the server log`: the path and SHA-256 go to the log, not to the caller or the audit
-  row. Not covered: the CAs of outbound connections, and an inbound `tls_crl_file`, which is still
+  refuses, because nothing would check it. A pin that is set but empty or whitespace also
+  refuses, and the message names the setting. That covers `tls_ca_pin`,
+  `[api].tls_client_ca_pin`, `[auth].oidc_tls_ca_cert_pin` and `[auth].ad_tls_ca_cert_pin`, for
+  example when an `env()` value or an environment variable is set to nothing. Leave the pin out
+  for no pin. The connection test (`POST /connections/{name}/test`) now builds a connector under
+  the same enforcement dial as the live build. So under `warn` it no longer fails a CA the
+  listener loads. For an outbound connection, the test now applies the same `enforce` clamp and
+  cleartext guards as the live build, so a hop the live build refuses now fails the test too. A
+  refused CA answers the test with `trust anchor refused; see the server log`. The path and
+  SHA-256 go to the log, not to the caller or the audit row. Not covered: the CAs of outbound connections, and an inbound `tls_crl_file`, which is still
   read by path, so a certificate inside it is trusted unchecked.
   ([BACKLOG #1142](docs/BACKLOG.md))
 - **A config reload now refuses a trust anchor that the next start would refuse.** The reload

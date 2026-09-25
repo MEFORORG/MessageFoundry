@@ -837,3 +837,16 @@ async def test_the_connection_test_echoes_no_anchor_path_or_hash(
             assert loaded not in text
         # The detail is not lost: the operator log carries the path and the hash.
         assert "peer-ca.pem" in caplog.text and loaded in caplog.text
+
+
+async def test_the_connection_test_echoes_no_path_for_a_missing_ca(
+    tmp_path: Path, cas: tuple[_Ca, _Ca]
+) -> None:
+    """A CA file that is gone raises OSError from the read, whose text names the path. The inbound
+    builder turns it into a TrustAnchorError, so the route redacts it too."""
+    good, _ = cas
+    anchor = tmp_path / "gone-ca.pem"
+    r, rows = await _post_test(tmp_path, {**_inbound(good, anchor), "port": 2575}, enforcing=False)
+    assert r.json()["detail"] == "trust anchor refused; see the server log"
+    for text in (r.text, rows[0]["detail"]):
+        assert "gone-ca.pem" not in text and tmp_path.name not in text

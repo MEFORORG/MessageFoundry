@@ -870,7 +870,8 @@ def connection_ca_pin(settings: Mapping[str, Any], setting: str) -> str | None:
     pin = settings.get("tls_ca_pin")
     if pin is not None and not isinstance(pin, str):
         raise ValueError(
-            f"{setting} must be text, the SHA-256 of the CA file; got a {type(pin).__name__}"
+            f"{setting} must be text, the SHA-256 of the CA file; got a value of type "
+            f"{type(pin).__name__}"
         )
     return refuse_a_blank_anchor_pin(pin, setting)
 
@@ -884,15 +885,17 @@ def connection_anchor_spec(name: str, settings: Mapping[str, Any]) -> AnchorSpec
     ``tls_ca_file`` are both set, so that pair is the test, whatever the connector type. A predicate
     keyed on ``intake_auth`` would reach the HTTP listener alone.
 
-    ``settings`` must already have its ``env()`` references resolved. An unresolved one is skipped
-    here, and the connector's own build still checks the resolved value. A blank ``tls_ca_pin``
-    raises ``ValueError`` (:func:`connection_ca_pin`)."""
-    pin = connection_ca_pin(settings, f"inbound connection '{name}' tls_ca_pin")
+    ``settings`` must already have its ``env()`` references resolved. An unresolved
+    ``tls_ca_file`` is skipped here, and the connector's own build still checks the resolved value.
+    On a connection that requires a peer certificate, a ``tls_ca_pin`` that is blank or not text
+    raises ``ValueError`` (:func:`connection_ca_pin`). Anywhere else the pin is left to the
+    connector's build, so one bad connection fails its own lane, not the whole graph."""
     ca = settings.get("tls_ca_file")
     if isinstance(ca, os.PathLike):
         ca = os.fspath(ca)
     if not settings.get("tls") or not isinstance(ca, str) or not ca:
         return None
+    pin = connection_ca_pin(settings, f"inbound connection '{name}' tls_ca_pin")
     return AnchorSpec(
         f"inbound:{name}",
         f"inbound connection '{name}' tls_ca_file",
@@ -930,13 +933,22 @@ def inbound_ca_cadata(name: str, settings: Mapping[str, Any], *, enforcing: bool
     The listener's context builder calls this in place of ``load_verify_locations(cafile=...)``, so the
     CA it trusts is the one the pin, ACL, path and PEM checks read. ``enforcing`` is the construction
     posture's dial. Raises :class:`TrustAnchorError` if ``settings`` names no such CA, since a caller
-    that reaches here has already decided to require a peer certificate."""
+    that reaches here has already decided to require a peer certificate.
+
+    A CA file that cannot be read raises :class:`TrustAnchorError` too, not the ``OSError``. Its
+    text names the path, and a caller that keeps anchor paths away from API callers, such as the
+    connection-test route, recognises the anchor refusal by its type."""
     spec = connection_anchor_spec(name, settings)
     if spec is None:
         raise TrustAnchorError(
             f"inbound connection '{name}' names no tls_ca_file to verify peers with"
         )
-    return verified_anchor_cadata(spec, enforcing=enforcing)
+    try:
+        return verified_anchor_cadata(spec, enforcing=enforcing)
+    except OSError as exc:
+        raise TrustAnchorError(
+            f"{spec.setting}: could not read the trust anchor '{spec.path}': {exc.strerror or exc}"
+        ) from exc
 
 
 def connection_anchor_specs(

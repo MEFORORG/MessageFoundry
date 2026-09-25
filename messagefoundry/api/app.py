@@ -1325,14 +1325,18 @@ _ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
 
 
 def _caused_by_trust_anchor(exc: BaseException) -> bool:
-    """Whether ``exc`` wraps a :class:`TrustAnchorError`, however deep in its cause chain."""
+    """Whether ``exc`` wraps a :class:`TrustAnchorError` through its explicit ``__cause__`` chain.
+
+    Only ``raise ... from``, the way ``build_test_connector`` wraps a build failure. An implicit
+    ``__context__`` is not followed: an unrelated error raised while handling an anchor refusal
+    would then be hidden as one."""
     seen: set[int] = set()
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
         if isinstance(cur, TrustAnchorError):
             return True
         seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
+        cur = cur.__cause__
     return False
 
 
