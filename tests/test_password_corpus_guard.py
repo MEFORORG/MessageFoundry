@@ -16,19 +16,23 @@ difference. Every arm below therefore has a stated failure reading -- see the ta
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
+from messagefoundry.__main__ import main
 from messagefoundry.auth import PasswordPolicy
 from messagefoundry.auth import policy as policy_module
 from messagefoundry.auth.policy import ASVS_6_2_4_MIN_CORPUS_ENTRIES, BreachCorpusUnavailable
-from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.crypto import generate_key
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin
+from tests.test_provision_first_administrator import _tty
 
 #: A password the stand-in corpora below declare leaked. Holds no CONTEXT_WORDS entry and clears the
 #: default length, so the breach clause is the only one it can trip -- which is what lets an arm read
@@ -65,11 +69,11 @@ def bundled_corpus(
 
 @pytest.fixture
 async def empty_store() -> AsyncIterator[MessageStore]:
-    """An in-memory store with no users, so `initialize` takes the first-run branch (BACKLOG #1447).
+    """An in-memory store with no users: the state of a fresh install (BACKLOG #1447).
 
-    `_ensure_bootstrap_admin` returns early on `count_users() > 0`, so an empty store is a
-    precondition of every arm below that calls `initialize()` on it, and not an incidental detail of
-    the fixture. The arms that use `create_admin` write their user first, so they skip that branch.
+    Since ADR 0183 Amendment A, Wave 2, ``initialize()`` mints no account on any store, so the empty
+    table is the first-run precondition for the provisioning arm rather than a branch selector. The
+    arms that use `create_admin` write their own user.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -149,19 +153,18 @@ def test_startup_reports_an_unusable_bundled_corpus_as_an_error(
     assert "REFUSED" in caplog.records[0].getMessage()
 
 
-async def test_the_startup_error_names_the_rotation_a_first_serve_cannot_finish(
+async def test_the_startup_error_names_what_an_unusable_corpus_blocks(
     bundled_corpus: Callable[[Sequence[str] | None], None],
     empty_store: MessageStore,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """BACKLOG #1886: the ERROR has to say what this boot hands the operator, not only what it refuses.
 
-    #1447 let a first run on an unusable corpus mint its bootstrap admin, born must-change, whose
-    rotation is screened by the corpus just reported unusable. The message and that behaviour were
-    changed in different pull requests, so this arm pins them together on ONE service. Drop the
-    sentence and the wording asserts fail. Change the behaviour -- the mint starts raising again, or
-    the rotation stops being refused -- and the behaviour asserts fail, which is the prompt to reword.
-    Why the wording is conditional is stated on `_error_if_bundled_corpus_unusable`.
+    The message and the behaviour it describes are pinned together on ONE service. Drop a sentence
+    and the wording asserts fail. Change the behaviour -- a must-change holder can finish rotating,
+    or ``provision-admin`` stops refusing -- and the behaviour asserts fail, which is the prompt to
+    reword. Before ADR 0183 retired it, the must-change holder here was the first-run bootstrap
+    account; now it is any account an administrator issued a credential to.
 
     SCOPE: this drives `AuthService` directly. It does not reach the must-change gate in
     `api/security.py` or the `serve` lifespan in `api/app.py`, so a change there cannot fail it.
@@ -173,17 +176,20 @@ async def test_the_startup_error_names_the_rotation_a_first_serve_cannot_finish(
     assert len(errors) == 1, errors
     message = errors[0]
     for phrase in (
-        "`serve` against a store with no users still creates the bootstrap admin",
         "cannot finish that change",
-        "`provision-admin` fails",
-        "deadline in bootstrap-admin.txt",
+        "`provision-admin` cannot create the first administrator",
         "password_check_breached = false and restart",
     ):
         assert phrase in message, f"{phrase!r} missing from the startup ERROR: {message}"
+    # The retired account is not described as a thing a start still creates.
+    assert "bootstrap" not in message
 
-    boot = await service.initialize()
-    assert boot is not None
-    out = await service.login(BOOTSTRAP_USERNAME, boot.password)
+    with pytest.raises(BreachCorpusUnavailable):
+        await service.provision_first_administrator(
+            username="opsadmin", password="an-operator-chosen-passphrase", actor="installer"
+        )
+    admin = await create_admin(service)
+    out = await service.login(admin.username, admin.password)
     assert out.ok and out.identity is not None
     assert out.identity.must_change_password
     with pytest.raises(BreachCorpusUnavailable):
@@ -204,8 +210,8 @@ def test_startup_is_silent_when_screening_is_turned_off(
 # --- BACKLOG #1447: the same guard, on the one input it can never screen -------------------------
 #
 # #1438 above made an unusable corpus REFUSE a password. That is right for every password a person
-# chooses and wrong for exactly one caller, the bootstrap generator -- whose reasoning is stated at
-# its own call site in `AuthService._generate_policy_password`, not repeated here.
+# chooses and wrong for exactly one caller, the temporary-credential generator -- whose reasoning is
+# stated at its own call site in `AuthService._generate_policy_password`, not repeated here.
 #
 # WHAT THESE ARMS ADD is the pairing. A blanket suppression passes the positive arms and fails the
 # controls, and that contrast is the only thing that can tell this targeted fix apart from the
@@ -256,38 +262,20 @@ def test_the_per_call_override_can_only_suppress_never_assert_a_screen(
     assert off.violations(_LEAKED, suppress_breach_check=False) == []
 
 
-async def test_a_first_run_mints_the_bootstrap_admin_when_the_corpus_is_unusable(
-    bundled_corpus: Callable[[Sequence[str] | None], None], empty_store: MessageStore
-) -> None:
-    """THE POSITIVE CONTROL for #1447, and the interaction the row was filed over.
-
-    Found by reading the call graph, not by a red leg: `initialize` -> `_ensure_bootstrap_admin` ->
-    `_generate_policy_password` -> `violations`, with no `try` at the lifespan call in `api/app.py`.
-    So the failure reading is not a wrong password, it is `BreachCorpusUnavailable` escaping here and
-    an engine that does not start at all on a fresh install whose corpus did not ship intact.
-
-    The minted credential is logged in with, so this cannot pass on a generator that returned
-    something unusable.
-    """
-    bundled_corpus([])
-    service = AuthService(empty_store, AuthSettings())
-    boot = await service.initialize()
-    assert boot is not None and boot.username == "admin"
-    assert (await service.login("admin", boot.password)).ok
-
-
 async def test_an_operator_supplied_first_administrator_still_refuses_on_an_unusable_corpus(
     bundled_corpus: Callable[[Sequence[str] | None], None], empty_store: MessageStore
 ) -> None:
-    """THE NEGATIVE CONTROL, and it is the arm that makes the one above mean anything.
+    """THE NEGATIVE CONTROL, and it is the arm that makes the admin-reset arm below mean anything.
 
-    Identical preconditions to the positive arm -- empty store, unusable corpus, a first-run
-    provisioning path -- with ONE variable changed: who chose the password. An operator chose this
-    one, so the corpus is the whole point and refusing is correct.
+    The positive arm used to be a first run minting the bootstrap account on an unusable corpus. ADR
+    0183 retired that account, so the generated credential is now only ever an admin reset's, pinned
+    by `test_an_admin_reset_issues_a_credential_on_an_unusable_corpus`. This arm keeps the one
+    variable that matters: who chose the password. An operator chose this one, so the corpus is the
+    whole point and refusing is correct.
 
     Flip `suppress_breach_check`'s default to True -- the one-character mutation that turns this
     targeted fix into the blanket one the row forbids -- and this test goes red with DID NOT RAISE
-    while the positive arm above still passes. Dropping `check_breached` from the gate does NOT fail
+    while the admin-reset arm still passes. Dropping `check_breached` from the gate does NOT fail
     this arm (it screens MORE, not less); see the measured mutation table at the top of this section.
     """
     bundled_corpus([])
@@ -296,6 +284,29 @@ async def test_an_operator_supplied_first_administrator_still_refuses_on_an_unus
         await service.provision_first_administrator(
             username="opsadmin", password="an-operator-chosen-passphrase", actor="installer"
         )
+
+
+def test_provision_admin_refuses_in_words_on_an_unusable_corpus(
+    bundled_corpus: Callable[[Sequence[str] | None], None],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The CLI face of the negative control above, and the one command a fresh install depends on.
+
+    Since ADR 0183 Wave 2 the engine creates no account on its own, so an install whose corpus did
+    not ship intact meets this refusal from ``provision-admin`` first. It must arrive as the command's
+    own error naming both repairs, not as a traceback, and before any store is created.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    _tty(monkeypatch, "an-operator-chosen-passphrase", "an-operator-chosen-passphrase")
+    bundled_corpus([])
+    db = tmp_path / "provision.db"
+    assert main(["provision-admin", "--username", "opsadmin", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "password_check_breached = false" in error and "Reinstall" in error
+    assert not db.exists(), "a refusal on the corpus left a store behind"
 
 
 async def test_a_user_password_change_still_refuses_while_the_same_service_mints_a_token(
@@ -326,9 +337,10 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
     bundled_corpus: Callable[[Sequence[str] | None], None], empty_store: MessageStore
 ) -> None:
     """`admin_reset_password` reaches the same generator, so the same suppression covers it. Worth its
-    own arm because it is a SECOND caller of `_generate_policy_password`: a fix applied at the
-    bootstrap call rather than inside the generator would fail this one. The pairing arm above now
-    mints through the same reset, so the two overlap; this arm keeps the length check.
+    own arm because it was the SECOND caller of `_generate_policy_password`, and is now the only one:
+    a fix applied at the retired first-run call rather than inside the generator would have failed
+    this one. The pairing arm above mints through the same reset, so the two overlap; this arm keeps
+    the length check.
 
     SCOPE, because the assertion is weaker than the test name suggests. This proves only that
     GENERATING the temporary credential no longer raises. It does NOT prove the reset is usable end to

@@ -30,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import datetime
 import json
 import logging
 import os
@@ -225,7 +224,7 @@ from messagefoundry.api.validation import (
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.reconcile import ReconcilePlan
-from messagefoundry.auth.service import AuthService, BootstrapAdmin
+from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
@@ -348,7 +347,6 @@ from messagefoundry.store.content_search import (
 )
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.store import _secure_file
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -6617,6 +6615,17 @@ def create_app(
     return app
 
 
+#: The one host command that creates the first Administrator. Named by every message below that
+#: tells an operator the store has none (ADR 0183 Amendment A, AC-11 and AC-12). ``{store}`` is the
+#: opened store's cross-backend ``path`` descriptor, so an operator whose service runs with a
+#: non-default config or store sees which one to point the command at: a provision into any other
+#: store reports OK and leaves this one refused.
+_PROVISION_ADMIN_HINT = (
+    "Create one at the host with `messagefoundry provision-admin --username <name> --email "
+    "<address>`, pointed at this store ({store}) and the service's own config, then start again"
+)
+
+
 async def _assert_security_notice_is_deliverable(
     store: Store,
     *,
@@ -6632,26 +6641,36 @@ async def _assert_security_notice_is_deliverable(
     The serve gate in ``messagefoundry/__main__.py`` already refuses without a notification channel,
     but it computes readiness from ``notify_security_events`` + ``email_smtp_host`` + ``email_from``
     -- **SMTP wiring alone**. That asks *"is a transport configured"* and never *"can the account
-    that matters actually receive"*: the instrument answering the adjacent question (SDS-3.8). On a
-    first run the only account that exists is the bootstrap administrator, created with no address,
-    so the gate passes green while every one of the ten notice types about the account holding
-    ``frozenset(Permission)`` silently no-ops -- including ``LOGIN_AFTER_FAILURES``, the classic
-    someone-guessed-it signal.
+    that matters actually receive"*: the instrument answering the adjacent question (SDS-3.8). An
+    Administrator with no address passes that gate green while every one of the ten notice types
+    about the account holding ``frozenset(Permission)`` silently no-ops -- including
+    ``LOGIN_AFTER_FAILURES``, the classic someone-guessed-it signal.
 
     **This check must live here and not beside the transport gate.** ``_serve`` is synchronous and
     opens no store, so at that point there is no user table to ask. The ASGI lifespan is the only
-    place the store and the freshly minted bootstrap admin are both in hand -- which is why the
-    owner's ruling (option (b), 2026-08-13) corrected the item's own stated fix location.
+    place the store is in hand -- which is why the owner's ruling (option (b), 2026-08-13) corrected
+    the item's own stated fix location.
+
+    **The refusal says which half failed, because the fix differs (ADR 0183 Amendment A).** The
+    engine creates no account on its own since Wave 2, so a store nobody has provisioned holds no
+    enabled Administrator at all. That half names ``provision-admin``, which succeeds against such a
+    store (AC-11). An Administrator with no address is the other half; ``provision-admin`` refuses
+    there, so it names the offline setter ``admin-set-notify-email`` and the audited waiver (AC-16).
+
+    **It is also where a skipped gate still says that nobody can sign in (AC-12).** With sign-in
+    required, notices off or waived in writing, and no enabled Administrator, the engine starts and
+    routes HL7 but no one can reach the console. That is logged as ONE WARNING naming
+    ``provision-admin``. Under ``warn`` the refusal's own WARNING already says it, so nothing more is
+    logged. With sign-in not required no Administrator is needed and nothing is logged. It stays a
+    warning rather than a refusal on purpose: NSSM restarts a service at boot with nobody present,
+    and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
 
     **Why deliverability rather than "require an email at creation".** A fix resting on an OPERATOR
     ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
-    table can. This paragraph used to justify that by saying an address a human sets on an AD or OIDC
-    account is overwritten at the holder's next sign-in, and **BACKLOG #1139 made that half false**:
-    ``update_user_profile`` still issues ``UPDATE users SET display_name=?, email=?`` unconditionally
-    on every directory login, but ``email`` is now the mirror only. The address this check reads --
-    ``notify_email`` -- is engine-owned and named by no directory-sync statement, so a directory login
-    no longer moves it. The conclusion stands on the narrower ground: an operator can still forget,
-    and a first-run bootstrap administrator is still minted with no address at all.
+    table can. BACKLOG #1139 narrowed that ground: the address this check reads -- ``notify_email``
+    -- is engine-owned and named by no directory-sync statement, so a directory login no longer
+    moves it. The conclusion stands on what is left: an operator can still forget, and
+    ``provision-admin`` without ``--email`` succeeds with a warning.
 
     **It reads ``notify_email`` and not ``email`` for the reason the split exists.** They are two
     columns now, and only one of them is where a notice is addressed. Asking about ``email`` would be
@@ -6662,80 +6681,55 @@ async def _assert_security_notice_is_deliverable(
     which is a different and much larger change.
     """
     auth_settings = auth_settings or AuthSettings()
-    if not auth_settings.enabled or not auth_settings.notify_security_events:
-        return  # no notices to deliver; the transport gate already governs whether that is allowed
+    if not auth_settings.enabled:
+        return  # sign-in is not required, so no Administrator is needed to reach the engine
     alerts = alerts_settings or AlertsSettings()
-    if not alerts.security_notifications_required:
-        return  # the audited, in-writing opt-out -- the pull-only feed is accepted
-    for user in await store.list_users():
-        if user.disabled or not user.notify_email:
-            continue
-        if Role.ADMINISTRATOR.value in await store.get_user_role_ids(user.id):
-            return
-    detail = (
-        "no enabled Administrator has a notification address, so every out-of-band security notice about "
-        "the most privileged accounts would be silently dropped (SecurityEventNotifier returns "
-        "early when the recipient has no address). The [alerts] SMTP transport being configured "
-        "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
-        "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
-        "/me/security-events feed in writing via [alerts].security_notifications_required=false. "
-        "(On a NEW install, `messagefoundry provision-admin --username <name> --email <address>` "
-        "before the first serve avoids this state entirely -- BACKLOG #1136. It is not a fix for "
-        "the instance that just refused: it declines once an enabled Administrator exists, which "
-        "by this point one does.)"
+    # The two preconditions of the deliverability question. Either one false skips the refusal: the
+    # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
+    gated = auth_settings.notify_security_events and alerts.security_notifications_required
+    # Addressed accounts first, so the common start stops at the first addressed Administrator and
+    # never reads the roles of the rest of the table. Once an Administrator WITHOUT an address is
+    # reached, every account after it lacks one too, so the question is settled there.
+    enabled = sorted(
+        (u for u in await store.list_users() if not u.disabled), key=lambda u: not u.notify_email
     )
+    administrator_exists = False
+    for user in enabled:
+        if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
+            continue
+        if user.notify_email or not gated:
+            return
+        administrator_exists = True
+        break
+    if not administrator_exists:
+        # A SQLite store file named absolutely, since the operator's shell may sit in another
+        # directory than the service; a server backend's descriptor is server/database, names no
+        # file, and is left as it is.
+        where = str(Path(store.path).resolve()) if Path(store.path).is_file() else store.path
+        detail = (
+            "no enabled Administrator exists in this store, so nobody can sign in, and every "
+            "out-of-band security notice about the most privileged accounts would reach nobody. The "
+            f"engine creates no account on its own. {_PROVISION_ADMIN_HINT.format(store=where)}."
+        )
+        if not gated:
+            # AC-12: the gate is skipped, so this is the one line that says the console is unreachable.
+            _log.warning("the engine is starting with no way to sign in: %s", detail)
+            return
+    else:
+        detail = (
+            "no enabled Administrator has a notification address, so every out-of-band security "
+            "notice about the most privileged accounts would be silently dropped "
+            "(SecurityEventNotifier returns early when the recipient has no address). The [alerts] "
+            "SMTP transport being configured does not make a notice deliverable. Set an address at "
+            "the host with `messagefoundry admin-set-notify-email --username <administrator> "
+            "--email <address>`, run against this store with the engine stopped, or accept the "
+            "pull-only /me/security-events feed in writing via "
+            "[alerts].security_notifications_required=false"
+        )
     enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
         raise RuntimeError(f"refusing to start a PHI instance: {detail}")
     _log.warning("PHI instance with no deliverable security-notice recipient: %s", detail)
-
-
-def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettings) -> None:
-    """Persist the one-time bootstrap password to a restricted file — never the rotating log.
-
-    Until rotated it is a standing Administrator credential, so it must not land in NSSM's broadly
-    readable stdout capture. Write it to an owner-only file the operator consumes and deletes; log
-    only the location. Paired with server-side must_change_password enforcement, it dies at first login.
-    """
-    base = Path(store_settings.path or ".").resolve()
-    secret_file = base.parent / "bootstrap-admin.txt"
-    body = f"username: {bootstrap.username}\npassword: {bootstrap.password}\n"
-    # ASVS 6.4.5: state the renewal deadline WITH the credential — an unclaimed bootstrap is
-    # auto-disabled at this instant, so the "sign in and change it before then" instruction ships
-    # alongside the secret rather than being an out-of-band assumption. None when expiry is off.
-    deadline = (
-        datetime.datetime.fromtimestamp(bootstrap.expires_at, tz=datetime.UTC).isoformat()
-        if bootstrap.expires_at is not None
-        else None
-    )
-    if deadline is not None:
-        body += (
-            f"expires: {deadline} — sign in and change this password before then, "
-            "or the unclaimed credential is disabled.\n"
-        )
-    # Create the file owner-only from the instant it exists, closing the POSIX create-then-chmod TOCTOU
-    # (SEC-020): O_EXCL + 0o600 means the secret is never group/world-readable even momentarily, and
-    # O_EXCL also refuses to follow a pre-planted symlink/file at that path. A second service start
-    # before the operator deletes the prior file would hit FileExistsError — remove the stale file we
-    # own, then re-create exclusively.
-    flags = os.O_CREAT | os.O_WRONLY | os.O_EXCL | os.O_TRUNC
-    try:
-        fd = os.open(str(secret_file), flags, 0o600)
-    except FileExistsError:
-        secret_file.unlink()  # the prior owner-only file we wrote; replace it under the same mode
-        fd = os.open(str(secret_file), flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(body)
-    # On Windows os.open's mode is minimal, so still apply the icacls owner-only DACL (the store's
-    # platform-correct primitive: chmod on POSIX is a no-op here since O_EXCL already set 0o600).
-    _secure_file(secret_file)
-    _log.warning(
-        "Created bootstrap admin %r; one-time password written to %s — sign in, change it, then "
-        "delete that file%s.",
-        bootstrap.username,
-        secret_file,
-        f" (expires {deadline} unless claimed)" if deadline is not None else "",
-    )
 
 
 _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound the sessions table
@@ -6809,34 +6803,6 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_session_revoked(revocation.username, reason=revocation.reason)
 
 
-_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL = 3600.0  # re-check the bootstrap warn window hourly
-
-
-async def _bootstrap_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
-    """Remind an operator, ONCE, that an UNCLAIMED first-run bootstrap admin is nearing its auto-disable
-    deadline (ASVS 6.4.5 arm 2). API-lifespan-owned (like :func:`_session_reaper`), NOT engine-owned — it
-    reaches the :class:`AuthService` directly. ``auth.bootstrap_expiry_warning()`` evaluates the warn
-    window and latches once-per-process; a non-None result is the fresh reminder to emit as the PHI-free
-    ``bootstrap_admin_expiring`` alert (the ISO deadline + whole hours remaining — never the password).
-
-    A transient store error must not kill the loop for the process lifetime (that would silently drop the
-    reminder) — log and retry next interval, the session-reaper precedent."""
-    while True:
-        try:
-            warning = await auth.bootstrap_expiry_warning()
-            if warning is not None:
-                expires_at, hours_remaining = warning
-                iso = datetime.datetime.fromtimestamp(expires_at, tz=datetime.UTC).isoformat()
-                sink.bootstrap_admin_expiring(
-                    "bootstrap-admin", expires_at=iso, hours_remaining=hours_remaining
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _log.exception("bootstrap expiry reminder: pass failed; will retry next interval")
-        await asyncio.sleep(_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL)
-
-
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
 
 
@@ -6868,10 +6834,8 @@ async def _remind_expiring_initial_credentials(
 
     The deadline is :func:`pending_credential_deadline`, the route-layer function the refusal and the
     console pages read. It returns :meth:`AuthService.initial_credential_deadline` under the gate's
-    own ``must_change_password`` condition, so the reminder names the instant the gate refuses on. It
-    also leaves out the never-claimed bootstrap account, which :func:`_bootstrap_expiry_reminder`
-    covers against the EARLIER of its two bounds. A disabled account is skipped: it cannot sign in
-    whatever the credential does.
+    own ``must_change_password`` condition, so the reminder names the instant the gate refuses on. A
+    disabled account is skipped: it cannot sign in whatever the credential does.
 
     ``warned`` maps a user id to the deadline already reminded about. A new credential on the same
     account has a new deadline, so it is reminded about again. An entry is dropped once its account
@@ -6907,8 +6871,8 @@ async def _initial_credential_expiry_reminder(auth: AuthService, sink: AlertSink
     holder, so the reminder goes to the ``[alerts]`` sink as ``initial_credential_expiring``.
 
     The poll runs at half the warn lead, capped at an hour, so every window holds at least one pass.
-    The ``_bootstrap_expiry_reminder`` shape: API-lifespan-owned, and a failed pass is logged and
-    retried rather than ending the loop."""
+    The :func:`_session_reaper` shape: API-lifespan-owned, and a failed pass is logged and retried
+    rather than ending the loop."""
     lead = _initial_credential_warn_lead(auth)
     if lead is None:
         return
@@ -7013,8 +6977,8 @@ def create_managed_app(
 
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
-    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService`, seeds the
-    built-in roles, and creates a bootstrap admin on first run. The store is opened via the
+    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService` and seeds the
+    built-in roles; it creates no account (ADR 0183). The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
     — the CLI server passes it; in-process/test callers omit it (no separate API socket is bound).
@@ -7328,7 +7292,6 @@ def create_managed_app(
         upload_retention_runner: UploadRetentionRunner | None = None
         reaper: asyncio.Task[None] | None = None
         reconciler: asyncio.Task[None] | None = None
-        bootstrap_reminder: asyncio.Task[None] | None = None
         # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
         credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
@@ -7470,10 +7433,8 @@ def create_managed_app(
                     # connector-construction gate, so the clamp is inert unless the posture arrives here).
                     hop_posture=_hop_posture,
                 )
-                bootstrap = await auth.initialize()
+                await auth.initialize()
                 app.state.auth = auth
-                if bootstrap is not None:
-                    _emit_bootstrap_admin(bootstrap, resolved)
                 await _assert_security_notice_is_deliverable(
                     store,
                     auth_settings=auth_settings,
@@ -7524,26 +7485,10 @@ def create_managed_app(
                         auth_settings.oidc_redirect_path,
                     )
                 reaper = asyncio.create_task(_session_reaper(store))
-                if auth.bootstrap_deadline_configured:
-                    # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
-                    # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
-                    # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
-                    # (LoggingAlertSink fallback) or notifies. No task when NEITHER bound is configured.
-                    #
-                    # BACKLOG #1141: this open-coded `auth_settings.bootstrap_expiry_hours > 0`, a THIRD copy
-                    # of a question `bootstrap_expiry_warning` answers over TWO bounds — WP-3 account
-                    # retirement AND the ASVS 6.4.1 credential expiry. At bootstrap_expiry_hours=0 with
-                    # initial_password_expiry_hours set, that method computed a correct deadline and this
-                    # task — ITS ONLY CONSUMER — was never created, so the warning arm was SILENTLY DEAD.
-                    # BACKLOG #1245 corrected the two computations in auth/service.py and never reached the
-                    # gate deciding whether they run. Ask the AuthService, which owns the predicate now.
-                    bootstrap_reminder = asyncio.create_task(
-                        _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
-                    )
                 if _initial_credential_warn_lead(auth) is not None:
-                    # BACKLOG #1141 (ASVS 6.4.5): the same nudge for every OTHER unclaimed temporary
-                    # password an administrator issued. Gated on the predicate the task itself reads,
-                    # so the gate cannot drift from the task the way the bootstrap one did above.
+                    # BACKLOG #1141 (ASVS 6.4.5): a nudge for every unclaimed temporary password an
+                    # administrator issued. Gated on the predicate the task itself reads, so the gate
+                    # cannot drift from the task.
                     credential_reminder = asyncio.create_task(
                         _initial_credential_expiry_reminder(auth, notifier or LoggingAlertSink())
                     )
@@ -7584,11 +7529,6 @@ def create_managed_app(
                 # previously-died reaper stored, so it can't propagate here and skip engine.stop()
                 # (review M-33).
                 await asyncio.gather(reaper, return_exceptions=True)
-            if bootstrap_reminder is not None:
-                bootstrap_reminder.cancel()
-                # gather(return_exceptions): absorb our cancellation + any stored exception so it can't
-                # propagate here and skip engine.stop() (the reaper precedent).
-                await asyncio.gather(bootstrap_reminder, return_exceptions=True)
             if credential_reminder is not None:
                 credential_reminder.cancel()
                 await asyncio.gather(credential_reminder, return_exceptions=True)

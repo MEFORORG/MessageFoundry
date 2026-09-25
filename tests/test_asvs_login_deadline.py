@@ -256,7 +256,8 @@ async def test_every_login_failure_branch_answers_at_one_deadline(
 ) -> None:
     """THE INVARIANCE ASSERTION for the sign-in seam.
 
-    Five failure branches whose real costs differ by 75x at the parent commit. Each is driven from a
+    Four failure branches whose real costs differed by up to 75x before the pad. A fifth, the
+    first-run account's spelling, went with that account (ADR 0183). Each is driven from a
     call start captured in :func:`_least_deadline_offsets`, and the assertion is that
     ``deadline - start`` is the same for all of them — not that it equals any particular number, and
     not that it equals a constant the production code also reads.
@@ -273,12 +274,6 @@ async def test_every_login_failure_branch_answers_at_one_deadline(
             "invalid credentials",
         ),
         "locked_account": (lambda: service.login("locky", "definitely-not-it"), "account locked"),
-        # The bootstrap spelling takes an extra store lookup plus the supersession check (#1268), and
-        # measured 3.6 ms slower than every other local branch before the pad.
-        "bootstrap_username": (
-            lambda: service.login("admin", "definitely-not-it"),
-            "invalid credentials",
-        ),
         # BACKLOG #1137 retired directory password sign-in on 2026-08-22, AFTER this item's research
         # was written. It refuses before any store lookup, so it was by far the loudest branch here —
         # and, measured 2026-09-16, by far the CHEAPEST, which is why a stall reaches it first.

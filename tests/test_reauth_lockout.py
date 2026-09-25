@@ -48,6 +48,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_admin
 
 GOOD = "Synth3tic-Pass-Phrase!!"
 WRONG = "not-the-password"
@@ -784,9 +785,8 @@ async def test_a_password_reauth_on_an_mfa_pending_session_does_not_clear_code_f
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(lockout_threshold=5, mfa_recovery_code_count=2))
-        boot = await service.initialize()
-        assert boot is not None
-        first = await service.login("admin", boot.password)
+        admin = await create_admin(service)
+        first = await service.login(admin.username, admin.password)
         assert first.ok and first.identity is not None and first.token is not None
         enroll = await service.begin_mfa_enrollment(first.identity)
         assert (
@@ -795,14 +795,14 @@ async def test_a_password_reauth_on_an_mfa_pending_session_does_not_clear_code_f
             )
         ).ok
 
-        pending = await service.login("admin", boot.password)
+        pending = await service.login(admin.username, admin.password)
         assert pending.ok and pending.identity is not None and pending.token is not None
         live = fresh_totp(enroll.secret)
         wrong_code = f"{(int(live[0]) + 1) % 10}{live[1:]}"
         for _ in range(2):
             assert not (await service.verify_mfa(pending.token, wrong_code)).ok
-        assert (await service.reauth(pending.identity, boot.password, token=pending.token)).ok
-        user = await store.get_user_by_username("admin")
+        assert (await service.reauth(pending.identity, admin.password, token=pending.token)).ok
+        user = await store.get_user_by_username(admin.username)
         assert user is not None and user.failed_attempts == 2
     finally:
         await store.close()
