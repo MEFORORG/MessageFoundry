@@ -148,6 +148,13 @@ class PasswordChangeRequest(RequestModel):
     new_password: str = Field(max_length=_PASSWORD_MAX)
 
 
+class NotifyEmailRequest(RequestModel):
+    """``POST /me/notify-email``: the address that fills a missing notification address (BACKLOG
+    #1139). Same bound as ``UserCreateRequest.email``; blank is refused by the service."""
+
+    email: str = Field(max_length=_NAME_MAX)
+
+
 class ReauthRequest(RequestModel):
     """Step-up re-verification (ASVS 7.5.3): the caller re-supplies their current credential to refresh
     the session's step-up window before a highly sensitive operation."""

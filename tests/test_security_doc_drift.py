@@ -68,9 +68,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # GET plus a stepdown POST for each of the planned and forced variants -- and no JSON route.
 # BACKLOG #1500 (ADR 0090 residual (a)) added two /ui routes -- the message resend confirm GET and the
 # body-less resend POST behind it -- and no JSON route: the resend endpoint already shipped with #123.
-_ROUTES_DEFAULT = 109
-_ROUTES_WITH_DOCS = 113
-_ROUTES_WITH_UI = 218
+# BACKLOG #1139 (ASVS 6.3.7) added one JSON route, POST /me/notify-email, and two /ui routes, the GET
+# and POST of /ui/account/notify-address: the way out of the missing-address confinement.
+_ROUTES_DEFAULT = 110
+_ROUTES_WITH_DOCS = 114
+_ROUTES_WITH_UI = 221
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -153,6 +155,7 @@ _PERMISSIONLESS_ROUTES = frozenset(
         ("POST", "/auth/logout"),
         ("GET", "/auth/me"),
         ("POST", "/me/password"),
+        ("POST", "/me/notify-email"),
         ("POST", "/me/reauth"),
         ("POST", "/auth/mfa-verify"),
         ("GET", "/me/mfa"),

@@ -40,8 +40,10 @@ from messagefoundry.auth.notifications import (
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     LOGIN_AFTER_FAILURES,
+    MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
+    NOTIFY_EMAIL_SET,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
@@ -81,6 +83,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     UserRecord,
     WebAuthnCredential,
+    require_notify_email,
 )
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -400,6 +403,37 @@ class BootstrapAdmin:
 
 class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
+
+
+# Characters that let one address field name more than one mailbox, or smuggle a display name or a
+# header, when ``send_plain_email`` joins the recipients into ``To``. Checked by hand, not by a regex.
+_ADDRESS_FORBIDDEN_CHARS = frozenset(',;<>"()[]:\\')
+
+
+def _is_single_mailbox(address: str) -> bool:
+    """Whether ``address`` reads as exactly one plain ``local@domain`` mailbox (BACKLOG #1139).
+
+    A shape check, not proof of delivery: nothing here can tell that the holder reads it. It exists so
+    the self-service fill cannot be satisfied by ``x``, and cannot fan every later notice out to two
+    mailboxes with ``a@b.org, c@d.org``. The address cannot be changed again without an administrator,
+    so a typo caught here is one the holder can still fix.
+    """
+    local, at, domain = address.partition("@")
+    return (
+        bool(at)
+        and bool(local)
+        and "@" not in domain
+        and "." in domain.strip(".")
+        and not domain.startswith(".")
+        and not domain.endswith(".")
+        and all(ch.isprintable() and not ch.isspace() for ch in address)
+        and not any(ch in _ADDRESS_FORBIDDEN_CHARS for ch in address)
+    )
+
+
+class NotifyEmailAlreadySet(RuntimeError):
+    """:meth:`AuthService.fill_own_notify_email` declined: the account already has a different
+    notification address. The self-service route only fills a missing one (BACKLOG #1139)."""
 
 
 class _DirectoryLoginRefused(Exception):
@@ -2220,6 +2254,7 @@ class AuthService:
             username=user.username,
             auth_provider=AuthProvider.AD,
             roles=ad_roles,
+            must_set_notify_email=self.notify_email_required(user),
             allowed_channels=_allowed_channels(user, ad_roles),
             extra_permissions=ad_custom_permissions,
         )
@@ -3374,9 +3409,73 @@ class AuthService:
             auth_provider=provider,
             roles=roles,
             must_change_password=user.must_change_password,
+            must_set_notify_email=self.notify_email_required(user),
             allowed_channels=_allowed_channels(user, roles),
             extra_permissions=custom_permissions,
         )
+
+    def notify_email_required(self, user: UserRecord) -> bool:
+        """Whether ``user`` is confined to setting a notification address before anything else.
+
+        BACKLOG #1139 (ASVS 6.3.7). An account with no ``notify_email`` is told nothing out of band
+        about a change to its authentication details, because the notifier drops a notice with no
+        address. At least four paths give birth to such an account: the first-run bootstrap administrator,
+        ``create_local_user`` with no email, ``provision-admin`` with no ``--email``, and a directory
+        sign-in whose directory returns no ``mail``. So the first sign-in sets one, in the shape of
+        the ``must_change_password`` confinement.
+
+        **ONLY WHEN A SECURITY-NOTICE CHANNEL IS WIRED**, which is ``[auth].notify_security_events``
+        on and an ``[alerts]`` SMTP relay configured. Without one, no account is notified whatever it
+        holds, so confining it would lock out a site with no mail server and buy nothing. A PHI
+        instance under ``enforce`` already refuses to start without that channel (ADR 0167).
+
+        Derived on every resolve rather than stored, so it ends the moment an address lands, and
+        no store backend carries a flag for it.
+        """
+        return self._security_notifier is not None and not (user.notify_email or "").strip()
+
+    async def fill_own_notify_email(
+        self, identity: Identity, email: str, *, client: str | None = None
+    ) -> bool:
+        """Set the caller's own notification address where it has none (BACKLOG #1139).
+
+        This is the way out of the confinement :meth:`notify_email_required` describes. Returns
+        ``True`` when it wrote, ``False`` when the same address was already on file. The value must
+        read as one plain mailbox (:func:`_is_single_mailbox`).
+
+        **IT FILLS A MISSING ADDRESS AND NOTHING ELSE**, like ``admin-set-notify-email``. Changing an
+        existing one here would move where notices go without telling the old address, and a
+        session is all it would take. Raises :class:`NotifyEmailAlreadySet` for that, and
+        :class:`ValueError` for a blank value (:func:`require_notify_email`).
+
+        **THE FIRST ADDRESS IS TRUSTED AS TYPED.** Whoever holds this session (password, and the
+        factor where one is enrolled) chooses where notices go. Nothing checks that the holder
+        receives mail there. The audit row names the change in the holder's own
+        ``/me/security-events`` feed, and the notice goes to the address just set.
+
+        The fill-only check is a read, then an unconditional write. Two concurrent calls from the
+        same account can both pass it; the later write wins and both are audited.
+        """
+        address = require_notify_email(email)
+        if not _is_single_mailbox(address):
+            raise ValueError("enter one email address, such as name@example.org")
+        user = await self._store.get_user(identity.user_id)
+        if user is None:
+            raise ValueError("no such account")
+        if user.notify_email == address:
+            return False
+        if (user.notify_email or "").strip():
+            raise NotifyEmailAlreadySet(
+                "this account already has a notification address; an administrator changes it"
+            )
+        await self._store.set_user_notify_email(user.id, email=address)
+        # The address itself stays out of the row, as provision-admin and admin-set-notify-email
+        # record only that one was set.
+        await self._audit("auth.notify_email_set", actor=user.username, client=client)
+        await self._notify_security(
+            NOTIFY_EMAIL_SET, username=user.username, email=address, client=client
+        )
+        return True
 
     # --- password management -------------------------------------------------
 
@@ -4707,8 +4806,11 @@ class AuthService:
         """Self-service: remove one of the caller's own passkeys (the API gates this behind the
         full step-up). Returns ``False`` for an unknown/foreign credential (self-scoped). Raises
         :class:`ValueError` when this is the last remaining second factor while MFA is still
-        required — "enroll another factor first" (ADR 0068 decision 5). Deleting the last factor
-        when NOT required fires the MFA_DISABLED-class notification (ASVS 6.3.7 parity)."""
+        required — "enroll another factor first" (ADR 0068 decision 5).
+
+        EVERY successful removal notifies out of band (ASVS 6.3.7, BACKLOG #1139), on the event type
+        that describes the resulting state: MFA_DISABLED where this was the last factor and MFA was
+        not required, MFA_CREDENTIAL_REMOVED where at least one other factor remains."""
         user = await self._store.get_user(identity.user_id)
         if user is None:
             return False
@@ -4732,9 +4834,42 @@ class AuthService:
             detail=_json({"label": target.label}),
             client=client,
         )
-        if last_second_factor:
+        # BACKLOG #1139 (ASVS 6.3.7): EVERY removal notifies, not only the last one. This used to
+        # emit under ``if last_second_factor`` alone, so removing a passkey while another factor
+        # remained wrote the audit row above and nothing else — leaving the audit log as the sole
+        # record of precisely the removal someone holding a stolen session makes, stripping the
+        # holder's own authenticator while keeping their own. Losing one of several factors is still
+        # an update to the account's authentication details, which is the requirement's own verb.
+        #
+        # TWO EVENT TYPES RATHER THAN ONE CARRYING A FLAG, because they are different statements
+        # about the resulting state. MFA_DISABLED asserts the account has no second factor left;
+        # emitting it while another passkey stands would be false, and consumers already read it as
+        # that state change. The last-factor arm is therefore untouched.
+        #
+        # WHICH ARM IS DECIDED BY A READ TAKEN AFTER THE DELETE, not by ``last_second_factor``. That
+        # flag comes from the read above, so two concurrent removals of an account's only two
+        # passkeys would each see one left and each send the "another factor remains" wording to an
+        # account that now has none. The flag still gates the refusal above, which is about intent.
+        after = await self._store.get_user(identity.user_id)
+        factor_remains = bool(
+            await self._store.list_webauthn_credentials(identity.user_id)
+        ) or bool(after is not None and after.totp_enabled)
+        if not factor_remains:
             await self._notify_security(
                 MFA_DISABLED,
+                username=user.username,
+                email=user.notify_email,
+                client=client,
+                detail={"factor": "webauthn"},
+            )
+        else:
+            # No remaining-factor COUNT in the detail. ``len(creds) - 1`` is off by one for every
+            # credential a concurrent caller removed between this method's read and its own delete,
+            # and the recovery-code sibling pays a re-read to avoid exactly that. Here the count buys
+            # the reader nothing the fixed wording does not already give them, so it is not carried
+            # rather than carried wrong.
+            await self._notify_security(
+                MFA_CREDENTIAL_REMOVED,
                 username=user.username,
                 email=user.notify_email,
                 client=client,
@@ -5345,11 +5480,45 @@ class AuthService:
         client: str | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
-        """Best-effort out-of-band security-event push (ASVS 6.3.5/6.3.7). A missing notifier or a
-        notifier failure is swallowed (logged) — a notification must never break a login or an admin
-        action. The caller writes the audit row, not this method: see
-        :meth:`_record_suspicious_login` for the two 6.3.5 events."""
+        """Best-effort out-of-band security-event push (ASVS 6.3.5/6.3.7). A missing notifier and a
+        notifier failure are each WARNED and then swallowed — a notification must never break a login
+        or an admin action. The caller writes the audit row, not this method: see
+        :meth:`_record_suspicious_login` for the two 6.3.5 events.
+
+        The docstring used to promise both arms were logged while only the failure arm was (BACKLOG
+        #1139), so read the branches rather than this paragraph if they ever diverge again."""
         if self._security_notifier is None:
+            # BACKLOG #1139: SAY SO, matching the sibling drop in ``pipeline/security_notify.py``
+            # (CLAUDE.md §6 forbids the silent swallow independently of ASVS).
+            #
+            # THIS DROP IS WIDER THAN THAT SIBLING, which loses one account.
+            # ``security_notifier_from_settings`` returns ``None`` whenever ``[alerts]`` names no SMTP
+            # host or sender, so an instance running with ``notify_security_events`` on and no relay
+            # configured would drop every notice for every account on a first deployment — and the
+            # lifespan wiring reports nothing either. Neither the serve gate nor
+            # ``_assert_security_notice_is_deliverable`` covers that on a non-PHI instance, so
+            # without this line the whole channel would be undetectably absent rather than merely
+            # unconfigured.
+            #
+            # Per occurrence rather than once per process, matching the sibling and the two drops it
+            # matched in turn: each line is a distinct notice nobody received, and collapsing them
+            # would hide the count — which is the figure that separates a missing relay from a quiet
+            # instance.
+            #
+            # **Never ``detail``** — an EMAIL_CHANGED carries the new address in it.
+            #
+            # NOT when the operator turned notices off: ``[auth].notify_security_events = false`` is a
+            # documented choice, and the lifespan wires no notifier for it, so a warning per event
+            # there would report the setting working as a fault.
+            if not self._settings.notify_security_events:
+                return
+            _log.warning(
+                "security notice %s for %s dropped: no security-event notifier is configured, so "
+                "the account was not told out of band (the /me/security-events feed still records "
+                "it)",
+                event_type,
+                username,
+            )
             return
         try:
             await self._security_notifier.notify(

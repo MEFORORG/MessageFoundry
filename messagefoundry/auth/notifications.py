@@ -48,6 +48,18 @@ MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on 
 MFA_DISABLED = (
     "mfa_disabled"  # 6.3.7 — the account's second factor was removed (self-service or admin reset)
 )
+# 6.3.7 -- ONE enrolled second factor was removed while AT LEAST ONE OTHER REMAINS, so the account
+# still has MFA. Distinct from MFA_DISABLED rather than a flag on it (BACKLOG #1139): MFA_DISABLED
+# asserts the account no longer has a second factor, and saying that while another one stands is a
+# false statement in a security notice. Emitted by the passkey path today; the TOTP self-disable
+# still sends MFA_DISABLED even where a passkey remains, which is the same asymmetry on the other
+# credential and is not fixed here.
+MFA_CREDENTIAL_REMOVED = "mfa_credential_removed"
+# 6.3.7 -- the account had no notification address and its holder set one, which is the only way out
+# of the first-sign-in confinement (BACKLOG #1139). Sent to the address just set: the account had no
+# earlier one, so there is nobody else to tell, and a send that fails shows up in the log now rather
+# than at the next real notice.
+NOTIFY_EMAIL_SET = "notify_email_set"
 # 6.3.7 — a single-use recovery code was spent, which permanently deletes that stored credential.
 RECOVERY_CODE_USED = "recovery_code_used"  # nosec B105 — event-type label, not a credential
 ADMIN_NEW_IP = (

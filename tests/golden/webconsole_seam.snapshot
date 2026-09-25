@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-9b4c5f387c70bbc6
+01894d979d8f66d9
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -127,6 +127,7 @@ complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client
 confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'Elevation'
 delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'str', *, client: 'str | None' = None) -> 'bool'
 factor_binding_is_blocked: (self, token: 'str | None', action: 'str') -> 'bool'
+fill_own_notify_email: (self, identity: 'Identity', email: 'str', *, client: 'str | None' = None) -> 'bool'
 finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
 finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
 flag_new_client_ip: (self, token: 'str | None', client_ip: 'str | None', *, path: 'str') -> 'bool'
@@ -171,6 +172,7 @@ messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, u
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
 messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
 messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
+messagefoundry.api.auth_models.NotifyEmailRequest: email
 messagefoundry.api.auth_models.PasswordChangeRequest: current_password, new_password
 messagefoundry.api.auth_models.PasswordResetResponse: expires_at, must_change_password, temp_password
 messagefoundry.api.auth_models.RoleInfo: builtin, description, display_name, id, permissions

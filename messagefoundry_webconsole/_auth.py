@@ -204,6 +204,9 @@ _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
 CLEAR_SITE_DATA_HEADER = "Clear-Site-Data"
 CLEAR_SITE_DATA_VALUE = '"cache"'
 
+#: Where ``require_ui`` sends a session that owes a notification address (BACKLOG #1139).
+NOTIFY_ADDRESS_PAGE = "/ui/account/notify-address"
+
 
 def _login_redirect(note: str = "") -> HTTPException:
     """A 303 redirect (as an exception, to short-circuit a dependency) to the /ui login page.
@@ -280,6 +283,7 @@ def require_ui(
     phi: bool = False,
     allow_must_change: bool = False,
     allow_mfa_pending: bool = False,
+    allow_missing_notify_email: bool = False,
     activity: bool = True,
     mfa_refusal: Callable[[Request], HTTPException] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
@@ -304,6 +308,12 @@ def require_ui(
     /ui route — ``allow_must_change=True`` is set ONLY by that page's own GET/POST (so the rotation
     can actually happen; anything else would loop). While it still owes a factor it has enrolled,
     it goes to ``/ui/mfa`` instead (``must_change_target``, BACKLOG #1954).
+
+    An account with no notification address, on an instance that sends security notices, is 303'd
+    to ``/ui/account/notify-address`` (BACKLOG #1139, ``Identity.must_set_notify_email``). Only that
+    page passes ``allow_missing_notify_email=True``. A route that passes ``allow_mfa_pending`` is
+    exempt as well: those are the enrolment, confinement and account pages, the ways out of the two
+    gates that run first.
 
     ``activity=False`` (ASVS 14.3.1) validates the session WITHOUT refreshing its idle clock — the
     same contract the engine's /ws/stats keepalive uses. Set it on the console's **timer-driven
@@ -353,6 +363,17 @@ def require_ui(
             # surfaces instead of dropping the record.
             await auth.audit_mfa_denied(identity, request.url.path)
             raise _mfa_redirect() if mfa_refusal is None else mfa_refusal(request)
+        # BACKLOG #1139 (ASVS 6.3.7), the cookie mirror of the JSON gate: below the factor gate, so a
+        # password-only cookie proves its factor before it chooses where notices go, and above the
+        # permission loop for the same oracle reason.
+        if (
+            identity.must_set_notify_email
+            and not allow_missing_notify_email
+            and not allow_mfa_pending
+        ):
+            raise HTTPException(
+                status.HTTP_303_SEE_OTHER, headers={"Location": NOTIFY_ADDRESS_PAGE}
+            )
         for permission in permissions:
             if not identity.has(permission):
                 await auth.audit_permission_denied(identity, permission, request.url.path)
@@ -915,6 +936,10 @@ async def authorize_ui_ws(
         # Same shape as ``require_ui`` above and ``api/security.py``: the PATH, never the full URL,
         # because the query string is where an operator's search terms live.
         await auth.audit_mfa_denied(identity, websocket.url.path)
+        return None, None
+    # BACKLOG #1139: an account that owes a notification address does not stream. BELOW the factor
+    # check, as in ``require_ui``, so a password-only probe still leaves its ``auth.mfa_denied`` row.
+    if identity.must_set_notify_email:
         return None, None
     for permission in permissions:
         if not identity.has(permission):

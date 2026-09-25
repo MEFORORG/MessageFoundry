@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.auth_models import (
+    NotifyEmailRequest,
     PasswordChangeRequest,
 )
 from messagefoundry.api.security import pending_credential_deadline_for
@@ -25,6 +26,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_WEBAUTHN_DELETE,
     STEP_UP_ACTION_WEBAUTHN_ENROLL,
     AuthService,
+    NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
 
@@ -277,6 +279,48 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         resp = RedirectResponse("/ui/login?e=pwchanged", status_code=303)
         clear_session_cookie(resp, request)
         return resp
+
+    @app.get("/ui/account/notify-address", response_class=HTMLResponse)
+    async def ui_notify_address_form(
+        identity: Identity = Depends(require_ui(allow_missing_notify_email=True)),
+    ) -> Response:
+        """BACKLOG #1139 (ASVS 6.3.7): the page ``require_ui`` confines an addressless account to.
+
+        Under the factor gate on purpose (no ``allow_mfa_pending``): a cookie that has proven only
+        the password must not choose where the account's security notices go."""
+        if not identity.must_set_notify_email:
+            return RedirectResponse("/ui/account", status_code=303)
+        return HTMLResponse(pages.notify_address_page())
+
+    @app.post("/ui/account/notify-address")
+    async def ui_notify_address(
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_ui(allow_missing_notify_email=True)),
+    ) -> Response:
+        assert_same_origin(request)
+        form = dict(await _form_pairs(request))
+        try:
+            # The JSON route's own request model, so both planes refuse the same inputs.
+            body = NotifyEmailRequest(email=form.get("email", ""))
+        except ValidationError:
+            return HTMLResponse(
+                pages.notify_address_page(error="that address is too long"), status_code=400
+            )
+        try:
+            await service.fill_own_notify_email(identity, body.email, client=_client(request))
+        except NotifyEmailAlreadySet as exc:
+            # Say so rather than redirect: a second tab that submitted a different address must not
+            # read a quiet redirect as its address having been saved.
+            return HTMLResponse(pages.notify_address_page(error=str(exc)), status_code=409)
+        except ValueError:
+            return HTMLResponse(
+                pages.notify_address_page(
+                    error="enter one email address, such as name@example.org"
+                ),
+                status_code=400,
+            )
+        return RedirectResponse("/ui", status_code=303)
 
     @app.post("/ui/account/mfa/enroll")
     async def ui_mfa_enroll(

@@ -33,6 +33,7 @@ __all__ = [
     "mfa_enroll_page",
     "mfa_gate",
     "mfa_recovery_page",
+    "notify_address_page",
     "password_page",
     "reauth",
     "reauth_continue",
@@ -715,6 +716,43 @@ def password_page(
         el("p", el("a", "← My account", href="/ui/account")),
         active="account",
     )
+
+
+def notify_address_page(*, error: str | None = None) -> Markup:
+    """The first-sign-in page that sets a missing notification address (BACKLOG #1139, ASVS 6.3.7).
+
+    The account is confined here, as the forced password page confines, because it has no address
+    for security notices while this instance sends them. So it drops the nav for ``minimal_nav``,
+    which keeps Sign out. It only fills a missing address; an administrator changes one later.
+    """
+    banner = el("p", error, class_="banner") if error else Markup("")
+    intro = el(
+        "p",
+        "Security notices about your account, such as a password change, are sent by email. "
+        "Your account has no address for them yet. Set one before you continue.",
+        class_="muted",
+    )
+    form = el(
+        "form",
+        el(
+            "label",
+            "Email address",
+            el(
+                "input",
+                name="email",
+                type="email",
+                autocomplete="email",
+                required=True,
+                autofocus=True,
+            ),
+        ),
+        el("button", "Save address", type="submit"),
+        method="post",
+        action="/ui/account/notify-address",
+        class_="login",
+    )
+    body = el("div", el("h1", "Set your notification address"), intro, banner, form, class_="card")
+    return page("Notification address", body, nav=minimal_nav())
 
 
 def mfa_enroll_page(secret: str, otpauth_uri: str) -> Markup:
