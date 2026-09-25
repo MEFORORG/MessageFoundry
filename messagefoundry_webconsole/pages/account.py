@@ -718,12 +718,23 @@ def password_page(
     )
 
 
-def notify_address_page(*, error: str | None = None) -> Markup:
+def notify_address_page(
+    *,
+    error: str | None = None,
+    suggested: str | None = None,
+    from_directory: bool = False,
+) -> Markup:
     """The first-sign-in page that sets a missing notification address (BACKLOG #1139, ASVS 6.3.7).
 
     The account is confined here, as the forced password page confines, because it has no address
     for security notices while this instance sends them. So it drops the nav for ``minimal_nav``,
     which keeps Sign out. It only fills a missing address; an administrator changes one later.
+
+    ``suggested`` is the account's profile ``email`` (slice 2), shown as the input's starting value.
+    It is only a suggestion: nothing is written until the holder submits the form. The line under the
+    input says where it came from, so the holder checks it rather than clicking through.
+    ``from_directory`` picks the wording, since only a directory account's profile address is the
+    directory's ``mail``.
     """
     banner = el("p", error, class_="banner") if error else Markup("")
     intro = el(
@@ -732,6 +743,14 @@ def notify_address_page(*, error: str | None = None) -> Markup:
         "Your account has no address for them yet. Set one before you continue.",
         class_="muted",
     )
+    hint = Markup("")
+    if suggested:
+        source = "your directory record" if from_directory else "your account record"
+        hint = el(
+            "p",
+            f"Suggested from {source}. Change it if it is not yours.",
+            class_="muted",
+        )
     form = el(
         "form",
         el(
@@ -742,10 +761,13 @@ def notify_address_page(*, error: str | None = None) -> Markup:
                 name="email",
                 type="email",
                 autocomplete="email",
+                # el() escapes attribute values, so a stored address cannot break out of value="".
+                value=suggested or None,
                 required=True,
                 autofocus=True,
             ),
         ),
+        hint,
         el("button", "Save address", type="submit"),
         method="post",
         action="/ui/account/notify-address",

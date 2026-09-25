@@ -16,7 +16,7 @@ from messagefoundry.api.auth_models import (
     PasswordChangeRequest,
 )
 from messagefoundry.api.security import pending_credential_deadline_for
-from messagefoundry.auth import Identity
+from messagefoundry.auth import AuthProvider, Identity
 from messagefoundry.auth import webauthn as webauthn_mod
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_CONFIRM,
@@ -282,15 +282,29 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.get("/ui/account/notify-address", response_class=HTMLResponse)
     async def ui_notify_address_form(
+        # identity BEFORE service, as on the password form: require_ui's redirects answer first.
         identity: Identity = Depends(require_ui(allow_missing_notify_email=True)),
+        service: AuthService = Depends(_service),
     ) -> Response:
         """BACKLOG #1139 (ASVS 6.3.7): the page ``require_ui`` confines an addressless account to.
 
         Under the factor gate on purpose (no ``allow_mfa_pending``): a cookie that has proven only
-        the password must not choose where the account's security notices go."""
+        the password must not choose where the account's security notices go.
+
+        Slice 2: the form starts filled with the account's profile ``email`` where it has one. On a
+        directory account that is the directory's ``mail``. THIS GET WRITES NOTHING. The address
+        reaches ``notify_email`` only when the holder submits it, through the POST below and
+        ``fill_own_notify_email``, so nobody who can write ``mail`` sets the target silently."""
         if not identity.must_set_notify_email:
             return RedirectResponse("/ui/account", status_code=303)
-        return HTMLResponse(pages.notify_address_page())
+        user = await service.store.get_user(identity.user_id)
+        suggested = ((user.email if user is not None else None) or "").strip() or None
+        return HTMLResponse(
+            pages.notify_address_page(
+                suggested=suggested,
+                from_directory=identity.auth_provider is AuthProvider.AD,
+            )
+        )
 
     @app.post("/ui/account/notify-address")
     async def ui_notify_address(

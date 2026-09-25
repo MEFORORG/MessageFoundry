@@ -138,6 +138,105 @@ async def test_a_second_address_is_refused_out_loud(engine: Engine) -> None:
     assert user is not None and user.notify_email == ADDRESS
 
 
+# --- slice 2: the form suggests the profile address, and only a submit writes it -------------------
+
+DIRECTORY_ADDRESS = "holder@example.org"
+SUGGESTED_LINE = "Change it if it is not yours."
+
+
+async def _set_count(engine: Engine) -> int:
+    return len(
+        [a for a in await engine.store.list_audit() if a["action"] == "auth.notify_email_set"]
+    )
+
+
+async def test_the_form_suggests_the_profile_address_and_a_get_writes_nothing(
+    engine: Engine,
+) -> None:
+    """The profile ``email`` starts in the input. The GET alone sets nothing, audits nothing and sends
+    no notice; submitting the suggested value then fills ``notify_email`` through the existing POST."""
+    notifier = _FakeNotifier()
+    service = await _service(engine, notifier=notifier)
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    # The directory-sync write: it names ``email`` and never ``notify_email``.
+    await engine.store.update_user_profile(user_id, display_name=None, email=DIRECTORY_ADDRESS)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        page = await c.get(PAGE)
+        assert page.status_code == 200
+        assert f'value="{DIRECTORY_ADDRESS}"' in page.text
+        assert "Suggested from your account record." in page.text
+        assert SUGGESTED_LINE in page.text
+
+        user = await engine.store.get_user(user_id)
+        assert user is not None and user.notify_email is None
+        assert await _set_count(engine) == 0
+        assert notifier.events == []
+        # Still confined: showing the suggestion released nothing.
+        r = await c.get("/ui")
+        assert r.status_code == 303 and r.headers["location"] == PAGE
+
+        done = await c.post(PAGE, data={"email": DIRECTORY_ADDRESS}, headers=SAME_ORIGIN)
+        assert done.status_code == 303 and done.headers["location"] == "/ui"
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.notify_email == DIRECTORY_ADDRESS
+    assert await _set_count(engine) == 1
+    assert [e.email for e in notifier.events if e.event_type == NOTIFY_EMAIL_SET] == [
+        DIRECTORY_ADDRESS
+    ]
+
+
+async def test_the_form_is_empty_when_the_account_has_no_address(engine: Engine) -> None:
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.email is None and user.notify_email is None
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        page = await c.get(PAGE)
+    assert page.status_code == 200
+    assert 'name="email"' in page.text
+    assert "value=" not in page.text.split('name="email"', 1)[1].split(">", 1)[0]
+    assert SUGGESTED_LINE not in page.text
+
+
+async def test_a_blank_profile_address_is_not_suggested(engine: Engine) -> None:
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    await engine.store.update_user_profile(user_id, display_name=None, email="   ")
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        page = await c.get(PAGE)
+    assert page.status_code == 200
+    assert SUGGESTED_LINE not in page.text
+
+
+async def test_a_suggested_address_is_escaped(engine: Engine) -> None:
+    """A directory writes ``mail``, so the value is not ours to trust inside an attribute."""
+    hostile = 'x"><script>alert(1)</script>&y@example.org'
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    await engine.store.update_user_profile(user_id, display_name=None, email=hostile)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        page = await c.get(PAGE)
+    assert page.status_code == 200
+    assert 'value="x&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&amp;y@example.org"' in page.text
+    assert "<script>alert(1)" not in page.text
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.notify_email is None
+
+
+def test_the_hint_names_the_directory_for_a_directory_account() -> None:
+    from messagefoundry_webconsole import pages
+
+    directory = pages.notify_address_page(suggested=DIRECTORY_ADDRESS, from_directory=True)
+    assert "Suggested from your directory record. Change it if it is not yours." in directory
+    local = pages.notify_address_page(suggested=DIRECTORY_ADDRESS, from_directory=False)
+    assert "Suggested from your account record. Change it if it is not yours." in local
+    assert SUGGESTED_LINE not in pages.notify_address_page(from_directory=True)
+
+
 class _FakeWS:
     """A same-origin browser handshake carrying the session cookie, for ``authorize_ui_ws``."""
 
