@@ -145,9 +145,12 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     ``cadata=`` takes ASCII text only, while ``cafile=`` reads a file with any bytes between its PEM
     blocks. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a ``cafile`` with a UTF-8 comment above the
     block (a PKCS#12 export's ``friendlyName``) or a UTF-8 byte-order mark loads, and the same bytes
-    as ``cadata`` raise. So this drops a byte-order mark at the start of ANY line, since two
-    concatenated files put one before the second block, and every non-ASCII line OUTSIDE a block.
-    OpenSSL skips those lines anyway, so the certificates loaded are the same.
+    as ``cadata`` raise. So this drops every non-ASCII line OUTSIDE a block, which OpenSSL skips
+    anyway, and a byte-order mark exactly where ``cafile=`` drops one: on the first line of the
+    file, and on the line straight after an ``-----END`` line. Measured, a mark there loads the
+    block behind it (two concatenated files), and a mark after a blank or comment line hides the
+    block from ``cafile=``. Stripping it anywhere else would trust a certificate ``cafile=`` never
+    loaded. ``tests/test_trust_anchor_byte_binding.py`` holds the shapes against ``cafile=``.
 
     Every line from ``-----BEGIN`` to ``-----END`` is kept exactly. A non-ASCII byte there refuses,
     as ``cafile=`` refuses it (``PEM lib``). The text is derived from ``data`` alone and nothing here
@@ -165,8 +168,10 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     kept: list[bytes] = []
     inside = False
     blocks = 0
+    fresh = True  # the first line, or the line after an END line: where OpenSSL drops a BOM
     for raw in data.splitlines(keepends=True):
-        line = raw[len(_UTF8_BOM) :] if not inside and raw.startswith(_UTF8_BOM) else raw
+        line = raw[len(_UTF8_BOM) :] if fresh and raw.startswith(_UTF8_BOM) else raw
+        fresh = False
         if line.startswith(_PEM_TRUSTED):
             raise TrustAnchorError(
                 f"{spec.setting}: the trust anchor '{spec.path}' holds a TRUSTED CERTIFICATE block, "
@@ -181,6 +186,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             kept.append(line)
         if line.startswith(_PEM_END):
             inside = False
+            fresh = True
     if not blocks:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor '{spec.path}' holds no PEM block, so it names no "

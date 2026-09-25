@@ -111,9 +111,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   swapped between the two reads was trusted unchecked, under a pin that had matched. Both now load
   the checked bytes as `cadata=`. Measured on Windows, CPython 3.14.6 with OpenSSL 3.5.7, over a
   localhost socket: for a valid PEM, `cadata=` and `cafile=` verify the same CA, refuse the same
-  wrong one, and each load exactly one anchor, on the client side and the server side. A UTF-8
-  byte-order mark, at the start of the file or of a later block, and non-ASCII text outside the
-  PEM blocks still load. **At least these anchors loaded under 0.4.0 and now refuse or change:**
+  wrong one, and each load exactly one anchor, on the client side and the server side. Non-ASCII
+  text outside the PEM blocks still loads, and a UTF-8 byte-order mark still loads where OpenSSL
+  reads one: at the start of the file, and straight after a block. **At least these anchors loaded under 0.4.0 and now refuse or change:**
   - an anchor holding a `TRUSTED CERTIFICATE` block, as `openssl x509 -trustout` writes, refuses at
     startup. Re-export each certificate in it as a plain `CERTIFICATE` block. `openssl x509 -in
     <one cert> -out <plain.pem>` converts one certificate per run;

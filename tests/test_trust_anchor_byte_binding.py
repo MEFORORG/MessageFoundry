@@ -401,19 +401,47 @@ def test_text_that_cafile_reads_also_loads_as_cadata(
     assert _subjects(by_data) == ["good-ca"]
 
 
-def test_two_concatenated_files_each_with_a_byte_order_mark_load_both_certificates(
-    tmp_path: Path, cas: tuple[_Ca, _Ca]
+_BOM = b"\xef\xbb\xbf"
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        pytest.param(lambda a, b: _BOM + a, ["good-ca"], id="mark at file start"),
+        pytest.param(
+            lambda a, b: _BOM + a + _BOM + b, ["evil-ca", "good-ca"], id="mark after END (copy a+b)"
+        ),
+        pytest.param(lambda a, b: a + _BOM + b"x\n" + b, ["evil-ca", "good-ca"], id="mark on text"),
+        pytest.param(lambda a, b: a + b"\n" + _BOM + b, ["good-ca"], id="mark after blank line"),
+        pytest.param(lambda a, b: a + b"x\n" + _BOM + b, ["good-ca"], id="mark after comment"),
+        pytest.param(lambda a, b: b"\n" + _BOM + a, None, id="blank line, then mark"),
+        pytest.param(lambda a, b: b"hello\n" + _BOM + a, None, id="comment, then mark"),
+    ],
+)
+def test_a_byte_order_mark_hides_or_shows_exactly_the_blocks_cafile_does(
+    shape: Callable[[bytes, bytes], bytes],
+    expected: list[str] | None,
+    tmp_path: Path,
+    cas: tuple[_Ca, _Ca],
 ) -> None:
-    """``copy a.pem+b.pem`` puts the second file's byte-order mark in front of its BEGIN line.
-    ``cafile=`` loads both certificates, so the conversion must not drop the second."""
+    """OpenSSL drops a byte-order mark only on the first line and on the line after an END line;
+    elsewhere the mark hides the block behind it. Stripping it anywhere would trust a certificate
+    ``cafile=`` never loaded, which is how round two of this slice's QA found it. Each case is held
+    against ``cafile=`` itself, so the expectation is OpenSSL's, not this module's."""
     good, evil = cas
-    data = b"\xef\xbb\xbf" + good.pem + b"\xef\xbb\xbf" + evil.pem
+    data = shape(good.pem, evil.pem)
     anchor = tmp_path / "bundle.pem"
     anchor.write_bytes(data)
+    if expected is None:
+        with pytest.raises(ssl.SSLError):
+            ssl.create_default_context(cafile=str(anchor))
+        with pytest.raises(TrustAnchorError, match="holds no PEM block"):
+            anchor_cadata(data, _SPEC)
+        return
     by_file = ssl.create_default_context(cafile=str(anchor))
     by_data = ssl.create_default_context(cadata=anchor_cadata(data, _SPEC))
-    assert sorted(_subjects(by_file)) == ["evil-ca", "good-ca"]  # the control: cafile= reads both
-    assert by_data.get_ca_certs() == by_file.get_ca_certs()
+    assert sorted(_subjects(by_file)) == expected
+    assert sorted(_subjects(by_data)) == expected
 
 
 @pytest.mark.parametrize(
