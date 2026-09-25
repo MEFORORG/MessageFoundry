@@ -273,6 +273,33 @@ All notable changes to MessageFoundry are documented here. The format follows
   offers no Link form on a local account or when `[auth].oidc_issuer` is unset, and shows the engine's refusals in words. The engine gains the `AuthService.oidc_issuer`
   property and a `FederatedIdentityView` model the console renders; no JSON route returns it, and
   `GET /users` is unchanged. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184 slice B)
+- **BREAKING: a federated (OIDC) identity now links only to a directory account that carries its
+  immutable directory id.** `PUT /users/{user_id}/federated-identity` and the console's Link refuse
+  an account with no `directory_object_id`, the normalised `objectGUID` a Windows SSO sign-in
+  writes when it creates the account. The API answers `400` with a detail that starts
+  `directory_object_id_missing:`. The console's federated-identity screen offers no Link form on
+  such an account and says why, and a hand-made POST gets the same words. The refusal writes an
+  `auth.federated_bind_refused` audit row naming the administrator. It links nothing, signs nobody
+  out and sends no notice. `FederatedIdentityView` gains `has_directory_object_id`, so the web
+  console seam moved.
+  - **Why.** The engine finds an account with no id by its username, at sign-in and on each
+    directory recheck. A directory can give a freed username to a new person, and a linked
+    account would then take that person's groups. Now every new link sits on an account the engine
+    finds by its `objectGUID` (ADR 0184 AC-5).
+  - **Which accounts now refuse.** A directory account created by a Windows SSO sign-in through a
+    directory that returned no readable `objectGUID`. Before this change it could be linked.
+  - **The cost.** A site whose directory returns no readable `objectGUID` can link nobody, so
+    nobody there can sign in through the identity provider. Directory sign-in still works there.
+  - **An account never gains an id after it is created.** To link one, make the directory return
+    `objectGUID`, turn Windows SSO on if it is off, delete the account, and have the person sign in
+    once with Windows SSO. Nothing else creates a directory account. The new account has a new
+    `user_id`, so the old one's uploads, upload quota and saved searches do not follow.
+  - **A link made before this change on such an account is left in place.** This change adds no
+    sign-in refusal for it, and it can still be removed. It cannot be moved to another `sub`. On a
+    directory that now returns `objectGUID`, its sign-in is already refused as
+    `directory_identity_conflict`, as it was before this change.
+
+  Federation still ships off. (`BACKLOG #1143`, slice C, ADR 0184)
 - **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
   `PATCH /users/{id}` copied any non-blank `email` into `users.notify_email`, and sent no notice
   unless the profile email changed. The route fills an omitted `email` from the stored profile, and

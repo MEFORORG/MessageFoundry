@@ -40,7 +40,15 @@ async def _audit(store: Any, action: str) -> list[Any]:
 async def _assert_federated_binding_service_contract(store: Any) -> None:
     service = AuthService(store, AuthSettings(require_mfa=False, oidc_issuer=ISSUER))
     for uid in ("bind-a", "bind-b", "bind-c"):
-        await store.create_user(user_id=uid, username=uid, auth_provider="ad", now=1_000.0)
+        # Each carries its immutable directory id: a row without one cannot take a binding
+        # (BACKLOG #1143 slice C).
+        await store.create_user(
+            user_id=uid,
+            username=uid,
+            auth_provider="ad",
+            directory_object_id=f"guid-{uid}",
+            now=1_000.0,
+        )
     await store.create_session(
         token_hash="t-bind-a", user_id="bind-a", expires_at=_EXPIRES, now=1_000.0
     )

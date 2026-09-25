@@ -6421,6 +6421,8 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
         email="j@x",
         dn="CN=jdoe,DC=x",
         groups=frozenset({"cn=mf-admins,dc=x"}),
+        # BACKLOG #1143 slice C: a bindable row carries the directory's objectGUID.
+        directory_object_id="guid-jdoe",
     )
 
     class _FakeLdap:
@@ -6614,7 +6616,9 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
     # BACKLOG #1143 (ADR 0184): a federated login selects its account by the (issuer, sub) pair and
     # never binds, so the account is bound through the admin path first.
-    await engine.store.create_user(user_id="f" * 32, username="jdoe", auth_provider="ad")
+    await engine.store.create_user(
+        user_id="f" * 32, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+    )
     await service.bind_federated_subject("f" * 32, "S-1-5-21-fed", actor="admin")
 
     async with _oidc_client(engine, service) as c:

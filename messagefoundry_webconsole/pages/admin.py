@@ -426,6 +426,16 @@ def _link_form(view: FederatedIdentityView, subject: str) -> Markup:
             "Linking needs [auth].oidc_issuer, and it is not set on this engine.",
             class_="muted",
         )
+    if not view.has_directory_object_id:
+        # BACKLOG #1143 slice C: the engine refuses this bind, so the form would only spend a
+        # single-use re-authentication on a certain refusal.
+        return el(
+            "p",
+            "This account cannot be linked. It has no immutable directory id (objectGUID), and it "
+            "never gains one. Only a Windows SSO sign-in through a directory that returns "
+            "objectGUID creates an account with one.",
+            class_="muted",
+        )
     return el(
         "form",
         *_shown_fields(view),
@@ -477,8 +487,8 @@ def federated_identity_page(
     An ``unlock`` page tagged ``admin_federated_identity``: a re-auth aimed here mints the single-use
     grant the link POST consumes. The forms offered follow the service's refusals, so an operator is
     not handed a button that can only fail: none on their own account, and no link form on a local
-    account or with no issuer set. The POSTs still refuse all three, because the gate is the
-    handler's, not this page's.
+    account, with no issuer set, or on an account with no directory id (BACKLOG #1143 slice C). The
+    POSTs still refuse all four, because the gate is the handler's, not this page's.
     """
     base = f"/ui/users/{_seg(view.user_id)}/federated-identity"
     message = _FEDERATED_NOTICES.get(notice)

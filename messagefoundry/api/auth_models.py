@@ -109,6 +109,9 @@ class FederatedIdentityView(BaseModel):
     ``issuer`` and ``subject`` are the stored pair; either one set counts as linked, as it does in
     :meth:`AuthService.unbind_federated_subject`. ``bind_issuer`` is the issuer a bind would use,
     ``[auth].oidc_issuer``, or ``None`` when it is unset and every bind is refused.
+    ``has_directory_object_id`` says whether the account carries its immutable directory id; a bind
+    is refused without one (BACKLOG #1143 slice C). A flag rather than the id, which the screen has
+    no use for.
     """
 
     user_id: str
@@ -117,6 +120,7 @@ class FederatedIdentityView(BaseModel):
     issuer: str | None = None
     subject: str | None = None
     bind_issuer: str | None = None
+    has_directory_object_id: bool = False
 
     @property
     def linked(self) -> bool:

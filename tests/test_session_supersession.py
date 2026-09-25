@@ -39,6 +39,9 @@ _PRINCIPAL = AdPrincipal(
     email="j@x",
     dn="CN=jdoe,DC=x",
     groups=frozenset({"cn=mf-ops,dc=x"}),
+    # BACKLOG #1143 slice C: a bindable row carries the directory's objectGUID, so the directory
+    # answers with it too, and the mirror row the sign-in creates carries the same value.
+    directory_object_id="guid-jdoe",
 )
 
 
@@ -276,7 +279,9 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
     # never binds, so the account is bound through the admin path first. The refused case presents a
     # subject nobody bound, which is what makes it fail since the claimed name no longer selects.
     jdoe_id = uuid4().hex
-    await store.create_user(user_id=jdoe_id, username="jdoe", auth_provider="ad")
+    await store.create_user(
+        user_id=jdoe_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+    )
     await service.bind_federated_subject(jdoe_id, "S-1-5-21-fed", actor="admin")
     prior = await _token(service)
 

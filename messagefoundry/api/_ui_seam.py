@@ -216,12 +216,17 @@ from typing import Any
 #: login itself. ``GET /ui/sso`` passed ``seed_reauth=False``, so a console that still passes it
 #: gets a ``TypeError`` on every SSO sign-in. A signature the console calls, so it forces a bump.
 #:
+#: BACKLOG #1143 slice C (ADR 0184 AC-5): ``FederatedIdentityView`` gained
+#: ``has_directory_object_id``. The engine now refuses a bind on an account with no immutable
+#: directory id, and the federated-identity screen reads the flag to offer no Link form there. A
+#: field the console renders, so it forces a bump.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "500b98c2d593db80"
+ENGINE_UI_SEAM: str = "4ce97d69013927db"
 
 
 @dataclass(frozen=True, slots=True)

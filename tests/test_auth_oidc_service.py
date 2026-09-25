@@ -142,7 +142,19 @@ PRINCIPAL = AdPrincipal(
     email="j@corp.example",
     dn="CN=jdoe,DC=corp,DC=example",
     groups=frozenset({"cn=mf-ops,dc=corp,dc=example"}),
+    # A directory that returns objectGUID, as a bindable site's must (BACKLOG #1143 slice C). The
+    # value is the one ``_oid`` gives the mirror row this principal's sign-in would create.
+    directory_object_id="guid-jdoe",
 )
+
+
+def _oid(username: str) -> str:
+    """The ``directory_object_id`` a Windows SSO sign-in writes onto ``username``'s mirror row.
+
+    Every principal in this suite carries the same shape, so a row created here and the principal
+    the fake directory answers with agree, as they do on a directory that returns objectGUID. A row
+    with no id cannot take a binding (BACKLOG #1143 slice C)."""
+    return f"guid-{username}"
 
 
 class _FakeLdap:
@@ -167,7 +179,9 @@ class _FakeLdap:
         self, username: str, *, object_id: str | None = None
     ) -> AdPrincipal | None:
         # ``object_id`` is accepted because the federated path hands over the bound row's id, as the
-        # reconciler does (ADR 0184 part 2). None of these rows carries one, so it selects nothing.
+        # reconciler does (ADR 0184 part 2). Every bound row carries one since BACKLOG #1143 slice C,
+        # but the fake still answers by name: the tests here steer the answer through
+        # ``by_username``, and ``_IdRecordingLdap`` below pins that the id is handed over.
         self.resolved.append(username)
         if self._by_username is not None:
             return self._by_username.get(username, self._principal)
@@ -223,7 +237,12 @@ async def _bind(
     user = await store.get_user_by_username(username)
     if user is None:
         user_id = uuid4().hex
-        await store.create_user(user_id=user_id, username=username, auth_provider="ad")
+        await store.create_user(
+            user_id=user_id,
+            username=username,
+            auth_provider="ad",
+            directory_object_id=_oid(username),
+        )
     else:
         user_id = user.id
     await service.bind_federated_subject(user_id, subject, actor="admin")
@@ -412,6 +431,7 @@ OTHER = AdPrincipal(
     email="bsmith@corp.example",
     dn="CN=bsmith,DC=corp,DC=example",
     groups=frozenset({"cn=mf-admins,dc=corp,dc=example"}),
+    directory_object_id="guid-bsmith",
 )
 
 
@@ -749,7 +769,12 @@ async def test_one_subject_cannot_be_bound_to_two_accounts(
     try:
         service = await _service(store, rsa_key, bind="S-1-alice")
         other_id = uuid4().hex
-        await store.create_user(user_id=other_id, username="bsmith", auth_provider="ad")
+        await store.create_user(
+            user_id=other_id,
+            username="bsmith",
+            auth_provider="ad",
+            directory_object_id=_oid("bsmith"),
+        )
 
         with pytest.raises(FederatedSubjectHeld):
             await service.bind_federated_subject(other_id, "S-1-alice", actor="admin")
@@ -776,7 +801,12 @@ async def test_a_directory_answer_leading_to_another_row_is_refused_before_roles
         ldap = _FakeLdap(by_username={"jdoe": OTHER})
         service = await _service(store, rsa_key, ldap=ldap, bind="S-1-alice")
         other_id = uuid4().hex
-        await store.create_user(user_id=other_id, username="bsmith", auth_provider="ad")
+        await store.create_user(
+            user_id=other_id,
+            username="bsmith",
+            auth_provider="ad",
+            directory_object_id=_oid("bsmith"),
+        )
 
         out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
 

@@ -52,10 +52,17 @@ async def _service(engine: Engine, **over: object) -> AuthService:
     return service
 
 
-async def _ad_account(engine: Engine, username: str = "jdoe") -> str:
-    """A directory mirror row, as a Kerberos sign-in leaves it: unbound."""
+async def _ad_account(engine: Engine, username: str = "jdoe", *, object_id: bool = True) -> str:
+    """A directory mirror row, as a Kerberos sign-in through a directory returning objectGUID
+    leaves it: unbound, and carrying its immutable id (BACKLOG #1143 slice C). ``object_id=False``
+    is the row a directory with no readable objectGUID leaves, which cannot take a binding."""
     user_id = uuid4().hex
-    await engine.store.create_user(user_id=user_id, username=username, auth_provider="ad")
+    await engine.store.create_user(
+        user_id=user_id,
+        username=username,
+        auth_provider="ad",
+        directory_object_id=f"guid-{username}" if object_id else None,
+    )
     return user_id
 
 
@@ -137,6 +144,26 @@ async def test_a_local_account_is_offered_no_link_form(
     assert page.status_code == 200
     assert "Only a directory (AD) account can be linked. This is a local account." in page.text
     assert f'action="{_screen(local)}/link"' not in page.text
+
+
+async def test_an_account_with_no_directory_id_is_offered_no_link_form(
+    engine: Engine, boss: tuple[httpx.AsyncClient, AuthService]
+) -> None:
+    """BACKLOG #1143 slice C. The engine refuses the bind, so the form would spend a single-use
+    re-authentication on a certain refusal. THE CONTROL is the same page for an account that
+    carries an id, which offers the form. The POST still refuses in words, pinned in
+    ``test_each_link_refusal_is_shown_in_words_and_writes_nothing``."""
+    c, _service = boss
+    no_id = await _ad_account(engine, object_id=False)
+    page = await c.get(_screen(no_id))
+    assert page.status_code == 200
+    assert "This account cannot be linked. It has no immutable directory id" in page.text
+    assert f'action="{_screen(no_id)}/link"' not in page.text
+
+    with_id = await _ad_account(engine, "bsmith")
+    control = await c.get(_screen(with_id))
+    assert f'action="{_screen(with_id)}/link"' in control.text
+    assert "This account cannot be linked" not in control.text
 
 
 async def test_no_issuer_means_no_link_form_and_the_post_is_refused_in_words(
@@ -395,6 +422,13 @@ async def test_an_admin_cannot_change_their_own_link(
         ("too long", "S" * 256, 400, "1 to 255 characters"),
         ("same pair", "S-1-mine", 400, "already holds that identity"),
         ("local", "S-1-a", 400, "only a directory (AD) account"),
+        # BACKLOG #1143 slice C: the engine's refusal reaches the page through the same mapping.
+        (
+            "no object id",
+            "S-1-a",
+            400,
+            "directory_object_id_missing: this account has no immutable",
+        ),
     ],
 )
 async def test_each_link_refusal_is_shown_in_words_and_writes_nothing(
@@ -408,6 +442,8 @@ async def test_each_link_refusal_is_shown_in_words_and_writes_nothing(
     c, service = boss
     if case == "local":
         target = await provision(service, "loc", [Role.VIEWER.value])
+    elif case == "no object id":
+        target = await _ad_account(engine, object_id=False)
     else:
         target = await _ad_account(engine)
     if case == "held":

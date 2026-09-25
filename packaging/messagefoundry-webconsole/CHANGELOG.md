@@ -47,6 +47,10 @@ under Changed says why engine 0.4.0 does not work with this console.
     later slice would move the check into the service's bind and unbind.
   - An administrator's own account shows no form, and the engine refuses a POST on it. A local
     account, or an engine with no `[auth].oidc_issuer`, shows no Link form.
+  - **A directory account with no immutable directory id (`objectGUID`) shows no Link form**
+    (`BACKLOG #1143`, slice C). The engine refuses to link it with `directory_object_id_missing`,
+    and a hand-made POST shows that refusal in words. Needs the new engine seam:
+    `FederatedIdentityView` gained `has_directory_object_id`, which the screen reads.
   - Needs the new engine seam: `AdminHandlers` gained the two handlers and the
     `federated_identity_view` projection, which returns the new `FederatedIdentityView`.
 - **Pages that issue or enforce an admin-set temporary password now say when it stops working**

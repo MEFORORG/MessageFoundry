@@ -243,6 +243,8 @@ def _federated_identity_view(user: UserRecord, service: AuthService) -> Federate
         issuer=user.oidc_issuer,
         subject=user.oidc_subject,
         bind_issuer=service.oidc_issuer,
+        # The same truthiness test AuthService.bind_federated_subject refuses on.
+        has_directory_object_id=bool(user.directory_object_id),
     )
 
 

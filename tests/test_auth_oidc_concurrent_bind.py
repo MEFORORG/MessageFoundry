@@ -63,10 +63,15 @@ def rsa_key() -> rsa.RSAPrivateKey:
 
 
 async def _two_accounts(store: MessageStore) -> tuple[str, str]:
-    """Two directory mirror rows, as Kerberos sign-ins would leave them: unbound."""
+    """Two directory mirror rows, as Kerberos sign-ins through a directory returning objectGUID
+    would leave them: unbound, each carrying its immutable id (BACKLOG #1143 slice C)."""
     first, second = uuid4().hex, uuid4().hex
-    await store.create_user(user_id=first, username="jdoe", auth_provider="ad")
-    await store.create_user(user_id=second, username="bsmith", auth_provider="ad")
+    await store.create_user(
+        user_id=first, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+    )
+    await store.create_user(
+        user_id=second, username="bsmith", auth_provider="ad", directory_object_id="guid-bsmith"
+    )
     return first, second
 
 
@@ -161,6 +166,7 @@ async def test_a_second_bind_for_a_DIFFERENT_subject_is_untouched(
             email="bsmith@corp.example",
             dn="CN=bsmith,DC=corp,DC=example",
             groups=PRINCIPAL.groups,
+            directory_object_id="guid-bsmith",
         )
         ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "bsmith": other})
         service = await _service(store, rsa_key, ldap=ldap, bind=None)
