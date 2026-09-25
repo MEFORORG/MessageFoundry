@@ -2007,7 +2007,7 @@ def create_app(
         secret_rotation_settings = (
             getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
         )
-        # ADR 0153 + #333: the THREE connection-scoped deviations. Read LIVE off the running graph (so a
+        # ADR 0153 + #333 + the 2026-09-24 hop attestation: the FOUR connection-scoped deviations. Read LIVE off the running graph (so a
         # reload is reflected) — this route is where an operator learns a cleartext hop is being crossed
         # by declaration, an expired certificate is being honoured, or a generic DB hop has no verifying
         # TLS keyword, and a stale or absent list would understate the posture. An engine with no

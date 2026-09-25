@@ -134,7 +134,12 @@ _OUTBOUND_CASES: dict[str, Any] = {
 }
 
 _IB_MAX: dict[str, Any] = {**_IB_BASE, **_INBOUND_CASES}
-_OB_MAX: dict[str, Any] = {**_OB_BASE, **_OUTBOUND_CASES}
+# The hop attestation and cleartext_accepted are opposite claims and refused together at load, so the
+# maximal outbound carries the acceptance only. Each attestation key still round-trips on its own below.
+_OB_MAX: dict[str, Any] = {
+    **_OB_BASE,
+    **{k: v for k, v in _OUTBOUND_CASES.items() if not k.startswith("tls_hop_attested")},
+}
 
 # Keys whose READ schema enforces a companion key (the per-key round-trip must still be load-legal):
 # a pruning size threshold does nothing without its window, so the loader rejects it alone.

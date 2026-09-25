@@ -1035,9 +1035,10 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > (`[security].enforcement = warn`) **warns**; everything else is **refused** (fail-closed).
 >
 > **`tls_hop_attested` is a per-connection declaration, set with `tls_hop_attested_reason`** (owner
-> ruling 2026-09-24): a keyword on `inbound()` / `outbound()` / `FhirLookup()` / `DatabaseLookup()` /
-> `DatabaseRef()`, or a top-level key on a `connections.toml` table. It is **not** a transport setting;
-> written into `[settings]` or a factory's settings dict it is refused at load. Use it only when the
+> ruling 2026-09-24). It is a keyword on `inbound()` / `outbound()` / `FhirLookup()` /
+> `DatabaseLookup()` / `DatabaseRef()`, or a top-level key on a `connections.toml` table. It is **not**
+> a transport setting. Written into `[settings]` or a factory's settings dict, it is refused at load.
+> Use it only when the
 > hop really is secured by something the engine cannot see, such as a TLS-terminating proxy. A hop
 > that is simply not secure is `cleartext_accepted` + `cleartext_reason`, which WARNs at every
 > construction. Both are reported by `messagefoundry check` and `GET /security/posture`; see

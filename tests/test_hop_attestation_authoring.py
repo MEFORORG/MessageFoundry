@@ -33,6 +33,7 @@ from messagefoundry.config.wiring import (
     attested_secure_hops,
     build_inbound_connection,
     build_outbound_connection,
+    env,
     load_config,
 )
 from messagefoundry.pipeline.wiring_runner import (
@@ -66,8 +67,8 @@ def _open_mllp_inbound(**kwargs: Any) -> InboundConnection:
 
 def test_the_raw_settings_hatch_no_longer_crosses_the_mllp_gate(tmp_path: Path) -> None:
     """The exact reproduction from the finding: write the pair into the factory's settings dict and
-    declare a non-loopback MLLP bind with no TLS. It used to PASS the enforcing gate. Now the choke
-    point every build path shares refuses it, naming the supported surface."""
+    declare a non-loopback MLLP bind with no TLS. It used to PASS the enforcing gate. Now the
+    declaration refuses it at load, naming the supported surface."""
     (tmp_path / "feed.py").write_text(
         "from messagefoundry import MLLP, inbound, router\n"
         "_s = MLLP(port=2575)\n"
@@ -79,9 +80,8 @@ def test_the_raw_settings_hatch_no_longer_crosses_the_mllp_gate(tmp_path: Path) 
         "    return []\n",
         encoding="utf-8",
     )
-    ic = load_config(tmp_path).inbound["IB"]
     with pytest.raises(WiringError, match="is not a transport setting"):
-        _source_config(ic, "127.0.0.1", {})
+        load_config(tmp_path)
 
 
 @pytest.mark.parametrize("key", ["tls_hop_attested", "tls_hop_attested_reason"])
@@ -97,8 +97,8 @@ def test_either_raw_key_alone_is_refused_on_both_directions(key: str) -> None:
 
 
 def test_a_raw_key_written_after_the_declaration_is_still_refused() -> None:
-    """The refusal sits at the build choke point, not only at declaration, because the settings dict
-    stays mutable after inbound() returns."""
+    """The refusal is repeated at the build choke point, because the settings dict stays mutable
+    after inbound() returns and a declaration-time check alone would miss this write."""
     spec = MLLP(port=2575)
     ic = build_inbound_connection("IB", spec, router="r", bind_address="0.0.0.0")
     spec.settings["tls_hop_attested"] = True
@@ -224,6 +224,69 @@ def test_connections_toml_refuses_the_pair_under_settings(tmp_path: Path) -> Non
     )
     with pytest.raises(WiringError, match="tls_hop_attested"):
         load_config(tmp_path)
+
+
+def test_an_attestation_and_a_cleartext_acceptance_are_refused_together() -> None:
+    """Opposite claims. The attestation is checked first, so with both set the acceptance's WARN and
+    audit record would never fire."""
+    with pytest.raises(WiringError, match="opposite claims"):
+        build_outbound_connection(
+            "OB",
+            Tcp(host="10.0.0.5", port=5000),
+            cleartext_accepted=True,
+            cleartext_reason="legacy firmware",
+            tls_hop_attested=True,
+            tls_hop_attested_reason=REASON,
+        )
+
+
+def test_an_env_reference_or_a_control_character_is_refused() -> None:
+    """An env() reference is always truthy, so it would attest the hop in every environment. A
+    control character in the reason could forge a line in the bind WARNING that records it."""
+    with pytest.raises(WiringError, match="must be true or false"):
+        build_outbound_connection(
+            "OB",
+            Tcp(host="10.0.0.5", port=5000),
+            tls_hop_attested=env("attest", cast=bool),  # type: ignore[arg-type]
+            tls_hop_attested_reason=REASON,
+        )
+    with pytest.raises(WiringError, match="control characters"):
+        build_outbound_connection(
+            "OB",
+            Tcp(host="10.0.0.5", port=5000),
+            tls_hop_attested=True,
+            tls_hop_attested_reason="sidecar\nWARNING forged line",
+        )
+
+
+def test_a_fhir_lookup_flag_written_without_its_reason_is_refused_by_the_executor() -> None:
+    """The FhirLookup executor reads the attestation from the lookup's settings. A flag written there
+    by hand, with no reason, is refused rather than crossing unexplained."""
+    from messagefoundry.transports.fhir import FhirLookupExecutor
+
+    with pytest.raises(ValueError, match="requires tls_hop_attested_reason"):
+        FhirLookupExecutor({"fl": {"url": "https://fhir.example/fhir", "tls_hop_attested": True}})
+
+
+def test_the_check_line_lists_every_attested_hop(tmp_path: Path) -> None:
+    from messagefoundry.checks import _check_hop_attested
+
+    (tmp_path / "logic.py").write_text(_LOGIC, encoding="utf-8")
+    (tmp_path / "ob.py").write_text(
+        "from messagefoundry import Tcp, outbound\n"
+        'outbound("OB", Tcp(host="10.0.0.5", port=5000), tls_hop_attested=True,\n'
+        f"         tls_hop_attested_reason={REASON!r})\n",
+        encoding="utf-8",
+    )
+    result = _check_hop_attested(tmp_path)
+    assert result.ok and not result.required
+    assert f"OB ({REASON})" in result.detail
+
+    (tmp_path / "ob.py").write_text(
+        'from messagefoundry import Tcp, outbound\noutbound("OB", Tcp(host="10.0.0.5", port=5000))\n',
+        encoding="utf-8",
+    )
+    assert _check_hop_attested(tmp_path).detail == "no hop is attested secure"
 
 
 # --- the lookup and reference-source carriers ----------------------------------------------------

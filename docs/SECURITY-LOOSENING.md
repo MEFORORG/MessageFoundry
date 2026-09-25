@@ -524,11 +524,13 @@ This section is kept rather than deleted, because the claim it used to make is t
   reach an SMTP `AUTH` over cleartext, which is refused outright.
 
 ### `tls_hop_attested = true` on a connection — a hop attested secure by means the engine cannot see
-> **Connection-scoped**, like `cleartext_accepted` above, and settable in both directions: a keyword on
-> `inbound(...)`, `outbound(...)`, `FhirLookup(...)`, `DatabaseLookup(...)` or `DatabaseRef(...)`, or a
-> top-level key on a `connections.toml` `[[inbound]]` / `[[outbound]]` table. It needs a mandatory `tls_hop_attested_reason`. Owner ruling
-> 2026-09-24; the attestation itself is [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
-> It is **not** a transport setting: writing it into a factory's `settings` dict is refused at load.
+> **Connection-scoped**, like `cleartext_accepted` above, and settable in both directions. It is a
+> keyword on `inbound(...)`, `outbound(...)`, `FhirLookup(...)`, `DatabaseLookup(...)` or
+> `DatabaseRef(...)`. It is also a top-level key on a `connections.toml` `[[inbound]]` / `[[outbound]]`
+> table. It needs a mandatory `tls_hop_attested_reason`, and it cannot be combined with
+> `cleartext_accepted`. Owner ruling 2026-09-24; the attestation itself is
+> [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
+> It is **not** a transport setting: written into a connection's `settings`, it is refused at load.
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as

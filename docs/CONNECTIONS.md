@@ -2431,7 +2431,8 @@ tls_hop_attested_reason = "TLS terminates at the stunnel sidecar"
 `outbound()` and a `[[outbound]]` table take the same pair, and so do `FhirLookup()`,
 `DatabaseLookup()` and `DatabaseRef()`. It is a top-level key, **not** a transport setting. Under
 `[settings]`, or written into a factory's settings dict from Python, it is refused at load. A flag with
-no reason, a blank reason, or a reason with no flag also fail at load.
+no reason, a blank reason, or a reason with no flag also fail at load. So does an `env()` value, and so
+does declaring it together with `cleartext_accepted`, which is the opposite claim.
 
 **Do not attest a hop that is not secure.** A peer that simply cannot do TLS is
 [`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted), which WARNs at every

@@ -5707,7 +5707,7 @@ def security_loosenings(
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like
-    # the three connection-scoped entries above and unlike every switch: the deviation is what the
+    # the connection-scoped entries above and unlike every switch: the deviation is what the
     # engine's own database credential turns out to hold, which no [store] flag declares. Both arms are
     # reported and they read DIFFERENTLY on purpose — "could not observe" is the ABSENCE of a clean
     # result, and collapsing it into silence would make this registry assert a posture nobody checked.

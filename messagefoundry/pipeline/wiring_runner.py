@@ -86,10 +86,10 @@ from messagefoundry.config.wiring import (
     PortConflictError,
     Registry,
     WiringError,
+    apply_hop_attestation,
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
-    refuse_raw_hop_attestation,
     resolve_env_settings,
     resolve_listener_binding,
     resolved_encoding_problems,
@@ -4636,6 +4636,7 @@ class RegistryRunner:
                 or name not in self._destinations
                 or old.outbound.get(name) is None
                 or old.outbound[name].spec != oc.spec
+                or _hop_policy(old.outbound[name]) != _hop_policy(oc)
             ):
                 # live worker but a missing/mismatched connector → (re)build it in place, close any old
                 # one. `failed` covers an outbound that failed to build at START (ADR 0031): its worker
@@ -7577,10 +7578,9 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
     # Owner ruling 2026-09-24: the hop attestation is the connection's typed field, never a transport
     # setting, so the loosening report and the gate read the same thing. Refuse the raw keys, then
     # mirror a declared pair for the settings-driven seams, as _dest_config does for cleartext_accepted.
-    refuse_raw_hop_attestation(settings, f"inbound connection {ic.name!r}")
-    if ic.tls_hop_attested:
-        settings["tls_hop_attested"] = True
-        settings["tls_hop_attested_reason"] = ic.tls_hop_attested_reason
+    apply_hop_attestation(
+        settings, f"inbound connection {ic.name!r}", ic.tls_hop_attested, ic.tls_hop_attested_reason
+    )
     # Inbound MLLP/TCP/X12 listeners never carry an author-supplied host (wiring rejects one) — they
     # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
@@ -7651,10 +7651,12 @@ def _dest_config(
         settings["cleartext_connection"] = oc.name
     # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
     # setting. Refuse the raw keys, then mirror a declared pair for the same settings-driven seams.
-    refuse_raw_hop_attestation(settings, f"outbound connection {oc.name!r}")
-    if oc.tls_hop_attested:
-        settings["tls_hop_attested"] = True
-        settings["tls_hop_attested_reason"] = oc.tls_hop_attested_reason
+    apply_hop_attestation(
+        settings,
+        f"outbound connection {oc.name!r}",
+        oc.tls_hop_attested,
+        oc.tls_hop_attested_reason,
+    )
     return Destination(
         name=oc.name,
         type=oc.spec.type,
@@ -8200,6 +8202,21 @@ def check_fhir_lookup_allowed(
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
+
+
+def _hop_policy(oc: OutboundConnection) -> tuple[object, ...]:
+    """The hop-policy declarations an outbound carries OUTSIDE its ``spec``.
+
+    A reload rebuilds a live outbound's connector only when something it was built from changed. These
+    typed fields feed the hop gates at construction, so an edit to one of them alone must rebuild too.
+    Otherwise a withdrawn attestation keeps ALLOWing the hop until a restart, while every report,
+    reading the new registry, says it is gone."""
+    return (
+        oc.tls_hop_attested,
+        oc.tls_hop_attested_reason,
+        oc.cleartext_accepted,
+        oc.cleartext_reason,
+    )
 
 
 def _insecure_bind_route(source: Source) -> str:

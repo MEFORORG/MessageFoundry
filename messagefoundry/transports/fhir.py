@@ -46,7 +46,11 @@ import urllib.request
 from collections.abc import Mapping
 from typing import Any
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    hop_attestation_from_settings,
+)
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
@@ -929,7 +933,9 @@ class FhirLookupExecutor:
             self._timeout[cname] = float(s.get("timeout_seconds", 30.0))
             self._encoding[cname] = str(s.get("encoding", "utf-8"))
             # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
-            attested = bool(s.get("tls_hop_attested", False))
+            # Validated like the DB lookups': a flag written into this mutable dict without its
+            # reason is refused here rather than crossing unexplained.
+            attested = hop_attestation_from_settings(s)
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
             # rides the spec settings, written there by the FhirLookup() factory (which load-validates
             # the flag/reason coherence, exactly as build_outbound_connection does for an outbound).
