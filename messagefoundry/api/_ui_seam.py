@@ -205,17 +205,18 @@ from typing import Any
 #: BACKLOG #1143 / #295, ADR 0184 slice B: ``AdminHandlers`` gained the REQUIRED
 #: ``bind_user_federated_identity`` and ``unbind_user_federated_identity``, the handlers behind
 #: ``PUT`` and ``DELETE /users/{id}/federated-identity`` that the console's federated-identity screen
-#: calls. ``UserSummary`` gained ``federated_issuer`` and ``federated_subject``, which the console's
-#: user pages render, and the console now imports ``FederatedIdentityRequest`` and ``SimpleMessage``.
-#: New required fields on a frozen dataclass, so a skew fails at the ``UiDeps`` construction; the
-#: digest moves and the handshake refuses it first. Unnumbered, as above.
+#: calls, and the sync ``federated_identity_view`` projection its pages render, a new
+#: ``FederatedIdentityView`` DTO. ``AuthService`` gained the ``oidc_issuer`` property that view reads.
+#: The console also imports ``FederatedIdentityRequest``. New required fields on a frozen dataclass,
+#: so a skew fails at the ``UiDeps`` construction; the digest moves and the handshake refuses it
+#: first. Unnumbered, as above.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "351c84bc39e96589"
+ENGINE_UI_SEAM: str = "bb53be9768239508"
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +341,9 @@ class AdminHandlers:
     # ``user`` arg stays opaque/Any across the seam).
     user_summary: Callable[..., Any]
     current_user: Callable[..., Any]
+    # BACKLOG #1143 (ADR 0184 slice B): one account's stored (issuer, sub) plus the issuer a bind
+    # would use, for the federated-identity screen. Takes the store row and the AuthService.
+    federated_identity_view: Callable[..., Any]
 
 
 @dataclass(frozen=True, slots=True)

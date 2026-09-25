@@ -146,11 +146,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   calls the same code as `PUT` and `DELETE /users/{user_id}/federated-identity`, so the checks,
   the audit rows and the notices to the holder are the same. Each needs `users:manage` and a fresh
   re-authentication for the action `admin_federated_identity`, as the API does. A recent sign-in
-  is not enough. An administrator cannot change their own link here either. The screen shows the
-  engine's refusals in words: a `sub` another account holds, a `sub` with spaces or control
-  characters, a local account, and no configured issuer. The `UserSummary` model gains
-  `federated_issuer` and `federated_subject`; `GET /users` leaves both empty, because it needs
-  only `users:read`. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184 slice B)
+  is not enough, unless the site set `[auth].require_action_step_up = false`, which the API honours
+  the same way. An administrator cannot change their own link here either. A page opened before
+  another administrator changed the link is refused, so nobody replaces or removes a link they
+  did not see. The screen offers no Link form on a local account or when `[auth].oidc_issuer` is
+  unset, and shows the engine's refusals in words. The engine gains the `AuthService.oidc_issuer`
+  property and a `FederatedIdentityView` model the console renders; no JSON route returns it, and
+  `GET /users` is unchanged. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184 slice B)
 - **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
   `PATCH /users/{id}` copied any non-blank `email` into `users.notify_email`, and sent no notice
   unless the profile email changed. The route fills an omitted `email` from the stored profile, and

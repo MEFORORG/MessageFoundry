@@ -96,13 +96,31 @@ class UserSummary(BaseModel):
     #: password can convey its deadline. ``GET /users`` needs only users:read and leaves it ``None``.
     #: Same source as the login gate. ``None`` once the holder sets their own password.
     credential_expires_at: float | None = None
-    #: BACKLOG #1143 / #295 (ADR 0184 slice B): the account's federated ``(issuer, sub)``, which
-    #: decides who may sign in as it through the IdP. Filled only where the caller holds
-    #: users:manage -- the console's user page and its federated-identity screen. ``GET /users`` needs
-    #: only users:read and leaves both ``None``, as it does ``credential_expires_at``. So ``None``
-    #: here means "not stated", not "not linked", unless the surface says it asked.
-    federated_issuer: str | None = None
-    federated_subject: str | None = None
+
+
+class FederatedIdentityView(BaseModel):
+    """One account's federated binding, as the console's federated-identity screen renders it
+    (BACKLOG #1143 / #295, ADR 0184 slice B).
+
+    A view of its own rather than two more fields on :class:`UserSummary`. That model is what
+    ``GET /users`` returns under users:read, where the pair must not appear, and a field that is
+    always ``None`` there would read as "not linked" to any client that trusts it.
+
+    ``issuer`` and ``subject`` are the stored pair; either one set counts as linked, as it does in
+    :meth:`AuthService.unbind_federated_subject`. ``bind_issuer`` is the issuer a bind would use,
+    ``[auth].oidc_issuer``, or ``None`` when it is unset and every bind is refused.
+    """
+
+    user_id: str
+    username: str
+    auth_provider: str
+    issuer: str | None = None
+    subject: str | None = None
+    bind_issuer: str | None = None
+
+    @property
+    def linked(self) -> bool:
+        return self.issuer is not None or self.subject is not None
 
 
 class UserPermissions(BaseModel):

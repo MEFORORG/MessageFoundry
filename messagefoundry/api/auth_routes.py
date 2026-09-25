@@ -37,6 +37,7 @@ from messagefoundry.api.auth_models import (
     CustomRoleRequest,
     ElevatedResponse,
     FederatedIdentityRequest,
+    FederatedIdentityView,
     LoginRequest,
     LoginResponse,
     MfaConfirmRequest,
@@ -230,18 +231,25 @@ def _parse_channel_scope(raw: str | None) -> list[str] | None:
     return [str(c) for c in value] if isinstance(value, list) else []
 
 
+def _federated_identity_view(user: UserRecord, service: AuthService) -> FederatedIdentityView:
+    """Project one account's federated binding for the console (BACKLOG #1143, ADR 0184 slice B).
+
+    Sync, like :func:`_user_summary`, so the console never reads a ``UserRecord`` attribute itself.
+    Only the console's users:manage pages call it; no JSON route returns this view."""
+    return FederatedIdentityView(
+        user_id=user.id,
+        username=user.username,
+        auth_provider=user.auth_provider,
+        issuer=user.oidc_issuer,
+        subject=user.oidc_subject,
+        bind_issuer=service.oidc_issuer,
+    )
+
+
 def _user_summary(
-    user: UserRecord,
-    role_ids: list[str],
-    *,
-    credential_expires_at: float | None = None,
-    with_federated_identity: bool = False,
+    user: UserRecord, role_ids: list[str], *, credential_expires_at: float | None = None
 ) -> UserSummary:
-    """Project a store row into the DTO. ``with_federated_identity`` states the account's
-    ``(issuer, sub)``; only a users:manage surface passes it (BACKLOG #1143, ADR 0184 slice B)."""
     return UserSummary(
-        federated_issuer=user.oidc_issuer if with_federated_identity else None,
-        federated_subject=user.oidc_subject if with_federated_identity else None,
         id=user.id,
         username=user.username,
         auth_provider=user.auth_provider,
@@ -1349,5 +1357,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         list_audit=_audit_ui_list,
         my_security_events=my_security_events,
         user_summary=_user_summary,
+        federated_identity_view=_federated_identity_view,
         current_user=_current_user,
     )

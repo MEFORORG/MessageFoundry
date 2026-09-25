@@ -18,11 +18,10 @@ from messagefoundry.api.auth_models import (
     CustomRoleInfo,
     CustomRoleRequest,
     FederatedIdentityRequest,
+    FederatedIdentityView,
     PasswordResetResponse,
     RolesUpdateRequest,
-    SimpleMessage,
     UserCreateRequest,
-    UserSummary,
     UserUpdateRequest,
 )
 from messagefoundry.api.security import (
@@ -149,11 +148,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     user,
                     role_ids,
                     credential_expires_at=pending_credential_deadline(service, user),
-                    # BACKLOG #1143 (ADR 0184 slice B): the page states the federated link.
-                    with_federated_identity=True,
                 ),
                 all_roles,
                 error=error,
+                # BACKLOG #1143 (ADR 0184 slice B): the page states the federated link.
+                federated=admin.federated_identity_view(user, service),
             ),
             status_code=status_code,
         )
@@ -447,14 +446,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # the API's own. What a direct call SKIPS is the handler's require_step_up_action Depends, so
     # each POST re-asserts it here with the same action. That dependency is the gate; the pages in
     # front of it only decide what an operator is offered.
+    #
+    # The single-use grant is spent by the dependency, before the body is read. So a refused POST
+    # costs its grant, and trying again goes through /ui/reauth first. The JSON twin behaves the
+    # same, and the page says so beside the form.
 
-    async def _federated_summary(user_id: str, service: AuthService) -> UserSummary:
+    async def _federated_view(user_id: str, service: AuthService) -> FederatedIdentityView:
         user = await service.store.get_user(user_id)
         if user is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        role_ids = await service.store.get_user_role_ids(user.id)
-        summary: UserSummary = admin.user_summary(user, role_ids, with_federated_identity=True)
-        return summary
+        view: FederatedIdentityView = admin.federated_identity_view(user, service)
+        return view
 
     async def _federated_screen(
         user_id: str,
@@ -466,17 +468,33 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         subject: str = "",
         status_code: int = 200,
     ) -> HTMLResponse:
-        summary = await _federated_summary(user_id, service)
+        view = await _federated_view(user_id, service)
         return HTMLResponse(
             pages.federated_identity_page(
-                summary,
-                is_self=summary.id == identity.user_id,
+                view,
+                is_self=view.user_id == identity.user_id,
                 notice=notice,
                 error=error,
                 subject=subject,
             ),
             status_code=status_code,
         )
+
+    def _still_shown(view: FederatedIdentityView, form: dict[str, str]) -> bool:
+        """Whether the pair the operator's page showed is still the stored pair.
+
+        The notify_email_shown guard on the user page, applied here: a link or unlink acts on the
+        stored binding, and a page opened before another administrator changed it would otherwise
+        replace or remove a binding its operator never saw. Both fields are required; a POST
+        without them is refused the same way. This narrows the window to the handler call. It does
+        not close it, and the service's own checks still run after it."""
+        shown = (form.get("shown_issuer"), form.get("shown_subject"))
+        return shown == (view.issuer or "", view.subject or "")
+
+    changed = (
+        "The link changed after this page was opened, so nothing was changed. The page now shows "
+        "the current link. Check it, then submit again."
+    )
 
     @app.get("/ui/users/{user_id}/federated-identity", response_class=HTMLResponse)
     async def ui_user_federated_identity(
@@ -503,9 +521,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
+        form = dict(await _form_pairs(request))
         # Passed as typed. The service refuses surrounding spaces rather than trimming them, because
         # the stored value must match the token byte for byte, and its refusal says so.
-        subject = dict(await _form_pairs(request)).get("subject", "")
+        subject = form.get("subject", "")
+        # Echo a bounded value only: an oversized post must not size the refusal page.
+        echo = subject[:255]
+        view = await _federated_view(user_id, service)
+        if not _still_shown(view, form):
+            return await _federated_screen(
+                user_id, service, identity, error=changed, subject=echo, status_code=409
+            )
         try:
             body = FederatedIdentityRequest(subject=subject)
         except ValidationError:
@@ -514,14 +540,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 service,
                 identity,
                 error="Enter the identity provider's subject (sub), 1 to 255 characters.",
-                # Echo a bounded value only: an oversized post must not size the refusal page.
-                subject=subject[:255],
+                subject=echo,
                 status_code=400,
             )
         try:
-            # Annotated, and SimpleMessage imported for it, so the seam discovery seeds the DTO this
-            # route reads a field off -- the reason reset-password annotates its result.
-            result: SimpleMessage = await admin.bind_user_federated_identity(
+            await admin.bind_user_federated_identity(
                 user_id, body=body, service=service, identity=identity
             )
         except HTTPException as exc:
@@ -532,13 +555,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 service,
                 identity,
                 error=str(exc.detail),
-                subject=subject,
+                subject=echo,
                 status_code=exc.status_code,
             )
-        # The handler words a rebind "federated identity rebound; ...". Read it off the handler's
-        # own answer rather than an earlier read, which another administrator can outrun.
-        rebound = result.detail.startswith("federated identity rebound")
-        outcome = "relinked" if rebound else "linked"
+        # Relink versus link, from the pair this request checked above rather than from the
+        # handler's message text, which no seam pins.
+        outcome = "relinked" if view.linked else "linked"
         return RedirectResponse(
             f"/ui/users/{user_id}/federated-identity?m={outcome}", status_code=303
         )
@@ -549,9 +571,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
     ) -> HTMLResponse:
-        summary = await _federated_summary(user_id, service)
+        view = await _federated_view(user_id, service)
         return HTMLResponse(
-            pages.federated_unlink_confirm_page(summary, is_self=summary.id == identity.user_id)
+            pages.federated_unlink_confirm_page(view, is_self=view.user_id == identity.user_id)
         )
 
     @app.post("/ui/users/{user_id}/federated-identity/unlink")
@@ -570,6 +592,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
+        form = dict(await _form_pairs(request))
+        view = await _federated_view(user_id, service)
+        if not _still_shown(view, form):
+            return await _federated_screen(
+                user_id, service, identity, error=changed, status_code=409
+            )
         try:
             await admin.unbind_user_federated_identity(user_id, service=service, identity=identity)
         except HTTPException as exc:

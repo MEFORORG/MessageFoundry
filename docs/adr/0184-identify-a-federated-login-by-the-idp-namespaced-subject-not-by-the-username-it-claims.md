@@ -29,10 +29,10 @@
   relink and unlink an account's federated identity at `/ui/users/{user_id}/federated-identity`,
   with an unlink confirm page. Both console POSTs call the slice A route handlers by reference, so
   the checks, audit rows and notices are the API's own. Each re-asserts the action-bound step-up
-  `admin_federated_identity`, because a direct call skips the handler's own gate. `UserSummary`
-  gained `federated_issuer` and `federated_subject`, stated only on the console's users:manage
-  pages; `GET /users` leaves both empty. Pinned in the console suite's
-  `test_ui_federated_identity.py`.
+  `admin_federated_identity`, because a direct call skips the handler's own gate. Each form posts
+  back the pair it showed, and a stale page is refused. The pair reaches the console through a
+  `FederatedIdentityView` that no JSON route returns, so `GET /users` is unchanged. Pinned in the
+  console suite's `test_ui_federated_identity.py`.
 - **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session

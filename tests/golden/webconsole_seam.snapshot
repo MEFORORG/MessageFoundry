@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-351c84bc39e96589
+bb53be9768239508
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -102,6 +102,7 @@ list_audit
 my_security_events
 user_summary
 current_user
+federated_identity_view
 
 ## api.security surface (imported directly by the console, outside UiDeps)
 client_ip: (conn: 'Request | WebSocket') -> 'str | None'
@@ -175,6 +176,7 @@ messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, u
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
 messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
 messagefoundry.api.auth_models.FederatedIdentityRequest: subject
+messagefoundry.api.auth_models.FederatedIdentityView: auth_provider, bind_issuer, issuer, subject, user_id, username
 messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
 messagefoundry.api.auth_models.NotifyEmailRequest: email
 messagefoundry.api.auth_models.PasswordChangeRequest: current_password, new_password
@@ -183,9 +185,8 @@ messagefoundry.api.auth_models.RoleInfo: builtin, description, display_name, id,
 messagefoundry.api.auth_models.RolesUpdateRequest: roles
 messagefoundry.api.auth_models.SecurityEventInfo: action, detail, ts
 messagefoundry.api.auth_models.SecurityEventsList: events
-messagefoundry.api.auth_models.SimpleMessage: detail
 messagefoundry.api.auth_models.UserCreateRequest: display_name, email, password, roles, username
-messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, credential_expires_at, disabled, display_name, email, federated_issuer, federated_subject, id, notify_email, roles, username
+messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, credential_expires_at, disabled, display_name, email, id, notify_email, roles, username
 messagefoundry.api.auth_models.UserUpdateRequest: disabled, display_name, email, notify_email
 messagefoundry.api.models.AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status, suspended_until
 messagefoundry.api.models.AlertInstanceList: alerts, total, worst_severity
