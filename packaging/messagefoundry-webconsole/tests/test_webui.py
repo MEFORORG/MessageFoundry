@@ -6425,7 +6425,9 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
         def authenticate(self, username: str, password: str) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(
+            self, username: str, *, object_id: str | None = None
+        ) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
     return AuthService(engine.store, _oidc_settings(**over), ldap=_FakeLdap())  # type: ignore[arg-type]
@@ -6608,6 +6610,10 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     service._oidc_jwks = _oidc.JwksCache(lambda: jwks)
     await service.initialize()
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
+    # BACKLOG #1143 (ADR 0184): a federated login selects its account by the (issuer, sub) pair and
+    # never binds, so the account is bound through the admin path first.
+    await engine.store.create_user(user_id="f" * 32, username="jdoe", auth_provider="ad")
+    await service.bind_federated_subject("f" * 32, "S-1-5-21-fed", actor="admin")
 
     async with _oidc_client(engine, service) as c:
         # ASVS 3.7.3: a real operator now traverses the interstitial, so the round trip does too --

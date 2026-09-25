@@ -429,6 +429,20 @@ async def test_the_federated_unbind_contract_on_sqlite() -> None:
         await store.close()
 
 
+async def test_the_federated_binding_service_contract_on_sqlite() -> None:
+    """``AuthService.bind_federated_subject`` on the SQLite backend (BACKLOG #1143), against the same
+    shared body the PostgreSQL and SQL Server suites run."""
+    from tests._federated_binding_service_contract import (
+        _assert_federated_binding_service_contract,
+    )
+
+    store = await _store()
+    try:
+        await _assert_federated_binding_service_contract(store)
+    finally:
+        await store.close()
+
+
 async def test_the_session_binding_guard_contract_on_sqlite() -> None:
     """``create_session(require_federated_subject=...)`` on the SQLite backend, against the same
     shared body the PostgreSQL and SQL Server suites run."""

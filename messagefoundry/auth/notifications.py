@@ -43,6 +43,9 @@ ROLES_CHANGED = "roles_changed"  # 6.3.7 — an admin changed the account's role
 FEDERATED_IDENTITY_BOUND = (
     "federated_identity_bound"  # 6.3.7 - an external identity was bound to the account
 )
+FEDERATED_IDENTITY_UNBOUND = (
+    "federated_identity_unbound"  # 6.3.7 - an admin removed the account's external identity
+)
 ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account
 MFA_DISABLED = (

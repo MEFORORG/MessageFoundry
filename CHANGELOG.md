@@ -114,6 +114,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a federated (OIDC) sign-in no longer links itself to an account. An administrator
+  links it first, through the API.** The engine now picks the account by the identity provider's
+  verified issuer and `sub`, before it reads any username. Before, it picked the account by the
+  username the token claimed. On that account's first federated sign-in it then linked whatever
+  `sub` arrived. So a token that claimed the name of a directory account that had never signed in
+  this way could take over that account and its roles. Now a sign-in whose `sub` is linked to no
+  account is refused and links nothing. Its audit row names the issuer and `sub` that arrived, so
+  an administrator can link it, and is filed under `<oidc>` rather than the name the token claimed.
+  The refusal reason is `federated_subject_not_bound`. The web
+  console's login page tells the person to ask an administrator. Roles come from the directory
+  entry of the linked account, never from the name in the token. A link on a local (non-directory)
+  account is refused as `local_account_conflict`. The refusal `federated_subject_conflict` is no
+  longer emitted. **What an operator must do before turning on `[auth].oidc_enabled`:** link each
+  account with `PUT /users/{user_id}/federated-identity` and a body of `{"subject": "<the IdP
+  sub>"}`. The issuer is always `[auth].oidc_issuer`, which must be set. The account must already
+  exist as a directory account; a Windows SSO (Kerberos) sign-in creates one. Nothing else creates
+  one yet, so a site with no Kerberos sign-in cannot link anyone until a later change adds that.
+  The same route with a new `sub` moves the link and signs the account out. `DELETE` on the same
+  path removes the link and signs the account out. Both routes need `users:manage` and a fresh
+  re-authentication for the action `admin_federated_identity`. Each write leaves an audit row
+  (`auth.federated_subject_bound`, `auth.federated_subject_rebound` or
+  `auth.federated_subject_unbound`) naming the administrator. Linking and unlinking each notify
+  the account holder; unlinking sends the new notice `federated_identity_unbound`. An
+  administrator cannot change their own link. **Linking works only through the API for now.** The web console gets its own screen in
+  a later change. Federation still ships off. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184)
 - **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
   `PATCH /users/{id}` copied any non-blank `email` into `users.notify_email`, and sent no notice
   unless the profile email changed. The route fills an omitted `email` from the stored profile, and

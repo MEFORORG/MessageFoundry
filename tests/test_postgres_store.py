@@ -955,6 +955,20 @@ async def test_federated_unbind_store_contract(store) -> None:
     await _assert_federated_unbind_contract(store)
 
 
+async def test_federated_binding_service_contract(store) -> None:
+    """BACKLOG #1143 ``AuthService.bind_federated_subject`` on the real Postgres backend.
+
+    The shared body is the one the SQLite and SQL Server suites run. What this leg executes that no
+    other does: asyncpg's ``UniqueViolationError`` from ``ux_users_federated_subject``, which the
+    bind must render as ``FederatedSubjectHeld`` rather than let escape as a 500.
+    """
+    from tests._federated_binding_service_contract import (
+        _assert_federated_binding_service_contract,
+    )
+
+    await _assert_federated_binding_service_contract(store)
+
+
 async def test_session_binding_guard_store_contract(store) -> None:
     """BACKLOG #1474 ``create_session(require_federated_subject=...)`` on the real Postgres backend.
 

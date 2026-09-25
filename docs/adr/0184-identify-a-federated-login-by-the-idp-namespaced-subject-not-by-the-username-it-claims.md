@@ -15,7 +15,17 @@
   > be written until it is taken — no longer states what blocks this. Four items remain open, and the
   > second follows directly from the ruling: the bootstrap posture. Accepting this ADR is a separate act
   > and has not happened."* The 2026-09-23 ruling is that separate act.
-- **Date:** 2026-09-05 (accepted 2026-09-23)
+- **Slice A BUILT 2026-09-25 (BACKLOG #1143, carried with #295).** A federated login now selects its
+  account by the verified `(issuer, sub)` pair before any username is read, re-resolves the directory
+  principal from the selected row, and refuses an unbound pair (AC-1 to AC-4). The administrative
+  surface is `PUT` and `DELETE /users/{user_id}/federated-identity`, which bind, rebind and unbind,
+  behind the action-bound step-up `admin_federated_identity`. The refusal and the routes ship
+  together, as the order derived under *To resolve on acceptance* requires. **Not in slice A:** the
+  console leg (slice B), the session mechanism field and the re-auth leg (#296), AC-5 (#1532), and a
+  way for an operator to create a directory account's mirror row. Today only a Kerberos sign-in
+  creates one, since the directory password sign-in is retired (BACKLOG #1137) and a federated
+  sign-in no longer creates rows. So a site with no Kerberos sign-in cannot bind anyone yet.
+- **Date:** 2026-09-05 (accepted 2026-09-23; slice A built 2026-09-25)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session
   mechanism field serves) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)
@@ -63,6 +73,13 @@ reaches its account through three username-keyed reads and consults the pair onl
 | `AuthService._complete_ad_login`, its `get_user_by_username` call | Fetches by `principal.username` again. **This read returns the row the session is issued for.** |
 | `AuthService._complete_ad_login`, the `federated_subject` branch | Reaches `get_user_by_federated_subject` **after** `_upsert_ad_user` has already run, so the pair is an exclusivity veto over an account chosen by username |
 
+*[STALE since slice A, 2026-09-25 (BACKLOG #1143). The table is the state before the build, kept as
+the record of what was fixed. Row by row, now: the first two rows are gone, replaced by one
+`get_user_by_federated_subject` read at the same point in `authenticate_oidc`, and the principal is
+resolved from the row that read returns. The third row's read still runs, but on the re-resolved
+principal's name, so it finds the pair's row. The fourth row's branch no longer binds: it refuses,
+BEFORE the role write, when the row reached does not hold the pair.]*
+
 **The continuity guard cannot cover first contact, by construction.** Its test includes
 `bound.oidc_subject is not None`, so it short-circuits on every account that has never
 federated-logged-in. That is the default state of every account: the whole population before
@@ -98,6 +115,10 @@ Four parts, and the fourth is gated on the owner decision below. *(That gate cle
 part 4.)*
 
 1. **Resolve by the pair at the head of `_complete_ad_login`**, before its `get_user_by_username` call.
+   *[Built one step earlier, 2026-09-25: in `authenticate_oidc`, in place of its `resolve_principal`
+   call on the claimed username. That call also reads a username, and the principal passed down must
+   already be the re-resolved one (part 2). `_complete_ad_login` keeps the pair check after
+   `_upsert_ad_user` as the backstop.]*
    `federated_subject` is already a parameter there and already defaults to `None`, so the simple-bind
    and Kerberos callers take no new branch. This is a re-ordering of existing primitives, not a new
    one, and it writes no DDL.
@@ -153,6 +174,11 @@ part 4.)*
 > **No test below is written yet, and that is deliberate.** The build is blocked on the owner decision,
 > and AC-4 cannot even be stated until that decision is taken. Each `→` names the module the test
 > belongs in.
+>
+> **Built 2026-09-25 (slice A).** AC-1 to AC-4 are pinned in `tests/test_auth_oidc_service.py`, under
+> the section headed for this ADR. The admin routes are pinned in
+> `tests/test_auth_federated_identity_routes.py`. AC-6 is the existing
+> `tests/test_ad_login_pathway_split.py`; AC-5 is not built here.
 >
 > **Updated 2026-09-23 on acceptance.** The build is no longer blocked, and AC-4 is now stated below.
 > The unbind and rebind surface and the session mechanism field (the last two items under *To resolve
@@ -250,6 +276,8 @@ caller in the engine: the bind-on-first-presentation site in `_complete_ad_login
 against a positive control of five callers for the sibling `set_user_roles`, so the probe
 discriminates. `api/auth_routes.py` has no federated route, and the web console has no federated
 surface. **The engine's only way to create a binding today is the one the verb forbids.**
+*[Stale since slice A, 2026-09-25. The one caller is now `AuthService.bind_federated_subject`, behind
+`PUT /users/{user_id}/federated-identity`, and the login path writes no binding.]*
 
 That has a consequence for the ceremony options that ADR 0142 Amendment A stated as an either/or.
 Its option (a), refuse an unbound account, says "until an operator binds them" — and its option (b) is
@@ -280,6 +308,13 @@ That limb is **not 6.8.1's verb** — a recycled name inside one directory is no
 so a 6.8.1 rescore can be honest and leave all four citations unaddressed. Whoever closes #1143 must
 either re-point those four or leave the item open for that limb. The failure mode is quiet: a citation
 to a closed item reads as done.
+
+*[STALE, measured 2026-09-25 at engine `6d988cb23`: none of the four names #1143 any more. They were
+re-pointed to BACKLOG #1471, the AD limb's own item. `git grep -n 1143` over `api/app.py`,
+`uploads.py`, `tests/test_upload_api.py` and ADR 0136 returns nothing; the control, `git grep -c
+'#1471'` over the same four files, returns 1 in each. So closing #1143 no longer orphans a citation.
+The count above was also inconsistent: "three places in the engine" plus ADR 0136 is four, which the
+paragraph then calls "all four".]*
 
 ---
 

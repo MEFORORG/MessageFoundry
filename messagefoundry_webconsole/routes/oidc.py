@@ -72,6 +72,20 @@ _REASON_TO_CODE = {
     "state_unknown": "flow_binding_missing",
     "state_mismatch": "flow_binding_missing",
     "mfa_claim_missing": "sso_mfa_required",
+    # BACKLOG #1143 (ADR 0184 AC-4). The IdP identity is bound to no account, so the login is refused
+    # until an administrator binds it. A distinct code is safe here, unlike ``disabled`` and
+    # ``locked``, and the reason differs by path, so it is stated per path:
+    #   - FIRST CONTACT is decided before any account or directory entry is read, so the code says
+    #     nothing about either. The visitor has proved control of this IdP identity and nothing more.
+    #   - MID-LOGIN (``federated_subject_unbound``, and ``federated_subject_not_bound`` from
+    #     ``_complete_ad_login``) is decided AFTER the bound row was selected and its disabled and
+    #     locked checks passed. So the code does reveal that the account existed, was enabled, and was
+    #     bound to this identity until moments ago. The only visitor who can reach it is the holder of
+    #     that very identity, who knew all three already.
+    # Without the code the visitor is told to "sign in with a password instead", which is no help on
+    # a site where every account is federated.
+    "federated_subject_not_bound": "oidc_not_linked",
+    "federated_subject_unbound": "oidc_not_linked",
 }
 
 
