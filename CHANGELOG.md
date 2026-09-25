@@ -137,8 +137,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   (`auth.federated_subject_bound`, `auth.federated_subject_rebound` or
   `auth.federated_subject_unbound`) naming the administrator. Linking and unlinking each notify
   the account holder; unlinking sends the new notice `federated_identity_unbound`. An
-  administrator cannot change their own link. **Linking works only through the API for now.** The web console gets its own screen in
-  a later change. Federation still ships off. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184)
+  administrator cannot change their own link. The web console has a screen for this too; see the
+  next entry. Federation still ships off. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184)
+- **The web console can now link, relink and unlink a federated (OIDC) identity.** A user's page
+  shows the account's link, its issuer and `sub`, or says it has none. The new screen
+  `/ui/users/{user_id}/federated-identity` links the account to a `sub`, or moves the link to a
+  new one. Unlinking goes through a confirm page that states the consequence first. Each change
+  calls the same code as `PUT` and `DELETE /users/{user_id}/federated-identity`, so the checks,
+  the audit rows and the notices to the holder are the same. Each needs `users:manage` and a fresh
+  re-authentication for the action `admin_federated_identity`, as the API does. A recent sign-in
+  is not enough. An administrator cannot change their own link here either. The screen shows the
+  engine's refusals in words: a `sub` another account holds, a `sub` with spaces or control
+  characters, a local account, and no configured issuer. The `UserSummary` model gains
+  `federated_issuer` and `federated_subject`; `GET /users` leaves both empty, because it needs
+  only `users:read`. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184 slice B)
 - **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
   `PATCH /users/{id}` copied any non-blank `email` into `users.notify_email`, and sent no notice
   unless the profile email changed. The route fills an omitted `email` from the stored profile, and

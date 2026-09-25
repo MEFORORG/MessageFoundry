@@ -96,6 +96,13 @@ class UserSummary(BaseModel):
     #: password can convey its deadline. ``GET /users`` needs only users:read and leaves it ``None``.
     #: Same source as the login gate. ``None`` once the holder sets their own password.
     credential_expires_at: float | None = None
+    #: BACKLOG #1143 / #295 (ADR 0184 slice B): the account's federated ``(issuer, sub)``, which
+    #: decides who may sign in as it through the IdP. Filled only where the caller holds
+    #: users:manage -- the console's user page and its federated-identity screen. ``GET /users`` needs
+    #: only users:read and leaves both ``None``, as it does ``credential_expires_at``. So ``None``
+    #: here means "not stated", not "not linked", unless the surface says it asked.
+    federated_issuer: str | None = None
+    federated_subject: str | None = None
 
 
 class UserPermissions(BaseModel):

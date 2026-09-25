@@ -25,7 +25,15 @@
   way for an operator to create a directory account's mirror row. Today only a Kerberos sign-in
   creates one, since the directory password sign-in is retired (BACKLOG #1137) and a federated
   sign-in no longer creates rows. So a site with no Kerberos sign-in cannot bind anyone yet.
-- **Date:** 2026-09-05 (accepted 2026-09-23; slice A built 2026-09-25)
+- **Slice B BUILT 2026-09-25 (BACKLOG #1143, carried with #295).** The web console can view, link,
+  relink and unlink an account's federated identity at `/ui/users/{user_id}/federated-identity`,
+  with an unlink confirm page. Both console POSTs call the slice A route handlers by reference, so
+  the checks, audit rows and notices are the API's own. Each re-asserts the action-bound step-up
+  `admin_federated_identity`, because a direct call skips the handler's own gate. `UserSummary`
+  gained `federated_issuer` and `federated_subject`, stated only on the console's users:manage
+  pages; `GET /users` leaves both empty. Pinned in the console suite's
+  `test_ui_federated_identity.py`.
+- **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session
   mechanism field serves) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)

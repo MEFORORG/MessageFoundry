@@ -29,6 +29,8 @@ from ._common import _deadline_stamp, _seg
 
 __all__ = [
     "ad_groups_page",
+    "federated_identity_page",
+    "federated_unlink_confirm_page",
     "role_form_page",
     "roles_page",
     "temp_password_page",
@@ -352,10 +354,202 @@ def user_detail_page(
         el("div", el("h2", "Profile"), profile, class_="card"),
         el("div", el("h2", "Roles"), roles_section, class_="card"),
         el("div", el("h2", "Channel scope"), scope, class_="card"),
+        el(
+            "div",
+            el("h2", "Federated sign-in"),
+            _federated_link_readout(user),
+            el(
+                "p",
+                el(
+                    "a",
+                    "Manage the federated identity",
+                    href=f"/ui/users/{_seg(user.id)}/federated-identity",
+                ),
+            ),
+            class_="card",
+        ),
         el("div", el("h2", "Account actions"), *danger, class_="card"),
         el("p", el("a", "← Users", href="/ui/users")),
         active="users",
     )
+
+
+# --- federated identity (BACKLOG #1143 / #295, ADR 0184 slice B) -----------------------------------
+
+# The post-redirect notices, keyed by the ?m= code. An allow-list, so the query string can select a
+# sentence but never supply one (the cluster page's rule).
+_FEDERATED_NOTICES: dict[str, str] = {
+    "linked": "Linked. The account can now sign in through the identity provider.",
+    "relinked": (
+        "Relinked. The account's sessions were signed out, and it now signs in with the new "
+        "subject."
+    ),
+    "unlinked": (
+        "Unlinked. The account's sessions were signed out, and its next federated sign-in is "
+        "refused."
+    ),
+}
+
+_SELF_NOTE = (
+    "Another administrator must change your own link. Changing it ends every session you hold, "
+    "this one included, and on a site where you sign in only through the identity provider it can "
+    "lock you out."
+)
+
+
+def _is_linked(user: UserSummary) -> bool:
+    return user.federated_issuer is not None or user.federated_subject is not None
+
+
+def _federated_link_readout(user: UserSummary) -> Markup:
+    """The account's stored ``(issuer, sub)``, or a sentence saying it has none.
+
+    Both halves are shown as stored, escaped, in a key/value table. Either half alone counts as
+    linked, matching the service's own test, so a half-written row is never shown as unlinked."""
+    if not _is_linked(user):
+        return el("p", "Not linked. No identity provider account can sign in as this user.")
+    return rows_table(
+        ["Field", "Value"],
+        [
+            ["Issuer", user.federated_issuer or "(none)"],
+            ["Subject (sub)", user.federated_subject or "(none)"],
+        ],
+        adjustable=False,
+    )
+
+
+def federated_identity_page(
+    user: UserSummary,
+    *,
+    is_self: bool,
+    notice: str = "",
+    error: str | None = None,
+    subject: str = "",
+) -> Markup:
+    """View, link, relink and unlink one account's federated identity (ADR 0184 slice B).
+
+    An ``unlock`` page tagged ``admin_federated_identity``: a re-auth aimed here mints the single-use
+    grant the link POST consumes. The forms offered follow the service's refusals, so an operator is
+    not handed a button that can only fail: no form on their own account, and no link form on a
+    local account. The POSTs still refuse both, because the gate is the handler's, not this page's.
+    """
+    base = f"/ui/users/{_seg(user.id)}/federated-identity"
+    message = _FEDERATED_NOTICES.get(notice)
+    linked = _is_linked(user)
+    actions: list[object] = []
+    if is_self:
+        actions.append(el("p", _SELF_NOTE, class_="muted"))
+    else:
+        if user.auth_provider == "ad":
+            actions.append(
+                el(
+                    "form",
+                    el(
+                        "label",
+                        "Identity provider subject (sub)",
+                        el(
+                            "input",
+                            name="subject",
+                            value=subject,
+                            required=True,
+                            maxlength="255",
+                            autocomplete="off",
+                            spellcheck="false",
+                            aria_describedby="federated-subject-hint",
+                        ),
+                    ),
+                    el(
+                        "p",
+                        "The exact sub value the identity provider sends for this person. It is "
+                        "matched byte for byte, so paste it with no spaces around it. The issuer is "
+                        "always the one set in [auth].oidc_issuer.",
+                        id="federated-subject-hint",
+                        class_="muted",
+                    ),
+                    *(
+                        [
+                            el(
+                                "p",
+                                "Relinking signs the account out of every session.",
+                                class_="muted",
+                            )
+                        ]
+                        if linked
+                        else []
+                    ),
+                    el("button", "Relink" if linked else "Link", type="submit"),
+                    method="post",
+                    action=f"{base}/link",
+                    class_="ctl",
+                )
+            )
+        else:
+            actions.append(
+                el(
+                    "p",
+                    "Only a directory (AD) account can be linked. This is a "
+                    f"{user.auth_provider} account.",
+                    class_="muted",
+                )
+            )
+        if linked:
+            actions.append(el("p", el("a", "Unlink this identity", href=f"{base}/unlink-confirm")))
+    return page(
+        f"Federated identity: {user.username}",
+        el("h1", f"Federated identity: {user.username}"),
+        el(
+            "p",
+            f"Which identity provider account may sign in as {user.username}. A federated sign-in "
+            "picks its account by this link, never by the name in the token.",
+            class_="muted",
+        ),
+        el("p", message, class_="banner") if message else Markup(""),
+        _banner(error),
+        el("div", el("h2", "Current link"), _federated_link_readout(user), class_="card"),
+        el("div", el("h2", "Change"), *actions, class_="card"),
+        el("p", el("a", f"<- User {user.username}", href=f"/ui/users/{_seg(user.id)}")),
+        active="users",
+    )
+
+
+def federated_unlink_confirm_page(user: UserSummary, *, is_self: bool) -> Markup:
+    """The confirm step for an unlink: it states the consequence before the one POST that acts.
+
+    An ``unlock`` page tagged ``admin_federated_identity``, the stepdown-confirm shape: a stale
+    unlink POST comes back here, never re-POSTed. It re-reads the account, so a link removed in the
+    meantime renders a sentence and no form."""
+    base = f"/ui/users/{_seg(user.id)}/federated-identity"
+    parts: list[object]
+    if is_self:
+        parts = [el("p", _SELF_NOTE)]
+    elif not _is_linked(user):
+        parts = [el("p", "This account has no federated link to remove.")]
+    else:
+        parts = [
+            _federated_link_readout(user),
+            el(
+                "p",
+                f"Unlinking signs {user.username} out of every session. Their next federated "
+                "sign-in is refused until an administrator links them again. Any other way they "
+                "sign in is not changed.",
+            ),
+            el(
+                "form",
+                el("button", f"Unlink {user.username}", type="submit"),
+                method="post",
+                action=f"{base}/unlink",
+                class_="ctl",
+            ),
+        ]
+    back = el("p", el("a", "Cancel", href=base))
+    body = el(
+        "div",
+        el("h1", f"Unlink the federated identity of {user.username}"),
+        *parts,
+        back,
+        class_="card detail-card",
+    )
+    return page("Unlink federated identity", body, active="users")
 
 
 def _pending_credential(user: UserSummary) -> list[object]:

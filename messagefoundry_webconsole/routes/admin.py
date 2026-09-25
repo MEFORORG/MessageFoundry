@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import ValidationError
 
@@ -17,9 +17,12 @@ from messagefoundry.api.auth_models import (
     ChannelScope,
     CustomRoleInfo,
     CustomRoleRequest,
+    FederatedIdentityRequest,
     PasswordResetResponse,
     RolesUpdateRequest,
+    SimpleMessage,
     UserCreateRequest,
+    UserSummary,
     UserUpdateRequest,
 )
 from messagefoundry.api.security import (
@@ -30,6 +33,7 @@ from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
 from messagefoundry.auth.service import (
+    STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
@@ -85,6 +89,28 @@ register_ui_action(
     r"^/ui/users/[^/?#]+/(revoke-sessions|delete)$",
     Permission.USERS_MANAGE,
 )
+# BACKLOG #1143 / #295 (ADR 0184 slice B): the federated-identity screen. Its two POSTs are
+# action-bound to admin_federated_identity, like their JSON twins, and NEITHER is registered: the link
+# POST carries a body, and an unlink is never auto-re-POSTed across a re-auth. Each stale POST maps
+# back to a GET page instead, the stepdown-confirm shape. Those two GET pages are the continuations,
+# and each is TAGGED, so /ui/reauth mints the one grant the POST that follows consumes. A fresh
+# login window opens the pages without minting one; the POST then bounces once through /ui/reauth
+# and the operator submits again. That is the admin_user_update lane's cost, accepted there first.
+register_ui_action(
+    r"^/ui/users/[^/?#]+/federated-identity$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    action=STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+)
+register_ui_action(
+    r"^/ui/users/[^/?#]+/federated-identity/unlink-confirm$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    action=STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+)
+
 register_ui_action(r"^/ui/roles/new$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
 register_ui_action(
     r"^/ui/roles/[^/?#]+/edit$", Permission.USERS_MANAGE, auto_retry=False, unlock=True
@@ -123,6 +149,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     user,
                     role_ids,
                     credential_expires_at=pending_credential_deadline(service, user),
+                    # BACKLOG #1143 (ADR 0184 slice B): the page states the federated link.
+                    with_federated_identity=True,
                 ),
                 all_roles,
                 error=error,
@@ -411,6 +439,148 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 user_id, service, identity, error=str(exc.detail), status_code=400
             )
         return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
+
+    # --- users: federated identity (BACKLOG #1143 / #295, ADR 0184 slice B) -----------------------
+    #
+    # The console's half of the only path that creates a federated binding. Both POSTs call the JSON
+    # handlers BY REFERENCE, so the service checks, the self-exclusion and the refusal mapping are
+    # the API's own. What a direct call SKIPS is the handler's require_step_up_action Depends, so
+    # each POST re-asserts it here with the same action. That dependency is the gate; the pages in
+    # front of it only decide what an operator is offered.
+
+    async def _federated_summary(user_id: str, service: AuthService) -> UserSummary:
+        user = await service.store.get_user(user_id)
+        if user is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        role_ids = await service.store.get_user_role_ids(user.id)
+        summary: UserSummary = admin.user_summary(user, role_ids, with_federated_identity=True)
+        return summary
+
+    async def _federated_screen(
+        user_id: str,
+        service: AuthService,
+        identity: Identity,
+        *,
+        notice: str = "",
+        error: str | None = None,
+        subject: str = "",
+        status_code: int = 200,
+    ) -> HTMLResponse:
+        summary = await _federated_summary(user_id, service)
+        return HTMLResponse(
+            pages.federated_identity_page(
+                summary,
+                is_self=summary.id == identity.user_id,
+                notice=notice,
+                error=error,
+                subject=subject,
+            ),
+            status_code=status_code,
+        )
+
+    @app.get("/ui/users/{user_id}/federated-identity", response_class=HTMLResponse)
+    async def ui_user_federated_identity(
+        user_id: str,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
+        m: str = Query("", max_length=16),
+    ) -> HTMLResponse:
+        return await _federated_screen(user_id, service, identity, notice=m)
+
+    @app.post("/ui/users/{user_id}/federated-identity/link")
+    async def ui_user_federated_link(
+        user_id: str,
+        request: Request,
+        service: AuthService = Depends(_service),
+        # Action-bound, as PUT /users/{id}/federated-identity is. Enforced HERE: the JSON dependency
+        # does not run on this path, because the handler FUNCTION is called through the seam.
+        identity: Identity = Depends(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+                Permission.USERS_MANAGE,
+                reauth_next=lambda r: r.url.path.removesuffix("/link"),
+            )
+        ),
+    ) -> Response:
+        assert_same_origin(request)
+        # Passed as typed. The service refuses surrounding spaces rather than trimming them, because
+        # the stored value must match the token byte for byte, and its refusal says so.
+        subject = dict(await _form_pairs(request)).get("subject", "")
+        try:
+            body = FederatedIdentityRequest(subject=subject)
+        except ValidationError:
+            return await _federated_screen(
+                user_id,
+                service,
+                identity,
+                error="Enter the identity provider's subject (sub), 1 to 255 characters.",
+                # Echo a bounded value only: an oversized post must not size the refusal page.
+                subject=subject[:255],
+                status_code=400,
+            )
+        try:
+            # Annotated, and SimpleMessage imported for it, so the seam discovery seeds the DTO this
+            # route reads a field off -- the reason reset-password annotates its result.
+            result: SimpleMessage = await admin.bind_user_federated_identity(
+                user_id, body=body, service=service, identity=identity
+            )
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                raise
+            return await _federated_screen(
+                user_id,
+                service,
+                identity,
+                error=str(exc.detail),
+                subject=subject,
+                status_code=exc.status_code,
+            )
+        # The handler words a rebind "federated identity rebound; ...". Read it off the handler's
+        # own answer rather than an earlier read, which another administrator can outrun.
+        rebound = result.detail.startswith("federated identity rebound")
+        outcome = "relinked" if rebound else "linked"
+        return RedirectResponse(
+            f"/ui/users/{user_id}/federated-identity?m={outcome}", status_code=303
+        )
+
+    @app.get("/ui/users/{user_id}/federated-identity/unlink-confirm", response_class=HTMLResponse)
+    async def ui_user_federated_unlink_confirm(
+        user_id: str,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
+    ) -> HTMLResponse:
+        summary = await _federated_summary(user_id, service)
+        return HTMLResponse(
+            pages.federated_unlink_confirm_page(summary, is_self=summary.id == identity.user_id)
+        )
+
+    @app.post("/ui/users/{user_id}/federated-identity/unlink")
+    async def ui_user_federated_unlink(
+        user_id: str,
+        request: Request,
+        service: AuthService = Depends(_service),
+        # Action-bound, as DELETE /users/{id}/federated-identity is. A stale POST goes back to the
+        # confirm page rather than being re-POSTed, so the operator reads the consequence again.
+        identity: Identity = Depends(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+                Permission.USERS_MANAGE,
+                reauth_next=lambda r: r.url.path.removesuffix("/unlink") + "/unlink-confirm",
+            )
+        ),
+    ) -> Response:
+        assert_same_origin(request)
+        try:
+            await admin.unbind_user_federated_identity(user_id, service=service, identity=identity)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                raise
+            return await _federated_screen(
+                user_id, service, identity, error=str(exc.detail), status_code=exc.status_code
+            )
+        return RedirectResponse(
+            f"/ui/users/{user_id}/federated-identity?m=unlinked", status_code=303
+        )
 
     @app.post("/ui/users/{user_id}/revoke-sessions")
     async def ui_user_revoke_sessions(

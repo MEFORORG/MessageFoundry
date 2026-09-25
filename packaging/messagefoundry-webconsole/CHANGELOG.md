@@ -25,6 +25,21 @@ that value. Console 0.3.0 does not work with that engine, so upgrade the two tog
 under Changed says why engine 0.4.0 does not work with this console.
 
 ### Added
+- **An administrator can link, relink and unlink a user's federated (OIDC) identity** (`BACKLOG
+  #1143`, `BACKLOG #295`, ADR 0184 slice B).
+  - The user page gains a Federated sign-in card. It shows the issuer and `sub` the account is
+    linked to, or says it is not linked.
+  - `/ui/users/{user_id}/federated-identity` shows the link and offers Link, or Relink when one
+    exists. `/ui/users/{user_id}/federated-identity/unlink-confirm` states what an unlink does
+    before the one button that does it.
+  - Both changes call the engine's own `PUT` and `DELETE /users/{user_id}/federated-identity`
+    handlers. Each POST needs a fresh re-authentication for the action
+    `admin_federated_identity`, and a recent sign-in does not count. A POST without one goes
+    through `/ui/reauth` and comes back to the page, so the operator submits again.
+  - An administrator's own account shows no form, and the engine refuses a POST on it.
+  - Refusals are shown in words on the page, with the typed `sub` kept in the field.
+  - Needs the new engine seam: `AdminHandlers` gained the two handlers and `UserSummary` the two
+    fields.
 - **Pages that issue or enforce an admin-set temporary password now say when it stops working**
   (`BACKLOG #1141`, PR 1456). The engine refuses such a password once
   `[auth].initial_password_expiry_hours` have passed since it was set.
