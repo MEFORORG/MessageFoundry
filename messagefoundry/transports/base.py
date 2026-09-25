@@ -8,8 +8,11 @@ and either returns normally (delivered) or raises :class:`DeliveryError` (the pi
 then reschedules per the channel's retry policy).
 
 Connectors are keyed by :class:`~messagefoundry.config.models.ConnectorType` in a small
-registry, so adding a transport never touches the channel model or the pipeline — you
-register a builder here (or, later, from a plugin).
+registry, and the pipeline builds them through it. ``ConnectorType`` is a closed enum, though.
+Adding a transport means at least a new member in ``config/models.py``, a builder registered
+here, and the per-type arms elsewhere (the egress allow-list, the authoring factory). Nothing
+outside this repository can add a new type today (``ConnectorType("kafka")`` raises). Whether
+to open it for plugins is BACKLOG #1624.
 """
 
 from __future__ import annotations

@@ -17,11 +17,16 @@ import pytest
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     EMAIL_CHANGED,
+    MFA_CREDENTIAL_REMOVED,
+    MFA_DISABLED,
+    PASSWORD_RESET,
     RECOVERY_CODE_USED,
     SecurityEvent,
+    deadline_utc,
 )
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.security_notify import (
+    _SUBJECTS,
     SecurityEventNotifier,
     _build_body,
     security_notifier_from_settings,
@@ -165,6 +170,32 @@ def test_body_names_the_new_address_on_a_repoint_and_does_not_say_removed() -> N
     assert "removed" not in body.lower()
 
 
+def test_a_non_last_factor_removal_renders_its_own_subject_and_body() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): MFA_CREDENTIAL_REMOVED must be wired into BOTH renderers.
+
+    THE TEST EXISTS BECAUSE BOTH FALL BACK SILENTLY. ``_SUBJECTS.get`` degrades to a generic
+    "MessageFoundry security alert" and ``_DESCRIPTIONS.get`` to "A security event occurred on your
+    account", so a half-wired event type sends a mail that looks well-formed and tells the holder
+    nothing. Neither renderer raises, so nothing else in the suite would notice.
+
+    It also pins the one thing this arm must NOT say. The account still holds another second factor,
+    so the MFA_DISABLED wording would be a false statement in a security notice.
+    """
+    assert _SUBJECTS[MFA_CREDENTIAL_REMOVED] != _SUBJECTS[MFA_DISABLED]
+    body = _build_body(
+        SecurityEvent(
+            MFA_CREDENTIAL_REMOVED,
+            username="bob",
+            email="bob@example.org",
+            detail={"factor": "webauthn"},
+        )
+    )
+    assert "A security event occurred on your account." not in body
+    assert "removed" in body.lower()
+    # Says the account is still protected, and does not claim a disable.
+    assert "disabled" not in body.lower()
+
+
 def test_body_says_a_directory_repoint_came_from_the_directory() -> None:
     """BACKLOG #1139 (ASVS 6.3.7): where the change came from decides what the reader can DO. A
     directory-driven repoint is not editable in the console, so an unexplained one reads as a
@@ -203,6 +234,41 @@ def test_body_states_the_remaining_recovery_code_count() -> None:
     assert "Recovery codes remaining: 3" in body
     assert "spent" in body.lower()
     assert "last recovery code" not in body.lower()  # only the zero arm says that
+
+
+def test_reset_body_states_the_deadline_in_the_api_surfaces_format() -> None:
+    """BACKLOG #1141 slice 2 (ASVS 6.4.5), limb (b): the reset notice reaches the HOLDER, so it
+    carries the instant the temporary password stops working. Rendered in the format the API refusal
+    and the console pages use, so the holder reads one string on every surface."""
+    stamp = 1_800_000_000.0
+    body = _build_body(
+        SecurityEvent(PASSWORD_RESET, username="bob", email="bob@x", detail={"expires_at": stamp})
+    )
+    rendered = deadline_utc(stamp)
+    assert rendered is not None
+    assert f"The temporary password stops working at {rendered}." in body
+    # An administrator did the reset, so the generic "no action is needed" close would contradict
+    # the deadline line. The reset notice closes on its own sentence.
+    assert "no action is needed" not in body
+    assert "If you did not expect this reset" in body
+
+
+def test_reset_body_states_no_deadline_without_one() -> None:
+    """Control: ``initial_password_expiry_hours = 0`` sends no instant, and the body must then say
+    nothing about one rather than a sentence with a hole in it."""
+    body = _build_body(SecurityEvent(PASSWORD_RESET, username="bob", email="bob@x"))
+    assert "stops working" not in body
+    assert "reset by an administrator" in body
+
+
+def test_reset_body_drops_an_unrenderable_deadline() -> None:
+    """The expiry setting has no upper bound, and ``fromtimestamp`` raises past year 9999 (3000 on
+    Windows). The API surfaces drop the sentence in that case; the notice does the same rather than
+    failing the send."""
+    body = _build_body(
+        SecurityEvent(PASSWORD_RESET, username="bob", email="bob@x", detail={"expires_at": 1e20})
+    )
+    assert "stops working" not in body
 
 
 def test_body_warns_when_the_last_recovery_code_is_spent() -> None:

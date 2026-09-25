@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-ab2e10f1b28a610f
+01894d979d8f66d9
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -119,14 +119,15 @@ audit_kerberos_reject: (self, reason: 'str') -> 'None'
 audit_mfa_denied: (self, identity: 'Identity', path: 'str', *, client: 'str | None' = None) -> 'None'
 audit_oidc_reject: (self, reason: 'str') -> 'None'
 audit_permission_denied: (self, identity: 'Identity', permission: 'Permission', path: 'str', *, client: 'str | None' = None) -> 'None'
-authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, seed_reauth: 'bool' = True) -> 'LoginOutcome'
-begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str') -> 'tuple[str, str]'
+authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, seed_reauth: 'bool' = True, supersedes: 'str | None' = None) -> 'LoginOutcome'
+begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str', prior_session: 'str | None' = None) -> 'tuple[str, str]'
 begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str | None'
 begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'
 complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'LoginOutcome'
 confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'Elevation'
 delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'str', *, client: 'str | None' = None) -> 'bool'
 factor_binding_is_blocked: (self, token: 'str | None', action: 'str') -> 'bool'
+fill_own_notify_email: (self, identity: 'Identity', email: 'str', *, client: 'str | None' = None) -> 'bool'
 finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
 finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
 flag_new_client_ip: (self, token: 'str | None', client_ip: 'str | None', *, path: 'str') -> 'bool'
@@ -135,7 +136,7 @@ has_recent_step_up: (self, token: 'str | None') -> 'bool'
 identity_for_token: (self, token: 'str | None', *, activity: 'bool' = True) -> 'Identity | None'
 kerberos_available: property -> 'bool'
 list_sessions: (self, user_id: 'str') -> 'list[SessionRecord]'
-login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None) -> 'LoginOutcome'
+login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None, supersedes: 'str | None' = None) -> 'LoginOutcome'
 logout: (self, token: 'str | None', *, actor: 'str | None' = None) -> 'None'
 mfa_satisfied: (self, token: 'str | None') -> 'bool'
 mfa_status: (self, identity: 'Identity') -> 'MfaStatus'
@@ -171,6 +172,7 @@ messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, u
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
 messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
 messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
+messagefoundry.api.auth_models.NotifyEmailRequest: email
 messagefoundry.api.auth_models.PasswordChangeRequest: current_password, new_password
 messagefoundry.api.auth_models.PasswordResetResponse: expires_at, must_change_password, temp_password
 messagefoundry.api.auth_models.RoleInfo: builtin, description, display_name, id, permissions

@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.auth_models import (
+    NotifyEmailRequest,
     PasswordChangeRequest,
 )
 from messagefoundry.api.security import pending_credential_deadline_for
@@ -25,6 +26,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_WEBAUTHN_DELETE,
     STEP_UP_ACTION_WEBAUTHN_ENROLL,
     AuthService,
+    NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
 
@@ -252,13 +254,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 new_password=form.get("new_password", ""),
             )
             await admin.change_password(
-                body=body, request=request, service=service, identity=identity
+                body=body,
+                request=request,
+                service=service,
+                identity=identity,
+                # The cookie session a wrong current password is charged to (BACKLOG #1138).
+                session=session_token(request),
             )
         except ValidationError:
             return await _retry("invalid input")
         except HTTPException as exc:
             if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                 raise  # rate-limited — keep the Retry-After semantics
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                # The session is gone: this failure spent its re-proof budget (BACKLOG #1138), or
+                # it was revoked by other means while the request waited.
+                return login_redirect_response()
             return await _retry(str(exc.detail), exc.status_code)
         # Changed: the service revoked every session (incl. this cookie) — sign in again. This is the
         # WIDEST termination the console offers (every session for this user, the one an operator
@@ -268,6 +279,48 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         resp = RedirectResponse("/ui/login?e=pwchanged", status_code=303)
         clear_session_cookie(resp, request)
         return resp
+
+    @app.get("/ui/account/notify-address", response_class=HTMLResponse)
+    async def ui_notify_address_form(
+        identity: Identity = Depends(require_ui(allow_missing_notify_email=True)),
+    ) -> Response:
+        """BACKLOG #1139 (ASVS 6.3.7): the page ``require_ui`` confines an addressless account to.
+
+        Under the factor gate on purpose (no ``allow_mfa_pending``): a cookie that has proven only
+        the password must not choose where the account's security notices go."""
+        if not identity.must_set_notify_email:
+            return RedirectResponse("/ui/account", status_code=303)
+        return HTMLResponse(pages.notify_address_page())
+
+    @app.post("/ui/account/notify-address")
+    async def ui_notify_address(
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_ui(allow_missing_notify_email=True)),
+    ) -> Response:
+        assert_same_origin(request)
+        form = dict(await _form_pairs(request))
+        try:
+            # The JSON route's own request model, so both planes refuse the same inputs.
+            body = NotifyEmailRequest(email=form.get("email", ""))
+        except ValidationError:
+            return HTMLResponse(
+                pages.notify_address_page(error="that address is too long"), status_code=400
+            )
+        try:
+            await service.fill_own_notify_email(identity, body.email, client=_client(request))
+        except NotifyEmailAlreadySet as exc:
+            # Say so rather than redirect: a second tab that submitted a different address must not
+            # read a quiet redirect as its address having been saved.
+            return HTMLResponse(pages.notify_address_page(error=str(exc)), status_code=409)
+        except ValueError:
+            return HTMLResponse(
+                pages.notify_address_page(
+                    error="enter one email address, such as name@example.org"
+                ),
+                status_code=400,
+            )
+        return RedirectResponse("/ui", status_code=303)
 
     @app.post("/ui/account/mfa/enroll")
     async def ui_mfa_enroll(
@@ -376,6 +429,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # to identify the current session and drive the SERVICE directly (the ui_mfa_verify pattern).
     _SESSION_NOTICES = {
         "revoked": "Session revoked.",
+        "revoke_missed": (
+            "Nothing was revoked: that session is no longer listed under the id this page showed. "
+            "It may have ended, or it signed in again or re-verified and now has a new id. "
+            "Check the list below and revoke it again if it is still there."
+        ),
         "signed_out_others": "Signed out of your other sessions.",
     }
 
@@ -411,11 +469,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        # Ownership-checked in the service; an unknown/foreign id is a silent no-op (never
-        # confirms another user's session id). Revoking the CURRENT session logs the caller
-        # out — the next request finds no session and 303s to login.
-        await service.revoke_own_session(identity, session_id, actor=identity.username)
-        return RedirectResponse("/ui/account/sessions?m=revoked", status_code=303)
+        # Ownership-checked in the service; an unknown/foreign id revokes nothing and never confirms
+        # another user's session id. Revoking the CURRENT session logs the caller out — the next
+        # request finds no session and 303s to login.
+        #
+        # ASVS 7.2.4: the notice follows the RESULT. A session's id is its token hash, and rotation
+        # changes the hash at every re-verification, so an id this page rendered can be dead by the
+        # time the POST lands: the target may have completed MFA or a step-up on its own device in
+        # between. Reporting "revoked" then would tell the operator a session had ended while it was
+        # still live under its new id. An unknown id and a foreign id
+        # read the same, so the notice discloses nothing the JSON twin's 404 does not.
+        revoked = await service.revoke_own_session(identity, session_id, actor=identity.username)
+        outcome = "revoked" if revoked else "revoke_missed"
+        return RedirectResponse(f"/ui/account/sessions?m={outcome}", status_code=303)
 
     @app.post("/ui/account/sessions/revoke-others")
     async def ui_revoke_other_sessions(

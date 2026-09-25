@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -30,6 +31,10 @@ from tests._admin_account import ADMIN_USERNAME, create_admin
 
 GOOD_PASSWORD = "Sup3rSecret!!"
 NEW_PASSWORD = "An0ther-Str0ng-Pass!!"
+
+# The service's own logger, named once so the capture filter and the module cannot drift apart
+# (matching tests/test_security_notify.py, which names its module's logger the same way).
+_AUTH_LOGGER = "messagefoundry.auth.service"
 
 
 class _FakeNotifier:
@@ -1247,6 +1252,69 @@ async def test_notifier_failure_is_isolated_from_the_auth_op() -> None:
         await store.close()
 
 
+async def test_missing_notifier_reports_the_drop_rather_than_swallowing_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): with no notifier wired, ``_notify_security`` returned on
+    ``self._security_notifier is None`` without a word, while its own docstring three lines above
+    said a missing notifier was logged. Only the FAILURE arm logged, which
+    ``test_notifier_failure_is_isolated_from_the_auth_op`` above already covers.
+
+    THIS DROP IS WIDER THAN THE SIBLING IN ``pipeline/security_notify.py``, which loses one account.
+    ``security_notifier_from_settings`` returns ``None`` whenever ``[alerts]`` names no SMTP host or
+    sender, so an instance running with ``notify_security_events`` on and no relay configured would
+    drop every notice for every account on a first deployment, with the lifespan wiring reporting
+    nothing either.
+    """
+    store = await _store()
+    try:
+        # No ``security_notifier=`` -- exactly what the factory hands the lifespan with no SMTP host.
+        service = AuthService(store, AuthSettings())
+        await _local_user(store)
+        with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
+            # EMAIL_CHANGED rather than any other event, because ITS DETAIL CARRIES AN ADDRESS -- so
+            # this one case pins the never-log-detail rule as well as the drop itself.
+            await service.update_user(
+                "u1",
+                display_name=None,
+                email="repointed@example.net",
+                disabled=None,
+                actor="admin",
+            )
+        dropped = [r for r in caplog.records if r.name == _AUTH_LOGGER]
+        assert len(dropped) == 1, "a dropped notice must be reported, not silently swallowed"
+        message = dropped[0].getMessage()
+        # Names WHICH notice and WHOSE account, so an operator can act on it.
+        assert EMAIL_CHANGED in message
+        assert "bob" in message
+        # Never the event detail: on this event type it holds an email address.
+        assert "repointed@example.net" not in message
+    finally:
+        await store.close()
+
+
+async def test_a_deliberate_notices_off_setting_is_not_reported_as_a_drop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``[auth].notify_security_events = false`` is a documented choice, and the lifespan wires no
+    notifier for it. A warning per event there would report the setting working as a fault."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(notify_security_events=False))
+        await _local_user(store)
+        with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
+            await service.update_user(
+                "u1",
+                display_name=None,
+                email="repointed@example.net",
+                disabled=None,
+                actor="admin",
+            )
+        assert [r for r in caplog.records if r.name == _AUTH_LOGGER] == []
+    finally:
+        await store.close()
+
+
 async def test_notifier_fires_on_ad_driven_role_change() -> None:
     # WP-L3-05 follow-up (ASVS 6.3.7): a role change pushed from the directory on login notifies the
     # affected user out-of-band, just like the local set_roles() path — not only the local one.
@@ -1830,5 +1898,90 @@ async def test_initial_credential_deadline_is_the_single_source_every_surface_re
         assert service.initial_credential_deadline(None) is None
         off = AuthService(store, AuthSettings(initial_password_expiry_hours=0))
         assert off.initial_credential_deadline(admin.password_changed_at) is None
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1141 slice 2, limb (b): the out-of-band reset notice CARRIES the deadline ----------
+#
+# The PASSWORD_RESET notice is the one surface that reaches the HOLDER rather than the issuing
+# administrator, so it is where "renewal instructions are sent" is most literally true. It shipped
+# with no deadline because the notice fired before the stored stamp was read back. The test pins the
+# instant it carries AGAINST THE GATE, the same shape as the reset-response test above, so neither a
+# fresh clock nor a gate that drifted from `initial_credential_deadline` can pass it.
+
+
+async def test_the_reset_notice_states_the_instant_the_login_gate_refuses_at() -> None:
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=72), security_notifier=notifier
+        )
+        await service.initialize()
+        issued = await _make_reset_temp(store, service)
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None and alice.password_changed_at is not None
+
+        notice = next(e for e in notifier.events if e.event_type == PASSWORD_RESET)
+        noticed = notice.detail["expires_at"]
+        # Off the STORED stamp the gate reads, exactly. A fresh clock read after the write differs
+        # from the stamp by the audit and revoke round-trips, so equality is what catches it.
+        assert noticed == alice.password_changed_at + 72 * 3600
+        # The holder and the issuing administrator are told the SAME instant.
+        assert noticed == issued.expires_at
+
+        # POSITIVE CONTROL: one second before the noticed instant the credential still works.
+        await _shift_deadline_to(store, alice.id, time.time() + 1, hours=72)
+        assert (await service.login("alice", issued.password)).ok
+        # One second after it, the gate refuses, so the notice named the real boundary.
+        await _shift_deadline_to(store, alice.id, time.time() - 1, hours=72)
+        out = await service.login("alice", issued.password)
+        assert not out.ok and out.error == "invalid credentials"
+    finally:
+        await store.close()
+
+
+async def test_the_reset_notice_carries_no_deadline_when_the_expiry_setting_is_off() -> None:
+    # Control for the test above: at 0 the credential genuinely does not expire, so a notice stating
+    # an instant would be the false deadline this item exists to prevent.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=0), security_notifier=notifier
+        )
+        await service.initialize()
+        await _make_reset_temp(store, service)
+        notice = next(e for e in notifier.events if e.event_type == PASSWORD_RESET)
+        assert "expires_at" not in notice.detail
+    finally:
+        await store.close()
+
+
+async def test_the_reset_notice_to_a_disabled_account_carries_no_deadline() -> None:
+    # The deadline line tells the holder to sign in before it, and a disabled account cannot sign
+    # in. The issuing administrator's return value still states the instant.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=72), security_notifier=notifier
+        )
+        await service.initialize()
+        await store.upsert_role(role_id="viewer", display_name="Viewer")
+        user_id = await service.create_local_user(
+            username="alice",
+            password="a-long-enough-original-passphrase",
+            display_name=None,
+            email=None,
+            roles=["viewer"],
+            actor="admin",
+        )
+        await store.set_user_disabled(user_id, disabled=True)
+        issued = await service.admin_reset_password(user_id, actor="admin")
+        notice = next(e for e in notifier.events if e.event_type == PASSWORD_RESET)
+        assert "expires_at" not in notice.detail
+        assert issued.expires_at is not None
     finally:
         await store.close()

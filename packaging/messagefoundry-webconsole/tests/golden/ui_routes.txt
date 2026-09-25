@@ -1,6 +1,7 @@
 GET /ui
 GET /ui/account
 GET /ui/account/mfa/confirm
+GET /ui/account/notify-address
 GET /ui/account/password
 GET /ui/account/sessions
 GET /ui/ad-groups
@@ -49,6 +50,7 @@ MOUNT /ui/static
 POST /ui/account/mfa/disable
 POST /ui/account/mfa/enroll
 POST /ui/account/mfa/verify
+POST /ui/account/notify-address
 POST /ui/account/password
 POST /ui/account/sessions/revoke-others
 POST /ui/account/sessions/{session_id}/revoke

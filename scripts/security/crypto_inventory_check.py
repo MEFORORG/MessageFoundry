@@ -1899,6 +1899,12 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "scripts/service/install-service.ps1": frozenset(
         {"tls_context:SecurityProtocolType[TLS12]", "hash:Get-FileHash[SHA256]"}
     ),
+    # CI-only measurement (ADR 0183 Wave 0, BACKLOG #1136), run by windows-service-smoke. It draws a
+    # synthetic per-run administrator password from the CSPRNG, which provision-admin and then a real
+    # sign-in use against a throwaway store. The CSPRNG, not Get-Random, because the account it
+    # protects is a real, enabled Administrator for the life of the run; the password is never printed,
+    # never on argv, and is masked in the Actions log.
+    "scripts/service/measure-store-access.ps1": frozenset({"csprng:RandomNumberGenerator"}),
     # --- Coordination tooling. Identifiers and change detection; no secret is hashed. ---
     # A per-attempt claim token from the CSPRNG, because it must be unmintable by a concurrent
     # claimer (the file says why Get-Random is not enough), and a SHA-256 of the host name.

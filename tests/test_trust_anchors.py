@@ -15,6 +15,7 @@ import pytest
 
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.auth import trust_anchors as ta
+from messagefoundry.auth.anchor_path import PathVerdict
 from messagefoundry.auth.trust_anchors import (
     AUDIT_ACTION,
     AnchorSpec,
@@ -43,6 +44,12 @@ def _pem(tmp_path: Path, body: bytes = b"-----BEGIN CERTIFICATE-----\nAAAA\n") -
     p = tmp_path / "anchor.pem"
     p.write_bytes(body)
     return p
+
+
+def _path_ok(_p: object) -> PathVerdict:
+    """A path check that passes. The row-count tests stub it for the reason they stub the ACL read:
+    the real answer depends on the host's temp directory, not on the test (BACKLOG #1142)."""
+    return PathVerdict(True)
 
 
 async def _rows(store: MessageStore, label: str | None = None) -> list[dict]:
@@ -628,6 +635,7 @@ async def test_preflight_baseline_then_unchanged_then_changed(
     # The row counts below are about fingerprints. Pin the ACL read so a host whose temp ACL reads
     # as indeterminate (an extra acl_indeterminate row) cannot change them.
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)  # the path arm adds rows the same way
     p = _pem(tmp_path, b"v1")
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
 
@@ -654,6 +662,7 @@ async def test_preflight_pin_mismatch_refuses_at_reload_and_audits(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)  # same reason as the test above
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     p = _pem(tmp_path, b"orig")
     spec = AnchorSpec(
         "oidc", "[auth].oidc_tls_ca_cert_file", str(p), hashlib.sha256(b"orig").hexdigest()
@@ -719,6 +728,7 @@ async def test_preflight_acl_determined_ok_writes_no_indeterminate_row(
     # The control for the test above: a determined, owner-only read must stay silent.
     p = _pem(tmp_path, b"body")
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
     await run_anchor_preflight([spec], store, enforcing=True)
     assert {r["event"] for r in await _rows(store, "api_client")} == {"observed"}

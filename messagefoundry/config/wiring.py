@@ -3175,7 +3175,7 @@ def Sftp(
     port: int | EnvRef = 22,
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
-    private_key: str | EnvRef | None = None,  # PEM private key text/path — secret, use env()
+    private_key: str | EnvRef | None = None,  # RSA private key TEXT, not a path — secret, use env()
     key_password: str | EnvRef | None = None,  # passphrase for an encrypted key — secret, use env()
     known_hosts: str | EnvRef | None = None,  # extra known_hosts file (system hosts always loaded)
     remote_dir: str | EnvRef,

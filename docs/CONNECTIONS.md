@@ -816,8 +816,8 @@ figure stops matching the constant named beside it.
 | `tcp`: raw TCP listener ([Raw TCP](#raw-tcp--tcp)) | the inbound's declared `content_type` | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB | no unpacking on intake |
 | `x12`: X12 EDI listener ([X12 EDI](#x12-edi--x12)) | X12 interchanges | not applicable; a framed stream | `max_interchange_bytes`, default `DEFAULT_MAX_INTERCHANGE_BYTES` = 16 MiB (`parsing/x12/delimiters.py`) | no unpacking on intake |
 | `database`: database poller, `DatabasePoll(...)` ([Database source](#database-source--databasepoll)) | rows from `poll_statement`, each handed on as one body in the declared `content_type` | not applicable; table rows | no byte cap of its own; the engine's per-message ceiling below rejects an oversized row after it is read; `poll_max_rows`, default `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows per poll | no unpacking on intake |
-| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | off unless `[store].uploads_dir` is set. Plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file onto a chosen inbound's ingress stage. First it runs that inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; and a check that the inbound's charset can hold the text. A refusal answers 413, 415 or 422, writes an `upload.resend_reject` audit row, and writes no message. Strict `hl7apy` validation still does not run on a resend | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
-| `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | The edited body re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. A re-route first runs the origin inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; and a check that the inbound's charset can hold the text. A re-route whose origin inbound this engine does not hold answers 409. The direct path has no inbound, so only the NUL rule and that ceiling apply. A refusal answers 413, 415 or 422, writes a `message_edit_resend_reject` audit row, and writes no message. Strict `hl7apy` validation still does not run on either path | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
+| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | off unless `[store].uploads_dir` is set. Plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file onto a chosen inbound's ingress stage. First it runs that inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; a check that the inbound's charset can hold the text; and, where the inbound sets `validation.strict`, the listener's strict `hl7apy` validation under the same `validation.strict_timeout_s` backstop, whose refusal counts the errors and quotes none. A refusal answers 413, 415 or 422, writes an `upload.resend_reject` audit row, and writes no message | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
+| `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | The edited body re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. A re-route first runs the origin inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; a check that the inbound's charset can hold the text; and, where the inbound sets `validation.strict`, the listener's strict `hl7apy` validation under the same `validation.strict_timeout_s` backstop, whose refusal counts the errors and quotes none. A re-route whose origin inbound this engine does not hold answers 409. The direct path has no inbound, so only the NUL rule and that ceiling apply, and strict validation, an inbound's setting, never does. A refusal answers 413, 415 or 422, writes a `message_edit_resend_reject` audit row, and writes no message | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
 | `ide/src/testBench.ts` (Load Message Set) and `ide/src/stepsView.ts` (Use for Live Values): the IDE extension's local file pickers, a 5.1.1 upload feature by owner ruling of 2026-09-23 | any file: each picked path goes to `messagefoundry dryrun`, which runs it against an inbound's declared `content_type` | the dialog offers `.hl7` first and also "All files", so no extension is enforced | `MAX_FIXTURE_FILE_BYTES` = 16 MiB per file (`pipeline/dryrun.py`), raised to the largest `max_message_bytes` an inbound in the graph sets; refused with a message naming the file, before it is read whole. `dryrun` then applies the per-message ceiling below itself. The Steps view also reads its picked sample inside the extension to list its segments, and that read has no cap. The live-debug sample choice (`liveDebug.ts`, a pick list of `.hl7` files) feeds the same `dryrun` read | no unpacking |
 | `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop. A re-ingressed reply does not pass the `Loopback()` inbound's listener checks, so the read bound in this row is its bound | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound, both checked only after the whole result set is fetched | no unpacking on capture |
 
@@ -1094,7 +1094,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `remote_dir` | both | — (required) | remote directory to poll / upload into |
 | `username` | both | — (unset) | login user (unset = anonymous, FTP only) |
 | `password` | both | — (unset) | login password — a **secret**, via `env()`. Refused over plain `ftp`. |
-| `private_key` | both | — | **`Sftp` only** — PEM private-key text or a path; a **secret**, via `env()` |
+| `private_key` | both | — | **`Sftp` only** — the **text** of an **RSA** private key, not a path; a **secret**, via `env()`. See *RSA key text only* below the table. |
 | `key_password` | both | — | **`Sftp` only** — passphrase for an encrypted `private_key`; a **secret**, via `env()` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP |
@@ -1111,6 +1111,17 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber) |
 | `encoding` | out | `utf-8` | charset the payload is encoded with before upload (the **source** hands the retrieved bytes to the pipeline and never uses it) |
 
+- **RSA key text only.** The connector loads `private_key` with paramiko's `RSAKey` and nothing else.
+  Two encodings of an RSA key load: PKCS#1, whose PEM header names `RSA PRIVATE KEY`, and the
+  OpenSSH format, whose header names `OPENSSH PRIVATE KEY`. At least these are refused:
+  - an Ed25519 or ECDSA key, in either encoding;
+  - an RSA key in PKCS#8 form, whose header names only `PRIVATE KEY`;
+  - a file path, which is read as key text.
+
+  Building the connection does not parse the key. The error comes on the first connect,
+  before any network traffic, as a permanent `SFTP connection rejected: ...` error. Its wording can
+  mislead: an Ed25519 key in OpenSSH form reports `unpack requires a buffer of 4 bytes`. Measured
+  against paramiko 5.0.0, the locked version.
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).
@@ -1124,10 +1135,10 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `min_age_seconds` (above).
 - **Leader-gated.** The remote directory is a *shared* external resource, so in a cluster only the leader
   lists, downloads, or moves its files — otherwise two nodes would double-ingest the drop.
-- **No timeout knob.** Neither factory exposes one — the 30 s value is a hard-coded module fallback in
-  `transports/remotefile.py`, handed to `paramiko.SSHClient.connect(timeout=…)` (the **TCP connect only**;
-  the SFTP channel read/write is unbounded) and to `ftplib.FTP_TLS/FTP(timeout=…)` (the **whole socket**).
-  See [Table B](#table-b--per-service-resource-strategy-asvs-1313).
+- **No timeout knob.** Neither factory exposes one. The bounds these connections do have are hard-coded
+  in `transports/remotefile.py`. The "Timeouts are per-connector, not universal" paragraph under
+  [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each one
+  covers, and [Table B](#table-b--per-service-resource-strategy-asvs-1313) has the SFTP and FTP/FTPS rows.
 - **Egress allowlist.** `[egress].allowed_remote` gates the host in **both** directions — a poll dials out
   too, so the allowlist guards against polling an arbitrary server. Fail-closed once configured.
 - **At-least-once.** An upload may re-send, and a poll may re-emit a file that was handled but not yet
@@ -2554,6 +2565,33 @@ auto_start = false        # deployed, but started at runtime, not at boot
 > value is moot. To bring a not-deployed connection online, set `deployed=true` (and supply any `env()`
 > values it needs), then reload — **no other change**.
 
+## Inline fast path — `inline` (code-first only, ADR 0057)
+
+**Leave `inline` off.** It is a per-inbound boolean on `inbound(...)`, default `False`.
+[ADR 0057](adr/0057-inline-step-a-fast-path.md) records that it ships default-off permanently. It cut
+commits per message as designed, and throughput moved by less than the measurement noise. It is
+documented here so a reader who meets it in code knows what it does.
+
+When it is `True`, the router worker runs the route and the transform for an eligible message itself.
+It then commits one handoff straight from the ingress stage to the outbound stage, skipping the routed
+stage. An inbound is eligible only when all of these hold:
+
+- the whole graph declares no live lookup (the database or FHIR lookups behind `db_lookup` and
+  `fhir_lookup`);
+- its `ack_after` resolves to `ingest`;
+- it is not a `Loopback()` inbound.
+
+Each message then faces its own checks. At least, the router must pick exactly one handler, and that
+handler must return one or more plain `Send`s to deployed outbound connections. A message that fails a check takes the
+ordinary staged path, which may run its transform a second time.
+
+```python
+inbound("IB_LAB_ORU", MLLP(port=2580), router="lab_router", inline=True)  # not recommended
+```
+
+**`connections.toml` has no `inline` key.** A `[[inbound]]` table that carries one fails to load with
+`unknown key(s) inline`, whether the value is `true` or `false`.
+
 ## Pipeline claim mode — `[pipeline].claim_mode` (default `pooled`, ADR 0066)
 
 How the engine drains the staged queue. This is a service setting in `messagefoundry.toml`, not a
@@ -2729,7 +2767,7 @@ connection-count knob** (the stdlib opener exposes none) — the same framing 13
 **Timeouts are per-connector, not universal.** Only the MLLP/TCP/X12/DICOM families expose both a
 `connect_timeout` and a `timeout_seconds`; the REST/SOAP/FHIR/DICOMweb HTTP family exposes
 `timeout_seconds` only (a single per-request wall clock — there is no separate connect timeout);
-REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument, and its bounds are hard-coded module values in `transports/remotefile.py`, not operator-configurable: a 30 s connect value on all three protocols, applied on SFTP to the banner and authentication phases as well, plus a `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` bound on each read from an established SFTP channel (BACKLOG #1195) that FTP and FTPS do not have;
+REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument, and its bounds are hard-coded module values in `transports/remotefile.py`, not operator-configurable. All three protocols start from a 30 s value. On FTP and FTPS it is a whole-socket timeout, on the control and data connections alike. On SFTP it covers the TCP connect, the SSH banner exchange and authentication; a separate `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` (120 s, BACKLOG #1195) then covers each read from the established SFTP channel. That read bound is per read, not per transfer, so a slow transfer that keeps making progress never trips it. **Opening the SFTP session, between those two steps, carries no engine bound.** A server that authenticates and then never answers the SFTP subsystem request would hold its worker thread;
 DATABASE exposes `connect_timeout` + `acquire_timeout` and no statement timeout; local FILE exposes
 none (filesystem I/O is unbounded by design). The MLLP/TCP/X12/HTTP listeners expose
 `receive_timeout`; the DICOM SCP instead applies `timeout_seconds` to its three pynetdicom timers. For
@@ -2792,12 +2830,15 @@ store, and only one of the pools carries a knob.
    - **Bounded infrastructure hops** — `db_lookup`, `fhir_lookup`, the AI broker POST, every SMTP send,
      every LDAP bind, the DICOM association work. Each carries a finite timeout (Table B), so *these*
      workers are released by their timeout rather than by any pool cap.
-   - **Unbounded-by-design file I/O** — local FILE and SFTP/FTP/FTPS channel reads and writes, whose
-     "timeout" posture is stated honestly per row in Table B.
+   - **File I/O** — local FILE, which is unbounded by design, and SFTP/FTP/FTPS, whose bounds are
+     hard-coded, differ by protocol and leave at least one SFTP step unbounded. The "Timeouts are
+     per-connector, not universal" paragraph above says what each covers; Table B has the per-row detail.
    - **Inbound strict validation** — the listener runs `hl7apy` strict validate off-loop via
      `asyncio.to_thread` (`pipeline/wiring_runner.py:3259`, `:3543`), bounded by the per-inbound
-     `validation.strict_timeout_s` (engine default `_STRICT_VALIDATE_TIMEOUT_SECONDS` = **5 s**,
-     `wiring_runner.py:285`). The timeout frees the *listener* but cannot kill the worker — an
+     `validation.strict_timeout_s` (engine default `STRICT_VALIDATE_TIMEOUT_SECONDS` = **5 s**, in
+     `pipeline/ingress_guards.py`, which `wiring_runner` re-exports as
+     `_STRICT_VALIDATE_TIMEOUT_SECONDS`). An operator resend into a strict inbound (BACKLOG #1911)
+     validates on this pool the same way, under the same timeout. The timeout frees the *listener* but cannot kill the worker — an
      orphaned validate holds its thread until it returns, bounded in turn by the 16 MiB / segment
      caps enforced before it.
    - **The store's own SQL Server I/O** — `aioodbc.create_pool()` is built with **no** `executor=`
@@ -2926,7 +2967,7 @@ reading this page already applies to a file the scan never opened.
 | Vault Transit — bulk at-rest cipher (`MEFOR_STORE_TRANSIT_KEY`, `[store].cipher_provider = vault_transit`, ADR 0138) | **one synchronous HTTPS round trip per encrypted CELL** on every store write and read, plus one `generate_hmac` per audit row; issued **on the event loop** (`_enc`/`_dec` are sync, with no `to_thread`). No concurrency cap of its own — the effective bound is the stage/lane budget | Vault's own rate limit or a slow Transit **stalls the event loop across the whole engine**; a per-operation failure raises `CipherError` and the stage errors/dead-letters that row | the store stays open; the row is retried by the normal stage re-claim |
 | Vault KV v2 (`MEFOR_SECRETS_VAULT_ADDR`) | one HTTPS request per secret resolution at config load / connector construction | fail-closed — the connection refuses to build | operator fixes Vault and reloads |
 | Alerts — SMTP sink (`[alerts].email_smtp_host`) | one connection per send, serialized on **its own** background drain task behind **its own** bounded 1000-item queue | over-cap events are **dropped with a warning** rather than growing the queue | a send failure is swallowed + logged; the alert is not retried |
-| Alerts — per-user security-event email (`[auth].notify_security_events`) | one connection per notification, serialized on a **second, independent** drain task with its **own** bounded 1000-item queue — so the SMTP relay sees up to **two** concurrent sessions from this engine, not one | at cap the event is **dropped with a warning**; the audited `GET /me/security-events` feed still records it | the send failure is swallowed + logged, never propagated onto the login or admin path; recovery is the pull feed |
+| Alerts — per-user security-event email (`[auth].notify_security_events`) | one connection per notification, serialized on a **second, independent** drain task with its **own** bounded 1000-item queue — so the SMTP relay sees up to **two** concurrent sessions from this engine, not one | at cap the event is **dropped with a warning**; the audited `GET /me/security-events` feed still records it when it is the user's own event, but not an administrator's change to their account (`auth/notifications.py` states the rule) | the send failure is swallowed + logged, never propagated onto the login or admin path; recovery is the pull feed, for the events it carries |
 | Alerts — webhook sink (`[alerts].webhook_url`) | one POST per event on the same single drain task and the same bounded 1000-item queue | as the SMTP sink — over-cap events are dropped with a warning | best-effort; a failure is swallowed + logged, never retried |
 | Syslog forwarder (`[logging].forward_host`) | a **single** socket, synchronous send, one record at a time | a stalled collector costs at most the socket timeout per record and the record is then **dropped** | an unreachable collector at startup is skipped with a warning and the service still starts |
 | SNTP clock-sync probe (`[logging].ntp_peer`) | exactly **one** datagram per process start; never on the message path | a silent peer raises `socket.timeout` | skew beyond `time_sync_max_skew_seconds` warns loudly, or refuses to start under `time_sync_fail_closed` |
@@ -2945,7 +2986,7 @@ reading this page already applies to a file the scan never opened.
 | HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408` | handler `finally` closes the connection with a shutdown grace | an over-size body is refused before buffering | n/a |
 | File endpoint — local filesystem | **none** — filesystem I/O is unbounded by design | file handles are context-managed; the source file is moved/deleted/left per `after_read` | an unreadable/oversize file is skipped or moved to `error_subdir` | `RetryPolicy` on the outbound write |
 | File endpoint — UNC / SMB share | **none engine-owned** — bounded only by the OS SMB redirector | the impersonation token is reverted (`RevertToSelf`) and the worker thread is per-endpoint isolated | a share failure surfaces as a transient poll/delivery error | `RetryPolicy` |
-| SFTP (remote-file) | 30 s on the **TCP connect only** — the hard-coded module fallback in `transports/remotefile.py` is passed to `paramiko.SSHClient.connect(timeout=…)`. The SSH banner and auth legs ride paramiko's own defaults (the engine sets neither `banner_timeout` nor `auth_timeout`), and the SFTP **channel read/write has no timeout at all**, so a server that stalls after connect blocks its `to_thread` worker until the engine restarts. `Sftp()` exposes no timeout argument, so none of this is operator-configurable | the `paramiko` session is closed in `finally` per poll or delivery | SSH failures map to transient | `RetryPolicy` |
+| SFTP (remote-file) | 30 s on the TCP connect, the SSH banner exchange and authentication (`timeout`, `banner_timeout` and `auth_timeout` on `paramiko.SSHClient.connect`), plus 120 s on **each read** from the established SFTP channel. All are hard-coded in `transports/remotefile.py`; `Sftp()` exposes no timeout argument, so none is operator-configurable. The bounds are **not complete**: the "Timeouts are per-connector, not universal" paragraph under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each covers and where the gap is | the `paramiko` session is closed in `finally` per poll or delivery | **Delivery:** at connect, any `paramiko.SSHException` is **permanent**. That covers a rejected host key, and also a banner timeout, which paramiko raises as `SSHException`. An authentication failure, a timeout included, is permanent and flagged as a credential fault. An `OSError`/`EOFError` at connect is transient. After connect, a missing remote path is permanent, and at least the read timeout is transient. With `validate_directory` on, the pre-upload directory check re-raises any failure as transient, these included. **Source:** the poller does not act on that split; a failed connect, listing or retrieve is logged and tried again on the next poll | `RetryPolicy` |
 | FTP / FTPS (remote-file) | 30 s **whole-socket** — the same hard-coded module fallback, handed to `ftplib.FTP_TLS(timeout=…)` / `ftplib.FTP(timeout=…)`, which sets it on the control **and** data connections. `Ftp()` exposes no timeout argument, so it is **not** operator-configurable | the `ftplib` session is closed in `finally` per poll or delivery | `ftplib.all_errors` maps to transient | `RetryPolicy` |
 | Reference-set sync (`FileRef`) | **none engine-owned** — filesystem / SMB-redirector I/O, the same posture as the File connector | the file handle is context-managed and closed per pass | a load error is logged and the previous encrypted snapshot is retained | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |

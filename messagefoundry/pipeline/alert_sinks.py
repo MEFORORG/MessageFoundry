@@ -924,6 +924,27 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def initial_credential_expiring(
+        self, name: str, *, expires_at: str, hours_remaining: int
+    ) -> None:
+        # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is unclaimed and near its
+        # deadline. `user:<username>` stands in for "connection", so the throttle and the alert
+        # instance key per account. Rules still match it: AlertRule.connection defaults to "*". So
+        # when a catch-all rule is the first match, its mute or transports=[] silences this reminder,
+        # and its control_action is dispatched at `user:<username>`, or, with control_target set, at
+        # that real connection, which it restarts. Scope such rules to real connection names or to
+        # one event_type. `reason` carries the deadline into the durable alert row. The payload is
+        # the ISO deadline and whole hours remaining only: never the password, no PHI.
+        self._emit(
+            {
+                "type": "initial_credential_expiring",
+                "connection": name,
+                "expires_at": expires_at,
+                "hours_remaining": hours_remaining,
+                "reason": f"unclaimed; stops working at {expires_at}",
+            }
+        )
+
     def approval_stale_requester(self, approval_id: str, *, operation: str, reason: str) -> None:
         # ASVS 8.3.2: a dual-control release was refused on the requester's standing. The approval id
         # stands in for "connection", so the throttle and the ADR 0044 instance key per request: two

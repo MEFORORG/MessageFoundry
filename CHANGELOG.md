@@ -43,6 +43,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   generated connection name that would fail it. **Migration:** rename such connections to fit the pattern;
   stored history stays under the old name. ([BACKLOG #1107](docs/BACKLOG.md))
 ### Fixed
+- **On Windows, the service account and the operator who runs `provision-admin` can now each open
+  the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
+  `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other
+  out. A provisioned store stopped the service starting, and a store the service created refused
+  `provision-admin`. In a data directory hardened the way `install-service.ps1` leaves it, each open
+  now writes one protected ACL on those files naming SYSTEM, Administrators and the one service
+  account. It is the same whoever opens, and it reaches every member of Administrators whose token
+  carries the group enabled, not only the operator who provisioned. `install-service.ps1` now also
+  makes Administrators the owner of the data directory, because the engine requires that. Outside a
+  hardened directory, the old owner-only behaviour is unchanged. What this widens and narrows is
+  stated in the ADR 0163 note of 2026-09-24; the measurement is ADR 0183 Wave 0 and 0b.
+  (`BACKLOG #1136`)
 - **The DICOM C-STORE SCP no longer answers Success for an object the engine does not accept.**
   The SCP's `max_object_bytes` defaults to 128 MiB, but the engine's binary ingress records any
   object over 16 MiB as `ERROR` and never processes it. So an object between 16 and 128 MiB was
@@ -56,7 +68,46 @@ All notable changes to MessageFoundry are documented here. The format follows
   failure status where it used to get Success. A `max_object_bytes` above 16 MiB no longer raises
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
+### Added
+- **The reset notice now states when a temporary password stops working, and the operator gets a
+  reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
+  already enforced it. The `PASSWORD_RESET` security notice to the holder now states that instant,
+  and asks them to choose a new password before then. A disabled account's notice carries no
+  deadline line. A new `[alerts]` event, `initial_credential_expiring`, reminds the operator while
+  an admin-issued temporary password is still unclaimed. It fires at most once per credential per
+  engine process, in the last third of the window, capped at 24 hours (24 hours at the default 72).
+  It names the holder as `user:<username>` and carries the deadline and whole hours left, never the
+  password. With no `[alerts]` transport it goes to the log (`LoggingAlertSink`), where no rule
+  applies. At `initial_password_expiry_hours = 0` no reminder runs. **Catch-all alert rules match
+  this event**, because a rule's `connection` defaults to `*`. When such a rule is the first match,
+  its `mute` or `transports = []` silences the reminder. Its `control_action` is dispatched at
+  `user:<username>`, or, with `control_target` set, at that real connection, which it restarts.
+  Scope such rules to real connection names or to one `event_type`.
+  ([BACKLOG #1141](docs/BACKLOG.md))
+
 ### Security
+- **BREAKING: an account with no notification address must set one at sign-in, whenever this
+  instance sends security notices.** A security notice goes to the account's engine-owned address,
+  `users.notify_email`. An account without one was told nothing about a password reset or any other
+  change to how it signs in. At least four paths create such an account: the first-run `admin` account, a user
+  created with no email, `provision-admin` without `--email`, and a directory sign-in where the
+  directory returns no `mail`. Now, while `[auth].notify_security_events` is on and an `[alerts]` SMTP
+  relay is configured, that account is confined at sign-in. The JSON API answers other routes with
+  `403` `notification address required` and `X-Notify-Email-Required: 1`. The web console sends other
+  pages to `/ui/account/notify-address`. `POST /me/notify-email` sets the address, which must read as one
+  plain mailbox. It only fills a missing one and answers `409` when one is set, so an administrator still changes an existing
+  address. It stays behind the second-factor gate, so a session that has proven only the password
+  cannot choose the address. Setting it writes `auth.notify_email_set` and sends a `notify_email_set`
+  notice to the new address. A site with no mail relay is not confined. **Who is confined:** every
+  existing account with no `notify_email`, at its next sign-in on an instance that sends notices. That
+  includes API clients and scripts that sign in with a password. Each one gets the `403` until the
+  address is set. (`BACKLOG #1139`)
+- **Removing a passkey now always sends a notice.** Removing one passkey while another factor remained
+  wrote an audit row and sent nothing. It now sends `mfa_credential_removed`. Removing the last factor
+  still sends `mfa_disabled`. (`BACKLOG #1139`)
+- **A dropped security notice is now logged.** With notices on and no SMTP relay configured, the engine
+  dropped every notice without a word. Each drop now logs a warning naming the event type and the
+  username, never the event detail. (`BACKLOG #1139`)
 - **An approval can no longer be granted faster than a person could read it.** A new setting,
   `[approvals].min_dwell_seconds`, sets the youngest age at which a pending request may be
   approved. It defaults to 2.0 seconds, which is provisional and derived from the keystroke-level
@@ -66,6 +117,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   path meets it. `0` means no floor. `[approvals].expiry_hours` now also refuses NaN, infinity and
   overflow, and with dual control on, startup refuses a floor at or past the expiry. Dual control
   (`[approvals].enabled`) still ships off. ([BACKLOG #287](docs/BACKLOG.md))
+- **A failed step-up re-auth or password change now counts toward the account lockout, and each
+  session gets at most `lockout_threshold` of them.** In 0.4.0, `POST /me/reauth`, the web console's
+  `POST /ui/reauth` and `POST /me/password` checked a password but counted no failure. So someone
+  holding a stolen session could keep guessing, bounded only by the per-actor ceremony budget. A
+  failure now counts on the account's sign-in counter, so it can lock sign-in and raise the lockout
+  notice. It is also charged to the session, and the failure that reaches `lockout_threshold` (5 by
+  default) revokes that session, so a stolen session gets 5 password guesses in total. The account
+  lock does not refuse a live session's password re-proofs, so an attacker who locks the account from
+  the sign-in page cannot take step-up or the password change away from the owner's live sessions,
+  once those sessions have met their second factor. Wrong TOTP or recovery codes still count on the
+  account alone. A rejected
+  directory (AD) re-bind counts too. The engine never writes a lock to the directory, but each
+  rejected re-bind still reaches the domain controller, so the domain's own lockout policy can still
+  lock the domain account. A directory the engine cannot reach, or one with no such account, is not
+  counted. The per-session count lives in each engine process: a restart resets it, and each engine
+  shard serving its own API port keeps its own, so there the cap is per process rather than in
+  total. The crossing attempt writes `auth.account_locked`. A
+  re-auth that clears a run of three or more failures writes `auth.login_after_failures`. A failed
+  current-password check at `POST /me/password` is now audited as `auth.password_change_failed`.
+  (`BACKLOG #1138`)
 - **BREAKING: the `Http()` inbound listener now refuses any `Transfer-Encoding`, not only
   `chunked`.** The listener decodes no transfer coding. In 0.4.0 it refused the header only when its
   whole value was `chunked`. A coding list such as `gzip, chunked` got through, and so did `chunked,`
@@ -104,6 +175,46 @@ All notable changes to MessageFoundry are documented here. The format follows
   2048-bit floor. **Migration:** generate an RSA key of at least 3072 bits, or an EC key for
   ES256 / ES384, and register its public half with the counterparty.
   ([BACKLOG #300](docs/BACKLOG.md))
+- **BREAKING: a trust anchor that another account can replace through its folder now refuses to
+  start.** This covers `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and
+  `[api].tls_client_ca_file`. 0.4.0 checked only the anchor file's own permissions. An account with
+  delete-child on the anchor's folder could delete it and plant its own CA, and the engine trusted
+  the copy. The engine now also checks the path. It reads every folder from the drive root or `/`
+  down to the anchor, each link on the way, and the file itself. On Windows it reads each owner and
+  DACL by SID, in process. On POSIX it reads each owner and mode. Under the default
+  `[security].enforcement = enforce`, an object an untrusted account can delete, rename,
+  re-permission or own refuses. At `warn` the engine starts and writes a `path_insecure` row under
+  `auth.trust_anchor`. The message names each object, the account and the right, and gives the
+  `icacls` or `chown` and `chmod` commands that fix it. On a folder, only removing or renaming an
+  entry counts. Adding files does not, so `C:\`, `C:\ProgramData` and a new folder under it pass as
+  Windows ships them. The trusted accounts include at least SYSTEM, Administrators,
+  TrustedInstaller, direct members of local Administrators, and the account the check runs as.
+  LocalService and NetworkService are not trusted as the engine's own. An owner is also trusted
+  when its SID ends in a well-known admin RID (500, 512, 518 or 519) in any domain, as the config
+  guard trusts it. On POSIX, root and the engine's uid are trusted, and only root when the engine
+  runs as root. The verdict depends on the account the check runs as, so run
+  `mefor verify federation` as the service account. Some paths the engine cannot judge: an unreadable folder, a network
+  share or mapped drive, a FAT volume, or a Linux mount other than ext2/3/4, xfs, btrfs, tmpfs or
+  overlay. They write a `path_indeterminate` row and a warning, and the engine still starts. The
+  file check still runs beside the path check. **These placements, at least, started under 0.4.0
+  and now refuse:**
+  - a Windows anchor whose own permissions are locked, in a new folder under `C:\Users\Public`;
+  - an anchor under a folder where a named account or local group can delete or rename entries.
+    0.4.0 caught only broad groups. One Windows 11 host's `%TEMP%` refuses this way;
+  - an anchor whose file or any folder above it is owned by an account that is neither an
+    administrator nor the engine's own, such as a folder a standard user made under
+    `C:\ProgramData`;
+  - on POSIX, an anchor or any folder above it owned by a uid other than root or the engine's;
+  - on POSIX, a group- or world-writable folder in the path, unless it is sticky and the entry
+    below it belongs to root or the engine. A link to a good bundle, kept in such a folder, refuses
+    too.
+
+  **Migration:** keep each anchor in a folder that only administrators and the engine's account can
+  change. On Windows that is the engine's data folder under `C:\ProgramData`. On POSIX it is a
+  root-owned `755` folder such as `/etc/messagefoundry/`. The container's `/config`, owned by uid
+  10001 as `docker/README.md` requires, passes when it sits on one of the mount types above. A
+  Docker Desktop bind mount does not, so there it answers indeterminate and starts with a warning.
+  ([BACKLOG #1142](docs/BACKLOG.md))
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
@@ -306,12 +417,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   row, and writes no message. **A resend that 0.4.0 accepted can now be refused**: an oversize body,
   a body that does not match the inbound's declared type, or an HL7 body `Peek.parse` rejects.
   An admitted body is committed in the listener's form: HL7 with `\r` line endings, and a binary
-  inbound's body as `mfb64:v1:` carriage. Strict `hl7apy` validation is still not run on a
-  resubmission. A re-route whose origin inbound this engine does not hold (removed, or owned by
+  inbound's body as `mfb64:v1:` carriage. Strict `hl7apy` validation is covered by the next
+  entry. A re-route whose origin inbound this engine does not hold (removed, or owned by
   another engine shard) is now refused with 409 rather than written unchecked. The edit-resend
   direct path (`to` set) writes an outbound row, so only the NUL rule applies there in practice; its
   body is already held below 16 MiB by the 1 MiB request cap. The web console shows an uploaded-log
   resend refused this way as its own notice. ([BACKLOG #1911](docs/BACKLOG.md))
+- **BREAKING — a resend into a strictly validated inbound now meets its strict validation.** Where
+  the target inbound sets `validation.strict`, `POST /uploads/{file_id}/resend` and an edit-resend
+  re-route now run the listener's strict `hl7apy` validation before anything is written. It runs
+  under the same `validation.strict_timeout_s` backstop, and a failure or a timeout is refused with
+  422. The refusal writes the same `upload.resend_reject` or `message_edit_resend_reject` audit row
+  as the other guards, with phase `strict`, and writes no message. Its reason counts the
+  validation errors and quotes none, because `hl7apy` can echo a field value; a dry run against
+  the inbound lists them. **A resend that 0.4.0 accepted can now be refused**: an HL7 body that passes `Peek.parse`
+  but not the inbound's strict validation. As on the listener, a streaming inbound's body at or over
+  `stream_threshold_bytes` gets header-only checking. The edit-resend direct path meets no inbound,
+  so strict validation does not apply to it. ([BACKLOG #1911](docs/BACKLOG.md))
 - **BREAKING — a session that has not proved its second factor can no longer change the password of
   an account that has one.** In 0.4.0 `POST /me/password` accepted an MFA-pending session on the
   password alone, and a change ends every session, so a caller holding only the password could lock
@@ -325,6 +447,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   returns, and retry. The JSON API has no passkey leg, so a passkey-only account proves its factor on
   the web console.
   ([BACKLOG #1954](docs/BACKLOG.md))
+- **A new sign-in now ends the session it replaces.** A console sign-in by password,
+  Windows SSO or OIDC ends the session the browser already held, and the IDE revokes
+  the token a new sign-in replaces. The bearer `POST /auth/login` and
+  `/auth/negotiate` legs revoke nothing, because they return a token without
+  replacing one; ending the old token is the client's job there.
+  ([BACKLOG #1146](docs/BACKLOG.md))
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,

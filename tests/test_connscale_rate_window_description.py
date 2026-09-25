@@ -4,21 +4,28 @@
 
 `_run_one_step` appends the step's FINAL engine sample **after** `sampler_stop.set()` has stopped the
 in-hold sampler, after `driver.stop(_STOP_GRACE)`, after `poller.await_drain(...)` and after
-`asyncio.sleep(_SETTLE)`. `_empty_claim_rates` then reads `samples[0]` and `samples[-1]`, so the
-window every empty-claim and throughput rate is computed over ENDS AT A POST-DRAIN READING. Five
-sites once described that window as "first to last in-hold samples". The last sample is not in-hold,
-so the described window and the computed window were not the same window.
+`asyncio.sleep(_SETTLE)`. It counts `in_hold_samples` BEFORE that append, and `_build_record` cuts the
+rate window as `samples[:in_hold_samples]`. So the window every empty-claim and throughput rate is
+computed over now STOPS BEFORE the post-drain reading. That is fix (a).
 
-Fix (b) corrected all five (commit 58b3d96b3, on `main` at a2eef0f37): the span is stated ONCE, in
-`_empty_claim_rates`, and the other four point there rather than restate it (SDS-3.5). The tail stays
-INSIDE the numbers.
+The history, in order. Five sites once described a window ending at the post-drain final as "first to
+last in-hold samples". Fix (b) (commit 58b3d96b3) corrected the words and kept the tail in the
+numbers. BACKLOG #1430's sampler floor then guaranteed two readings before the final, and fix (a)
+took the tail out. The window is defined ONCE, in `_empty_claim_rates`, and the other sites point
+there rather than restate it (SDS-3.5).
 
-**THIS MODULE IS THE GUARD AGAINST THAT CORRECTION AND THE CODE DRIFTING APART AGAIN.** It pins both
-halves, because either one moving alone re-opens the defect:
+**THE WINDOW IS STILL NOT "THE HOLD".** It holds the in-hold readings plus up to
+`_MIN_IN_HOLD_SAMPLES` make-up floor ticks, which the sampler can take after the hold ends. So the
+retired sentence stays retired, and the scanner below still reds on it.
 
-* the ORDERING in `_run_one_step` -- the final sample really is appended after the sampler stops;
-* the DESCRIPTION -- the one definition still says the tail is inside, the other sites still point at
-  it, and no site re-asserts the retired sentence.
+**THIS MODULE IS THE GUARD AGAINST THE DESCRIPTION AND THE CODE DRIFTING APART.** It pins three
+things, because any one moving alone re-opens the defect:
+
+* the ORDERING in `_run_one_step` -- `in_hold_samples` is counted after the sampler stops and before
+  the final sample is appended;
+* the SLICE in `_build_record` -- both rate functions get the same window, and it excludes the final;
+* the DESCRIPTION -- the one definition says the tail is OUTSIDE, the other sites point at it, and no
+  site re-asserts the retired sentence.
 
 **A GUARD NOBODY CAN SHOW FIRING IS NOT EVIDENCE, so the controls are tests, not a one-off terminal
 run.** `test_the_scanner_flags_every_sentence_fix_b_retired` feeds the scanner the five sentences
@@ -45,12 +52,15 @@ import pytest
 
 from harness.load.connscale import report as report_module
 from harness.load.connscale import runner as runner_module
+from harness.load.connscale.report import ConnScaleRecord
 from harness.load.connscale.runner import (
     _empty_claim_rates,
     _empty_claims_per_msg,
     _run_one_step,
     _throughput_rates,
 )
+from harness.load.enginepoll import EnginePoller, EngineSample
+from harness.load.metrics import Counters, Histogram
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -104,19 +114,34 @@ _RETIRED_AT_FD44B0F17 = {
     ),
 }
 
-# The claims `_empty_claim_rates` must keep making. Reverting any of them is the drift this guards.
+# The claims `_empty_claim_rates` must keep making since fix (a). Reverting any of them is the drift
+# this guards: the slice, the make-up ticks that stop it being "the hold", the exclusion, and the
+# warning that readings either side of the change do not compare.
 _DEFINITION_CLAIMS = (
-    "samples[-1]",
-    "NOT in-hold",
+    "samples[:in_hold_samples]",
+    "make-up floor ticks",
     "sampler_stop.set()",
     "await_drain",
+    "EXCLUDES the post-drain final",
+    "OUTSIDE the number",
+    "NOT COMPARABLE",
+    "rate_window",
+)
+
+# Fix (b)'s claims that the tail is IN the number. Any of them coming back means the description has
+# reverted while the code has not.
+_RETIRED_DEFINITION_CLAIMS = (
     "the hold PLUS",
     "INSIDE the number",
 )
 
-# The ordering that makes the final sample post-drain, in the order `_run_one_step` runs it.
+# The ordering that keeps the final sample out of the rate window, in the order `_run_one_step` runs
+# it. `in_hold_samples` must be counted after the sampler stops and before the final is appended:
+# `_build_record` slices `samples[:in_hold_samples]`, so a count taken after the append would put the
+# post-drain final back inside every rate.
 _ORDERING = (
     "sampler_stop.set()",
+    "in_hold_samples = len(samples)",
     "await driver.stop(_STOP_GRACE)",
     "await poller.await_drain(",
     "await asyncio.sleep(_SETTLE)",
@@ -182,13 +207,21 @@ def test_the_scanner_flags_every_sentence_fix_b_retired(site: str) -> None:
 
 
 def test_the_scanner_does_not_flag_the_corrected_sentences() -> None:
-    """NEGATIVE CONTROL. Fix (b)'s replacement wording must pass, or the guard is unsatisfiable and
-    the next author's only way out is to delete it."""
-    corrected = (
+    """NEGATIVE CONTROL. Acceptable wording must pass, or the guard is unsatisfiable and the next
+    author's only way out is to delete it. Two PARAPHRASES are fed in, one in the fix (a) sense and one
+    in fix (b)'s older sense: the scanner polices the retired "in-hold" sentence, not which side of
+    the tail a site is on -- the definition test below polices that. The corpus sweep further down
+    is what reads the real sources."""
+    current = (
+        "Empty claims PER MESSAGE absorbed, over the same rate window as the rates above. That "
+        "window EXCLUDES the step's post-drain final, and runs first→last over the readings it holds."
+    )
+    fix_b = (
         "Empty claims PER MESSAGE absorbed, over the same first→last sample window as the "
         "rates above. That window is the hold PLUS the step's post-drain tail."
     )
-    assert retired_window_claims(corrected) == []
+    assert retired_window_claims(current) == []
+    assert retired_window_claims(fix_b) == []
 
 
 def test_quoting_the_retired_sentence_is_allowed_but_asserting_it_is_not() -> None:
@@ -220,37 +253,159 @@ def test_a_docstring_delimiter_does_not_hide_an_assertion() -> None:
     )
 
 
-def test_the_ordering_check_reports_a_final_sample_taken_before_the_sampler_stops() -> None:
-    """CONTROL for the ordering half. Against a mutant that appends the final sample BEFORE
-    `sampler_stop.set()` -- which would make the sample genuinely in-hold and the current description
-    wrong in the other direction -- the check must name the landmark that moved."""
-    mutant = "\n".join(
-        (
+@pytest.mark.parametrize(
+    ("mutant", "offender"),
+    [
+        pytest.param(
+            (
+                "samples.append(final)",
+                "sampler_stop.set()",
+                "in_hold_samples = len(samples)",
+                "await driver.stop(_STOP_GRACE)",
+                "await poller.await_drain(timeout=1.0)",
+                "await asyncio.sleep(_SETTLE)",
+            ),
             "samples.append(final)",
-            "sampler_stop.set()",
+            id="final-appended-before-the-sampler-stops",
+        ),
+        pytest.param(
+            (
+                "sampler_stop.set()",
+                "await driver.stop(_STOP_GRACE)",
+                "await poller.await_drain(timeout=1.0)",
+                "await asyncio.sleep(_SETTLE)",
+                "samples.append(final)",
+                "in_hold_samples = len(samples)",
+            ),
+            # The check resumes each search where the last landmark matched, so it reports the first
+            # landmark it cannot find AFTER the moved count -- the driver stop, not the count itself.
             "await driver.stop(_STOP_GRACE)",
-            "await poller.await_drain(timeout=1.0)",
-            "await asyncio.sleep(_SETTLE)",
-        )
-    )
-    assert first_out_of_order(mutant, _ORDERING) == "samples.append(final)"
+            id="count-taken-after-the-final-is-appended",
+        ),
+    ],
+)
+def test_the_ordering_check_reports_a_landmark_that_moved(
+    mutant: tuple[str, ...], offender: str
+) -> None:
+    """CONTROL for the ordering half, against the two mutants that matter.
+
+    The first appends the final sample BEFORE `sampler_stop.set()`, which would make it genuinely
+    in-hold. The second counts `in_hold_samples` AFTER the append, which would put the post-drain
+    final back inside the rate window while every description says it is out. The check must reject
+    both, and accept the real order."""
+    assert first_out_of_order("\n".join(mutant), _ORDERING) == offender
     in_order = "\n".join(_ORDERING)
     assert first_out_of_order(in_order, _ORDERING) is None
+
+
+def _engine_sample(elapsed: float, *, read: int, empty: int) -> EngineSample:
+    return EngineSample(
+        elapsed_s=elapsed,
+        pending=0,
+        inflight=0,
+        done=0,
+        dead=0,
+        read=read,
+        written=read,
+        out_dead=0,
+        queue_depth=0,
+        in_pipeline=0,
+        db_size_bytes=0,
+        journal_mode="wal",
+        synchronous="normal",
+        uptime_s=elapsed,
+        empty_claims=empty,
+        empty_claims_idle_poll=empty,
+    )
+
+
+def _record_over(samples: list[EngineSample], in_hold_samples: int) -> ConnScaleRecord:
+    poller = EnginePoller("http://127.0.0.1:1", token=None, origin=0.0)
+    poller._samples = [samples[0], samples[-1]]
+    return runner_module._build_record(
+        claim_mode="per_lane",
+        fuse_mode=False,
+        batch_mode=False,
+        mode="fixed_aggregate",
+        count=4,
+        aggregate_rate=10.0,
+        metrics_counters=Counters(sent=samples[-1].read),
+        ack_hist=Histogram(),
+        poller=poller,
+        samples=samples,
+        in_hold_samples=in_hold_samples,
+        in_hold_floor_ticks=0,
+        proc_readings=[],
+        drain_seconds=1.0,
+        reload_seconds=None,
+    )
+
+
+def test_every_rate_is_computed_over_the_in_hold_slice_and_not_the_post_drain_final() -> None:
+    """THE SLICE, measured on the record rather than read off the source.
+
+    Three in-hold readings a second apart absorb 40 messages and 500 empty claims over 2 s, at an
+    UNEVEN pace, so a slice off by one reading at either end gives a different number for every
+    rate, the per-message ratio included. The post-drain final then lands 8 s later having absorbed
+    5 more messages and 400 more empty claims: the idle-drain regime fix (a) exists to keep out. Every rate must come from the first
+    three, and the numerator and denominator of `empty_claims_per_msg` must come from the SAME three.
+
+    THE CONTROL ARM runs the same list with the count taken after the append, which is the mutant the
+    ordering check above guards. It must move every number, or this test cannot tell the slice from
+    no slice."""
+    samples = [
+        _engine_sample(0.0, read=0, empty=0),
+        _engine_sample(1.0, read=10, empty=100),
+        _engine_sample(2.0, read=40, empty=500),
+        _engine_sample(10.0, read=45, empty=900),  # the post-drain final
+    ]
+    rec = _record_over(samples, in_hold_samples=3)
+    # 40 messages and 500 empty claims over 2 s. `samples[:2]` would give 10/s, 100/s and 10.0 per
+    # message; `samples[1:3]` 30/s, 400/s and about 13.3. Neither off-by-one passes any assert.
+    assert rec.achieved_read_per_s == pytest.approx(20.0)
+    assert rec.achieved_written_per_s == pytest.approx(20.0)
+    assert rec.empty_claims_per_s == pytest.approx(250.0)
+    assert rec.idle_poll_per_s == pytest.approx(250.0)
+    assert rec.empty_claims_per_msg == pytest.approx(12.5)
+    # The no-loss reconcile still sees the post-drain final: it reads `poller.final`, not the window.
+    assert rec.no_loss.engine_read == 45
+
+    tail_in = _record_over(samples, in_hold_samples=len(samples))
+    assert tail_in.achieved_read_per_s == pytest.approx(4.5)
+    assert tail_in.empty_claims_per_s == pytest.approx(90.0)
+    assert tail_in.empty_claims_per_msg == pytest.approx(20.0)
+
+
+def test_a_single_in_hold_reading_leaves_wall_3_undefined_rather_than_borrowing_the_final() -> None:
+    """With one reading before the final there is no window. The rates must be the guards' zeros and
+    the ratio `None`, NOT a number quietly computed against the post-drain final. This is the state
+    the #1430 floor prevents. On a live run the smoke's per-step floor assertion catches it, and
+    its `assert graded` is the run-level backstop."""
+    samples = [
+        _engine_sample(0.0, read=0, empty=0),
+        _engine_sample(10.0, read=25, empty=900),  # the post-drain final
+    ]
+    rec = _record_over(samples, in_hold_samples=1)
+    assert rec.achieved_read_per_s == 0.0
+    assert rec.empty_claims_per_s == 0.0
+    assert rec.empty_claims_per_msg is None
 
 
 # --- the guard proper -----------------------------------------------------------------------------
 
 
 def test_the_final_sample_is_appended_after_the_sampler_stops() -> None:
-    """THE ORDERING HALF. `samples[-1]` is a post-drain reading, which is what every description of
-    the window now says. If this reds, the code moved and the descriptions below need re-reading --
-    the fix is not to loosen this test."""
+    """THE ORDERING HALF. `in_hold_samples` is counted after the sampler stops and before the
+    post-drain final is appended, so `samples[:in_hold_samples]` excludes that final. If this reds,
+    the code moved and the descriptions below need re-reading -- the fix is not to loosen this
+    test."""
     source = inspect.getsource(_run_one_step)
     offender = first_out_of_order(source, _ORDERING)
     assert offender is None, (
         f"`_run_one_step` no longer runs {_ORDERING} in that order -- {offender!r} moved. "
-        "The rate window's description assumes the final sample is taken after the sampler stops "
-        "(BACKLOG #1420); re-read `_empty_claim_rates` before changing this."
+        "The rate window's description assumes `in_hold_samples` is counted after the sampler stops "
+        "and before the post-drain final is appended (BACKLOG #1420); re-read `_empty_claim_rates` "
+        "before changing this."
     )
     assert source.count("samples.append(") == 1, (
         "a second `samples.append(` appeared in the step -- which sample ends the rate window is no "
@@ -258,14 +413,20 @@ def test_the_final_sample_is_appended_after_the_sampler_stops() -> None:
     )
 
 
-def test_the_window_is_defined_once_and_still_says_the_tail_is_inside_it() -> None:
+def test_the_window_is_defined_once_and_says_the_tail_is_outside_it() -> None:
     """THE DESCRIPTION HALF, at the single definition site (SDS-3.5). `_empty_claim_rates` is the one
-    place BACKLOG #1420 allows to state the span; these are the claims it must keep making."""
+    place BACKLOG #1420 allows to state the span; these are the claims it must keep making, and fix
+    (b)'s claims that the tail is inside must not come back."""
     doc = " ".join((_empty_claim_rates.__doc__ or "").split())
     missing = [claim for claim in _DEFINITION_CLAIMS if claim not in doc]
     assert not missing, (
         f"`_empty_claim_rates` stopped saying {missing} -- it is the ONE place that defines the rate "
         "window, and every other site points here instead of restating it (BACKLOG #1420)"
+    )
+    reverted = [claim for claim in _RETIRED_DEFINITION_CLAIMS if claim in doc]
+    assert not reverted, (
+        f"`_empty_claim_rates` says {reverted} again. That was fix (b)'s wording, when the post-drain "
+        "tail was inside the rates; since fix (a) it is outside them (BACKLOG #1420)"
     )
 
 
@@ -299,9 +460,9 @@ def test_no_connscale_source_asserts_the_retired_window_description() -> None:
         if hits:
             offenders[path.relative_to(_REPO_ROOT).as_posix()] = [ascii(h) for h in hits]
     assert not offenders, (
-        f"{offenders} describe the rate window as first-to-last IN-HOLD. The last sample is taken "
-        "after `sampler_stop.set()`, `driver.stop`, `await_drain` and `sleep(_SETTLE)`, so it is not "
-        "in-hold (BACKLOG #1420). Point at `_empty_claim_rates` instead of restating the span."
+        f"{offenders} describe the rate window as first-to-last IN-HOLD. Its last reading can be a "
+        "make-up floor tick taken after the hold ended, so the window is not the hold (BACKLOG "
+        "#1420, #1430). Point at `_empty_claim_rates` instead of restating the span."
     )
 
 

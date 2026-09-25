@@ -19,11 +19,13 @@ silently-dropped key leaves the setting it was meant to apply un-applied, with n
 reporting a problem. An unknown top-level **section** is still tolerated.
 
 The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
-oversight: the **env** and **CLI** layers still drop an unrecognized key silently. Env cannot be
-checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read straight from
-``os.environ`` by their consuming module and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``,
-``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership test would refuse a
-correctly-configured deployment; CLI keys are engine-written, never operator-spelled. The one
+oversight: the **env** layer and the ``cli`` mapping still drop an unrecognized key silently. Env
+cannot be checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read
+straight from ``os.environ`` by their consuming module and are not fields on any section
+(``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership
+test would refuse a correctly-configured deployment. ``cli`` keys are engine-written from parsed
+arguments, never operator-spelled; an operator's unknown flag never reaches them, because argparse
+refuses it first with exit 2. The one
 exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
 Anything stated to an operator about this refusal must carry that scope — see
 ``docs/CONFIGURATION.md``.
@@ -3151,6 +3153,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
         # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
         "bootstrap_admin_expiring",
+        # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
+        # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)
+        "initial_credential_expiring",
         # #122 (ADR 0162): an application-log sink was rolled after a write failure (stage 1) or is
         # UNWRITABLE and this process's connections were stopped (stage 2). Routable on its own so an
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
@@ -3436,8 +3441,9 @@ class AlertsSettings(_Section):
     # security-notification channel exists — SMTP transport (the settings above) configured AND the
     # [auth].notify_security_events kill-switch on (both are what api/app.py needs to wire the notifier)
     # — so account-security events (lockout, password/roles change, new-IP admin action) always have a
-    # push channel, not just the pull-only /me/security-events feed. Set false to accept the pull-only
-    # feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
+    # push channel, not just the pull-only /me/security-events feed. That feed carries the user's own
+    # events, not an administrator's change to their account (auth/notifications.py states the rule).
+    # Set false to accept the pull-only feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
     # messagefoundry/__main__.py.
     security_notifications_required: bool = True
 

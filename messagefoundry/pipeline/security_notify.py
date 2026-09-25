@@ -25,13 +25,16 @@ from messagefoundry.auth.notifications import (
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     LOGIN_AFTER_FAILURES,
+    MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
+    NOTIFY_EMAIL_SET,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SecurityEvent,
+    deadline_utc,
 )
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AlertsSettings
@@ -51,6 +54,8 @@ _SUBJECTS = {
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
+    MFA_CREDENTIAL_REMOVED: "A second factor was removed from your MessageFoundry account",
+    NOTIFY_EMAIL_SET: "Security notices for your MessageFoundry account now come to this address",
     RECOVERY_CODE_USED: "A MessageFoundry recovery code was used on your account",
     ADMIN_NEW_IP: "A sensitive action on your MessageFoundry account from a new location",
 }
@@ -66,6 +71,19 @@ _DESCRIPTIONS = {
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",
+    # BACKLOG #1139: this arm reports WHAT CHANGED and states what still stands. It must not borrow
+    # the MFA_DISABLED wording, which asserts the account has no second factor left -- untrue here by
+    # construction, and a security notice the holder can falsify is one they stop reading. WHICH
+    # credential went is deliberately not named: the label is user-authored free text, and the audit
+    # row (``auth.webauthn_removed``) already carries it somewhere better protected than a mailbox.
+    MFA_CREDENTIAL_REMOVED: (
+        "One of the second factors on your account was removed. At least one other factor remains, "
+        "so two-factor authentication is still in force."
+    ),
+    NOTIFY_EMAIL_SET: (
+        "This address was set to receive security notices about your account. If you did not set "
+        "it, tell your administrator."
+    ),
     RECOVERY_CODE_USED: (
         "One of your single-use recovery codes was accepted as a second factor. That code is now "
         "spent and cannot be used again."
@@ -89,6 +107,16 @@ def _build_body(event: SecurityEvent) -> str:
     failed = event.detail.get("failed_attempts")
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
+    if event.event_type == PASSWORD_RESET:
+        # BACKLOG #1141 (ASVS 6.4.5): the renewal instruction for an expiring credential, sent to the
+        # holder. `expires_at` is the instant the login gate refuses on, read off the stored stamp.
+        stamp = event.detail.get("expires_at")
+        expires = deadline_utc(stamp) if isinstance(stamp, (int, float)) else None
+        if expires is not None:
+            lines.append(
+                f"The temporary password stops working at {expires}. Sign in with it and choose "
+                "a new password before then."
+            )
     if event.event_type == EMAIL_CHANGED:
         # BACKLOG #1139: an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL, not a repoint, and
         # it must not render as the repoint wording minus a line. "Was changed" with the new value
@@ -139,10 +167,13 @@ def _build_body(event: SecurityEvent) -> str:
                 )
     if event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
-    lines += [
-        "",
-        "If this was you, no action is needed. If not, contact your MessageFoundry administrator.",
-    ]
+    if event.event_type == PASSWORD_RESET:
+        # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
+        # would contradict the deadline line above it (BACKLOG #1141).
+        closing = "If you did not expect this reset, contact your MessageFoundry administrator."
+    else:
+        closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."
+    lines += ["", closing]
     return "\n".join(lines)
 
 

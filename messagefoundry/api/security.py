@@ -14,7 +14,6 @@ raising, so the caller can close the socket cleanly).
 
 from __future__ import annotations
 
-import datetime
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -24,6 +23,7 @@ from fastapi import HTTPException, Request, WebSocket, status
 
 from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
+from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
 from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
 from messagefoundry.config.tls_policy import HopDisposition
 
@@ -107,6 +107,36 @@ _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/me/reauth"),
         ("GET", "/me/mfa"),
     }
+)
+
+# BACKLOG #1139 (ASVS 6.3.7): while an account has no notification address and a notice channel is
+# wired (``Identity.must_set_notify_email``), only these routes stay reachable. Keyed on (METHOD,
+# path) for the reason the MFA set above is. /me/notify-email is the way out. The rest are the ways
+# out of the two gates that run first, so neither can deadlock behind this one.
+#
+# THE ``mfa_gate=False`` ROUTES ARE EXEMPT TOO, and they are not listed. Those are the reauth-only
+# factories (TOTP enrolment and confirm, session termination): the escapes an account under
+# ``require_mfa`` with no factor needs. Keying on the flag rather than on a copy of their paths is
+# what keeps this plane and the console's (which exempts every ``allow_mfa_pending`` route) the same.
+#
+# /me/notify-email is deliberately NOT in the MFA set above. A session still owing its factor has
+# proven only the password, and letting that caller choose where the account's notices go would hand
+# a password thief the channel meant to warn the holder.
+_NOTIFY_EMAIL_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("POST", "/auth/logout"),
+        ("GET", "/auth/me"),
+        ("POST", "/auth/mfa-verify"),
+        ("POST", "/me/password"),
+        ("POST", "/me/reauth"),
+        ("GET", "/me/mfa"),
+        ("POST", "/me/notify-email"),
+    }
+)
+
+#: The 403 detail for a session confined by the set above. Clients match on it, so keep it stable.
+NOTIFY_EMAIL_REQUIRED_DETAIL = (
+    "notification address required; POST /me/notify-email to set one, then retry"
 )
 
 # The one exempt route above whose exemption serves an account with NO factor only. A pending
@@ -236,18 +266,6 @@ def initial_credential_window_hours(auth: AuthService) -> float | None:
     return None if deadline is None else deadline / 3600.0
 
 
-def deadline_utc(ts: float) -> str | None:
-    """A deadline instant as a UTC ISO-8601 stamp, for text a client shows to a person.
-
-    ``None`` when the instant cannot be rendered. The expiry setting has no upper bound, and
-    ``fromtimestamp`` raises past year 9999, or past year 3000 on Windows. A deadline that far out
-    is not worth a 500 on the refusal that states it, so the caller drops the sentence instead."""
-    try:
-        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
 def _allow_no_auth(app_state: object) -> bool:
     """Whether this app explicitly opted out of auth (embedding/dev). Default: fail-closed."""
     return bool(getattr(app_state, "allow_no_auth", False))
@@ -375,6 +393,15 @@ def require(
                 status.HTTP_403_FORBIDDEN,
                 "multi-factor verification required; POST /auth/mfa-verify then retry",
                 headers={"X-MFA-Required": "1"},
+            )
+        # BACKLOG #1139 (ASVS 6.3.7): an account with no notification address sets one first. BELOW
+        # the factor gate, so a password-only session is sent to prove its factor before it can
+        # choose where notices go. ABOVE the permission loop, for the oracle reason given there.
+        if identity.must_set_notify_email and mfa_gate and route not in _NOTIFY_EMAIL_EXEMPT_ROUTES:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                NOTIFY_EMAIL_REQUIRED_DETAIL,
+                headers={"X-Notify-Email-Required": "1"},
             )
         for permission in permissions:
             if not identity.has(permission):
@@ -968,6 +995,10 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     # not tear down an established socket; the connection's own revalidation is the backstop.
     if not await auth.mfa_satisfied(ws_token(websocket)):
         await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
+        return None
+    # BACKLOG #1139: an account that owes a notification address does not stream either. BELOW the
+    # factor check, as in require(), so a password-only probe still leaves its auth.mfa_denied row.
+    if identity.must_set_notify_email:
         return None
     for permission in permissions:
         if not identity.has(permission):
