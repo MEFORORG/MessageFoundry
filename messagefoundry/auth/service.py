@@ -22,7 +22,8 @@ import secrets
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -168,11 +169,14 @@ _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
 # Bound on the per-process new-client-IP dedup cache (WP-L3-13). It only debounces the audit/notify
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
 _NEW_IP_DEDUP_MAX = 4096
-# Bound on the per-session re-proof failure counts (BACKLOG #1138). When it is full, entries older than
-# the absolute session lifetime go first, since their sessions cannot still be alive. Only then is the
-# oldest live entry evicted, which resets that one session's budget: a residual that needs this many
-# sessions with failed re-proofs inside one session lifetime.
+# Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
+# its entry is younger than the absolute session lifetime, because evicting it would hand that session
+# a fresh budget. When the map is full, entries older than that lifetime go first; if it is still
+# full, a session with no entry yet is revoked on its first failed re-proof instead (fail closed). One
+# account may hold at most _REPROOF_SESSION_PER_USER entries, dropping its own oldest, so a single
+# account cannot fill the map.
 _REPROOF_SESSION_MAX = 4096
+_REPROOF_SESSION_PER_USER = 64
 
 #: ASVS 6.3.8 — the fixed budget every FAILED authentication response is held to, so the branch a
 #: challenge took cannot be read off its latency (BACKLOG #1140). Successes are never padded: a valid
@@ -431,6 +435,15 @@ class _FederatedBindingWithdrawn(Exception):
     """
 
 
+def _reproof_refusal_reason(proof: _Reproof) -> str:
+    """The closed-set ``reason`` a refused password-change re-proof is audited with."""
+    if proof.session_revoked:
+        return "session_revoked"
+    if proof.session_gone:
+        return "session_gone"
+    return "bad_password"
+
+
 def _live_lock(user: UserRecord, now: float) -> bool:
     """Whether ``user`` is under a lockout that has not yet expired at ``now``."""
     return user.locked_until is not None and now < user.locked_until
@@ -463,10 +476,14 @@ class _Reproof:
     ``attempts`` come from the one atomic store call; the caller audits its own row first and only
     then records the lockout, so the order in the trail matches the login leg's. ``cleared`` says a
     success reset the counter, which happens only at full authentication. ``session_revoked`` says
-    the session is gone: this attempt spent its re-proof budget, or it was already revoked."""
+    this attempt spent the session's re-proof budget; the caller audits it and then revokes the
+    session with :meth:`AuthService._revoke_for_budget`."""
 
     ok: bool
     session_revoked: bool = False
+    #: The session was already gone (revoked or rotated away) when the attempt got the lock. It was
+    #: not verified and this attempt revoked nothing.
+    session_gone: bool = False
     user: UserRecord | None = None
     attempts: int = 0
     just_locked: bool = False
@@ -759,12 +776,12 @@ class AuthService:
         # Process-local like the caches above; an entry lives only while someone holds or awaits it.
         self._reproof_locks: dict[str, _ReproofLock] = {}
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
-        # session, monotonic time of the first). At lockout_threshold the session is revoked, so a stolen session gets that many
+        # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
         # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
         # oldest evicted) and carried across a rotation by _rekey_token_state. PROCESS-LOCAL, with the
         # same accepted caveat as _action_step_up_grants: a restart forgets the counts, and a topology
         # that serves the API from more than one process gives each process its own budget.
-        self._reproof_session_failures: dict[str, tuple[int, float]] = {}
+        self._reproof_session_failures: dict[str, tuple[int, float, str]] = {}
         # Boot-time Kerberos acceptor preflight outcome (ADR 0068 §9): None = usable (or the
         # preflight never ran); a reason string = browser SSO degraded until restart.
         self._kerberos_unavailable_reason: str | None = None
@@ -3016,7 +3033,7 @@ class AuthService:
           started before the rotation can never be finished, which is a dead end, not a retry.
         * ``_new_ip_seen`` — the WP-L3-13 dedupe. Stranded ⇒ a *second* new-IP step-up + audit row
           for an address the session already re-verified from.
-        * ``_reproof_session_failures`` — the BACKLOG #1138 per-session re-proof budget. Stranded ⇒
+        * ``_reproof_session_failures`` — the BACKLOG #1138 per-session re-proof budget. Stranded,
           any rotation would hand the session a fresh budget of guesses.
 
         Deadlines and values are carried, never refreshed: a rotation must not extend anything.
@@ -3046,11 +3063,18 @@ class AuthService:
         nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
         """
         old_hash = hash_token(token)
-        new_token = mint_token()
-        if not await self._store.rotate_session(old_hash, new_token_hash=hash_token(new_token)):
+        session = await self._store.get_session(old_hash)
+        if session is None:
             return None
-        self._rekey_token_state(old_hash, hash_token(new_token))
-        return new_token
+        # Under the account's re-proof lock (BACKLOG #1138), so no rotation lands while a password
+        # re-proof on this session is mid-verify. Otherwise the re-proof would charge its failure to
+        # the hash the rotation just retired, and the live session would never count it.
+        async with self._account_reproof_lock(session.user_id):
+            new_token = mint_token()
+            if not await self._store.rotate_session(old_hash, new_token_hash=hash_token(new_token)):
+                return None
+            self._rekey_token_state(old_hash, hash_token(new_token))
+            return new_token
 
     async def _elevated(
         self,
@@ -3299,13 +3323,13 @@ class AuthService:
         await self._audit(
             "auth.password_change_failed",
             actor=identity.username,
-            detail=_json(
-                {"reason": "session_revoked" if proof.session_revoked else "bad_password"}
-            ),
+            detail=_json({"reason": _reproof_refusal_reason(proof)}),
             client=client,
         )
         await self._record_reproof_lockout(proof, client=client, audit_detail=None)
         if proof.session_revoked:
+            await self._revoke_for_budget(hash_token(token))
+        if proof.session_revoked or proof.session_gone:
             return CurrentPasswordCheck.SESSION_ENDED
         return CurrentPasswordCheck.WRONG
 
@@ -3315,7 +3339,7 @@ class AuthService:
         password: str,
         *,
         directory: bool,
-        token: str | None,
+        token: str,
         clear: bool = True,
     ) -> _Reproof:
         """Verify a post-session credential re-proof: counted on the ACCOUNT, capped per SESSION.
@@ -3357,43 +3381,57 @@ class AuthService:
 
         **The cap covers these password re-proofs only.** A wrong TOTP or recovery code
         (``verify_mfa``) still counts on the account alone."""
-        entry = self._reproof_locks.setdefault(identity.user_id, _ReproofLock())
+        async with self._account_reproof_lock(identity.user_id):
+            return await self._reproof_serialized(
+                identity, password, directory=directory, token=token, clear=clear
+            )
+
+    @asynccontextmanager
+    async def _account_reproof_lock(self, user_id: str) -> AsyncIterator[None]:
+        """Hold the per-account lock that orders password re-proofs and session rotations."""
+        entry = self._reproof_locks.setdefault(user_id, _ReproofLock())
         entry.users += 1
         try:
             async with entry.lock:
-                return await self._reproof_serialized(
-                    identity, password, directory=directory, token=token, clear=clear
-                )
+                yield
         finally:
             entry.users -= 1
             if entry.users == 0:
-                del self._reproof_locks[identity.user_id]
+                del self._reproof_locks[user_id]
 
     def _session_reproof_failures(self, token_hash: str) -> int:
         """How many failed re-proofs this session has been charged."""
         entry = self._reproof_session_failures.get(token_hash)
         return 0 if entry is None else entry[0]
 
-    def _charge_reproof_failure(self, token_hash: str) -> int:
+    def _charge_reproof_failure(self, token_hash: str, user_id: str) -> int:
         """Charge one failed re-proof to a session; return its total. Synchronous on purpose: it runs
         before any await after the verdict, so a store error later in the attempt cannot leave an
-        evaluated guess uncharged. Re-inserting keeps the most recently failing sessions newest."""
-        now = time.monotonic()
-        count, first = self._reproof_session_failures.pop(token_hash, (0, now))
-        if len(self._reproof_session_failures) >= _REPROOF_SESSION_MAX:
-            lifetime = self._settings.session_absolute_hours * 3600
-            for stale in [
-                h
-                for h, (_, seen) in self._reproof_session_failures.items()
-                if now - seen > lifetime
-            ]:
-                del self._reproof_session_failures[stale]
-        if len(self._reproof_session_failures) >= _REPROOF_SESSION_MAX:
-            self._reproof_session_failures.pop(next(iter(self._reproof_session_failures)))
-        self._reproof_session_failures[token_hash] = (count + 1, first)
-        return count + 1
+        evaluated guess uncharged.
 
-    async def _revoke_for_budget(self, token_hash: str, now: float) -> None:
+        A live count is never evicted (see :data:`_REPROOF_SESSION_MAX`). When there is no room, the
+        answer is the cap itself, so the caller revokes this session rather than track it."""
+        now = time.monotonic()
+        failures = self._reproof_session_failures
+        existing = failures.get(token_hash)
+        if existing is not None:
+            count, first, _ = existing
+            failures[token_hash] = (count + 1, first, user_id)
+            return count + 1
+        mine = [h for h, (_, _, uid) in failures.items() if uid == user_id]
+        if len(mine) >= _REPROOF_SESSION_PER_USER:
+            # This account's own oldest entry goes; no other account's count is touched.
+            del failures[mine[0]]
+        if len(failures) >= _REPROOF_SESSION_MAX:
+            lifetime = self._settings.session_absolute_hours * 3600
+            for stale in [h for h, (_, seen, _) in failures.items() if now - seen > lifetime]:
+                del failures[stale]
+        if len(failures) >= _REPROOF_SESSION_MAX:
+            return max(self._policy.lockout_threshold, 1)
+        failures[token_hash] = (1, now, user_id)
+        return 1
+
+    async def _revoke_for_budget(self, token_hash: str, now: float | None = None) -> None:
         """Revoke a session that spent its re-proof budget. The count is dropped only AFTER the revoke
         commits: if the write fails, the count stays at the cap and the next attempt revokes again
         instead of starting a fresh budget."""
@@ -3406,28 +3444,29 @@ class AuthService:
         password: str,
         *,
         directory: bool,
-        token: str | None,
+        token: str,
         clear: bool,
     ) -> _Reproof:
         """The body of :meth:`_reproof`, run under its per-account lock."""
         user = await self._store.get_user(identity.user_id)
         if user is None:
             return _Reproof(ok=False)
-        if token is None:
-            # No session to charge a failure to, so no budget: fail closed without verifying.
-            return _Reproof(ok=False, session_revoked=True, user=user)
         token_hash = hash_token(token)
         session = await self._store.get_session(token_hash)
         if session is None or session.revoked_at is not None or session.user_id != user.id:
-            # Revoked while this attempt waited behind the lock -- by the budget, or by anything
-            # else. It is not verified, so a queued burst cannot outrun the budget.
+            # Revoked or rotated away while this attempt waited behind the lock -- by the budget,
+            # or by anything else. It is not verified, so a queued burst cannot outrun the budget.
             self._reproof_session_failures.pop(token_hash, None)
-            return _Reproof(ok=False, session_revoked=True, user=user)
-        threshold = self._policy.lockout_threshold
+            return _Reproof(ok=False, session_gone=True, user=user)
+        # At least one guess, so a lockout_threshold of 0 (documented as "locks on the first
+        # failure") revokes on the first failure rather than on every re-proof.
+        threshold = max(self._policy.lockout_threshold, 1)
         if self._session_reproof_failures(token_hash) >= threshold:
-            # Already at the cap with the session still live: an earlier revoke did not land.
+            # Already at the cap with the session still live: the attempt that reached the cap has
+            # not revoked it yet, or its revoke failed. Revoke without verifying. The revocation is
+            # that earlier attempt's, so this one reports the session gone.
             await self._revoke_for_budget(token_hash, time.time())
-            return _Reproof(ok=False, session_revoked=True, user=user)
+            return _Reproof(ok=False, session_gone=True, user=user)
         verdict: bool | None
         if directory:
             verdict = await self._reauth_ad(identity.username, password)
@@ -3437,7 +3476,7 @@ class AuthService:
             )
         if verdict is None:
             return _Reproof(ok=False, user=user)
-        charged = self._charge_reproof_failure(token_hash) if not verdict else 0
+        charged = self._charge_reproof_failure(token_hash, user.id) if not verdict else 0
         # A fresh read and a fresh clock: the verify may have taken seconds, and another leg may have
         # set a lock meanwhile.
         now = time.time()
@@ -3448,7 +3487,9 @@ class AuthService:
             if current is not None and not locked:
                 attempts, just_locked = await self._register_failure(user, now)
             if charged >= threshold:
-                await self._revoke_for_budget(token_hash, now)
+                # The caller audits this attempt, records any lockout, and only then revokes, so a
+                # failed revoke cannot lose those rows. Until the revoke lands the count stays at the
+                # cap, and any attempt that gets the lock first revokes the session unverified.
                 return _Reproof(
                     ok=False,
                     session_revoked=True,
@@ -3462,7 +3503,7 @@ class AuthService:
         if not clear:
             # The password-change leg: nothing rotates here, and a change refused by policy leaves the
             # session as it was, budget included.
-            return _Reproof(ok=True, user=user)
+            return _Reproof(ok=True, user=current)
         # The re-auth leg: a good proof resets this session's budget, and the success rotates it.
         self._reproof_session_failures.pop(token_hash, None)
         cleared = (
@@ -3472,7 +3513,9 @@ class AuthService:
         )
         if cleared:
             await self._store.record_login_success(user.id, now=now)
-        return _Reproof(ok=True, user=user, cleared=cleared)
+        # The FRESH row, so the caller's login-after-failures check sees failures other legs added
+        # during the verify.
+        return _Reproof(ok=True, user=current, cleared=cleared)
 
     async def _record_reproof_lockout(
         self, proof: _Reproof, *, client: str | None, audit_detail: dict[str, Any] | None
@@ -3527,7 +3570,7 @@ class AuthService:
             token=token,
         )
         ok = proof.ok
-        elevation = Elevation(session_lost=proof.session_revoked)
+        elevation = Elevation(session_lost=proof.session_revoked or proof.session_gone)
         grant_refused = False
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
@@ -3566,8 +3609,8 @@ class AuthService:
                     # A good password whose purpose grant was refused (a pending session on an
                     # account with a factor). Without it the row reads as a granted re-proof.
                     "grant_refused": grant_refused,
-                    # The session is gone: this failure spent its re-proof budget and revoked it,
-                    # or it was revoked while the attempt waited (BACKLOG #1138).
+                    # This failure spent the session's re-proof budget, so it is revoked
+                    # (BACKLOG #1138). A session already gone reads session_lost alone.
                     "session_revoked": proof.session_revoked,
                 }
             ),
@@ -3575,6 +3618,8 @@ class AuthService:
         )
         provider_detail = {"provider": identity.auth_provider.value}
         await self._record_reproof_lockout(proof, client=client, audit_detail=provider_detail)
+        if proof.session_revoked:
+            await self._revoke_for_budget(hash_token(token))
         # Flagged only on the success that CLEARED the counter. On a session still owing its second
         # factor nothing clears, so flagging there would repeat the row and the notice on every
         # re-auth. That session's clear happens later in verify_mfa, which flags nothing: the gap
@@ -3747,9 +3792,10 @@ class AuthService:
         try:
             known = await asyncio.to_thread(self._ldap.resolve_principal, username)
         except LdapError:
-            # The directory answered the bind and refused it; only the follow-up lookup failed.
-            # That was a guess the DC evaluated, so it counts.
-            return False
+            # ``authenticate`` also answers None where no real bind was judged (an empty password, an
+            # unfound principal's equalizing bind, a DC too busy to answer the bind), so a lookup
+            # that then fails cannot show the password was checked. Not counted, like an outage.
+            return None
         return False if known is not None else None
 
     async def has_recent_step_up(self, token: str | None) -> bool:

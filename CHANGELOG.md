@@ -81,7 +81,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   rejected re-bind still reaches the domain controller, so the domain's own lockout policy can still
   lock the domain account. A directory the engine cannot reach, or one with no such account, is not
   counted. The per-session count lives in each engine process: a restart resets it, and each engine
-  shard serving its own API port keeps its own. The crossing attempt writes `auth.account_locked`. A
+  shard serving its own API port keeps its own, so there the cap is per process rather than in
+  total. The crossing attempt writes `auth.account_locked`. A
   re-auth that clears a run of three or more failures writes `auth.login_after_failures`. A failed
   current-password check at `POST /me/password` is now audited as `auth.password_change_failed`.
   (`BACKLOG #1138`)

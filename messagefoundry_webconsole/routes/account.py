@@ -265,7 +265,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                 raise  # rate-limited — keep the Retry-After semantics
             if exc.status_code == status.HTTP_401_UNAUTHORIZED:
-                # The failure spent this session's re-proof budget and revoked it (BACKLOG #1138).
+                # The session is gone: this failure spent its re-proof budget (BACKLOG #1138), or
+                # it was revoked by other means while the request waited.
                 return login_redirect_response()
             return await _retry(str(exc.detail), exc.status_code)
         # Changed: the service revoked every session (incl. this cookie) — sign in again. This is the

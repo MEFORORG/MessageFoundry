@@ -354,6 +354,10 @@ async def test_a_failed_revoke_keeps_the_session_at_its_cap(
         with pytest.raises(RuntimeError):
             await service.reauth(identity, WRONG, token=token)
         assert not await _session_revoked(store, token)
+        # The attempt and the lockout it crossed were recorded before the revoke was tried.
+        feed = await service.security_events_for("bob")
+        assert len(_actions(feed, "auth.reauth")) == 3
+        assert len(_actions(feed, "auth.account_locked")) == 1
         monkeypatch.setattr(store, "revoke_session", real_revoke)
 
         verifies = 0
@@ -383,6 +387,76 @@ async def test_the_password_change_leg_does_not_reset_the_budget_on_a_refused_ch
         await service.reauth(identity, WRONG, token=token)
         await service.verify_current_password(identity, GOOD, token=token)
         assert service._reproof_session_failures[hash_token(token)][0] == 1
+    finally:
+        await store.close()
+
+
+async def test_a_rotation_during_the_verify_cannot_strand_the_charge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rotation (a verified code, a passkey) that lands while a password re-proof is mid-verify
+    would move the count to the new hash, and the failure would be charged to the retired one. The
+    live session would then never count it: an uncharged guess per rotation. Rotation waits for the
+    re-proof instead, and then carries the charge across."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        real_argon2 = service._argon2
+        rotation: list[asyncio.Task[str | None]] = []
+
+        async def rotate_mid_verify(fn: Any, *args: Any) -> Any:
+            rotation.append(asyncio.create_task(service._rotate_session_token(token)))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            return await real_argon2(fn, *args)
+
+        monkeypatch.setattr(service, "_argon2", rotate_mid_verify)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        rotated = await rotation[0]
+        assert rotated is not None
+        assert service._session_reproof_failures(hash_token(rotated)) == 1
+        assert hash_token(token) not in service._reproof_session_failures
+    finally:
+        await store.close()
+
+
+async def test_a_threshold_of_zero_revokes_on_the_first_failure_not_on_every_reproof() -> None:
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=0, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok, "a correct re-proof must not be refused by a zero threshold"
+        assert out.token is not None
+        assert (await service.reauth(identity, WRONG, token=out.token)).session_lost
+    finally:
+        await store.close()
+
+
+async def test_one_account_cannot_evict_another_sessions_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Evicting a live count hands that session a fresh budget. One account's entries are capped and
+    evict only its own; a full map revokes a new session on its first failure instead of evicting."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_MAX", 3)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        assert service._charge_reproof_failure("victim", "u-victim") == 1
+        for i in range(10):  # an attacker's own account, looping sign in and fail once
+            service._charge_reproof_failure(f"attacker-{i}", "u-attacker")
+        assert service._session_reproof_failures("victim") == 1, "the victim's count was evicted"
+        owned = [
+            h for h, (_, _, uid) in service._reproof_session_failures.items() if uid == "u-attacker"
+        ]
+        assert len(owned) == 2
+        # Full: a third account's new session is answered at the cap, so its caller revokes it.
+        assert service._charge_reproof_failure("other", "u-other") == 5
+        assert service._session_reproof_failures("victim") == 1
     finally:
         await store.close()
 

@@ -1992,7 +1992,7 @@ per-actor ceremony budget exists to prevent. So a re-proof failure counts on the
 lock sign-in and raise `ACCOUNT_LOCKED`, and is also charged to its own **session**: the failure that
 brings a session to `lockout_threshold` revokes it. A stolen session therefore gets that many
 **password** guesses in total, not that many per lock window. The count travels with the session when
-its token rotates. During a live lock a failure is charged to the session only, so a re-proof does not
+its token rotates, and a rotation waits for any re-proof on the account that is mid-verify. During a live lock a failure is charged to the session only, so a re-proof does not
 re-arm or extend the lock, except when another leg sets the lock in the moment between the re-proof's
 read of the account and its failure write. A good re-proof during a lock succeeds without clearing it.
 **The cap covers the password re-proofs only.** A wrong TOTP or recovery code still counts on the
@@ -2001,9 +2001,10 @@ second factor cannot complete it, or reach the password change, while the accoun
 **The per-session count is process-local**, like the per-action step-up grants: a restart
 resets it, and a topology that serves the API from several processes, such as `serve --shard` engine
 shards with their own API ports over one store, gives each process its own count, so a session reachable
-on K ports gets up to K times the budget. The count is also held in a bounded map: when it fills,
-entries older than the absolute session lifetime go first, and only then the oldest live one, whose
-session starts over. That matters for AD, because since the AD sign-in was retired
+on K ports gets up to K times the budget. The count is also held in a bounded map, and a live count is never
+evicted: one account holds at most 64 entries and drops only its own oldest, entries older than the
+absolute session lifetime go when the map fills, and if it is still full a session with no entry yet
+is revoked on its first failed re-proof. That matters for AD, because since the AD sign-in was retired
 the step-up re-auth route is the **only** place an AD password is still bound: a rejected re-bind counts
 on the engine's own row and against the session. The engine never writes a lock to the directory
 account. Each rejected re-bind still reaches the DC, though, up to `lockout_threshold` per session. So a
@@ -2070,7 +2071,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 
 | # | Control | Protects | Threshold / window | Disable switch | What remains when off |
 |---|---|---|---|---|---|
-| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs of sign-in. The step-up re-auth and password-change re-proofs feed it but are not refused by it; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session (the note after the 6.1.3 paragraph above) | 5 consecutive failures → 15 min; the count is applied by a single atomic store call, so failures submitted **in parallel** each land and a burst locks the account exactly as a serial run does; a lapsed window restarts the counter, so each lock expires on its own — but **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure | limiters 2 + 3 only |
+| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs of sign-in. The step-up re-auth and password-change re-proofs feed it but are not refused by it; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session (the note after the 6.1.3 paragraph above) | 5 consecutive failures → 15 min; the count is applied by a single atomic store call, so failures submitted **in parallel** each land and a burst locks the account exactly as a serial run does; a lapsed window restarts the counter, so each lock expires on its own — but **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure, and a session is revoked on its first failed re-proof | limiters 2 + 3 only |
 | 2 | **Sign-in sliding window** (`allow_login_attempt`) | password-spraying across many usernames, which never trips a single account's lockout | > 10 attempts per client IP **or** > 60 across all clients, per 60 s (either dimension alone refuses — `global_full or key_full`) | `[auth].login_rate_limit_enabled = false` | lockout only — **and limiter 3 disappears with it** (see below) |
 | 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, **before** the per-session cap revokes the session | > 10 ceremonies per acting **user**, per 60 s. **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled` | the per-session cap — `POST /me/reauth` and `POST /me/password` still count each failure, and a session is revoked at `lockout_threshold` failures. Re-proofs run one at a time per account, so a burst on one session is checked one at a time against its cap, within one engine process |
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
