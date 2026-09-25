@@ -28,6 +28,7 @@ from messagefoundry.auth.policy import ASVS_6_2_4_MIN_CORPUS_ENTRIES, BreachCorp
 from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_admin
 
 #: A password the stand-in corpora below declare leaked. Holds no CONTEXT_WORDS entry and clears the
 #: default length, so the breach clause is the only one it can trip -- which is what lets an arm read
@@ -67,7 +68,8 @@ async def empty_store() -> AsyncIterator[MessageStore]:
     """An in-memory store with no users, so `initialize` takes the first-run branch (BACKLOG #1447).
 
     `_ensure_bootstrap_admin` returns early on `count_users() > 0`, so an empty store is a
-    precondition of every arm below and not an incidental detail of the fixture.
+    precondition of every arm below that calls `initialize()` on it, and not an incidental detail of
+    the fixture. The arms that use `create_admin` write their user first, so they skip that branch.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -302,14 +304,19 @@ async def test_a_user_password_change_still_refuses_while_the_same_service_mints
     """The tightest pairing available: ONE service, ONE unusable corpus, two paths through it.
 
     Environment is held constant to the point of being the same object, so nothing but the per-call
-    argument can explain the difference. The bootstrap mints; the human's replacement password is
-    refused. A blanket suppression makes the `raises` block fail.
+    argument can explain the difference. The generator mints a temporary credential through an admin
+    reset; the human's replacement password is refused. A blanket suppression makes the `raises` block
+    fail.
+
+    The mint leg used to be the first-run bootstrap account. ADR 0183 Amendment A retires that
+    account (BACKLOG #1136), so the leg now goes through `admin_reset_password`, the generator's other
+    caller. The pairing is the same: one generated credential, one human-chosen one.
     """
     bundled_corpus([])
     service = AuthService(empty_store, AuthSettings())
-    boot = await service.initialize()
-    assert boot is not None
-    out = await service.login("admin", boot.password)
+    admin = await create_admin(service)
+    issued = await service.admin_reset_password(admin.user_id, actor="test")
+    out = await service.login(admin.username, issued.password)
     assert out.ok and out.identity is not None
     with pytest.raises(BreachCorpusUnavailable):
         await service.change_password(out.identity, "a-human-chosen-replacement-pass")
@@ -320,7 +327,8 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
 ) -> None:
     """`admin_reset_password` reaches the same generator, so the same suppression covers it. Worth its
     own arm because it is a SECOND caller of `_generate_policy_password`: a fix applied at the
-    bootstrap call rather than inside the generator would pass every arm above and fail this one.
+    bootstrap call rather than inside the generator would fail this one. The pairing arm above now
+    mints through the same reset, so the two overlap; this arm keeps the length check.
 
     SCOPE, because the assertion is weaker than the test name suggests. This proves only that
     GENERATING the temporary credential no longer raises. It does NOT prove the reset is usable end to
@@ -332,10 +340,8 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
     """
     bundled_corpus([])
     service = AuthService(empty_store, AuthSettings())
-    assert await service.initialize() is not None
-    admin = await empty_store.get_user_by_username("admin")
-    assert admin is not None
-    issued = await service.admin_reset_password(admin.id, actor="admin")
+    admin = await create_admin(service)
+    issued = await service.admin_reset_password(admin.user_id, actor="test")
     assert issued.password and len(issued.password) >= 20
 
 

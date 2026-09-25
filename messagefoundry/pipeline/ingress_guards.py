@@ -10,7 +10,8 @@ check`` and the Test Bench previewed ``RECEIVED`` for fixtures the engine would 
 previewed ``ERROR``/mojibake for bodies the engine accepts (BACKLOG #1689).
 
 This module holds the rule once. It is **pure** — no store, no ACK, no event loop — which is exactly
-the subset both callers share: the live listener's remaining work (recording the ``ERROR`` row,
+the subset both callers share. The one exception is :func:`admit_resubmission`, the operator resend's
+async entry point, which only schedules the pure checks onto worker threads as the listener does: the live listener's remaining work (recording the ``ERROR`` row,
 building the AR/AE frame, capturing the ACK) is I/O the dry-run has no business simulating, so the
 seam sits at "decoded text, or the reason it was refused".
 
@@ -20,14 +21,15 @@ runner keeps its own inline copy of the sequence, and
 ``tests/test_ingress_guard_parity.py`` pins the two against each other so the copy cannot drift
 silently.
 
-**Two live guards are deliberately NOT mirrored here, and both omissions are by design:**
+**Two live guards are deliberately NOT mirrored for the dry-run, and both omissions are by design:**
 
 * **the strict-validation timeout.** The listener runs ``hl7apy`` off the event loop under
-  ``validation.strict_timeout_s`` and records ``ERROR`` + ``AE`` on expiry. Honouring it here would
-  force :func:`~messagefoundry.pipeline.dryrun.dry_run` to become ``async``, which ripples into
-  ``checks.py``, ``verify/smoke.py`` and ``dryrun_trace.py``. A dry-run therefore validates
-  **un-timed**: it can report ``RECEIVED``/``ERROR`` for a pathological body the engine would
-  ``AE``-NAK on a timeout instead.
+  ``validation.strict_timeout_s`` and records ``ERROR`` + ``AE`` on expiry. Honouring it in the
+  dry-run would force :func:`~messagefoundry.pipeline.dryrun.dry_run` to become ``async``, which
+  ripples into ``checks.py``, ``verify/smoke.py`` and ``dryrun_trace.py``. A dry-run therefore
+  validates **un-timed**: it can report ``RECEIVED``/``ERROR`` for a pathological body the engine
+  would ``AE``-NAK on a timeout instead. The operator resend (:func:`admit_resubmitted_body`) is
+  already off the loop, so it does honour the timeout.
 * **document detach** (``_detach_documents``, #149 / ADR 0105). It is ``async`` and it *writes*
   attachment rows, so there is no honest pure mirror of it. A dry-run consequently previews the
   whole body where a streaming inbound would have detached its documents.
@@ -35,6 +37,7 @@ silently.
 
 from __future__ import annotations
 
+import asyncio
 import codecs
 
 from messagefoundry.config.models import ContentType
@@ -49,20 +52,51 @@ from messagefoundry.parsing.peek import (
     enforce_size_limits,
 )
 from messagefoundry.parsing.sniff import _content_matches_declared, text_sniff_head
+from messagefoundry.parsing.validate import validate
 from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "INGRESS_MAX_BYTES",
     "NUL_REJECTED_REASON",
+    "STRICT_VALIDATE_TIMEOUT_SECONDS",
     "IngressGuardError",
+    "admit_resubmission",
     "admit_resubmitted_body",
     "carry_binary_ingress",
     "decode_ingress",
     "ingress_encoding",
     "ingress_size_error",
     "peek_max_bytes",
+    "raise_if_strictly_invalid",
     "store_safe_raw",
+    "streaming_over_threshold",
+    "strict_validate_timeout",
+    "strict_validation_due",
 ]
+
+# How long a single strict hl7apy validate may run before the message dead-letters (#89, DoS backstop).
+# Mirrors the _LOOKUP_RESULT_TIMEOUT_SECONDS rationale: a pathological body that makes hl7apy's
+# structure/cardinality parse spin can otherwise pin the listener's off-loop worker; the timeout frees
+# the listener and routes the message to ERROR/dead-letter. It CANNOT kill the worker thread (no
+# thread cancellation in CPython) — the orphaned validate leaks its thread until it returns, bounded by
+# the 16 MiB / segment caps enforce_size_limits fires BEFORE the slow parse (validate.py). Per-inbound
+# `validation.strict_timeout_s` overrides this; <= 0 there disables the backstop entirely. Owner-tunable.
+# The listener reads it as ``wiring_runner._STRICT_VALIDATE_TIMEOUT_SECONDS``; it lives here so the
+# resend (BACKLOG #1911) and the listener resolve it by one rule.
+STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
+
+
+def strict_validate_timeout(ic: InboundConnection) -> float | None:
+    """The effective wall-clock (seconds) for this inbound's strict validate, or ``None`` if disabled.
+
+    Resolves the per-connection ``validation.strict_timeout_s`` against the engine default (#89):
+    ``None`` inherits :data:`STRICT_VALIDATE_TIMEOUT_SECONDS`; ``<= 0`` disables the backstop (returns
+    ``None``, so the caller runs the validate un-timed, the pre-#89 behaviour). The value is trusted
+    config, not an HL7 field."""
+    configured = ic.validation.strict_timeout_s
+    effective = STRICT_VALIDATE_TIMEOUT_SECONDS if configured is None else configured
+    return effective if effective > 0 else None
+
 
 #: Engine-level ingress size ceiling (SEC-017, CWE-770). Mirrors ``wiring_runner._INGRESS_MAX_BYTES``;
 #: the HL7 path gets the same ceiling through ``Peek.parse`` -> ``enforce_size_limits`` instead, at the
@@ -80,8 +114,9 @@ class IngressGuardError(Exception):
 
     ``phase`` names which guard fired (``"decode"`` or ``"size"``) and matches the live listener's ACK
     phase labels, so a caller that records dispositions can map it onto the same one the engine writes.
-    :func:`admit_resubmitted_body` adds two more, ``"type"`` for the declared-type sniff and
-    ``"parse"`` for ``Peek.parse``; the dry-run entry points never raise either.
+    :func:`admit_resubmitted_body` adds three more, ``"type"`` for the declared-type sniff,
+    ``"parse"`` for ``Peek.parse`` and ``"strict"`` for strict ``hl7apy`` validation; the dry-run entry
+    points never raise any of them.
     """
 
     def __init__(self, reason: str, *, phase: str) -> None:
@@ -266,19 +301,23 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     * **type** -- the declared-type magic-byte sniff the listener applies to a non-HL7 body.
     * **parse** -- an HL7 body must pass ``Peek.parse``, which is the listener's only HL7 type check.
 
+    Strict ``hl7apy`` validation is NOT run here, because the listener times it and a synchronous
+    function cannot time itself without a thread of its own. :func:`admit_resubmission` runs this and
+    then the strict step, timed as the listener times it; call that one.
+
     The committed form is the ``\\r``-normalized text for HL7, the text verbatim for another text
     type, and canonical ``mfb64:v1:`` carriage for a binary type.
 
     ``ic`` is ``None`` when there is no inbound to guard for: the edit-resend direct path writes an
     outbound row, and a re-route whose origin inbound is no longer registered has no declared type. Only
     the engine-wide rules apply then, the NUL rule and the engine ceiling, and ``raw`` is returned as
-    is. Both callers today already bound that body below the ceiling (``EditResendRequest.raw`` and the
-    API's 1 MiB request cap), so the ceiling there is a backstop.
+    is. Strict validation is an inbound's setting, so it never applies there either. Both callers today
+    already bound that body below the ceiling (``EditResendRequest.raw`` and the API's 1 MiB request
+    cap), so the ceiling there is a backstop.
 
-    **Not mirrored, and a resubmission can therefore still differ from a sender's body:** strict
-    ``hl7apy`` validation (an inbound with ``validation.strict`` would ``AE``-NAK a body this admits),
-    and document detach. A streaming inbound raises ``max_message_bytes`` to pay for a detach this path
-    does not do, so its HL7 ceiling here stays at the engine default rather than the raised value.
+    **Not mirrored, and a resubmission can therefore still differ from a sender's body:** document
+    detach. A streaming inbound raises ``max_message_bytes`` to pay for a detach this path does not do,
+    so its HL7 ceiling here stays at the engine default rather than the raised value.
 
     The reason never carries a byte of the body, so a caller may return it to the operator and audit it."""
     if ic is None:
@@ -324,6 +363,72 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             raise IngressGuardError(f"parse error: {safe_exc(exc)}", phase="parse") from exc
     else:
         _raise_if_mistyped(ic, text_sniff_head(text))
+    return text
+
+
+def streaming_over_threshold(ic: InboundConnection, text: str) -> bool:
+    """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at or
+    above that threshold (#149, ADR 0105 Phase 1a). The listener gates its detach path on this, and
+    downgrades strict validation to header-only for such a body. Below threshold or unset, ``False``."""
+    threshold = ic.stream_threshold_bytes
+    return threshold is not None and len(text) >= threshold
+
+
+def strict_validation_due(ic: InboundConnection | None, text: str) -> bool:
+    """Whether the listener would run whole-body strict ``hl7apy`` validation on ``text`` for ``ic``.
+
+    It does when the inbound sets ``validation.strict``, unless the body is a streaming inbound's at or
+    over its threshold: there the listener validates the header only, which ``Peek.parse`` has already
+    done. With no inbound there is no setting to read, so never. The HL7 check restates what wiring
+    already enforces, since ``validation.strict`` is refused on any other content type."""
+    return (
+        ic is not None
+        and ic.content_type is ContentType.HL7V2
+        and ic.validation.strict
+        and not streaming_over_threshold(ic, text)
+    )
+
+
+def raise_if_strictly_invalid(text: str, ic: InboundConnection) -> None:
+    """Run the listener's strict ``hl7apy`` validate over ``text``; raise the ``strict`` refusal.
+
+    The same call the listener makes, :func:`~messagefoundry.parsing.validate.validate` against
+    ``validation.hl7_version``. Blocking and CPU-bound, so run it off the event loop.
+
+    The reason names no field and quotes no value. ``hl7apy``'s error text can carry a byte of the body
+    (it echoes an unsupported MSH-12 verbatim, for one), and ``safe_text`` does not scrub a bare token,
+    so the text is not carried at all. The reason counts the errors instead and points at the dry run,
+    which lists them to a caller that may see message content."""
+    result = validate(text, expected_version=ic.validation.hl7_version)
+    if not result.ok:
+        count = len(result.errors)
+        plural = "" if count == 1 else "s"
+        raise IngressGuardError(
+            f"strict-validation failed ({count} error{plural}); a dry run of the body against "
+            f"inbound {ic.name!r} lists them",
+            phase="strict",
+        )
+
+
+async def admit_resubmission(raw: str, ic: InboundConnection | None) -> str:
+    """Admit an operator-resubmitted body as the inbound ``ic``'s listener would (BACKLOG #1911).
+
+    :func:`admit_resubmitted_body` off the event loop, then, where :func:`strict_validation_due` says
+    the listener would, :func:`raise_if_strictly_invalid` in the listener's own shape: on a pooled
+    worker thread under :func:`strict_validate_timeout`. A timeout is the listener's refusal too, so it
+    raises the ``strict`` phase with the listener's wording. As on the listener, the timeout frees this
+    call and cannot stop the worker, which runs on until the size and segment caps let it finish.
+
+    Returns the form to commit; raises :class:`IngressGuardError` for the first guard that refuses."""
+    text = await asyncio.to_thread(admit_resubmitted_body, raw, ic)
+    if ic is not None and strict_validation_due(ic, text):
+        timeout = strict_validate_timeout(ic)
+        try:
+            await asyncio.wait_for(asyncio.to_thread(raise_if_strictly_invalid, text, ic), timeout)
+        except TimeoutError:
+            raise IngressGuardError(
+                f"strict-validation timed out after {timeout}s", phase="strict"
+            ) from None
     return text
 
 

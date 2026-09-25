@@ -32,6 +32,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_admin
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
 
@@ -48,29 +49,44 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
-async def _admin_session(c: httpx.AsyncClient, service: AuthService) -> dict[str, str]:
-    """Bootstrap the first admin exactly as a first run does, and clear its must-change flag."""
-    boot = await service.initialize()
-    assert boot is not None
+async def _rotated_session(c: httpx.AsyncClient, username: str, password: str) -> dict[str, str]:
+    """Sign in, clear the must-change flag, and sign in again; return the auth headers."""
     tok = (
         await c.post(
             "/auth/login",
-            json={"username": "admin", "password": boot.password, "provider": "local"},
+            json={"username": username, "password": password, "provider": "local"},
         )
     ).json()["token"]
     h = {"Authorization": f"Bearer {tok}"}
     await c.post(
         "/me/password",
         headers=h,
-        json={"current_password": boot.password, "new_password": "a-rotated-passphrase-99"},
+        json={"current_password": password, "new_password": "a-rotated-passphrase-99"},
     )
     tok = (
         await c.post(
             "/auth/login",
-            json={"username": "admin", "password": "a-rotated-passphrase-99", "provider": "local"},
+            json={"username": username, "password": "a-rotated-passphrase-99", "provider": "local"},
         )
     ).json()["token"]
     return {"Authorization": f"Bearer {tok}"}
+
+
+async def _bootstrap_session(c: httpx.AsyncClient, service: AuthService) -> dict[str, str]:
+    """Bootstrap the first admin exactly as a first run does, and clear its must-change flag.
+
+    Only the arm whose SUBJECT is the first-run bootstrap account uses this. ADR 0183 Amendment A
+    retires that account (BACKLOG #1136), and that arm goes with it in Wave 2.
+    """
+    boot = await service.initialize()
+    assert boot is not None
+    return await _rotated_session(c, "admin", boot.password)
+
+
+async def _admin_session(c: httpx.AsyncClient, service: AuthService) -> dict[str, str]:
+    """Create an addressless admin, which needs no bootstrap account, and clear its must-change flag."""
+    admin = await create_admin(service)
+    return await _rotated_session(c, admin.username, admin.password)
 
 
 async def test_the_bootstrap_admin_alone_is_not_notifiable(engine: Engine) -> None:
@@ -81,7 +97,7 @@ async def test_the_bootstrap_admin_alone_is_not_notifiable(engine: Engine) -> No
     """
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     async with _client(engine, service) as c:
-        await _admin_session(c, service)
+        await _bootstrap_session(c, service)
         assert await service.has_notifiable_admin() is False
 
 

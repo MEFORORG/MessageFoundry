@@ -816,8 +816,8 @@ figure stops matching the constant named beside it.
 | `tcp`: raw TCP listener ([Raw TCP](#raw-tcp--tcp)) | the inbound's declared `content_type` | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB | no unpacking on intake |
 | `x12`: X12 EDI listener ([X12 EDI](#x12-edi--x12)) | X12 interchanges | not applicable; a framed stream | `max_interchange_bytes`, default `DEFAULT_MAX_INTERCHANGE_BYTES` = 16 MiB (`parsing/x12/delimiters.py`) | no unpacking on intake |
 | `database`: database poller, `DatabasePoll(...)` ([Database source](#database-source--databasepoll)) | rows from `poll_statement`, each handed on as one body in the declared `content_type` | not applicable; table rows | no byte cap of its own; the engine's per-message ceiling below rejects an oversized row after it is read; `poll_max_rows`, default `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows per poll | no unpacking on intake |
-| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | off unless `[store].uploads_dir` is set. Plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file onto a chosen inbound's ingress stage. First it runs that inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; and a check that the inbound's charset can hold the text. A refusal answers 413, 415 or 422, writes an `upload.resend_reject` audit row, and writes no message. Strict `hl7apy` validation still does not run on a resend | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
-| `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | The edited body re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. A re-route first runs the origin inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; and a check that the inbound's charset can hold the text. A re-route whose origin inbound this engine does not hold answers 409. The direct path has no inbound, so only the NUL rule and that ceiling apply. A refusal answers 413, 415 or 422, writes a `message_edit_resend_reject` audit row, and writes no message. Strict `hl7apy` validation still does not run on either path | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
+| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | off unless `[store].uploads_dir` is set. Plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file onto a chosen inbound's ingress stage. First it runs that inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; a check that the inbound's charset can hold the text; and, where the inbound sets `validation.strict`, the listener's strict `hl7apy` validation under the same `validation.strict_timeout_s` backstop, whose refusal counts the errors and quotes none. A refusal answers 413, 415 or 422, writes an `upload.resend_reject` audit row, and writes no message | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
+| `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | The edited body re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. A re-route first runs the origin inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; a check that the inbound's charset can hold the text; and, where the inbound sets `validation.strict`, the listener's strict `hl7apy` validation under the same `validation.strict_timeout_s` backstop, whose refusal counts the errors and quotes none. A re-route whose origin inbound this engine does not hold answers 409. The direct path has no inbound, so only the NUL rule and that ceiling apply, and strict validation, an inbound's setting, never does. A refusal answers 413, 415 or 422, writes a `message_edit_resend_reject` audit row, and writes no message | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
 | `ide/src/testBench.ts` (Load Message Set) and `ide/src/stepsView.ts` (Use for Live Values): the IDE extension's local file pickers, a 5.1.1 upload feature by owner ruling of 2026-09-23 | any file: each picked path goes to `messagefoundry dryrun`, which runs it against an inbound's declared `content_type` | the dialog offers `.hl7` first and also "All files", so no extension is enforced | `MAX_FIXTURE_FILE_BYTES` = 16 MiB per file (`pipeline/dryrun.py`), raised to the largest `max_message_bytes` an inbound in the graph sets; refused with a message naming the file, before it is read whole. `dryrun` then applies the per-message ceiling below itself. The Steps view also reads its picked sample inside the extension to list its segments, and that read has no cap. The live-debug sample choice (`liveDebug.ts`, a pick list of `.hl7` files) feeds the same `dryrun` read | no unpacking |
 | `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop. A re-ingressed reply does not pass the `Loopback()` inbound's listener checks, so the read bound in this row is its bound | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound, both checked only after the whole result set is fetched | no unpacking on capture |
 
@@ -1234,7 +1234,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql)) |
-| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-db-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
+| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
@@ -1356,6 +1356,71 @@ reads through a stored procedure — which this gate refuses anyway.
 > database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
 > a credential the operator configures per connection.
 
+#### Static credentials on every backend hop
+
+ASVS 13.2.1 asks that every backend hop authenticate with an individual service account, a short-term
+token or a certificate, not with an unchanging credential. The engine keeps one list of the hops it
+dials that do not (BACKLOG #1182). A hop is on the list when it presents a static credential (a
+password, API key, static bearer token or Vault token) or no credential at all. A hop that presents
+only a compliant credential is never on it.
+
+Three surfaces read that one list, so they cannot disagree:
+
+- `messagefoundry check` prints it on the advisory `static-credentials` line. With a
+  `messagefoundry.toml` it also reads the service-settings hops, and it says when it could not.
+- `GET /security/posture` returns it as `static_credential_hops`, one entry per hop.
+- `serve` refuses on it, but only when you turn the refusal on.
+
+The list covers the hops named in the table below. It is not a promise about hops added later, or
+about plugin connector types.
+
+**The refusal ships off.** Set `[security].require_nonstatic_credentials = true` to turn it on. `serve`
+then refuses to start while any listed hop has no opt-out. To keep a hop, name it with a reason:
+
+```toml
+[security]
+require_nonstatic_credentials = true
+static_credential_accepted = { "OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "no credential field exists" }
+```
+
+Each opt-out is logged at start with the hop's name and your reason, never a secret, and
+`security_loosenings()` names the set. The refuse/warn split is `[security].enforcement`, as it is for
+`[store].require_managed_identity`. The settings hops are checked before anything starts. The graph
+hops are checked at the first graph load and at every `/config/reload`, where a refusal leaves the
+running graph in place.
+
+**Some hops have no compliant option today.** For those, the only way through with the refusal on is an
+opt-out. That is expected, and the table says which they are.
+
+| Hop | Named as | Compliant kind in the product |
+|-----|----------|-------------------------------|
+| `Rest(...)`, `FHIR(...)` | `<name>` | yes: SMART Backend Services or OAuth2 client credentials |
+| `FhirLookup(...)` | `fhir_lookup:<name>` | yes: SMART Backend Services |
+| `Soap(...)` | `<name>` | yes: client certificate, or OAuth2 |
+| `DICOMweb(...)` | `<name>` | **no** (static bearer or Basic only) |
+| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`, or a user and password in the proxy URL, its own or an inherited `[egress].proxy_url`) | `proxy:<name>`, or `proxy:fhir_lookup:<name>` for a lookup | **no** (Basic or Digest only) |
+| `MLLP(...)`, `DICOM(...)` outbound | `<name>` | yes: `tls=True` with `tls_cert_file` |
+| `Tcp(...)`, `X12(...)` outbound | `<name>` | **no** (no credential of any kind) |
+| `Email(...)`, `Direct(...)` SMTP AUTH | `<name>` | **no** |
+| `Sftp(...)` | `<name>` or `inbound:<name>` | yes: SSH private key |
+| `Ftp(...)` | `<name>` or `inbound:<name>` | **no** |
+| `File(...)` alternate-share credential | `<name>` or `inbound:<name>` | **no** (drop it to run as the service identity) |
+| the four database factories | see the table below | yes: `auth="integrated"` or `"entra"` |
+| `[store]` on SQL Server or Postgres | `settings:store` | SQL Server yes; Postgres **no** |
+| Vault token (store key, Transit, secrets) | `settings:vault.store_key`, `settings:vault.store_transit`, `settings:vault.secrets` | **no** |
+| `[alerts]` webhook | `settings:alerts.webhook` | **no** (the sink has no credential field) |
+| `[alerts]` SMTP | `settings:alerts.smtp` | **no** |
+| `[ai]` broker key | `settings:ai.broker` | **no** |
+| `[auth]` OIDC client secret | `settings:auth.oidc` | **no** |
+| `[auth]` AD/LDAP bind | `settings:auth.ad_bind` | **no** |
+| `[logging]` syslog forwarder | `settings:logging.forward` | yes: `forward_protocol = "tls"` with `forward_tls_client_cert` |
+
+Listeners are **not** on the list. On an inbound MLLP, TCP, X12, DICOM or HTTP listener the partner
+presents a credential to the engine, not the other way round. A connection declared with
+`deployed=False` is not on it either, because the engine never opens it. OAuth2 counts as compliant by
+the 2026-08-22 owner ruling, although its own token request still sends a static client secret; that
+token request is not listed as a separate hop.
+
 #### Static database credentials
 
 ASVS 13.2.1 asks that a backend hop authenticate with an individual service account, a short-term token
@@ -1363,10 +1428,11 @@ or a certificate rather than an unchanging credential. On SQL Server that means 
 gMSA or Windows machine principal) or `auth="entra"`; `auth="sql"`, the shipped default, is a static
 username and password.
 
-`messagefoundry check` prints an advisory **`static-db-credentials`** line naming every declared database
-hop that presents an unchanging credential, with its peer. It is an **inventory, not a gate** — it
-refuses nothing and blocks nothing. A named hop may be entirely legitimate, and a site whose database
-offers no managed-identity mode has no compliant option to move to.
+`messagefoundry check` names every declared database hop that presents an unchanging credential, with
+its peer, on its advisory **`static-credentials`** line. That line covers every backend hop, not only
+databases; see [Static credentials on every backend hop](#static-credentials-on-every-backend-hop)
+above. The line itself refuses nothing. The refusal is the opt-in
+`[security].require_nonstatic_credentials`, which is off by default.
 
 It covers **four** factories, because four of them dial a database with a credential:
 
@@ -2730,8 +2796,10 @@ store, and only one of the pools carries a knob.
      "timeout" posture is stated honestly per row in Table B.
    - **Inbound strict validation** — the listener runs `hl7apy` strict validate off-loop via
      `asyncio.to_thread` (`pipeline/wiring_runner.py:3259`, `:3543`), bounded by the per-inbound
-     `validation.strict_timeout_s` (engine default `_STRICT_VALIDATE_TIMEOUT_SECONDS` = **5 s**,
-     `wiring_runner.py:285`). The timeout frees the *listener* but cannot kill the worker — an
+     `validation.strict_timeout_s` (engine default `STRICT_VALIDATE_TIMEOUT_SECONDS` = **5 s**, in
+     `pipeline/ingress_guards.py`, which `wiring_runner` re-exports as
+     `_STRICT_VALIDATE_TIMEOUT_SECONDS`). An operator resend into a strict inbound (BACKLOG #1911)
+     validates on this pool the same way, under the same timeout. The timeout frees the *listener* but cannot kill the worker — an
      orphaned validate holds its thread until it returns, bounded in turn by the 16 MiB / segment
      caps enforced before it.
    - **The store's own SQL Server I/O** — `aioodbc.create_pool()` is built with **no** `executor=`

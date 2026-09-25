@@ -4204,13 +4204,28 @@ class ApprovalsSettings(_Section):
     2.3.5). **Off by default** so a single-operator deployment is never blocked. When ``enabled``, an
     action in ``operations`` is held as a pending request and must be released by a *distinct* second
     user holding ``approvals:approve`` — the requester can never approve their own. A request older than
-    ``expiry_hours`` can no longer be approved."""
+    ``expiry_hours`` can no longer be approved, and one younger than ``min_dwell_seconds`` cannot be
+    approved YET.
+
+    ``min_dwell_seconds`` is the FLOOR beside ``expiry_hours``' CEILING (ASVS 2.4.2, BACKLOG #287). An
+    approve that arrives sooner gets a 409 and an ``approval.too_early`` audit row.
+
+    **The default (2.0 s) is PROVISIONAL.** It comes from published human-timing research, not from a
+    timed session (owner ruling 2026-09-23). Source: Card, Moran and Newell, "The keystroke-level model
+    for user performance time with interactive systems", Communications of the ACM 23(7), 1980,
+    pp. 396-410. How the default follows from it, and what the floor does not do, is stated once in
+    docs/SECURITY.md under "Dual-control approval for high-value actions". Change the two together."""
 
     enabled: bool = False
     operations: list[str] = Field(default_factory=lambda: sorted(_DEFAULT_APPROVABLE_OPERATIONS))
-    expiry_hours: float = (
-        72.0  # a pending request expires this many hours after it's made (0 = never)
-    )
+    # A pending request expires this many hours after it's made (0 = never). allow_inf_nan=False because
+    # a non-finite expiry means something different on each store backend, and none of them is what an
+    # operator asked for. `nan > 0` is also False, so a nan expiry would skip the dwell cross-check below.
+    expiry_hours: float = Field(default=72.0, allow_inf_nan=False)
+    # Seconds a pending request must have existed before it may be approved (0 = no floor), measured
+    # from its own ``requested_at``. allow_inf_nan=False matters: nan compares False against everything,
+    # so `age < nan` would switch the floor OFF silently.
+    min_dwell_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
 
     @field_validator("operations")
     @classmethod
@@ -4228,7 +4243,27 @@ class ApprovalsSettings(_Section):
     def _check_expiry(cls, v: float) -> float:
         if v < 0:
             raise ValueError("approvals.expiry_hours must be >= 0 (0 = never expires)")
+        # A huge FINITE value still overflows to inf once guard() turns it into seconds, which is the
+        # non-finite expiry allow_inf_nan exists to refuse.
+        if v * 3600.0 == float("inf"):
+            raise ValueError("approvals.expiry_hours is too large to express in seconds")
         return v
+
+    @model_validator(mode="after")
+    def _dwell_inside_expiry(self) -> ApprovalsSettings:
+        # A floor at or past the ceiling leaves no moment when a request can be approved: each one is
+        # refused as too early and then as expired. Refuse that at startup, not at the first release.
+        # Only while dual control is ON: a disabled feature must not refuse startup over its defaults.
+        if (
+            self.enabled
+            and self.expiry_hours > 0
+            and self.min_dwell_seconds >= self.expiry_hours * 3600.0
+        ):
+            raise ValueError(
+                "approvals.min_dwell_seconds must be shorter than approvals.expiry_hours, or no "
+                "request could ever be approved"
+            )
+        return self
 
 
 #: The two snapshot mechanisms for the SQLite store backup (ADR 0049). ``vacuum_into`` (default) writes
@@ -4597,6 +4632,28 @@ class SecuritySettings(_Section):
     # names it, so the opt-out is never silent.
     allow_unverified_alert_smtp_tls: bool = False
 
+    # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
+    # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
+    # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
+    # any hop that config/static_credentials.py's static_credential_hops() names lacks an entry in
+    # static_credential_accepted below; the refuse/warn split is [security].enforcement, exactly like
+    # [store].require_managed_identity. The settings half (six sections: [store], [secrets],
+    # [alerts], [ai], [auth] and [logging]) is checked before anything starts; the graph half at every
+    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
+    # (among them the alert webhook, DICOMweb, Tcp, X12, a File alternate-share credential, a
+    # forward-proxy credential, FTP, SMTP AUTH, a Postgres store, Vault tokens, the AI broker key, OIDC
+    # client_secret and the LDAP bind; each hop's compliant_kind field is the source of record), so
+    # with this on they can only run under an opt-out. Not a loosening (it tightens).
+    # DIRECT-READ by the serve gate, not desugared: there is no legacy field it replaces.
+    require_nonstatic_credentials: bool = False
+    # The audited per-hop opt-outs: hop name -> the operator's reason, e.g.
+    # {"OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "..."}. Hop names
+    # are the ones `messagefoundry check`'s static-credentials line and GET /security/posture print.
+    # Read only when require_nonstatic_credentials is TRUE; each honoured entry is logged at startup
+    # (hop name and reason, never a secret) and named by security_loosenings(). A blank reason is
+    # refused at load: an opt-out must say why.
+    static_credential_accepted: dict[str, str] = Field(default_factory=dict)
+
     # ── Sign-in & identity ───────────────────────────────────────────
     require_sign_in: bool = True  # authenticate every request
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
@@ -4699,6 +4756,17 @@ class SecuritySettings(_Section):
                 )
             cleaned.append(item)
         return cleaned
+
+    @field_validator("static_credential_accepted", mode="after")
+    @classmethod
+    def _opt_outs_say_why(cls, value: dict[str, str]) -> dict[str, str]:
+        blank = sorted(name for name, reason in value.items() if not str(reason).strip())
+        if blank:
+            raise ValueError(
+                "[security].static_credential_accepted: every opt-out needs a reason; blank for "
+                + ", ".join(repr(name) for name in blank)
+            )
+        return value
 
     @field_validator("allowed_client_networks", mode="before")
     @classmethod
@@ -5569,6 +5637,22 @@ def security_loosenings(
                 "allow_unverified_alert_smtp_tls",
                 "an unauthenticated [alerts] SMTP hop is permitted to start an enforcing PHI instance "
                 "— the serve gate that would otherwise refuse it is acknowledged away",
+            )
+        )
+    # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a
+    # deliberate departure from it, so the opt-outs are the loosening. With the refusal OFF (the shipped
+    # default, owner decision 2026-09-23) nothing is refused and an opt-out is inert, so it is not
+    # reported; the static-credential inventory itself is GET /security/posture's
+    # `static_credential_hops` and `messagefoundry check`'s static-credentials line.
+    if sec.require_nonstatic_credentials and sec.static_credential_accepted:
+        named = ", ".join(sorted(sec.static_credential_accepted))
+        out.append(
+            (
+                "static_credential_accepted",
+                f"{len(sec.static_credential_accepted)} opt-out(s) from the static-credential refusal "
+                f"are declared ({named}) — each named hop that exists runs on an unchanging "
+                "credential or none, which ASVS 13.2.1 asks backend hops not to do (the serve log "
+                "names any opt-out that matches no hop)",
             )
         )
     # --- the CONNECTION-scoped deviations (ADR 0153 decision 2; #333). None is a [security] switch, but

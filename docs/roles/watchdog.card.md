@@ -66,12 +66,16 @@ because one arrived.
 ## On arrival
 
 1. Read the korus `roles/COMMON.md`, then `roles/WATCHDOG.md`, at `origin/main`.
-2. **Establish the watched seat is alive from two surfaces.** An agent listing can omit a live seat.
-3. **Read the watched seat's own stated gates first.** A seat honouring its own gate is doing its
+2. Query the fleet wiki for your subject before you act. Cite any note you act on by id; after,
+   write a lesson, decision, gotcha or correction. A miss never blocks. Run korus's wiki scripts by
+   path with the stores CLAUDE.md section 5 names: the defaults fail here. How:
+   korus `roles/WIKI.md`.
+3. **Establish the watched seat is alive from two surfaces.** An agent listing can omit a live seat.
+4. **Read the watched seat's own stated gates first.** A seat honouring its own gate is doing its
    job, not stalling.
-4. **Establish what working looks like as a number.** You cannot call a gap abnormal with no
+5. **Establish what working looks like as a number.** You cannot call a gap abnormal with no
    baseline, and you will be asked for one.
-5. Arm one control on every detector you intend to publish from.
+6. Arm one control on every detector you intend to publish from.
 
 ## Before you publish a reading
 

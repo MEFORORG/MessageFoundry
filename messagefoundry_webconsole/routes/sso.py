@@ -16,6 +16,7 @@ from messagefoundry.api.security import get_auth
 
 from .. import pages
 from .._auth import (
+    session_token,
     set_session_cookie,
 )
 
@@ -74,7 +75,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # be born with a free step-up window; the first sensitive action forces the
         # directory-password step-up at /ui/reauth. ONE session per navigation into this
         # route (the resync side effect fires here, never per page).
-        outcome = await auth.authenticate_kerberos(token_bytes, client=client, seed_reauth=False)
+        #
+        # ASVS 7.2.4: ``supersedes`` ends the session this browser presented, as /ui/login does, once
+        # the ticket is accepted. RESIDUAL: a cross-site link into this route (an intranet portal)
+        # withholds the Strict cookie, so there is nothing to read and nothing is ended -- yet the
+        # Set-Cookie below still replaces that cookie, leaving the prior session valid until it
+        # expires. Only a same-site hop in front of this leg could close that, as the federated
+        # leg's start page does for OIDC. A same-site navigation, such as the login page's own link,
+        # carries the cookie and is covered.
+        outcome = await auth.authenticate_kerberos(
+            token_bytes, client=client, seed_reauth=False, supersedes=session_token(request)
+        )
         if not outcome.ok or outcome.token is None:
             # authenticate_kerberos audited the reject. NEVER a second 401 — no challenge
             # loops (Kerberos-only single-leg is a hard line; an NTLM NegTokenInit from an

@@ -20,6 +20,71 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
+**Requires an engine newer than 0.4.0**, one whose `messagefoundry.api._ui_seam.ENGINE_UI_SEAM` is
+that value. Console 0.3.0 does not work with that engine, so upgrade the two together. The entry
+under Changed says why engine 0.4.0 does not work with this console.
+
+### Added
+- **Pages that issue or enforce an admin-set temporary password now say when it stops working**
+  (`BACKLOG #1141`, PR 1456). The engine refuses such a password once
+  `[auth].initial_password_expiry_hours` have passed since it was set.
+  - The create-user form states that window in hours. The account does not exist yet, so the form
+    cannot state an instant.
+  - A user's page states the instant while that user still owes a password change. The create form
+    lands on the new account's page.
+  - The forced change-password page, `/ui/account/password`, states the same instant. It adds that
+    after that time an administrator has to reset the password. The page keeps the sentence when
+    it re-renders after a rejected attempt.
+  - Nothing is stated when no deadline applies. That includes a setting of `0` or less, a password
+    the user chose, and the first-run bootstrap account while it is still unclaimed.
+  - Each instant is the one the engine's sign-in check enforces, read from the stored stamp. It is
+    shown in UTC.
+
+### Changed
+- **BREAKING — the engine UI seam moved again, so this console no longer pairs with engine 0.4.0**
+  (`BACKLOG #1141`, PR 1456). `SUPPORTED_ENGINE_SEAMS` no longer holds `75c4117d21fd0b98`, the
+  seam engine 0.4.0 ships. The line at the top of this section says where to read the value it
+  holds now, which can move again before the release. The console now imports three helpers from
+  `messagefoundry.api.security`: `pending_credential_deadline`, `pending_credential_deadline_for`
+  and `initial_credential_window_hours`. Engine 0.4.0 has none of them. So with the console on,
+  engine 0.4.0 fails while importing this console and reports it as not installed. It never reaches
+  `UiSeamMismatch`. Same one-value `SUPPORTED_ENGINE_SEAMS` rule as 0.2.15 (`BACKLOG #279`).
+  **Migration:** upgrade the engine and the console together. Or set
+  `[security].serve_web_console = false` on the engine to run its JSON API alone.
+
+### Fixed
+- **The reset-password page no longer fails with a `500` when the temporary password's deadline is
+  too far out to render** (`BACKLOG #1141`, PR 1456). Console 0.3.0 formatted the deadline with no
+  guard. It raised past year 9999, or past year 3000 on Windows, which a large
+  `[auth].initial_password_expiry_hours` can reach. By then the reset had already replaced the
+  password, so the administrator never saw the new one. The page now drops the deadline sentence
+  instead, and so do the new deadline sentences under Added.
+
+### Security
+- **Ending a session or enrolling a factor from an MFA-pending session now needs the existing
+  factor first, on an account that has one** (`BACKLOG #1951`, PR 1469).
+  `require_ui_reauth_only_action` skips the MFA check, so that an account with no factor can still
+  enrol one and end its own sessions. It guards `POST /ui/account/sessions/{session_id}/revoke`,
+  `POST /ui/account/sessions/revoke-others`, `POST /ui/account/mfa/enroll`,
+  `POST /ui/account/mfa/verify` and `POST /ui/account/webauthn/enroll`. For an account with a TOTP
+  factor or a passkey, it now refuses a pending session itself. It writes an
+  `auth.mfa_denied` audit row and redirects to `/ui/reauth`, which asks for the second factor as
+  well as the password. Console 0.3.0's gate left this to its step-up check. That check covered
+  the three enrol routes, wrote no audit row, and did not cover the two session routes. An account
+  with no factor is unaffected. Other routes also skip the MFA gate, and this change does not
+  cover them. At least `POST /ui/account/webauthn/verify`, `GET /ui/account/mfa/confirm` and
+  `/ui/account/password` are among them. **The session-route half needs the engine side of the
+  same PR.** That side adds `session_terminate` to the actions `AuthService` refuses to a pending
+  session; engine 0.4.0 does not refuse it. The seam digest does not record that behaviour. On
+  `main`, PR 1469 merged before the seam moved, so an engine released from `main` with this
+  console's seam carries both halves.
+
+### Notes
+- **Not every `/ui` change needs a console change.** PR 1432 touched only a console test fixture,
+  yet the console's OIDC sign-in now needs the IdP's `auth_time` claim (`BACKLOG #296`). That rule
+  lives in the engine, and the engine's own `CHANGELOG.md` records it. Read that file too for
+  engine changes that reach `/ui`.
+
 ## [0.3.0] — 2026-09-23 — Early Access
 
 **Requires engine 0.4.0. Supported engine UI seam: `75c4117d21fd0b98`**, the value engine 0.4.0

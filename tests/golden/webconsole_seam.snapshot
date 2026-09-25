@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-37e84a155b662187
+9b4c5f387c70bbc6
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -119,8 +119,8 @@ audit_kerberos_reject: (self, reason: 'str') -> 'None'
 audit_mfa_denied: (self, identity: 'Identity', path: 'str', *, client: 'str | None' = None) -> 'None'
 audit_oidc_reject: (self, reason: 'str') -> 'None'
 audit_permission_denied: (self, identity: 'Identity', permission: 'Permission', path: 'str', *, client: 'str | None' = None) -> 'None'
-authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, seed_reauth: 'bool' = True) -> 'LoginOutcome'
-begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str') -> 'tuple[str, str]'
+authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, seed_reauth: 'bool' = True, supersedes: 'str | None' = None) -> 'LoginOutcome'
+begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str', prior_session: 'str | None' = None) -> 'tuple[str, str]'
 begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str | None'
 begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'
 complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'LoginOutcome'
@@ -135,7 +135,7 @@ has_recent_step_up: (self, token: 'str | None') -> 'bool'
 identity_for_token: (self, token: 'str | None', *, activity: 'bool' = True) -> 'Identity | None'
 kerberos_available: property -> 'bool'
 list_sessions: (self, user_id: 'str') -> 'list[SessionRecord]'
-login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None) -> 'LoginOutcome'
+login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None, supersedes: 'str | None' = None) -> 'LoginOutcome'
 logout: (self, token: 'str | None', *, actor: 'str | None' = None) -> 'None'
 mfa_satisfied: (self, token: 'str | None') -> 'bool'
 mfa_status: (self, identity: 'Identity') -> 'MfaStatus'
@@ -228,8 +228,9 @@ messagefoundry.api.models.ResendRequest: idempotency_key, source, to
 messagefoundry.api.models.SearchPresetCreateRequest: criteria, name
 messagefoundry.api.models.SearchPresetCriteria: channel_id, content, control_id, field_path, field_value, limit, message_type, status, target
 messagefoundry.api.models.SecurityLoosening: risk, switch
-messagefoundry.api.models.SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, store_privilege
+messagefoundry.api.models.SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, static_credential_hops, static_credential_hops_scope, store_privilege
 messagefoundry.api.models.ServiceStatusInfo: enabled, service_name, state
+messagefoundry.api.models.StaticCredentialHopView: accepted, compliant_kind, credential, detail, name
 messagefoundry.api.models.StatsResetRequest: all, targets
 messagefoundry.api.models.StatsResetTarget: channel_id, destination, role
 messagefoundry.api.models.StorePrivilegeView: detail, excess, status

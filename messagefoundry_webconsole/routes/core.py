@@ -412,6 +412,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             form.get("password", ""),
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,
+            # ASVS 7.2.4: the Set-Cookie below REPLACES whatever session cookie this browser sent,
+            # so the engine ends that one session as part of a SUCCESSFUL mint, rather than leave
+            # it valid and unreachable until it expires. A failed sign-in ends nothing.
+            supersedes=session_token(request),
         )
         if not outcome.ok or outcome.token is None:
             return RedirectResponse("/ui/login?e=bad", status_code=303)

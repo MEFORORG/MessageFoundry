@@ -12,12 +12,17 @@ Each test names the mutation that must turn it RED.
 
 from __future__ import annotations
 
+import asyncio
+from uuid import uuid4
+
 import httpx
 import pytest
 from _ui_clients import SAME_ORIGIN
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
+from messagefoundry.auth.identity import AuthProvider
+from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -53,6 +58,40 @@ async def _service(engine: Engine, **kw: object) -> AuthService:
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False, **kw))  # type: ignore[arg-type]
     await service.initialize()
     return service
+
+
+#: The first Administrator's name and temporary password. Synthetic; the password clears the default
+#: policy. Not "admin", which is the bootstrap account's name.
+_ADMIN_USERNAME = "test-admin"
+_ADMIN_PW = "a-strong-operator-passphrase"
+
+
+async def _must_change_admin(service: AuthService) -> str:
+    """Write a must-change local Administrator with no factor, then run ``initialize()``. Returns its
+    username.
+
+    A local twin of ``tests/_admin_account.create_admin``, for the same reason ``_PinnedClock`` is
+    one: this package has its own test root. It stands in for the first-run bootstrap account, which
+    ADR 0183 Amendment A retires (BACKLOG #1136), and it has the same credential state: admin-issued,
+    must change, no factor. The row goes in BEFORE ``initialize()``, which mints the bootstrap only on
+    an empty users table, so this behaves the same with and without the bootstrap. Call it INSTEAD of
+    ``initialize()``, not after it.
+    """
+    if await service.store.get_user_by_username("admin") is not None:
+        raise RuntimeError(
+            "the bootstrap account already exists: call _must_change_admin() instead of initialize()"
+        )
+    user_id = uuid4().hex
+    await service.store.create_user(
+        user_id=user_id,
+        username=_ADMIN_USERNAME,
+        auth_provider=AuthProvider.LOCAL.value,
+        password_hash=await asyncio.to_thread(hash_password, _ADMIN_PW),
+        must_change_password=True,
+    )
+    await service.initialize()  # seeds the roles; the table is not empty, so it mints no account
+    await service.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")
+    return _ADMIN_USERNAME
 
 
 def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
@@ -301,14 +340,13 @@ async def test_must_change_outranks_the_second_factor_on_the_gate_page(
 ) -> None:
     """RED when: GET /ui/mfa checks mfa before must_change.
 
-    A bootstrap admin is BOTH. Leading with MFA parks it on a page it cannot answer until it has
-    rotated — the cookie-plane twin of the JSON ordering rule.
+    A first Administrator on a temporary password is BOTH. Leading with MFA parks it on a page it
+    cannot answer until it has rotated — the cookie-plane twin of the JSON ordering rule.
     """
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
-    boot = await service.initialize()  # the FIRST initialize is what mints the bootstrap admin
-    assert boot is not None
+    admin = await _must_change_admin(service)
     async with _client(engine, service) as c:
-        r = await c.post("/ui/login", data={"username": boot.username, "password": boot.password})
+        r = await c.post("/ui/login", data={"username": admin, "password": _ADMIN_PW})
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/password"
         r = await c.get("/ui/mfa")
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/password"
@@ -651,13 +689,13 @@ async def test_ui_reauth_webauthn_lets_a_reset_passkey_account_prove_it_and_rota
 async def test_a_must_change_account_with_no_factor_still_rotates_first(engine: Engine) -> None:
     """RED when: the refusal or the new sign-in order reaches an account with no factor.
 
-    The bootstrap administrator and an administrator-created user are must-change with nothing to
-    prove. Sending either to the factor page would bounce it to enroll, which the must-change
-    confinement refuses: the brick. Both must still land on the password page and rotate there.
+    A first Administrator on a temporary password and an administrator-created user are must-change
+    with nothing to prove. Sending either to the factor page would bounce it to enroll, which the
+    must-change confinement refuses: the brick. Both must still land on the password page and rotate
+    there.
     """
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
-    boot = await service.initialize()  # the FIRST initialize mints the bootstrap admin
-    assert boot is not None
+    admin = await _must_change_admin(service)
     await service.create_local_user(
         username="newbie",
         password=PW,
@@ -666,7 +704,7 @@ async def test_a_must_change_account_with_no_factor_still_rotates_first(engine: 
         roles=[Role.OPERATOR.value],
         actor="test",
     )
-    for username, password in ((boot.username, boot.password), ("newbie", PW)):
+    for username, password in ((admin, _ADMIN_PW), ("newbie", PW)):
         async with _client(engine, service) as c:
             r = await c.post("/ui/login", data={"username": username, "password": password})
             assert r.status_code == 303 and r.headers["location"] == _PASSWORD, username
