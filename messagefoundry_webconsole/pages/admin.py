@@ -487,8 +487,8 @@ def federated_identity_page(
     An ``unlock`` page tagged ``admin_federated_identity``: a re-auth aimed here mints the single-use
     grant the link POST consumes. The forms offered follow the service's refusals, so an operator is
     not handed a button that can only fail: none on their own account, and no link form on a local
-    account or with no issuer set. The POSTs still refuse all three, because the gate is the
-    handler's, not this page's.
+    account, with no issuer set, or on an account with no directory id (BACKLOG #1143 slice C). The
+    POSTs still refuse all four, because the gate is the handler's, not this page's.
     """
     base = f"/ui/users/{_seg(view.user_id)}/federated-identity"
     message = _FEDERATED_NOTICES.get(notice)
