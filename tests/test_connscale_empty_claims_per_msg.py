@@ -1123,6 +1123,11 @@ _EXPECTED_DIAGNOSTIC_LABELS = frozenset(
         # BACKLOG #1292, added 2026-09-25. The reload probe closes every connection, and on a loaded
         # runner what it strands was read as intake loss. This separates the two on every run.
         "reload_stranded",
+        # BACKLOG #1292, added 2026-09-25 after merge-group run 36166728739. Post-reload sends were
+        # all stored and none drew a reply in the stop grace. These separate a slow engine, a silent
+        # one, and a second close that took the replies.
+        "post_reload_reply_s",
+        "post_reload_drops",
     }
 )
 

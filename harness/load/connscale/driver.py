@@ -171,6 +171,12 @@ class ConnScaleDriver:
         self._strand_log = None
         return log
 
+    @property
+    def drops(self) -> int:
+        """How many sockets the peer has closed or reset across all N connections, never counting
+        one this side closed on stop. Read it twice to count the closes between two moments."""
+        return sum(conn.drops for conn in self._conns)
+
     def generations(self) -> list[int]:
         """Each connection's open count, in port order. Snapshot it before an event that closes the
         engine side of every socket, then hand it to :meth:`await_reconnected`."""

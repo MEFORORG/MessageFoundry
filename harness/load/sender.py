@@ -98,6 +98,10 @@ class PersistentConnection:
         # reload probe, BACKLOG #1292) can wait until the connection is back rather than guess.
         self._generation = 0
         self._up = False  # True from a successful open until that socket's serve loop ends
+        # How many sockets ended while this side was NOT stopping: the peer closed or reset them.
+        # The connscale reload probe reads it after every connection is back, so a second close
+        # that took the replies can be told from an engine that never answered (BACKLOG #1292).
+        self._drops = 0
         # Called with the SEND time (perf_counter_ns) of each send a close left unconfirmed, so the
         # connscale reload probe can tell a send made inside its window from one that had already
         # waited too long for an ACK (BACKLOG #1292). None by default. It runs only on a close, never
@@ -116,6 +120,11 @@ class PersistentConnection:
         """True while the current socket is open and being served. A socket the peer has closed
         reads True until this side notices, so pair it with :attr:`generation`, never alone."""
         return self._up
+
+    @property
+    def drops(self) -> int:
+        """How many sockets ended without this side stopping them: the peer closed or reset each."""
+        return self._drops
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"loadconn-{self._host}:{self._port}")
@@ -169,6 +178,8 @@ class PersistentConnection:
                 pass
             finally:
                 self._up = False
+                if not self._stop.is_set():
+                    self._drops += 1
                 self._fail_inflight()
                 writer.close()
                 with contextlib.suppress(ConnectionError, OSError):
