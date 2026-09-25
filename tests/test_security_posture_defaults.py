@@ -60,6 +60,7 @@ def _names(
     cleartext_hops: tuple[str, ...] = (),
     expiry_hops: tuple[str, ...] = (),
     db_hops: tuple[str, ...] = (),
+    attested_hops: tuple[str, ...] = (),
 ) -> list[str]:
     """The loosening SWITCH NAMES for a settings combination (defaults where not overridden)."""
     return [
@@ -73,6 +74,7 @@ def _names(
             cleartext_hops,
             expiry_hops,
             db_hops,
+            attested_hops,
             None,
             None,
         )
@@ -109,6 +111,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             (),
             (),
             (),
+            (),
             None,
             None,
         )
@@ -134,6 +137,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             (),
             (),
             (),
+            (),
             None,
             None,
         )
@@ -153,6 +157,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             auth,
             AlertsSettings(),
             SecretRotationSettings(),
+            (),
             (),
             (),
             (),
@@ -337,6 +342,8 @@ def test_every_security_bool_at_its_insecure_value_is_reported() -> None:
 _CONNECTION_DEVIATIONS_REPORTED = {
     "cleartext_accepted": "accepted_cleartext_hops",
     "tls_allow_expired": "expiry_relaxed_hops",
+    # Owner ruling 2026-09-24: the hop attestation got a factory surface, so it is reported.
+    "tls_hop_attested": "attested_secure_hops",
 }
 
 #: Per-connection parameters the readers do NOT report, each with the reason. Same discipline as the
@@ -345,6 +352,7 @@ _CONNECTION_DEVIATIONS_REPORTED = {
 _CONNECTION_DEVIATIONS_EXEMPT = {
     # Not switches — the reason string beside a declaration, and TLS key/cert material or paths.
     "cleartext_reason": "the reason text for cleartext_accepted, not a second switch",
+    "tls_hop_attested_reason": "the reason text for tls_hop_attested, not a second switch",
     "tls_cert_file": "material/path, not a posture switch",
     "tls_key_file": "material/path, not a posture switch",
     "tls_key_password": "material/path, not a posture switch",
@@ -434,6 +442,7 @@ def test_the_reported_connection_deviations_are_actually_wired() -> None:
         ConnectionSpec,
         Registry,
         accepted_cleartext_hops,
+        attested_secure_hops,
         build_outbound_connection,
         expiry_relaxed_hops,
     )
@@ -456,13 +465,24 @@ def test_the_reported_connection_deviations_are_actually_wired() -> None:
             cleartext_reason="vendor firmware predates TLS",
         )
     )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ATTESTED",
+            ConnectionSpec(type=ConnectorType.TCP, settings={"host": "h", "port": 3}),
+            tls_hop_attested=True,
+            tls_hop_attested_reason="TLS terminates at the site's stunnel sidecar",
+        )
+    )
     assert _CONNECTION_DEVIATIONS_REPORTED["tls_allow_expired"] == "expiry_relaxed_hops"
+    assert _CONNECTION_DEVIATIONS_REPORTED["tls_hop_attested"] == "attested_secure_hops"
     assert _CONNECTION_DEVIATIONS_REPORTED["cleartext_accepted"] == "accepted_cleartext_hops"
     names = _names(
         expiry_hops=tuple(n for n, _ in expiry_relaxed_hops(reg)),
         cleartext_hops=tuple(n for n, _ in accepted_cleartext_hops(reg)),
+        attested_hops=tuple(n for n, _ in attested_secure_hops(reg)),
     )
     assert "tls_allow_expired" in names and "cleartext_accepted" in names
+    assert "tls_hop_attested" in names
 
 
 # --- the API surface: GET /security/posture reports store + auth deviations --------------------
@@ -522,6 +542,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             ("OB_LEGACY", "OB_LAB"),
             (),
             (),
+            (),
             None,
             None,
         )
@@ -558,6 +579,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             (),
             ("OB_PARTNER_ADT", "OB_LAB_ORU"),
             (),
+            (),
             None,
             None,
         )
@@ -586,6 +608,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             (),
             (),
             ("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
+            (),
             None,
             None,
         )

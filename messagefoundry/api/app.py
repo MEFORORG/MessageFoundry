@@ -296,6 +296,7 @@ from messagefoundry.config.wiring import (
     Registry,
     WiringError,
     accepted_cleartext_hops,
+    attested_secure_hops,
     expiry_relaxed_hops,
     load_config,
     redacted_settings,
@@ -2018,14 +2019,16 @@ def create_app(
             cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
             expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
             db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
+            attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
         else:
-            cleartext_hops, expired_hops, db_hops = [], [], []
+            cleartext_hops, expired_hops, db_hops, attested_hops = [], [], [], []
         loosenings_scope = (
             None
             if runner is not None
             else (
                 "settings only — no connection graph is loaded on this engine, so the per-connection "
-                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS declarations are "
+                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS / tls_hop_attested "
+                "declarations are "
                 "NOT included (see `messagefoundry check`)"
             )
         )
@@ -2045,6 +2048,7 @@ def create_app(
                 cleartext_hops,
                 expired_hops,
                 db_hops,
+                attested_hops,
                 store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
                 engine.store.audit_chain_unkeyed(),

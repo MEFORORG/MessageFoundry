@@ -1595,8 +1595,8 @@ class DatabaseLookupExecutor:
             # Per-connection insecure-hop attestation (#200), honoured here as the DATABASE
             # destination and poll source honour theirs: a live read crosses the same wire a write
             # does, so dropping it refused a hop the operator had attested. The mapping is the only
-            # carrier this cell has (no Source/Destination model), and reading it does not make the
-            # setting authorable — see :func:`hop_attestation_from_settings`.
+            # carrier this cell has (no Source/Destination model); DatabaseLookup() writes it there
+            # from its own tls_hop_attested parameter — see :func:`hop_attestation_from_settings`.
             attested = hop_attestation_from_settings(s)
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.

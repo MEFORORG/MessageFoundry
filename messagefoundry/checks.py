@@ -228,6 +228,8 @@ def run_checks(
         # is not the surface anyone queries three months later. Advisory — see the checks.
         _check_expiry_relaxed(config_dir),
         _check_generic_db_tls(config_dir),
+        # Owner ruling 2026-09-24: every attested hop, the one per-hop declaration that ALLOWs. Advisory.
+        _check_hop_attested(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
@@ -1918,6 +1920,45 @@ def _check_cleartext_accepted(
         ok=True,
         required=False,
         detail=(f"{len(accepted)} connection(s) cross a cleartext hop by declaration — {listed}"),
+    )
+
+
+def _check_hop_attested(config_dir: str | Path) -> CheckResult:
+    """Surface **the whole set** of declarations that attest their hop secure (``tls_hop_attested``).
+
+    The sibling of :func:`_check_cleartext_accepted`, with the opposite claim: an attested hop is
+    ALLOWed rather than warned, so this line is where a reviewer sees what the engine is taking on
+    trust. Owner ruling 2026-09-24. Advisory (``required=False``): an attestation with a written reason
+    is a legitimate choice, not a config error. It reads through ``attested_secure_hops``, the same
+    reader as ``security_loosenings()`` and ``GET /security/posture``.
+
+    SKIPs when the graph will not load, same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, attested_secure_hops, load_config
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "tls-hop-attested",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    attested = attested_secure_hops(registry)
+    if not attested:
+        return CheckResult(
+            "tls-hop-attested", ok=True, required=False, detail="no hop is attested secure"
+        )
+    listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    return CheckResult(
+        "tls-hop-attested",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(attested)} hop(s) are attested secure by means the engine cannot see, and are "
+            f"ALLOWed where an enforcing gate would refuse them — {listed}"
+        ),
     )
 
 

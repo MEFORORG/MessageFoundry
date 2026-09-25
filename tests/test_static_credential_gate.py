@@ -144,6 +144,7 @@ def _loosening_names(sec: SecuritySettings) -> list[str]:
             (),
             (),
             (),
+            (),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )

@@ -219,10 +219,10 @@ def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
     Same three fail-loud rules as :func:`_check_hop_attestation` — this is that validator with the
     mapping read in front of it, so the two cells cannot drift from the modelled ones or each other.
 
-    A mapping is the ONLY carrier for those cells, and reading one here does **not** make the setting
-    authorable: neither ``DatabaseLookup()`` nor ``DatabaseRef()`` takes the parameter and neither has
-    a ``connections.toml`` surface, so a direct embedding is the only way to populate it. Giving a
-    factory the parameter is a separate question."""
+    A mapping is the ONLY carrier for those cells. ``DatabaseLookup()`` and ``DatabaseRef()`` write the
+    pair into it from their own ``tls_hop_attested`` parameters (owner ruling 2026-09-24), and
+    ``config.wiring.attested_secure_hops`` reads the same mapping, so the loosening report names every
+    attestation this reader honours."""
     attested = bool(settings.get("tls_hop_attested", False))
     reason = settings.get("tls_hop_attested_reason")
     _check_hop_attestation(attested, None if reason is None else str(reason))

@@ -89,6 +89,7 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    refuse_raw_hop_attestation,
     resolve_env_settings,
     resolve_listener_binding,
     resolved_encoding_problems,
@@ -7573,6 +7574,13 @@ def _hl7_batch_timestamp(created_at: float | None) -> str:
 def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[str, Any]) -> Source:
     # Resolve any env() references first (a missing value raises WiringError here, before bind).
     settings = resolve_env_settings(ic.spec.settings, env_values)
+    # Owner ruling 2026-09-24: the hop attestation is the connection's typed field, never a transport
+    # setting, so the loosening report and the gate read the same thing. Refuse the raw keys, then
+    # mirror a declared pair for the settings-driven seams, as _dest_config does for cleartext_accepted.
+    refuse_raw_hop_attestation(settings, f"inbound connection {ic.name!r}")
+    if ic.tls_hop_attested:
+        settings["tls_hop_attested"] = True
+        settings["tls_hop_attested_reason"] = ic.tls_hop_attested_reason
     # Inbound MLLP/TCP/X12 listeners never carry an author-supplied host (wiring rejects one) — they
     # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
@@ -7595,18 +7603,12 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
         name=ic.name,
         settings=settings,
         ack_mode=ic.ack_mode,
-        # #200 (ADR 0092): surface the per-connection insecure-hop attestation as a typed field so the
-        # cell (built inside build_check_registry's active_hop_posture scope) can ALLOW a legitimately-
-        # secure hop. Default False → keyed purely on posture; a bad attested/reason pair fails loud here.
-        tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
-        tls_hop_attested_reason=_hop_attested_reason(settings),
+        # #200 (ADR 0092): the per-connection insecure-hop attestation, so the cell (built inside
+        # build_check_registry's active_hop_posture scope) can ALLOW a legitimately-secure hop. Read off
+        # the InboundConnection (owner ruling 2026-09-24). Default False → keyed purely on posture.
+        tls_hop_attested=ic.tls_hop_attested,
+        tls_hop_attested_reason=ic.tls_hop_attested_reason,
     )
-
-
-def _hop_attested_reason(settings: Mapping[str, Any]) -> str | None:
-    """The env-resolved ``tls_hop_attested_reason`` connector setting as ``str | None`` (#200)."""
-    reason = settings.get("tls_hop_attested_reason")
-    return None if reason is None else str(reason)
 
 
 def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings | None) -> None:
@@ -7647,6 +7649,12 @@ def _dest_config(
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = oc.cleartext_reason
         settings["cleartext_connection"] = oc.name
+    # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
+    # setting. Refuse the raw keys, then mirror a declared pair for the same settings-driven seams.
+    refuse_raw_hop_attestation(settings, f"outbound connection {oc.name!r}")
+    if oc.tls_hop_attested:
+        settings["tls_hop_attested"] = True
+        settings["tls_hop_attested_reason"] = oc.tls_hop_attested_reason
     return Destination(
         name=oc.name,
         type=oc.spec.type,
@@ -7658,9 +7666,10 @@ def _dest_config(
         # connections.toml setting) flips it. The MLLP connector reads config.hl7_raw_separators.
         hl7_raw_separators=bool(settings.get("hl7_raw_separators", False)),
         # #200 (ADR 0092): the per-outbound insecure-hop attestation, typed here so the cell can ALLOW a
-        # legitimately-secure egress hop even on production-PHI. Default False → keyed purely on posture.
-        tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
-        tls_hop_attested_reason=_hop_attested_reason(settings),
+        # legitimately-secure egress hop. Read off the OutboundConnection (owner ruling 2026-09-24).
+        # Default False → keyed purely on posture.
+        tls_hop_attested=oc.tls_hop_attested,
+        tls_hop_attested_reason=oc.tls_hop_attested_reason,
         # ADR 0153 decision 2: the per-outbound cleartext-hop ACCEPTANCE ("this hop is NOT secure and we
         # accept that"). A TOP-LEVEL outbound key, not a transport setting, so it is read off the
         # OutboundConnection rather than the env-resolved settings dict — one authoring surface, and no
@@ -8193,6 +8202,16 @@ def check_fhir_lookup_allowed(
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
 
+def _insecure_bind_route(source: Source) -> str:
+    """How a permitted cleartext inbound bind was permitted, for its WARNING line.
+
+    An attestation is named WITH its reason (owner ruling 2026-09-24), so the log line records why the
+    operator vouched for the hop. Otherwise the route is the ``--allow-insecure-bind`` flag."""
+    if source.tls_hop_attested:
+        return f"tls_hop_attested; reason: {source.tls_hop_attested_reason}"
+    return "--allow-insecure-bind"
+
+
 def _inbound_insecure_bind_permitted(
     *, allow_insecure_bind: bool, attested: bool, posture: HopPosture | None
 ) -> bool:
@@ -8312,10 +8331,11 @@ def check_mllp_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r without TLS "
-            "(--allow-insecure-bind / tls_hop_attested); HL7 bodies cross the network in cleartext — "
+            "(%s); HL7 bodies cross the network in cleartext — "
             "set tls=true (+ tls_cert_file/tls_key_file) on it.",
             name,
             host,
+            _insecure_bind_route(source),
         )
         return
     raise WiringError(
@@ -8348,10 +8368,11 @@ def check_http_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r for an HTTP listener without TLS "
-            "(--allow-insecure-bind / tls_hop_attested); POSTed bodies (frequently PHI) cross the "
+            "(%s); POSTed bodies (frequently PHI) cross the "
             "network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on the Http connection.",
             name,
             host,
+            _insecure_bind_route(source),
         )
         return
     raise WiringError(
@@ -8581,10 +8602,11 @@ def check_dimse_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r without DICOM-over-TLS "
-            "(--allow-insecure-bind / tls_hop_attested); DICOM PHI (header + pixel data) crosses the "
+            "(%s); DICOM PHI (header + pixel data) crosses the "
             "network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on the DICOM connection.",
             name,
             host,
+            _insecure_bind_route(source),
         )
         return
     raise WiringError(
@@ -8619,11 +8641,12 @@ def check_tcp_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r for a plaintext-only %s listener "
-            "(--allow-insecure-bind / tls_hop_attested); X12/raw-TCP payloads (frequently PHI) cross "
+            "(%s); X12/raw-TCP payloads (frequently PHI) cross "
             "the network in cleartext — these listeners have no TLS, so firewall/segment them.",
             name,
             host,
             source.type.value.upper(),
+            _insecure_bind_route(source),
         )
         return
     raise WiringError(

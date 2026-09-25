@@ -126,6 +126,11 @@ _INBOUND_KEYS = frozenset(
         # table without it is byte-identical. The FIRST console-settable connections.toml key (its write
         # seam rides connections_edit); display-only, no runtime effect.
         "flagged",
+        # ADR 0092, owner ruling 2026-09-24: the per-connection hop attestation. TOP-LEVEL for the same
+        # reason as the outbound cleartext pair below: a hop-policy declaration, not a transport setting
+        # the factory's schema would accept. Under [settings] it is refused.
+        "tls_hop_attested",
+        "tls_hop_attested_reason",
     }
 )
 _OUTBOUND_KEYS = frozenset(
@@ -156,6 +161,9 @@ _OUTBOUND_KEYS = frozenset(
         # (see _build_spec: "the factory IS the schema"), which no factory would accept.
         "cleartext_accepted",
         "cleartext_reason",
+        # ADR 0092, owner ruling 2026-09-24: the per-connection hop attestation; see the inbound note.
+        "tls_hop_attested",
+        "tls_hop_attested_reason",
     }
 )
 
@@ -230,6 +238,10 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         deployed=_require_bool(table, "deployed", where, default=True),
         # #131: the object-of-interest flag defaults FALSE (an absent key = unflagged).
         flagged=_require_bool(table, "flagged", where, default=False),
+        # Owner ruling 2026-09-24: absent = not attested; the flag/reason rules live in the shared
+        # build_*_connection choke point, so this surface and the code-first one cannot drift.
+        tls_hop_attested=_require_bool(table, "tls_hop_attested", where, default=False),
+        tls_hop_attested_reason=_optional_str(table, "tls_hop_attested_reason", where),
         source_file=source,
         source_line=None,
     )
@@ -265,6 +277,10 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         deployed=_require_bool(table, "deployed", where, default=True),
         # #131: the object-of-interest flag defaults FALSE (an absent key = unflagged).
         flagged=_require_bool(table, "flagged", where, default=False),
+        # Owner ruling 2026-09-24: absent = not attested; the flag/reason rules live in the shared
+        # build_*_connection choke point, so this surface and the code-first one cannot drift.
+        tls_hop_attested=_require_bool(table, "tls_hop_attested", where, default=False),
+        tls_hop_attested_reason=_optional_str(table, "tls_hop_attested_reason", where),
         # #136: the cosmetic waiting-for-reply pre-display delay; absent = 0.0 (show immediately).
         waiting_display_delay=_optional_float(table, "waiting_display_delay", where) or 0.0,
         # ADR 0153: the cleartext-hop acceptance pair; absent = off, so an existing table is

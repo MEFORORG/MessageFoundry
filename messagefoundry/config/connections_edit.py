@@ -93,6 +93,10 @@ _SCALAR_FIELDS = (
     # nothing in their edit explains. `cleartext_reason` rides with it; the pair is validated together.
     "cleartext_accepted",
     "cleartext_reason",
+    # ADR 0092, owner ruling 2026-09-24: the per-connection hop attestation (both directions). Dropping
+    # it on a save would turn an attested hop into a REFUSED one at the next reload, as above.
+    "tls_hop_attested",
+    "tls_hop_attested_reason",
 )
 # Sub-tables follow the scalars. ``schedule`` is deliberately LAST — it nests ``windows`` as an array
 # of inline tables, visually the heaviest entry, so the simple knobs stay greppable above it.
