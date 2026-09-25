@@ -43,6 +43,7 @@ from messagefoundry.api.auth_models import (
     MfaEnrollResponse,
     MfaStatusResponse,
     MfaVerifyRequest,
+    NotifyEmailRequest,
     PasswordChangeRequest,
     PasswordResetResponse,
     ProvidersInfo,
@@ -97,6 +98,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
     CurrentPasswordCheck,
+    NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
@@ -407,6 +409,27 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
             )
         return SimpleMessage(detail="password changed; please sign in again")
+
+    @app.post("/me/notify-email", response_model=SimpleMessage)
+    async def fill_notify_email(
+        body: NotifyEmailRequest,
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require()),
+    ) -> SimpleMessage:
+        """Set the caller's own notification address where it has none (BACKLOG #1139, ASVS 6.3.7).
+
+        The way out of the confinement ``require()`` applies to ``must_set_notify_email``. It fills a
+        missing address only: an account that has one gets 409, and an administrator changes it,
+        which notifies the old address. ``require()`` leaves this route under the factor gate, so a
+        session still owing its second factor cannot reach it."""
+        try:
+            await service.fill_own_notify_email(identity, body.email, client=_client(request))
+        except NotifyEmailAlreadySet as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return SimpleMessage(detail="notification address set")
 
     @app.post("/me/reauth", response_model=ElevatedResponse)
     async def reauth(

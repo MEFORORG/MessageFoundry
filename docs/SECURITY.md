@@ -18,12 +18,12 @@ with secure defaults, and AD-group→role mapping is automatic.
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer (`[security] require_sign_in = true` by default). Of the **109** engine route objects, **91 demand a
-specific permission** and 18 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
+auth layer (`[security] require_sign_in = true` by default). Of the **110** engine route objects, **91 demand a
+specific permission** and 19 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
 window instead), 2 answer a tokenless
-client through `optional_identity` (`GET /health`, `GET /ai/policy`), and 13 are authenticated
+client through `optional_identity` (`GET /health`, `GET /ai/policy`), and 14 are authenticated
 self-service routes that require no permission. One route (`GET /service/identity`) accepts **no bearer
 token at all** — it authenticates by verified mTLS client certificate only. Every route is enumerated,
 with its gate, in [Route → permission map](#route--permission-map-engine-api) below; nothing is left
@@ -275,7 +275,10 @@ route handler only when all of them pass.
    `/me/password`) → **403** + `X-MFA-Required`
    plus an `auth.mfa_denied` audit row when the session's second factor is pending and the route is not
    MFA-exempt (on `/me/password`, only when an account other than a directory account holds a
-   factor, BACKLOG #1954; see the "MFA state" row below) → **403** `missing permission: <value>`
+   factor, BACKLOG #1954; see the "MFA state" row below) → **403** `notification address required`
+   + `X-Notify-Email-Required` when the account has no `notify_email`, a security-notice channel is
+   wired, and the route is not in `_NOTIFY_EMAIL_EXEMPT_ROUTES` (the way out, `POST /me/notify-email`,
+   plus the escapes of the two gates above; BACKLOG #1139) → **403** `missing permission: <value>`
    plus an `auth.permission_denied` audit row for the first unheld permission. On success it writes one
    `auth.permission_granted` row — **every satisfied route, GETs included**, since
    `[security].audit_all_authorization_decisions` defaults **on** (BACKLOG #1277). PHI-view grants are
@@ -296,7 +299,7 @@ apply. What each **adds** over plain `require()`:
 
 | Gate wrapper | Routes | What it adds over `require()` |
 |---|---|---|
-| `require` | 40 | nothing — the ladder itself |
+| `require` | 41 | nothing — the ladder itself |
 | `require_paced` | 19 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
 | `require_step_up` | 28 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
@@ -408,12 +411,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **109 route objects** — 71 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket) and 38 declared in
+**Counting basis.** `create_app()` with no arguments builds **110 route objects** — 71 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket) and 39 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
-and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 113 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 218
-(109 + the 108 console routes + the `/ui/static` mount). Of the 109: **91 are permission-gated**, 18 are
+and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 114 (`/openapi.json`,
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 221
+(110 + the 110 console routes + the `/ui/static` mount). Of the 110: **91 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -430,7 +433,7 @@ These are the routes the requirement equally demands be defined.
 
 #### Authentication & self-service — authenticated, no permission required
 
-All 13 use `require()` / `require_reauth_only*` / `require_step_up_action` with an **empty** permission
+All 14 use `require()` / `require_reauth_only*` / `require_step_up_action` with an **empty** permission
 tuple: they act only on the caller's own account.
 
 | Method | Path | Gate | Extra constraints |
@@ -438,6 +441,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/auth/logout` | `require` | exempt from the `must_change_password` confinement |
 | `GET` | `/auth/me` | `require` | exempt from the `must_change_password` confinement |
 | `POST` | `/me/password` | `require` | per-**actor** credential-ceremony limiter; refused (400) for an AD identity; exempt from the confinement; MFA-exempt only for an account with **no** factor: a pending session on an account that has one gets 403 + `X-MFA-Required` (BACKLOG #1954) |
+| `POST` | `/me/notify-email` | `require` | fills a **missing** notification address only (409 when one is set, 400 when blank); the way out of the address confinement, and **not** MFA-exempt, so a session owing its factor gets 403 + `X-MFA-Required` (BACKLOG #1139) |
 | `POST` | `/me/reauth` | `require` | per-**actor** credential-ceremony limiter; mints the action-bound grant when `purpose=` is given |
 | `POST` | `/auth/mfa-verify` | `require` | draws the **sign-in** window (per-IP + global); feeds the per-account lockout; exempt from the confinement, so a must-change account that has a factor can prove it before it rotates (BACKLOG #1954) |
 | `GET` | `/me/mfa` | `require` | |
@@ -626,7 +630,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 109 route objects a default `create_app()` serves, **fifteen** can put
+**PHI-egress route set.** Of the 110 route objects a default `create_app()` serves, **fifteen** can put
 PHI on the wire: the twelve message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
@@ -648,13 +652,13 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **108 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **110 routes + one `/ui/static` mount** (federation off,
 the default — the two `/ui/oidc/*` routes are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `/ui`-confined `SameSite=Strict` **session
 cookie** rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 98 of the 108 carry a gate; the 10 that do not are the
+**Route → permission map (`/ui` plane).** 100 of the 110 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -670,6 +674,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/account/mfa/disable` | *(authenticated session only)* | `require_ui_step_up_action` |
 | `POST` | `/ui/account/mfa/enroll` | *(authenticated session only)* | `require_ui_reauth_only_action` |
 | `POST` | `/ui/account/mfa/verify` | *(authenticated session only)* | `require_ui_reauth_only_action` |
+| `GET` | `/ui/account/notify-address` | *(authenticated session only)* | `require_ui` |
+| `POST` | `/ui/account/notify-address` | *(authenticated session only)* | `require_ui` |
 | `GET` | `/ui/account/password` | *(authenticated session only)* | `require_ui` |
 | `POST` | `/ui/account/password` | *(authenticated session only)* | `require_ui` |
 | `GET` | `/ui/account/sessions` | *(authenticated session only)* | `require_ui` |
@@ -1867,8 +1873,18 @@ Users are notified of security-relevant changes to their account through **two**
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, and **account disable** (credential changes, 6.3.7). An email-change notice goes to the
   **old** address so the legitimate owner is alerted even if the change was hostile. With no `[alerts]`
-  SMTP configured (or for accounts with no email on file), the email is simply skipped. Emission is
-  **best-effort** — a notification failure is logged and never blocks a login or an admin action.
+  SMTP configured, or for an account with no `notify_email`, the email is skipped and each skipped
+  notice logs a WARNING naming the event and the username. Emission is **best-effort** — a
+  notification failure is logged and never blocks a login or an admin action.
+- **An account with no notification address sets one at sign-in** (BACKLOG #1139). While a notice
+  channel is wired, `require()` and `require_ui` confine such a session to `POST /me/notify-email`
+  (console: `/ui/account/notify-address`) plus the escapes of the password and factor gates, in the
+  shape of the `must_change_password` confinement. It sits **below** the factor gate, so a session
+  that has proven only the password cannot choose where notices go. It fills a missing address only;
+  an administrator changes an existing one, which notifies the old address. **The first address is
+  trusted as typed:** nothing checks that the holder receives mail there. The `auth.notify_email_set`
+  row puts the change in the holder's own feed, and a `notify_email_set` notice goes to the new
+  address. A site with no mail relay notifies nobody, so it is not confined.
 - **`GET /me/security-events`** — a pull-based feed of the caller's own audited `auth.*` events
   (sign-ins, lockouts, password changes), most-recent-first, for accounts without a deliverable mailbox.
   Both 6.3.5 signals are in it, as `auth.account_locked` and `auth.login_after_failures`, whichever leg

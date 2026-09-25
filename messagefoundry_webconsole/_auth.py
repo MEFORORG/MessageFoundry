@@ -201,6 +201,9 @@ _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
 #: the in-flight OIDC flow cookie), and ``"storage"`` would wipe the deliberately-persistent, PHI-free
 #: ``mfcols:v2`` column preferences (14.3.3), which are not session state. Defense-in-depth against
 #: Back/bfcache resurrection of a terminated session's rendered PHI page.
+#: Where ``require_ui`` sends a session that owes a notification address (BACKLOG #1139).
+NOTIFY_ADDRESS_PAGE = "/ui/account/notify-address"
+
 CLEAR_SITE_DATA_HEADER = "Clear-Site-Data"
 CLEAR_SITE_DATA_VALUE = '"cache"'
 
@@ -280,6 +283,7 @@ def require_ui(
     phi: bool = False,
     allow_must_change: bool = False,
     allow_mfa_pending: bool = False,
+    allow_missing_notify_email: bool = False,
     activity: bool = True,
     mfa_refusal: Callable[[Request], HTTPException] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
@@ -304,6 +308,12 @@ def require_ui(
     /ui route — ``allow_must_change=True`` is set ONLY by that page's own GET/POST (so the rotation
     can actually happen; anything else would loop). While it still owes a factor it has enrolled,
     it goes to ``/ui/mfa`` instead (``must_change_target``, BACKLOG #1954).
+
+    An account with no notification address, on an instance that sends security notices, is 303'd
+    to ``/ui/account/notify-address`` (BACKLOG #1139, ``Identity.must_set_notify_email``). Only that
+    page passes ``allow_missing_notify_email=True``. A route that passes ``allow_mfa_pending`` is
+    exempt as well: those are the enrolment, confinement and account pages, the ways out of the two
+    gates that run first.
 
     ``activity=False`` (ASVS 14.3.1) validates the session WITHOUT refreshing its idle clock — the
     same contract the engine's /ws/stats keepalive uses. Set it on the console's **timer-driven
@@ -353,6 +363,17 @@ def require_ui(
             # surfaces instead of dropping the record.
             await auth.audit_mfa_denied(identity, request.url.path)
             raise _mfa_redirect() if mfa_refusal is None else mfa_refusal(request)
+        # BACKLOG #1139 (ASVS 6.3.7), the cookie mirror of the JSON gate: below the factor gate, so a
+        # password-only cookie proves its factor before it chooses where notices go, and above the
+        # permission loop for the same oracle reason.
+        if (
+            identity.must_set_notify_email
+            and not allow_missing_notify_email
+            and not allow_mfa_pending
+        ):
+            raise HTTPException(
+                status.HTTP_303_SEE_OTHER, headers={"Location": NOTIFY_ADDRESS_PAGE}
+            )
         for permission in permissions:
             if not identity.has(permission):
                 await auth.audit_permission_denied(identity, permission, request.url.path)
@@ -893,7 +914,7 @@ async def authorize_ui_ws(
     # activity=False (ASVS 14.3.1): app.js now re-opens this socket on a TIMER after a drop, and a
     # timer is not user activity. The page load that opened the first socket already counted.
     identity = await auth.identity_for_token(token, activity=False)
-    if identity is None or identity.must_change_password:
+    if identity is None or identity.must_change_password or identity.must_set_notify_email:
         return None, None
     # ASVS 6.3.3, mirroring authorize_ws on the header path: an MFA-pending session does not stream.
     # No exempt set — every /ui socket is a data feed, none is part of the enroll/verify escape path.

@@ -55,6 +55,11 @@ MFA_DISABLED = (
 # still sends MFA_DISABLED even where a passkey remains, which is the same asymmetry on the other
 # credential and is not fixed here.
 MFA_CREDENTIAL_REMOVED = "mfa_credential_removed"
+# 6.3.7 -- the account had no notification address and its holder set one, which is the only way out
+# of the first-sign-in confinement (BACKLOG #1139). Sent to the address just set: the account had no
+# earlier one, so there is nobody else to tell, and a send that fails shows up in the log now rather
+# than at the next real notice.
+NOTIFY_EMAIL_SET = "notify_email_set"
 # 6.3.7 — a single-use recovery code was spent, which permanently deletes that stored credential.
 RECOVERY_CODE_USED = "recovery_code_used"  # nosec B105 — event-type label, not a credential
 ADMIN_NEW_IP = (

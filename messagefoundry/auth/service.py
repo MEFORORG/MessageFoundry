@@ -43,6 +43,7 @@ from messagefoundry.auth.notifications import (
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
+    NOTIFY_EMAIL_SET,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
@@ -82,6 +83,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     UserRecord,
     WebAuthnCredential,
+    require_notify_email,
 )
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -401,6 +403,11 @@ class BootstrapAdmin:
 
 class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
+
+
+class NotifyEmailAlreadySet(RuntimeError):
+    """:meth:`AuthService.fill_own_notify_email` declined: the account already has a different
+    notification address. The self-service route only fills a missing one (BACKLOG #1139)."""
 
 
 class _DirectoryLoginRefused(Exception):
@@ -2221,6 +2228,7 @@ class AuthService:
             username=user.username,
             auth_provider=AuthProvider.AD,
             roles=ad_roles,
+            must_set_notify_email=self.notify_email_required(user),
             allowed_channels=_allowed_channels(user, ad_roles),
             extra_permissions=ad_custom_permissions,
         )
@@ -3375,9 +3383,70 @@ class AuthService:
             auth_provider=provider,
             roles=roles,
             must_change_password=user.must_change_password,
+            must_set_notify_email=self.notify_email_required(user),
             allowed_channels=_allowed_channels(user, roles),
             extra_permissions=custom_permissions,
         )
+
+    def notify_email_required(self, user: UserRecord) -> bool:
+        """Whether ``user`` is confined to setting a notification address before anything else.
+
+        BACKLOG #1139 (ASVS 6.3.7). An account with no ``notify_email`` is told nothing out of band
+        about a change to its authentication details, because the notifier drops a notice with no
+        address. Four paths give birth to such an account: the first-run bootstrap administrator,
+        ``create_local_user`` with no email, ``provision-admin`` with no ``--email``, and a directory
+        sign-in whose directory returns no ``mail``. So the first sign-in sets one, in the shape of
+        the ``must_change_password`` confinement.
+
+        **ONLY WHEN A SECURITY-NOTICE CHANNEL IS WIRED**, which is ``[auth].notify_security_events``
+        on and an ``[alerts]`` SMTP relay configured. Without one, no account is notified whatever it
+        holds, so confining it would lock out a site with no mail server and buy nothing. A PHI
+        instance under ``enforce`` already refuses to start without that channel (ADR 0167).
+
+        Derived on every resolve rather than stored, so it ends the moment an address lands, and
+        no store backend carries a flag for it.
+        """
+        return self._security_notifier is not None and not (user.notify_email or "").strip()
+
+    async def fill_own_notify_email(
+        self, identity: Identity, email: str, *, client: str | None = None
+    ) -> bool:
+        """Set the caller's own notification address where it has none (BACKLOG #1139).
+
+        This is the way out of the confinement :meth:`notify_email_required` describes. Returns
+        ``True`` when it wrote, ``False`` when the same address was already on file.
+
+        **IT FILLS A MISSING ADDRESS AND NOTHING ELSE**, like ``admin-set-notify-email``. Changing an
+        existing one here would move where notices go without telling the old address, and a
+        session is all it would take. Raises :class:`NotifyEmailAlreadySet` for that, and
+        :class:`ValueError` for a blank value (:func:`require_notify_email`).
+
+        **THE FIRST ADDRESS IS TRUSTED AS TYPED.** Whoever holds this session (password, and the
+        factor where one is enrolled) chooses where notices go. Nothing checks that the holder
+        receives mail there. The audit row names the change in the holder's own
+        ``/me/security-events`` feed, and the notice goes to the address just set.
+
+        The fill-only check is a read, then an unconditional write. Two concurrent calls from the
+        same account can both pass it; the later write wins and both are audited.
+        """
+        address = require_notify_email(email)
+        user = await self._store.get_user(identity.user_id)
+        if user is None:
+            raise ValueError("no such account")
+        if user.notify_email == address:
+            return False
+        if (user.notify_email or "").strip():
+            raise NotifyEmailAlreadySet(
+                "this account already has a notification address; an administrator changes it"
+            )
+        await self._store.set_user_notify_email(user.id, email=address)
+        # The address itself stays out of the row, as provision-admin and admin-set-notify-email
+        # record only that one was set.
+        await self._audit("auth.notify_email_set", actor=user.username, client=client)
+        await self._notify_security(
+            NOTIFY_EMAIL_SET, username=user.username, email=address, client=client
+        )
+        return True
 
     # --- password management -------------------------------------------------
 

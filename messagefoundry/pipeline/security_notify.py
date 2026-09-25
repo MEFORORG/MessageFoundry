@@ -28,6 +28,7 @@ from messagefoundry.auth.notifications import (
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
+    NOTIFY_EMAIL_SET,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
@@ -54,6 +55,7 @@ _SUBJECTS = {
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
     MFA_CREDENTIAL_REMOVED: "A second factor was removed from your MessageFoundry account",
+    NOTIFY_EMAIL_SET: "Security notices for your MessageFoundry account now come to this address",
     RECOVERY_CODE_USED: "A MessageFoundry recovery code was used on your account",
     ADMIN_NEW_IP: "A sensitive action on your MessageFoundry account from a new location",
 }
@@ -77,6 +79,10 @@ _DESCRIPTIONS = {
     MFA_CREDENTIAL_REMOVED: (
         "One of the second factors on your account was removed. At least one other factor remains, "
         "so two-factor authentication is still in force."
+    ),
+    NOTIFY_EMAIL_SET: (
+        "This address was set to receive security notices about your account. If you did not set "
+        "it, tell your administrator."
     ),
     RECOVERY_CODE_USED: (
         "One of your single-use recovery codes was accepted as a second factor. That code is now "
