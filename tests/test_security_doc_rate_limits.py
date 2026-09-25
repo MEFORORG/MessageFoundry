@@ -1396,9 +1396,11 @@ def test_me_password_is_not_described_as_part_of_the_sign_in_surface() -> None:
 
 
 def test_reauth_surface_feeds_the_lockout_and_the_doc_says_so() -> None:
-    """BACKLOG #1138 (owner ruling 2026-09-23): both re-proofs go through ``_reproof``, which checks
-    ``locked_until`` first and registers a failure through the login leg's counter. The global sign-in
-    ceiling still does NOT reach them, and the SEC-024 caveat must say both halves.
+    """BACKLOG #1138 (owner ruling 2026-09-23, design E): both re-proofs go through ``_reproof``,
+    which registers a failure through the login leg's counter when no lock is live, and revokes the
+    session once that session has failed ``lockout_threshold`` re-proofs. The account lock does not
+    refuse them. The global sign-in ceiling still does NOT reach them, and the SEC-024 caveat must
+    say so, including that the per-session count is per process.
 
     This test used to pin the opposite, that ``reauth`` fed nothing and the ceremony budget was the
     only bound, and told whoever changed that to update the caveat. This is that update."""
@@ -1407,20 +1409,22 @@ def test_reauth_surface_feeds_the_lockout_and_the_doc_says_so() -> None:
     )
     for name in ("reauth", "verify_current_password"):
         assert calls_to(named_func(source, name), {"_reproof"}), (
-            f"{name} no longer re-proves through _reproof, so it may have stopped feeding or "
-            "honouring the lockout; the SEC-024 caveat below says it does both."
+            f"{name} no longer re-proves through _reproof, so it may have stopped feeding the "
+            "lockout or the per-session cap; the SEC-024 caveat below says it does both."
         )
     assert calls_to(named_func(source, "_reproof"), {"_reproof_serialized"})
     reproof = named_func(source, "_reproof_serialized")
     assert calls_to(reproof, {"_register_failure"})
-    assert calls_to(reproof, {"_live_lock"}), "the re-proof no longer checks the lock"
-    block = _section(_H_BRUTE)
-    assert "The lockout also reaches the credential re-proof surface" in block, (
-        "the SEC-024 caveat must state that the lockout covers POST /me/reauth and POST /me/password."
+    assert calls_to(reproof, {"_live_lock"}), "a failure during a live lock must not extend it"
+    assert calls_to(reproof, {"revoke_session"}), "the per-session cap no longer revokes"
+    block = " ".join(_section(_H_BRUTE).split())
+    assert "bounded by a per-session cap" in block, (
+        "the SEC-024 caveat must state how POST /me/reauth and POST /me/password are bounded."
     )
-    assert "global ceiling does **not**" in " ".join(block.split()), (
+    assert "global ceiling does **not**" in block, (
         "the SEC-024 caveat must still state that the global sign-in ceiling does not cover them."
     )
+    assert "per engine process" in block, "the caveat must state the per-process limit of the cap."
 
 
 def test_throttle_observability_split_is_documented() -> None:

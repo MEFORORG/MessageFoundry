@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #1138, ASVS 6.3.5: a failed re-authentication counts toward the engine account lockout.
+"""BACKLOG #1138, ASVS 6.3.5: re-proof failures count toward the account lockout, and each session
+gets a bounded number of them.
 
-Owner ruling 2026-09-23: failed re-authentication and step-up attempts count, directory (AD) accounts
-included. Before this change the post-session credential ceremonies -- ``POST /me/reauth`` (and the
-console's ``POST /ui/reauth``, which calls the same ``AuthService.reauth``) and ``POST /me/password``
--- verified a password without counting a failure or checking ``locked_until``. So someone holding a
-stolen session could guess the password with no bound but the per-actor ceremony budget, and could
-keep guessing after the account was locked.
+Owner ruling 2026-09-23: failed re-authentication and step-up attempts count toward engine account
+lockout, directory (AD) accounts included. Before this change the post-session credential ceremonies
+-- ``POST /me/reauth`` (and the console's ``POST /ui/reauth``, which calls the same
+``AuthService.reauth``) and ``POST /me/password`` -- verified a password without counting a failure.
+So someone holding a stolen session could guess the password with no bound but the per-actor
+ceremony budget.
 
-These tests reuse the LOGIN leg's policy as the yardstick: the same counter, the same threshold, the
-same refusal of a locked account, the same ``auth.account_locked`` / ``auth.login_after_failures``
-rows, and the same clearing rules. Engine lockout sets ``locked_until`` on the engine's own row; it
-never writes to the directory, which is why it is safe to apply to an AD account.
+How the tests read the ruling (design E, Manager decision 2026-09-24): a re-proof failure counts on
+the account's shared counter, so it can lock the account and fire ``ACCOUNT_LOCKED``; the lock gates
+SIGN-IN, not the re-proofs of a session that already exists; and each session may fail at most
+``lockout_threshold`` re-proofs before that session is revoked. A stolen session therefore gets that
+many guesses in total, and an attacker who can only lock the account from the sign-in page cannot
+take step-up away from the owner's live sessions.
 
 All credentials and directory data here are synthetic.
 """
@@ -41,6 +44,7 @@ from messagefoundry.auth.notifications import (
 )
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
@@ -96,6 +100,16 @@ async def _lock_state(store: MessageStore, user_id: str) -> tuple[int, float | N
     return user.failed_attempts, user.locked_until
 
 
+async def _session_revoked(store: MessageStore, token: str) -> bool:
+    session = await store.get_session(hash_token(token))
+    return session is None or session.revoked_at is not None
+
+
+async def _lock_by_sign_in(service: AuthService, username: str, attempts: int) -> None:
+    for _ in range(attempts):
+        assert not (await service.login(username, WRONG)).ok
+
+
 # --- (a) re-auth failures lock the account at the login threshold -------------------------------
 
 
@@ -142,66 +156,242 @@ async def test_reauth_and_login_failures_share_one_counter() -> None:
         await store.close()
 
 
-# --- (b) a locked account is refused at re-auth and at the password change ----------------------
+# --- (b) the lock gates sign-in, not the re-proofs of a live session ------------------------------
 
 
-async def test_a_locked_account_is_refused_reauth_even_with_the_right_password() -> None:
+async def test_a_sign_in_lock_does_not_block_step_up_on_a_live_session() -> None:
+    """An attacker who only knows the username can lock the account from the sign-in page, every
+    lock window, indefinitely. If that lock also refused re-proofs, the owner's live sessions would
+    lose step-up for as long as the attacker kept it up. The lock gates sign-in only."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        await _lock_by_sign_in(service, "bob", service.policy.lockout_threshold)
+        attempts, locked_until = await _lock_state(store, "u-bob")
+        assert locked_until is not None
+
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None, "a live session must keep step-up during a lock"
+        # The lock stands: a good re-proof during it neither lifts nor restarts the counter.
+        assert await _lock_state(store, "u-bob") == (attempts, locked_until)
+        assert not (await service.login("bob", GOOD)).ok, "sign-in stays locked"
+    finally:
+        await store.close()
+
+
+async def _api_user(service: AuthService, username: str = "carol") -> None:
+    user_id = await service.create_local_user(
+        username=username,
+        password=GOOD,
+        display_name=None,
+        email=None,
+        roles=[Role.VIEWER.value],
+        actor="test",
+    )
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        user_id, password_hash=user.password_hash, must_change_password=False
+    )
+
+
+@pytest.fixture
+async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
+    eng = await Engine.create(tmp_path / "reauth-lockout.db", poll_interval=0.02)
+    yield eng
+    await eng.stop()
+
+
+async def _api_login(c: httpx.AsyncClient, username: str = "carol") -> dict[str, str]:
+    r = await c.post(
+        "/auth/login", json={"username": username, "password": GOOD, "provider": "local"}
+    )
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['token']}"}
+
+
+async def test_a_sign_in_lock_does_not_block_a_password_change_on_a_live_session(
+    engine: Engine,
+) -> None:
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    await service.initialize()
+    await _api_user(service)
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        headers = await _api_login(c)
+        await _lock_by_sign_in(service, "carol", service.policy.lockout_threshold)
+        locked = await service.store.get_user_by_username("carol")
+        assert locked is not None and locked.locked_until is not None
+
+        r = await c.post(
+            "/me/password",
+            headers=headers,
+            json={"current_password": GOOD, "new_password": NEW_GOOD},
+        )
+        assert r.status_code == 200, r.text
+    changed = await service.store.get_user_by_username("carol")
+    assert changed is not None and changed.password_hash != locked.password_hash
+    # The owner's own rotation is an in-band way out of the lock again, as it was before #1138.
+    assert changed.locked_until is None
+
+
+async def test_a_reproof_failure_does_not_extend_a_live_lock() -> None:
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        await _lock_by_sign_in(service, "bob", service.policy.lockout_threshold)
+        before = await _lock_state(store, "u-bob")
+        assert before[1] is not None
+
+        out = await service.reauth(identity, WRONG, token=token)
+        assert not out.ok and not out.locked, "checked as a wrong password, not refused as locked"
+        assert await _lock_state(store, "u-bob") == before, "the lock must not be re-armed"
+        # It is still charged to the session.
+        assert service._reproof_session_failures[hash_token(token)] == 1
+    finally:
+        await store.close()
+
+
+# --- (b2) each session gets at most lockout_threshold failed re-proofs ----------------------------
+
+
+async def test_a_sessions_reproof_budget_revokes_it_at_the_threshold(engine: Engine) -> None:
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    await service.initialize()
+    await _api_user(service)
+    identity, token = await _signed_in(service, "carol")
+    threshold = service.policy.lockout_threshold
+    for _ in range(threshold - 1):
+        out = await service.reauth(identity, WRONG, token=token)
+        assert not out.ok and not out.session_lost
+    out = await service.reauth(identity, WRONG, token=token)
+    assert out.session_lost, "the threshold-th failure must end the session"
+    assert await _session_revoked(service.store, token)
+
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.post(
+            "/me/reauth", headers={"Authorization": f"Bearer {token}"}, json={"password": GOOD}
+        )
+        assert r.status_code == 401
+
+
+async def test_a_stolen_session_gets_at_most_threshold_guesses_across_lock_cycles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The account lock releases itself every lock window. Charged only to the account, a stolen
+    session would get ``threshold`` guesses per window, forever. Charged to the session, it gets
+    ``threshold`` in total."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        verifies = 0
+        real_argon2 = service._argon2
+
+        async def counting(fn: Any, *args: Any) -> Any:
+            nonlocal verifies
+            verifies += 1
+            return await real_argon2(fn, *args)
+
+        monkeypatch.setattr(service, "_argon2", counting)
+        for _ in range(4 * service.policy.lockout_threshold):
+            await service.reauth(identity, WRONG, token=token)
+            attempts, locked_until = await _lock_state(store, "u-bob")
+            if locked_until is not None:  # the lock window passes, as the clock would move it
+                await store.record_login_failure(
+                    "u-bob", failed_attempts=attempts, locked_until=time.time() - 1
+                )
+        assert verifies == service.policy.lockout_threshold
+    finally:
+        await store.close()
+
+
+async def test_a_parallel_burst_on_one_session_is_capped_at_the_threshold() -> None:
+    """Re-proofs for one account run one at a time and check the session first, so a burst queued
+    on one session cannot be verified past its budget, and a correct guess behind it is refused."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
         await _local_user(store)
         identity, token = await _signed_in(service)
-        for _ in range(3):
-            await service.reauth(identity, WRONG, token=token)
-        attempts_at_lock, locked_until_at_lock = await _lock_state(store, "u-bob")
-        assert locked_until_at_lock is not None
-
-        out = await service.reauth(identity, GOOD, token=token, purpose="mfa_enroll")
-        assert not out.ok and out.token is None and not out.session_lost
-        assert out.locked, "the route must be able to say 'locked' rather than 'wrong password'"
-        assert await service.identity_for_token(token) is not None, "nothing rotated"
-        assert not await service.has_action_step_up(token, "mfa_enroll"), "no grant was minted"
-
-        # (5) Refusing a locked account must not re-arm or extend the lock, which the login leg never
-        # does either: its pre-check refuses before any failure is registered.
-        await service.reauth(identity, WRONG, token=token)
-        assert await _lock_state(store, "u-bob") == (attempts_at_lock, locked_until_at_lock)
-
-        # The refusal is audited once, on the attempt's own row, and says why.
-        rows = [r for r in await store.list_audit(limit=100) if r["action"] == "auth.reauth"]
-        assert len(rows) == 5
-        assert '"locked": true' in str(rows[0]["detail"])
+        burst = [service.reauth(identity, WRONG, token=token) for _ in range(8)]
+        burst.append(service.reauth(identity, GOOD, token=token))
+        results = await asyncio.gather(*burst)
+        assert not results[-1].ok, "a correct guess queued behind the cap must be refused"
+        attempts, locked_until = await _lock_state(store, "u-bob")
+        assert attempts == 3 and locked_until is not None
+        assert await _session_revoked(store, token)
+        assert service._reproof_locks == {}, "the per-account lock entry must not leak"
+        assert hash_token(token) not in service._reproof_session_failures
     finally:
         await store.close()
 
 
-async def test_a_locked_account_cannot_verify_its_current_password() -> None:
-    """``POST /me/password`` re-proves the current password, so it is a re-auth ceremony too."""
+async def test_a_lock_set_by_another_leg_during_the_verify_does_not_block_or_get_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sign-in failure can lock the account while a re-proof waits on its verify. The re-proof
+    still succeeds, since the lock gates sign-in only, and it must not clear the lock it did not see
+    at the start."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
         await _local_user(store)
-        identity, _ = await _signed_in(service)
+        identity, token = await _signed_in(service)
+        assert not (await service.login("bob", WRONG)).ok  # one earlier failure on the row
+        real_argon2 = service._argon2
 
-        for _ in range(3):
-            assert not await service.verify_current_password(identity, WRONG, client="10.0.0.8")
-        state = await _lock_state(store, "u-bob")
-        assert state[1] is not None, "wrong current passwords must lock the account"
+        async def lock_lands_mid_verify(fn: Any, *args: Any) -> Any:
+            result = await real_argon2(fn, *args)
+            await store.record_login_failure(
+                "u-bob", failed_attempts=3, locked_until=time.time() + 900
+            )
+            return result
 
-        assert not await service.verify_current_password(identity, GOOD, client="10.0.0.8")
-        assert await _lock_state(store, "u-bob") == state, "a refusal must not extend the lock"
+        monkeypatch.setattr(service, "_argon2", lock_lands_mid_verify)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok
+        attempts, locked_until = await _lock_state(store, "u-bob")
+        assert locked_until is not None and attempts == 3, "the re-proof lifted a live lock"
+    finally:
+        await store.close()
+
+
+async def test_a_wrong_current_password_counts_and_is_audited_once() -> None:
+    """``POST /me/password`` re-proves the current password, so it is a re-auth ceremony too."""
+    # Imported here so the module still collects against a tree that predates the type.
+    from messagefoundry.auth.service import CurrentPasswordCheck
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        for _ in range(2):
+            got = await service.verify_current_password(
+                identity, WRONG, token=token, client="10.0.0.8"
+            )
+            assert got is CurrentPasswordCheck.WRONG
+        got = await service.verify_current_password(identity, WRONG, token=token, client="10.0.0.8")
+        assert got is CurrentPasswordCheck.SESSION_ENDED
+        assert (await _lock_state(store, "u-bob"))[1] is not None
 
         feed = await service.security_events_for("bob")
         locked = _actions(feed, "auth.account_locked")
         assert len(locked) == 1
-        # No richer than the attempt's own row, which carries only its reason.
-        assert locked[0]["detail"] is None
-        # Each attempt is audited once. Before this change a failed current-password check wrote
-        # nothing at all, so a guessing run was invisible in the user's feed.
+        assert locked[0]["detail"] is None  # no richer than the attempt's own row
         failed = _actions(feed, "auth.password_change_failed")
-        assert len(failed) == 4
-        assert failed[0]["detail"] == '{"reason": "locked"}'
-        assert failed[-1]["detail"] == '{"reason": "bad_password"}'
+        assert [f["detail"] for f in failed] == [
+            '{"reason": "session_revoked"}',
+            '{"reason": "bad_password"}',
+            '{"reason": "bad_password"}',
+        ]
     finally:
         await store.close()
 
@@ -228,7 +418,10 @@ async def test_the_reauth_crossing_attempt_audits_account_locked_once_and_notifi
         assert len(locked) == 1
         # Mirrors the auth.reauth row beside it; the failure count stays in the notice.
         assert locked[0]["detail"] == '{"provider": "local"}'
-        assert len(_actions(feed, "auth.reauth")) == 3, "each attempt audited exactly once"
+        reauths = _actions(feed, "auth.reauth")
+        assert len(reauths) == 3, "each attempt audited exactly once"
+        assert '"session_revoked": true' in str(reauths[0]["detail"])
+        assert '"session_revoked": false' in str(reauths[-1]["detail"])
 
         notices = [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
         assert len(notices) == 1
@@ -238,42 +431,20 @@ async def test_the_reauth_crossing_attempt_audits_account_locked_once_and_notifi
         await store.close()
 
 
-@pytest.fixture
-async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "reauth-lockout.db", poll_interval=0.02)
-    yield eng
-    await eng.stop()
-
-
-async def _api_user(service: AuthService) -> None:
-    user_id = await service.create_local_user(
-        username="carol",
-        password=GOOD,
-        display_name=None,
-        email=None,
-        roles=[Role.VIEWER.value],
-        actor="test",
-    )
-    user = await service.store.get_user(user_id)
-    assert user is not None and user.password_hash is not None
-    await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
-    )
-
-
-async def test_the_json_routes_lock_the_account_and_the_feed_shows_it(engine: Engine) -> None:
+async def test_the_json_routes_count_end_the_session_and_the_feed_shows_it(
+    engine: Engine,
+) -> None:
     service = AuthService(engine.store, AuthSettings(lockout_threshold=3, require_mfa=False))
     await service.initialize()
     await _api_user(service)
     transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        r = await c.post(
-            "/auth/login", json={"username": "carol", "password": GOOD, "provider": "local"}
-        )
-        assert r.status_code == 200, r.text
-        headers = {"Authorization": f"Bearer {r.json()['token']}"}
+        headers = await _api_login(c)
+        before = await service.store.get_user_by_username("carol")
+        assert before is not None
 
-        # Two wrong re-auths and one wrong current password: one counter, three failures.
+        # Two wrong re-auths and one wrong current password: one counter, three failures. The third
+        # also exhausts this session's budget, so it ends the session.
         for _ in range(2):
             r = await c.post("/me/reauth", headers=headers, json={"password": WRONG})
             assert r.status_code == 403
@@ -282,83 +453,22 @@ async def test_the_json_routes_lock_the_account_and_the_feed_shows_it(engine: En
             headers=headers,
             json={"current_password": WRONG, "new_password": NEW_GOOD},
         )
-        assert r.status_code == 403
+        assert r.status_code == 401 and r.json()["detail"] == "session ended; sign in again"
 
-        # Locked: the right password is refused on both routes, and the password is not changed.
-        before = await service.store.get_user_by_username("carol")
-        assert before is not None
+        # The session is gone: even the right password gets nowhere on it.
         r = await c.post("/me/reauth", headers=headers, json={"password": GOOD})
-        assert r.status_code == 403 and r.json()["detail"] == "account locked"
+        assert r.status_code == 401
         r = await c.post(
             "/me/password",
             headers=headers,
             json={"current_password": GOOD, "new_password": NEW_GOOD},
         )
-        assert r.status_code == 403 and r.json()["detail"] == "account locked"
-        after = await service.store.get_user_by_username("carol")
-        assert after is not None and after.password_hash == before.password_hash
-
-        feed = await c.get("/me/security-events", headers=headers)
-        assert feed.status_code == 200, feed.text
-        body = feed.json()
-        events = body["events"] if isinstance(body, dict) else body
-        assert [e["action"] for e in events].count("auth.account_locked") == 1
-
-
-async def test_a_parallel_burst_cannot_outrun_the_lock() -> None:
-    """Re-proofs for one account run one at a time. Without that, a burst passes the lock check
-    together, every guess in it is verified after the account locks, and a correct guess inside the
-    burst succeeds. The code review reproduced exactly that before the serialization landed."""
-    store = await MessageStore.open(":memory:")
-    try:
-        service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
-        await _local_user(store)
-        identity, token = await _signed_in(service)
-        burst = [service.verify_current_password(identity, WRONG) for _ in range(8)]
-        burst.append(service.verify_current_password(identity, GOOD))
-        results = await asyncio.gather(*burst)
-        assert results[-1] is False, "a correct guess queued behind the lock must be refused"
-        attempts, locked_until = await _lock_state(store, "u-bob")
-        assert locked_until is not None
-        assert attempts == 3, "no guess may be verified or counted once the lock is set"
-
-        again = await asyncio.gather(
-            *[service.reauth(identity, GOOD, token=token) for _ in range(3)]
-        )
-        assert all(not e.ok and e.locked for e in again)
-        assert service._reproof_locks == {}, "the per-account lock entry must not leak"
-    finally:
-        await store.close()
-
-
-async def test_a_lock_set_by_another_leg_during_the_verify_refuses_the_reproof(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The per-account lock orders re-proofs only. A sign-in failure can lock the account while a
-    re-proof waits on its argon2 verify; the re-proof must then be refused, and must not clear the
-    lock it never saw. The code review reproduced both before the post-verify check landed."""
-    store = await MessageStore.open(":memory:")
-    try:
-        service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
-        await _local_user(store)
-        identity, token = await _signed_in(service)
-        assert not (await service.login("bob", WRONG)).ok  # one earlier failure on the row
-        real_argon2 = service._argon2
-
-        async def lock_lands_mid_verify(fn: Any, *args: Any) -> Any:
-            result = await real_argon2(fn, *args)
-            await store.record_login_failure(
-                "u-bob", failed_attempts=3, locked_until=time.time() + 900
-            )
-            return result
-
-        monkeypatch.setattr(service, "_argon2", lock_lands_mid_verify)
-        out = await service.reauth(identity, GOOD, token=token)
-        assert not out.ok and out.locked, "a correct re-proof must not win against a fresh lock"
-        attempts, locked_until = await _lock_state(store, "u-bob")
-        assert locked_until is not None and attempts == 3, "the re-proof lifted a live lock"
-    finally:
-        await store.close()
+        assert r.status_code == 401
+    after = await service.store.get_user_by_username("carol")
+    assert after is not None and after.password_hash == before.password_hash
+    assert after.locked_until is not None
+    feed = await service.security_events_for("carol")
+    assert [e["action"] for e in feed].count("auth.account_locked") == 1
 
 
 # --- (d) a directory account's failed re-bind counts toward ENGINE lockout ----------------------
@@ -392,14 +502,16 @@ class _FakeDirectory:
         return _principal() if self.known else None
 
 
-async def _ad_service(store: MessageStore, directory: _FakeDirectory) -> AuthService:
+async def _ad_service(
+    store: MessageStore, directory: _FakeDirectory, *, threshold: int = 3
+) -> AuthService:
     settings = AuthSettings(
         ad_enabled=True,
         ad_server="ldaps://dc.test.invalid",
         ad_user_search_base="OU=Staff,DC=test,DC=invalid",
         ad_bind_dn="CN=svc,OU=Service,DC=test,DC=invalid",
         ad_bind_password="synthetic",
-        lockout_threshold=3,
+        lockout_threshold=threshold,
         require_mfa=False,
     )
     service = AuthService(store, settings, ldap=directory)  # type: ignore[arg-type]
@@ -446,11 +558,34 @@ async def test_a_directory_accounts_failed_rebind_counts_toward_engine_lockout()
         assert len(locked) == 1
         assert locked[0]["detail"] == '{"provider": "ad"}'
 
-        # Locked: the engine refuses BEFORE asking the directory, so no bind reaches the DC while the
-        # engine lock lasts.
+        # The third rejected bind also spent the session's budget: it is revoked, and nothing more
+        # reaches the directory through it.
+        assert await _session_revoked(store, token)
         binds_before = directory.binds
-        assert not (await service.reauth(identity, AD_GOOD, token=token)).ok
+        assert (await service.reauth(identity, AD_GOOD, token=token)).session_lost
         assert directory.binds == binds_before
+    finally:
+        await store.close()
+
+
+async def test_an_ad_session_sends_at_most_threshold_binds() -> None:
+    """Each rejected re-bind reaches the DC and counts there too. Charged only to the engine lock,
+    a stolen session would send ``threshold`` binds every lock window, which a domain lockout policy
+    can turn into a domain lockout. Charged to the session, it sends ``threshold`` in total."""
+    store = await MessageStore.open(":memory:")
+    try:
+        directory = _FakeDirectory()
+        service = await _ad_service(store, directory, threshold=5)
+        out = await service._complete_ad_login(_principal(), None, mfa_verified=True)
+        assert out.ok and out.identity is not None and out.token is not None, out.error
+        for _ in range(20):
+            await service.reauth(out.identity, WRONG, token=out.token)
+            attempts, locked_until = await _lock_state(store, out.identity.user_id)
+            if locked_until is not None:  # the lock window passes
+                await store.record_login_failure(
+                    out.identity.user_id, failed_attempts=attempts, locked_until=time.time() - 1
+                )
+        assert directory.binds == 5, "the 6th attempt must never reach the directory"
     finally:
         await store.close()
 
@@ -559,9 +694,11 @@ async def test_a_reauth_lock_expires_on_the_login_clock_and_an_admin_reset_clear
         attempts, locked_until = await _lock_state(store, "u-bob")
         assert locked_until is not None
 
-        # Timed expiry: move the stored deadline into the past, as the clock would.
+        assert not (await service.login("bob", GOOD)).ok, "sign-in is locked"
+        # Timed expiry: move the stored deadline into the past, as the clock would. The session that
+        # failed three times was revoked, so the proof is a fresh sign-in.
         await store.record_login_failure("u-bob", failed_attempts=attempts, locked_until=1.0)
-        assert (await service.reauth(identity, GOOD, token=token)).ok
+        assert (await service.login("bob", GOOD)).ok
 
         identity, token = await _signed_in(service)
         for _ in range(3):
@@ -594,16 +731,17 @@ def test_the_admin_unlock_cli_clears_a_lock_set_by_reauth(
         finally:
             await store.close()
 
-    identity, token = asyncio.run(lock())
+    asyncio.run(lock())
     assert main(["admin-unlock", "--username", "admin", "--db", str(db)]) == 0
     capsys.readouterr()
 
-    async def reauth_after_unlock() -> bool:
+    async def sign_in_after_unlock() -> bool:
         store = await MessageStore.open(db)
         try:
             service = AuthService(store, AuthSettings(lockout_threshold=3, require_mfa=False))
-            return (await service.reauth(identity, GOOD, token=token)).ok
+            # The session that failed three times was revoked, so the proof is a fresh sign-in.
+            return (await service.login("admin", GOOD)).ok
         finally:
             await store.close()
 
-    assert asyncio.run(reauth_after_unlock()), "admin-unlock must lift a lock that re-auth set"
+    assert asyncio.run(sign_in_after_unlock()), "admin-unlock must lift a lock that re-auth set"

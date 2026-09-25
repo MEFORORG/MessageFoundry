@@ -66,19 +66,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   path meets it. `0` means no floor. `[approvals].expiry_hours` now also refuses NaN, infinity and
   overflow, and with dual control on, startup refuses a floor at or past the expiry. Dual control
   (`[approvals].enabled`) still ships off. ([BACKLOG #287](docs/BACKLOG.md))
-- **A failed step-up re-auth or password change now counts toward the account lockout, and a locked
-  account is refused there even with the right password.** In 0.4.0, `POST /me/reauth`, the web
-  console's `POST /ui/reauth` and `POST /me/password` checked a password but counted no failure and
-  ignored the lock. So someone holding a stolen session could keep guessing, bounded only by the
-  per-actor ceremony budget. They now share the sign-in counter, threshold and window. A rejected
-  directory (AD) re-bind counts too. The engine lock is set on the engine's own account row and is
-  never written to the directory. Each rejected re-bind still reaches the domain controller, though,
-  so the domain's own lockout policy can still lock the domain account. A directory the engine
-  cannot reach, or one with no such account, is not counted. The crossing attempt writes
-  `auth.account_locked`. A re-auth that clears a run of three or more failures writes
-  `auth.login_after_failures`. A failed current-password check at `POST /me/password` is now
-  audited as `auth.password_change_failed`. That route no longer lifts a live lock: the lock ends
-  when it expires, on an administrator's reset, or with `messagefoundry admin-unlock`.
+- **A failed step-up re-auth or password change now counts toward the account lockout, and each
+  session gets at most `lockout_threshold` of them.** In 0.4.0, `POST /me/reauth`, the web console's
+  `POST /ui/reauth` and `POST /me/password` checked a password but counted no failure. So someone
+  holding a stolen session could keep guessing, bounded only by the per-actor ceremony budget. A
+  failure now counts on the account's sign-in counter, so it can lock sign-in and raise the lockout
+  notice. It is also charged to the session, and the failure that reaches `lockout_threshold` (5 by
+  default) revokes that session, so a stolen session gets 5 guesses in total. The account lock does
+  not refuse a live session's re-proofs, so an attacker who locks the account from the sign-in page
+  cannot take step-up or the password change away from the owner's live sessions. A rejected
+  directory (AD) re-bind counts too. The engine never writes a lock to the directory, but each
+  rejected re-bind still reaches the domain controller, so the domain's own lockout policy can still
+  lock the domain account. A directory the engine cannot reach, or one with no such account, is not
+  counted. The per-session count lives in each engine process: a restart resets it, and each engine
+  shard serving its own API port keeps its own. The crossing attempt writes `auth.account_locked`. A
+  re-auth that clears a run of three or more failures writes `auth.login_after_failures`. A failed
+  current-password check at `POST /me/password` is now audited as `auth.password_change_failed`.
   (`BACKLOG #1138`)
 - **BREAKING: the `Http()` inbound listener now refuses any `Transfer-Encoding`, not only
   `chunked`.** The listener decodes no transfer coding. In 0.4.0 it refused the header only when its
