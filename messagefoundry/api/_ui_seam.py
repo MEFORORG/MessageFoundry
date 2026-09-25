@@ -198,8 +198,9 @@ from typing import Any
 #:
 #: BACKLOG #1139, slice 3 (ADR 0182 Amendment A): ``UserUpdateRequest`` gained ``notify_email``, the
 #: one field that moves the notification address. Saving the profile ``email`` no longer moves it.
-#: The console's user page posts the new field, and an engine without it refuses the body with a
-#: 422 (``RequestModel`` forbids unknown keys), so an older engine must fail the handshake instead.
+#: The console's user page builds that model in-process with the new key. An engine without the
+#: field refuses it (``RequestModel`` forbids unknown keys), so every save that changes the address
+#: would render "invalid input". An older engine must fail the handshake instead.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

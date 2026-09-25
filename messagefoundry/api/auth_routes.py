@@ -98,6 +98,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
     CurrentPasswordCheck,
+    InvalidNotifyEmail,
     NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -856,11 +857,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
         supplied = body.model_fields_set
-        # BACKLOG #1139: notify_email is NOT filled from the stored row when omitted. Omitted means
-        # "leave it", and the service moves it only on an explicit value. Filling `email` above is
-        # harmless for that reason: the profile address no longer reaches the notification one.
-        # An explicit null is refused rather than read as "leave it", because a client sending it
-        # asked for a clear, and the address can be repointed but never cleared.
+        # BACKLOG #1139, ADR 0182 Amendment A (the rule is on AuthService.update_user): notify_email
+        # is NOT filled from the stored row when omitted, and an explicit null is refused, because a
+        # client sending it asked for a clear the address does not allow.
         if "notify_email" in supplied and body.notify_email is None:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
@@ -877,9 +876,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 notify_email=body.notify_email,
                 actor=identity.username,
             )
-        except ValueError as exc:
-            # The service checks the address before it writes anything, so this refuses the whole
-            # save. Its messages name the rule and never echo the value.
+        except InvalidNotifyEmail as exc:
+            # Raised before any write, so this refuses the whole save. The message names the rule
+            # and never echoes the value.
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="updated")
 

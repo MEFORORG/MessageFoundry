@@ -19,6 +19,7 @@ from messagefoundry.auth.notifications import (
     EMAIL_CHANGED,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
+    NOTIFY_EMAIL_SET,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
     SecurityEvent,
@@ -237,9 +238,13 @@ def test_body_names_a_moved_notification_address_as_such() -> None:
             detail={"new_email": "new@example.org", "field": "notify_email"},
         )
     )
+    assert "An administrator changed the address that receives security notices" in moved
     assert "New notification address: new@example.org" in moved
-    assert "Later notices go to the new address" in moved
+    assert "Notices about later changes go to the new address" in moved
     assert "New email on file" not in moved
+    # An administrator did it, so "if this was you" cannot apply.
+    assert "If this was you" not in moved
+    assert "If you did not expect this change" in moved
 
     profile = _build_body(
         SecurityEvent(
@@ -250,7 +255,27 @@ def test_body_names_a_moved_notification_address_as_such() -> None:
         )
     )
     assert "New email on file: new@example.org" in profile
-    assert "Later notices go to the new address" not in profile
+    assert "Notices about later changes" not in profile
+    assert "If this was you" in profile
+
+
+def test_body_says_an_administrator_set_the_first_address() -> None:
+    """The holder's own fill says "if you did not set it". An administrator's fill must not, since
+    the holder never sets it on that path. The holder's own fill is the control."""
+    by_admin = _build_body(
+        SecurityEvent(
+            NOTIFY_EMAIL_SET,
+            username="bob",
+            email="new@example.org",
+            detail={"set_by": "administrator"},
+        )
+    )
+    assert "An administrator set this address" in by_admin
+    assert "If you did not set it" not in by_admin
+    assert "If this was you" not in by_admin
+
+    own = _build_body(SecurityEvent(NOTIFY_EMAIL_SET, username="bob", email="new@example.org"))
+    assert "If you did not set it" in own
 
 
 def test_body_states_the_remaining_recovery_code_count() -> None:

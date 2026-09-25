@@ -5117,8 +5117,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         return settings
     try:
         # Validated before the store opens, so a refusal touches nothing. The same helper every
-        # write of the column uses, plus the web console's length bound, so this offline surface
-        # accepts nothing the console's user form refuses.
+        # write of the column uses, plus the web console's length bound. It does NOT apply the
+        # one-mailbox shape check the console's user form and POST /me/notify-email apply (BACKLOG
+        # #1139), so it accepts a host-only address such as ops@localhost that those refuse. The
+        # console's user form does not re-check a stored value it is handed back unchanged.
         address = require_notify_email(args.email)
     except ValueError as exc:
         return _emit_error(str(exc), as_json=args.json)

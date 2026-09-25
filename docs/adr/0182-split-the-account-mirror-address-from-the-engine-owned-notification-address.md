@@ -174,18 +174,24 @@ demand. This is the demand.
 
 **Decision.** The notification address gets its own input.
 
-- `UserUpdateRequest.notify_email` is the one field that moves it. Omitted, it is left alone. A
-  value must pass `require_notify_email` and `_is_single_mailbox`, and is checked before anything
-  is written, so a refusal undoes the whole save. An explicit `null` is refused with `400`.
+- `UserUpdateRequest.notify_email` is the one field that moves it. Omitted, it is left alone. An
+  explicit `null` is refused with `400`.
 - `update_user` takes `notify_email: str | None = None`. The profile `email` never reaches
-  `set_user_notify_email`. A value equal to the stored address writes nothing and sends nothing,
-  so the console can post the stored value back safely.
+  `set_user_notify_email`. The stored address sent back writes nothing, sends nothing, and is not
+  re-checked, so a value another writer stored cannot block an unrelated save. Any other value
+  must pass `_require_single_mailbox` (not blank, one plain mailbox), checked before anything is
+  written, so a refusal undoes the whole save. It raises `InvalidNotifyEmail`, which the route
+  alone turns into `400`.
 - A move writes `user.notify_email_changed` (actor: the administrator; detail: `user_id` and
-  `had_address`, never an address). It sends `email_changed` to the OLD address with
-  `field: notify_email`, and the notice body names the notification address. When there was no
-  old address, it sends `notify_email_set` to the new one, as the holder's own fill does.
-- The console user page shows a Notification address field, pre-filled with the stored value. A
-  blank field is left out of the request.
+  `had_address`, never an address) BEFORE the column, as `admin-set-notify-email` orders it. It
+  sends `email_changed` to the OLD address with `field: notify_email`. When there was no old
+  address, it sends `notify_email_set` to the new one with `set_by: administrator`. Both bodies say
+  an administrator did it.
+- The save's other notices (a profile email change, a disable) still go to the address from before
+  the save. An account that had none gets them at the address the save set.
+- The console user page shows a Notification address field and a hidden copy of the value it
+  showed. The route sends the field only when the administrator changed it from that copy, so a
+  stale page cannot undo another administrator's move. Emptying it is refused.
 
 The rest of the Decision stands. `set_user_notify_email` is still the only writer after creation,
 and no directory-derived value reaches it.

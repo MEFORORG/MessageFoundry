@@ -99,10 +99,31 @@ _DESCRIPTIONS = {
 def _build_body(event: SecurityEvent) -> str:
     """A short, PHI-free notice. The recipient is the account owner, so naming their own account /
     source IP / new email is appropriate; no message data or secrets ever appear here."""
+    # BACKLOG #1139, ADR 0182 Amendment A: an administrator moved or set the NOTIFICATION address.
+    # The generic wording fits neither: EMAIL_CHANGED names the profile address, NOTIFY_EMAIL_SET
+    # assumes the holder set it, and "if this was you" cannot apply to an administrator's act.
+    moved_by_admin = (
+        event.event_type == EMAIL_CHANGED and event.detail.get("field") == "notify_email"
+    )
+    set_by_admin = (
+        event.event_type == NOTIFY_EMAIL_SET and event.detail.get("set_by") == "administrator"
+    )
+    if moved_by_admin:
+        description = (
+            "An administrator changed the address that receives security notices for your account."
+        )
+    elif set_by_admin:
+        description = (
+            "An administrator set this address to receive security notices about your account."
+        )
+    else:
+        description = _DESCRIPTIONS.get(
+            event.event_type, "A security event occurred on your account."
+        )
     lines = [
         f"A security-relevant change occurred on your MessageFoundry account ({event.username}).",
         "",
-        _DESCRIPTIONS.get(event.event_type, "A security event occurred on your account."),
+        description,
     ]
     failed = event.detail.get("failed_attempts")
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
@@ -140,14 +161,11 @@ def _build_body(event: SecurityEvent) -> str:
         # arm reports WHAT CHANGED and states the one thing the schema does guarantee, rather than
         # forecasting what the address will or will not receive.
         new_email = event.detail.get("new_email")
-        if new_email and event.detail.get("field") == "notify_email":
-            # BACKLOG #1139, ADR 0182 Amendment A: an administrator moved the NOTIFICATION address,
-            # not the profile one. Say which, because this is the last notice this address gets.
-            lines.append(
-                "An administrator changed the address that receives security notices for your "
-                "account. Later notices go to the new address, not to this one."
-            )
+        if new_email and moved_by_admin:
+            # Other notices from the same save still come here, so "later changes", not "later
+            # notices".
             lines.append(f"New notification address: {new_email}")
+            lines.append("Notices about later changes go to the new address, not to this one.")
         elif new_email:
             lines.append(f"New email on file: {new_email}")
         else:
@@ -179,6 +197,8 @@ def _build_body(event: SecurityEvent) -> str:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
         # would contradict the deadline line above it (BACKLOG #1141).
         closing = "If you did not expect this reset, contact your MessageFoundry administrator."
+    elif moved_by_admin or set_by_admin:
+        closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."
     lines += ["", closing]

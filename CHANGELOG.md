@@ -94,11 +94,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   the directory's `mail`, so the save did the directory repoint ADR 0182 blocks. On an account with
   no notification address it filled one from the directory. Now `email` sets the profile address
   only. A new `notify_email` field on `PATCH /users/{id}` is the one way an administrator moves
-  the notification address. Omitted, it leaves the address as it is. A new value must be one plain
-  mailbox, and `null` or a blank value is refused with `400`, because the address can be changed
-  but not cleared. A move writes a `user.notify_email_changed` audit row that holds no address. It
-  sends an `email_changed` notice to the old address, which names the new one, or a
-  `notify_email_set` notice to the new address when there was none. The console's user page has a
+  the notification address. Omitted, it leaves the address as it is. Sending the stored address
+  back changes nothing. A new value must be one plain mailbox, and `null` or a blank value is
+  refused with `400`, because the address can be changed but not cleared. A move writes a
+  `user.notify_email_changed` audit row that holds no address. It sends an `email_changed` notice
+  to the old address, which names the new one, or a `notify_email_set` notice to the new address
+  when there was none. Both say an administrator made the change. The console's user page has a
   Notification address field for it. **What changes for a client:** a `PATCH` that sets `email` to
   repoint notices now moves only the profile address. Send `notify_email` too. (`BACKLOG #1139`,
   ADR 0182 Amendment A)

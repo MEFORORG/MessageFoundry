@@ -2946,9 +2946,10 @@ async def test_an_unrelated_console_save_leaves_the_notification_address(engine:
                 uid, display_name=None, email="dir@example.test"
             )
 
-        # The page shows both addresses, each in its own field.
+        # The page shows both addresses, each in its own field, plus the shown copy.
         page = (await c.get(f"/ui/users/{set_uid}")).text
         assert 'name="notify_email"' in page and 'value="owner@example.test"' in page
+        assert 'name="notify_email_shown"' in page
         assert 'value="dir@example.test"' in page
 
         # Posted back exactly as the page pre-fills it, with only the display name changed.
@@ -2959,13 +2960,19 @@ async def test_an_unrelated_console_save_leaves_the_notification_address(engine:
                 "display_name": "Renamed",
                 "email": "dir@example.test",
                 "notify_email": "owner@example.test",
+                "notify_email_shown": "owner@example.test",
             },
         )
         assert r.status_code == 303
         r = await _save_profile(
             c,
             blank_uid,
-            {"display_name": "Renamed", "email": "dir@example.test", "notify_email": ""},
+            {
+                "display_name": "Renamed",
+                "email": "dir@example.test",
+                "notify_email": "",
+                "notify_email_shown": "",
+            },
         )
         assert r.status_code == 303
 
@@ -2977,16 +2984,45 @@ async def test_an_unrelated_console_save_leaves_the_notification_address(engine:
         assert blank.notify_email is None
 
 
+async def test_a_stale_console_page_cannot_undo_another_admins_move(engine: Engine) -> None:
+    """Round-one QA finding. Admin A's page showed X. Admin B then moved the address to Z. A's
+    display-name save posts X back, and comparing it with the STORED value read that as a move back
+    to X. The route compares it with the value A's page SHOWED, so nothing moves."""
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        await service.store.set_user_notify_email(uid, email="moved@example.test")  # B's move
+
+        r = await _save_profile(
+            c,
+            uid,
+            {
+                "display_name": "Renamed",
+                "email": "",
+                "notify_email": "owner@example.test",
+                "notify_email_shown": "owner@example.test",
+            },
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name == "Renamed"
+        assert user.notify_email == "moved@example.test"
+
+
 async def test_the_console_moves_the_notification_address_only_when_told(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "u1", Role.VIEWER)
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "u1")
         await service.store.set_user_notify_email(uid, email="owner@example.test")
+        shown = {"notify_email_shown": "owner@example.test"}
 
         # A value that is not one mailbox is refused whole, and the page says why.
         r = await _save_profile(
-            c, uid, {"display_name": "Renamed", "email": "", "notify_email": "not-an-address"}
+            c,
+            uid,
+            {"display_name": "Renamed", "email": "", "notify_email": "not-an-address", **shown},
         )
         assert r.status_code == 400
         assert "enter one email address" in r.text
@@ -2994,8 +3030,18 @@ async def test_the_console_moves_the_notification_address_only_when_told(engine:
         assert user is not None and user.display_name is None
         assert user.notify_email == "owner@example.test"
 
+        # Emptying the field is refused, as the JSON twin refuses an explicit null.
         r = await _save_profile(
-            c, uid, {"display_name": "", "email": "", "notify_email": "new@example.test"}
+            c, uid, {"display_name": "Renamed", "email": "", "notify_email": "", **shown}
+        )
+        assert r.status_code == 400
+        assert "can be changed but not cleared" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name is None
+        assert user.notify_email == "owner@example.test"
+
+        r = await _save_profile(
+            c, uid, {"display_name": "", "email": "", "notify_email": "new@example.test", **shown}
         )
         assert r.status_code == 303
         user = await service.store.get_user(uid)
