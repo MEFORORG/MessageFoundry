@@ -3191,10 +3191,10 @@ class AuthService:
 
         BACKLOG #1139 (ASVS 6.3.7). An account with no ``notify_email`` is told nothing out of band
         about a change to its authentication details, because the notifier drops a notice with no
-        address. At least four paths give birth to such an account: the first-run bootstrap administrator,
-        ``create_local_user`` with no email, ``provision-admin`` with no ``--email``, and a directory
-        sign-in whose directory returns no ``mail``. So the first sign-in sets one, in the shape of
-        the ``must_change_password`` confinement.
+        address. At least three paths give birth to such an account: ``create_local_user`` with no
+        email, ``provision-admin`` with no ``--email``, and a directory sign-in whose directory returns
+        no ``mail``. (A fourth, the first-run bootstrap administrator, was retired by ADR 0183.) So the
+        first sign-in sets one, in the shape of the ``must_change_password`` confinement.
 
         **ONLY WHEN A SECURITY-NOTICE CHANNEL IS WIRED**, which is ``[auth].notify_security_events``
         on and an ``[alerts]`` SMTP relay configured. Without one, no account is notified whatever it
