@@ -1290,10 +1290,10 @@ def cleartext_acceptance_audit_sink(
 
     def _record(detail: str) -> None:
         logger.warning(
-            "cleartext hop crossed on an operator acceptance — %s "
-            "(cleartext_accepted on connection %s; reason: %s)",
-            detail,
+            "cleartext hop crossed on an operator acceptance — connection %s; %s "
+            "(cleartext_accepted; reason: %s)",
             _audit_connection(connection),
+            detail,
             reason or "(none provided)",
         )
 
@@ -1302,7 +1302,10 @@ def cleartext_acceptance_audit_sink(
 
 def _audit_connection(connection: str | None) -> str:
     """Render a declaring connection's name for an audit record, or ``(unnamed)`` for a hop that is not
-    a connection.
+    a connection (or an empty name, which the loader does not refuse).
+
+    It goes at the FRONT of the record: the detail after it runs to several hundred characters, and a
+    relay or SIEM that truncates a long line would otherwise cut the name first.
 
     Quoted with ``repr`` so a control character in a code-first name is escaped, not passed raw to a
     handler that lacks the control-character scrub.
@@ -1310,8 +1313,10 @@ def _audit_connection(connection: str | None) -> str:
     **Callers must not follow the name with ``:`` or ``=``.** ``CredentialScrubFilter`` reads
     ``LABEL: value`` as a credential pair when the label ends in a credential word, and it allows a
     quote between the two. So ``connection 'IB_LAB_PASS': MLLP inbound`` ships as
-    ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``."""
-    return "(unnamed)" if connection is None else repr(connection)
+    ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``.
+    Residual: a name that itself contains a space, ``:`` or ``=`` can still be scrubbed, because
+    connection names are not validated for characters at load."""
+    return repr(connection) if connection else "(unnamed)"
 
 
 def log_revocation_attestation(
@@ -1331,11 +1336,11 @@ def log_revocation_attestation(
     ``reason`` is a logging parameter are all stated once, on :func:`cleartext_acceptance_audit_sink`,
     and hold here unchanged."""
     log.warning(
-        "%s on operator attestation — %s (%s on connection %s; reason: %s)",
+        "%s on operator attestation — connection %s; %s (%s; reason: %s)",
         crossing,
+        _audit_connection(connection),
         detail,
         declaration,
-        _audit_connection(connection),
         reason or "(none provided)",
     )
 

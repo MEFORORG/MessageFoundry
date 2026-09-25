@@ -91,7 +91,7 @@ def test_two_outbounds_to_one_host_the_audit_line_names_the_attested_one(
                 _dest("OB_LAB_B", ConnectorType.REST, Rest(url=url).settings, attested=False)
             )
     audit = _audit(caplog)
-    assert "on connection 'OB_LAB_A';" in audit
+    assert "connection 'OB_LAB_A';" in audit
     assert "OB_LAB_B" not in audit
     assert _REASON in audit
 
@@ -109,8 +109,8 @@ def test_two_attested_outbounds_to_one_host_each_line_names_its_own(
             )
     lines = [r.getMessage() for r in caplog.records if "operator attestation" in r.getMessage()]
     assert len(lines) == 2
-    assert "on connection 'OB_LAB_A';" in lines[0] and "OB_LAB_B" not in lines[0]
-    assert "on connection 'OB_LAB_B';" in lines[1] and "OB_LAB_A" not in lines[1]
+    assert "connection 'OB_LAB_A';" in lines[0] and "OB_LAB_B" not in lines[0]
+    assert "connection 'OB_LAB_B';" in lines[1] and "OB_LAB_A" not in lines[1]
 
 
 # --- every outbound call site passes the name ------------------------------------------------------
@@ -130,14 +130,14 @@ def test_the_http_family_audit_line_names_the_connection(
     ctype, factory, url = _HTTP[cell]
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         build_destination(_dest(f"OB_{cell}", ctype, factory(url=url).settings, attested=True))
-    assert f"on connection 'OB_{cell}';" in _audit(caplog)
+    assert f"connection 'OB_{cell}';" in _audit(caplog)
 
 
 def test_the_mllp_audit_line_names_the_connection(caplog: pytest.LogCaptureFixture) -> None:
     settings: dict[str, object] = {"host": _HOST, "port": 5000, "tls": True}
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         MLLPDestination(_dest("OB_MLLP_X", ConnectorType.MLLP, settings, attested=True))
-    assert "on connection 'OB_MLLP_X';" in _audit(caplog)
+    assert "connection 'OB_MLLP_X';" in _audit(caplog)
 
 
 def test_the_email_audit_line_names_the_connection(caplog: pytest.LogCaptureFixture) -> None:
@@ -148,7 +148,7 @@ def test_the_email_audit_line_names_the_connection(caplog: pytest.LogCaptureFixt
     }
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         EmailDestination(_dest("OB_MAIL_X", ConnectorType.EMAIL, settings, attested=True))
-    assert "on connection 'OB_MAIL_X';" in _audit(caplog)
+    assert "connection 'OB_MAIL_X';" in _audit(caplog)
 
 
 # --- the SMART token hop gets the name through the settings mirror ---------------------------------
@@ -187,7 +187,7 @@ def test_the_smart_token_hop_of_an_outbound_names_the_connection(
     dest = _dest_config(_toml(tmp_path, ob_extra=toml_attest).outbound["OB"], {})
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         token_provider_from_settings({**dest.settings, **_smart(smart_key)})
-    assert "on connection 'OB';" in _audit(caplog)
+    assert "connection 'OB';" in _audit(caplog)
 
 
 def test_the_smart_token_hop_of_a_fhir_lookup_names_the_lookup(
@@ -202,7 +202,7 @@ def test_the_smart_token_hop_of_a_fhir_lookup_names_the_lookup(
     spec = load_config(tmp_path, allow_empty=True).fhir_lookups["epic"]
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         token_provider_from_settings({**spec.settings, **_smart(smart_key)})
-    assert "on connection 'epic';" in _audit(caplog)
+    assert "connection 'epic';" in _audit(caplog)
 
 
 # --- the shared record: inbound shape, and a hop with no connection --------------------------------
@@ -216,7 +216,7 @@ def test_the_inbound_line_uses_the_same_record(
     with caplog.at_level(logging.WARNING):
         check_inbound_revocation(src, "IB", posture=_ENFORCING)
     audit = _audit(caplog)
-    assert "on connection 'IB';" in audit and _REASON in audit
+    assert "connection 'IB';" in audit and _REASON in audit
 
 
 def test_a_hop_with_no_connection_renders_unnamed(caplog: pytest.LogCaptureFixture) -> None:
@@ -230,7 +230,7 @@ def test_a_hop_with_no_connection_renders_unnamed(caplog: pytest.LogCaptureFixtu
     )
     with caplog.at_level(logging.WARNING):
         guard.enforce_construction()
-    assert "on connection (unnamed);" in _audit(caplog)
+    assert "connection (unnamed);" in _audit(caplog)
 
 
 def _shipped(text: str) -> str:
@@ -249,7 +249,7 @@ def test_the_name_and_cell_survive_the_log_filters(
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         build_destination(_dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True))
     shipped = _shipped(_audit(caplog))
-    assert f"on connection '{name}';" in shipped
+    assert f"connection '{name}';" in shipped
     assert "REST destination (verified TLS" in shipped
 
 
@@ -267,13 +267,13 @@ def test_the_cleartext_record_quotes_its_name_the_same_way(
         cleartext_acceptance_audit_sink(_REASON, connection="IB_LAB_PASS")("MLLP inbound")
         cleartext_acceptance_audit_sink(_REASON)("MLLP inbound")
     shipped = [_shipped(r.getMessage()) for r in caplog.records]
-    assert "MLLP inbound (cleartext_accepted on connection 'IB_LAB_PASS';" in shipped[0]
-    assert "on connection (unnamed);" in shipped[1]
+    assert "connection 'IB_LAB_PASS'; MLLP inbound (cleartext_accepted;" in shipped[0]
+    assert "connection (unnamed);" in shipped[1]
 
 
-def test_raw_spec_keys_cannot_attest_or_name_the_smart_hop(tmp_path: Path) -> None:
-    # Only the top-level declaration writes the mirror. A spec that carries the keys as raw transport
-    # settings would cross the SMART refusal with no reason check and name a connection of its choice.
+def test_raw_spec_keys_cannot_attest_or_name_the_smart_hop(tmp_path: Path, smart_key: str) -> None:
+    # Only a top-level declaration writes the mirror. A spec carrying the keys as raw transport settings
+    # would cross the SMART refusal with no reason check and name a connection of its own choosing.
     (tmp_path / "graph.py").write_text(
         """
 from messagefoundry import Rest, outbound
@@ -282,6 +282,9 @@ raw = {
     "tls_revocation_attested": True,
     "tls_revocation_attested_reason": "spoofed",
     "tls_revocation_attested_connection": "OB_OTHER",
+    "cleartext_accepted": True,
+    "cleartext_reason": "spoofed",
+    "cleartext_connection": "OB_OTHER",
 }
 spoofed = Rest(url="https://collector.example.org/ingest")
 spoofed.settings.update(raw)
@@ -299,7 +302,17 @@ outbound(
     )
     reg = load_config(tmp_path, allow_empty=True)
     raw = _dest_config(reg.outbound["OB_RAW"], {}).settings
-    assert not any(k.startswith("tls_revocation_attested") for k in raw)
+    assert not any(k.startswith(("tls_revocation_attested", "cleartext_")) for k in raw)
+    # The spoofed outbound's SMART token hop is refused, as an undeclared one is.
+    with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
+        token_provider_from_settings({**raw, **_smart(smart_key)})
     declared = _dest_config(reg.outbound["OB_DECLARED"], {}).settings
     assert declared["tls_revocation_attested_connection"] == "OB_DECLARED"
     assert declared["tls_revocation_attested_reason"] == "declared"
+    assert "cleartext_connection" not in declared  # its raw key went; nothing declared it
+
+
+def test_an_empty_name_renders_unnamed(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        cleartext_acceptance_audit_sink(_REASON, connection="")("MLLP inbound")
+    assert "connection (unnamed);" in caplog.records[0].getMessage()

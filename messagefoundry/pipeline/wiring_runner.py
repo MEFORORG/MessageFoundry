@@ -7620,6 +7620,18 @@ def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings
         settings["proxy_no_proxy"] = list(egress.proxy_no_proxy)
 
 
+#: The settings keys `_dest_config` mirrors from a connection's top-level declarations (ADR 0153,
+#: ADR 0173). Named once so the strip and the writes cannot drift apart.
+_DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
+    "cleartext_accepted",
+    "cleartext_reason",
+    "cleartext_connection",
+    "tls_revocation_attested",
+    "tls_revocation_attested_reason",
+    "tls_revocation_attested_connection",
+)
+
+
 def _dest_config(
     oc: OutboundConnection,
     env_values: Mapping[str, Any],
@@ -7634,6 +7646,11 @@ def _dest_config(
     # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
     # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
     _apply_egress_proxy_default(settings, egress)
+    # Only a top-level declaration may write the mirrored keys below. A code-first spec could otherwise
+    # carry them as raw transport settings, and a settings-driven seam would then cross its refusal with
+    # no reason check and name whatever connection the spec chose in the audit line. So clear them first.
+    for key in _DECLARATION_MIRROR_KEYS:
+        settings.pop(key, None)
     # ADR 0153: MIRROR the cleartext-acceptance declaration into the resolved settings. The connectors
     # read the typed Destination fields below, but the deep settings-driven seams — the forward-proxy
     # credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers — receive only a
@@ -7649,16 +7666,6 @@ def _dest_config(
     # reads it -- the SMART token-endpoint provider (transports/smart.py). Written only when set. The
     # name rides with it for the same reason `cleartext_connection` does: the audit line that seam
     # logs must name the declaring connection.
-    #
-    # The keys are cleared first, because only the top-level declaration may write them. A code-first
-    # spec could otherwise carry them as raw transport settings: that crosses the refusal with no
-    # reason check, and names whatever connection the spec chose in the audit line.
-    for key in (
-        "tls_revocation_attested",
-        "tls_revocation_attested_reason",
-        "tls_revocation_attested_connection",
-    ):
-        settings.pop(key, None)
     if oc.tls_revocation_attested:
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = oc.tls_revocation_attested_reason
