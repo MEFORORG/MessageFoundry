@@ -222,15 +222,37 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         form = dict(await _form_pairs(request))
+        # BACKLOG #1139, ADR 0182 Amendment A. The notification address is sent only when the
+        # administrator changed it from the value the page showed (`notify_email_shown`). Comparing
+        # against the stored value instead would let a stale page revert another administrator's
+        # move. A form with no shown value predates the field and sends a typed value as is.
+        typed_notify = form.get("notify_email", "").strip()
+        shown_notify = form.get("notify_email_shown")
+        notify_changed = (
+            typed_notify != shown_notify.strip() if shown_notify is not None else bool(typed_notify)
+        )
+        if notify_changed and not typed_notify:
+            # The JSON twin refuses an explicit null for the same reason: it cannot be cleared.
+            return await _user_detail(
+                user_id,
+                service,
+                identity,
+                error="the notification address can be changed but not cleared",
+                status_code=400,
+            )
         try:
             # An HTML form always posts the full profile picture, so every field is set explicitly
             # ("" clears to None; an absent checkbox means enabled) — the PATCH partial semantics of
-            # the JSON handler don't apply to a form submit.
-            body = UserUpdateRequest(
-                display_name=form.get("display_name", "").strip() or None,
-                email=form.get("email", "").strip() or None,
-                disabled="disabled" in form,
-            )
+            # the JSON handler don't apply to a form submit. The notification address is the
+            # exception above.
+            fields: dict[str, object] = {
+                "display_name": form.get("display_name", "").strip() or None,
+                "email": form.get("email", "").strip() or None,
+                "disabled": "disabled" in form,
+            }
+            if notify_changed:
+                fields["notify_email"] = typed_notify
+            body = UserUpdateRequest.model_validate(fields)
             await admin.update_user(user_id, body=body, service=service, identity=identity)
         except (ValidationError, HTTPException) as exc:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:

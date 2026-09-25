@@ -98,6 +98,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
     CurrentPasswordCheck,
+    InvalidNotifyEmail,
     NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -856,13 +857,29 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
         supplied = body.model_fields_set
-        await service.update_user(
-            user_id,
-            display_name=body.display_name if "display_name" in supplied else current.display_name,
-            email=body.email if "email" in supplied else current.email,
-            disabled=body.disabled if "disabled" in supplied else None,
-            actor=identity.username,
-        )
+        # BACKLOG #1139, ADR 0182 Amendment A (the rule is on AuthService.update_user): notify_email
+        # is NOT filled from the stored row when omitted, and an explicit null is refused, because a
+        # client sending it asked for a clear the address does not allow.
+        if "notify_email" in supplied and body.notify_email is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "the notification address can be changed but not cleared",
+            )
+        try:
+            await service.update_user(
+                user_id,
+                display_name=(
+                    body.display_name if "display_name" in supplied else current.display_name
+                ),
+                email=body.email if "email" in supplied else current.email,
+                disabled=body.disabled if "disabled" in supplied else None,
+                notify_email=body.notify_email,
+                actor=identity.username,
+            )
+        except InvalidNotifyEmail as exc:
+            # Raised before any write, so this refuses the whole save. The message names the rule
+            # and never echoes the value.
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="updated")
 
     @app.delete("/users/{user_id}", response_model=SimpleMessage)

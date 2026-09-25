@@ -211,6 +211,26 @@ def user_detail_page(
             el("input", name="display_name", value=user.display_name or ""),
         ),
         el("label", "Email", el("input", name="email", value=user.email or "")),
+        # BACKLOG #1139, ADR 0182 Amendment A: the notification address is its own field, and the
+        # route sends it only when it differs from `notify_email_shown`.
+        el(
+            "label",
+            "Notification address",
+            el(
+                "input",
+                name="notify_email",
+                value=user.notify_email or "",
+                aria_describedby="notify-email-hint",
+            ),
+        ),
+        el("input", type="hidden", name="notify_email_shown", value=user.notify_email or ""),
+        el(
+            "p",
+            "Where security notices for this account are sent. Changing it notifies the old "
+            "address. It cannot be cleared. Changing the Email field does not change it.",
+            id="notify-email-hint",
+            class_="muted",
+        ),
         el(
             "label",
             el("input", type="checkbox", name="disabled", checked=user.disabled),

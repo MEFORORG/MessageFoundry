@@ -2923,6 +2923,137 @@ async def test_update_user_profile_roundtrip(engine: Engine) -> None:
         assert not user.disabled and user.email is None
 
 
+async def _save_profile(c: httpx.AsyncClient, uid: str, form: dict[str, str]) -> httpx.Response:
+    await _mint_action(c, f"/ui/users/{uid}")  # BACKLOG #1737: action-bound, single-use
+    return await c.post(
+        f"/ui/users/{uid}/update", data=form, headers={"Sec-Fetch-Site": "same-origin"}
+    )
+
+
+async def test_an_unrelated_console_save_leaves_the_notification_address(engine: Engine) -> None:
+    """BACKLOG #1139, ADR 0182 Amendment A. The form is pre-filled with the stored profile email and
+    posts it back on every save. A display-name edit must not copy it into the notification
+    address, whether that address is set (X stays X) or missing (it stays missing)."""
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    await _add(service, "u2", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        set_uid, blank_uid = await _uid(service, "u1"), await _uid(service, "u2")
+        await service.store.set_user_notify_email(set_uid, email="owner@example.test")
+        # The directory-sync write: profile email only.
+        for uid in (set_uid, blank_uid):
+            await service.store.update_user_profile(
+                uid, display_name=None, email="dir@example.test"
+            )
+
+        # The page shows both addresses, each in its own field, plus the shown copy.
+        page = (await c.get(f"/ui/users/{set_uid}")).text
+        assert 'name="notify_email"' in page and 'value="owner@example.test"' in page
+        assert 'name="notify_email_shown"' in page
+        assert 'value="dir@example.test"' in page
+
+        # Posted back exactly as the page pre-fills it, with only the display name changed.
+        r = await _save_profile(
+            c,
+            set_uid,
+            {
+                "display_name": "Renamed",
+                "email": "dir@example.test",
+                "notify_email": "owner@example.test",
+                "notify_email_shown": "owner@example.test",
+            },
+        )
+        assert r.status_code == 303
+        r = await _save_profile(
+            c,
+            blank_uid,
+            {
+                "display_name": "Renamed",
+                "email": "dir@example.test",
+                "notify_email": "",
+                "notify_email_shown": "",
+            },
+        )
+        assert r.status_code == 303
+
+        kept = await service.store.get_user(set_uid)
+        blank = await service.store.get_user(blank_uid)
+        assert kept is not None and kept.display_name == "Renamed"
+        assert kept.notify_email == "owner@example.test"
+        assert blank is not None and blank.display_name == "Renamed"
+        assert blank.notify_email is None
+
+
+async def test_a_stale_console_page_cannot_undo_another_admins_move(engine: Engine) -> None:
+    """Round-one QA finding. Admin A's page showed X. Admin B then moved the address to Z. A's
+    display-name save posts X back, and comparing it with the STORED value read that as a move back
+    to X. The route compares it with the value A's page SHOWED, so nothing moves."""
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        await service.store.set_user_notify_email(uid, email="moved@example.test")  # B's move
+
+        r = await _save_profile(
+            c,
+            uid,
+            {
+                "display_name": "Renamed",
+                "email": "",
+                "notify_email": "owner@example.test",
+                "notify_email_shown": "owner@example.test",
+            },
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name == "Renamed"
+        assert user.notify_email == "moved@example.test"
+
+
+async def test_the_console_moves_the_notification_address_only_when_told(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        await service.store.set_user_notify_email(uid, email="owner@example.test")
+        shown = {"notify_email_shown": "owner@example.test"}
+
+        # A value that is not one mailbox is refused whole, and the page says why.
+        r = await _save_profile(
+            c,
+            uid,
+            {"display_name": "Renamed", "email": "", "notify_email": "not-an-address", **shown},
+        )
+        assert r.status_code == 400
+        assert "enter one email address" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name is None
+        assert user.notify_email == "owner@example.test"
+
+        # Emptying the field is refused, as the JSON twin refuses an explicit null.
+        r = await _save_profile(
+            c, uid, {"display_name": "Renamed", "email": "", "notify_email": "", **shown}
+        )
+        assert r.status_code == 400
+        assert "can be changed but not cleared" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name is None
+        assert user.notify_email == "owner@example.test"
+
+        r = await _save_profile(
+            c, uid, {"display_name": "", "email": "", "notify_email": "new@example.test", **shown}
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user(uid)
+        assert user is not None and user.notify_email == "new@example.test"
+        rows = [
+            a
+            for a in await service.store.list_audit()
+            if a["action"] == "user.notify_email_changed"
+        ]
+        assert len(rows) == 1 and rows[0]["actor"] == "boss"
+
+
 async def test_update_user_requires_a_grant_bound_to_this_action(engine: Engine) -> None:
     """BACKLOG #1737 (ASVS 7.5.1): the console update lane must require the same action-bound,
     single-use step-up its JSON twin (``PATCH /users/{id}``) requires — not the shared window.

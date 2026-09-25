@@ -413,6 +413,28 @@ def _is_single_mailbox(address: str) -> bool:
     )
 
 
+class InvalidNotifyEmail(ValueError):
+    """A notification address was refused before anything was written (BACKLOG #1139).
+
+    A ``ValueError``, so a caller that catches that still does. Its own type lets a route turn
+    exactly this refusal into a ``400``, and not some other ``ValueError`` raised after a write."""
+
+
+def _require_single_mailbox(value: str) -> str:
+    """``value`` stripped, when it may become a notification address; else :class:`InvalidNotifyEmail`.
+
+    The check both engine surfaces that take a typed address apply: the holder's own fill and an
+    administrator's explicit change. Not blank (:func:`require_notify_email`), and one plain
+    mailbox (:func:`_is_single_mailbox`)."""
+    try:
+        address = require_notify_email(value)
+    except ValueError as exc:
+        raise InvalidNotifyEmail(str(exc)) from exc
+    if not _is_single_mailbox(address):
+        raise InvalidNotifyEmail("enter one email address, such as name@example.org")
+    return address
+
+
 class NotifyEmailAlreadySet(RuntimeError):
     """:meth:`AuthService.fill_own_notify_email` declined: the account already has a different
     notification address. The self-service route only fills a missing one (BACKLOG #1139)."""
@@ -3258,9 +3280,7 @@ class AuthService:
         The fill-only check is a read, then an unconditional write. Two concurrent calls from the
         same account can both pass it; the later write wins and both are audited.
         """
-        address = require_notify_email(email)
-        if not _is_single_mailbox(address):
-            raise ValueError("enter one email address, such as name@example.org")
+        address = _require_single_mailbox(email)
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such account")
@@ -4731,27 +4751,69 @@ class AuthService:
         email: str | None,
         disabled: bool | None,
         actor: str,
+        notify_email: str | None = None,
     ) -> None:
+        """Apply an administrator's edit to an account's profile, disabled flag and notification
+        address.
+
+        **THE NOTIFICATION ADDRESS MOVES ONLY WHEN ``notify_email`` NAMES A DIFFERENT ONE (BACKLOG
+        #1139, ADR 0182 Amendment A).** ``None`` leaves it alone, and the profile ``email`` never
+        touches it. It used to: any non-blank ``email`` was copied in, and both admin surfaces post
+        the stored profile email back on every save. So a display-name edit copied the directory's
+        ``mail`` into the engine-owned column with no notice, and filled a blank one from it.
+
+        The stored address, posted back, is a no-op and is not re-checked, so an address another
+        writer stored cannot block an unrelated save. Any other value is checked before anything is
+        written (:func:`_require_single_mailbox`), so a refusal leaves the whole save undone. Raises
+        :class:`InvalidNotifyEmail` for it.
+        """
         before = await self._store.get_user(user_id)  # capture old email/disabled for notifications
+        stored_notify = ((before.notify_email if before is not None else None) or "").strip()
+        new_notify: str | None = None
+        if notify_email is not None and (
+            not notify_email.strip() or notify_email.strip() != stored_notify
+        ):
+            new_notify = _require_single_mailbox(notify_email)
         await self._store.update_user_profile(user_id, display_name=display_name, email=email)
-        # THE ENGINE-OWNED NOTIFICATION ADDRESS MOVES ONLY HERE, AND ONLY UPWARDS (BACKLOG #1139).
-        # This is an administrator acting on the engine's own surface, so it is the one write allowed
-        # to repoint where notices go — the directory sync above (`update_user_profile`, which
-        # `_upsert_ad_user` also calls) is not.
-        #
-        # A BLANK ADDRESS FALLS THROUGH DELIBERATELY, and that is the durability rule in force: the
-        # profile mirror clears, and the notification address stands. Requiring an address at creation
-        # would not have achieved this on its own, because an explicit null still strips it afterwards
-        # — and an account with no address is excluded from every later notice, which is exactly the
-        # structural exclusion this item was filed against. `set_user_notify_email` takes `str`, so
-        # there is no way to spell the clear even by mistake.
-        if email is not None and email.strip():
-            await self._store.set_user_notify_email(user_id, email=email)
+        # The profile write above never names `notify_email`: it is the same call `_upsert_ad_user`
+        # makes, and on a directory account `email` is the directory's.
+        if before is not None and new_notify is not None:
+            # AUDITED BEFORE THE WRITE, as admin-set-notify-email is. Of the two orders that can
+            # leave the row and the column disagreeing, an unaudited move is the worse. The row
+            # holds no address, as every other write of the column records it.
+            await self._audit(
+                "user.notify_email_changed",
+                actor=actor,
+                detail=_json({"user_id": user_id, "had_address": bool(stored_notify)}),
+            )
+            await self._store.set_user_notify_email(user_id, email=new_notify)
+            if stored_notify:
+                # Tell the address notices are moving AWAY from. It is the one the legitimate holder
+                # still reads when the move was hostile or mistaken (ADR 0182, option 3).
+                await self._notify_security(
+                    EMAIL_CHANGED,
+                    username=before.username,
+                    email=stored_notify,
+                    detail={"new_email": new_notify, "field": "notify_email"},
+                )
+            else:
+                # No earlier address, so nobody else to tell: the notice goes to the one just set,
+                # as the holder's own fill does (`fill_own_notify_email`).
+                await self._notify_security(
+                    NOTIFY_EMAIL_SET,
+                    username=before.username,
+                    email=new_notify,
+                    detail={"set_by": "administrator"},
+                )
         if disabled is not None:
             await self._store.set_user_disabled(user_id, disabled=disabled)
             if disabled:
                 await self._store.revoke_user_sessions(user_id)
         await self._audit("user.updated", actor=actor, detail=_json({"user_id": user_id}))
+        # The rest of this save's notices go where the account's notices went before it, so a move
+        # in the same save cannot take them away from the previous holder. An account that had no
+        # address is the exception: the one this save set is then the only one reachable.
+        notice_to = stored_notify or new_notify
         if before is not None:
             if email != before.email:
                 # Notify the OLD address — so the legitimate owner is alerted even if an attacker (or a
@@ -4774,12 +4836,12 @@ class AuthService:
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=before.username,
-                    email=before.notify_email,
+                    email=notice_to,
                     detail={"new_email": email},
                 )
             if disabled and not before.disabled:
                 await self._notify_security(
-                    ACCOUNT_DISABLED, username=before.username, email=before.notify_email
+                    ACCOUNT_DISABLED, username=before.username, email=notice_to
                 )
 
     async def delete_user(self, user_id: str, *, actor: str) -> None:
