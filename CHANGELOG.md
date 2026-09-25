@@ -35,8 +35,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   with nothing that could set it, and on the inbound side the runner never filled it, so the attested
   branch of the mTLS listener's revocation check could not fire. A flag without a reason fails at load.
   Each time the attestation lets a hop through that an enforcing instance would refuse, the engine logs
-  a WARNING naming the hop and the reason. The revocation refusals name this lever again. It is not yet
-  listed by `messagefoundry check` or `security_loosenings()`.
+  a WARNING naming the hop and the reason. The revocation refusals name this lever again.
+- **The per-connection revocation attestation is now reported, like `cleartext_accepted` (ADR 0173).**
+  `messagefoundry check` has a `tls-revocation-attested` line naming every attesting connection and
+  its reason. `security_loosenings()`, and so `GET /security/posture`, has a `tls_revocation_attested`
+  entry. Both walk inbound, outbound and `FhirLookup` connections. Before this, the only record was the
+  WARNING logged at construction.
 ### Changed
 - **`messagefoundry dryrun` and `messagefoundry check` now refuse an oversized fixture file.** The
   cap is `MAX_FIXTURE_FILE_BYTES`, which defaults to `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) and rises
