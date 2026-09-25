@@ -228,6 +228,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
+    make_registry_anchor_preflight,
     run_anchor_preflight,
 )
 from messagefoundry.config.ai_policy import (
@@ -1319,6 +1320,26 @@ async def _record_control_audit(
     )
 
 
+#: What the connection-test routes return for a refused trust anchor, in place of its text.
+_ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
+
+
+def _caused_by_trust_anchor(exc: BaseException) -> bool:
+    """Whether ``exc`` wraps a :class:`TrustAnchorError` through its explicit ``__cause__`` chain.
+
+    Only ``raise ... from``, the way ``build_test_connector`` wraps a build failure. An implicit
+    ``__context__`` is not followed: an unrelated error raised while handling an anchor refusal
+    would then be hidden as one."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, TrustAnchorError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return False
+
+
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
@@ -1366,6 +1387,12 @@ async def _run_connection_test(
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
+        if _caused_by_trust_anchor(exc):
+            # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
+            # full text goes to the operator log, as the reload route's does; the caller and the
+            # audit row get a fixed line (BACKLOG #1142).
+            _log.warning("connection test refused %r (trust anchor): %s", name, exc)
+            return _result(supported=True, success=False, ms=0.0, detail=_ANCHOR_REFUSED_DETAIL)
         return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
     start = time.monotonic()
     supported, success, detail = True, False, None
@@ -3521,6 +3548,10 @@ def create_app(
             raise HTTPException(404, "config directory not found") from exc
         except WiringError as exc:
             _log.warning("config reload failed (invalid config): %s", exc)
+            # An inbound connection's trust anchor (BACKLOG #1142, slice 3) is refused inside the
+            # engine and arrives wrapped. It keeps the reason the settings anchors' refusal above
+            # records, so one filter on reason="trust_anchor" sees both.
+            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
             await engine.store.record_audit(
                 "config_reload_failed",
                 actor=user.username,
@@ -3528,7 +3559,7 @@ def create_app(
                     {
                         "requested": req.config_dir,
                         "dry_run": req.dry_run,
-                        "reason": "invalid_config",
+                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
                     }
                 ),
                 client=client_ip(request),
@@ -7261,6 +7292,13 @@ def create_managed_app(
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
             registry_guard=registry_guard,
+            # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
+            # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
+            # every real reload. Each connector's own build then enforces again and loads the bytes
+            # it read. Dormant when no inbound names a CA: no store call, no audit row.
+            registry_preflight=make_registry_anchor_preflight(
+                store, enforcing=trust_anchors_enforcing
+            ),
         )
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
@@ -7277,6 +7315,8 @@ def create_managed_app(
                 # re-applied on every reload inside the engine). None = the whole graph.
                 if registry_filter is not None:
                     loaded = registry_filter(loaded)
+                # After the filter, as the reload path does: the anchors this process will load.
+                await engine.preflight_registry(loaded)
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()

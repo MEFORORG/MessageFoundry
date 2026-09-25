@@ -45,7 +45,7 @@ from collections.abc import Callable
 from typing import Any
 
 from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
-from messagefoundry.auth.trust_anchors import AnchorSpec, verified_anchor_cadata
+from messagefoundry.auth.trust_anchors import oidc_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_crl_check,
@@ -116,10 +116,7 @@ def build_idp_opener(
         # cafile= does. An EMPTY one would load the whole OS store, because it tests cadata for
         # truth, so anchor_cadata refuses an anchor with no PEM block before it gets here. A
         # certificate inside crl_file still joins the store, by path: see verified_anchor_cadata.
-        cadata = verified_anchor_cadata(
-            AnchorSpec("oidc", "[auth].oidc_tls_ca_cert_file", ca_cert_file, pin),
-            enforcing=enforcing,
-        )
+        cadata = verified_anchor_cadata(oidc_anchor_spec(ca_cert_file, pin), enforcing=enforcing)
         ctx = ssl.create_default_context(cadata=cadata)
     else:
         ctx = ssl.create_default_context()

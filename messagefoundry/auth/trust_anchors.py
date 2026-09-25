@@ -24,8 +24,8 @@ runs, no audit rows, no new settings effects):
    and **warned + audited** at ``warn``. It reuses ``_secure_file``'s ``icacls`` DACL mechanism as a
    *verify-only* companion — it inspects the DACL and never changes it. Readability is deliberately not
    the threat (a CA certificate is public); tamperability is. The verdict is **tri-state**: a DACL the
-   engine could not read is ``acl_indeterminate``, audited and warned but not refused, and never
-   reported as owner-only (BACKLOG #1142).
+   engine could not read is ``acl_indeterminate``, audited, and never reported as owner-only (BACKLOG
+   #1142). Item 6 says when it refuses.
 2. An **optional SHA-256 fingerprint pin** per anchor. A configured pin that the PEM's SHA-256 does not
    match **refuses** — always, independent of the enforcement dial — at construction and at reload.
 3. An **anchor-changed audit event**: when a configured anchor's SHA-256 differs from the previously
@@ -36,14 +36,25 @@ runs, no audit rows, no new settings effects):
    (:mod:`messagefoundry.auth.anchor_path`). A directory that lets an untrusted principal delete or
    rename an entry lets it replace the anchor without any right on the file itself. ``path_ok`` is
    ``False`` then, and it refuses at ``enforce`` and warns at ``warn``, as ``acl_ok`` does. A chain
-   that could not be read is ``path_indeterminate``: audited and warned, not refused. The file arm
-   (1) still runs beside it, so the combined verdict is never weaker than the file arm alone.
+   that could not be read is ``path_indeterminate`` and audited; item 6 says when it refuses. The file
+   arm (1) still runs beside it, so the combined verdict is never weaker than the file arm alone.
 5. **The checked bytes are the loaded bytes** (BACKLOG #1142, slice 2). :func:`evaluate_anchor` reads
    the file once and keeps the bytes it hashed. :func:`verified_anchor_cadata` hands those bytes to the
-   TLS context as ``cadata=``, so the OIDC opener and the API client-CA never open the file a second
-   time. Before this, a file swapped between the check and the load was trusted unchecked. **Not
+   TLS context as ``cadata=``, so no consumer that builds a context opens the file a second time.
+   Before this, a file swapped between the check and the load was trusted unchecked. **Not
    covered:** the AD anchor, which ``ldap3`` still reads by path on every bind, and the audit row of
    the central preflight, which records its own read rather than the consumer's.
+6. **An indeterminate read refuses at ``enforce``, and a matching pin is the escape** (BACKLOG #1142,
+   slice 3). When the ACL or the path could not be settled, the engine cannot say who else can
+   replace the anchor, so ``enforce`` refuses to load it. A configured SHA-256 pin that matches the
+   bytes read lets it load anyway, with a warning and the audit row: since item 5 those bytes are the
+   bytes the context loads, so the pin already defeats a substitution. ``warn`` warns and loads.
+   The refusal names both fixes: move the anchor, or set the pin.
+7. **The per-connection inbound CAs** (BACKLOG #1142, slice 3). Every inbound connection whose server
+   context requires a peer certificate (``tls`` and ``tls_ca_file`` set: MLLP, the HTTP listener and
+   the DICOM SCP) gets the same checks. The connector loads its CA through
+   :func:`inbound_ca_cadata` when it builds its context, and :func:`registry_anchor_specs` feeds the
+   audited preflight each time a graph is loaded.
 """
 
 from __future__ import annotations
@@ -56,10 +67,10 @@ import os
 import re
 import shlex
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.auth.anchor_path import (
     LINK,
@@ -71,6 +82,7 @@ from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ApiSettings, AuthSettings
+    from messagefoundry.config.wiring import Registry
     from messagefoundry.store.base import Store
 
 log = logging.getLogger(__name__)
@@ -78,30 +90,40 @@ log = logging.getLogger(__name__)
 #: The audit action for every trust-anchor observation. One action so an operator can filter the whole
 #: family, and so :func:`_last_fingerprint` can find the prior load. The ``event`` field in the detail
 #: carries which one: ``observed`` (baseline), ``changed``, ``pin_mismatch``, ``acl_insecure``,
-#: ``acl_indeterminate`` (the ACL could not be determined, BACKLOG #1142), and ``path_insecure`` and
-#: ``path_indeterminate`` (the path check, BACKLOG #1142 directory arm).
+#: ``acl_indeterminate`` (the ACL could not be determined, BACKLOG #1142), ``path_insecure`` and
+#: ``path_indeterminate`` (the path check, BACKLOG #1142 directory arm), and ``pem_refused`` (the
+#: file holds no loadable PEM block, BACKLOG #1142 slice 3).
 AUDIT_ACTION = "auth.trust_anchor"
 
 
 class TrustAnchorError(Exception):
-    """An operator-supplied auth-path trust anchor failed its integrity preflight — a configured
-    SHA-256 pin mismatch, or a group-/world-writable DACL under ``[security].enforcement = enforce``.
-    Raised at construction and at reload so the engine refuses a tampered/exposed anchor rather than
-    silently trusting it."""
+    """An operator-supplied trust anchor failed its integrity preflight: a configured SHA-256 pin
+    mismatch, a file that holds no loadable PEM block, or, under ``[security].enforcement = enforce``,
+    an ACL or path that lets another principal replace it or that could not be read. Raised at
+    construction and at reload so the engine refuses a tampered/exposed anchor rather than silently
+    trusting it."""
 
 
 @dataclass(frozen=True)
 class AnchorSpec:
     """One operator-supplied trust anchor to preflight.
 
-    ``label`` is the stable, PHI-free audit key (``"oidc"`` / ``"ad"`` / ``"api_client"``); ``setting``
-    is the human-facing config key for messages; ``path`` is the configured PEM; ``pin`` is the optional
-    configured SHA-256 pin (any case, optional ``:`` separators)."""
+    ``label`` is the stable, PHI-free audit key (``"oidc"`` / ``"ad"`` / ``"api_client"`` /
+    ``"inbound:<connection>"``); ``setting`` is the human-facing config key for messages; ``path`` is
+    the configured PEM; ``pin`` is the optional configured SHA-256 pin (any case, optional ``:``
+    separators); ``pin_setting`` names where that pin is set, so a refusal can name the escape.
+
+    ``loads_verified_bytes`` says whether the consumer loads the bytes the check read (slice 2's
+    ``cadata=``). It is ``False`` for the AD anchor alone, which ``ldap3`` reads by path on every
+    bind. A pin cannot stand in for an unreadable ACL or path there, and the PEM shape checks
+    (:func:`anchor_cadata`) do not apply, because ``cafile=`` reads what ``cadata=`` refuses."""
 
     label: str
     setting: str
     path: str
     pin: str | None = None
+    pin_setting: str | None = None
+    loads_verified_bytes: bool = True
 
 
 @dataclass(frozen=True)
@@ -109,7 +131,7 @@ class AnchorVerdict:
     """The pure result of inspecting an anchor file (no enforcement, no I/O side effects)."""
 
     fingerprint: str
-    acl_ok: bool | None  # None = the DACL could not be determined (degrade, don't refuse)
+    acl_ok: bool | None  # None = the DACL could not be determined (refuses at enforce, unpinned)
     pin_ok: bool | None  # None = no pin configured
     # False = another principal can replace the anchor through its path; None = could not tell.
     path_ok: bool | None = None
@@ -692,20 +714,60 @@ def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     return "\n".join(lines + _path_fix(verdict))
 
 
-def _path_indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    """What could not be read, object by object. The caller adds the outcome."""
     lines = [
-        f"{spec.setting}: could not settle whether the trust anchor '{spec.path}' can be replaced "
-        "through its path, so it is loaded without that check:"
+        f"{spec.setting}: could not settle whether anyone else can replace the trust anchor "
+        f"'{spec.path}':"
     ]
-    lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=False)]
+    if verdict.acl_ok is None:
+        lines.append(
+            f"  file '{spec.path}': its permissions could not be read, or they grant write to a "
+            "principal the engine could not identify"
+        )
+    if verdict.path_ok is None:
+        lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=False)]
     return "\n".join(lines)
 
 
+def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    """The two ways out of an indeterminate read: a folder the engine can read, or a pin. The pin is
+    offered with this file's own digest, and with the warning that goes with it: pinning bytes the
+    engine could not vouch for is only as good as the operator's check of them."""
+    check = verdict.path_check
+    windows = check.platform == "windows" if check is not None else os.name == "nt"
+    folder = (
+        "the engine's data folder under C:\\ProgramData"
+        if windows
+        else "a root-owned 755 folder like /etc/messagefoundry/"
+    )
+    if not spec.loads_verified_bytes:
+        return (
+            f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
+            f"{folder}. A pin does not help here: this anchor is read again by path each time it "
+            "is used, so a pin cannot vouch for the bytes loaded."
+        )
+    pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
+    return (
+        f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
+        f"{folder}. Or {pin} the SHA-256 of the CA you mean to trust; this file's is "
+        f"{verdict.fingerprint}. Check it against the CA first. With a matching pin the engine "
+        "loads exactly those bytes, so it may load them without this check."
+    )
+
+
 def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: bool) -> None:
-    """Apply the owner fork to a verdict: a pin mismatch always refuses; a group/world-writable DACL,
-    or a path another principal can replace the anchor through, refuses at ``enforce`` and warns at
-    ``warn``. A path that could not be judged warns at both. Raises :class:`TrustAnchorError` on a
-    fatal violation."""
+    """Apply the owner fork to a verdict. Raises :class:`TrustAnchorError` on a fatal violation.
+
+    * A pin mismatch always refuses.
+    * A group/world-writable DACL, or a path another principal can replace the anchor through,
+      refuses at ``enforce`` and warns at ``warn``. A pin does not change this: an anchor anyone can
+      replace is a finding, not an unknown.
+    * An ACL or path that could not be read refuses at ``enforce`` and warns at ``warn`` (BACKLOG
+      #1142, slice 3). **A configured pin that matches is the escape**: it warns and loads, at either
+      dial, because the bytes it matched are the bytes the context loads. Not for an anchor whose
+      consumer reads the file again (``loads_verified_bytes`` False, the AD anchor): there the pin
+      matched bytes nobody loads."""
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
@@ -722,10 +784,22 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
         log.warning(
             "%s\n[security].enforcement=warn, starting anyway", _path_message(spec, verdict)
         )
-    elif verdict.path_ok is None:
-        # Not fatal, as acl_ok None is not: a refusal here must wait until the verified bytes are the
-        # bytes the consumer loads (BACKLOG #1142, slice 3).
-        log.warning("%s", _path_indeterminate_message(spec, verdict))
+    if verdict.acl_ok is not None and verdict.path_ok is not None:
+        return
+    # BACKLOG #1142, slice 3. Slice 2 made the checked bytes the loaded bytes, which is what lets a
+    # pin stand in for a read the file system would not give.
+    unknown = _indeterminate_message(spec, verdict)
+    if verdict.pin_ok is True and spec.loads_verified_bytes:
+        log.warning(
+            "%s\n%s matches the bytes read, and those are the bytes loaded, so it is loaded anyway",
+            unknown,
+            spec.pin_setting or "the configured SHA-256 pin",
+        )
+        return
+    fix = _indeterminate_fix(spec, verdict)
+    if enforcing:
+        raise TrustAnchorError(f"{unknown}\n{fix}\n[security].enforcement=enforce refuses to start")
+    log.warning("%s\n%s\n[security].enforcement=warn, starting anyway", unknown, fix)
 
 
 def enforce_anchor(spec: AnchorSpec, *, enforcing: bool) -> str:
@@ -769,24 +843,156 @@ def api_client_anchor_spec(api: ApiSettings) -> AnchorSpec | None:
     if not api.tls_client_ca_file:
         return None
     return AnchorSpec(
-        "api_client", "[api].tls_client_ca_file", api.tls_client_ca_file, api.tls_client_ca_pin
+        "api_client",
+        "[api].tls_client_ca_file",
+        api.tls_client_ca_file,
+        api.tls_client_ca_pin,
+        "[api].tls_client_ca_pin",
     )
 
 
+def oidc_anchor_spec(ca_cert_file: str, pin: str | None) -> AnchorSpec:
+    """The ``[auth].oidc_tls_ca_cert_file`` anchor spec. One spelling for every site that builds it."""
+    return AnchorSpec(
+        "oidc", "[auth].oidc_tls_ca_cert_file", ca_cert_file, pin, "[auth].oidc_tls_ca_cert_pin"
+    )
+
+
+def connection_ca_pin(settings: Mapping[str, Any], setting: str) -> str | None:
+    """A connection's ``tls_ca_pin``, or ``None`` when the key is absent or ``None``.
+
+    **A pin that is present but blank refuses, never reads as no pin** (BACKLOG #1142). An
+    ``env()`` value set to nothing, or a blank literal, used to read as no pin: the config looked
+    pinned while nothing was checked. ``setting`` names the key for the message. Raises
+    ``ValueError``, which a connector build reports as a config error."""
+    from messagefoundry.config.settings import refuse_a_blank_anchor_pin
+
+    pin = settings.get("tls_ca_pin")
+    if pin is not None and not isinstance(pin, str):
+        raise ValueError(
+            f"{setting} must be text, the SHA-256 of the CA file; got a value of type "
+            f"{type(pin).__name__}"
+        )
+    return refuse_a_blank_anchor_pin(pin, setting)
+
+
+def connection_anchor_spec(name: str, settings: Mapping[str, Any]) -> AnchorSpec | None:
+    """The CA of one inbound connection whose server context requires a peer certificate, or ``None``.
+
+    The predicate is the one BACKLOG #1142 names: **every per-connection inbound CA whose server
+    context requires a peer certificate**. All three inbound listeners that build a server context
+    (MLLP, the HTTP listener, the DICOM SCP) set ``CERT_REQUIRED`` exactly when ``tls`` and
+    ``tls_ca_file`` are both set, so that pair is the test, whatever the connector type. A predicate
+    keyed on ``intake_auth`` would reach the HTTP listener alone.
+
+    ``settings`` must already have its ``env()`` references resolved. An unresolved
+    ``tls_ca_file`` is skipped here, and the connector's own build still checks the resolved value.
+    On a connection that requires a peer certificate, a ``tls_ca_pin`` that is blank or not text
+    raises ``ValueError`` (:func:`connection_ca_pin`). Anywhere else the pin is left to the
+    connector's build, so one bad connection fails its own lane, not the whole graph."""
+    ca = settings.get("tls_ca_file")
+    if isinstance(ca, os.PathLike):
+        ca = os.fspath(ca)
+    if not settings.get("tls") or not isinstance(ca, str) or not ca:
+        return None
+    pin = connection_ca_pin(settings, f"inbound connection '{name}' tls_ca_pin")
+    return AnchorSpec(
+        f"inbound:{name}",
+        f"inbound connection '{name}' tls_ca_file",
+        ca,
+        pin,
+        f"inbound connection '{name}' tls_ca_pin",
+    )
+
+
+def refuse_an_unread_ca_pin(settings: Mapping[str, Any], *, inbound: bool, connector: str) -> None:
+    """Refuse a ``tls_ca_pin`` that nothing reads. It pins the CA an INBOUND listener verifies
+    client certificates with, so it means something only with ``tls`` and ``tls_ca_file`` on an
+    inbound connection. Anywhere else the config would read as pinned while nothing checks it, which
+    is worse than no pin. Raises ``ValueError``, which a connector build reports as a config error.
+    A blank pin refuses here too, on every connection, whatever else it sets."""
+    if connection_ca_pin(settings, f"{connector}: tls_ca_pin") is None:
+        return
+    if inbound and connection_anchor_spec("", settings) is not None:
+        return
+    where = (
+        "an inbound connection without tls=True and a tls_ca_file"
+        if inbound
+        else "an outbound connection, whose tls_ca_file it does not pin"
+    )
+    raise ValueError(
+        f"{connector}: tls_ca_pin is set on {where}, so nothing would check it. It pins the CA an "
+        "inbound listener verifies client certificates with. Remove it, or turn on tls with a "
+        "tls_ca_file on the inbound listener"
+    )
+
+
+def inbound_ca_cadata(name: str, settings: Mapping[str, Any], *, enforcing: bool) -> str:
+    """The verified ``cadata=`` text for an inbound listener's ``tls_ca_file`` (BACKLOG #1142, slice 3).
+
+    The listener's context builder calls this in place of ``load_verify_locations(cafile=...)``, so the
+    CA it trusts is the one the pin, ACL, path and PEM checks read. ``enforcing`` is the construction
+    posture's dial. Raises :class:`TrustAnchorError` if ``settings`` names no such CA, since a caller
+    that reaches here has already decided to require a peer certificate.
+
+    A CA file that cannot be read raises :class:`TrustAnchorError` too, not the ``OSError``. Its
+    text names the path, and a caller that keeps anchor paths away from API callers, such as the
+    connection-test route, recognises the anchor refusal by its type."""
+    spec = connection_anchor_spec(name, settings)
+    if spec is None:
+        raise TrustAnchorError(
+            f"inbound connection '{name}' names no tls_ca_file to verify peers with"
+        )
+    try:
+        return verified_anchor_cadata(spec, enforcing=enforcing)
+    except OSError as exc:
+        raise TrustAnchorError(
+            f"{spec.setting}: could not read the trust anchor '{spec.path}': {exc.strerror or exc}"
+        ) from exc
+
+
+def connection_anchor_specs(
+    inbound: Iterable[tuple[str, Mapping[str, Any]]],
+) -> list[AnchorSpec]:
+    """:func:`connection_anchor_spec` over ``(name, resolved settings)`` pairs, in the order given."""
+    return [s for name, st in inbound if (s := connection_anchor_spec(name, st)) is not None]
+
+
+#: The connection settings :func:`connection_anchor_spec` reads, and the only ones resolved for it.
+_CONNECTION_ANCHOR_KEYS = ("tls", "tls_ca_file", "tls_ca_pin")
+
+
+def registry_anchor_specs(registry: Registry, env_values: Mapping[str, Any]) -> list[AnchorSpec]:
+    """The inbound CAs of every deployed inbound connection in ``registry`` that requires a peer
+    certificate, with ``env()`` references resolved against ``env_values``.
+
+    A connection whose anchor settings do not resolve is skipped: its own build refuses it, and
+    that error names the missing value."""
+    from messagefoundry.config.wiring import WiringError, resolve_env_settings
+
+    pairs: list[tuple[str, Mapping[str, Any]]] = []
+    for ic in registry.inbound.values():
+        if not ic.deployed:
+            continue
+        raw = {k: ic.spec.settings[k] for k in _CONNECTION_ANCHOR_KEYS if k in ic.spec.settings}
+        try:
+            pairs.append((ic.name, resolve_env_settings(raw, env_values)))
+        except WiringError:
+            continue
+    return connection_anchor_specs(pairs)
+
+
 def collect_anchor_specs(auth: AuthSettings, api: ApiSettings) -> list[AnchorSpec]:
-    """Every configured operator-supplied auth-path trust anchor, in a stable order. An anchor with no
-    path set is omitted, so an install with no OIDC/AD/mTLS anchor yields an empty list — the dormant,
-    byte-identical path."""
+    """Every configured operator-supplied trust anchor, in a stable order. An anchor with no path set
+    is omitted, so an install with no OIDC/AD/mTLS anchor yields an empty list: the dormant,
+    byte-identical path.
+
+    The per-connection inbound CAs are not here: ``serve`` calls this before any graph is loaded.
+    :func:`registry_anchor_specs` collects them each time a graph is loaded, at start and at
+    reload (BACKLOG #1142, slice 3)."""
     specs: list[AnchorSpec] = []
     if auth.oidc_tls_ca_cert_file:
-        specs.append(
-            AnchorSpec(
-                "oidc",
-                "[auth].oidc_tls_ca_cert_file",
-                auth.oidc_tls_ca_cert_file,
-                auth.oidc_tls_ca_cert_pin,
-            )
-        )
+        specs.append(oidc_anchor_spec(auth.oidc_tls_ca_cert_file, auth.oidc_tls_ca_cert_pin))
     if auth.ad_tls_ca_cert_file:
         specs.append(
             AnchorSpec(
@@ -794,6 +1000,8 @@ def collect_anchor_specs(auth: AuthSettings, api: ApiSettings) -> list[AnchorSpe
                 "[auth].ad_tls_ca_cert_file",
                 auth.ad_tls_ca_cert_file,
                 auth.ad_tls_ca_cert_pin,
+                "[auth].ad_tls_ca_cert_pin",
+                loads_verified_bytes=False,  # ldap3 reads it by path on every bind
             )
         )
     api_spec = api_client_anchor_spec(api)
@@ -848,8 +1056,20 @@ async def _record(store: Store, spec: AnchorSpec, event: str, **extra: object) -
 async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> None:
     """Preflight one anchor: audit the observation (baseline / changed) FIRST so a change is durably
     recorded even when the anchor then fails its pin/ACL, record any violation, then enforce (which may
-    raise)."""
+    raise).
+
+    **It applies every check a consumer applies**, the PEM shape of :func:`anchor_cadata` included
+    (BACKLOG #1142, slice 3). The reload route runs this and builds no context, so before this a
+    reload accepted an anchor with no PEM block, or a ``TRUSTED CERTIFICATE`` block, that the next
+    start refuses. The AD anchor skips the shape check: its consumer reads ``cafile=``, which loads
+    a ``TRUSTED CERTIFICATE`` block, so refusing one here would refuse what the start accepts."""
     verdict = await asyncio.to_thread(evaluate_anchor, spec)
+    shape_error: TrustAnchorError | None = None
+    if spec.loads_verified_bytes:  # the AD anchor's consumer reads cafile=, which has no such rule
+        try:
+            anchor_cadata(verdict.data, spec)
+        except TrustAnchorError as exc:
+            shape_error = exc
     previous = await _last_fingerprint(store, spec.label)
     if previous is None:
         await _record(store, spec, "observed", fingerprint=verdict.fingerprint)
@@ -864,17 +1084,21 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     elif verdict.acl_ok is None:
         # BACKLOG #1142. This branch used to write no row at all, so an operator following the
         # runbook's "alert on auth.trust_anchor" instruction saw nothing on the one branch where the
-        # engine cannot vouch for the anchor — a detective control blind on its own subject.
-        #
-        # It is deliberately VISIBLE and NOT FATAL. Refusing here would buy the verdict with
-        # availability, and it must not ship before the verified bytes are bound to the bytes the
-        # opener actually loads: until then a refusal would attest a file that is re-read afterwards.
+        # engine cannot vouch for the anchor, a detective control blind on its own subject. Since
+        # slice 3 it also refuses at enforce unless a matching pin lets it through, and `pinned`
+        # says which of the two this row saw.
         await _record(
-            store, spec, "acl_indeterminate", fingerprint=verdict.fingerprint, enforcing=enforcing
+            store,
+            spec,
+            "acl_indeterminate",
+            fingerprint=verdict.fingerprint,
+            enforcing=enforcing,
+            pinned=verdict.pin_ok is True,
         )
     if verdict.path_ok is not True:
         # Each row names every object that failed, with the principal and the right, or the cause.
         insecure = verdict.path_ok is False
+        extra: dict[str, object] = {} if insecure else {"pinned": verdict.pin_ok is True}
         await _record(
             store,
             spec,
@@ -885,8 +1109,13 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
                 {"path": f.path, "kind": f.kind, "reason": f.reason}
                 for f in _findings(verdict, insecure=insecure)
             ],
+            **extra,
         )
+    if shape_error is not None:
+        await _record(store, spec, "pem_refused", fingerprint=verdict.fingerprint)
     _enforce_verdict(spec, verdict, enforcing=enforcing)
+    if shape_error is not None:
+        raise shape_error
 
 
 async def run_anchor_preflight(
@@ -897,7 +1126,34 @@ async def run_anchor_preflight(
     caught). **Dormant when ``specs`` is empty** — it makes no store call and writes no audit row, so an
     install with no OIDC/AD/mTLS anchor is byte-identical.
 
-    On a fatal violation (pin mismatch, or a group/world-writable DACL under ``enforce``) it raises
-    :class:`TrustAnchorError` after auditing it, so the caller refuses to start / refuses the reload."""
+    On a fatal violation (a pin mismatch, a file with no loadable PEM block, or under ``enforce`` an
+    anchor another principal can replace or whose ACL or path could not be read, with no matching pin)
+    it raises :class:`TrustAnchorError` after auditing it, so the caller refuses to start / refuses
+    the reload."""
     for spec in specs:
         await _preflight_one(store, spec, enforcing=enforcing)
+
+
+def make_registry_anchor_preflight(
+    store: Store, *, enforcing: bool
+) -> Callable[[Registry, Mapping[str, Any]], Awaitable[None]]:
+    """The engine's ``registry_preflight`` for ``serve``: :func:`run_anchor_preflight` over a graph's
+    per-connection inbound CAs (:func:`registry_anchor_specs`), at the first load and at every real
+    reload. A refusal is re-raised as ``WiringError``, which the reload route answers with 422 and
+    the first load with a refused start. Dormant when no inbound names a CA."""
+
+    async def preflight(registry: Registry, env_values: Mapping[str, Any]) -> None:
+        try:
+            # Inside the try: a blank tls_ca_pin raises ValueError while the specs are collected.
+            specs = registry_anchor_specs(registry, env_values)
+            if not specs:
+                return
+            await run_anchor_preflight(specs, store, enforcing=enforcing)
+        except (TrustAnchorError, OSError, ValueError) as exc:
+            # ValueError too: an env()-supplied path with a NUL in it raises one from the read, and
+            # it must reach the route as a refused config, not an unaudited 500.
+            from messagefoundry.config.wiring import WiringError
+
+            raise WiringError(f"an inbound trust anchor was refused: {exc}") from exc
+
+    return preflight

@@ -1072,6 +1072,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/transports/dicom.py": frozenset(
         {
+            # BACKLOG #1142, slice 3: the SCP's mTLS CA is hashed (pin, audit) before it loads.
+            "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
             "tls_context:.load_cert_chain()",
             "tls_context:.load_verify_locations()",
@@ -1129,12 +1131,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "compare:via messagefoundry.credential",
             "hash:via messagefoundry.credential",
+            # BACKLOG #1142, slice 3: the listener's mTLS CA goes through mllp's context builder.
+            "hash:via messagefoundry.transports.mllp",
             "key_cert:via messagefoundry.transports.mllp",
             "tls_context:via messagefoundry.transports.mllp",
         }
     ),
     "messagefoundry/transports/mllp.py": frozenset(
         {
+            # BACKLOG #1142, slice 3: the listener's mTLS CA is hashed (pin, audit) before it loads.
+            "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
             "tls_context:.check_hostname =",
             "tls_context:.check_hostname = False",

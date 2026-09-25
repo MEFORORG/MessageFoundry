@@ -114,6 +114,68 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: under `enforce`, a trust anchor whose permissions or path the engine cannot read now
+  refuses to start, unless its SHA-256 pin matches.** This covers `[auth].oidc_tls_ca_cert_file`,
+  `[auth].ad_tls_ca_cert_file`, `[api].tls_client_ca_file` and, new in this release, the mTLS CA
+  of every inbound connection. Before, an unreadable ACL or path only wrote an
+  `acl_indeterminate` or `path_indeterminate` row and a warning. Now, under the default
+  `[security].enforcement = enforce`, the engine refuses. The message names what it could not
+  read, the anchor's SHA-256, and both fixes. **The escape is the pin:** set the anchor's pin to
+  its SHA-256, after checking it is the CA you mean to trust. The engine loads the exact bytes it
+  hashed, so a matching pin rules out a swapped file. It then starts with a warning, and the audit
+  row carries `"pinned": true`. At `warn`, the engine starts with a warning, as before. A pin does
+  not excuse an anchor that another account CAN replace; that still refuses. **The AD anchor has
+  no pin escape:** `ldap3` reads `[auth].ad_tls_ca_cert_file` by path on every bind, so its pin
+  cannot vouch for the bytes loaded. An AD anchor the engine cannot judge must move. **At least these
+  placements started under 0.4.0 and now refuse under `enforce` with no pin:**
+  - on Windows, an anchor under `C:\Windows\Temp` when the engine's account cannot read that
+    folder's permissions. Measured on one Windows 11 host, as a non-elevated user;
+  - an anchor on a network share, a mapped drive, or a FAT or exFAT volume;
+  - on Linux, an anchor on a mount other than ext2/3/4, xfs, btrfs, tmpfs or overlay, such as NFS,
+    a FUSE mount, or a Docker Desktop bind mount;
+  - a path the check cannot finish: a link loop, an alternate data stream, or a folder it cannot
+    read;
+  - on Windows, an anchor whose `icacls` output is empty, cannot be run, or grants write to a group
+    name the engine does not know, such as a localized `Everyone`.
+
+  **Migration:** move the anchor into a folder the engine can read and only administrators and the
+  engine's account can change. On Windows that is the engine's data folder under `C:\ProgramData`.
+  On POSIX it is a root-owned `755` folder such as `/etc/messagefoundry/`. Both pass with no pin.
+  Or set the pin: `[auth].oidc_tls_ca_cert_pin`, `[api].tls_client_ca_pin`, or the new
+  `tls_ca_pin` on the connection. For the AD anchor, only the move works.
+  ([BACKLOG #1142](docs/BACKLOG.md))
+- **BREAKING: the mTLS CA of every inbound MLLP, HTTP and DICOM connection now gets the same
+  checks as the auth anchors.** This is any inbound connection with `tls=True` and a
+  `tls_ca_file`, which makes it require a client certificate. For the DICOM listener that CA is
+  the whole peer authentication decision. Before, the engine read the file by path and checked
+  nothing. Now each gets the SHA-256 pin, the ACL check and the path check, when the connection is
+  built and at every config reload. The listener then loads the bytes the check read, never a
+  second read of the file. The new optional `tls_ca_pin` on `MLLP(...)`, `Http(...)` and
+  `DICOM(...)` is that CA's SHA-256; a pin that does not match always refuses. Each check writes
+  its `auth.trust_anchor` rows under the label `inbound:<connection name>`. **These started under
+  0.4.0 and now refuse under `enforce`:** an inbound CA another account can replace, as the
+  directory-arm entry below lists, and an inbound CA the engine cannot judge, as the entry above
+  lists. An inbound CA with no PEM block, or with a `TRUSTED CERTIFICATE` block, refuses at both
+  dials. `tls_ca_pin` set on an outbound connection, or on one without `tls` and `tls_ca_file`,
+  refuses, because nothing would check it. A pin that is set but empty or whitespace also
+  refuses, and the message names the setting. That covers `tls_ca_pin`,
+  `[api].tls_client_ca_pin`, `[auth].oidc_tls_ca_cert_pin` and `[auth].ad_tls_ca_cert_pin`, for
+  example when an `env()` value or an environment variable is set to nothing. Leave the pin out
+  for no pin. The connection test (`POST /connections/{name}/test`) now builds a connector under
+  the same enforcement dial as the live build. So under `warn` it no longer fails a CA the
+  listener loads. For an outbound connection, the test now applies the same `enforce` clamp and
+  cleartext guards as the live build, so a hop the live build refuses now fails the test too. A
+  refused CA answers the test with `trust anchor refused; see the server log`. The path and
+  SHA-256 go to the log, not to the caller or the audit row. Not covered: the CAs of outbound connections, and an inbound `tls_crl_file`, which is still
+  read by path, so a certificate inside it is trusted unchecked.
+  ([BACKLOG #1142](docs/BACKLOG.md))
+- **A config reload now refuses a trust anchor that the next start would refuse.** The reload
+  check ran the pin, ACL and path checks, but not the check that the file holds a loadable PEM
+  block. So a reload accepted an anchor with no PEM block, or a `TRUSTED CERTIFICATE` block, and
+  the next start refused it. The reload now applies every check and writes a `pem_refused` row.
+  The AD anchor is the exception: `ldap3` loads a `TRUSTED CERTIFICATE` block, so the reload does
+  not refuse one there either.
+  ([BACKLOG #1142](docs/BACKLOG.md))
 - **BREAKING: a Windows SSO (Kerberos) sign-in through `POST /auth/negotiate` no longer opens a
   step-up window.** Now no directory sign-in opens it: Kerberos by either route, and the federated
   (OIDC) callback, which already did not. Local password sign-in is unchanged.
@@ -346,7 +408,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   runs as root. The verdict depends on the account the check runs as, so run
   `mefor verify federation` as the service account. Some paths the engine cannot judge: an unreadable folder, a network
   share or mapped drive, a FAT volume, or a Linux mount other than ext2/3/4, xfs, btrfs, tmpfs or
-  overlay. They write a `path_indeterminate` row and a warning, and the engine still starts. The
+  overlay. They write a `path_indeterminate` row. Under `enforce` they refuse unless the pin
+  matches, as the first Security entry above says; at `warn` the engine starts with a warning. The
   file check still runs beside the path check. **These placements, at least, started under 0.4.0
   and now refuse:**
   - a Windows anchor whose own permissions are locked, in a new folder under `C:\Users\Public`;
@@ -364,7 +427,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   change. On Windows that is the engine's data folder under `C:\ProgramData`. On POSIX it is a
   root-owned `755` folder such as `/etc/messagefoundry/`. The container's `/config`, owned by uid
   10001 as `docker/README.md` requires, passes when it sits on one of the mount types above. A
-  Docker Desktop bind mount does not, so there it answers indeterminate and starts with a warning.
+  Docker Desktop bind mount does not, so there it answers indeterminate, and under `enforce` it
+  refuses unless the pin matches.
   ([BACKLOG #1142](docs/BACKLOG.md))
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
@@ -437,8 +501,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   `icacls` output was empty or was not `icacls` output. It also passed a write grant to a bare
   name it did not know, such as the German `Jeder` for Everyone, and a line-1 write grant it could
   not split from the echoed path. Those now read as indeterminate. The engine logs a warning,
-  writes a new `acl_indeterminate` row under the `auth.trust_anchor` audit action, and still
-  starts, under `enforce` as under `warn`. 0.4.0 wrote no row for an ACL it could not read.
+  writes a new `acl_indeterminate` row under the `auth.trust_anchor` audit action. Under
+  `enforce` it then refuses unless the pin matches, as the first Security entry above says; at
+  `warn` it starts. 0.4.0 wrote no row for an ACL it could not read.
   Under the default `[security].enforcement = enforce`, the check now refuses a write or DELETE
   grant to broad principals 0.4.0 missed. They include at least `NT AUTHORITY\INTERACTIVE`,
   `SERVICE`, `BATCH`, `NETWORK`, `ANONYMOUS LOGON` and `Local account`, `Guests`, `Domain

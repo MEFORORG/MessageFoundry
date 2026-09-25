@@ -18,6 +18,7 @@ Where a test names "red under", that is the one edit to the rule that must turn 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -855,15 +856,28 @@ def test_path_false_refuses_at_enforce_and_warns_at_warn(
     assert "starting anyway" in caplog.text
 
 
-def test_path_none_warns_and_never_refuses(
+def test_path_none_refuses_at_enforce_unless_a_pin_matches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """BACKLOG #1142, slice 3 inverts this arm's degrade: a chain that could not be read refuses at
+    enforce, names what could not be read and both fixes, and a matching pin lets it load."""
     p = _pem(tmp_path)
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _unknown_path)
-    spec = AnchorSpec("t", "[x]", str(p), None)
-    assert ta.enforce_anchor(spec, enforcing=True)
-    assert "could not settle" in caplog.text and "access denied" in caplog.text
+    spec = AnchorSpec("t", "[x]", str(p), None, "[x].pin")
+    with pytest.raises(TrustAnchorError) as err:
+        ta.enforce_anchor(spec, enforcing=True)
+    text = str(err.value)
+    assert "could not settle" in text and "directory 'C:\\x': access denied" in text
+    assert "move the anchor" in text and "set [x].pin to" in text
+    assert hashlib.sha256(p.read_bytes()).hexdigest() in text
+    assert "enforce refuses to start" in text and text.isascii()
+    ta.enforce_anchor(spec, enforcing=False)
+    assert "starting anyway" in caplog.text
+    caplog.clear()
+    pinned = AnchorSpec("t", "[x]", str(p), hashlib.sha256(p.read_bytes()).hexdigest(), "[x].pin")
+    assert ta.enforce_anchor(pinned, enforcing=True)
+    assert "[x].pin matches the bytes read" in caplog.text
 
 
 def test_path_arm_runs_beside_the_file_arm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -953,18 +967,34 @@ async def _events(store: MessageStore) -> list[dict[str, Any]]:
     return [json.loads(r["detail"]) for r in rows]
 
 
-async def test_preflight_audits_path_indeterminate_and_does_not_refuse(
+async def test_preflight_audits_path_indeterminate_and_refuses_at_enforce(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The second receipt: path_indeterminate is written, and it does not refuse. Slice 3 inverts
-    this test, and the inversion is where that decision gets reviewed."""
+    """The second receipt, inverted by BACKLOG #1142 slice 3 as the design memo planned:
+    path_indeterminate is written, and then the preflight refuses at enforce."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _unknown_path)
     spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(tmp_path)), None)
-    await ta.run_anchor_preflight([spec], store, enforcing=True)
+    with pytest.raises(TrustAnchorError, match="could not settle"):
+        await ta.run_anchor_preflight([spec], store, enforcing=True)
     row = next(r for r in await _events(store) if r["event"] == "path_indeterminate")
     assert row["components"] == [{"path": "C:\\x", "kind": DIRECTORY, "reason": "access denied"}]
-    assert row["enforcing"] is True
+    assert row["enforcing"] is True and row["pinned"] is False
+
+
+async def test_preflight_path_indeterminate_with_a_matching_pin_loads_and_says_so(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _unknown_path)
+    p = _pem(tmp_path)
+    pin = hashlib.sha256(p.read_bytes()).hexdigest()
+    spec = AnchorSpec(
+        "api_client", "[api].tls_client_ca_file", str(p), pin, "[api].tls_client_ca_pin"
+    )
+    await ta.run_anchor_preflight([spec], store, enforcing=True)
+    row = next(r for r in await _events(store) if r["event"] == "path_indeterminate")
+    assert row["pinned"] is True
 
 
 # --- real file systems ----------------------------------------------------------------------------
@@ -1100,3 +1130,71 @@ async def test_posix_liveness_receipt(tmp_path: Path, store: MessageStore) -> No
 
     os.chmod(d, 0o755)
     await ta.run_anchor_preflight([spec], store, enforcing=True)
+
+
+# --- default-install placements under slice 3 (BACKLOG #1142) ------------------------------------
+#
+# Slice 3 refuses an ACL or path the engine could not read, at enforce, unless a pin matches. So the
+# realistic secure placements must read DETERMINATE on both arms, or a default install stops starting.
+
+_PEM_BLOCK = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+
+
+@_windows_only
+def test_windows_default_programdata_placement_loads_at_enforce_with_no_pin(
+    programdata_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both arms read for real: the conftest path stub is put back. Measured on this CI leg, and on
+    a Windows 11 dev host as the interactive user, 2026-09-25."""
+    monkeypatch.setattr(ta, "anchor_path_verdict", ap.anchor_path_verdict)
+    anchor = programdata_dir / "anchor.pem"
+    anchor.write_bytes(_PEM_BLOCK)
+    spec = AnchorSpec("t", "[api].tls_client_ca_file", str(anchor), None)
+    v = ta.evaluate_anchor(spec)
+    assert (v.acl_ok, v.path_ok) == (True, True), v.path_check
+    assert ta.verified_anchor_cadata(spec, enforcing=True)
+
+
+@_windows_only
+def test_windows_temp_placement_refuses_at_enforce_where_it_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The placement slice 3 newly refuses. Measured on a Windows 11 dev host, not elevated,
+    2026-09-25: reading C:\\Windows\\Temp's DACL fails with Win32 error 5, so the path check answers
+    indeterminate. An account that can read it, such as an elevated CI runner, skips here."""
+    monkeypatch.setattr(ta, "anchor_path_verdict", ap.anchor_path_verdict)
+    temp = Path(os.environ.get("SYSTEMROOT", "C:\\Windows")) / "Temp"
+    anchor = temp / f"mefor-test-{uuid.uuid4().hex[:12]}.pem"
+    try:
+        anchor.write_bytes(_PEM_BLOCK)
+    except OSError as exc:
+        pytest.skip(f"cannot write under {temp}: {exc}")
+    try:
+        spec = AnchorSpec(
+            "t", "[api].tls_client_ca_file", str(anchor), None, "[api].tls_client_ca_pin"
+        )
+        v = ta.evaluate_anchor(spec)
+        if v.path_ok is not None:
+            pytest.skip(f"this account can read {temp} (path_ok={v.path_ok})")
+        with pytest.raises(TrustAnchorError) as err:
+            ta.enforce_anchor(spec, enforcing=True)
+        text = str(err.value)
+        assert "Win32 error 5" in text
+        assert "move the anchor" in text and "set [api].tls_client_ca_pin to" in text
+        pinned = AnchorSpec("t", "[x]", str(anchor), hashlib.sha256(_PEM_BLOCK).hexdigest())
+        assert ta.verified_anchor_cadata(pinned, enforcing=True)  # the escape
+    finally:
+        anchor.unlink(missing_ok=True)
+
+
+def test_posix_root_owned_755_placement_loads_at_enforce_with_no_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The POSIX default: a root-owned 755 folder such as /etc/messagefoundry/, a 644 file, and the
+    engine running as its own non-root account. Recorded modes, so both CI legs run it."""
+    table = {"/etc/messagefoundry": (0, D755), "/etc/messagefoundry/ca.pem": (0, F644)}
+    v = _posix("/etc/messagefoundry/ca.pem", table, euid=999)
+    assert v.ok is True, v.findings
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)  # 644: no group or other write
+    ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=True)

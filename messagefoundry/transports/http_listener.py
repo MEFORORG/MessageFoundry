@@ -602,7 +602,7 @@ class HttpSource(SourceConnector):
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # Per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file), built once at
         # construction so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
-        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True)
+        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True, name=config.name or "")
         # Intake authentication (ADR 0154 D6) — a PEER control: it authorises SUBMITTING a message on
         # this inbound, mints no identity and opens no session. Defaults to "none", which makes every
         # path below a no-op and every shipped configuration byte-identical. The env() refs are already

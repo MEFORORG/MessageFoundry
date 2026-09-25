@@ -349,6 +349,10 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     "tls_key_file": "material/path, not a posture switch",
     "tls_key_password": "material/path, not a posture switch",
     "tls_ca_file": "material/path, not a posture switch",
+    # BACKLOG #1142, slice 3. A TIGHTENING, like tls_ciphers below: a set pin refuses any other
+    # bytes, and the one thing it relaxes (an unreadable ACL or path loads, with a warning and a
+    # pinned=true audit row) is reported by that row rather than by a posture reader.
+    "tls_ca_pin": "SHA-256 of tls_ca_file: a tightening; its escape writes an audit row",
     # BACKLOG #1005 added this one. It is exempt for BOTH of the reasons already used above, and
     # stating only the first would be the weaker half: it is a material PATH like tls_ca_file
     # beside it, AND its ABSENCE is GATED rather than reported -- check_inbound_revocation refuses

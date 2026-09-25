@@ -48,7 +48,14 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from messagefoundry.config.ai_policy import (
     AiDataScope,
@@ -224,6 +231,21 @@ class SqlAuth(str, Enum):  # noqa: UP042
     SQL = "sql"  # SQL login (username + password)
     INTEGRATED = "integrated"  # Windows Integrated auth
     ENTRA = "entra"  # Microsoft Entra ID (Azure AD)
+
+
+def refuse_a_blank_anchor_pin(value: str | None, setting: str) -> str | None:
+    """Refuse a trust-anchor SHA-256 pin that is set but blank (BACKLOG #1142).
+
+    ``None`` is the only spelling of "no pin". An empty or whitespace value, such as an environment
+    variable set to nothing, used to reach the anchor code as a pin and refuse there or, on a
+    connection, read as no pin at all. A blank pin is a mistake, so it refuses at load, naming the
+    setting. Shared with the per-connection ``tls_ca_pin`` check in ``auth/trust_anchors.py``."""
+    if value is not None and not value.strip():
+        raise ValueError(
+            f"{setting} is set but empty, so it pins nothing. Remove it for no pin, or set it to "
+            "the SHA-256 of the CA file (64 hex characters)"
+        )
+    return value
 
 
 class _Section(BaseModel):
@@ -1109,6 +1131,11 @@ class ApiSettings(_Section):
                     "collapsing every client source IP to the proxy)"
                 ) from exc
         return v
+
+    @field_validator("tls_client_ca_pin")
+    @classmethod
+    def _refuse_a_blank_client_ca_pin(cls, v: str | None) -> str | None:
+        return refuse_a_blank_anchor_pin(v, "[api].tls_client_ca_pin")
 
     @field_validator("tls_min_version")
     @classmethod
@@ -2477,6 +2504,11 @@ class AuthSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("ad_tls_ca_cert_pin", "oidc_tls_ca_cert_pin")
+    @classmethod
+    def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
+        return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
 
     @field_validator("oidc_clock_skew_seconds")
     @classmethod
