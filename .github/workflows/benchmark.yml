@@ -64,6 +64,7 @@ jobs:
           # 32 random bytes, base64 -- the MEFOR_STORE_ENCRYPTION_KEY format. serve refuses without one.
           # Assigned before export: `export VAR="$(...)"` returns export's status and hides a failed mint.
           store_key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          echo "::add-mask::$store_key"
           export MEFOR_STORE_ENCRYPTION_KEY="$store_key"
           # THE ENGINE ALWAYS SERVES TLS (ADR 0172) and mints a self-signed pair beside [store].path on
           # first run. This step used to probe http://, so it talked cleartext at a TLS socket and never
@@ -150,17 +151,38 @@ jobs:
         run: |
           mkdir -p out/load
           { echo "## postgres"; uname -a; python --version; psql --version 2>/dev/null || echo "psql n/a"; git rev-parse HEAD; } | tee out/load/env-postgres.txt
-      - name: Mint a throwaway store key for this job
-        id: mint
-        # ONE key for the whole job, because the reference step and the failover nodes open the SAME
-        # server database. The first keyed open keys its audit chain, and a later keyless append is
-        # refused (store.py, "audit chain is keyed ... refusing to append"). A key minted inside the
-        # reference step would leave the failover nodes, which inherit this job's environment, keyless.
-        # Never a committed literal (gitleaks); 32 random bytes, base64. Masked before it is written.
+      - name: Create a separate database for the failover profile
+        id: failover_db
+        # Why the failover profile needs its own database is at its step below. POSTGRES_DB creates
+        # only one, so this adds the second through asyncpg, which the postgres extra installs.
+        # continue-on-error so a failure here skips only the failover step, which gates on this
+        # step's `outcome`, and never the reference measurement.
+        continue-on-error: true
         run: |
-          key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
-          echo "::add-mask::$key"
-          echo "MEFOR_STORE_ENCRYPTION_KEY=$key" >> "$GITHUB_ENV"
+          python - <<'PY'
+          import asyncio
+          import os
+
+          import asyncpg
+
+
+          async def main() -> None:
+              conn = await asyncpg.connect(
+                  host=os.environ["MEFOR_STORE_SERVER"],
+                  port=int(os.environ["MEFOR_STORE_PORT"]),
+                  user=os.environ["MEFOR_STORE_USERNAME"],
+                  password=os.environ["MEFOR_STORE_PASSWORD"],
+                  database="postgres",
+              )
+              try:
+                  if not await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = 'messagefoundry_failover'"):
+                      await conn.execute("CREATE DATABASE messagefoundry_failover")
+              finally:
+                  await conn.close()
+
+
+          asyncio.run(main())
+          PY
       - name: Serve (Postgres) + reference rate-steps
         env:
           MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
@@ -171,14 +193,18 @@ jobs:
           # the escape and still reports every gate. ci.yml's `load test (smoke, sqlserver)` leg carries
           # the full reasoning, including why no narrower fix exists for a `services:` container.
           MEFOR_SECURITY_ENFORCEMENT: "warn"
-          # The PHI posture's gates, provisioned as in the sqlite leg. The store key is the job's, minted above.
+          # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
           set -o pipefail
-          # MEFOR_STORE_ENCRYPTION_KEY comes from the job's mint step above.
+          # Mint a throwaway AES-256 store key at runtime; never a committed literal (gitleaks). Assigned
+          # before export: `export VAR="$(...)"` returns export's status and hides a failed mint.
+          store_key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          echo "::add-mask::$store_key"
+          export MEFOR_STORE_ENCRYPTION_KEY="$store_key"
           # https + pinned, as in the sqlite leg. This step passes no --db, so [store].path keeps its
           # default relative "messagefoundry.db" and the minted pair lands in the working directory,
           # $GITHUB_WORKSPACE (measured on ci.yml's sqlserver load leg, run 33511381948). serve derives
@@ -214,9 +240,16 @@ jobs:
           [ -n "$ready" ]
       - name: Failover profile (two nodes, kill primary mid-load)
         # Runs even when the reference step failed: it starts its own serve nodes, so a reference
-        # engine that never came up says nothing about it. The mint step gates it, because every
-        # setup step runs before that one, and failover cannot work without the install or the key.
-        if: ${{ !cancelled() && steps.mint.outcome == 'success' }}
+        # engine that never came up says nothing about it. It gates on the database step, which runs
+        # only once every earlier setup step has succeeded.
+        if: ${{ !cancelled() && steps.failover_db.outcome == 'success' }}
+        # ITS OWN DATABASE, created above. The reference step keys the database it opens, and a keyed
+        # audit chain refuses a later keyless append; these nodes run keyless on purpose
+        # (harness/load/failover.py). And its no-loss check reads ABSOLUTE counts
+        # (`final.in_pipeline == 0 and final.dead == 0`), so rows the reference run left undrained
+        # would be reported as failover's loss. A separate database keeps both out.
+        env:
+          MEFOR_STORE_DATABASE: messagefoundry_failover
         run: |
           set +e
           python -m harness --failover failover --db-backend postgres \
@@ -316,17 +349,16 @@ jobs:
         run: |
           mkdir -p out/load
           { echo "## sqlserver"; uname -a; python --version; git rev-parse HEAD; } | tee out/load/env-sqlserver.txt
-      - name: Mint a throwaway store key for this job
-        id: mint
-        # ONE key for the whole job, because the reference step and the failover nodes open the SAME
-        # server database. The first keyed open keys its audit chain, and a later keyless append is
-        # refused (store.py, "audit chain is keyed ... refusing to append"). A key minted inside the
-        # reference step would leave the failover nodes, which inherit this job's environment, keyless.
-        # Never a committed literal (gitleaks); 32 random bytes, base64. Masked before it is written.
+      - name: Create a separate database for the failover profile
+        id: failover_db
+        # As in the postgres leg: why is at the failover step, and continue-on-error keeps a failure
+        # here from skipping the reference measurement. -b makes a T-SQL error exit non-zero.
+        # ALLOW_SNAPSHOT_ISOLATION is set here so the two failover nodes do not both race to set it
+        # on first open of a fresh database.
+        continue-on-error: true
         run: |
-          key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
-          echo "::add-mask::$key"
-          echo "MEFOR_STORE_ENCRYPTION_KEY=$key" >> "$GITHUB_ENV"
+          /opt/mssql-tools18/bin/sqlcmd -b -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
+            -Q "IF DB_ID('MessageFoundryFailover') IS NULL CREATE DATABASE MessageFoundryFailover; ALTER DATABASE MessageFoundryFailover SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE; ALTER DATABASE MessageFoundryFailover SET ALLOW_SNAPSHOT_ISOLATION ON;"
       - name: Serve (SQL Server) + reference rate-steps
         env:
           MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
@@ -337,14 +369,18 @@ jobs:
           # the escape and still reports every gate. ci.yml's `load test (smoke, sqlserver)` leg carries
           # the full reasoning, including why no narrower fix exists for a `services:` container.
           MEFOR_SECURITY_ENFORCEMENT: "warn"
-          # The PHI posture's gates, provisioned as in the sqlite leg. The store key is the job's, minted above.
+          # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
           set -o pipefail
-          # MEFOR_STORE_ENCRYPTION_KEY comes from the job's mint step above.
+          # Mint a throwaway AES-256 store key at runtime; never a committed literal (gitleaks). Assigned
+          # before export: `export VAR="$(...)"` returns export's status and hides a failed mint.
+          store_key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          echo "::add-mask::$store_key"
+          export MEFOR_STORE_ENCRYPTION_KEY="$store_key"
           # https + pinned, as in the sqlite leg. This step passes no --db, so [store].path keeps its
           # default relative "messagefoundry.db" and the minted pair lands in the working directory,
           # $GITHUB_WORKSPACE (measured on ci.yml's sqlserver load leg, run 33511381948). serve derives
@@ -380,9 +416,12 @@ jobs:
           [ -n "$ready" ]
       - name: Failover profile (two nodes, kill primary mid-load)
         # Runs even when the reference step failed: it starts its own serve nodes, so a reference
-        # engine that never came up says nothing about it. The mint step gates it, because every
-        # setup step runs before that one, and failover cannot work without the install or the key.
-        if: ${{ !cancelled() && steps.mint.outcome == 'success' }}
+        # engine that never came up says nothing about it. It gates on the database step, which runs
+        # only once every earlier setup step has succeeded.
+        if: ${{ !cancelled() && steps.failover_db.outcome == 'success' }}
+        # Its own database, for the reasons at the postgres leg's failover step.
+        env:
+          MEFOR_STORE_DATABASE: MessageFoundryFailover
         run: |
           set +e
           python -m harness --failover failover --db-backend sqlserver \
