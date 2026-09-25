@@ -52,10 +52,17 @@ async def _service(engine: Engine, **over: object) -> AuthService:
     return service
 
 
-async def _ad_account(engine: Engine, username: str = "jdoe") -> str:
-    """A directory mirror row, as a Kerberos sign-in leaves it: unbound."""
+async def _ad_account(engine: Engine, username: str = "jdoe", *, object_id: bool = True) -> str:
+    """A directory mirror row, as a Kerberos sign-in through a directory returning objectGUID
+    leaves it: unbound, and carrying its immutable id (BACKLOG #1143 slice C). ``object_id=False``
+    is the row a directory with no readable objectGUID leaves, which cannot take a binding."""
     user_id = uuid4().hex
-    await engine.store.create_user(user_id=user_id, username=username, auth_provider="ad")
+    await engine.store.create_user(
+        user_id=user_id,
+        username=username,
+        auth_provider="ad",
+        directory_object_id=f"guid-{username}" if object_id else None,
+    )
     return user_id
 
 
@@ -395,6 +402,13 @@ async def test_an_admin_cannot_change_their_own_link(
         ("too long", "S" * 256, 400, "1 to 255 characters"),
         ("same pair", "S-1-mine", 400, "already holds that identity"),
         ("local", "S-1-a", 400, "only a directory (AD) account"),
+        # BACKLOG #1143 slice C: the engine's refusal reaches the page through the same mapping.
+        (
+            "no object id",
+            "S-1-a",
+            400,
+            "directory_object_id_missing: this account has no immutable",
+        ),
     ],
 )
 async def test_each_link_refusal_is_shown_in_words_and_writes_nothing(
@@ -408,6 +422,8 @@ async def test_each_link_refusal_is_shown_in_words_and_writes_nothing(
     c, service = boss
     if case == "local":
         target = await provision(service, "loc", [Role.VIEWER.value])
+    elif case == "no object id":
+        target = await _ad_account(engine, object_id=False)
     else:
         target = await _ad_account(engine)
     if case == "held":

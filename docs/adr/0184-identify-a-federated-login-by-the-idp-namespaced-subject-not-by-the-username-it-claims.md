@@ -36,7 +36,28 @@
   the service's bind and unbind. The pair reaches the console through a `FederatedIdentityView`
   that no JSON route returns, so `GET /users` is unchanged. Pinned in the console suite's
   `test_ui_federated_identity.py`.
-- **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25)
+- **Slice C BUILT 2026-09-25 (BACKLOG #1143): AC-5 now holds by construction for every binding
+  made from here on.** `AuthService.bind_federated_subject` refuses an account whose
+  `directory_object_id` is NULL or empty, with the code `directory_object_id_missing`, and audits
+  the refusal as `auth.federated_bind_refused` naming the actor. It writes no binding, revokes no
+  session and sends no notice. The API route answers 400 and the console screen shows the words,
+  both through their existing refusal mapping. The id is written only when the row is created and
+  nothing clears it, so a bound row always carries one. `resolve_principal` prefers the id, so the
+  login re-resolve and the reconciler's probe never ask by name for a bound row. Pinned by
+  `tests/test_ad_session_reconcile.py`, `test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id`,
+  and by the refusal tests in `tests/test_auth_federated_identity_routes.py` and the console suite.
+  **The cost: a site whose directory returns no readable `objectGUID` can bind nobody, so nobody
+  there can sign in through the IdP.** Its directory sign-ins still work and still resolve by name,
+  as BACKLOG #1471 leaves them. A row created without an id never gains one, because a later
+  sign-in presenting an id is refused as `directory_identity_conflict`. So the remedy on such a
+  site is to make the directory return `objectGUID`, remove the account, and let one Windows SSO
+  sign-in create it again. That discards the old `user_id`.
+  **What holds for a binding made before slice C: nothing new.** A binding already on an id-less row
+  is not refused at login, because on a directory with no readable `objectGUID` that would lock its
+  holder out. Such a row still probes by name, so residual (d) of the 6.8.1 re-score stands for it.
+  The bind now refuses to re-point it, and the unbind still removes it. Section 0 of
+  [CLAUDE.md](../../CLAUDE.md) (zero deployments) means no such binding exists outside a test.
+- **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25; slice C built 2026-09-25)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session
   mechanism field serves) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)
@@ -216,6 +237,10 @@ part 4.)*
   object id, so directory disable and role reconciliation keep running for it. *(Second clause added
   2026-09-23: it is what tells the chosen re-key from the rejected option of excluding bound rows.)*
   → `tests/test_ad_session_reconcile.py`
+  *Built 2026-09-25 (slice C), by construction rather than by a check in the reconciler: the admin
+  bind refuses a row with no `directory_object_id`, so a binding made since then never sits on a row
+  the probe keys by name. A binding made before slice C on an id-less row is not covered; see the
+  slice C status line.*
 - **AC-6** — WHEN a federated login presents no `federated_subject` (the simple-bind and Kerberos
   callers), THE SYSTEM SHALL take no pair-keyed branch and SHALL emit the same audit row it emits today.
   → `tests/test_ad_login_pathway_split.py`

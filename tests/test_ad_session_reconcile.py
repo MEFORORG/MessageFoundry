@@ -28,7 +28,7 @@ from pydantic import ValidationError
 
 from messagefoundry.auth import reconcile
 from messagefoundry.auth.ldap import AdPrincipal, LdapError
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 
@@ -689,6 +689,54 @@ async def test_a_row_with_no_immutable_id_still_probes_by_name() -> None:
 
         await service.reconcile_directory_sessions()
         assert ldap.probe_keys == [("username", "jdoe")]
+    finally:
+        await store.close()
+
+
+async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id() -> None:
+    """ADR 0184 AC-5, held by construction (BACKLOG #1143 slice C).
+
+    A bound row must never be re-resolved from its username, or a reissued name would hand the
+    pair's holder the new person's groups. The name-keyed probe above is still there for a row with
+    no id, so AC-5 holds only if no such row can be bound. Both rows here are made by a real
+    directory sign-in: one through a directory answering with objectGUID, one through a directory
+    that returns none. The id-less row refuses the bind. Then one pass: the bound row is probed by
+    its id, and the only name-keyed probe is the unbound row's.
+
+    The planted control is the refusal itself: without it the second bind lands, and the pass then
+    probes a BOUND row by name.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "jdoe": _principal("jdoe"),
+                "nobody": replace(_principal("nobody"), directory_object_id=None),
+            }
+        )
+        settings = _ad_settings(oidc_issuer="https://idp.test.invalid")
+        service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+        await _signed_in_ad_user(service, store, "nobody")
+        jdoe = await store.get_user_by_username("jdoe")
+        nobody = await store.get_user_by_username("nobody")
+        assert jdoe is not None and jdoe.directory_object_id == _object_id_for("jdoe")
+        assert nobody is not None and nobody.directory_object_id is None
+
+        await service.bind_federated_subject(jdoe.id, "S-1-jdoe", actor="admin")
+        with pytest.raises(DirectoryObjectIdMissing):
+            await service.bind_federated_subject(nobody.id, "S-1-nobody", actor="admin")
+
+        ldap.probe_keys.clear()
+        await service.reconcile_directory_sessions()
+
+        bound = {u.username for u in await store.list_users() if u.oidc_subject is not None}
+        assert bound == {"jdoe"}
+        assert sorted(ldap.probe_keys) == [
+            ("object_id", _object_id_for("jdoe")),
+            ("username", "nobody"),
+        ]
     finally:
         await store.close()
 
