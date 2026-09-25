@@ -25,6 +25,30 @@ that value. Console 0.3.0 does not work with that engine, so upgrade the two tog
 under Changed says why engine 0.4.0 does not work with this console.
 
 ### Added
+- **An administrator can link, relink and unlink a user's federated (OIDC) identity** (`BACKLOG
+  #1143`, `BACKLOG #295`, ADR 0184 slice B).
+  - The user page gains a Federated sign-in card. It shows the issuer and `sub` the account is
+    linked to, or says it is not linked.
+  - `/ui/users/{user_id}/federated-identity` shows the link and offers Link, or Relink when one
+    exists. `/ui/users/{user_id}/federated-identity/unlink-confirm` states what an unlink does
+    before the one button that does it.
+  - Both changes call the engine's own `PUT` and `DELETE /users/{user_id}/federated-identity`
+    handlers. Each POST needs a fresh re-authentication for the action
+    `admin_federated_identity`. A recent sign-in does not count, unless the site set
+    `[auth].require_action_step_up = false`. A POST without one goes through `/ui/reauth` and
+    comes back to the page, so the operator submits again.
+  - Each attempt uses up its re-authentication, including one the engine refuses. The refusal
+    page shows the reason in words and keeps the typed `sub`, and trying again asks for the
+    password first.
+  - Each form posts back the link it showed. If another administrator changed the link since
+    the page opened, the POST is refused and the page shows the current link. The check runs
+    before the engine's handler and does not serialise against a concurrent write. So a stale
+    page can still replace or remove a link another administrator set at the same moment. A
+    later slice would move the check into the service's bind and unbind.
+  - An administrator's own account shows no form, and the engine refuses a POST on it. A local
+    account, or an engine with no `[auth].oidc_issuer`, shows no Link form.
+  - Needs the new engine seam: `AdminHandlers` gained the two handlers and the
+    `federated_identity_view` projection, which returns the new `FederatedIdentityView`.
 - **Pages that issue or enforce an admin-set temporary password now say when it stops working**
   (`BACKLOG #1141`, PR 1456). The engine refuses such a password once
   `[auth].initial_password_expiry_hours` have passed since it was set.

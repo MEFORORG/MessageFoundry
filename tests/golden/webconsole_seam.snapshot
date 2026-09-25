@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-afae70a0a371355f
+500b98c2d593db80
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -83,6 +83,8 @@ set_user_roles
 set_channel_scope
 reset_user_password
 reset_user_mfa
+bind_user_federated_identity
+unbind_user_federated_identity
 admin_revoke_user_sessions
 delete_user
 create_custom_role
@@ -100,6 +102,7 @@ list_audit
 my_security_events
 user_summary
 current_user
+federated_identity_view
 
 ## api.security surface (imported directly by the console, outside UiDeps)
 client_ip: (conn: 'Request | WebSocket') -> 'str | None'
@@ -172,6 +175,8 @@ messagefoundry.api.auth_models.ChannelScope: channels
 messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, user_id, username
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
 messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
+messagefoundry.api.auth_models.FederatedIdentityRequest: subject
+messagefoundry.api.auth_models.FederatedIdentityView: auth_provider, bind_issuer, issuer, subject, user_id, username
 messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
 messagefoundry.api.auth_models.NotifyEmailRequest: email
 messagefoundry.api.auth_models.PasswordChangeRequest: current_password, new_password

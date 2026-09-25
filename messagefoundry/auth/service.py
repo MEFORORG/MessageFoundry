@@ -1014,6 +1014,13 @@ class AuthService:
         return self._settings.oidc_enabled and self._ldap is not None
 
     @property
+    def oidc_issuer(self) -> str | None:
+        """The configured ``[auth].oidc_issuer``, or ``None`` when unset: the only issuer
+        :meth:`bind_federated_subject` binds under. Read by the console's federated-identity screen,
+        so it offers no Link form that can only be refused (BACKLOG #1143, ADR 0184 slice B)."""
+        return self._settings.oidc_issuer or None
+
+    @property
     def oidc_available(self) -> bool:
         """``oidc_enabled`` AND the last IdP interaction did not fail.
 

@@ -162,11 +162,20 @@ def test_a_disabled_mfa_gate_is_reported_not_hidden() -> None:
     assert "DISABLED" in rows["fed.mfa_gate"].detail
 
 
-def test_secret_and_tls_can_actually_pass() -> None:
+def test_the_secret_can_actually_pass() -> None:
     rows = _by_id(run_federation_checks(_settings()))
     assert rows["fed.client_secret"].status is Status.PASS
     assert "shhh" not in rows["fed.client_secret"].detail  # never echo the value
-    assert rows["fed.idp_tls"].status is Status.PASS
+
+
+def test_no_anchor_trusts_the_whole_os_store_and_is_not_a_pass() -> None:
+    """BACKLOG #1142: with no anchor the IdP hop trusts every root in the OS store. That built
+    cleanly, and the row used to call it PASS. A person has to confirm it, so it is MANUAL. The
+    anchored rows, PASS included, are in tests/test_trust_anchor_byte_binding.py."""
+    row = _by_id(run_federation_checks(_settings()))["fed.idp_tls"]
+    assert row.status is Status.MANUAL
+    assert "EVERY root" in row.detail
+    assert "[auth].oidc_tls_ca_cert_file" in row.detail
 
 
 def test_an_unreadable_ca_file_fails(tmp_path: Path) -> None:

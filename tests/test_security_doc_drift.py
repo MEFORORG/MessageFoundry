@@ -73,9 +73,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # BACKLOG #1143 / #295 (ADR 0184 slice A) added two JSON routes -- PUT and DELETE
 # /users/{user_id}/federated-identity, the only path that binds a federated identity -- and no /ui
 # route: the console leg is slice B.
+# BACKLOG #1143 / #295 (ADR 0184 slice B) added four /ui routes and no JSON route: the
+# federated-identity screen and its unlink confirm page, and the link and unlink POSTs behind them.
 _ROUTES_DEFAULT = 112
 _ROUTES_WITH_DOCS = 116
-_ROUTES_WITH_UI = 223
+_ROUTES_WITH_UI = 227
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate

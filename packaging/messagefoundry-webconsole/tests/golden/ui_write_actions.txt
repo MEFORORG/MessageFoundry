@@ -27,6 +27,8 @@
 ^/ui/uploaded-logs/upload-form$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/users/[^/?#]+$	admin_user_update	step_up=1,auto_retry=0,unlock=1
 ^/ui/users/[^/?#]+/(revoke-sessions|delete)$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/users/[^/?#]+/federated-identity$	admin_federated_identity	step_up=1,auto_retry=0,unlock=1
+^/ui/users/[^/?#]+/federated-identity/unlink-confirm$	admin_federated_identity	step_up=1,auto_retry=0,unlock=1
 ^/ui/users/[^/?#]+/reset-mfa$	admin_reset_mfa	step_up=1,auto_retry=1,unlock=0
 ^/ui/users/[^/?#]+/reset-password$	admin_reset_password	step_up=1,auto_retry=1,unlock=0
 ^/ui/users/new$	-	step_up=1,auto_retry=0,unlock=1
