@@ -190,12 +190,18 @@ from typing import Any
 #: (BACKLOG #279), so an older console refuses this engine at startup rather than ignoring them.
 #: Unnumbered: the ``vN`` labels are retired as identifiers (#1220 above).
 #:
+#: BACKLOG #1139: ``AuthService`` gained the public static ``suggested_notify_email``, which the
+#: console's ``/ui/account/notify-address`` form calls to pre-fill the address. It was first a
+#: module function in ``auth.service``, which discovery does not read, so the seam did not move and
+#: an older engine passed the handshake and then failed the console's import. A METHOD the console
+#: calls, so it forces a bump for the reason the ``factor_binding_is_blocked`` entry above gives.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "01894d979d8f66d9"
+ENGINE_UI_SEAM: str = "f26d3fff5f3fdec8"
 
 
 @dataclass(frozen=True, slots=True)

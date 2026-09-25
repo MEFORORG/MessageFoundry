@@ -17,6 +17,7 @@ from _ui_clients import PW, SAME_ORIGIN, cookie_login, provision
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Permission, Role
+from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.notifications import NOTIFY_EMAIL_SET, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -136,6 +137,198 @@ async def test_a_second_address_is_refused_out_loud(engine: Engine) -> None:
         assert "already has a notification address" in again.text
     user = await engine.store.get_user(user_id)
     assert user is not None and user.notify_email == ADDRESS
+
+
+# --- the form suggests the profile address, and only a submit writes it ---------------------------
+
+DIRECTORY_ADDRESS = "holder@example.org"
+SUGGESTED_LINE = "Change it if it is not yours."
+
+
+async def _set_count(engine: Engine) -> int:
+    # Filtered in the store, so no row falls outside a page of the whole log.
+    return len(await engine.store.list_audit(action="auth.notify_email_set", limit=1000))
+
+
+def _email_input(html: str) -> str:
+    """The ``<input name="email" ...>`` tag alone, so an assertion cannot match elsewhere."""
+    start = html.index('<input name="email"')
+    return html[start : html.index(">", start) + 1]
+
+
+async def test_the_form_suggests_the_profile_address_and_a_get_writes_nothing(
+    engine: Engine,
+) -> None:
+    """The profile ``email`` starts in the input. The GET alone sets nothing, audits nothing and sends
+    no notice; submitting the suggested value then fills ``notify_email`` through the existing POST."""
+    notifier = _FakeNotifier()
+    service = await _service(engine, notifier=notifier)
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    # The directory-sync write: it names ``email`` and never ``notify_email``.
+    await engine.store.update_user_profile(user_id, display_name=None, email=DIRECTORY_ADDRESS)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        page = await c.get(PAGE)
+        assert page.status_code == 200
+        tag = _email_input(page.text)
+        assert f'value="{DIRECTORY_ADDRESS}"' in tag
+        # Announced with the input, and not focused, so a stray Enter cannot accept it unread.
+        assert 'aria-describedby="notify-address-hint"' in tag
+        assert "autofocus" not in tag
+        assert "Suggested from the address on your account record." in page.text
+        assert SUGGESTED_LINE in page.text
+
+        user = await engine.store.get_user(user_id)
+        assert user is not None and user.notify_email is None
+        assert await _set_count(engine) == 0
+        assert notifier.events == []
+        # Still confined: showing the suggestion released nothing.
+        r = await c.get("/ui")
+        assert r.status_code == 303 and r.headers["location"] == PAGE
+
+        done = await c.post(PAGE, data={"email": DIRECTORY_ADDRESS}, headers=SAME_ORIGIN)
+        assert done.status_code == 303 and done.headers["location"] == "/ui"
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.notify_email == DIRECTORY_ADDRESS
+    assert await _set_count(engine) == 1
+    assert [e.email for e in notifier.events if e.event_type == NOTIFY_EMAIL_SET] == [
+        DIRECTORY_ADDRESS
+    ]
+
+
+async def test_the_form_is_empty_when_the_account_has_no_address(engine: Engine) -> None:
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.email is None and user.notify_email is None
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        page = await c.get(PAGE)
+    assert page.status_code == 200
+    tag = _email_input(page.text)
+    assert "value=" not in tag
+    assert "autofocus" in tag
+    assert SUGGESTED_LINE not in page.text
+
+
+async def test_a_profile_address_the_submit_would_refuse_is_not_suggested(engine: Engine) -> None:
+    """Blank, a list, no dot in the domain, or over the POST's length bound: offer nothing."""
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    too_long = "a" * 250 + "@example.org"
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        for value in (
+            "   ",
+            "a@x.org, b@y.org",
+            "['a@x.org', 'b@y.org']",
+            "root@localhost",
+            too_long,
+        ):
+            await engine.store.update_user_profile(user_id, display_name=None, email=value)
+            page = await c.get(PAGE)
+            assert page.status_code == 200, value
+            assert "value=" not in _email_input(page.text), value
+            assert SUGGESTED_LINE not in page.text, value
+
+
+async def test_a_non_ascii_profile_address_is_not_suggested(engine: Engine) -> None:
+    """A directory writer could store a homoglyph lookalike of the holder's real address, such as
+    a Cyrillic ``a`` (U+0430) for a Latin one, or the same domain in Punycode. A pre-filled
+    lookalike is the attack the suggestion must not carry, so neither is offered. The POST is
+    unchanged: the holder may still type any address the submit accepts."""
+    from messagefoundry.auth.service import _is_single_mailbox
+
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        for value in (
+            "\u0430lice@example.org",  # Cyrillic a in the local part
+            "alice@ex\u0430mple.org",  # Cyrillic a in the domain
+            "alice\u00e9@example.org",  # a Latin-1 letter, not a lookalike, still refused
+            "alice@xn--exmple-4nf.org",  # the Cyrillic-a domain above, IDNA-encoded
+            "alice@mail.XN--exmple-4nf.org",  # the same, upper case and not the first label
+        ):
+            # The control: the shape check passes each one, so the refusal below is the new rule's.
+            assert _is_single_mailbox(value), ascii(value)
+            await engine.store.update_user_profile(user_id, display_name=None, email=value)
+            page = await c.get(PAGE)
+            assert page.status_code == 200, ascii(value)
+            assert "value=" not in _email_input(page.text), ascii(value)
+            assert SUGGESTED_LINE not in page.text, ascii(value)
+            assert service.suggested_notify_email(value) is None, ascii(value)
+    # The ASCII original of the same address is still offered.
+    assert service.suggested_notify_email("alice@example.org") == "alice@example.org"
+
+
+async def test_a_suggested_address_is_escaped_in_the_route(engine: Engine) -> None:
+    """``&`` and ``'`` pass the mailbox check, so they reach the attribute and must arrive escaped."""
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    await engine.store.update_user_profile(user_id, display_name=None, email="o'b&c@example.org")
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        page = await c.get(PAGE)
+    assert page.status_code == 200
+    assert 'value="o&#x27;b&amp;c@example.org"' in _email_input(page.text)
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.notify_email is None
+
+
+def test_the_page_escapes_quote_and_angle_brackets_in_a_suggestion() -> None:
+    """The route never offers ``"<>``, since the mailbox check refuses them. The page escapes them
+    anyway, so its safety does not rest on the caller's filter."""
+    from messagefoundry_webconsole import pages
+
+    html = pages.notify_address_page(suggested='x"><script>alert(1)</script>&y@example.org')
+    assert 'value="x&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&amp;y@example.org"' in html
+    assert "<script>alert(1)" not in html
+
+
+async def test_a_directory_account_is_told_the_suggestion_came_from_its_directory(
+    engine: Engine,
+) -> None:
+    """Born with no ``mail``, so no address was seeded. The directory then supplies one, which
+    lands in ``email`` only, and the page offers it with the directory wording."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        ),
+        security_notifier=_FakeNotifier(),
+    )
+    await service.initialize()
+
+    def principal(mail: str | None) -> AdPrincipal:
+        return AdPrincipal(
+            username="dir", display_name="dir", email=mail, dn="CN=dir,DC=x", groups=frozenset()
+        )
+
+    first = await service._complete_ad_login(principal(None), None, mfa_verified=True)
+    assert first.ok and first.identity is not None and first.identity.must_set_notify_email
+    out = await service._complete_ad_login(principal(DIRECTORY_ADDRESS), None, mfa_verified=True)
+    assert out.ok and out.token is not None and out.identity is not None
+    user = await engine.store.get_user(out.identity.user_id)
+    assert user is not None and user.email == DIRECTORY_ADDRESS and user.notify_email is None
+
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", out.token)
+        page = await c.get(PAGE)
+    assert page.status_code == 200
+    assert f'value="{DIRECTORY_ADDRESS}"' in _email_input(page.text)
+    assert (
+        "Suggested from the address your directory last gave for your account. "
+        "Change it if it is not yours."
+    ) in page.text
+    user = await engine.store.get_user(out.identity.user_id)
+    assert user is not None and user.notify_email is None
 
 
 class _FakeWS:
