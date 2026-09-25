@@ -1986,9 +1986,12 @@ class AuthStore(Protocol):
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None
     ) -> None:
-        """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the
-        first federated login so a later login whose reassignable username resolves to this account but
-        carries a different subject is refused, not handed the account."""
+        """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015).
+
+        Its one caller is :meth:`AuthService.bind_federated_subject`, the administrative bind (BACKLOG
+        #1143, ADR 0184). A federated login selects its account by this pair and never writes it.
+        **Until #1143 this was recorded on the account's first federated login**, which is the
+        bind-on-first-presentation the owner's 2026-09-06 ruling forbids."""
         ...
 
     async def clear_user_federated_subject(

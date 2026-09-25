@@ -70,9 +70,12 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # body-less resend POST behind it -- and no JSON route: the resend endpoint already shipped with #123.
 # BACKLOG #1139 (ASVS 6.3.7) added one JSON route, POST /me/notify-email, and two /ui routes, the GET
 # and POST of /ui/account/notify-address: the way out of the missing-address confinement.
-_ROUTES_DEFAULT = 110
-_ROUTES_WITH_DOCS = 114
-_ROUTES_WITH_UI = 221
+# BACKLOG #1143 / #295 (ADR 0184 slice A) added two JSON routes -- PUT and DELETE
+# /users/{user_id}/federated-identity, the only path that binds a federated identity -- and no /ui
+# route: the console leg is slice B.
+_ROUTES_DEFAULT = 112
+_ROUTES_WITH_DOCS = 116
+_ROUTES_WITH_UI = 223
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -1178,8 +1181,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     assert len(gated) == len(rows) - len(no_gate) - len(permissionless)
     # 87 -> 90: BACKLOG #1184's three needle-bearing POSTs, each gated exactly as its GET sibling.
     # 90 -> 91: BACKLOG #1494's POST /cluster/stepdown, gated on the new cluster:control.
-    assert len(gated) == 91, (
-        f"{len(gated)} permission-gated routes, not 91 — update the doc's totals."
+    # 91 -> 93: BACKLOG #1143's PUT and DELETE /users/{user_id}/federated-identity, users:manage.
+    assert len(gated) == 93, (
+        f"{len(gated)} permission-gated routes, not 93 — update the doc's totals."
     )
 
 

@@ -273,6 +273,15 @@ STEP_UP_ACTION_SESSION_TERMINATE = "session_terminate"
 # every recovery code and every passkey, on someone else's account.
 STEP_UP_ACTION_ADMIN_RESET_MFA = "admin_reset_mfa"
 STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — step-up action id, not a credential; echoed publicly in X-Step-Up-Action
+# BACKLOG #1143 / #295 (ADR 0184). Binding, rebinding or unbinding a federated identity decides who
+# may sign in as the account, so it is the same class of change as an admin password reset: an
+# attribute that affects authentication (ASVS 7.5.1). Bound to its own action and single-use, and
+# MFA-gated, for the same reason `admin_reset_password` is.
+STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY = "admin_federated_identity"
+
+#: The closed-set reason a federated login is refused with when its verified ``(issuer, sub)`` is
+#: bound to no account (ADR 0184 AC-4). Named because the browser layer maps it to a login-page code.
+FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 
 _T = TypeVar("_T")
 
@@ -467,6 +476,43 @@ class _FederatedBindingWithdrawn(Exception):
     second transaction. The exception carries the refusal out of a method whose whole contract is
     "returns the token", without giving every other caller a ``None`` to handle.
     """
+
+
+class FederatedSubjectHeld(RuntimeError):
+    """:meth:`AuthService.bind_federated_subject` declined: a DIFFERENT account already holds the
+    ``(issuer, sub)`` it was asked to bind (BACKLOG #1143). The message is operator-facing.
+
+    Refused rather than moved. Moving a binding hands the subject the newer account and strands the
+    older one, which is the takeover shape the #1256 exclusivity guard exists to prevent. An operator
+    who means to move it unbinds the holder first, and that act is audited on its own.
+    """
+
+
+@dataclass(frozen=True)
+class FederatedBinding:
+    """What :meth:`AuthService.bind_federated_subject` wrote (BACKLOG #1143).
+
+    ``previous_*`` are ``None`` for a first bind. ``sessions_revoked`` is non-zero only on a rebind,
+    where the prior identity's sessions end in the same transaction that clears its binding.
+    """
+
+    issuer: str
+    subject: str
+    previous_issuer: str | None
+    previous_subject: str | None
+    sessions_revoked: int
+
+
+def _is_integrity_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` is a backend's UNIQUE-constraint refusal, matched by MRO NAME.
+
+    Each backend raises its own class -- ``sqlite3.IntegrityError``, asyncpg's
+    ``UniqueViolationError``, pyodbc's ``IntegrityError`` -- and naming them would make this module
+    import-aware of every driver and silently stop covering a backend added later. The same test the
+    ``_enroll_webauthn`` duplicate-label race uses (ADR 0068 section 4).
+    """
+    mro = "".join(t.__name__ for t in type(exc).__mro__)
+    return "Integrity" in mro or "UniqueViolation" in mro
 
 
 def _reproof_refusal_reason(proof: _Reproof) -> str:
@@ -1907,9 +1953,60 @@ class AuthService:
                 ok=False, error="identity provider unavailable", reason="idp_unavailable"
             )
 
+        # The claimed username is kept ONLY as the audit actor for a refusal. It selects nothing.
         username = principal_claims.username
+
+        # BACKLOG #1143 / #295 (ADR 0184, ASVS 6.8.1): THE ACCOUNT IS SELECTED BY THE VERIFIED
+        # (issuer, sub) PAIR, BEFORE ANY USERNAME IS READ.
+        #
+        # This replaces two username-keyed steps that stood here. The first resolved the directory
+        # principal from the token's username claim. The second was the #1015 continuity guard, which
+        # fetched the account by that principal's username and compared its pair -- and short-
+        # circuited on `bound.oidc_subject is not None`, so it passed every account that had never
+        # federated. That is every account on a fresh deployment, so a principal the IdP would mint
+        # an allow-listed name for could land on a never-federated directory account and take its
+        # roles. The guard's job is now done by construction: the account IS the pair's account.
+        #
+        # So `federated_subject_conflict` is no longer emitted. A reassigned username that presents a
+        # new subject now meets the refusal below, because the new subject is bound to nothing.
+        bound = await self._store.get_user_by_federated_subject(
+            principal_claims.issuer, principal_claims.subject
+        )
+        if bound is None:
+            # ADR 0184 AC-4, and the owner ruling it rests on (2026-09-06): the administrative
+            # binding surface is the ONLY path that may create a binding. So first contact is refused
+            # and binds nothing. Before this, `_complete_ad_login` recorded the pair on the account's
+            # first federated login, which is the bind-on-first-presentation the ruling forbids.
+            #
+            # The visitor has proved control of this IdP identity and nothing else, so saying it is
+            # not linked tells them nothing about any MessageFoundry account. It is refused before the
+            # directory is consulted, so it says nothing about the directory either.
+            await self._directory_reject_audit(username, "oidc", FEDERATED_SUBJECT_NOT_BOUND)
+            return LoginOutcome(
+                ok=False,
+                error=(
+                    "this identity provider sign-in is not linked to an account; an administrator"
+                    " must bind it with PUT /users/{user_id}/federated-identity"
+                ),
+                reason=FEDERATED_SUBJECT_NOT_BOUND,
+            )
+        if bound.auth_provider != AuthProvider.AD.value:
+            # ADR 0184 part 3 and AC-3. The bind route refuses a LOCAL row, so this is the second
+            # layer: a binding placed on one by any other means still never signs a LOCAL account in
+            # through the directory path.
+            await self._directory_reject_audit(username, "oidc", "local_account_conflict")
+            return LoginOutcome(ok=False, error="account conflict", reason="local_account_conflict")
+
+        # ADR 0184 part 2 and AC-2: RE-RESOLVE THE DIRECTORY PRINCIPAL FROM THE BOUND ROW, never from
+        # the claim. Carrying on with a principal resolved from the claimed username is the half-done
+        # re-ordering the ADR warns about: `_upsert_ad_user` would touch the claimed name's row and
+        # `roles_for_ad_groups` would write that name's groups onto the bound account. The row's own
+        # object id is handed over as the reconciler hands it, so a directory-side rename still
+        # resolves (BACKLOG #1532).
         try:
-            principal = await asyncio.to_thread(self._ldap.resolve_principal, username)
+            principal = await asyncio.to_thread(
+                self._ldap.resolve_principal, bound.username, object_id=bound.directory_object_id
+            )
         except LdapError as exc:
             await self._audit(
                 "auth.login_error",
@@ -1921,29 +2018,10 @@ class AuthService:
                 ok=False, error="directory unavailable", reason="directory_unavailable"
             )
         if principal is None:
-            # Hybrid-only by design: a federated principal with no on-prem AD object is refused.
+            # Hybrid-only by design: a bound account with no on-prem AD object is refused.
             await self._directory_reject_audit(username, "oidc", "not_in_directory")
             return LoginOutcome(
                 ok=False, error="user not found in directory", reason="not_in_directory"
-            )
-
-        # BACKLOG #1015 (ADR 0142): subject-continuity guard. The AD-backed account is still RESOLVED by
-        # its username (roles stay LDAP-sourced), but its federated identity is PINNED to the non-
-        # reassignable OIDC (issuer, sub). If a local account for this resolved username is already bound
-        # to a DIFFERENT verified subject, an IdP has reassigned the username to a new person — refuse
-        # rather than hand the new subject the prior holder's account (the account-takeover-without-
-        # credential-compromise this item closes). An unbound account (never federated-logged-in) binds
-        # on first login below, in _complete_ad_login.
-        bound = await self._store.get_user_by_username(principal.username)
-        if (
-            bound is not None
-            and bound.oidc_subject is not None
-            and (bound.oidc_issuer, bound.oidc_subject)
-            != (principal_claims.issuer, principal_claims.subject)
-        ):
-            await self._directory_reject_audit(username, "oidc", "federated_subject_conflict")
-            return LoginOutcome(
-                ok=False, error="federated sign-in failed", reason="federated_subject_conflict"
             )
 
         now = time.time()
@@ -2048,8 +2126,9 @@ class AuthService:
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
         # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller stays
-        # byte-identical — no extra store write, no changed audit row. The federated
-        # caller has already enforced the subject-continuity guard before reaching here.
+        # byte-identical -- no extra store read, no changed audit row. The federated caller has
+        # already SELECTED the account by that pair and re-resolved ``principal`` from the selected
+        # row (ADR 0184), so the name read below finds that row unless the directory renamed it.
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
             # Never let an AD login adopt/overwrite a like-named LOCAL account (provider confusion).
@@ -2137,91 +2216,29 @@ class AuthService:
             )
             != federated_subject
         ):
-            # BACKLOG #1256: SUBJECT-EXCLUSIVITY, the direction #1015's guard cannot look. That guard
-            # resolves by username and asks whether THIS ACCOUNT holds a different subject; it is
-            # structurally incapable of seeing a SECOND ACCOUNT already bound to the subject now
-            # presenting.
+            # THE ROW THIS LOGIN REACHED DOES NOT HOLD THE PAIR THAT SELECTED IT. The caller chose the
+            # account by the pair and re-resolved ``principal`` from it, so on the ordinary path this
+            # never fires. It fires when the directory leads somewhere else: the re-resolved
+            # principal maps, by name or by object id, to a different mirror row. That row must not
+            # be signed in, and above all must not take the pair's roles, which the role write below
+            # would give it. So refuse, BEFORE the role write.
             #
-            # This is the FRIENDLY half of a two-layer control, not the only thing standing here.
-            # `ux_users_federated_subject` carries the same rule on all three backends and is the
-            # layer that holds under concurrency; the except-block below renders its refusal as this
-            # same outcome. This check exists so the sequential case gets a clean answer rather than
-            # an integrity error.
+            # BACKLOG #1256: this was the subject-exclusivity guard, and its refusal slug is kept for
+            # the case it still names -- the subject is held by a DIFFERENT account than the one
+            # reached. `ux_users_federated_subject` still makes that holder unique on all three
+            # backends.
             #
-            # Until BACKLOG #1472 this said, with a measurement, that no UNIQUE constraint named
-            # these columns on any backend. True when taken and false once the index landed -- and
-            # by then it invited the one wrong reading: that nothing but this check-then-act stood
-            # between one subject and two accounts.
-            #
-            # Without this, one verified identity could come to own two accounts: bind as `alice`,
-            # have the directory resolve you to `bob` later, and both rows carry your subject with
-            # #1015 refusing neither, because each account's own binding is self-consistent.
-            #
-            # Refused rather than re-pointed: silently moving a binding would hand the subject the
-            # newer account and strand the older one, which is the account-takeover-without-
-            # credential-compromise shape #1015 exists to prevent, arriving from the other side.
+            # BACKLOG #1143 / #295: IT NO LONGER BINDS. When no account holds the pair any more, this
+            # used to record the pair on the row reached -- bind on first presentation, the path the
+            # owner's 2026-09-06 ruling forbids. The only way the pair can be unheld here is an
+            # admin unbind or rebind landing after the caller's read, so it is refused as first
+            # contact is (ADR 0184 AC-4), and nothing is written.
             holder = await self._store.get_user_by_federated_subject(*federated_subject)
-            if holder is not None and holder.id != user.id:
-                await self._directory_reject_audit(
-                    principal.username, "oidc", "federated_subject_already_bound"
-                )
-                return LoginOutcome(
-                    ok=False,
-                    error="federated sign-in failed",
-                    reason="federated_subject_already_bound",
-                )
-            # First federated login for this account (or an unbound AD account's first): record the
-            # (issuer, sub) binding so a later reassigned-username login carrying a different subject is
-            # refused by the guard above. A matching binding is left untouched (no updated_at churn).
-            try:
-                await self._store.set_user_federated_subject(
-                    user.id, federated_subject[0], federated_subject[1]
-                )
-            except Exception as exc:
-                # BACKLOG #1256. THE GUARD ABOVE IS CHECK-THEN-ACT: its read and this write are
-                # separate awaits, so two concurrent FIRST logins for one subject can both see
-                # `holder is None` and both reach here. `ux_users_federated_subject` refuses the
-                # loser on all three backends, and this renders that refusal as the SAME outcome the
-                # sequential path returns -- otherwise the race loser gets a 500 for a condition the
-                # gate handles cleanly one microsecond earlier.
-                #
-                # MRO BY NAME, matching the duplicate-label race at `_enroll_webauthn` (ADR 0068 4):
-                # each backend raises its own integrity class -- sqlite3.IntegrityError, asyncpg's
-                # UniqueViolationError, pyodbc's IntegrityError -- and naming them here would make
-                # this module import-aware of every driver and silently stop covering a backend added
-                # later. Anything that is NOT an integrity violation re-raises untouched.
-                mro = "".join(t.__name__ for t in type(exc).__mro__)
-                if "Integrity" not in mro and "UniqueViolation" not in mro:
-                    raise
-                await self._directory_reject_audit(
-                    principal.username, "oidc", "federated_subject_already_bound"
-                )
-                return LoginOutcome(
-                    ok=False,
-                    error="federated sign-in failed",
-                    reason="federated_subject_already_bound",
-                )
-            # BACKLOG #1248. Binding an external identity decides WHO MAY SIGN IN as this account
-            # from now on, so it is a privilege change and gets the same two records the role
-            # resync below emits: an audit row, and an out-of-band notice to the account holder
-            # (ASVS 6.3.7). Before this it was the only silent write in the method.
-            await self._audit(
-                "auth.federated_subject_bound",
-                actor=user.username,
-                detail=_json({"issuer": federated_subject[0], "subject": federated_subject[1]}),
-                client=client,
+            reason = (
+                FEDERATED_SUBJECT_NOT_BOUND if holder is None else "federated_subject_already_bound"
             )
-            # THE NOTICE CARRIES THE ISSUER AND NOT THE SUBJECT, deliberately. The audit row needs
-            # the exact ``sub`` so an operator can tell two bindings apart; the account holder needs
-            # to know WHICH PROVIDER was linked, and an opaque identifier in an email tells them
-            # nothing while putting it somewhere less protected than the audit store.
-            await self._notify_security(
-                FEDERATED_IDENTITY_BOUND,
-                username=user.username,
-                email=user.notify_email,
-                client=client,
-                detail={"issuer": federated_subject[0]},
-            )
+            await self._directory_reject_audit(principal.username, "oidc", reason)
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
@@ -5169,8 +5186,10 @@ class AuthService:
         The account keeps ``auth_provider='ad'``. A federated account is an AD row carrying an extra
         pair, so a NULL pair is exactly the state every AD account is in before its first federated
         login: a coherent directory account, still swept by :meth:`reconcile_directory_sessions`.
-        The next federated login for it binds whatever subject then presents, which is what an
-        operator unbinding it wants.
+        A federated login presenting the old subject afterwards is refused as unbound (ADR 0184
+        AC-4), and so is any other: only :meth:`bind_federated_subject` gives the account a subject
+        again. **Until BACKLOG #1143 this said the next federated login binds whatever subject then
+        presents.** That was true, and it was why no unbind caller could ship before the refusal.
 
         The store clears the pair and revokes the sessions in one transaction, so a session issued
         under the old binding cannot outlive it. The audit row carries the prior pair and the
@@ -5207,6 +5226,113 @@ class AuthService:
             ),
         )
         return outcome.sessions_revoked
+
+    async def bind_federated_subject(
+        self, user_id: str, subject: str, *, actor: str
+    ) -> FederatedBinding:
+        """Admin: bind an account to a federated ``sub`` under the configured issuer, or rebind it
+        to a new one (BACKLOG #1143 / #295, ADR 0184).
+
+        **This is the only path that creates a federated binding.** Owner ruling 2026-09-06, recorded
+        in ADR 0184: a federated login never binds, and an unbound login is refused (AC-4).
+
+        The issuer is the configured ``[auth].oidc_issuer`` and nothing else. The claims ladder
+        refuses any token whose ``iss`` differs from it, so a binding under another issuer could never
+        be presented; taking the issuer from the caller would only add a way to write a dead one.
+
+        Refuses, as :class:`ValueError` with an operator-facing message: no configured issuer, an
+        unknown user, a non-directory account (ADR 0184 part 3), and a pair the account already
+        holds -- a no-op should not sign anybody out. Refuses as :class:`FederatedSubjectHeld` when a
+        different account holds the pair.
+
+        **EVERY BIND CLEARS FIRST, THEN BINDS.** The clear is the unbind's own transaction, so the prior
+        pair and every live session of the account go together and the audit row names the pair that
+        transaction cleared. On an unbound account the clear writes nothing and revokes nothing, so a
+        first bind revokes no session: it adds a way in and withdraws none. On a rebind the account is
+        unbound between the two writes, and a federated login in that gap is refused rather than
+        admitted. If the bind is then refused because another account took the pair in the gap, the
+        account is left unbound, and the error says so.
+
+        Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
+        actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).
+        """
+        issuer = self._settings.oidc_issuer
+        if not issuer:
+            raise ValueError("no OIDC issuer is configured ([auth].oidc_issuer)")
+        # The pair is exact-matched against the verified token, so a stray space or a control
+        # character makes a binding nobody can ever present. Refused here rather than stored dead.
+        if not subject or subject != subject.strip() or not subject.isprintable():
+            raise ValueError("the subject must be the IdP's exact sub, with no surrounding spaces")
+        user = await self._store.get_user(user_id)
+        if user is None:
+            raise ValueError("no such user")
+        if user.auth_provider != AuthProvider.AD.value:
+            raise ValueError("only a directory (AD) account can take a federated binding")
+        if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
+            raise ValueError("the account is already bound to that identity")
+        holder = await self._store.get_user_by_federated_subject(issuer, subject)
+        if holder is not None and holder.id != user_id:
+            raise FederatedSubjectHeld(
+                "that identity is already bound to another account; unbind it there first"
+            )
+        # ALWAYS THROUGH THE CLEAR, and the transaction's own answer decides bind versus rebind -- not
+        # the `user` read above. The clear writes nothing and revokes nothing on an unbound account,
+        # so a first bind costs one statement. Deciding from the earlier read would let a binding
+        # another administrator wrote in between be overwritten with its sessions left live.
+        cleared = await self._store.clear_user_federated_subject(user_id)
+        if cleared is None:
+            raise ValueError("no such user")
+        previous_issuer, previous_subject = cleared.issuer, cleared.subject
+        revoked = cleared.sessions_revoked
+        rebind = previous_issuer is not None or previous_subject is not None
+        try:
+            await self._store.set_user_federated_subject(user_id, issuer, subject)
+        except Exception as exc:
+            # `ux_users_federated_subject` refused it: another account took the pair after the read
+            # above. Rendered as the same refusal the sequential check gives; anything else re-raises.
+            if not _is_integrity_refusal(exc):
+                raise
+            suffix = "; the account's previous binding was removed and it is now unbound"
+            raise FederatedSubjectHeld(
+                "that identity is already bound to another account" + (suffix if rebind else "")
+            ) from exc
+        detail: dict[str, object] = {
+            "user_id": user_id,
+            "username": user.username,
+            "issuer": issuer,
+            "subject": subject,
+        }
+        if rebind:
+            detail.update(
+                {
+                    "previous_issuer": previous_issuer,
+                    "previous_subject": previous_subject,
+                    "sessions_revoked": revoked,
+                }
+            )
+        await self._audit(
+            "auth.federated_subject_rebound" if rebind else "auth.federated_subject_bound",
+            actor=actor,
+            detail=_json(detail),
+        )
+        # BACKLOG #1248. Binding an external identity decides WHO MAY SIGN IN as this account, so the
+        # holder hears of it out of band (ASVS 6.3.7). THE NOTICE CARRIES THE ISSUER AND NOT THE
+        # SUBJECT: the audit row needs the exact ``sub`` to tell two bindings apart; the holder needs
+        # to know which provider was linked, and an opaque identifier in an email tells them nothing
+        # while putting it somewhere less protected than the audit store.
+        await self._notify_security(
+            FEDERATED_IDENTITY_BOUND,
+            username=user.username,
+            email=user.notify_email,
+            detail={"issuer": issuer},
+        )
+        return FederatedBinding(
+            issuer=issuer,
+            subject=subject,
+            previous_issuer=previous_issuer,
+            previous_subject=previous_subject,
+            sessions_revoked=revoked,
+        )
 
     async def set_channel_scope(
         self, user_id: str, channels: Sequence[str] | None, *, actor: str

@@ -143,6 +143,17 @@ class RolesUpdateRequest(RequestModel):
     roles: list[RoleId] = Field(max_length=64)
 
 
+class FederatedIdentityRequest(RequestModel):
+    """``PUT /users/{user_id}/federated-identity``: the IdP ``sub`` to bind (BACKLOG #1143).
+
+    No issuer field: the service binds under the configured ``[auth].oidc_issuer``, the only issuer
+    whose tokens the claims ladder accepts. 255 is OpenID Connect Core's own ceiling on ``sub``, and
+    fits the narrowest backend column (SQL Server ``NVARCHAR(256)``).
+    """
+
+    subject: str = Field(min_length=1, max_length=255)
+
+
 class PasswordChangeRequest(RequestModel):
     current_password: str = Field(max_length=_PASSWORD_MAX)
     new_password: str = Field(max_length=_PASSWORD_MAX)

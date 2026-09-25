@@ -1261,10 +1261,11 @@ class UserRecord:
     totp_enrolled_at: float | None = None
     # Federated-account identity (BACKLOG #1015, ADR 0142): the verified OIDC ``(issuer, sub)`` this
     # AD-backed account's federated identity is PINNED to. Non-reassignable, unlike the display username.
-    # The account is still resolved by its username; this binding only refuses a login whose username
-    # resolves here but carries a different subject. NULL on a local account and on an AD account that
-    # has never completed a federated login. Set on the first federated login and enforced on every
-    # subsequent one, so a reassigned username cannot hand the account to a new subject.
+    # Since BACKLOG #1143 (ADR 0184) a federated login SELECTS its account by this pair, before any
+    # username is read, and an unbound pair is refused. NULL on a local account and on an AD account
+    # nobody has bound. Written only by the administrative bind (``AuthService.bind_federated_subject``),
+    # never by a login. Until #1143 the account was resolved by its username, this pair only vetoed a
+    # mismatch, and it was set on the account's first federated login.
     oidc_issuer: str | None = None
     oidc_subject: str | None = None
     # THE DIRECTORY'S IMMUTABLE IDENTIFIER FOR THIS ACCOUNT (BACKLOG #1471): the normalised AD
@@ -10314,9 +10315,8 @@ class MessageStore:
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None
     ) -> None:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the first
-        federated login so a later login carrying a different ``sub`` for a reassigned username is
-        refused rather than handed the prior subject's account."""
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Written only by the
+        administrative bind since BACKLOG #1143; see :meth:`AuthStore.set_user_federated_subject`."""
         now = time.time() if now is None else now
         # _writer_txn, not a bare lock: ux_users_federated_subject refusing this UPDATE is EXPECTED
         # (the #1256 race loser), and the unwind rolls back the transaction the refusal would

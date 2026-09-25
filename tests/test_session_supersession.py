@@ -19,6 +19,7 @@ import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
+from uuid import uuid4
 
 import pytest
 
@@ -49,7 +50,9 @@ async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
 
 
 class _FakeLdap:
-    def resolve_principal(self, username: str) -> AdPrincipal | None:
+    def resolve_principal(
+        self, username: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
         return _PRINCIPAL if username == "jdoe" else None
 
 
@@ -269,12 +272,18 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
     # AD mirror row and the mint all run for real, so the supersession is reached the way it is live.
     service = await _service(store, **_oidc_settings())
     await service.set_ad_group_map([("cn=mf-ops,dc=x", Role.OPERATOR.value)], actor="admin")
+    # BACKLOG #1143 (ADR 0184): a federated login selects its account by the (issuer, sub) pair and
+    # never binds, so the account is bound through the admin path first. The refused case presents a
+    # subject nobody bound, which is what makes it fail since the claimed name no longer selects.
+    jdoe_id = uuid4().hex
+    await store.create_user(user_id=jdoe_id, username="jdoe", auth_provider="ad")
+    await service.bind_federated_subject(jdoe_id, "S-1-5-21-fed", actor="admin")
     prior = await _token(service)
 
     def _exchange(*_a: object, **_k: object) -> FederatedPrincipal:
         return FederatedPrincipal(
             username="jdoe" if ok else "stranger",
-            subject="S-1-5-21-fed",
+            subject="S-1-5-21-fed" if ok else "S-1-5-21-stranger",
             issuer="https://idp.example",
             amr=("pwd", "mfa"),
             acr=None,

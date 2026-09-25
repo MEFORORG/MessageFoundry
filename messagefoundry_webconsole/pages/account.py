@@ -84,6 +84,11 @@ def login(
         "sso_mfa_required": (
             "Your identity provider did not confirm multi-factor authentication for this sign-in."
         ),
+        # BACKLOG #1143 (ADR 0184 AC-4): the IdP identity is not bound to an account yet.
+        "oidc_not_linked": (
+            "Your identity provider sign-in is not linked to an account yet."
+            " Ask an administrator to link it."
+        ),
     }
     banner = el("p", notes.get(error or "", ""), class_="banner") if error else Markup("")
     # NO PROVIDER SELECTOR. The directory simple-bind login pathway is retired (BACKLOG #1137,
