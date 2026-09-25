@@ -58,7 +58,8 @@ class ChainFinding:
 
     ``insecure`` is ``True`` for a definite finding and ``False`` for an indeterminate one. ``sids``
     names the Windows principals the finding is about, so the fix text can remove them. ``owner``
-    marks a finding about who owns the object rather than about a grant."""
+    marks a finding about who owns the object rather than about a grant. ``writable`` marks a POSIX
+    finding about group or other write bits, so its fix is the chmod alone and never a chown."""
 
     path: str
     kind: str
@@ -66,6 +67,7 @@ class ChainFinding:
     reason: str
     sids: tuple[str, ...] = ()
     owner: bool = False
+    writable: bool = False
 
 
 @dataclass(frozen=True)
@@ -580,7 +582,11 @@ def posix_path_verdict(
         if st.uid not in trusted:
             findings.append(
                 ChainFinding(
-                    obj, kind, True, f"it is owned by uid {st.uid}, not root or the engine"
+                    obj,
+                    kind,
+                    True,
+                    f"it is owned by uid {st.uid}, not root or the engine",
+                    owner=True,
                 )
             )
         mounted = fstype_fn(obj)
@@ -634,7 +640,9 @@ def posix_path_verdict(
             missing = exc
         sticky = bool(cur_st.mode & stat.S_ISVTX)
         if cur_st.mode & 0o022 and not sticky:
-            findings.append(ChainFinding(cur, DIRECTORY, True, "group or others can write to it"))
+            findings.append(
+                ChainFinding(cur, DIRECTORY, True, "group or others can write to it", writable=True)
+            )
         elif (
             cur_st.mode & 0o022
             and child_st is not None
@@ -651,6 +659,7 @@ def posix_path_verdict(
                     True,
                     f"it is owned by uid {child_st.uid}, not root or the engine, and sits in "
                     f"'{cur}', which others can write to",
+                    owner=True,
                 )
             )
         if child_st is None:
@@ -687,7 +696,9 @@ def posix_path_verdict(
         elif not stat.S_ISREG(child_st.mode):
             findings.append(ChainFinding(child, FILE, True, "it is not a regular file"))
         elif child_st.mode & 0o022:
-            findings.append(ChainFinding(child, FILE, True, "group or others can write to it"))
+            findings.append(
+                ChainFinding(child, FILE, True, "group or others can write to it", writable=True)
+            )
         break
     else:
         # The components ran out on a directory: the anchor is not a file.

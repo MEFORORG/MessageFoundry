@@ -536,11 +536,12 @@ def _ps_quote(text: str) -> str:
 
 
 def _path_fix(verdict: AnchorVerdict) -> list[str]:
-    """The fix, as commands, for every insecure object. The message must carry its own fix: the
-    document the file arm's message cites ships in neither a checkout nor a wheel.
+    """The fix, as commands, for each insecure finding that a command can fix. The message must
+    carry its own fix: the document the file arm's message cites ships in neither a checkout nor a
+    wheel.
 
-    Every command is narrow. It removes the grants the check named, or hands ownership to
-    Administrators or root, and leaves every other entry alone. A blanket reset such as
+    Every command is narrow. It removes the grants or write bits the check named, or hands
+    ownership to Administrators or root, and leaves every other entry alone. A blanket reset such as
     ``/inheritance:r /grant:r`` would strip the engine's own modify grant from its data folder,
     or the user's rights from a profile folder."""
     check = verdict.path_check
@@ -568,17 +569,28 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
                 lines.append(f"  icacls {q} /setowner '*S-1-5-32-544'")
         lines.append("Then read each one back with: icacls <path>")
         return lines
-    lines = [
-        move + "can change, such as a root-owned 755 folder like /etc/messagefoundry/. Or, for "
-        "each object named above:"
-    ]
-    for obj, kind in objects.items():
+    # Each finding gets only its own command. A mode finding gets the chmod that drops the group and
+    # other write bits, never a chown: the object may be the engine's own data folder, such as the
+    # container's /config, and a chown to root would take it away from the engine.
+    #
+    # An owner finding gets a chown to root, the owner an anchor's folder wants: the engine only
+    # reads an anchor. It names no group, because root:root would also take the group, and with it
+    # any access the engine holds through that group. The finding says the account the check ran
+    # as is not the owner, and the message says to run the check as the service account, so
+    # handing ownership to root takes nothing from the engine.
+    #
+    # Always -h: on a link it re-owns the link and not its target, and on anything else it acts
+    # the same. The owner the finding names can swap its entry for a link before root runs this.
+    cmds: list[str] = []
+    for obj in objects:
         q = shlex.quote(obj)
-        if kind == LINK:
-            lines.append(f"  chown -h root:root {q}")  # -h: the link itself, not its target
-        else:
-            lines.append(f"  chown root:root {q} && chmod go-w {q}")
-    return lines
+        here = [f for f in bad if f.path == obj]
+        if any(f.owner for f in here):
+            cmds.append(f"  chown -h root {q}")
+        if any(f.writable for f in here):
+            cmds.append(f"  chmod go-w {q}")
+    lead = move + "can change, such as a root-owned 755 folder like /etc/messagefoundry/."
+    return [lead + " Or, to fix it in place:", *cmds] if cmds else [lead]
 
 
 def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:

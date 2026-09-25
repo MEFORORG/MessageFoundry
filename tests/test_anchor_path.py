@@ -889,14 +889,45 @@ def _refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: ap.PathVe
 
 
 def test_posix_fix_text_names_each_object(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    folder = ap.ChainFinding("/srv/it's", DIRECTORY, True, "group or others can write to it")
-    link = ap.ChainFinding("/tmp/ca.pem", LINK, True, "it is owned by uid 1000")
+    folder = ap.ChainFinding(
+        "/srv/it's", DIRECTORY, True, "group or others can write to it", writable=True
+    )
+    link = ap.ChainFinding("/tmp/ca.pem", LINK, True, "it is owned by uid 1000", owner=True)
     text = _refusal(tmp_path, monkeypatch, ap.PathVerdict(False, (folder, link), "posix", "uid 7"))
     q = shlex.quote("/srv/it's")
-    assert f"chown root:root {q} && chmod go-w {q}" in text
+    # Each finding gets its own command: the folder's is about write bits, so no chown.
+    assert f"  chmod go-w {q}" in text
+    assert not [line for line in text.splitlines() if "chown" in line and q in line]
     # A link is re-owned with -h, so the command acts on the link and not on what it points at.
-    assert "chown -h root:root /tmp/ca.pem" in text and "chmod go-w /tmp/ca.pem" not in text
+    assert "  chown -h root /tmp/ca.pem" in text and "chmod go-w /tmp/ca.pem" not in text
     assert "account it ran as (uid 7)" in text
+
+
+def test_posix_mode_only_finding_on_the_engines_folder_suggests_no_chown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The container's ``/config`` belongs to the engine. Made group-writable, it earns a mode
+    finding and nothing else, so the fix is the chmod alone. A chown to root would take the
+    engine's own data folder away from it. Red under: printing a chown for every object."""
+    table = {"/config": (10001, stat.S_IFDIR | 0o775), "/config/ca.pem": (10001, F644)}
+    v = _posix("/config/ca.pem", table, euid=10001)
+    assert [(f.path, f.owner) for f in v.findings if f.insecure] == [("/config", False)]
+    text = _refusal(tmp_path, monkeypatch, v)
+    assert "  chmod go-w /config" in text
+    assert "chown" not in text
+
+
+def test_posix_owner_finding_suggests_a_chown_that_keeps_the_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An owner finding hands the object to root and changes nothing else. ``root:root`` would
+    also take the group, and with it any access the engine held through that group."""
+    table = {"/srv": (0, D755), "/srv/ca": (2000, D755), "/srv/ca/a.pem": (0, F644)}
+    v = _posix("/srv/ca/a.pem", table)
+    assert [(f.path, f.owner) for f in v.findings if f.insecure] == [("/srv/ca", True)]
+    text = _refusal(tmp_path, monkeypatch, v)
+    assert "  chown -h root /srv/ca" in text
+    assert "root:root" not in text and "chmod" not in text
 
 
 def test_windows_fix_text_for_an_owner_and_a_link(

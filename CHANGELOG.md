@@ -112,8 +112,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `mefor verify federation` as the service account. Some paths the engine cannot judge: an unreadable folder, a network
   share or mapped drive, a FAT volume, or a Linux mount other than ext2/3/4, xfs, btrfs, tmpfs or
   overlay. They write a `path_indeterminate` row and a warning, and the engine still starts. The
-  file check still runs beside the path check. **These placements started under 0.4.0 and now
-  refuse:**
+  file check still runs beside the path check. **These placements, at least, started under 0.4.0
+  and now refuse:**
   - a Windows anchor whose own permissions are locked, in a new folder under `C:\Users\Public`;
   - an anchor under a folder where a named account or local group can delete or rename entries.
     0.4.0 caught only broad groups. One Windows 11 host's `%TEMP%` refuses this way;
