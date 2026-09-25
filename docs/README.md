@@ -73,7 +73,7 @@ catalog, and **[../CHANGELOG.md](../CHANGELOG.md)**, which is authoritative for 
 | [DEPLOY-SERVER-DB.md](DEPLOY-SERVER-DB.md) | Store setup on a real database server. |
 | [ADOPTER-CI.md](ADOPTER-CI.md) | CI for **your config repo** — and honestly, what it does not prove. Not the engine's CI. |
 | [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) | Operator notes for one hardening phase; §4–§5 are the living crypto and comms inventories. |
-| [AI.md](AI.md) | How the shipped AI assistant is governed: modes, data scopes, RBAC, the PHI guarantee. |
+| [AI.md](AI.md) | How the shipped AI assistant is governed: modes, data scopes, RBAC, and what the assistant sends versus what the engine checks. |
 | [DICOM.md](DICOM.md) · [HL7-VALIDATION.md](HL7-VALIDATION.md) · [CODESETS.md](CODESETS.md) | Per-domain references. |
 
 ## Developers building on the engine

@@ -1094,7 +1094,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `remote_dir` | both | — (required) | remote directory to poll / upload into |
 | `username` | both | — (unset) | login user (unset = anonymous, FTP only) |
 | `password` | both | — (unset) | login password — a **secret**, via `env()`. Refused over plain `ftp`. |
-| `private_key` | both | — | **`Sftp` only** — PEM private-key text or a path; a **secret**, via `env()` |
+| `private_key` | both | — | **`Sftp` only** — the **text** of an **RSA** private key, not a path; a **secret**, via `env()`. See *RSA key text only* below the table. |
 | `key_password` | both | — | **`Sftp` only** — passphrase for an encrypted `private_key`; a **secret**, via `env()` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP |
@@ -1111,6 +1111,17 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber) |
 | `encoding` | out | `utf-8` | charset the payload is encoded with before upload (the **source** hands the retrieved bytes to the pipeline and never uses it) |
 
+- **RSA key text only.** The connector loads `private_key` with paramiko's `RSAKey` and nothing else.
+  Two encodings of an RSA key load: PKCS#1, whose PEM header names `RSA PRIVATE KEY`, and the
+  OpenSSH format, whose header names `OPENSSH PRIVATE KEY`. At least these are refused:
+  - an Ed25519 or ECDSA key, in either encoding;
+  - an RSA key in PKCS#8 form, whose header names only `PRIVATE KEY`;
+  - a file path, which is read as key text.
+
+  Building the connection does not parse the key. The error comes on the first connect,
+  before any network traffic, as a permanent `SFTP connection rejected: ...` error. Its wording can
+  mislead: an Ed25519 key in OpenSSH form reports `unpack requires a buffer of 4 bytes`. Measured
+  against paramiko 5.0.0, the locked version.
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).
@@ -2553,6 +2564,33 @@ auto_start = false        # deployed, but started at runtime, not at boot
 > `deployed=false` **wins over** `auto_start`: a not-deployed connection is never built, so its `auto_start`
 > value is moot. To bring a not-deployed connection online, set `deployed=true` (and supply any `env()`
 > values it needs), then reload — **no other change**.
+
+## Inline fast path — `inline` (code-first only, ADR 0057)
+
+**Leave `inline` off.** It is a per-inbound boolean on `inbound(...)`, default `False`.
+[ADR 0057](adr/0057-inline-step-a-fast-path.md) records that it ships default-off permanently. It cut
+commits per message as designed, and throughput moved by less than the measurement noise. It is
+documented here so a reader who meets it in code knows what it does.
+
+When it is `True`, the router worker runs the route and the transform for an eligible message itself.
+It then commits one handoff straight from the ingress stage to the outbound stage, skipping the routed
+stage. An inbound is eligible only when all of these hold:
+
+- the whole graph declares no live lookup (the database or FHIR lookups behind `db_lookup` and
+  `fhir_lookup`);
+- its `ack_after` resolves to `ingest`;
+- it is not a `Loopback()` inbound.
+
+Each message then faces its own checks. At least, the router must pick exactly one handler, and that
+handler must return one or more plain `Send`s to deployed outbound connections. A message that fails a check takes the
+ordinary staged path, which may run its transform a second time.
+
+```python
+inbound("IB_LAB_ORU", MLLP(port=2580), router="lab_router", inline=True)  # not recommended
+```
+
+**`connections.toml` has no `inline` key.** A `[[inbound]]` table that carries one fails to load with
+`unknown key(s) inline`, whether the value is `true` or `false`.
 
 ## Pipeline claim mode — `[pipeline].claim_mode` (default `pooled`, ADR 0066)
 
