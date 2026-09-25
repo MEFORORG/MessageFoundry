@@ -55,7 +55,7 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     # required-but-unenrolled admin, and the no-lockout enroll path) is covered by the dedicated MFA
     # tests below, which pass require_mfa explicitly.
     service = AuthService(engine.store, settings or AuthSettings(require_mfa=False))
-    await service.initialize()  # seeds roles + a bootstrap admin we don't use here
+    await service.initialize()  # seeds the built-in roles; it creates no account (ADR 0183)
     return service
 
 
@@ -1989,24 +1989,25 @@ async def test_no_deadline_is_stated_on_login_when_none_is_owed(engine: Engine) 
         assert blocked.json()["detail"] == "password change required"
 
 
-async def test_the_unclaimed_bootstrap_admin_is_told_no_credential_deadline(engine: Engine) -> None:
-    # WP-3 can retire the never-claimed bootstrap ACCOUNT before its CREDENTIAL bound, so the route
-    # layer states nothing for it rather than a later instant than the real one. bootstrap-admin.txt
-    # already carries the earlier of the two.
+async def test_an_account_named_admin_is_told_its_credential_deadline(engine: Engine) -> None:
+    # The route layer used to state NO deadline for a never-claimed account named ``admin``, because
+    # that was the first-run bootstrap account and WP-3 could retire it before its credential bound.
+    # ADR 0183 retired the account and the sweep, so the name means nothing now. An admin-issued
+    # credential on an account an operator happens to name ``admin`` is stated like any other; the
+    # old exemption would hide the deadline from exactly that holder.
     service = AuthService(
-        engine.store,
-        AuthSettings(
-            require_mfa=False, bootstrap_expiry_hours=24, initial_password_expiry_hours=72
-        ),
+        engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=72)
     )
-    boot = await service.initialize()
-    assert boot is not None
+    await service.initialize()
+    await service.create_local_user(
+        username="admin", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    )
     async with _client(engine, service) as c:
-        login = await _login(c, boot.username, boot.password)
+        login = await _login(c, "admin")
         assert login.json()["must_change_password"] is True
-        assert login.json()["credential_expires_at"] is None
+        assert login.json()["credential_expires_at"] is not None
         blocked = await c.get("/users", headers=_auth(login.json()["token"]))
-        assert blocked.json()["detail"] == "password change required"
+        assert blocked.json()["detail"].startswith("password change required; the temporary")
 
 
 async def test_a_deadline_too_far_out_to_render_still_refuses_with_a_403(engine: Engine) -> None:

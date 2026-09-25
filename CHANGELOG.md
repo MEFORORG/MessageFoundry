@@ -13,8 +13,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   stored stamp the login gate checks. It is `null` in at least these cases: no change is owed, or
   `[auth].initial_password_expiry_hours` is `0` or less. `GET /users` always returns `null` here.
   That route needs only `users:read`, and a list of live temporary passwords is a target list. The
-  never-claimed bootstrap account also gets `null`, because `bootstrap-admin.txt` already states its
-  earlier deadline. The web console's create-user form now states how many hours the password
+  web console's create-user form now states how many hours the password
   lasts. Its user page and forced change-password page state the time, and so does the IDE's
   must-change warning. (`BACKLOG #1141`)
 - **`messagefoundry admin-set-notify-email` sets a missing notification address on an enabled
@@ -35,6 +34,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING — the engine no longer creates an account on its own.** A `serve` on a store with no
+  users used to create an enabled Administrator named `admin` and write its one-time password to
+  `bootstrap-admin.txt` beside the store. It now creates no account and writes no file. Create the
+  first Administrator at the host with `messagefoundry provision-admin --username <name> --email
+  <address>`, before the first start or after one that was refused. At the shipped posture a start
+  with no enabled Administrator is refused, and the refusal names that command. A start refused
+  because no Administrator has an address now names `admin-set-notify-email` instead. Under
+  `[security].enforcement = "warn"`, or with security notices off or waived in writing, the engine
+  starts and routes HL7, logs one warning naming `provision-admin`, and nobody can sign in until it
+  runs. The WP-3 lifecycle that disabled the first-run account went with it, and so did its expiry
+  reminder. An account an operator names `admin` is now an ordinary account, so it gets a
+  `credential_expires_at` like any other. `provision-admin` now refuses before it asks for a password
+  when an enabled Administrator already exists or an argument is out of range. It opens the store
+  only after the password passes the policy, so a refusal leaves no new SQLite store file behind.
+  Its `--username`, `--email` and `--display-name` are limited to 256 characters, as in the web
+  console.
+  `[auth].bootstrap_expiry_hours` and `[auth].bootstrap_warn_hours` still load but do nothing now; a
+  later change removes them. **Migration:** run `provision-admin` once at the host, as the account
+  that installs the service, against the store and service config the service uses. ADR 0183
+  Amendment A, Wave 2. (`BACKLOG #1136`)
 - **BREAKING — the config loader refuses a connection name that does not match
   `^[A-Za-z][A-Za-z0-9_-]{0,255}$`.** In 0.4.0 such a name still loaded and ran, and only the API
   refused it. Now a code-first `inbound()` or `outbound()` call, or a `connections.toml` entry,

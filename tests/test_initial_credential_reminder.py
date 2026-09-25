@@ -48,7 +48,7 @@ class _RecordingSink(LoggingAlertSink):
 async def _service(hours: int = 72) -> tuple[MessageStore, AuthService]:
     store = await MessageStore.open(":memory:")
     service = AuthService(store, AuthSettings(initial_password_expiry_hours=hours))
-    await service.initialize()  # the never-claimed bootstrap admin exists from here on
+    await service.initialize()  # seeds the built-in roles; it creates no account (ADR 0183)
     await store.upsert_role(role_id="viewer", display_name="Viewer")
     return store, service
 
@@ -170,8 +170,7 @@ async def test_a_claimed_or_disabled_account_gets_no_reminder() -> None:
         await _remind_expiring_initial_credentials(
             service, sink, lead=24 * _HOUR, warned={}, now=now
         )
-        # Only erin. The never-claimed bootstrap "admin" is in the same window too, and is left to
-        # its own reminder, which states the EARLIER of its two bounds.
+        # Only erin: carol claimed hers and the third account is disabled.
         assert [e["name"] for e in sink.events] == ["user:erin"]
     finally:
         await store.close()
