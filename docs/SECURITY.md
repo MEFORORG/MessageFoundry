@@ -1833,8 +1833,8 @@ is identified by, and a renamed account's stored username is refreshed from the 
 pass. That is why *renamed* is absent from the ambiguity list below: it used to sit there, and reading a
 rename as an absence revoked the renamed person's sessions on every interval. A directory that returns
 no readable `objectGUID` still probes by name and keeps that ambiguity (BACKLOG #1471, #1532). Such a
-row cannot take a federated binding: the bind refuses it, so every binding made since BACKLOG #1143
-slice C sits on a row probed by its id (ADR 0184 AC-5).
+row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
+BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5).
 
 Three safety properties, because the lookup still returns one indistinguishable "not found" for
 *disabled*, *deleted*, *moved out of the search base* and *the search base was never right*:

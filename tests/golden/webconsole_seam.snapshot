@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-500b98c2d593db80
+4ce97d69013927db
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -176,7 +176,7 @@ messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, u
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
 messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
 messagefoundry.api.auth_models.FederatedIdentityRequest: subject
-messagefoundry.api.auth_models.FederatedIdentityView: auth_provider, bind_issuer, issuer, subject, user_id, username
+messagefoundry.api.auth_models.FederatedIdentityView: auth_provider, bind_issuer, has_directory_object_id, issuer, subject, user_id, username
 messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
 messagefoundry.api.auth_models.NotifyEmailRequest: email
 messagefoundry.api.auth_models.PasswordChangeRequest: current_password, new_password

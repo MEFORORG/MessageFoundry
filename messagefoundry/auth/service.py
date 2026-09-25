@@ -508,12 +508,19 @@ class DirectoryObjectIdMissing(ValueError):
     route answers 400 with the message, and the console screen shows it. ``reason`` is the
     closed-set code the audit row carries.
 
-    **WHY A ROW WITH NO ID MAY NOT TAKE A BINDING.** Such a row is re-resolved by its USERNAME, at
-    login and on every ``reconcile_directory_sessions`` pass, because the engine has no other key for
-    it. A directory may reissue a freed name to a different person. The bound row would then take
-    the new person's groups, and the pair's holder would sign in with them. AC-5 says a bound row is
-    never re-resolved by name. Refusing the bind here makes that hold for every binding this method
-    writes, since the id is written at the row's creation and nothing clears it.
+    **WHY A ROW WITH NO ID MAY NOT TAKE A BINDING.** Such a row is re-resolved by its USERNAME, by
+    the federated login's re-resolve and on every ``reconcile_directory_sessions`` pass, because the
+    engine has no other key for it. A directory may reissue a freed name to a different person. The
+    bound row would then take the new person's groups, and the pair's holder would sign in with
+    them. AC-5 says a bound row is not re-resolved from its username in the reconciler.
+
+    **WHAT THE REFUSAL MAKES HOLD, AND WHAT IT DOES NOT.** Every binding the administrative bind
+    writes sits on a row carrying an id, and the id is written at the row's creation and never
+    cleared, so both re-resolves above ask by the id for it. It does not reach three things: a
+    binding written onto an id-less row before this refusal existed, which keeps its name-keyed
+    re-resolve (ADR 0184, slice C status line); a direct ``set_user_federated_subject`` call, which
+    checks no id, and whose one caller is the bind; and the step-up re-proof, which binds by name.
+    **The cost:** on a directory that returns no readable ``objectGUID``, no account can be bound.
     """
 
     reason = DIRECTORY_OBJECT_ID_MISSING
@@ -5199,11 +5206,8 @@ class AuthService:
         different account holds the pair.
 
         **Refuses as :class:`DirectoryObjectIdMissing` an account with no ``directory_object_id``**,
-        and writes an ``auth.federated_bind_refused`` audit row naming the actor (BACKLOG
-        #1143 slice C). That is what makes ADR 0184 AC-5 hold by construction: a bound row always
-        carries the id, so login and the reconciler re-resolve it by the id and never by its name.
-        The cost is plain: on a directory that returns no readable ``objectGUID``, no account can be
-        bound, so nobody there can sign in through the IdP.
+        and writes an ``auth.federated_bind_refused`` audit row naming the actor (BACKLOG #1143
+        slice C). That class's docstring holds the reason, what it makes hold, and the cost.
 
         **EVERY BIND CLEARS FIRST, THEN BINDS.** The clear is the unbind's own transaction, so the prior
         pair and every live session of the account go together and the audit row names the pair that
@@ -5237,12 +5241,12 @@ class AuthService:
             raise ValueError("no such user")
         if user.auth_provider != AuthProvider.AD.value:
             raise ValueError("only a directory (AD) account can take a federated binding")
+        if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
+            raise ValueError("the account already holds that identity")
         if not user.directory_object_id:
-            # BACKLOG #1143 slice C (ADR 0184 AC-5). A row with no immutable directory id is
-            # re-resolved BY NAME, at login and by the reconciler, so a reissued name would hand this
-            # binding's holder the new person's groups. Refusing here means no binding this method
-            # writes can sit on such a row. Ordered before the no-op check, so a legacy binding on
-            # an id-less row cannot be re-pointed either; unbinding it stays open.
+            # BACKLOG #1143 slice C: see DirectoryObjectIdMissing. After the no-op check, so a
+            # legacy binding resubmitted as it stands gets the harmless answer above, while moving
+            # it to another pair is still refused. Unbinding it stays open.
             await self._audit(
                 "auth.federated_bind_refused",
                 actor=actor,
@@ -5258,14 +5262,13 @@ class AuthService:
             )
             raise DirectoryObjectIdMissing(
                 f"{DIRECTORY_OBJECT_ID_MISSING}: this account has no immutable directory identifier"
-                " (objectGUID), so it cannot take"
-                " a federated binding. It gets one only when it is created, by a Windows SSO"
-                " sign-in through a directory that returns a readable objectGUID. Make the"
-                " directory return objectGUID, remove this account, have the person sign in once"
-                " with Windows SSO, then bind the new account"
+                " (objectGUID), so it cannot take a federated binding, and it never gains one."
+                " Only a Windows SSO sign-in creates an account with one, through a directory that"
+                " returns a readable objectGUID. To link this person: make the directory return"
+                " objectGUID, turn Windows SSO on if it is off, remove this account, have the"
+                " person sign in once with Windows SSO, then bind the new account. Removing the"
+                " account discards its user_id and what is keyed on it"
             )
-        if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
-            raise ValueError("the account already holds that identity")
         holder = await self._store.get_user_by_federated_subject(issuer, subject)
         if holder is not None and holder.id != user_id:
             raise FederatedSubjectHeld(

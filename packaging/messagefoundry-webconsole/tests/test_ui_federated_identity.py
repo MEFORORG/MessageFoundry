@@ -146,6 +146,26 @@ async def test_a_local_account_is_offered_no_link_form(
     assert f'action="{_screen(local)}/link"' not in page.text
 
 
+async def test_an_account_with_no_directory_id_is_offered_no_link_form(
+    engine: Engine, boss: tuple[httpx.AsyncClient, AuthService]
+) -> None:
+    """BACKLOG #1143 slice C. The engine refuses the bind, so the form would spend a single-use
+    re-authentication on a certain refusal. THE CONTROL is the same page for an account that
+    carries an id, which offers the form. The POST still refuses in words, pinned in
+    ``test_each_link_refusal_is_shown_in_words_and_writes_nothing``."""
+    c, _service = boss
+    no_id = await _ad_account(engine, object_id=False)
+    page = await c.get(_screen(no_id))
+    assert page.status_code == 200
+    assert "This account cannot be linked. It has no immutable directory id" in page.text
+    assert f'action="{_screen(no_id)}/link"' not in page.text
+
+    with_id = await _ad_account(engine, "bsmith")
+    control = await c.get(_screen(with_id))
+    assert f'action="{_screen(with_id)}/link"' in control.text
+    assert "This account cannot be linked" not in control.text
+
+
 async def test_no_issuer_means_no_link_form_and_the_post_is_refused_in_words(
     engine: Engine,
 ) -> None:

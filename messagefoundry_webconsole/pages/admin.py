@@ -426,6 +426,16 @@ def _link_form(view: FederatedIdentityView, subject: str) -> Markup:
             "Linking needs [auth].oidc_issuer, and it is not set on this engine.",
             class_="muted",
         )
+    if not view.has_directory_object_id:
+        # BACKLOG #1143 slice C: the engine refuses this bind, so the form would only spend a
+        # single-use re-authentication on a certain refusal.
+        return el(
+            "p",
+            "This account cannot be linked. It has no immutable directory id (objectGUID), and it "
+            "never gains one. Only a Windows SSO sign-in through a directory that returns "
+            "objectGUID creates an account with one.",
+            class_="muted",
+        )
     return el(
         "form",
         *_shown_fields(view),

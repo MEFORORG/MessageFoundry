@@ -43,6 +43,7 @@ from tests.test_api_auth import (
     _login,
     _reauth,
 )
+from tests.test_auth_oidc_service import _CapturingNotifier
 
 ISSUER = "https://idp.example"
 ACTION = "admin_federated_identity"
@@ -64,20 +65,16 @@ async def _service(engine: Engine, **over: object) -> AuthService:
     return service
 
 
-async def _ad_account(
-    engine: Engine, username: str = "jdoe", *, object_id: str | None = "derived"
-) -> str:
+async def _ad_account(engine: Engine, username: str = "jdoe", *, object_id: bool = True) -> str:
     """A directory mirror row, as a Kerberos sign-in through a directory returning objectGUID
-    leaves it: unbound, and carrying its immutable id (BACKLOG #1143 slice C).
-
-    ``object_id=None`` (or ``""``) is the row a directory with no readable objectGUID leaves, which
-    cannot take a binding."""
+    leaves it: unbound, and carrying its immutable id (BACKLOG #1143 slice C). ``object_id=False``
+    is the row a directory with no readable objectGUID leaves, which cannot take a binding."""
     user_id = uuid4().hex
     await engine.store.create_user(
         user_id=user_id,
         username=username,
         auth_provider="ad",
-        directory_object_id=f"guid-{username}" if object_id == "derived" else object_id,
+        directory_object_id=f"guid-{username}" if object_id else None,
     )
     return user_id
 
@@ -308,16 +305,6 @@ async def test_bind_refusals(
 # --- BACKLOG #1143 slice C: a binding needs an immutable directory id (ADR 0184 AC-5) ---------------
 
 
-class _Notices:
-    """Captures security notices instead of emailing them."""
-
-    def __init__(self) -> None:
-        self.events: list[object] = []
-
-    async def notify(self, event: object) -> None:
-        self.events.append(event)
-
-
 @pytest.mark.parametrize("object_id", [None, ""], ids=["NULL", "empty"])
 async def test_the_service_refuses_a_row_with_no_directory_object_id(
     engine: Engine, object_id: str | None
@@ -328,14 +315,18 @@ async def test_the_service_refuses_a_row_with_no_directory_object_id(
     ``auth.federated_subject_*`` row, no revoked session, no notice to the holder. THE CONTROL is the
     last call: the same bind on a row that carries an id succeeds, so the refusal is keyed on the id
     and not on something the two rows share."""
-    notices = _Notices()
+    notices = _CapturingNotifier()
     service = AuthService(
         engine.store,
         AuthSettings(require_mfa=False, oidc_issuer=ISSUER),
-        security_notifier=notices,  # type: ignore[arg-type]
+        security_notifier=notices,
     )
     await service.initialize()
-    target = await _ad_account(engine, object_id=object_id)
+    # Written directly, so the empty string reaches the store as it is.
+    target = uuid4().hex
+    await engine.store.create_user(
+        user_id=target, username="jdoe", auth_provider="ad", directory_object_id=object_id
+    )
     await engine.store.create_session(
         token_hash="t-target", user_id=target, expires_at=9e9, now=1.0
     )
@@ -362,11 +353,13 @@ async def test_the_service_refuses_a_row_with_no_directory_object_id(
         "reason": DIRECTORY_OBJECT_ID_MISSING,
     }
 
-    # CONTROL: a row carrying an id binds, and is not audited as refused.
+    # CONTROL: a row carrying an id binds, is not audited as refused, and DOES notify -- so the
+    # empty capture above is the refusal's, not a notifier that was never wired.
     other = await _ad_account(engine, "bsmith")
     await service.bind_federated_subject(other, "S-1-b", actor="root")
     assert (await _pairs(engine, other))[other] == (ISSUER, "S-1-b")
     assert len(await _audit(engine, "auth.federated_bind_refused")) == 1
+    assert len(notices.events) == 1, "the control bind sent no notice, so the zero above is unarmed"
 
 
 async def test_a_legacy_binding_on_a_row_with_no_id_cannot_be_moved_but_can_be_removed(
@@ -374,21 +367,24 @@ async def test_a_legacy_binding_on_a_row_with_no_id_cannot_be_moved_but_can_be_r
 ) -> None:
     """The residual this slice leaves, pinned so it is a stated arm rather than an accident.
 
-    A binding written onto an id-less row BEFORE slice C is not refused at login: that would lock
-    its holder out on a directory with no readable objectGUID. Such a binding can only have come
-    from before this change, so it is PLANTED through the store. The bind refuses to re-point it
-    and leaves it and its sessions alone. The unbind still removes it, which is the operator's way
-    out of the name-keyed state."""
+    Slice C adds no login refusal for a binding written onto an id-less row BEFORE it: on a
+    directory with no readable objectGUID that would lock the holder out. Such a binding can only
+    have come from before this change, so it is PLANTED through the store. Moving it to another
+    pair is refused, and it and its sessions are left alone. Resubmitting it as it stands gets the
+    harmless no-op answer rather than advice to remove the account. The unbind still removes it,
+    which is the operator's way out of the name-keyed state."""
     service = await _service(engine)
-    target = await _ad_account(engine, object_id=None)
+    target = await _ad_account(engine, object_id=False)
     await engine.store.set_user_federated_subject(target, ISSUER, "S-1-legacy")
     await engine.store.create_session(
         token_hash="t-target", user_id=target, expires_at=9e9, now=1.0
     )
 
-    for subject in ("S-1-new", "S-1-legacy"):
-        with pytest.raises(DirectoryObjectIdMissing):
-            await service.bind_federated_subject(target, subject, actor="root")
+    with pytest.raises(DirectoryObjectIdMissing):
+        await service.bind_federated_subject(target, "S-1-new", actor="root")
+    with pytest.raises(ValueError, match="already holds that identity") as same:
+        await service.bind_federated_subject(target, "S-1-legacy", actor="root")
+    assert not isinstance(same.value, DirectoryObjectIdMissing)
     assert await _pairs(engine, target) == {target: (ISSUER, "S-1-legacy")}
     session = await engine.store.get_session("t-target")
     assert session is not None and session.revoked_at is None
@@ -402,7 +398,7 @@ async def test_the_route_refuses_a_row_with_no_directory_object_id(engine: Engin
     code and its remedy, and writes nothing. THE CONTROL is the same request, under a fresh grant,
     against a row that carries an id."""
     service = await _service(engine)
-    target = await _ad_account(engine, object_id=None)
+    target = await _ad_account(engine, object_id=False)
     control = await _ad_account(engine, "bsmith")
     async with _client(engine, service) as c:
         tok = await _admin(c, service)

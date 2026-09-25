@@ -703,8 +703,9 @@ async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id(
     that returns none. The id-less row refuses the bind. Then one pass: the bound row is probed by
     its id, and the only name-keyed probe is the unbound row's.
 
-    The planted control is the refusal itself: without it the second bind lands, and the pass then
-    probes a BOUND row by name.
+    The pass assertion is the one that discriminates: without the refusal the second bind lands,
+    and the pass then probes a BOUND row by name. So the refusal is caught rather than asserted
+    first, which lets that assertion be reached either way.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -725,18 +726,25 @@ async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id(
         assert nobody is not None and nobody.directory_object_id is None
 
         await service.bind_federated_subject(jdoe.id, "S-1-jdoe", actor="admin")
-        with pytest.raises(DirectoryObjectIdMissing):
+        refused = False
+        try:
             await service.bind_federated_subject(nobody.id, "S-1-nobody", actor="admin")
+        except DirectoryObjectIdMissing:
+            refused = True
 
         ldap.probe_keys.clear()
         await service.reconcile_directory_sessions()
 
         bound = {u.username for u in await store.list_users() if u.oidc_subject is not None}
-        assert bound == {"jdoe"}
+        # AC-5 ITSELF: no bound row was asked about by name.
+        assert [key for key in ldap.probe_keys if key[0] == "username" and key[1] in bound] == []
+        # CONTROL: the pass did probe by name -- the unbound id-less row -- so the check above had
+        # a name-keyed probe to find, and the bound row was probed by its id.
         assert sorted(ldap.probe_keys) == [
             ("object_id", _object_id_for("jdoe")),
             ("username", "nobody"),
         ]
+        assert refused and bound == {"jdoe"}
     finally:
         await store.close()
 
