@@ -339,8 +339,6 @@ _CONTEXTUAL_TOKENS = frozenset(
         "oidc_required_acr_values",
         "oidc_allowed_username_domains",
         "oidc_username_strip_domain",
-        # a time attribute x admin-population state that DENIES (disable + revoke + audit)
-        "bootstrap_expiry_hours",
         # DATA PLANE — the binding correction: these are pre-auth, IP-keyed ALLOW/DENY decisions too
         "source_ip_allowlist",
         "calling_ae_allowlist",
@@ -416,7 +414,6 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "ad_session_recheck_max_users", 200, "200 users"),
     ("auth", "ad_session_revoke_max", 5, "**5**"),
     ("auth", "ad_session_revoke_max_fraction", 0.34, "**0.34**"),
-    ("auth", "bootstrap_expiry_hours", 72, "72 h"),
     ("auth", "oidc_require_mfa_claim", True, "on"),
     # These three were documented but unpinned — precisely the defaults the trailing lanes plan to
     # move (#297's 8.3.2 route proposes an ADR-0080-style derived ad_session_recheck_seconds), so a
@@ -487,11 +484,6 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # trusts the IdP's certificate, not what the engine decides about a request it receives. A
         # certificate it rejects never yields an identity at all.
         "oidc_tls_crl_file",
-        # ASVS 6.4.5 arm 2: how long BEFORE the bootstrap deadline to start reminding an operator that
-        # the unclaimed first-run credential is about to be retired. Purely the timing of an advisory
-        # ALERT — no login, session or authorization outcome turns on it (contrast its sibling
-        # `bootstrap_expiry_hours`, which DISABLES the account and is therefore an inventoried input).
-        "bootstrap_warn_hours",
         # ASVS 3.7.3: destinations exempted from the "you are leaving this site" interstitial. It
         # decides whether the operator is SHOWN A NOTIFICATION before an outbound navigation — not
         # whether any request is authorized. No login, session, permission or authorization outcome

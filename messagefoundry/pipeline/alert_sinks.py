@@ -909,21 +909,6 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
-        # ASVS 6.4.5 arm 2: the UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline.
-        # The fixed label ("bootstrap-admin") stands in for "connection" so the realert throttle + subject
-        # keying + rule matching work uniformly; the payload carries only the ISO deadline + whole hours
-        # remaining (never the password or any secret — no PHI). The AuthService latch already collapses
-        # it to one emit per process; the (type, connection) throttle is a second belt.
-        self._emit(
-            {
-                "type": "bootstrap_admin_expiring",
-                "connection": name,
-                "expires_at": expires_at,
-                "hours_remaining": hours_remaining,
-            }
-        )
-
     def initial_credential_expiring(
         self, name: str, *, expires_at: str, hours_remaining: int
     ) -> None:
