@@ -730,11 +730,12 @@ def notify_address_page(
     for security notices while this instance sends them. So it drops the nav for ``minimal_nav``,
     which keeps Sign out. It only fills a missing address; an administrator changes one later.
 
-    ``suggested`` is the account's profile ``email`` (slice 2), shown as the input's starting value.
-    It is only a suggestion: nothing is written until the holder submits the form. The line under the
-    input says where it came from, so the holder checks it rather than clicking through.
-    ``from_directory`` picks the wording, since only a directory account's profile address is the
-    directory's ``mail``.
+    ``suggested`` is the account's profile ``email``, shown as the input's starting value. It is
+    only a suggestion: nothing is written until the holder submits the form. The line under the
+    input says where it came from, so the holder checks it rather than clicking through. It is tied
+    to the input with ``aria-describedby`` so a screen reader announces it, and a pre-filled input
+    is not autofocused, so a stray Enter cannot accept it unread. ``from_directory`` picks the
+    wording, since only a directory account's profile address came from the directory's ``mail``.
     """
     banner = el("p", error, class_="banner") if error else Markup("")
     intro = el(
@@ -745,10 +746,15 @@ def notify_address_page(
     )
     hint = Markup("")
     if suggested:
-        source = "your directory record" if from_directory else "your account record"
+        source = (
+            "the address your directory last gave for your account"
+            if from_directory
+            else "the address on your account record"
+        )
         hint = el(
             "p",
             f"Suggested from {source}. Change it if it is not yours.",
+            id="notify-address-hint",
             class_="muted",
         )
     form = el(
@@ -763,8 +769,9 @@ def notify_address_page(
                 autocomplete="email",
                 # el() escapes attribute values, so a stored address cannot break out of value="".
                 value=suggested or None,
+                aria_describedby="notify-address-hint" if suggested else None,
                 required=True,
-                autofocus=True,
+                autofocus=not suggested,
             ),
         ),
         hint,

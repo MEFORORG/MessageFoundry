@@ -17,6 +17,7 @@ from _ui_clients import PW, SAME_ORIGIN, cookie_login, provision
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Permission, Role
+from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.notifications import NOTIFY_EMAIL_SET, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -138,16 +139,21 @@ async def test_a_second_address_is_refused_out_loud(engine: Engine) -> None:
     assert user is not None and user.notify_email == ADDRESS
 
 
-# --- slice 2: the form suggests the profile address, and only a submit writes it -------------------
+# --- the form suggests the profile address, and only a submit writes it ---------------------------
 
 DIRECTORY_ADDRESS = "holder@example.org"
 SUGGESTED_LINE = "Change it if it is not yours."
 
 
 async def _set_count(engine: Engine) -> int:
-    return len(
-        [a for a in await engine.store.list_audit() if a["action"] == "auth.notify_email_set"]
-    )
+    # Filtered in the store, so no row falls outside a page of the whole log.
+    return len(await engine.store.list_audit(action="auth.notify_email_set", limit=1000))
+
+
+def _email_input(html: str) -> str:
+    """The ``<input name="email" ...>`` tag alone, so an assertion cannot match elsewhere."""
+    start = html.index('<input name="email"')
+    return html[start : html.index(">", start) + 1]
 
 
 async def test_the_form_suggests_the_profile_address_and_a_get_writes_nothing(
@@ -164,8 +170,12 @@ async def test_the_form_suggests_the_profile_address_and_a_get_writes_nothing(
         await cookie_login(c, "bare")
         page = await c.get(PAGE)
         assert page.status_code == 200
-        assert f'value="{DIRECTORY_ADDRESS}"' in page.text
-        assert "Suggested from your account record." in page.text
+        tag = _email_input(page.text)
+        assert f'value="{DIRECTORY_ADDRESS}"' in tag
+        # Announced with the input, and not focused, so a stray Enter cannot accept it unread.
+        assert 'aria-describedby="notify-address-hint"' in tag
+        assert "autofocus" not in tag
+        assert "Suggested from the address on your account record." in page.text
         assert SUGGESTED_LINE in page.text
 
         user = await engine.store.get_user(user_id)
@@ -195,46 +205,100 @@ async def test_the_form_is_empty_when_the_account_has_no_address(engine: Engine)
         await cookie_login(c, "bare")
         page = await c.get(PAGE)
     assert page.status_code == 200
-    assert 'name="email"' in page.text
-    assert "value=" not in page.text.split('name="email"', 1)[1].split(">", 1)[0]
+    tag = _email_input(page.text)
+    assert "value=" not in tag
+    assert "autofocus" in tag
     assert SUGGESTED_LINE not in page.text
 
 
-async def test_a_blank_profile_address_is_not_suggested(engine: Engine) -> None:
+async def test_a_profile_address_the_submit_would_refuse_is_not_suggested(engine: Engine) -> None:
+    """Blank, a list, no dot in the domain, or over the POST's length bound: offer nothing."""
     service = await _service(engine, notifier=_FakeNotifier())
     user_id = await provision(service, "bare", [Role.OPERATOR.value])
-    await engine.store.update_user_profile(user_id, display_name=None, email="   ")
+    too_long = "a" * 250 + "@example.org"
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        for value in (
+            "   ",
+            "a@x.org, b@y.org",
+            "['a@x.org', 'b@y.org']",
+            "root@localhost",
+            too_long,
+        ):
+            await engine.store.update_user_profile(user_id, display_name=None, email=value)
+            page = await c.get(PAGE)
+            assert page.status_code == 200, value
+            assert "value=" not in _email_input(page.text), value
+            assert SUGGESTED_LINE not in page.text, value
+
+
+async def test_a_suggested_address_is_escaped_in_the_route(engine: Engine) -> None:
+    """``&`` and ``'`` pass the mailbox check, so they reach the attribute and must arrive escaped."""
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    await engine.store.update_user_profile(user_id, display_name=None, email="o'b&c@example.org")
     async with _client(engine, service) as c:
         await cookie_login(c, "bare")
         page = await c.get(PAGE)
     assert page.status_code == 200
-    assert SUGGESTED_LINE not in page.text
-
-
-async def test_a_suggested_address_is_escaped(engine: Engine) -> None:
-    """A directory writes ``mail``, so the value is not ours to trust inside an attribute."""
-    hostile = 'x"><script>alert(1)</script>&y@example.org'
-    service = await _service(engine, notifier=_FakeNotifier())
-    user_id = await provision(service, "bare", [Role.OPERATOR.value])
-    await engine.store.update_user_profile(user_id, display_name=None, email=hostile)
-    async with _client(engine, service) as c:
-        await cookie_login(c, "bare")
-        page = await c.get(PAGE)
-    assert page.status_code == 200
-    assert 'value="x&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&amp;y@example.org"' in page.text
-    assert "<script>alert(1)" not in page.text
+    assert 'value="o&#x27;b&amp;c@example.org"' in _email_input(page.text)
     user = await engine.store.get_user(user_id)
     assert user is not None and user.notify_email is None
 
 
-def test_the_hint_names_the_directory_for_a_directory_account() -> None:
+def test_the_page_escapes_quote_and_angle_brackets_in_a_suggestion() -> None:
+    """The route never offers ``"<>``, since the mailbox check refuses them. The page escapes them
+    anyway, so its safety does not rest on the caller's filter."""
     from messagefoundry_webconsole import pages
 
-    directory = pages.notify_address_page(suggested=DIRECTORY_ADDRESS, from_directory=True)
-    assert "Suggested from your directory record. Change it if it is not yours." in directory
-    local = pages.notify_address_page(suggested=DIRECTORY_ADDRESS, from_directory=False)
-    assert "Suggested from your account record. Change it if it is not yours." in local
-    assert SUGGESTED_LINE not in pages.notify_address_page(from_directory=True)
+    html = pages.notify_address_page(suggested='x"><script>alert(1)</script>&y@example.org')
+    assert 'value="x&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&amp;y@example.org"' in html
+    assert "<script>alert(1)" not in html
+
+
+async def test_a_directory_account_is_told_the_suggestion_came_from_its_directory(
+    engine: Engine,
+) -> None:
+    """Born with no ``mail``, so no address was seeded. The directory then supplies one, which
+    lands in ``email`` only, and the page offers it with the directory wording."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        ),
+        security_notifier=_FakeNotifier(),
+    )
+    await service.initialize()
+
+    def principal(mail: str | None) -> AdPrincipal:
+        return AdPrincipal(
+            username="dir", display_name="dir", email=mail, dn="CN=dir,DC=x", groups=frozenset()
+        )
+
+    first = await service._complete_ad_login(principal(None), None, mfa_verified=True)
+    assert first.ok and first.identity is not None and first.identity.must_set_notify_email
+    out = await service._complete_ad_login(principal(DIRECTORY_ADDRESS), None, mfa_verified=True)
+    assert out.ok and out.token is not None and out.identity is not None
+    user = await engine.store.get_user(out.identity.user_id)
+    assert user is not None and user.email == DIRECTORY_ADDRESS and user.notify_email is None
+
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", out.token)
+        page = await c.get(PAGE)
+    assert page.status_code == 200
+    assert f'value="{DIRECTORY_ADDRESS}"' in _email_input(page.text)
+    assert (
+        "Suggested from the address your directory last gave for your account. "
+        "Change it if it is not yours."
+    ) in page.text
+    user = await engine.store.get_user(out.identity.user_id)
+    assert user is not None and user.notify_email is None
 
 
 class _FakeWS:

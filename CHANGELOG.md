@@ -98,9 +98,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   username, never the event detail. (`BACKLOG #1139`)
 - **The web console's notification-address page now suggests the address already on the account.**
   At `/ui/account/notify-address`, the input starts with the account's profile address,
-  `users.email`, when it has one. On a directory account that is the directory's `mail`. A line
-  under the input says where it came from and asks the holder to change it if it is not theirs.
-  Opening the page writes nothing. The address becomes `notify_email` only when the holder submits
+  `users.email`, when it passes the same checks as a submitted address. On a directory account that
+  is the last `mail` the directory supplied. A line under the input says where it came from and
+  asks the holder to change it if it is not theirs. A pre-filled input is not focused on load, so a
+  stray Enter does not accept it. Opening the page writes nothing. The address becomes `notify_email` only when the holder submits
   the form, through the same check, audit row and notice as before. The directory still never sets
   `notify_email` itself. The API is unchanged and suggests nothing. A client with no browser still
   sets its address with `POST /me/notify-email`, or an administrator sets it. (`BACKLOG #1139`)

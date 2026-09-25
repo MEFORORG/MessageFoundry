@@ -431,6 +431,18 @@ def _is_single_mailbox(address: str) -> bool:
     )
 
 
+def suggested_notify_email(profile_email: str | None) -> str | None:
+    """The profile ``email`` to offer on the console's address form, or ``None`` (BACKLOG #1139).
+
+    Stripped, and only when it passes the shape check :meth:`AuthService.fill_own_notify_email`
+    applies, so the form never offers a value its own submit refuses. On a directory account the
+    profile address is the last ``mail`` the directory supplied, which is why this is a suggestion
+    only. It writes nothing; the holder's submit is the only thing that fills ``notify_email``.
+    """
+    address = (profile_email or "").strip()
+    return address if address and _is_single_mailbox(address) else None
+
+
 class NotifyEmailAlreadySet(RuntimeError):
     """:meth:`AuthService.fill_own_notify_email` declined: the account already has a different
     notification address. The self-service route only fills a missing one (BACKLOG #1139)."""
@@ -3448,9 +3460,10 @@ class AuthService:
         session is all it would take. Raises :class:`NotifyEmailAlreadySet` for that, and
         :class:`ValueError` for a blank value (:func:`require_notify_email`).
 
-        **THE FIRST ADDRESS IS TRUSTED AS TYPED.** Whoever holds this session (password, and the
+        **THE FIRST ADDRESS IS TRUSTED AS SUBMITTED.** Whoever holds this session (password, and the
         factor where one is enrolled) chooses where notices go. Nothing checks that the holder
-        receives mail there. The audit row names the change in the holder's own
+        receives mail there. The console form may start with :func:`suggested_notify_email`, which a
+        directory writer can influence; the holder still has to submit it. The audit row names the change in the holder's own
         ``/me/security-events`` feed, and the notice goes to the address just set.
 
         The fill-only check is a read, then an unconditional write. Two concurrent calls from the

@@ -61,6 +61,14 @@ under Changed says why engine 0.4.0 does not work with this console.
   instead, and so do the new deadline sentences under Added.
 
 ### Security
+- **The notification-address page suggests the address already on the account** (`BACKLOG #1139`).
+  Engine PR 1522 added `/ui/account/notify-address`, where an account with no notification address
+  is confined while the engine sends security notices. Its input now starts with the account's
+  profile address, `users.email`, when that passes the same checks as a submitted address. On a
+  directory account that is the last `mail` the directory supplied. A line under the input names
+  the source and asks the holder to change it if it is not theirs. A pre-filled input is not
+  focused on load. Opening the page writes nothing; the address is set only when the holder
+  submits the form.
 - **Ending a session or enrolling a factor from an MFA-pending session now needs the existing
   factor first, on an account that has one** (`BACKLOG #1951`, PR 1469).
   `require_ui_reauth_only_action` skips the MFA check, so that an account with no factor can still

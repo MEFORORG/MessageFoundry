@@ -27,6 +27,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_WEBAUTHN_ENROLL,
     AuthService,
     NotifyEmailAlreadySet,
+    suggested_notify_email,
 )
 from messagefoundry.auth.tokens import hash_token
 
@@ -291,14 +292,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         Under the factor gate on purpose (no ``allow_mfa_pending``): a cookie that has proven only
         the password must not choose where the account's security notices go.
 
-        Slice 2: the form starts filled with the account's profile ``email`` where it has one. On a
-        directory account that is the directory's ``mail``. THIS GET WRITES NOTHING. The address
-        reaches ``notify_email`` only when the holder submits it, through the POST below and
-        ``fill_own_notify_email``, so nobody who can write ``mail`` sets the target silently."""
+        The form starts with the account's profile ``email`` where it passes the submit's own
+        checks. On a directory account that is the last ``mail`` the directory supplied. THIS GET
+        WRITES NOTHING. The address reaches ``notify_email`` only when the holder submits it,
+        through the POST below and ``fill_own_notify_email``, so a directory writer can shape the
+        suggestion but cannot set the target."""
         if not identity.must_set_notify_email:
             return RedirectResponse("/ui/account", status_code=303)
         user = await service.store.get_user(identity.user_id)
-        suggested = ((user.email if user is not None else None) or "").strip() or None
+        suggested = suggested_notify_email(user.email if user is not None else None)
+        if suggested is not None:
+            try:
+                NotifyEmailRequest(email=suggested)  # the POST's length bound
+            except ValidationError:
+                suggested = None
         return HTMLResponse(
             pages.notify_address_page(
                 suggested=suggested,

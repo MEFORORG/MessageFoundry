@@ -1882,9 +1882,12 @@ Users are notified of security-relevant changes to their account through **two**
   shape of the `must_change_password` confinement. It sits **below** the factor gate, so a session
   that has proven only the password cannot choose where notices go. It fills a missing address only;
   an administrator changes an existing one, which notifies the old address. **The first address is
-  trusted as typed:** nothing checks that the holder receives mail there. The `auth.notify_email_set`
-  row puts the change in the holder's own feed, and a `notify_email_set` notice goes to the new
-  address. A site with no mail relay notifies nobody, so it is not confined.
+  trusted as submitted:** nothing checks that the holder receives mail there. The console form starts
+  with the account's profile `email` when that passes the same shape check. On a directory account
+  that is the last `mail` the directory supplied, so a directory writer chooses the SUGGESTION. The
+  page says where it came from, and nothing is written until the holder submits it. The
+  `auth.notify_email_set` row puts the change in the holder's own feed, and a `notify_email_set`
+  notice goes to the new address. A site with no mail relay notifies nobody, so it is not confined.
 - **`GET /me/security-events`** — a pull-based feed of the caller's own audited `auth.*` events
   (sign-ins, lockouts, password changes), most-recent-first, for accounts without a deliverable mailbox.
   Both 6.3.5 signals are in it, as `auth.account_locked` and `auth.login_after_failures`, whichever leg
