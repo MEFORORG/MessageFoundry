@@ -4621,14 +4621,21 @@ class AuthService:
             actor=actor,
             detail=_json({"user_id": user_id, "username": user.username}),
         )
-        await self._notify_security(PASSWORD_RESET, username=user.username, email=user.notify_email)
         stamped = await self._store.get_user(user_id)
-        return IssuedCredential(
-            password=temp,
-            expires_at=self.initial_credential_deadline(
-                None if stamped is None else stamped.password_changed_at
-            ),
+        expires_at = self.initial_credential_deadline(
+            None if stamped is None else stamped.password_changed_at
         )
+        # BACKLOG #1141 slice 2: the notice goes to the HOLDER, the one party the return value never
+        # reaches, so it carries the same instant. It is sent after the read-back so the two cannot
+        # differ; sending it first left the only holder-facing surface with no deadline at all. A
+        # DISABLED account gets no deadline line: it tells the holder to sign in, and they cannot.
+        await self._notify_security(
+            PASSWORD_RESET,
+            username=user.username,
+            email=user.notify_email,
+            detail=None if expires_at is None or user.disabled else {"expires_at": expires_at},
+        )
+        return IssuedCredential(password=temp, expires_at=expires_at)
 
     async def unbind_federated_subject(self, user_id: str, *, actor: str) -> int:
         """Admin: remove an account's federated ``(issuer, sub)`` binding and revoke every live

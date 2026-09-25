@@ -1832,3 +1832,88 @@ async def test_initial_credential_deadline_is_the_single_source_every_surface_re
         assert off.initial_credential_deadline(admin.password_changed_at) is None
     finally:
         await store.close()
+
+
+# --- BACKLOG #1141 slice 2, limb (b): the out-of-band reset notice CARRIES the deadline ----------
+#
+# The PASSWORD_RESET notice is the one surface that reaches the HOLDER rather than the issuing
+# administrator, so it is where "renewal instructions are sent" is most literally true. It shipped
+# with no deadline because the notice fired before the stored stamp was read back. The test pins the
+# instant it carries AGAINST THE GATE, the same shape as the reset-response test above, so neither a
+# fresh clock nor a gate that drifted from `initial_credential_deadline` can pass it.
+
+
+async def test_the_reset_notice_states_the_instant_the_login_gate_refuses_at() -> None:
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=72), security_notifier=notifier
+        )
+        await service.initialize()
+        issued = await _make_reset_temp(store, service)
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None and alice.password_changed_at is not None
+
+        notice = next(e for e in notifier.events if e.event_type == PASSWORD_RESET)
+        noticed = notice.detail["expires_at"]
+        # Off the STORED stamp the gate reads, exactly. A fresh clock read after the write differs
+        # from the stamp by the audit and revoke round-trips, so equality is what catches it.
+        assert noticed == alice.password_changed_at + 72 * 3600
+        # The holder and the issuing administrator are told the SAME instant.
+        assert noticed == issued.expires_at
+
+        # POSITIVE CONTROL: one second before the noticed instant the credential still works.
+        await _shift_deadline_to(store, alice.id, time.time() + 1, hours=72)
+        assert (await service.login("alice", issued.password)).ok
+        # One second after it, the gate refuses, so the notice named the real boundary.
+        await _shift_deadline_to(store, alice.id, time.time() - 1, hours=72)
+        out = await service.login("alice", issued.password)
+        assert not out.ok and out.error == "invalid credentials"
+    finally:
+        await store.close()
+
+
+async def test_the_reset_notice_carries_no_deadline_when_the_expiry_setting_is_off() -> None:
+    # Control for the test above: at 0 the credential genuinely does not expire, so a notice stating
+    # an instant would be the false deadline this item exists to prevent.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=0), security_notifier=notifier
+        )
+        await service.initialize()
+        await _make_reset_temp(store, service)
+        notice = next(e for e in notifier.events if e.event_type == PASSWORD_RESET)
+        assert "expires_at" not in notice.detail
+    finally:
+        await store.close()
+
+
+async def test_the_reset_notice_to_a_disabled_account_carries_no_deadline() -> None:
+    # The deadline line tells the holder to sign in before it, and a disabled account cannot sign
+    # in. The issuing administrator's return value still states the instant.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=72), security_notifier=notifier
+        )
+        await service.initialize()
+        await store.upsert_role(role_id="viewer", display_name="Viewer")
+        user_id = await service.create_local_user(
+            username="alice",
+            password="a-long-enough-original-passphrase",
+            display_name=None,
+            email=None,
+            roles=["viewer"],
+            actor="admin",
+        )
+        await store.set_user_disabled(user_id, disabled=True)
+        issued = await service.admin_reset_password(user_id, actor="admin")
+        notice = next(e for e in notifier.events if e.event_type == PASSWORD_RESET)
+        assert "expires_at" not in notice.detail
+        assert issued.expires_at is not None
+    finally:
+        await store.close()

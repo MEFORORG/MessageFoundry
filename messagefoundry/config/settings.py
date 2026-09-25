@@ -3151,6 +3151,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
         # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
         "bootstrap_admin_expiring",
+        # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
+        # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)
+        "initial_credential_expiring",
         # #122 (ADR 0162): an application-log sink was rolled after a write failure (stage 1) or is
         # UNWRITABLE and this process's connections were stopped (stage 2). Routable on its own so an
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped

@@ -56,6 +56,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   failure status where it used to get Success. A `max_object_bytes` above 16 MiB no longer raises
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
+### Added
+- **The reset notice now states when a temporary password stops working, and the operator gets a
+  reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
+  already enforced it. The `PASSWORD_RESET` security notice to the holder now states that instant,
+  and asks them to choose a new password before then. A disabled account's notice carries no
+  deadline line. A new `[alerts]` event, `initial_credential_expiring`, reminds the operator while
+  an admin-issued temporary password is still unclaimed. It fires at most once per credential per
+  engine process, in the last third of the window, capped at 24 hours (24 hours at the default 72).
+  It names the holder as `user:<username>` and carries the deadline and whole hours left, never the
+  password. With no `[alerts]` transport it goes to the log (`LoggingAlertSink`), where no rule
+  applies. At `initial_password_expiry_hours = 0` no reminder runs. **Catch-all alert rules match
+  this event**, because a rule's `connection` defaults to `*`. When such a rule is the first match,
+  its `mute` or `transports = []` silences the reminder. Its `control_action` is dispatched at
+  `user:<username>`, or, with `control_target` set, at that real connection, which it restarts.
+  Scope such rules to real connection names or to one `event_type`.
+  ([BACKLOG #1141](docs/BACKLOG.md))
+
 ### Security
 - **An approval can no longer be granted faster than a person could read it.** A new setting,
   `[approvals].min_dwell_seconds`, sets the youngest age at which a pending request may be

@@ -14,7 +14,6 @@ raising, so the caller can close the socket cleanly).
 
 from __future__ import annotations
 
-import datetime
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -24,6 +23,7 @@ from fastapi import HTTPException, Request, WebSocket, status
 
 from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
+from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
 from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
 from messagefoundry.config.tls_policy import HopDisposition
 
@@ -234,18 +234,6 @@ def initial_credential_window_hours(auth: AuthService) -> float | None:
     """
     deadline = auth.initial_credential_deadline(0.0)
     return None if deadline is None else deadline / 3600.0
-
-
-def deadline_utc(ts: float) -> str | None:
-    """A deadline instant as a UTC ISO-8601 stamp, for text a client shows to a person.
-
-    ``None`` when the instant cannot be rendered. The expiry setting has no upper bound, and
-    ``fromtimestamp`` raises past year 9999, or past year 3000 on Windows. A deadline that far out
-    is not worth a 500 on the refusal that states it, so the caller drops the sentence instead."""
-    try:
-        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (OverflowError, OSError, ValueError):
-        return None
 
 
 def _allow_no_auth(app_state: object) -> bool:
