@@ -5214,8 +5214,8 @@ async def test_sso_session_not_reauth_seeded(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # AC-14: the SSO proof is AMBIENT — the session is born WITHOUT a step-up window (a step_up
-    # action 303s to /ui/reauth), and the directory-password reauth then completes it. The
-    # AD-password login and the JSON /auth/negotiate keep seeding (the recorded asymmetry pins).
+    # action 303s to /ui/reauth), and the directory-password reauth then completes it. BACKLOG
+    # #1144 step 5 closed the recorded asymmetry: the JSON /auth/negotiate leg is born the same way.
     from messagefoundry.auth.tokens import hash_token
 
     service = _sso_service(engine)
@@ -5242,18 +5242,18 @@ async def test_sso_session_not_reauth_seeded(
         )
         assert r.status_code == 200 and 'action="/ui/account/webauthn/enroll"' in r.text
 
-    # The asymmetry this pins LOST ITS OTHER HALF: AD-password login is retired (BACKLOG #1137), so
-    # the surviving comparison is the /ui/sso leg above (seed_reauth=False) against the JSON
-    # negotiate leg below (default True). Both still reach _complete_ad_login; only the seeding
-    # differs, which is the property under test.
+    # The asymmetry this used to pin is GONE (BACKLOG #1144 step 5). AD-password login is retired
+    # (BACKLOG #1137), and the JSON negotiate leg below took the seeding default until step 5, while
+    # the /ui/sso leg above passed False. Both reach _complete_ad_login, which now decides the
+    # seeding itself, so the JSON leg must be born with no window too.
     out = await service.login("jdoe", "pw", provider=AuthProvider.AD)
     assert out.ok is False and out.token is None  # the retired pathway, refused
 
     out = await service.authenticate_kerberos(b"tok")
     assert out.ok and out.token is not None
     session = await service.store.get_session(hash_token(out.token))
-    assert session is not None and session.reauth_at is not None
-    # The grant is the same on BOTH Kerberos legs -- only the step-up seeding differs (BACKLOG #1144).
+    assert session is not None and session.reauth_at is None
+    # The grant is the same on BOTH Kerberos legs, and so is the seeding now (BACKLOG #1144).
     assert session.mfa_verified_at is None
 
 

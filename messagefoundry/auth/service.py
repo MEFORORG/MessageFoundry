@@ -1519,7 +1519,6 @@ class AuthService:
         token: bytes,
         *,
         client: str | None = None,
-        seed_reauth: bool = True,
         supersedes: str | None = None,
     ) -> LoginOutcome:
         """The browser/API Windows-SSO seam, with every failed outcome held to a fixed deadline.
@@ -1544,9 +1543,7 @@ class AuthService:
         identical for every principal and already disclosed in the redirect.
         """
         started = time.monotonic()
-        outcome = await self._authenticate_kerberos(
-            token, client=client, seed_reauth=seed_reauth, supersedes=supersedes
-        )
+        outcome = await self._authenticate_kerberos(token, client=client, supersedes=supersedes)
         return await self._equalize_failure(outcome, started, seam="kerberos")
 
     async def _authenticate_kerberos(
@@ -1554,7 +1551,6 @@ class AuthService:
         token: bytes,
         *,
         client: str | None = None,
-        seed_reauth: bool = True,
         supersedes: str | None = None,
     ) -> LoginOutcome:
         # Audit every reject path so blocked/failed Windows-SSO attempts are not invisible to a
@@ -1595,7 +1591,6 @@ class AuthService:
             principal,
             client,
             mfa_verified=False,
-            seed_reauth=seed_reauth,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
 
@@ -1730,15 +1725,14 @@ class AuthService:
         *,
         redirect_uri: str,
         client: str | None = None,
-        seed_reauth: bool = False,
     ) -> LoginOutcome:
         """Complete a federated login: exchange the code, verify the ``id_token``, then resolve the
         principal against on-prem AD and hand off to the shared directory-login path.
 
-        ``seed_reauth`` defaults **False**, unlike :meth:`authenticate_kerberos`: a federated proof is
-        ambient (the browser was redirected back holding a token), so the session must not be born
-        with a free step-up window — the first sensitive action forces an explicit re-auth. This
-        mirrors browser Kerberos SSO's explicit ``seed_reauth=False``, not its default.
+        The session is born with NO step-up window, as every directory login's is: a federated proof
+        is ambient (the browser was redirected back holding a token), so the first sensitive action
+        forces an explicit re-auth. :meth:`_complete_ad_login` decides that for every directory leg
+        and no caller can override it (BACKLOG #1144, step 5).
 
         Roles come from ``resolve_principal`` — the same password-free LDAP lookup Kerberos uses —
         and NEVER from a token claim, so a claims-parsing bug degrades to wrong-user login rather
@@ -1917,7 +1911,6 @@ class AuthService:
             principal,
             client,
             mfa_verified=mfa_verified,
-            seed_reauth=seed_reauth,
             mech="oidc",
             evidence={
                 "amr": list(principal_claims.amr),
@@ -1968,7 +1961,6 @@ class AuthService:
         client: str | None,
         *,
         mfa_verified: bool,
-        seed_reauth: bool = True,
         mech: str | None = None,
         evidence: Mapping[str, object] | None = None,
         max_expires_at: float | None = None,
@@ -2135,7 +2127,19 @@ class AuthService:
                 user.id,
                 client,
                 mfa_verified=mfa_verified,
-                seed_reauth=seed_reauth,
+                # NO DIRECTORY LOGIN SEEDS THE STEP-UP WINDOW (BACKLOG #1144 step 5, ASVS 6.8.4). A
+                # ticket or a federated redirect is an AMBIENT proof, and seeding would let the
+                # engine's own login stamp satisfy `has_recent_step_up` for the whole
+                # `step_up_max_age_seconds` window with no directory interaction. So the first
+                # window-gated action demands a real step-up: a live directory re-bind at
+                # `POST /me/reauth` or `/ui/reauth`, or an engine TOTP or recovery code at the MFA
+                # gate, since `verify_mfa` stamps the window.
+                #
+                # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
+                # two Kerberos routes disagreed: `GET /ui/sso` passed False while `POST
+                # /auth/negotiate` took the seeding default. One pathway, two postures. Taking the
+                # choice away from the caller is what keeps them one.
+                seed_reauth=False,
                 max_expires_at=max_expires_at,
                 # BACKLOG #1474. THE UNBIND'S SESSION SWEEP CANNOT SEE A SESSION THAT DOES NOT EXIST
                 # YET, which is the race this closes: an admin unbinding this account mid-login
@@ -2920,9 +2924,9 @@ class AuthService:
             # session gets no step-up freshness, so enrolling a first authenticator (or any step-up op)
             # requires an explicit password re-verify — a stolen pre-MFA token can't ride login's
             # freshness to bind an attacker-controlled authenticator (WP-14).
-            # seed_reauth=False overrides that for browser Kerberos SSO (ADR 0068 §9): the session's
-            # proof is AMBIENT, so it must not be born with a free step-up window — the first
-            # sensitive action forces the directory-password step-up.
+            # seed_reauth=False overrides that for every directory login (ADR 0068 s9, BACKLOG #1144
+            # step 5): the session's proof is AMBIENT, so it must not be born with a free step-up
+            # window, and the first sensitive action forces a step-up. See _complete_ad_login.
             seed_reauth=mfa_verified if seed_reauth is None else seed_reauth,
             # BACKLOG #1474: on the federated leg the INSERT is conditional on the account still
             # carrying this verified pair, checked in the store's own transaction. See

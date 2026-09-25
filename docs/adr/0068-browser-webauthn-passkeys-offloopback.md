@@ -549,3 +549,17 @@ This also retires two earlier sentences. Under "Both halves, deliberately", the 
 call is no longer the only place a credential is refused. Under "Residual closed", the
 assertion-side catch is no longer the backstop for a stored key; the check above is, and the
 catch now guards the response itself.
+
+## Amendment (2026-09-25) -- the JSON `/auth/negotiate` flip is made (BACKLOG #1144 step 5)
+
+The approved follow-up recorded under *Out of scope* and *Resolved on acceptance* is done. The JSON
+`POST /auth/negotiate` no longer seeds the step-up window at login, so both Kerberos routes mint the
+session the way `GET /ui/sso` always has: with no window.
+
+The choice also moved. `_complete_ad_login` passes `seed_reauth=False` itself, and
+`authenticate_kerberos` and `authenticate_oidc` no longer take the argument. A route cannot pick
+a posture any more, which is how the two routes came to disagree.
+
+The step-up path is unchanged: a live directory re-bind at `POST /me/reauth` or `/ui/reauth`, or
+an engine TOTP or recovery code at the MFA gate. Decision 9's text above is left as written and
+dated by this amendment.

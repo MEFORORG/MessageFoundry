@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-63e2790a9a4b0854
+afae70a0a371355f
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -119,7 +119,7 @@ audit_kerberos_reject: (self, reason: 'str') -> 'None'
 audit_mfa_denied: (self, identity: 'Identity', path: 'str', *, client: 'str | None' = None) -> 'None'
 audit_oidc_reject: (self, reason: 'str') -> 'None'
 audit_permission_denied: (self, identity: 'Identity', permission: 'Permission', path: 'str', *, client: 'str | None' = None) -> 'None'
-authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, seed_reauth: 'bool' = True, supersedes: 'str | None' = None) -> 'LoginOutcome'
+authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, supersedes: 'str | None' = None) -> 'LoginOutcome'
 begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str', prior_session: 'str | None' = None) -> 'tuple[str, str]'
 begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str | None'
 begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'

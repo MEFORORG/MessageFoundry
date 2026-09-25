@@ -114,6 +114,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a Windows SSO (Kerberos) sign-in through `POST /auth/negotiate` no longer opens a
+  step-up window.** Until now the engine stamped the new session as freshly re-verified, so the
+  engine's own sign-in stamp passed the step-up check for `[auth].step_up_max_age_seconds` (300
+  seconds by default). Nothing checked with the directory again. With `[security].require_mfa`
+  off, a bearer client could run step-up-gated actions on the ticket alone in that window, such as
+  purge, export, replay, config deploy and user admin. With it on (the default) the session still
+  owed a second factor, so the window reached only the routes that skip that gate, and only where
+  `[auth].require_action_step_up` is off: factor enrollment and session termination. The console's
+  `GET /ui/sso` never opened the window, so one sign-in method had two postures. Now no directory
+  sign-in opens it: Kerberos by either route, and the federated (OIDC) callback, which already did
+  not. **What a client now sees:** its first step-up-gated action returns `403` with
+  `X-Step-Up-Required: 1`.
+  It answers with `POST /me/reauth` and the account's directory password, which the engine checks
+  by a live bind. A TOTP or recovery code at `POST /auth/mfa-verify` also opens the window. Local
+  password sign-in is unchanged. `AuthService.authenticate_kerberos` and
+  `AuthService.authenticate_oidc` no longer take a `seed_reauth` argument, so no caller can open
+  the window at sign-in. The web console seam moved with it. (`BACKLOG #1144`, step 5)
 - **BREAKING: a federated (OIDC) sign-in no longer links itself to an account. An administrator
   links it first, through the API.** The engine now picks the account by the identity provider's
   verified issuer and `sub`, before it reads any username. Before, it picked the account by the
