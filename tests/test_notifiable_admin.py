@@ -5,15 +5,17 @@
 The PHI startup gate computes notification readiness from the SMTP transport alone
 (``notify_security_events`` + ``email_smtp_host`` + ``email_from``). That answers *"is a transport
 configured"* and never *"can the account that matters actually receive"* -- and the two come apart on
-exactly the instance the gate is meant to protect: ``_ensure_bootstrap_admin`` creates the account
-holding ``frozenset(Permission)`` with no ``email=``, so every notice about it no-ops while the gate
-reports a healthy channel.
+exactly the instance the gate is meant to protect. ``provision-admin`` without ``--email`` creates the
+account holding ``frozenset(Permission)`` with no address, so every notice about it no-ops while the
+gate reports a healthy channel. (The item was found on the first-run bootstrap account, which ADR
+0183 Amendment A has since retired.)
 
 ``has_notifiable_admin`` is the missing half of that question. These arms are deliberately
 ASYMMETRIC -- a control that failed on everything would not distinguish *"the predicate keys on a
 deliverable admin"* from *"the predicate is just hard to satisfy"*:
 
-* the REAL bootstrap path yields False (the defect, reproduced rather than described);
+* the REAL first-administrator path, with no address, yields False (the defect, reproduced
+  rather than described);
 * an administrator WITH an address yields True;
 * a non-administrator with an address still yields False -- so the predicate keys on the ROLE, not
   on "some mailbox exists somewhere", which is the scope the item asks for (``email`` is optional
@@ -72,33 +74,26 @@ async def _rotated_session(c: httpx.AsyncClient, username: str, password: str) -
     return {"Authorization": f"Bearer {tok}"}
 
 
-async def _bootstrap_session(c: httpx.AsyncClient, service: AuthService) -> dict[str, str]:
-    """Bootstrap the first admin exactly as a first run does, and clear its must-change flag.
-
-    Only the arm whose SUBJECT is the first-run bootstrap account uses this. ADR 0183 Amendment A
-    retires that account (BACKLOG #1136), and that arm goes with it in Wave 2.
-    """
-    boot = await service.initialize()
-    assert boot is not None
-    return await _rotated_session(c, "admin", boot.password)
-
-
 async def _admin_session(c: httpx.AsyncClient, service: AuthService) -> dict[str, str]:
     """Create an addressless admin, which needs no bootstrap account, and clear its must-change flag."""
     admin = await create_admin(service)
     return await _rotated_session(c, admin.username, admin.password)
 
 
-async def test_the_bootstrap_admin_alone_is_not_notifiable(engine: Engine) -> None:
-    """The defect, on the REAL first-run path rather than a hand-built fixture.
+async def test_an_administrator_provisioned_without_an_address_is_not_notifiable(
+    engine: Engine,
+) -> None:
+    """The defect, on the REAL first-administrator path rather than a hand-built fixture.
 
-    This is the state a deploying site is in at the moment the SMTP-only gate passes: one account,
-    holding every permission, with no address any notice could reach.
+    Since ADR 0183 the first administrator comes from ``provision-admin``, where ``--email`` is
+    optional. Without it the store holds one account, holding every permission, with no address any
+    notice could reach: the state a deploying site is in at the moment the SMTP-only gate passes.
     """
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    async with _client(engine, service) as c:
-        await _bootstrap_session(c, service)
-        assert await service.has_notifiable_admin() is False
+    await service.initialize()
+    await service.provision_first_administrator(username="site-admin", password=PW, actor="test")
+    assert await service.has_enabled_administrator() is True  # control: the account is there
+    assert await service.has_notifiable_admin() is False
 
 
 async def test_an_administrator_with_an_address_is_notifiable(engine: Engine) -> None:

@@ -4,9 +4,11 @@
 
 The serve gate in ``messagefoundry/__main__.py`` proves a TRANSPORT exists -- it computes readiness
 from ``notify_security_events`` + ``email_smtp_host`` + ``email_from``. It never asks whether any
-notice is DELIVERABLE, and on a first run the only account that exists is the bootstrap
-administrator, created with no address. So the gate reports green while every notice about the
-account holding ``frozenset(Permission)`` silently no-ops.
+notice is DELIVERABLE. An Administrator created with no address -- ``provision-admin`` without
+``--email`` -- passes it green while every notice about the account holding
+``frozenset(Permission)`` silently no-ops. (The first-run bootstrap administrator this was found on
+was retired by ADR 0183 Amendment A; a store with no Administrator at all is now refused too, and
+``tests/test_start_without_an_administrator.py`` pins that half.)
 
 These drive the lifespan assertion directly rather than through ``create_managed_app``: the unit
 under test is the predicate, and a full app spin-up would put a dozen unrelated failure modes
@@ -141,8 +143,12 @@ async def test_a_DISABLED_admin_with_an_address_does_not_count() -> None:
     # counting the transport: a check that looks at the wrong thing and reports green.
     store = await _store_with_admin(email="ops@example.test", disabled=True)
     try:
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError) as exc:
             await _call(store)
+        # A disabled Administrator is no Administrator, so the fix named is provision-admin, not the
+        # address setter (ADR 0183 Amendment A): pinning the branch keeps the two fixes apart.
+        assert "no enabled Administrator exists" in str(exc.value)
+        assert "provision-admin --username" in str(exc.value)
     finally:
         await store.close()
 
@@ -207,7 +213,7 @@ async def test_the_gate_is_silent_outside_its_two_preconditions(
 
 
 def _phi_app(tmp_path: Path, *, security: SecuritySettings) -> FastAPI:
-    """A real PHI/enforce managed app whose only account will be the addressless bootstrap admin.
+    """A real PHI/enforce managed app over a store that holds no account at all (ADR 0183).
 
     SMTP is fully wired on purpose: the transport gate in ``__main__`` would call this channel
     healthy, which is the whole of #1020 -- a green transport over an undeliverable notice.
@@ -234,7 +240,7 @@ async def test_the_LIFESPAN_refuses_and_not_merely_the_predicate(tmp_path: Path)
         async with app.router.lifespan_context(app):
             pass  # pragma: no cover -- startup must not reach here
     assert "refusing to start" in str(exc.value)
-    assert "no enabled Administrator has a notification address" in str(exc.value)
+    assert "no enabled Administrator exists" in str(exc.value)
 
 
 async def test_the_same_app_starts_cleanly_under_warn(tmp_path: Path) -> None:

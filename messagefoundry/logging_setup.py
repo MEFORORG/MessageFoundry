@@ -49,6 +49,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_crl_check,
     harden_verify_flags,
+    narrow_to_approved_suites,
 )
 
 # The escape table and this function were DEFINED here until BACKLOG #1591 and now live in
@@ -538,6 +539,8 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
     if forward.tls_client_cert is not None:
         # Mutual TLS: a single PEM carrying both the client cert and its key (keyfile defaults to it).
         ctx.load_cert_chain(certfile=forward.tls_client_cert)
+    # The approved AEAD suites are every engine-built hop's default (BACKLOG #300).
+    narrow_to_approved_suites(ctx)
     # Assert forward secrecy LAST of the suite work, so it sees the final suite list (ASVS 12.1.2).
     # This runs on the tls_verify=False arm too: that opt-out drops peer AUTHENTICATION, and the log
     # records still cross the network encrypted, so the suite list still decides whether a recorded

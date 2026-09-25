@@ -36,7 +36,7 @@ from tests.test_auth_oidc_service import _oidc_login, _service
 def rsa_key() -> rsa.RSAPrivateKey:
     """Local rather than imported: a fixture resolves by name in the module that requests it, so
     importing the sibling suite's function would not register it here."""
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 async def _unbound_rows(store: MessageStore) -> list[Mapping[str, Any]]:

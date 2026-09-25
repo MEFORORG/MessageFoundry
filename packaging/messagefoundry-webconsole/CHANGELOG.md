@@ -61,6 +61,33 @@ under Changed says why engine 0.4.0 does not work with this console.
   instead, and so do the new deadline sentences under Added.
 
 ### Security
+- **The user page sets the notification address in its own field** (`BACKLOG #1139`, ADR 0182
+  Amendment A). The page's Email field is pre-filled with the stored profile address and posted
+  back on every save, and the engine copied it into the notification address. So saving a display
+  name or a disable moved where security notices go, or filled a missing address from the
+  directory. The engine no longer does that. The page now shows a Notification address field,
+  pre-filled with the stored value, and a hidden copy of that value. The route sends the address
+  only when the administrator changed it from what the page showed, so an unrelated save moves
+  nothing, and a page left open cannot undo another administrator's change. Emptying the field is
+  refused with an error, because the address cannot be cleared. A new value moves it and notifies
+  the old address. **Requires an engine whose `UserUpdateRequest` carries `notify_email`**, which
+  moved the engine UI seam. An older engine's model refuses the key, so every address change would
+  fail as "invalid input". This console refuses that engine at startup with `UiSeamMismatch`
+  instead.
+- **The notification-address page suggests the address already on the account** (`BACKLOG #1139`).
+  Engine PR 1522 added `/ui/account/notify-address`, where an account with no notification address
+  is confined while the engine sends security notices. Its input now starts with the account's
+  profile address, `users.email`, when that passes the same checks as a submitted address. On a
+  directory account that is the last `mail` the directory supplied. A line under the input names
+  the source and asks the holder to change it if it is not theirs. A pre-filled input is not
+  focused on load. Opening the page writes nothing; the address is set only when the holder
+  submits the form. Only a pure-ASCII address with no Punycode (`xn--`) domain label is suggested.
+  So a directory writer cannot pre-fill a lookalike built from non-ASCII letters, such as a Cyrillic
+  `a`. An all-ASCII lookalike such as `examp1e.org` is still offered, and the line under the input
+  is what asks the holder to check it. The submit still accepts what it did.
+  **Requires an engine with `AuthService.suggested_notify_email`**, which moved the engine UI seam
+  again. An engine at PR 1522 lacks that method and ships the older seam, so this console refuses
+  it at startup with `UiSeamMismatch` rather than failing on the page.
 - **Ending a session or enrolling a factor from an MFA-pending session now needs the existing
   factor first, on an account that has one** (`BACKLOG #1951`, PR 1469).
   `require_ui_reauth_only_action` skips the MFA check, so that an account with no factor can still

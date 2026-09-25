@@ -100,7 +100,7 @@ import pytest
 # Python-AST clauses have nothing to read there. That is a fact about the LANGUAGE, not a finding that
 # ``ide/`` is free of the things these clauses look for: it ships first-party crypto in TypeScript
 # (``ide/src/cspNonce.ts`` draws CSPRNG bytes from ``node:crypto``; ``ide/src/engineClient.ts`` pins a
-# TLS floor), none of which any Python walker can see. The crypto gate's non-Python arms read them
+# TLS floor and suite list), none of which any Python walker can see. The crypto gate's non-Python arms read them
 # instead: randomness under the required run (BACKLOG #1172), every operation class under
 # ``--non-python-operations`` in its own ``crypto-operations`` job in ci.yml (BACKLOG #1164).
 # This comment previously stated the exclusion as a property of the tree and that was the wrong fact.

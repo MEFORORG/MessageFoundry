@@ -80,7 +80,8 @@ class UserSummary(BaseModel):
     #: overwrites, so it is not where a security notice goes -- see ``notify_email`` (BACKLOG #1139).
     email: str | None = None
     #: READ-ONLY: the engine-owned address every out-of-band security notice is sent to. No directory
-    #: sync writes it, and no request can clear it -- it is repointed by setting ``email`` on a PATCH.
+    #: sync writes it, and no request can clear it -- it is repointed by setting ``notify_email`` on a
+    #: PATCH. Setting ``email`` does not move it (BACKLOG #1139, ADR 0182 Amendment A).
     #: Surfaced so an operator can see where notices actually go; without it the split is invisible.
     #: Defaults None, so an older client that never reads it is unaffected.
     notify_email: str | None = None
@@ -135,8 +136,13 @@ class UserCreateRequest(RequestModel):
 
 class UserUpdateRequest(RequestModel):
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
+    #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
     email: str | None = Field(default=None, max_length=_NAME_MAX)
     disabled: bool | None = None
+    #: The engine-owned address security notices go to. Omitted leaves it as it is. A value moves it
+    #: and notifies the address it moves away from. It must be one plain mailbox, and an explicit
+    #: null or a blank value is refused, because the address can be repointed but never cleared.
+    notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
 class RolesUpdateRequest(RequestModel):

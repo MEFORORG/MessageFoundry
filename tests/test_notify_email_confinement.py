@@ -3,9 +3,9 @@
 """BACKLOG #1139 (ASVS 6.3.7): an account with no notification address sets one before anything else.
 
 The notifier drops a notice for an account with no ``notify_email``, so such an account is told
-nothing out of band about a change to its authentication details. At least four paths give birth
-to one. This file drives the four known ones to the confinement, the way out of it, and the two conditions that keep the
-confinement from doing harm: it applies only while a notice channel is wired, and it never lets a
+nothing out of band about a change to its authentication details. At least three paths give birth
+to one. This file drives the three known ones to the confinement, the way out of it, and the two
+conditions that keep the confinement from doing harm: it applies only while a notice channel is wired, and it never lets a
 session that still owes its second factor choose the address.
 """
 
@@ -80,19 +80,10 @@ async def _flag_after_login(service: AuthService, username: str, password: str =
     return resolved.must_set_notify_email
 
 
-# --- the four birth paths --------------------------------------------------------------------------
-
-
-async def test_the_first_run_bootstrap_administrator_is_confined() -> None:
-    store = await MessageStore.open(":memory:")
-    try:
-        service = AuthService(store, _no_mfa(), security_notifier=_FakeNotifier())
-        bootstrap = await service.initialize()
-        assert bootstrap is not None
-        # The bootstrap is must-change too; that confinement runs first, this one after it.
-        assert await _flag_after_login(service, bootstrap.username, bootstrap.password) is True
-    finally:
-        await store.close()
+# --- the three birth paths -------------------------------------------------------------------------
+# There were four. The fourth, the first-run bootstrap administrator, was retired by ADR 0183
+# Amendment A, Wave 2 (BACKLOG #1136), and its test went with it. The first administrator of an
+# install now comes from `provision-admin`, whose no-address arm is pinned below.
 
 
 async def test_a_local_account_created_without_an_address_is_confined_and_one_with_is_not() -> None:

@@ -535,7 +535,14 @@ def test_no_loss_reconciles_at_every_step(smoke_report: ConnScaleReport) -> None
     """
     for r in smoke_report.records:
         assert r.sent > 0, r
-        assert r.no_loss.ok, (r.sweep_mode, r.count, r.no_loss.detail)
+        # A STRING, not a tuple. Pytest shortens each element of a tuple message, and on
+        # 2026-09-25 that cut the #1292 audit verdict off the end of this line in CI, so the red
+        # read as engine loss while the verdict that cleared the engine sat in the part not shown.
+        assert r.no_loss.ok, (
+            f"{r.sweep_mode}@N={r.count}: sent={r.sent} acked={r.acked} nak={r.nak} "
+            f"timeouts={r.timeouts} reload_stranded={r.reload_stranded} "
+            f"reload_seconds={r.reload_seconds} -- {r.no_loss.detail}"
+        )
 
 
 def test_no_accept_acked_message_is_absent_from_the_stopped_engines_store(

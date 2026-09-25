@@ -13,8 +13,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   stored stamp the login gate checks. It is `null` in at least these cases: no change is owed, or
   `[auth].initial_password_expiry_hours` is `0` or less. `GET /users` always returns `null` here.
   That route needs only `users:read`, and a list of live temporary passwords is a target list. The
-  never-claimed bootstrap account also gets `null`, because `bootstrap-admin.txt` already states its
-  earlier deadline. The web console's create-user form now states how many hours the password
+  web console's create-user form now states how many hours the password
   lasts. Its user page and forced change-password page state the time, and so does the IDE's
   must-change warning. (`BACKLOG #1141`)
 - **`messagefoundry admin-set-notify-email` sets a missing notification address on an enabled
@@ -35,6 +34,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING — the engine no longer creates an account on its own.** A `serve` on a store with no
+  users used to create an enabled Administrator named `admin` and write its one-time password to
+  `bootstrap-admin.txt` beside the store. It now creates no account and writes no file. Create the
+  first Administrator at the host with `messagefoundry provision-admin --username <name> --email
+  <address>`, before the first start or after one that was refused. At the shipped posture a start
+  with no enabled Administrator is refused, and the refusal names that command. A start refused
+  because no Administrator has an address now names `admin-set-notify-email` instead. Under
+  `[security].enforcement = "warn"`, or with security notices off or waived in writing, the engine
+  starts and routes HL7, logs one warning naming `provision-admin`, and nobody can sign in until it
+  runs. The WP-3 lifecycle that disabled the first-run account went with it, and so did its expiry
+  reminder. An account an operator names `admin` is now an ordinary account, so it gets a
+  `credential_expires_at` like any other. `provision-admin` now refuses before it asks for a password
+  when an enabled Administrator already exists or an argument is out of range. It opens the store
+  only after the password passes the policy, so a refusal leaves no new SQLite store file behind.
+  Its `--username`, `--email` and `--display-name` are limited to 256 characters, as in the web
+  console.
+  `[auth].bootstrap_expiry_hours` and `[auth].bootstrap_warn_hours` still load but do nothing now; a
+  later change removes them. **Migration:** run `provision-admin` once at the host, as the account
+  that installs the service, against the store and service config the service uses. ADR 0183
+  Amendment A, Wave 2. (`BACKLOG #1136`)
 - **BREAKING — the config loader refuses a connection name that does not match
   `^[A-Za-z][A-Za-z0-9_-]{0,255}$`.** In 0.4.0 such a name still loaded and ran, and only the API
   refused it. Now a code-first `inbound()` or `outbound()` call, or a `connections.toml` entry,
@@ -43,6 +62,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   generated connection name that would fail it. **Migration:** rename such connections to fit the pattern;
   stored history stays under the old name. ([BACKLOG #1107](docs/BACKLOG.md))
 ### Fixed
+- **On Windows, the service account and the operator who runs `provision-admin` can now each open
+  the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
+  `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other
+  out. A provisioned store stopped the service starting, and a store the service created refused
+  `provision-admin`. In a data directory hardened the way `install-service.ps1` leaves it, each open
+  now writes one protected ACL on those files naming SYSTEM, Administrators and the one service
+  account. It is the same whoever opens, and it reaches every member of Administrators whose token
+  carries the group enabled, not only the operator who provisioned. `install-service.ps1` now also
+  makes Administrators the owner of the data directory, because the engine requires that. Outside a
+  hardened directory, the old owner-only behaviour is unchanged. What this widens and narrows is
+  stated in the ADR 0163 note of 2026-09-24; the measurement is ADR 0183 Wave 0 and 0b.
+  (`BACKLOG #1136`)
 - **The DICOM C-STORE SCP no longer answers Success for an object the engine does not accept.**
   The SCP's `max_object_bytes` defaults to 128 MiB, but the engine's binary ingress records any
   object over 16 MiB as `ERROR` and never processes it. So an object between 16 and 128 MiB was
@@ -99,12 +130,29 @@ All notable changes to MessageFoundry are documented here. The format follows
   the account holder; unlinking sends the new notice `federated_identity_unbound`. An
   administrator cannot change their own link. **Linking works only through the API for now.** The web console gets its own screen in
   a later change. Federation still ships off. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184)
+- **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
+  `PATCH /users/{id}` copied any non-blank `email` into `users.notify_email`, and sent no notice
+  unless the profile email changed. The route fills an omitted `email` from the stored profile, and
+  the web console's user form posts it back on every save. So a display-name edit or a disable
+  copied the profile address into the notification address. On a directory account that address is
+  the directory's `mail`, so the save did the directory repoint ADR 0182 blocks. On an account with
+  no notification address it filled one from the directory. Now `email` sets the profile address
+  only. A new `notify_email` field on `PATCH /users/{id}` is the one way an administrator moves
+  the notification address. Omitted, it leaves the address as it is. Sending the stored address
+  back changes nothing. A new value must be one plain mailbox, and `null` or a blank value is
+  refused with `400`, because the address can be changed but not cleared. A move writes a
+  `user.notify_email_changed` audit row that holds no address. It sends an `email_changed` notice
+  to the old address, which names the new one, or a `notify_email_set` notice to the new address
+  when there was none. Both say an administrator made the change. The console's user page has a
+  Notification address field for it. **What changes for a client:** a `PATCH` that sets `email` to
+  repoint notices now moves only the profile address. Send `notify_email` too. (`BACKLOG #1139`,
+  ADR 0182 Amendment A)
 - **BREAKING: an account with no notification address must set one at sign-in, whenever this
   instance sends security notices.** A security notice goes to the account's engine-owned address,
   `users.notify_email`. An account without one was told nothing about a password reset or any other
-  change to how it signs in. At least four paths create such an account: the first-run `admin` account, a user
-  created with no email, `provision-admin` without `--email`, and a directory sign-in where the
-  directory returns no `mail`. Now, while `[auth].notify_security_events` is on and an `[alerts]` SMTP
+  change to how it signs in. At least three paths create such an account: a user created with no
+  email, `provision-admin` without `--email`, and a directory sign-in where the directory returns no
+  `mail`. Now, while `[auth].notify_security_events` is on and an `[alerts]` SMTP
   relay is configured, that account is confined at sign-in. The JSON API answers other routes with
   `403` `notification address required` and `X-Notify-Email-Required: 1`. The web console sends other
   pages to `/ui/account/notify-address`. `POST /me/notify-email` sets the address, which must read as one
@@ -121,6 +169,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **A dropped security notice is now logged.** With notices on and no SMTP relay configured, the engine
   dropped every notice without a word. Each drop now logs a warning naming the event type and the
   username, never the event detail. (`BACKLOG #1139`)
+- **The web console's notification-address page now suggests the address already on the account.**
+  At `/ui/account/notify-address`, the input starts with the account's profile address,
+  `users.email`, when it passes the same checks as a submitted address. On a directory account that
+  is the last `mail` the directory supplied. A line under the input says where it came from and
+  asks the holder to change it if it is not theirs. A pre-filled input is not focused on load, so a
+  stray Enter does not accept it. Opening the page writes nothing. The address becomes `notify_email` only when the holder submits
+  the form, through the same check, audit row and notice as before. The directory still never sets
+  `notify_email` itself. The API is unchanged and suggests nothing. A client with no browser still
+  sets its address with `POST /me/notify-email`, or an administrator sets it. (`BACKLOG #1139`)
 - **An approval can no longer be granted faster than a person could read it.** A new setting,
   `[approvals].min_dwell_seconds`, sets the youngest age at which a pending request may be
   approved. It defaults to 2.0 seconds, which is provisional and derived from the keystroke-level
@@ -175,6 +232,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   - any HTTP version other than 1.x.
 
   **A deploying sender relying on any of these would be refused.** ([BACKLOG #1125](docs/BACKLOG.md))
+- **BREAKING — every TLS context the engine builds now defaults to the approved AEAD TLS 1.2
+  suites, MLLP and DICOM included, and the engine's own signing key must be RSA-3072 or larger.**
+  A CBC-only TLS 1.2 peer that connected on 0.4.0 would now fail the handshake. For MLLP and DICOM
+  the owner ruled on 2026-09-23 to drop the six CBC-SHA2 suites with no peer census. There is no
+  override setting: a legacy CBC-only peer is served only by a reviewed code change to
+  `_APPROVED_TLS_SUITES`. TLS 1.3 is unaffected, and the IDE client pins the same suite list.
+  [ADR 0188](docs/adr/0188-per-connection-tls-ciphers-on-the-mllp-and-dicom-connectors.md) is
+  amended with a per-hop table. Separately, `transports/signing.py` now refuses an RSA signing key
+  below 3072 bits, for outbound detached-JWS signing and the SMART `client_assertion`; 0.4.0
+  accepted 2048. Counterparty keys, such as an IdP's JWKS key and the `Direct()` signer, keep the
+  2048-bit floor. **Migration:** generate an RSA key of at least 3072 bits, or an EC key for
+  ES256 / ES384, and register its public half with the counterparty.
+  ([BACKLOG #300](docs/BACKLOG.md))
 - **BREAKING: a trust anchor that another account can replace through its folder now refuses to
   start.** This covers `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and
   `[api].tls_client_ca_file`. 0.4.0 checked only the anchor file's own permissions. An account with

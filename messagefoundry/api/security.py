@@ -24,7 +24,7 @@ from fastapi import HTTPException, Request, WebSocket, status
 from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
-from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.tls_policy import HopDisposition
 
 # Re-imported, not redefined. The cert->principal mapping now lives in the neutral package-root leaf
@@ -233,18 +233,11 @@ def pending_credential_deadline(auth: AuthService, user: UserRecord | None) -> f
     refuses this credential on time: no such user, a password the holder chose, or
     ``[auth].initial_password_expiry_hours`` set to 0.
 
-    **The never-claimed first-run bootstrap account gets ``None`` here, on purpose.** WP-3 can retire
-    that ACCOUNT earlier than this CREDENTIAL bound (``bootstrap_expiry_hours`` set shorter), and it
-    is retired outright once a second administrator exists. ``bootstrap-admin.txt`` and the lifespan
-    reminder already state the earlier of the two. Stating the credential bound alone would name a
-    later instant than the real one. The recorded ``password_claimed_at`` stamp is the test, so an
-    ``admin`` account claimed long ago and then reset by another administrator still gets its
-    deadline. The complete answer, one service method that the gate itself calls and that takes the
-    earlier bound, belongs in ``AuthService``.
+    No account is exempt by name. The first-run account named ``admin`` used to get ``None`` here,
+    because the WP-3 sweep could retire it before this bound. ADR 0183 retired that account and its
+    sweep, so an account an operator names ``admin`` is an ordinary account and gets its deadline.
     """
     if user is None or not user.must_change_password:
-        return None
-    if user.username == BOOTSTRAP_USERNAME and user.password_claimed_at is None:
         return None
     return auth.initial_credential_deadline(user.password_changed_at)
 
@@ -372,7 +365,7 @@ def require(
                 ),
             )
         # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
-        # BOTH directions. must_change stays FIRST: a fresh account (new user, bootstrap admin) is
+        # BOTH directions. must_change stays FIRST: a fresh account (a new user) is
         # must_change AND mfa_pending with NO factor, so leading with MFA would point it at
         # /auth/mfa-verify with nothing to prove there — the brick. It rotates first instead, and
         # /me/password lets it, because the factor refusal below skips an account with no factor.

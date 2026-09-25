@@ -3,7 +3,8 @@
 
 # 0182 — Split the account mirror address from the engine-owned notification address
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-09-25, see Amendment A: `update_user` no longer moves
+  `notify_email` from the profile `email`)
 - **Date:** 2026-09-03
 - **Related:** BACKLOG #1139 (ASVS 6.3.7) · BACKLOG #1020 · [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md) · CLAUDE.md §0, §9, §11
 
@@ -52,7 +53,8 @@ notification address, and no directory-sync statement names it.**
   directory pass can move it.
 - After creation the only writer is `set_user_notify_email`. `AuthService.update_user` calls it when an
   administrator supplies a non-blank address, so a repoint on the engine's own admin surface still
-  works.
+  works. *Amended 2026-09-25 (Amendment A): the code read "a non-blank address" as any non-blank
+  profile `email`, so every admin save moved it. Only an explicit `notify_email` value does now.*
 - Every `_notify_security` call site, `has_notifiable_admin`, and the PHI startup gate
   `_assert_security_notice_is_deliverable` read `notify_email`.
 
@@ -140,3 +142,83 @@ Also out of scope and worth naming: `AuthService.update_user` writes the notific
 same field the profile write uses, so there is no way to set the two independently. That is deliberate
 — a separate input is an API and console change with no demand behind it yet — but it means an
 operator cannot today point notices somewhere the profile does not say.
+
+## Amendment A (2026-09-25) -- the admin save moves the notification address only on an explicit value
+
+BACKLOG #1139, slice 3. Found by the ASVS 6.3.7 re-score and read at engine `origin/main`
+`cfed42287`.
+
+**The Decision above let the admin surface do the repoint this ADR blocks.** It said
+`AuthService.update_user` calls `set_user_notify_email` "when an administrator supplies a non-blank
+address". The code did that for ANY non-blank profile `email`:
+
+```python
+if email is not None and email.strip():
+    await self._store.set_user_notify_email(user_id, email=email)
+```
+
+It sent a notice only when `email != before.email`. Both admin surfaces post the stored profile
+email back on every save:
+
+- `PATCH /users/{id}` fills an omitted `email` from the stored row.
+- The console user form is pre-filled with it.
+
+So a display-name edit or a disable copied the profile address into `notify_email`, silently. On
+a directory account the profile address is the directory's `mail`. That is the directory repoint
+this ADR exists to block, done one admin save later. On an account with no `notify_email`, it
+filled one from the directory. That is the auto-fill the Manager rejected on PR 1522.
+
+The *Negative / risks* paragraph said moving both kept "the ordinary edit behaves as before". That
+is the defect, stated as a feature. *Out of scope* recorded the missing separate input as having no
+demand. This is the demand.
+
+**Decision.** The notification address gets its own input.
+
+- `UserUpdateRequest.notify_email` is the one field that moves it. Omitted, it is left alone. An
+  explicit `null` is refused with `400`.
+- `update_user` takes `notify_email: str | None = None`. The profile `email` never reaches
+  `set_user_notify_email`. The stored address sent back writes nothing, sends nothing, and is not
+  re-checked, so a value another writer stored cannot block an unrelated save. Any other value
+  must pass `_require_single_mailbox` (not blank, one plain mailbox), checked before anything is
+  written, so a refusal undoes the whole save. It raises `InvalidNotifyEmail`, which the route
+  alone turns into `400`.
+- A move writes `user.notify_email_changed` (actor: the administrator; detail: `user_id` and
+  `had_address`, never an address) BEFORE the column, as `admin-set-notify-email` orders it. It
+  sends `email_changed` to the OLD address with `field: notify_email`. When there was no old
+  address, it sends `notify_email_set` to the new one with `set_by: administrator`. Both bodies say
+  an administrator did it.
+- The save's other notices (a profile email change, a disable) still go to the address from before
+  the save. An account that had none gets them at the address the save set.
+- The console user page shows a Notification address field and a hidden copy of the value it
+  showed. The route sends the field only when the administrator changed it from that copy, so a
+  stale page cannot undo another administrator's move. Emptying it is refused.
+
+The rest of the Decision stands. `set_user_notify_email` is still the only writer after creation,
+and no directory-derived value reaches it.
+
+**Rejected: compare the posted `email` against the stored `email`, and move `notify_email` only
+when it changed.** It stops the unrelated save. It still moves the notification address as a side
+effect of a profile edit, and fills a blank one from it. On a directory account that edit is
+overwritten at the next sign-in, while the notification address keeps the value.
+
+**Rejected: compare the posted `email` against the stored `notify_email`.** The surfaces post the
+PROFILE value, so on a directory account whose `mail` moved the two differ on every save. That is
+the defect itself.
+
+**Breaking.** An API client that set `email` to repoint notices now moves only the profile address.
+It must send `notify_email`. CLAUDE.md section 0: zero deployments, so no shim.
+
+**Acceptance criteria added.**
+
+- **AC-9** -- WHEN an administrator saves an account without naming `notify_email`, THE SYSTEM SHALL
+  leave `users.notify_email` unchanged, whether it is set or blank, and SHALL send no address
+  notice. -> `tests/test_admin_notify_email_update.py::test_an_unrelated_save_does_not_move_the_notification_address`,
+  `::test_an_unrelated_save_does_not_fill_a_blank_notification_address`,
+  `::test_patch_without_the_field_leaves_the_notification_address`, and
+  `packaging/messagefoundry-webconsole/tests/test_webui.py::test_an_unrelated_console_save_leaves_the_notification_address`
+- **AC-10** -- WHEN an administrator names a new `notify_email`, THE SYSTEM SHALL move it, write
+  `user.notify_email_changed`, and notify the previous address, or the new one when there was none.
+  -> `tests/test_admin_notify_email_update.py::test_an_explicit_change_moves_the_address_and_tells_the_old_one`,
+  `::test_an_explicit_fill_tells_the_address_it_set`
+- **AC-5 is re-pointed**: its test now names `notify_email`. Setting `email` alone no longer moves
+  the address, which is AC-9.

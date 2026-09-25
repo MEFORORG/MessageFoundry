@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""AuthService — orchestrates authentication, sessions, role resolution, and first-run bootstrap.
+"""AuthService — orchestrates authentication, sessions, role resolution, and role seeding.
 
 Pure engine-side code (no FastAPI): the API layer composes it. It ties together the store (users,
 roles, sessions, audit), password hashing/policy, opaque session tokens, and the LDAP/Kerberos
@@ -91,9 +91,6 @@ from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
 
-#: The account created on first run when the store has no users (HIPAA unique-user bootstrap).
-BOOTSTRAP_USERNAME = "admin"
-
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
     """Eagerly load (and cache) an operator breach corpus at startup so a misconfigured path surfaces
@@ -132,13 +129,14 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     an outage. The engine's own ``serve`` lifespan no longer stops either, since BACKLOG #1447: a FIRST
     run used to fail there, and :meth:`AuthService._generate_policy_password` now suppresses this screen
     on its own candidate -- see that call for why. Stated as that ONE path rather than as "nothing
-    anywhere": the ``provision-first-administrator`` CLI still halts on this, and uncaught.
+    anywhere": the ``provision-admin`` CLI still refuses on this, as an error message since Wave 2.
 
-    BACKLOG #1886: the message names the forced rotation a first ``serve`` now cannot finish. The
-    chain behind that is stated once, on :class:`BreachCorpusUnavailable`. This runs from
-    ``__init__``, before ``initialize`` decides whether to mint, so the claim is conditional. A
-    repaired file is read without a restart, since ``lru_cache`` does not cache an exception. The
-    setting is read once into ``PasswordPolicy``, so changing it needs a restart.
+    BACKLOG #1886: the message names the forced rotation that cannot finish while the corpus is
+    unusable. The chain behind that is stated once, on :class:`BreachCorpusUnavailable`. Since ADR
+    0183 Amendment A, Wave 2, a first ``serve`` mints no account, so the first administrator comes
+    from ``provision-admin``, and that command fails for this reason too. A repaired file is read
+    without a restart, since ``lru_cache`` does not cache an exception. The setting is read once into
+    ``PasswordPolicy``, so changing it needs a restart.
 
     Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
     """
@@ -150,11 +148,9 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
         _log.error(
             "%s; creating or changing a local password by hand will be REFUSED until it is "
             "repaired (ASVS 6.2.4). An account that must change its password therefore cannot "
-            "finish that change, and the attempt fails with a server error. A `serve` against a "
-            "store with no users still creates the bootstrap admin, and that account must change "
-            "its password. An administrator's password reset leaves its user stuck the same way, "
-            "and `provision-admin` fails for this reason too. Repair the corpus before the deadline "
-            "in bootstrap-admin.txt, and keep that file until the change succeeds. To repair it, "
+            "finish that change, and the attempt fails with a server error. An administrator's "
+            "password reset leaves its user stuck the same way, and `provision-admin` cannot "
+            "create the first administrator for this reason either. To repair it, "
             "reinstall the messagefoundry wheel; a repaired file is read without a restart. Or set "
             "[auth].password_check_breached = false and restart, to accept unscreened passwords "
             "deliberately",
@@ -398,20 +394,6 @@ class MfaStatus:
     webauthn_enrolled: bool = False
 
 
-@dataclass(frozen=True)
-class BootstrapAdmin:
-    """Credentials for the one-time bootstrap admin (printed once, then must be changed)."""
-
-    username: str
-    password: str
-    # ASVS 6.4.5: the instant this credential stops working — the EARLIER of the two bounds, since
-    # BACKLOG #1245 (WP-3 retiring the ACCOUNT at created_at + [auth].bootstrap_expiry_hours, and
-    # ASVS 6.4.1 expiring the CREDENTIAL at password_changed_at + [auth].initial_password_expiry_hours).
-    # None only when BOTH are off. Surfaced at issuance so the renewal instruction ("claim it before
-    # <ISO>") ships WITH the credential — which is exactly why it must not name the later of the two.
-    expires_at: float | None = None
-
-
 class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
 
@@ -440,6 +422,28 @@ def _is_single_mailbox(address: str) -> bool:
         and all(ch.isprintable() and not ch.isspace() for ch in address)
         and not any(ch in _ADDRESS_FORBIDDEN_CHARS for ch in address)
     )
+
+
+class InvalidNotifyEmail(ValueError):
+    """A notification address was refused before anything was written (BACKLOG #1139).
+
+    A ``ValueError``, so a caller that catches that still does. Its own type lets a route turn
+    exactly this refusal into a ``400``, and not some other ``ValueError`` raised after a write."""
+
+
+def _require_single_mailbox(value: str) -> str:
+    """``value`` stripped, when it may become a notification address; else :class:`InvalidNotifyEmail`.
+
+    The check both engine surfaces that take a typed address apply: the holder's own fill and an
+    administrator's explicit change. Not blank (:func:`require_notify_email`), and one plain
+    mailbox (:func:`_is_single_mailbox`)."""
+    try:
+        address = require_notify_email(value)
+    except ValueError as exc:
+        raise InvalidNotifyEmail(str(exc)) from exc
+    if not _is_single_mailbox(address):
+        raise InvalidNotifyEmail("enter one email address, such as name@example.org")
+    return address
 
 
 class NotifyEmailAlreadySet(RuntimeError):
@@ -879,9 +883,6 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
-        #: ASVS 6.4.5 arm 2: once-per-process latch so the bootstrap-expiry reminder fires exactly once
-        #: while the unclaimed bootstrap sits inside its warn window (see :meth:`bootstrap_expiry_warning`).
-        self._bootstrap_expiry_warned = False
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_secret: str | None = None
@@ -1042,13 +1043,17 @@ class AuthService:
 
     # --- lifecycle -----------------------------------------------------------
 
-    async def initialize(self) -> BootstrapAdmin | None:
-        """Seed the built-in roles and, on an empty store, create the bootstrap admin. Also retires an
-        unclaimed bootstrap that became superseded/expired while the service was down (WP-3)."""
+    async def initialize(self) -> None:
+        """Seed the built-in roles. It creates no account (ADR 0183 Amendment A, BACKLOG #1136).
+
+        ASVS 6.3.2 asks that default accounts are not present or are disabled, and this takes the
+        first arm: until an operator acts, a store holds no account at all. Three paths create one,
+        and each needs a person first: ``messagefoundry provision-admin`` at the host,
+        :meth:`create_local_user` behind ``USERS_MANAGE``, and a directory sign-in, which assigns no
+        role. The first-run account this used to mint went in Wave 2, and the WP-3 lifecycle that
+        retired it went with it.
+        """
         await self._seed_roles()
-        created = await self._ensure_bootstrap_admin()
-        await self._retire_superseded_bootstrap()
-        return created
 
     async def _seed_roles(self) -> None:
         for role in Role:
@@ -1057,53 +1062,9 @@ class AuthService:
                 role_id=role.value, display_name=label, description=description, builtin=True
             )
 
-    async def _ensure_bootstrap_admin(self) -> BootstrapAdmin | None:
-        if await self._store.count_users() > 0:
-            return None
-        password = self._generate_policy_password()
-        user_id = uuid4().hex
-        await self._store.create_user(
-            user_id=user_id,
-            username=BOOTSTRAP_USERNAME,
-            auth_provider=AuthProvider.LOCAL.value,
-            display_name="Bootstrap Administrator",
-            password_hash=await self._argon2(hash_password, password),
-            must_change_password=True,
-        )
-        await self._store.set_user_roles(
-            user_id, [Role.ADMINISTRATOR.value], assigned_by="bootstrap"
-        )
-        await self._audit("auth.bootstrap_admin_created", actor="bootstrap")
-        # ASVS 6.4.5: derive the expiry from the STORED created_at (the same base
-        # _retire_superseded_bootstrap uses), so the surfaced deadline is exactly the retirement instant.
-        # BACKLOG #1245: the surfaced deadline is the EARLIER of the two bounds that can end this
-        # credential, not the WP-3 one alone. Computing it from `bootstrap_expiry_hours` by itself was
-        # the same account-versus-credential conflation #1245 removed from the login gate, surviving
-        # in the one field whose entire job is telling the operator when the credential dies — and it
-        # made `bootstrap-admin.txt` LIE in both directions once 6.4.1 stopped carving the bootstrap
-        # out: at `bootstrap_expiry_hours = 0` the file stated NO deadline while the credential
-        # expired at `initial_password_expiry_hours`, and at 8760 it stated a window 121x the real
-        # one. Each arm contributes nothing when its own setting is 0, so with both off there is
-        # genuinely no deadline and None is still correct.
-        created = await self._store.get_user(user_id)
-        deadlines: list[float] = []
-        if created is not None:
-            if self._settings.bootstrap_expiry_hours > 0:
-                # WP-3 retires the ACCOUNT, keyed on created_at.
-                deadlines.append(created.created_at + self._settings.bootstrap_expiry_hours * 3600)
-            # ASVS 6.4.1 expires the CREDENTIAL, keyed on password_changed_at. For a freshly minted
-            # bootstrap these two stamps are the same clock read, so at equal windows the minimum is
-            # that shared instant and the surfaced value is unchanged. BACKLOG #1141: through
-            # initial_credential_deadline, so this file states that arithmetic exactly once.
-            credential_deadline = self.initial_credential_deadline(created.password_changed_at)
-            if credential_deadline is not None:
-                deadlines.append(credential_deadline)
-        expires_at: float | None = min(deadlines) if deadlines else None
-        return BootstrapAdmin(username=BOOTSTRAP_USERNAME, password=password, expires_at=expires_at)
-
     def _generate_policy_password(self) -> str:
-        """A random password that satisfies the active policy — so the printed bootstrap credential
-        is held to the same bar operators are. ``token_urlsafe(n)`` yields ~1.33·n chars (so length is
+        """A random password that satisfies the active policy — so an administrator-issued temporary
+        credential is held to the same bar operators are. ``token_urlsafe(n)`` yields ~1.33·n chars (so length is
         guaranteed ≥ ``min_length``); the loop covers the astronomically-unlikely context hit or an
         opt-in character-class requirement a given token happens to miss.
 
@@ -1120,8 +1081,8 @@ class AuthService:
             # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
             # contain it -- the breach clause is inert on this input by construction. Honouring
             # `check_breached` here therefore converts a screen that can never FIRE into one that
-            # always BLOCKS: the corpus load raises on an unusable install (BACKLOG #1438), and this
-            # is the generator a first run's bootstrap admin comes from, so the raise escaped an
+            # always BLOCKS: the corpus load raises on an unusable install (BACKLOG #1438). While this
+            # also generated the first-run account (retired by ADR 0183), the raise escaped an
             # unguarded lifespan call and the engine did not start at all.
             #
             # Scoped to this ONE call on purpose. Every other caller of `violations` screens an
@@ -1147,10 +1108,9 @@ class AuthService:
     async def has_enabled_administrator(self) -> bool:
         """True iff some enabled account holds Administrator.
 
-        Delegates rather than re-looping, so the provisioning refusal below and the WP-3 supersession
-        test share ONE definition of "an enabled account holding Administrator" and cannot drift
-        apart. (Three further open-coded copies of that enumeration already exist -- see
-        :meth:`has_notifiable_admin` -- and unifying them is its own item, not this one.)
+        The provisioning refusal below asks this, and so does ``provision-admin`` before it prompts.
+        (Further open-coded copies of that enumeration exist -- see :meth:`has_notifiable_admin` --
+        and unifying them is its own item, not this one.)
         """
         return await self._other_enabled_admin_exists()
 
@@ -1170,8 +1130,8 @@ class AuthService:
         application or are disabled". The disabled arm is unexpressible at two altitudes --
         ``Store.create_user`` carries no ``disabled`` parameter and all three backends hardcode the
         column -- so the honest route is that no account is minted at all until an operator names one.
-        An operator who runs this before the first ``serve`` gets an install with no account named
-        ``admin``, because :meth:`_ensure_bootstrap_admin` then sees a non-empty table and declines.
+        Since ADR 0183 Amendment A, Wave 2, :meth:`initialize` mints nothing, so this is how the first
+        administrator of an install comes to exist.
 
         **The way in is filesystem authority over the store, not an account** -- the host gate argued
         once on :func:`messagefoundry.__main__._admin_unlock` and in ADR 0171, and not restated here.
@@ -1182,25 +1142,24 @@ class AuthService:
         assigns no role, so one completed sign-in leaves a roleless row, a non-empty table, and no
         administrator -- reached entirely through shipped code. A command guarded on emptiness would
         refuse exactly there, which is the state where the install has no way in. That refusal is
-        wider than the bootstrap guard by design: it makes this a standing recovery path whenever
+        wider than an emptiness guard by design: it makes this a standing recovery path whenever
         every administrator is lost, which overlaps BACKLOG #1236's subject on the same host boundary.
 
         **THE CREDENTIAL IS CLAIMED AT BIRTH, so there is no half-claimed state to restart into.**
         The password is typed by the operator at a TTY and reaches no file, no argv and no log, so
         "the holder set their own credential" is already true and ``users.password_claimed_at`` is
         stamped here rather than deferred to a forced rotation. ASVS 6.4.6's one-time temp governs an
-        admin-ISSUED credential handed to a second party; there is no second party here. The stamp is
-        also load-bearing against WP-3: an operator who names this account ``admin`` would otherwise
-        satisfy :meth:`_unclaimed_bootstrap`, and the retirement sweep would disable the only
-        administrator on the deployment at ``bootstrap_expiry_hours``.
+        admin-ISSUED credential handed to a second party; there is no second party here. Before Wave 2
+        the stamp also kept an account the operator named ``admin`` out of the WP-3 retirement sweep.
+        That sweep is gone, and the stamp stays because the fact it records is still true.
 
         **EVERY INTERRUPTION POINT LEAVES A RECOVERABLE STORE, and the test for that is HOLDS NO
         ROLES -- one signal, chosen because it is the only one true at both of them.** The row is
         created with no password hash, then the credential is set, then the role is assigned, so the
         two states a crash can leave are *no hash, no roles* and *hash, no roles*. An earlier draft
         also refused a stamped ``password_claimed_at``, which is set by the credential write: that
-        refused the SECOND state, leaving a row this command could never complete and WP-3 could never
-        retire -- a stranded install, which is exactly the risk the design exists to avoid. Roleless
+        refused the SECOND state, leaving a row this command could never complete -- a stranded
+        install, which is exactly the risk the design exists to avoid. Roleless
         is also what makes the takeover safe rather than merely convenient: the account holds no
         permission to inherit, and this branch is reachable only when the store has no enabled
         administrator at all, which is already the state an operator needs recovering from.
@@ -1289,75 +1248,14 @@ class AuthService:
         )
         return ProvisionedAdministrator(user_id=user_id, username=username, repaired=repaired)
 
-    async def _unclaimed_bootstrap(self) -> UserRecord | None:
-        """The first-run bootstrap admin while it is still present, enabled and **never claimed** —
-        otherwise ``None``. This is the ONE claimed-ness test of the WP-3 lifecycle: both the
-        retirement (:meth:`_retire_superseded_bootstrap`) and its advisory warning
-        (:meth:`bootstrap_expiry_warning`) go through it, because two open-coded copies of one
-        lifecycle test is exactly how the warn path silently inherited BACKLOG #1245.
-
-        Claimed-ness is the RECORDED ``users.password_claimed_at`` — stamped write-once when the
-        holder sets their own credential through authenticated self-service rotation — never the
-        INFERRED ``must_change_password``. That distinction is the fix: "never claimed" is
-        monotonic (once claimed, always claimed) while ``must_change_password`` is not, since an
-        admin password reset legitimately re-raises it (ASVS 6.4.6 wants an admin-issued credential
-        to be a one-time temp, so that write must stay). Reading the flag as claimed-ness therefore
-        made a reset of the account named ``admin`` look never-claimed again, and the next trigger
-        would disable an account claimed long ago — on a single-admin deployment, with no second
-        administrator left able to re-enable it. A recorded fact cannot be un-recorded by a writer
-        that means something else.
-
-        Note ``password_claimed_at`` records that the holder once set their own credential, NOT
-        that they are still in control — recovering a compromised account is what the admin reset
-        is for, and it deliberately does not restore retirement eligibility."""
-        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
-        if boot is None or boot.disabled or boot.password_claimed_at is not None:
-            return None  # gone, already disabled, or claimed (a real account now)
-        # WP-3 governs the LOCAL first-run account and nothing else. This guard is not incidental to
-        # the claimed-ness fix, it is REQUIRED BY it: the retired ``must_change_password`` test
-        # excluded a directory-provisioned account BY ACCIDENT, because such a row has no password
-        # and so carries the flag False, and the old predicate returned early on exactly that. The
-        # recorded stamp does not reproduce that side effect -- a federated row has no stamp either,
-        # which reads as "never claimed" -- so replacing the flag without this line would newly
-        # auto-disable a real directory administrator who happens to be named ``admin``, revoking
-        # their sessions and auditing it as a bootstrap retirement. That is the same lockout class
-        # WP-3's own fix exists to prevent, re-opened on a different row shape.
-        if boot.auth_provider != AuthProvider.LOCAL.value:
-            return None
-        return boot
-
-    async def _retire_superseded_bootstrap(self, now: float | None = None) -> None:
-        """Disable the first-run bootstrap admin once it's no longer needed (WP-3): when a **second**
-        administrator exists, or — while still **unclaimed** — once its expiry window lapses. It only
-        ever touches an account that has never been claimed per :meth:`_unclaimed_bootstrap`; an
-        account whose holder set their own credential is a normal admin account and is left alone,
-        so retirement cannot lock a single-admin deployment out of its only administrator."""
-        now = time.time() if now is None else now
-        boot = await self._unclaimed_bootstrap()
-        if boot is None:
-            return
-        expiry_hours = self._settings.bootstrap_expiry_hours
-        expired = expiry_hours > 0 and now >= boot.created_at + expiry_hours * 3600
-        superseded = await self._other_enabled_admin_exists(boot.id)
-        if not (expired or superseded):
-            return
-        await self._store.set_user_disabled(boot.id, disabled=True)
-        await self._store.revoke_user_sessions(boot.id)
-        await self._audit(
-            "auth.bootstrap_admin_retired",
-            actor="system",
-            detail=_json({"reason": "superseded" if superseded else "expired"}),
-        )
-
     def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
         """The instant an admin-issued must-change credential stops working, or ``None`` when
         ``[auth].initial_password_expiry_hours`` is 0 (no expiry) or the account carries no
         ``password_changed_at`` stamp.
 
         BACKLOG #1141 (ASVS 6.4.5). THE ONE COMPUTATION OF THE 6.4.1 CREDENTIAL DEADLINE. The login
-        gate refuses on it, :meth:`admin_reset_password` surfaces it to the issuing administrator,
-        :meth:`_ensure_bootstrap_admin` writes it into ``bootstrap-admin.txt`` and
-        :meth:`bootstrap_expiry_warning` warns ahead of it. Those were four open-coded copies of one
+        gate refuses on it, :meth:`admin_reset_password` surfaces it to the issuing administrator, and
+        the lifespan's reminder warns ahead of it. Those were once four open-coded copies of one
         arithmetic, which is precisely the shape BACKLOG #1245 already cost this file once: two copies
         of one lifecycle test let the warn path drift from the gate silently. A surfaced deadline that
         can disagree with the enforced one is worse than no deadline at all, because the holder plans
@@ -1370,47 +1268,6 @@ class AuthService:
         if hours <= 0 or password_changed_at is None:
             return None
         return password_changed_at + hours * 3600.0
-
-    async def bootstrap_expiry_warning(self, now: float | None = None) -> tuple[float, int] | None:
-        """ASVS 6.4.5 arm 2: if the first-run bootstrap admin is STILL UNCLAIMED (the shared test,
-        :meth:`_unclaimed_bootstrap`) and ``now`` sits inside its warn window
-        ``[expires_at - bootstrap_warn_hours, expires_at)``, return the retirement instant
-        + whole hours remaining ONCE — an in-memory latch means a periodic caller emits exactly one
-        reminder per process. Returns ``None`` when time-expiry is off, the bootstrap is
-        gone/disabled/claimed, ``now`` is before the window (or already at/past it — retirement itself has
-        taken over by then), or a reminder already fired this process. Advisory only: the actual
-        auto-disable is :meth:`_retire_superseded_bootstrap`; this nudges an operator BEFORE it happens.
-
-        ``expires_at`` is derived from the STORED ``created_at`` — the same base
-        :meth:`_retire_superseded_bootstrap` uses — so the surfaced deadline is exactly the retirement
-        instant, not a fresh clock. The caller (the API-lifespan reminder) turns it into an ISO string +
-        the PHI-free ``bootstrap_admin_expiring`` AlertSink event; the password is never surfaced."""
-        if self._bootstrap_expiry_warned:
-            return None
-        # BACKLOG #1245: warn about whichever bound comes FIRST. Gating on bootstrap_expiry_hours
-        # alone meant that at 0 this returned None and the operator got no warning at all for the
-        # deadline that now actually ends the credential (ASVS 6.4.1), and at a long WP-3 window it
-        # would have warned about the later bound. Keyed off the same minimum the issuance deadline
-        # uses, so the two can never disagree.
-        boot = await self._unclaimed_bootstrap()
-        if boot is None:
-            return None
-        candidates: list[float] = []
-        if self._settings.bootstrap_expiry_hours > 0:
-            candidates.append(boot.created_at + self._settings.bootstrap_expiry_hours * 3600)
-        credential_deadline = self.initial_credential_deadline(boot.password_changed_at)
-        if credential_deadline is not None:
-            candidates.append(credential_deadline)
-        if not candidates:
-            return None  # no bound of either kind configured → nothing to warn about
-        now = time.time() if now is None else now
-        expires_at = min(candidates)
-        warn_start = expires_at - max(0, self._settings.bootstrap_warn_hours) * 3600
-        if not (warn_start <= now < expires_at):
-            return None  # not yet in the window, or already at/past the retirement instant
-        self._bootstrap_expiry_warned = True  # latch: exactly one reminder per process
-        hours_remaining = max(0, int((expires_at - now) // 3600))
-        return (expires_at, hours_remaining)
 
     # --- login ---------------------------------------------------------------
 
@@ -1522,30 +1379,7 @@ class AuthService:
     async def _login_local(
         self, username: str, password: str, *, client: str | None, supersedes: str | None = None
     ) -> LoginOutcome:
-        # Enforce bootstrap expiry/supersession before the credential check: an unclaimed bootstrap
-        # that lapsed (or was superseded) is disabled here, so the disabled-account path below refuses
-        # it like any other invalid login (WP-3).
-        #
-        # BACKLOG #1268: THE GATE ASKS THE ROW THE STORE RESOLVED, NEVER THE CALLER'S SPELLING. It
-        # used to read `if username == BOOTSTRAP_USERNAME` -- a PYTHON comparison against the input,
-        # while the lookup below is resolved by the COLUMN'S COLLATION. On a case-insensitive store
-        # those disagree in exactly one direction: `Admin` FAILS the Python guard, so retirement never
-        # runs, and then SUCCEEDS at the lookup, handing back the very row the skipped call would have
-        # disabled. MEASURED before this fix: a lapsed, unclaimed bootstrap credential logged in
-        # successfully as `Admin` while the identical attempt as `admin` was refused and retired.
-        # That is SDS-3.7 exactly -- a compensating control resting on a false premise, the premise
-        # being that the username the gate compared is the username the store matched.
-        #
-        # Comparing the STORED value keeps this correct under any collation, including one the engine
-        # does not control (an operator-supplied database, a restored dump, a column altered
-        # downstream), so it does not depend on the sibling fix in the SQL Server DDL. The `==` is
-        # exact on purpose: `_ensure_bootstrap_admin` writes the canonical spelling, so the stored
-        # value is canonical by construction. The cost is one extra lookup ON THE BOOTSTRAP PATH ONLY
-        # -- an ordinary login still does the single lookup it always did, plus a string compare.
         user = await self._store.get_user_by_username(username)
-        if user is not None and user.username == BOOTSTRAP_USERNAME:
-            await self._retire_superseded_bootstrap()
-            user = await self._store.get_user(user.id)  # re-read: retirement may have disabled it
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
             # distinguishable from a wrong password (defeats username enumeration via latency).
@@ -1587,24 +1421,9 @@ class AuthService:
         # it is indistinguishable from a wrong password) and audited. A user who set their own
         # password has `must_change_password=False` and is never gated here.
         #
-        # THERE IS NO BOOTSTRAP CARVE-OUT HERE, AND BACKLOG #1245 IS WHY IT WENT. It used to exempt
-        # the bootstrap entirely, on the premise that WP-3 gives that account its own deadline. That
-        # premise CONFLATES TWO DIFFERENT CONTROLS: WP-3 retires an ACCOUNT, 6.4.1 expires a
-        # CREDENTIAL. Different triggers, different outcomes, and one is not a substitute for the
-        # other — which becomes visible the moment WP-3 cannot bound the credential at all:
-        #
-        #   - `bootstrap_expiry_hours = 0` is a documented, supported value that disables the time
-        #     arm outright (settings.py, "0 = no time expiry"), and the supersession arm needs a
-        #     second administrator who may never be created. MEASURED before this fix: the printed
-        #     first-run credential still logged in at 73 hours, 8760 hours and 87600 hours.
-        #   - `bootstrap_expiry_hours` set LONGER than this policy (say 8760) bounded the credential
-        #     at 100x the 6.4.1 window.
-        #
-        # Neither is reported by security_loosenings(), so both were silent. Dropping the carve-out
-        # is near-behaviour-neutral at the stock 72/72 defaults — a freshly minted bootstrap has
-        # created_at and password_changed_at within milliseconds of each other, so 6.4.1 comes due at
-        # the same instant WP-3 retirement already does — while closing both misconfigurations.
-        # BACKLOG #1141: the deadline comes from initial_credential_deadline, the SAME call
+        # There is no per-account carve-out here. BACKLOG #1245 removed the one the first-run account
+        # had, because retiring an ACCOUNT and expiring a CREDENTIAL are different controls and one
+        # is not a substitute for the other; ADR 0183 then retired that account. BACKLOG #1141: the deadline comes from initial_credential_deadline, the SAME call
         # admin_reset_password surfaces to the issuing administrator — so the instant the response
         # states and the instant this gate refuses on are one computation, not two that agree today.
         expiry_hours = self._settings.initial_password_expiry_hours
@@ -2633,31 +2452,6 @@ class AuthService:
         return bool(self._settings.ad_session_recheck_seconds) and self._ldap is not None
 
     @property
-    def bootstrap_deadline_configured(self) -> bool:
-        """Whether ANY bound can end the unclaimed bootstrap credential -- so whether the ASVS 6.4.5
-        reminder task has anything to warn about. Drives whether the API lifespan creates it at all.
-
-        BACKLOG #1141. This exists because the lifespan gate open-coded
-        ``bootstrap_expiry_hours > 0`` while :meth:`bootstrap_expiry_warning` warns on the EARLIER of
-        **two** bounds -- WP-3 account retirement and the ASVS 6.4.1 credential expiry. Those are
-        different questions, and BACKLOG #1245 corrected the two computations in this file without
-        reaching the gate that decides whether they ever run.
-
-        THE CONSEQUENCE WAS A SILENTLY DEAD WARNING ARM, not a style defect: at
-        ``bootstrap_expiry_hours = 0`` with ``initial_password_expiry_hours`` set, the warning method
-        correctly computes a deadline and **nothing ever calls it**, because the reminder task is its
-        only consumer and was never created. The operator gets no notice before the credential dies.
-
-        Same lesson :meth:`_unclaimed_bootstrap` records one level over: two open-coded copies of one
-        lifecycle question is how the warn path inherited #1245. This is the third copy, in another
-        module, and it inherited it too.
-        """
-        return (
-            self._settings.bootstrap_expiry_hours > 0
-            or self._settings.initial_password_expiry_hours > 0
-        )
-
-    @property
     def directory_reconcile_alert(self) -> str | None:
         """The last mass-revoke circuit-breaker trip, or ``None``. Latches until a pass completes
         without tripping, so an operator who missed the log line still sees the standing condition."""
@@ -3468,10 +3262,10 @@ class AuthService:
 
         BACKLOG #1139 (ASVS 6.3.7). An account with no ``notify_email`` is told nothing out of band
         about a change to its authentication details, because the notifier drops a notice with no
-        address. At least four paths give birth to such an account: the first-run bootstrap administrator,
-        ``create_local_user`` with no email, ``provision-admin`` with no ``--email``, and a directory
-        sign-in whose directory returns no ``mail``. So the first sign-in sets one, in the shape of
-        the ``must_change_password`` confinement.
+        address. At least three paths give birth to such an account: ``create_local_user`` with no
+        email, ``provision-admin`` with no ``--email``, and a directory sign-in whose directory returns
+        no ``mail``. (A fourth, the first-run bootstrap administrator, was retired by ADR 0183.) So the
+        first sign-in sets one, in the shape of the ``must_change_password`` confinement.
 
         **ONLY WHEN A SECURITY-NOTICE CHANNEL IS WIRED**, which is ``[auth].notify_security_events``
         on and an ``[alerts]`` SMTP relay configured. Without one, no account is notified whatever it
@@ -3482,6 +3276,34 @@ class AuthService:
         no store backend carries a flag for it.
         """
         return self._security_notifier is not None and not (user.notify_email or "").strip()
+
+    @staticmethod
+    def suggested_notify_email(profile_email: str | None) -> str | None:
+        """The profile ``email`` to offer on the console's address form, or ``None``.
+
+        BACKLOG #1139. Stripped, and only when it passes the shape check
+        :meth:`fill_own_notify_email` applies, so the form never offers a value its own submit
+        refuses. On a directory account the profile address is the last ``mail`` the directory
+        supplied, which is why this is a suggestion only. It writes nothing; the holder's submit is
+        the only thing that fills ``notify_email``.
+
+        **ONLY A PURE-ASCII ADDRESS IS OFFERED, AND NO PUNYCODE DOMAIN.** A directory writer could
+        store a homoglyph lookalike of the holder's real address, such as a Cyrillic ``a`` for a
+        Latin one. An ``xn--`` label is the same lookalike in ASCII form, and a browser may show it
+        decoded. This refuses both. It does NOT refuse an all-ASCII lookalike such as ``examp1e``;
+        the line under the input asks the holder to check the value. The submit is not narrowed: a
+        holder may still type any address :meth:`fill_own_notify_email` accepts.
+
+        A method rather than a module function so the console reaches it through the service it
+        already holds, where seam discovery sees it and moves ``ENGINE_UI_SEAM``.
+        """
+        address = (profile_email or "").strip()
+        if not _is_single_mailbox(address) or not address.isascii():
+            return None
+        domain = address.rpartition("@")[2]
+        if any(label.lower().startswith("xn--") for label in domain.split(".")):
+            return None
+        return address
 
     async def fill_own_notify_email(
         self, identity: Identity, email: str, *, client: str | None = None
@@ -3497,17 +3319,17 @@ class AuthService:
         session is all it would take. Raises :class:`NotifyEmailAlreadySet` for that, and
         :class:`ValueError` for a blank value (:func:`require_notify_email`).
 
-        **THE FIRST ADDRESS IS TRUSTED AS TYPED.** Whoever holds this session (password, and the
+        **THE FIRST ADDRESS IS TRUSTED AS SUBMITTED.** Whoever holds this session (password, and the
         factor where one is enrolled) chooses where notices go. Nothing checks that the holder
-        receives mail there. The audit row names the change in the holder's own
-        ``/me/security-events`` feed, and the notice goes to the address just set.
+        receives mail there. The console form may start with :meth:`suggested_notify_email`, which a
+        directory writer can influence; the holder still has to submit it. The audit row names the
+        change in the holder's own ``/me/security-events`` feed, and the notice goes to the address
+        just set.
 
         The fill-only check is a read, then an unconditional write. Two concurrent calls from the
         same account can both pass it; the later write wins and both are audited.
         """
-        address = require_notify_email(email)
-        if not _is_single_mailbox(address):
-            raise ValueError("enter one email address, such as name@example.org")
+        address = _require_single_mailbox(email)
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such account")
@@ -4967,8 +4789,6 @@ class AuthService:
         await self._audit(
             "user.created", actor=actor, detail=_json({"username": username, "roles": list(roles)})
         )
-        # If this created a second administrator, retire the now-redundant bootstrap admin (WP-3).
-        await self._retire_superseded_bootstrap()
         return user_id
 
     async def update_user(
@@ -4979,27 +4799,69 @@ class AuthService:
         email: str | None,
         disabled: bool | None,
         actor: str,
+        notify_email: str | None = None,
     ) -> None:
+        """Apply an administrator's edit to an account's profile, disabled flag and notification
+        address.
+
+        **THE NOTIFICATION ADDRESS MOVES ONLY WHEN ``notify_email`` NAMES A DIFFERENT ONE (BACKLOG
+        #1139, ADR 0182 Amendment A).** ``None`` leaves it alone, and the profile ``email`` never
+        touches it. It used to: any non-blank ``email`` was copied in, and both admin surfaces post
+        the stored profile email back on every save. So a display-name edit copied the directory's
+        ``mail`` into the engine-owned column with no notice, and filled a blank one from it.
+
+        The stored address, posted back, is a no-op and is not re-checked, so an address another
+        writer stored cannot block an unrelated save. Any other value is checked before anything is
+        written (:func:`_require_single_mailbox`), so a refusal leaves the whole save undone. Raises
+        :class:`InvalidNotifyEmail` for it.
+        """
         before = await self._store.get_user(user_id)  # capture old email/disabled for notifications
+        stored_notify = ((before.notify_email if before is not None else None) or "").strip()
+        new_notify: str | None = None
+        if notify_email is not None and (
+            not notify_email.strip() or notify_email.strip() != stored_notify
+        ):
+            new_notify = _require_single_mailbox(notify_email)
         await self._store.update_user_profile(user_id, display_name=display_name, email=email)
-        # THE ENGINE-OWNED NOTIFICATION ADDRESS MOVES ONLY HERE, AND ONLY UPWARDS (BACKLOG #1139).
-        # This is an administrator acting on the engine's own surface, so it is the one write allowed
-        # to repoint where notices go — the directory sync above (`update_user_profile`, which
-        # `_upsert_ad_user` also calls) is not.
-        #
-        # A BLANK ADDRESS FALLS THROUGH DELIBERATELY, and that is the durability rule in force: the
-        # profile mirror clears, and the notification address stands. Requiring an address at creation
-        # would not have achieved this on its own, because an explicit null still strips it afterwards
-        # — and an account with no address is excluded from every later notice, which is exactly the
-        # structural exclusion this item was filed against. `set_user_notify_email` takes `str`, so
-        # there is no way to spell the clear even by mistake.
-        if email is not None and email.strip():
-            await self._store.set_user_notify_email(user_id, email=email)
+        # The profile write above never names `notify_email`: it is the same call `_upsert_ad_user`
+        # makes, and on a directory account `email` is the directory's.
+        if before is not None and new_notify is not None:
+            # AUDITED BEFORE THE WRITE, as admin-set-notify-email is. Of the two orders that can
+            # leave the row and the column disagreeing, an unaudited move is the worse. The row
+            # holds no address, as every other write of the column records it.
+            await self._audit(
+                "user.notify_email_changed",
+                actor=actor,
+                detail=_json({"user_id": user_id, "had_address": bool(stored_notify)}),
+            )
+            await self._store.set_user_notify_email(user_id, email=new_notify)
+            if stored_notify:
+                # Tell the address notices are moving AWAY from. It is the one the legitimate holder
+                # still reads when the move was hostile or mistaken (ADR 0182, option 3).
+                await self._notify_security(
+                    EMAIL_CHANGED,
+                    username=before.username,
+                    email=stored_notify,
+                    detail={"new_email": new_notify, "field": "notify_email"},
+                )
+            else:
+                # No earlier address, so nobody else to tell: the notice goes to the one just set,
+                # as the holder's own fill does (`fill_own_notify_email`).
+                await self._notify_security(
+                    NOTIFY_EMAIL_SET,
+                    username=before.username,
+                    email=new_notify,
+                    detail={"set_by": "administrator"},
+                )
         if disabled is not None:
             await self._store.set_user_disabled(user_id, disabled=disabled)
             if disabled:
                 await self._store.revoke_user_sessions(user_id)
         await self._audit("user.updated", actor=actor, detail=_json({"user_id": user_id}))
+        # The rest of this save's notices go where the account's notices went before it, so a move
+        # in the same save cannot take them away from the previous holder. An account that had no
+        # address is the exception: the one this save set is then the only one reachable.
+        notice_to = stored_notify or new_notify
         if before is not None:
             if email != before.email:
                 # Notify the OLD address — so the legitimate owner is alerted even if an attacker (or a
@@ -5022,12 +4884,12 @@ class AuthService:
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=before.username,
-                    email=before.notify_email,
+                    email=notice_to,
                     detail={"new_email": email},
                 )
             if disabled and not before.disabled:
                 await self._notify_security(
-                    ACCOUNT_DISABLED, username=before.username, email=before.notify_email
+                    ACCOUNT_DISABLED, username=before.username, email=notice_to
                 )
 
     async def delete_user(self, user_id: str, *, actor: str) -> None:
@@ -5174,8 +5036,7 @@ class AuthService:
         bare password: the renewal instruction for an expiring mechanism has to travel WITH the
         mechanism, and this return value is the only thing that reaches the issuing administrator.
         ``expires_at`` is read back from the STORED ``password_changed_at`` the write above just
-        stamped — the same source :meth:`_ensure_bootstrap_admin` uses — rather than from a fresh
-        clock, so the surfaced instant is the one the login gate will actually refuse on.
+        stamped rather than from a fresh clock, so the surfaced instant is the one the login gate will actually refuse on.
         """
         user = await self._store.get_user(user_id)
         if user is None:
@@ -5444,7 +5305,8 @@ class AuthService:
         """True iff ``user_id`` is an enabled administrator and the only one remaining.
 
         Guards the role-removal path so the deployment can never be left with no usable admin
-        account (the bootstrap admin only regenerates against a fully empty users table).
+        account. Nothing regenerates one: since ADR 0183 the way back is ``provision-admin`` at the
+        host.
         """
         admins: set[str] = set()
         for user in await self._store.list_users():
@@ -5460,15 +5322,15 @@ class AuthService:
         BACKLOG #1020. The PHI startup gate computes notification readiness from the SMTP transport
         alone (``notify_security_events`` + ``email_smtp_host`` + ``email_from``), which answers
         *"is a transport configured"* and never *"can the account that matters actually receive"*.
-        Those come apart on a first run: ``_ensure_bootstrap_admin`` creates the account holding
-        ``frozenset(Permission)`` with no ``email=``, and ``SecurityEventNotifier.notify`` starts
-        ``if not event.email: return`` -- so every notice about the most privileged account on the
-        instance no-ops while the gate reports a healthy channel.
+        Those come apart whenever an Administrator has no address -- ``provision-admin`` without
+        ``--email``, or an account made in the web console without one -- and
+        ``SecurityEventNotifier.notify`` starts ``if not event.email: return``, so every notice about
+        the most privileged account on the instance no-ops while the gate reports a healthy channel.
 
-        Deliberately scoped to the ROLE, not to the bootstrap account: ``email`` is optional in
-        ``UserCreateRequest`` and is not required for the Administrator role, so a hand-created
-        privileged account has the identical hole. Keying on the bootstrap user alone would close
-        the instance this was found on and leave the class open.
+        Deliberately scoped to the ROLE, not to one account: ``email`` is optional in
+        ``UserCreateRequest`` and is not required for the Administrator role. The item was found on
+        the first-run account ADR 0183 has since retired, and keying on that account alone would have
+        closed the instance and left the class open.
 
         **Reads ``notify_email``, not ``email`` (BACKLOG #1139).** Those are two columns now: ``email``
         is the profile address and, on a directory account, a mirror the next AD login overwrites,

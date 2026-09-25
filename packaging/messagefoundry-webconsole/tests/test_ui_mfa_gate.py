@@ -61,7 +61,7 @@ async def _service(engine: Engine, **kw: object) -> AuthService:
 
 
 #: The first Administrator's name and temporary password. Synthetic; the password clears the default
-#: policy. Not "admin", which is the bootstrap account's name.
+#: policy. Not "admin", so it cannot collide with a test that names an account that on purpose.
 _ADMIN_USERNAME = "test-admin"
 _ADMIN_PW = "a-strong-operator-passphrase"
 
@@ -71,16 +71,11 @@ async def _must_change_admin(service: AuthService) -> str:
     username.
 
     A local twin of ``tests/_admin_account.create_admin``, for the same reason ``_PinnedClock`` is
-    one: this package has its own test root. It stands in for the first-run bootstrap account, which
-    ADR 0183 Amendment A retires (BACKLOG #1136), and it has the same credential state: admin-issued,
-    must change, no factor. The row goes in BEFORE ``initialize()``, which mints the bootstrap only on
-    an empty users table, so this behaves the same with and without the bootstrap. Call it INSTEAD of
-    ``initialize()``, not after it.
+    one: this package has its own test root. It stood in for the first-run bootstrap account before
+    ADR 0183 Amendment A retired it (BACKLOG #1136), and it keeps that credential state: admin-issued,
+    must change, no factor. Wave 2 dropped its guard against a pre-existing ``admin`` row, as it did
+    in the twin: nothing creates that row now.
     """
-    if await service.store.get_user_by_username("admin") is not None:
-        raise RuntimeError(
-            "the bootstrap account already exists: call _must_change_admin() instead of initialize()"
-        )
     user_id = uuid4().hex
     await service.store.create_user(
         user_id=user_id,
@@ -89,7 +84,7 @@ async def _must_change_admin(service: AuthService) -> str:
         password_hash=await asyncio.to_thread(hash_password, _ADMIN_PW),
         must_change_password=True,
     )
-    await service.initialize()  # seeds the roles; the table is not empty, so it mints no account
+    await service.initialize()  # seeds the roles the assignment below refers to
     await service.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")
     return _ADMIN_USERNAME
 

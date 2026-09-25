@@ -19,6 +19,7 @@ from messagefoundry.auth.notifications import (
     EMAIL_CHANGED,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
+    NOTIFY_EMAIL_SET,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
     SecurityEvent,
@@ -223,6 +224,58 @@ def test_body_omits_the_directory_line_for_a_console_change() -> None:
         )
     )
     assert "directory" not in body.lower()
+
+
+def test_body_names_a_moved_notification_address_as_such() -> None:
+    """BACKLOG #1139, ADR 0182 Amendment A: an administrator moving the NOTIFICATION address sends
+    this notice to the old one, and it is the last that address gets. It must say which address
+    moved, and that later notices go elsewhere. The profile-change body is the control."""
+    moved = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            detail={"new_email": "new@example.org", "field": "notify_email"},
+        )
+    )
+    assert "An administrator changed the address that receives security notices" in moved
+    assert "New notification address: new@example.org" in moved
+    assert "Notices about later changes go to the new address" in moved
+    assert "New email on file" not in moved
+    # An administrator did it, so "if this was you" cannot apply.
+    assert "If this was you" not in moved
+    assert "If you did not expect this change" in moved
+
+    profile = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            detail={"new_email": "new@example.org"},
+        )
+    )
+    assert "New email on file: new@example.org" in profile
+    assert "Notices about later changes" not in profile
+    assert "If this was you" in profile
+
+
+def test_body_says_an_administrator_set_the_first_address() -> None:
+    """The holder's own fill says "if you did not set it". An administrator's fill must not, since
+    the holder never sets it on that path. The holder's own fill is the control."""
+    by_admin = _build_body(
+        SecurityEvent(
+            NOTIFY_EMAIL_SET,
+            username="bob",
+            email="new@example.org",
+            detail={"set_by": "administrator"},
+        )
+    )
+    assert "An administrator set this address" in by_admin
+    assert "If you did not set it" not in by_admin
+    assert "If this was you" not in by_admin
+
+    own = _build_body(SecurityEvent(NOTIFY_EMAIL_SET, username="bob", email="new@example.org"))
+    assert "If you did not set it" in own
 
 
 def test_body_states_the_remaining_recovery_code_count() -> None:

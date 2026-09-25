@@ -213,6 +213,18 @@ class ConnScaleRecord:
     intake_audit_live: IntakeAudit = field(
         default_factory=lambda: not_run("audit not wired", moment=MOMENT_LIVE)
     )
+    # --- wall #5's cost to the step's own traffic (BACKLOG #1292) ---
+    # The reload probe closes every inbound connection. `reload_stranded` is how many sends that
+    # close left unconfirmed AND that were written inside the reload window; the reconcile excuses
+    # them and says so. A stranded send written before the window is not in it: the budget judges
+    # it, and the reconcile detail names that count. `reload_not_reconnected` is how
+    # many connections were still down when the step stopped waiting for them. And
+    # `post_reload_extra_hold_s` is the offered time the step added so traffic followed the reload;
+    # it is 0.0 whenever the reload was quick. All three are None when no reload probe ran, and
+    # default to None so an older artifact deserializes as "not measured" rather than as a clean 0.
+    reload_stranded: int | None = None
+    reload_not_reconnected: int | None = None
+    post_reload_extra_hold_s: float | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -299,7 +311,12 @@ class ConnScaleRecord:
                 "post_mortem": self.intake_audit.to_json_dict(),
                 "live": self.intake_audit_live.to_json_dict(),
             },
-            "wall5_reload": {"seconds": self.reload_seconds},
+            "wall5_reload": {
+                "seconds": self.reload_seconds,
+                "stranded": self.reload_stranded,
+                "not_reconnected": self.reload_not_reconnected,
+                "extra_hold_s": _round_or_none(self.post_reload_extra_hold_s, 3),
+            },
             "wall6_ack_ms": {
                 "p50": round(self.ack_p50_ms, 3),
                 "p95": round(self.ack_p95_ms, 3),
@@ -630,6 +647,12 @@ DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
         "reload_seconds",
         lambda r: r.reload_seconds,
         "the other half of that pair; None means the reload probe did not measure this step",
+    ),
+    DiagnosticField(
+        "reload_stranded",
+        lambda r: r.reload_stranded,
+        "sends left unconfirmed when the reload probe closed every connection -- a slow reload "
+        "strands most of a short step, which reads as intake loss unless it is counted here",
     ),
     DiagnosticField(
         "fd_probe_ticks",

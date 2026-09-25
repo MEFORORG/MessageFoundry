@@ -927,7 +927,7 @@ class ApiSettings(_Section):
     tls_key_password: str | None = None
     # Minimum negotiated TLS version floor (NIST SP 800-52r2: 1.2+). "1.2" or "1.3".
     tls_min_version: str = "1.2"
-    # Optional OpenSSL cipher string (default = the interpreter's secure defaults).
+    # Optional OpenSSL cipher string (default = the approved AEAD suites, BACKLOG #300).
     tls_ciphers: str | None = None
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
