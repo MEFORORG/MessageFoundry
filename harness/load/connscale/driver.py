@@ -176,8 +176,13 @@ class ConnScaleDriver:
         engine side of every socket, then hand it to :meth:`await_reconnected`."""
         return [conn.generation for conn in self._conns]
 
-    async def await_reconnected(self, since: Sequence[int], *, timeout: float) -> int:
+    async def await_reconnected(
+        self, since: Sequence[int], *, timeout: float, require_new: bool = True
+    ) -> int:
         """Wait until every connection is serving a NEW socket opened since ``since`` was taken.
+
+        With ``require_new=False`` a connection also counts as back while its OLD socket is still up:
+        for an event that may or may not have closed anything, such as a refused reload.
 
         Returns how many connections were NOT back when the wait ended, so 0 means all of them are.
         A connection counts as back only while that new socket is still up, so one that reconnected
@@ -193,7 +198,7 @@ class ConnScaleDriver:
             behind = sum(
                 1
                 for conn, gen in zip(self._conns, since, strict=True)
-                if conn.generation <= gen or not conn.up
+                if (require_new and conn.generation <= gen) or not conn.up
             )
             if behind == 0 or loop.time() >= deadline:
                 return behind

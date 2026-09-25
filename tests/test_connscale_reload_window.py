@@ -12,8 +12,8 @@ connection to come back, and keeps traffic flowing after it. These tests pin tha
   WRITTEN inside the window. A send that had already waited longer than any ACK is a no-ACK fault,
   and the budget judges it (the planted 28-of-36 fault below);
 * more hold is offered only when a slow reload left too little of it, or no send, behind;
-* the reconnect wait runs unless dual-control held the reload or the engine refused it, including
-  when the request timed out, and it scales with N;
+* the reconnect wait always runs, and scales with N. After a reload that was held or refused it
+  waits only for every connection to be UP, since a refusal can follow a rollback that closed them;
 * the reconnect wait is real: a connection the engine drops opens a new socket, and one that cannot
   reconnect is reported rather than waited on forever.
 
@@ -54,6 +54,8 @@ class _FakeDriver:
         self.emitted_count = 0
         self.slowest_ack_s = 0.0
         self.strand_log: list[int] | None = None
+        self.up = [True] * count
+        self.required_new: bool | None = None
 
     def strand(self, send_ns: int) -> None:
         """A close left a send written at ``send_ns`` unconfirmed, as the sender reports it."""
@@ -76,10 +78,17 @@ class _FakeDriver:
     def generations(self) -> list[int]:
         return list(self.gens)
 
-    async def await_reconnected(self, since: list[int], *, timeout: float) -> int:
+    async def await_reconnected(
+        self, since: list[int], *, timeout: float, require_new: bool = True
+    ) -> int:
         self.waited_with = list(since)
         self.waited_for = timeout
-        return sum(1 for g, s in zip(self.gens, since, strict=True) if g <= s)
+        self.required_new = require_new
+        return sum(
+            1
+            for g, s, up in zip(self.gens, since, self.up, strict=True)
+            if (require_new and g <= s) or not up
+        )
 
 
 async def _window(
@@ -165,15 +174,22 @@ async def test_a_send_the_close_found_already_waiting_too_long_is_not_the_reload
     )
     assert account.stranded == 7
     assert account.aged == 3
-    assert account.lookback_s == runner._RELOAD_LOOKBACK_FLOOR_S  # no ACK seen: the floor
+    assert account.lookback_s <= runner._RELOAD_LOOKBACK_FLOOR_S  # no ACK seen: at most the floor
 
 
-def test_the_lookback_is_the_slowest_ack_between_its_floor_and_the_stop_grace() -> None:
+def test_the_lookback_is_the_slowest_ack_between_its_floor_and_its_two_caps() -> None:
     floor = runner._RELOAD_LOOKBACK_FLOOR_S
-    assert runner._reload_lookback(0.0) == floor  # no ACK recorded yet
-    assert runner._reload_lookback(floor / 10) == floor  # a fast host
-    assert runner._reload_lookback(0.8) == 0.8  # a loaded runner: its own slowest ACK
-    assert runner._reload_lookback(60.0) == runner._STOP_GRACE  # one pathological ACK is capped
+    long_hold = 60.0  # the operator profile's hold, so the half-hold cap is 15 s
+    assert runner._reload_lookback(0.0, long_hold) == floor  # no ACK recorded yet
+    assert runner._reload_lookback(floor / 10, long_hold) == floor  # a fast host
+    assert runner._reload_lookback(0.8, long_hold) == 0.8  # a loaded runner: its own slowest ACK
+    assert runner._reload_lookback(60.0, long_hold) == runner._STOP_GRACE  # the step's ACK wait
+    # The smoke fires at 0.75 s into its hold. One slow ACK of 0.75 s must not reach back to the
+    # start of the hold: the window stops at half of it, so the first half is always judged.
+    assert runner._reload_lookback(0.75, 0.75) == pytest.approx(0.375)
+    assert runner._reload_lookback(0.0, 0.2) == pytest.approx(
+        0.1
+    )  # the half-hold cap beats the floor
 
 
 async def test_a_quick_reload_adds_no_hold() -> None:
@@ -227,23 +243,39 @@ async def test_a_reload_with_no_reading_is_still_waited_for() -> None:
     assert account.stranded == 3
 
 
-async def test_a_reload_that_closed_nothing_is_not_waited_for() -> None:
-    # Dual-control held it, or the engine refused it: nothing was swapped or closed, so waiting
-    # would only burn the timeout and then fail the step as "never came back". A timeout that lands
-    # meanwhile is not the reload's, so nothing is excused as stranded either.
+async def test_a_reload_that_was_not_applied_waits_only_for_every_connection_to_be_up() -> None:
+    # Dual-control held it, or the engine refused it, and no connection dropped. Waiting for a NEW
+    # socket would burn the whole timeout and fail the step as "never came back". The wait asks only
+    # that every connection be up, which is true at once.
     driver = _FakeDriver(2)
     account, _ = await _window(
         counters=Counters(),
         driver=driver,
-        strands=1,
+        strands=0,
         returns=(None, True),
         reconnect=False,
         hold_left_after=10.0,
     )
-    assert driver.waited_with is None
-    assert account.closed_nothing
+    assert driver.required_new is False
+    assert account.not_applied
     assert account.not_reconnected == 0
-    assert account.stranded == 0
+
+
+async def test_a_refusal_after_a_rollback_that_left_a_listener_down_is_still_caught() -> None:
+    # THE CONTROL for the test above. A 404 or 422 can follow a swap that closed every client and
+    # then rolled back; if a listener did not restart, its connection stays down and must count.
+    driver = _FakeDriver(3)
+    driver.up = [True, False, True]
+    account, _ = await _window(
+        counters=Counters(),
+        driver=driver,
+        strands=2,
+        returns=(None, True),
+        reconnect=False,
+        hold_left_after=10.0,
+    )
+    assert account.not_reconnected == 1
+    assert account.stranded == 2  # what the rollback's close stranded is still the reload's
 
 
 class _RefusingClient:
@@ -255,8 +287,8 @@ class _RefusingClient:
 
 
 @pytest.mark.parametrize("status", [403, 404, 422])
-def test_a_refused_reload_closed_nothing(status: int) -> None:
-    # Outside the allowed reload roots, not found, does not validate: the engine touched nothing.
+def test_a_refused_reload_was_not_applied(status: int) -> None:
+    # Outside the allowed reload roots, not found, does not validate: the reload was not applied.
     assert status in probe.RELOAD_REFUSED_STATUSES
     assert probe.time_reload_outcome(_RefusingClient(status), None) == (None, True)  # type: ignore[arg-type]
 
@@ -268,32 +300,36 @@ def test_a_reload_that_failed_otherwise_may_have_closed_everything(status: int |
 
 
 def test_a_refused_reload_does_not_fail_the_step() -> None:
-    # The CI shape of a refusal: no reading, nothing closed, the step's sends all ACKed. It must
-    # reconcile, and the record must say the reconnect wait did not run rather than "0 came back".
+    # The CI shape of a refusal: no reading, nothing closed, every connection up, the step's sends
+    # all ACKed. It must reconcile, with no reading for wall #5, exactly as before BACKLOG #1292.
     account = runner._ReloadAccount(
         seconds=None,
         stranded=0,
         not_reconnected=0,
         extra_hold_s=0.0,
         after=Counters(sent=18, acked=18),
-        closed_nothing=True,
+        not_applied=True,
     )
     rec = _record(Counters(sent=36, acked=36, sink_received=36), account)
     assert rec.no_loss.ok, rec.no_loss.detail
     assert "never came back" not in rec.no_loss.detail
     assert rec.reload_seconds is None
-    assert rec.reload_not_reconnected is None
+    assert rec.reload_not_reconnected == 0
 
 
 def test_the_reconnect_wait_scales_with_n_and_with_the_measured_reload() -> None:
     floor = runner._RECONNECT_TIMEOUT
-    assert runner._reconnect_timeout(12, None) == floor  # the smoke keeps the old 10 s
-    assert runner._reconnect_timeout(500, None) == floor  # where the per-connection term meets it
-    assert runner._reconnect_timeout(1000, None) == pytest.approx(20.0)
-    assert runner._reconnect_timeout(1500, None) == pytest.approx(30.0)  # the operator rig's top N
+    assert runner._reconnect_timeout(12, 0.5) == floor  # the smoke's quick reload keeps 10 s
+    assert runner._reconnect_timeout(500, 0.5) == floor  # where the per-connection term meets it
+    assert runner._reconnect_timeout(1000, 0.5) == pytest.approx(20.0)
+    assert runner._reconnect_timeout(1500, 0.5) == pytest.approx(30.0)  # the operator rig's top N
     # A measured reload of 4 s at N=12: twice it plus one full reconnect backoff.
     assert runner._reconnect_timeout(12, 4.0) == pytest.approx(13.0)
     assert runner._reconnect_timeout(1500, 4.0) == pytest.approx(30.0)  # N still governs
+    # No reading: the request hit its own 5 s timeout, so the reload took at least that. It must not
+    # get a shorter wait than the measured 4 s reload above.
+    assert runner._reconnect_timeout(12, None) == pytest.approx(15.0)
+    assert runner._reconnect_timeout(12, None) > runner._reconnect_timeout(12, 4.0)
 
 
 async def test_the_probe_waits_the_scaled_timeout() -> None:
@@ -470,6 +506,16 @@ async def test_a_connection_that_reconnected_and_dropped_again_is_still_behind()
     assert await driver.await_reconnected([1], timeout=0.05) == 0
 
 
+async def test_without_require_new_an_old_socket_still_up_counts_as_back() -> None:
+    # After a held or refused reload: the old socket, never dropped, is back. A dropped one is not.
+    driver = _real_driver(1)
+    driver._conns = [_Conn(1, up=True)]  # type: ignore[list-item]
+    assert await driver.await_reconnected([1], timeout=0.05) == 1  # the control: default needs new
+    assert await driver.await_reconnected([1], timeout=0.05, require_new=False) == 0
+    driver._conns = [_Conn(1, up=False)]  # type: ignore[list-item]
+    assert await driver.await_reconnected([1], timeout=0.05, require_new=False) == 1
+
+
 # --- the planted control: a no-ACK fault the reload must not excuse (BACKLOG #1292) ---------------
 
 _ACK = "MSH|^~\\&|ENG|F|H|F|20260925000000||ACK|1|P|2.5\rMSA|AA|1\r"
@@ -522,8 +568,8 @@ async def _no_ack_fault_step(*, unacked_just_before_reload: bool) -> runner.NoLo
     until the reload closes the socket, then 6 more after it are ACKed: 28 of 36 unconfirmed, 78%.
 
     ``unacked_just_before_reload`` places the 28 at 0.55 s, inside the window. Otherwise they go
-    out at 0 s with the 2, and have waited 0.6 s for an ACK when the reload fires: more than twice
-    the 0.25 s lookback, which is all a millisecond ACK earns.
+    out at 0 s with the 2, and have waited 0.6 s for an ACK when the reload fires. The lookback is
+    at most half of that 0.6 s whatever the ACKs took, so they are outside the window.
     """
     engine = _NoAckEngine(ack_first=2)
     server = await asyncio.start_server(engine.on_client, "127.0.0.1", 0)
@@ -548,6 +594,11 @@ async def _no_ack_fault_step(*, unacked_just_before_reload: bool) -> runner.NoLo
             await asyncio.sleep(max(0.0, started + hold - loop.time()))
 
         async def reload() -> tuple[float | None, bool]:
+            # ORDERING, NOT WALL CLOCK: close only once the engine has read all 30 frames, so the 28
+            # are in flight on the old socket whatever a loaded runner does to the two timers.
+            deadline = loop.time() + 5.0
+            while engine.read < 30 and loop.time() < deadline:
+                await asyncio.sleep(0.005)
             engine.reload()
             return 0.01, False
 
@@ -587,6 +638,9 @@ async def _no_ack_fault_step(*, unacked_just_before_reload: bool) -> runner.NoLo
 async def test_a_no_ack_fault_before_the_reload_is_not_excused_as_its_stranding() -> None:
     # PLANTED CONTROL. At a6a6d7586 the excusal counted every timeout the close produced, so these
     # 28 sends, unACKed for 0.6 s before the reload fired, were excused and the step PASSED.
+    # SCOPE: the budget still forgives up to three quarters of the sends it judges, so the window
+    # changes the verdict only where the aged sends pass that line. 28 of 36 is one over it. The
+    # third assertion pins the window's own classification, which does not depend on the budget.
     result = await _no_ack_fault_step(unacked_just_before_reload=False)
     assert not result.ok, result.detail
     assert "28 unconfirmed sends exceed the stranding budget" in result.detail

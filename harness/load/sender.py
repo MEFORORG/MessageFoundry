@@ -100,7 +100,8 @@ class PersistentConnection:
         self._up = False  # True from a successful open until that socket's serve loop ends
         # Called with the SEND time (perf_counter_ns) of each send a close left unconfirmed, so the
         # connscale reload probe can tell a send made inside its window from one that had already
-        # waited too long for an ACK (BACKLOG #1292). None by default: the hot path is unchanged.
+        # waited too long for an ACK (BACKLOG #1292). None by default. It runs only on a close, never
+        # per send, and the connscale driver wires it on every connection.
         self._on_strand = on_strand
 
     # --- public API ----------------------------------------------------------

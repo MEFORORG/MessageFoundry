@@ -102,6 +102,9 @@ _SETTLE = 0.5  # let final ACKs/arrivals settle before the truly-final engine sa
 #: full only when a connection never returns, and that fails the step. It is the FLOOR of the wait:
 #: see `_reconnect_timeout`, which scales it with N and with the measured reload.
 _RECONNECT_TIMEOUT = 10.0
+#: The reload request's own timeout: the `EngineClient` default the poller builds its client with.
+#: A reload that returned no reading took at least this long, or failed some other way.
+_RELOAD_CLIENT_TIMEOUT_S = 5.0
 #: The reconnect wait each connection adds, so the wait grows with N. The engine stops and restarts
 #: one listener per connection and each client then reconnects on its own backoff, so the time to
 #: bring every connection back is O(N). A fixed 10 s could fail N=1500 on the operator rig. At 20 ms
@@ -110,9 +113,11 @@ _RECONNECT_PER_CONNECTION_S = 0.02
 #: How long before the reload request a send may have been written and still be excused as the
 #: reload's when the close strands it (BACKLOG #1292). A send already in flight when the request goes
 #: out legitimately has no ACK yet only if it was written within about one ACK time of it. So the
-#: window reaches back by the slowest ACK the step has seen, never less than this floor and never
-#: more than `_STOP_GRACE`, which is the longest the step itself waits for an in-flight ACK. A send
-#: older than that which still has no ACK is a no-ACK fault, and the budget judges it.
+#: window reaches back by the slowest ACK the step has seen, never less than this floor. It never
+#: reaches back more than `_STOP_GRACE`, the longest the step itself waits for an in-flight ACK, nor
+#: more than half the time from the start of the hold to the request, so one slow ACK cannot excuse
+#: the whole hold. A send older than that which still has no ACK is a no-ACK fault, and the budget
+#: judges it.
 _RELOAD_LOOKBACK_FLOOR_S = 0.25
 #: The least offered time a step keeps AFTER every connection is back from the reload probe, as a
 #: fraction of `hold_seconds`. The probe fires at half the hold, so a quick reload leaves about half
@@ -1157,9 +1162,10 @@ class _ReloadAccount:
     not_reconnected: int  # connections still down when the wait gave up; 0 means all came back
     extra_hold_s: float  # offered time added after the hold, so traffic follows the reload
     after: Counters
-    # The reload was held by dual-control or refused (403/404/422), so nothing was swapped or
-    # closed. Nothing was waited for, and nothing is excused as stranded.
-    closed_nothing: bool = False
+    # The reload was held by dual-control or refused (403/404/422), so no new graph is running. A
+    # hold closes nothing, but a 404 or 422 can follow a rollback that closed every connection
+    # and reopened the old listeners, so the probe still waits for every connection to be up.
+    not_applied: bool = False
     aged: int = 0  # sends the close stranded that were made BEFORE the window; not excused
     lookback_s: float = _RELOAD_LOOKBACK_FLOOR_S  # how far before the request the window opened
     reconnect_timeout_s: float = _RECONNECT_TIMEOUT  # the reconnect wait this step allowed
@@ -1196,9 +1202,12 @@ async def _reload_mid_hold(
 
     The wait runs whenever the reload may have swapped, which includes a reload that returned no
     reading: the client gives up after 5 s while the engine is still restarting its listeners, and
-    that slow reload is the case this exists for. Only a reload dual-control HELD, or the engine
-    REFUSED, skips it: nothing was closed, and the wait would spend its whole timeout on connections
-    that never dropped and then fail the step as "never came back".
+    that slow reload is the case this exists for. A reload dual-control HELD, or the engine REFUSED,
+    waits only until every connection is UP, on its old socket or a new one. A hold closes nothing,
+    so that returns at once. A refusal usually closes nothing either, but a 404 or 422 can follow a
+    rollback that closed every client and restarted the old listeners. Waiting for a NEW socket there
+    would spend the whole timeout on connections that never dropped and fail the step as "never came
+    back"; not waiting at all would miss a rollback that left a listener down.
 
     `hold_task` is cancelled if anything here raises, so a failed probe cannot leave the token
     bucket emitting into a driver the step is tearing down.
@@ -1207,19 +1216,19 @@ async def _reload_mid_hold(
     try:
         await asyncio.sleep(hold_seconds * 0.5)
         generations = driver.generations()
-        lookback = _reload_lookback(driver.slowest_ack_s)
+        lookback = _reload_lookback(driver.slowest_ack_s, loop.time() - hold_started)
         window_opens_ns = time.perf_counter_ns() - int(lookback * 1e9)
         driver.watch_strands()
         try:
-            seconds, closed_nothing = await reload()
-            not_reconnected = 0
+            seconds, not_applied = await reload()
             timeout = _reconnect_timeout(driver.count, seconds)
-            if not closed_nothing:
-                not_reconnected = await driver.await_reconnected(generations, timeout=timeout)
+            not_reconnected = await driver.await_reconnected(
+                generations, timeout=timeout, require_new=not not_applied
+            )
         finally:
             strand_sends = driver.end_strand_watch()
-        stranded = 0 if closed_nothing else sum(1 for ns in strand_sends if ns >= window_opens_ns)
-        aged = 0 if closed_nothing else len(strand_sends) - stranded
+        stranded = sum(1 for ns in strand_sends if ns >= window_opens_ns)
+        aged = len(strand_sends) - stranded
         after = counters.snapshot()
         back_at = loop.time()
         emitted_at_back = driver.emitted
@@ -1241,35 +1250,42 @@ async def _reload_mid_hold(
         not_reconnected,
         extra,
         after,
-        closed_nothing=closed_nothing,
+        not_applied=not_applied,
         aged=aged,
         lookback_s=lookback,
         reconnect_timeout_s=timeout,
     )
 
 
-def _reload_lookback(slowest_ack_s: float) -> float:
+def _reload_lookback(slowest_ack_s: float, held_so_far_s: float) -> float:
     """How far before the reload request the stranding window opens, in seconds.
 
-    ``min(_STOP_GRACE, max(_RELOAD_LOOKBACK_FLOOR_S, slowest_ack_s))``: the slowest ACK the step has
-    recorded, floored so a fast host still covers a send written just before the request, and capped
-    at the step's own ACK wait so one pathological ACK cannot excuse the whole hold.
+    ``min(_STOP_GRACE, held_so_far_s / 2, max(_RELOAD_LOOKBACK_FLOOR_S, slowest_ack_s))``: the
+    slowest ACK the step has recorded, floored so a fast host still covers a send written just
+    before the request. It is capped at the step's own ACK wait, and at half the hold that ran before
+    the request, so at least the first half of the pre-reload sends is always judged by the budget:
+    one slow ACK, or a fault that grew out of rising latency, cannot excuse the whole hold.
     """
-    return min(_STOP_GRACE, max(_RELOAD_LOOKBACK_FLOOR_S, slowest_ack_s))
+    ceiling = min(_STOP_GRACE, max(0.0, held_so_far_s) / 2)
+    return min(ceiling, max(_RELOAD_LOOKBACK_FLOOR_S, slowest_ack_s))
 
 
 def _reconnect_timeout(count: int, reload_seconds: float | None) -> float:
     """How long the reload probe waits for every connection to come back, in seconds.
 
-    ``max(_RECONNECT_TIMEOUT, count * _RECONNECT_PER_CONNECTION_S, 2 * reload_seconds + 5.0)``:
-    10 s at least, 20 ms a connection above N=500, and never less than twice the measured reload
-    plus one full reconnect backoff (`harness.load.sender._BACKOFF_MAX`, 5 s) when the reload
-    returned a reading. The wait is spent in full only when a connection never returns.
+    ``max(_RECONNECT_TIMEOUT, count * _RECONNECT_PER_CONNECTION_S, 2 * reload + 5.0)``: 10 s at
+    least, 20 ms a connection above N=500, and never less than twice the reload plus one full
+    reconnect backoff (`harness.load.sender._BACKOFF_MAX`, 5 s). ``reload`` is the measured reading,
+    or the request's own 5 s timeout when there is none: a reload that timed out took at least that
+    long, so it must not get a shorter wait than a quicker one that was measured. The wait is spent
+    in full only when a connection never returns.
     """
-    scaled = max(_RECONNECT_TIMEOUT, count * _RECONNECT_PER_CONNECTION_S)
-    if reload_seconds is not None:
-        scaled = max(scaled, 2.0 * reload_seconds + _BACKOFF_MAX)
-    return scaled
+    reload = reload_seconds if reload_seconds is not None else _RELOAD_CLIENT_TIMEOUT_S
+    return max(
+        _RECONNECT_TIMEOUT,
+        count * _RECONNECT_PER_CONNECTION_S,
+        2.0 * reload + _BACKOFF_MAX,
+    )
 
 
 def _build_record(
@@ -1405,8 +1421,7 @@ def _build_record(
         # not. `stranded` is clamped exactly as `_excusal` clamps it, so the record and the detail
         # text can never disagree about the count.
         reload_stranded=(None if ra is None else max(0, min(ra.stranded, c.timeouts, c.sent))),
-        # None, not 0, when nothing was closed: the wait did not run, so there is no reading.
-        reload_not_reconnected=None if ra is None or ra.closed_nothing else ra.not_reconnected,
+        reload_not_reconnected=None if ra is None else ra.not_reconnected,
         post_reload_extra_hold_s=None if ra is None else ra.extra_hold_s,
     )
 

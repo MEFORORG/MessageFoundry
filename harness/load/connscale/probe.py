@@ -38,6 +38,7 @@ It reads only counts / timings — never a message body or any PHI.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -48,6 +49,8 @@ from pathlib import Path
 
 from messagefoundry.api.models import PendingApprovalResponse
 from messagefoundry.apiclient import ApiError, EngineClient
+
+_log = logging.getLogger(__name__)
 
 _WINDOWS = sys.platform == "win32"
 # Bound every shell-out so a hung child (a stuck WMI/Get-Process or lsof) can't wedge a poll tick.
@@ -686,25 +689,35 @@ def time_reload(client: EngineClient, config_dir: str | None) -> float | None:
     return time_reload_outcome(client, config_dir)[0]
 
 
-#: The HTTP statuses with which the engine REFUSES a reload before touching anything: a directory
-#: outside the allowed reload roots (403), one that does not exist (404), a config that does not
-#: validate (422). A refused reload swapped no graph and closed no connection (BACKLOG #1292).
+#: The HTTP statuses with which the engine REFUSES a reload: a directory outside the allowed reload
+#: roots (403), one that does not exist (404), a config that does not validate (422). No new graph
+#: runs after one. Most close nothing, but a 404 or 422 can also follow a failed swap that closed
+#: every client and then rolled back to the old listeners (BACKLOG #1292).
 RELOAD_REFUSED_STATUSES = frozenset({403, 404, 422})
 
 
 def time_reload_outcome(client: EngineClient, config_dir: str | None) -> tuple[float | None, bool]:
-    """:func:`time_reload`, plus whether the reload certainly CLOSED NOTHING.
+    """:func:`time_reload`, plus whether the reload was NOT APPLIED.
 
     That is true when dual-control HELD the reload, or when the engine REFUSED it with a status in
-    :data:`RELOAD_REFUSED_STATUSES`. Either way no graph was swapped and every connection is still
-    up. Any other failure may have swapped: the client's 5 s timeout raises ``ApiError`` while the
-    engine is still stopping and restarting every listener, which is the slow reload BACKLOG #1292 is
-    about. So the flag is reported, not folded into the ``None`` reading."""
+    :data:`RELOAD_REFUSED_STATUSES`. No new graph runs, so the caller need not wait for a new socket
+    on every connection, only for every connection to be up. Any other failure may have swapped: the
+    client's 5 s timeout raises ``ApiError`` while the engine is still stopping and restarting every
+    listener, which is the slow reload BACKLOG #1292 is about. So the flag is reported, not folded
+    into the ``None`` reading, and every failure is logged, because a probe refused on every step
+    otherwise leaves no trace but a missing reading."""
     t0 = time.perf_counter()
     try:
         result = client.reload_config(config_dir)
     except ApiError as exc:
-        return None, exc.status in RELOAD_REFUSED_STATUSES
+        refused = exc.status in RELOAD_REFUSED_STATUSES
+        _log.warning(
+            "reload probe: %s (HTTP %s): %s",
+            "the engine refused the reload" if refused else "the reload request failed",
+            exc.status,
+            exc,
+        )
+        return None, refused
     if isinstance(result, PendingApprovalResponse):
         # Dual-control held the reload (ASVS 2.3.5): no graph was swapped, so the elapsed time is
         # the cost of parking an approval, not the O(connections) reload this wall measures. Report

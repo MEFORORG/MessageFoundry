@@ -215,7 +215,9 @@ class ConnScaleRecord:
     )
     # --- wall #5's cost to the step's own traffic (BACKLOG #1292) ---
     # The reload probe closes every inbound connection. `reload_stranded` is how many sends that
-    # close left unconfirmed; the reconcile excuses them and says so. `reload_not_reconnected` is how
+    # close left unconfirmed AND that were written inside the reload window; the reconcile excuses
+    # them and says so. A stranded send written before the window is not in it: the budget judges
+    # it, and the reconcile detail names that count. `reload_not_reconnected` is how
     # many connections were still down when the step stopped waiting for them. And
     # `post_reload_extra_hold_s` is the offered time the step added so traffic followed the reload;
     # it is 0.0 whenever the reload was quick. All three are None when no reload probe ran, and
