@@ -2103,9 +2103,10 @@ def _serve(args: argparse.Namespace) -> int:
     # security_loosenings() feeds both this warning and the read-only GET /security/posture view.
     # The connection graph is NOT loaded yet here (the Engine loads it inside the ASGI lifespan, well
     # below), so this early warning covers the SETTINGS-scoped switches only and passes empty lists for
-    # all THREE connection-scoped deviations. That is not a silent subset: each is reported moments
+    # all FOUR connection-scoped deviations. That is not a silent subset: each is reported moments
     # later — per connection — by the connector's own construction-time WARN (the ADR 0153 acceptance
-    # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection),
+    # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection;
+    # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal),
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
@@ -2122,6 +2123,7 @@ def _serve(args: argparse.Namespace) -> int:
         (),
         (),
         (),
+        (),
         None,
         None,
     )
@@ -2130,8 +2132,8 @@ def _serve(args: argparse.Namespace) -> int:
         _seclog.warning(
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
-            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired and generic-ODBC "
-            "DATABASE TLS declarations are NOT in this list — the graph is not loaded yet; they are "
+            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, generic-ODBC "
+            "DATABASE TLS and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by the connector construction gate, `messagefoundry check` and "
             "GET /security/posture. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -6528,7 +6530,7 @@ def _security(args: argparse.Namespace) -> int:
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
-        # store — so it can see NEITHER the three per-connection declarations NOR the two store
+        # store — so it can see NEITHER the four per-connection declarations NOR the two store
         # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
         # declares BOTH gaps
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
@@ -6537,14 +6539,14 @@ def _security(args: argparse.Namespace) -> int:
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
-                sec, _store, _auth, _alerts, _rotation, (), (), (), None, None
+                sec, _store, _auth, _alerts, _rotation, (), (), (), (), None, None
             )
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
     #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
     #: read at all (the file did not load); the scope string is the standing limitation above. It names
-    #: ALL THREE connection-scoped deviations (#333) — naming only cleartext_accepted made the DECLARED
+    #: ALL FOUR connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
     #: scope itself incomplete, which is the same defect one level up.
     #:
     #: BACKLOG #1852 added a FOURTH gap and it is named for that same reason. This command reads the
@@ -6557,8 +6559,8 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
-            "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
-            "included, and neither are the store-principal privilege and audit-chain keying "
+            "cleartext_accepted, tls_allow_expired, generic-ODBC DATABASE TLS and "
+            "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "

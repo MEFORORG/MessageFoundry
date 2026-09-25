@@ -220,6 +220,9 @@ def run_checks(
         # is not the surface anyone queries three months later. Advisory — see the checks.
         _check_expiry_relaxed(config_dir),
         _check_generic_db_tls(config_dir),
+        # ADR 0173: the per-connection revocation attestation, same shape and same reason. Its only
+        # report was the WARNING logged where it suppresses a refusal. Advisory — see the check.
+        _check_revocation_attested(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
@@ -1925,6 +1928,49 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(relaxed)} outbound connection(s) accept an EXPIRED server certificate "
             f"indefinitely — {listed} (chain, hostname and key usage are still verified)"
+        ),
+    )
+
+
+def _check_revocation_attested(config_dir: str | Path) -> CheckResult:
+    """Surface every connection that declares ``tls_revocation_attested`` (ADR 0173), with its reason.
+
+    The sibling of :func:`_check_cleartext_accepted`. The attestation says a revocation-checking PKI
+    covers the hop outside the engine, so an enforcing instance does not refuse it for lacking a CRL.
+    That is logged and audited where it suppresses the refusal, and nothing else listed it. ``check``
+    names the whole set, inbound, outbound and ``FhirLookup``, so it is visible in review.
+
+    Advisory (``required=False``): a reasoned attestation is a legitimate choice, and it is the only
+    lever ADR 0173 offers a site whose revocation runs at the edge. SKIPs when the graph will not load,
+    same convention and same reason as its siblings."""
+    from messagefoundry.config.wiring import WiringError, load_config, revocation_attested_hops
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "tls-revocation-attested",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    attested = revocation_attested_hops(registry)
+    if not attested:
+        return CheckResult(
+            "tls-revocation-attested",
+            ok=True,
+            required=False,
+            detail="no connection declares tls_revocation_attested",
+        )
+    listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    return CheckResult(
+        "tls-revocation-attested",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(attested)} connection(s) attest revocation is checked outside the engine, so "
+            f"the revocation refusal does not fire on them — {listed}"
         ),
     )
 
