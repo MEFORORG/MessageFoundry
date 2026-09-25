@@ -80,7 +80,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   username the token claimed. On that account's first federated sign-in it then linked whatever
   `sub` arrived. So a token that claimed the name of a directory account that had never signed in
   this way could take over that account and its roles. Now a sign-in whose `sub` is linked to no
-  account is refused, audited as `federated_subject_not_bound`, and links nothing. The web
+  account is refused and links nothing. Its audit row names the issuer and `sub` that arrived, so
+  an administrator can link it, and is filed under `<oidc>` rather than the name the token claimed.
+  The refusal reason is `federated_subject_not_bound`. The web
   console's login page tells the person to ask an administrator. Roles come from the directory
   entry of the linked account, never from the name in the token. A link on a local (non-directory)
   account is refused as `local_account_conflict`. The refusal `federated_subject_conflict` is no
@@ -93,8 +95,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   path removes the link and signs the account out. Both routes need `users:manage` and a fresh
   re-authentication for the action `admin_federated_identity`. Each write leaves an audit row
   (`auth.federated_subject_bound`, `auth.federated_subject_rebound` or
-  `auth.federated_subject_unbound`) naming the administrator. Linking also notifies the account
-  holder. **Linking works only through the API for now.** The web console gets its own screen in
+  `auth.federated_subject_unbound`) naming the administrator. Linking and unlinking each notify
+  the account holder; unlinking sends the new notice `federated_identity_unbound`. An
+  administrator cannot change their own link. **Linking works only through the API for now.** The web console gets its own screen in
   a later change. Federation still ships off. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184)
 - **BREAKING: an account with no notification address must set one at sign-in, whenever this
   instance sends security notices.** A security notice goes to the account's engine-owned address,

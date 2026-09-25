@@ -39,6 +39,7 @@ from messagefoundry.auth.notifications import (
     ADMIN_NEW_IP,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
+    FEDERATED_IDENTITY_UNBOUND,
     LOGIN_AFTER_FAILURES,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
@@ -80,6 +81,7 @@ from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    FederatedUnbind,
     SessionRecord,
     UserRecord,
     WebAuthnCredential,
@@ -479,8 +481,9 @@ class _FederatedBindingWithdrawn(Exception):
 
 
 class FederatedSubjectHeld(RuntimeError):
-    """:meth:`AuthService.bind_federated_subject` declined: a DIFFERENT account already holds the
-    ``(issuer, sub)`` it was asked to bind (BACKLOG #1143). The message is operator-facing.
+    """:meth:`AuthService.bind_federated_subject` declined on a conflict (BACKLOG #1143): a DIFFERENT
+    account already holds the ``(issuer, sub)`` it was asked to bind, or another request bound THIS
+    account while the bind ran. The message is operator-facing and says which.
 
     Refused rather than moved. Moving a binding hands the subject the newer account and strands the
     older one, which is the takeover shape the #1256 exclusivity guard exists to prevent. An operator
@@ -508,8 +511,10 @@ def _is_integrity_refusal(exc: BaseException) -> bool:
 
     Each backend raises its own class -- ``sqlite3.IntegrityError``, asyncpg's
     ``UniqueViolationError``, pyodbc's ``IntegrityError`` -- and naming them would make this module
-    import-aware of every driver and silently stop covering a backend added later. The same test the
-    ``_enroll_webauthn`` duplicate-label race uses (ADR 0068 section 4).
+    import-aware of every driver and silently stop covering a backend added later. The ONE copy of
+    this test: the webauthn duplicate-label race (ADR 0068 section 4), the cached-username refresh and
+    the federated bind all call it. ``_refresh_cached_username`` records why the test is on
+    "Integrity" and not "IntegrityError", and the one engine class the name test would wrongly absorb.
     """
     mro = "".join(t.__name__ for t in type(exc).__mro__)
     return "Integrity" in mro or "UniqueViolation" in mro
@@ -1953,7 +1958,7 @@ class AuthService:
                 ok=False, error="identity provider unavailable", reason="idp_unavailable"
             )
 
-        # The claimed username is kept ONLY as the audit actor for a refusal. It selects nothing.
+        # The claimed username selects nothing. It is kept only as a hint in the not-bound refusal.
         username = principal_claims.username
 
         # BACKLOG #1143 / #295 (ADR 0184, ASVS 6.8.1): THE ACCOUNT IS SELECTED BY THE VERIFIED
@@ -1969,9 +1974,14 @@ class AuthService:
         #
         # So `federated_subject_conflict` is no longer emitted. A reassigned username that presents a
         # new subject now meets the refusal below, because the new subject is bound to nothing.
-        bound = await self._store.get_user_by_federated_subject(
-            principal_claims.issuer, principal_claims.subject
-        )
+        presented = (principal_claims.issuer, principal_claims.subject)
+        bound = await self._store.get_user_by_federated_subject(*presented)
+        if bound is not None and (bound.oidc_issuer, bound.oidc_subject) != presented:
+            # BYTE-EXACT, whatever the backend's collation. SQL Server compares these columns under
+            # the database default, usually case-insensitive, so `abc` can find the row bound to `ABC`.
+            # That was harmless while the lookup only vetoed; now it SELECTS the account, so a pair
+            # that differs in any byte is not this account's pair.
+            bound = None
         if bound is None:
             # ADR 0184 AC-4, and the owner ruling it rests on (2026-09-06): the administrative
             # binding surface is the ONLY path that may create a binding. So first contact is refused
@@ -1981,7 +1991,26 @@ class AuthService:
             # The visitor has proved control of this IdP identity and nothing else, so saying it is
             # not linked tells them nothing about any MessageFoundry account. It is refused before the
             # directory is consulted, so it says nothing about the directory either.
-            await self._directory_reject_audit(username, "oidc", FEDERATED_SUBJECT_NOT_BOUND)
+            #
+            # Audited under a NEUTRAL actor: the claimed name selects nothing, so filing the row under
+            # it would put a stranger's refusal in that person's security-events feed. The row
+            # carries the presented pair, because the only remedy is an admin bind that needs the
+            # exact `sub`, and the claimed name as a hint to whom it belongs.
+            await self._audit(
+                "auth.login_failed",
+                actor="<oidc>",
+                detail=_json(
+                    {
+                        "provider": "ad",
+                        "mech": "oidc",
+                        "reason": FEDERATED_SUBJECT_NOT_BOUND,
+                        "issuer": principal_claims.issuer,
+                        "subject": principal_claims.subject,
+                        "claimed_username": username,
+                    }
+                ),
+                client=client,
+            )
             return LoginOutcome(
                 ok=False,
                 error=(
@@ -1990,6 +2019,9 @@ class AuthService:
                 ),
                 reason=FEDERATED_SUBJECT_NOT_BOUND,
             )
+        # From here on every refusal concerns the SELECTED account, so it is audited under that
+        # account's name, not the claimed one.
+        username = bound.username
         if bound.auth_provider != AuthProvider.AD.value:
             # ADR 0184 part 3 and AC-3. The bind route refuses a LOCAL row, so this is the second
             # layer: a binding placed on one by any other means still never signs a LOCAL account in
@@ -2938,9 +2970,10 @@ class AuthService:
             # belt-and-braces rather than redundancy: either term alone covers it, both together mean
             # a rename of one asyncpg class cannot silently drop the backend.
             #
-            # THIS APPLIES TO THE TWO SIBLING SITES TOO. Censused rather than assumed: `__mro__`
-            # appears exactly three times in the engine, all in this module, all using this substring
-            # form. So anyone "fixing" the predicate here should not fix it there either.
+            # THIS APPLIES TO THE TWO SIBLING SITES TOO, and since BACKLOG #1143 there is one copy:
+            # `_is_integrity_refusal`, which this site, the webauthn label race and the federated
+            # bind all call. `__mro__` appears once in the engine, inside it. Until #1143 it appeared
+            # three times, all in this module, all in this substring form.
             #
             # THE COST OF A NAME TEST, NAMED ONCE: it matches on a string, so an unrelated class whose
             # name happens to contain "Integrity" would be swallowed here. The engine HAS one --
@@ -2951,8 +2984,7 @@ class AuthService:
             # raises it from a store or auth path, all three of these handlers would silently report a
             # username conflict instead of a refused attestation -- a fail-closed control absorbed by
             # a fail-open one. If that class ever moves, test on identity here, not on a name.
-            mro = "".join(t.__name__ for t in type(exc).__mro__)
-            if "Integrity" not in mro and "UniqueViolation" not in mro:
+            if not _is_integrity_refusal(exc):
                 raise
             # Re-read rather than guess who won: this is an error path, the cost is irrelevant, and an
             # audit row naming the holder is what makes the collision actionable.
@@ -4651,8 +4683,7 @@ class AuthService:
             # The concurrent duplicate-label race (ADR 0068 §4): each backend raises its own
             # integrity class (sqlite3.IntegrityError / asyncpg UniqueViolationError / pyodbc
             # IntegrityError) — rendered as the same legible error as a pre-checked duplicate.
-            mro = "".join(t.__name__ for t in type(exc).__mro__)
-            if "Integrity" in mro or "UniqueViolation" in mro:
+            if _is_integrity_refusal(exc):
                 raise ValueError("label already in use") from exc
             raise
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
@@ -5212,6 +5243,20 @@ class AuthService:
         # remove" about a write that just happened.
         if outcome.issuer is None and outcome.subject is None:
             raise ValueError("the account has no federated binding to remove")
+        await self._record_federated_unbind(user_id, outcome, actor=actor)
+        return outcome.sessions_revoked
+
+    async def _record_federated_unbind(
+        self, user_id: str, outcome: FederatedUnbind, *, actor: str
+    ) -> None:
+        """Audit a cleared binding from the clear's own record, and tell the holder (BACKLOG #1143).
+
+        Shared by the unbind and by a rebind whose second write failed after its clear committed, so
+        a binding never disappears without an ``auth.federated_subject_unbound`` row. The notice is
+        ASVS 6.3.7, as on the bind: the holder's federated sign-in stopped working and their
+        sessions ended. The account is read for its address only AFTER the clear, and only for that;
+        every audited field comes out of the clear's transaction.
+        """
         await self._audit(
             "auth.federated_subject_unbound",
             actor=actor,
@@ -5225,7 +5270,13 @@ class AuthService:
                 }
             ),
         )
-        return outcome.sessions_revoked
+        holder = await self._store.get_user(user_id)
+        await self._notify_security(
+            FEDERATED_IDENTITY_UNBOUND,
+            username=outcome.username,
+            email=None if holder is None else holder.notify_email,
+            detail={"issuer": outcome.issuer},
+        )
 
     async def bind_federated_subject(
         self, user_id: str, subject: str, *, actor: str
@@ -5261,15 +5312,24 @@ class AuthService:
             raise ValueError("no OIDC issuer is configured ([auth].oidc_issuer)")
         # The pair is exact-matched against the verified token, so a stray space or a control
         # character makes a binding nobody can ever present. Refused here rather than stored dead.
-        if not subject or subject != subject.strip() or not subject.isprintable():
-            raise ValueError("the subject must be the IdP's exact sub, with no surrounding spaces")
+        # ASCII because OpenID Connect Core requires it of `sub`, and because the narrowest column
+        # (SQL Server NVARCHAR(256)) counts UTF-16 units, so 255 non-ASCII characters could overflow.
+        if (
+            not subject
+            or subject != subject.strip()
+            or not subject.isascii()
+            or not subject.isprintable()
+        ):
+            raise ValueError(
+                "the subject must be the IdP's exact sub: printable ASCII, no surrounding spaces"
+            )
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
         if user.auth_provider != AuthProvider.AD.value:
             raise ValueError("only a directory (AD) account can take a federated binding")
         if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
-            raise ValueError("the account is already bound to that identity")
+            raise ValueError("the account already holds that identity")
         holder = await self._store.get_user_by_federated_subject(issuer, subject)
         if holder is not None and holder.id != user_id:
             raise FederatedSubjectHeld(
@@ -5286,16 +5346,37 @@ class AuthService:
         revoked = cleared.sessions_revoked
         rebind = previous_issuer is not None or previous_subject is not None
         try:
-            await self._store.set_user_federated_subject(user_id, issuer, subject)
+            # CONDITIONAL ON THE ROW STILL BEING UNBOUND, in the same statement. The clear above and
+            # this write are two transactions, so a second bind of this account can land between
+            # them; an unconditional write would overwrite it with no audit row and leave the
+            # sessions it admitted live.
+            written = await self._store.set_user_federated_subject(
+                user_id, issuer, subject, expect_unbound=True
+            )
         except Exception as exc:
+            # A binding this call removed is recorded whatever happens next, so it never disappears
+            # without an audit row or a notice to its holder.
+            if rebind:
+                await self._record_federated_unbind(user_id, cleared, actor=actor)
             # `ux_users_federated_subject` refused it: another account took the pair after the read
             # above. Rendered as the same refusal the sequential check gives; anything else re-raises.
             if not _is_integrity_refusal(exc):
                 raise
-            suffix = "; the account's previous binding was removed and it is now unbound"
             raise FederatedSubjectHeld(
-                "that identity is already bound to another account" + (suffix if rebind else "")
+                "that identity is already bound to another account"
+                + (
+                    "; the account's previous binding was removed and it is now unbound"
+                    if rebind
+                    else ""
+                )
             ) from exc
+        if not written:
+            if rebind:
+                await self._record_federated_unbind(user_id, cleared, actor=actor)
+            raise FederatedSubjectHeld(
+                "another request bound this account while this one ran; read it and retry"
+                + ("; this request removed its previous binding first" if rebind else "")
+            )
         detail: dict[str, object] = {
             "user_id": user_id,
             "username": user.username,

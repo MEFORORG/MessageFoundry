@@ -106,5 +106,5 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
     assert (detail["previous_subject"], detail["subject"]) == (FIRST_SUB, REBOUND_SUB)
 
     # 5. The same pair again is refused, so a no-op signs nobody out.
-    with pytest.raises(ValueError, match="already bound to that identity"):
+    with pytest.raises(ValueError, match="already holds that identity"):
         await service.bind_federated_subject("bind-a", REBOUND_SUB, actor="admin")

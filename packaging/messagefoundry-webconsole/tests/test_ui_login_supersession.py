@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import time
 from urllib.parse import parse_qsl, urlsplit
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -51,7 +52,9 @@ class _FakeLdap:
     def authenticate(self, username: str, password: str) -> AdPrincipal | None:
         return _PRINCIPAL if username == "jdoe" else None
 
-    def resolve_principal(self, username: str) -> AdPrincipal | None:
+    def resolve_principal(
+        self, username: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
         return _PRINCIPAL if username == "jdoe" else None
 
 
@@ -206,12 +209,21 @@ async def _oidc_round_trip(
     """
 
     # The IdP exchange is replaced at the one seam the service calls; the directory resolve, the
-    # AD mirror row and the mint all run for real. A name the directory cannot resolve is the
-    # failing proof.
+    # AD mirror row and the mint all run for real. BACKLOG #1143 (ADR 0184): a federated login
+    # selects its account by the (issuer, sub) pair and never binds, so ``jdoe`` is bound through
+    # the admin path first, and a subject nobody bound is the failing proof.
+    jdoe = await service.store.get_user_by_username("jdoe")
+    if jdoe is None:
+        jdoe_id = uuid4().hex
+        await service.store.create_user(user_id=jdoe_id, username="jdoe", auth_provider="ad")
+    else:
+        jdoe_id = jdoe.id
+    await service.bind_federated_subject(jdoe_id, "S-1-5-21-fed", actor="admin")
+
     def _exchange(*_a: object, **_k: object) -> FederatedPrincipal:
         return FederatedPrincipal(
             username="jdoe" if ok else "stranger",
-            subject="S-1-5-21-fed",
+            subject="S-1-5-21-fed" if ok else "S-1-5-21-stranger",
             issuer="https://idp.example",
             amr=("pwd", "mfa"),
             acr=None,

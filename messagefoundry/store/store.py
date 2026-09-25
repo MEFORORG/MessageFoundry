@@ -1228,6 +1228,16 @@ WITHDRAW_AD_SCOPE_SQL: Final = (
     " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
 )
 
+#: ``set_user_federated_subject``'s two statements on SQLite: unconditional, and conditional on the
+#: row holding no pair (``expect_unbound``, BACKLOG #1143). Both literal, so no SQL is assembled.
+_SET_FEDERATED_SQL: Final = (
+    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
+)
+_SET_FEDERATED_IF_UNBOUND_SQL: Final = (
+    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
+    " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
+)
+
 
 @dataclass(frozen=True)
 class UserRecord:
@@ -10313,8 +10323,14 @@ class MessageStore:
             return int(cur.rowcount) > 0
 
     async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
         """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Written only by the
         administrative bind since BACKLOG #1143; see :meth:`AuthStore.set_user_federated_subject`."""
         now = time.time() if now is None else now
@@ -10322,11 +10338,14 @@ class MessageStore:
         # (the #1256 race loser), and the unwind rolls back the transaction the refusal would
         # otherwise leave open for the next writer's BEGIN to fail on (BACKLOG #1801).
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
-                (issuer, subject, now, user_id),
-            )
+            if expect_unbound:
+                cur = await self._db.execute(
+                    _SET_FEDERATED_IF_UNBOUND_SQL, (issuer, subject, now, user_id)
+                )
+            else:
+                cur = await self._db.execute(_SET_FEDERATED_SQL, (issuer, subject, now, user_id))
             await self._commit()
+            return int(cur.rowcount) > 0
 
     async def clear_user_federated_subject(
         self, user_id: str, *, now: float | None = None

@@ -1026,8 +1026,15 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ),
     ) -> SimpleMessage:
         """Bind the account to an IdP ``sub`` under the configured issuer, or rebind it. A rebind
-        revokes the account's sessions with the old binding. 404 for an unknown user, 409 when
-        another account holds the identity, 400 for every other refusal."""
+        revokes the account's sessions with the old binding. 404 for an unknown user, 409 on a
+        conflict, 400 for every other refusal, including the caller's own account."""
+        # SELF-EXCLUSION, as the two reset routes above do. Re-pointing or removing your own
+        # federated identity ends every session you hold, the calling one included, and on a site
+        # where you sign in only through the IdP it can leave the last administrator locked out.
+        if user_id == identity.user_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
+            )
         try:
             bound = await service.bind_federated_subject(
                 user_id, body.subject, actor=identity.username
@@ -1058,6 +1065,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> SimpleMessage:
         """Remove the account's federated binding and revoke its sessions (BACKLOG #1474's service
         method). Its next federated login is refused until it is bound again."""
+        if user_id == identity.user_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
+            )
         try:
             revoked = await service.unbind_federated_subject(user_id, actor=identity.username)
         except ValueError as exc:

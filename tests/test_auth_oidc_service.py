@@ -35,7 +35,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND
+from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND, FEDERATED_IDENTITY_UNBOUND
 from messagefoundry.auth.service import (
     FEDERATED_SUBJECT_NOT_BOUND,
     AuthService,
@@ -443,10 +443,18 @@ async def test_ac4_first_contact_is_refused_and_binds_nothing(
         assert await store.get_user_by_username("jdoe") is None, "first contact created a row"
         assert await _audit_rows(store, "auth.login_success") == []
         assert await _audit_rows(store, "auth.federated_subject_bound") == []
-        rows = await _audit_rows(store, "auth.login_failed")
-        assert any(
-            f'"reason": "{FEDERATED_SUBJECT_NOT_BOUND}"' in (r["detail"] or "") for r in rows
-        )
+        [row] = [
+            r
+            for r in await _audit_rows(store, "auth.login_failed")
+            if FEDERATED_SUBJECT_NOT_BOUND in (r["detail"] or "")
+        ]
+        # A NEUTRAL actor: the claimed name selects nothing, so the row must not land in that
+        # person's security-events feed. The presented pair is recorded, because binding it is the
+        # only remedy and the operator needs the exact sub to do that.
+        assert row["actor"] == "<oidc>"
+        detail = json.loads(row["detail"])
+        assert (detail["issuer"], detail["subject"]) == ("https://idp.example", DEFAULT_SUB)
+        assert detail["claimed_username"] == "jdoe"  # the ladder strips the UPN suffix
 
         # CONTROL: bind through the admin path, and the same token now signs in.
         await _bind(service, store, DEFAULT_SUB)
@@ -1213,3 +1221,112 @@ def test_the_browser_layer_gives_a_refused_account_no_distinguishing_code() -> N
             "caller the account exists"
         )
         assert _REASON_TO_CODE.get(slug, "oidc_failed") == "oidc_failed"
+
+
+async def test_a_pair_matching_only_under_a_case_blind_collation_selects_nothing(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SQL Server compares the federated columns under the database default, usually
+    case-insensitive, so its lookup for ``s-1-abc`` returns the row bound to ``S-1-ABC``. The lookup
+    now SELECTS the account, so the service re-checks the pair byte for byte.
+
+    SQLite is case-sensitive, so the case-blind lookup is modelled by wrapping it. The CONTROL is the
+    exact-case login, which the same wrapped lookup lets through.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind="S-1-ABC")
+        real = store.get_user_by_federated_subject
+
+        async def case_blind(issuer: str, subject: str) -> Any:
+            for u in await store.list_users():
+                if u.oidc_issuer == issuer and (u.oidc_subject or "").lower() == subject.lower():
+                    return u
+            return await real(issuer, subject)
+
+        monkeypatch.setattr(store, "get_user_by_federated_subject", case_blind)
+        other_case = await _oidc_login(service, monkeypatch, rsa_key, sub="s-1-abc")
+        assert not other_case.ok and other_case.reason == FEDERATED_SUBJECT_NOT_BOUND
+        exact = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-ABC")
+        assert exact.ok, exact.reason
+    finally:
+        await store.close()
+
+
+async def test_a_refusal_after_selection_is_filed_under_the_selected_account(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the pair has chosen ``jdoe``, a later refusal is about ``jdoe``, whatever name the token
+    claimed. Filing it under the claimed name would put it in a stranger's security-events feed."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, ldap=_FakeLdap(principal=None), bind="S-1-alice")
+        out = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="bsmith@corp.example"
+        )
+        assert not out.ok and out.reason == "not_in_directory"
+        [row] = [
+            r
+            for r in await _audit_rows(store, "auth.login_failed")
+            if "not_in_directory" in (r["detail"] or "")
+        ]
+        assert row["actor"] == "jdoe"
+    finally:
+        await store.close()
+
+
+async def test_a_rebind_racing_another_bind_is_refused_and_audits_what_it_removed(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """The admin bind clears and then sets, in two transactions. A second bind landing between them
+    must not be overwritten, and the binding this call already removed must still be recorded.
+
+    The wedge runs the second bind straight after the clear. The set is conditional on the row being
+    unbound, so it writes nothing; the call is refused; the account keeps the SECOND bind's pair;
+    and the first binding's removal is audited and its holder told.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _CapturingNotifier()
+        service = await _service(store, rsa_key, notifier=notifier, bind="S-1-first")
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+        real_clear = store.clear_user_federated_subject
+
+        async def clear_then_another_bind(user_id: str, **kw: Any) -> Any:
+            outcome = await real_clear(user_id, **kw)
+            await store.set_user_federated_subject(user_id, "https://idp.example", "S-1-other")
+            return outcome
+
+        store.clear_user_federated_subject = clear_then_another_bind  # type: ignore[method-assign]
+        try:
+            with pytest.raises(FederatedSubjectHeld, match="while this one ran"):
+                await service.bind_federated_subject(account.id, "S-1-mine", actor="admin")
+        finally:
+            del store.clear_user_federated_subject
+
+        after = await store.get_user(account.id)
+        assert after is not None and after.oidc_subject == "S-1-other", "the other bind was lost"
+        [unbound] = await _audit_rows(store, "auth.federated_subject_unbound")
+        assert json.loads(unbound["detail"])["subject"] == "S-1-first"
+        assert await _audit_rows(store, "auth.federated_subject_rebound") == []
+        assert any(e.event_type == FEDERATED_IDENTITY_UNBOUND for e in notifier.events)
+    finally:
+        await store.close()
+
+
+async def test_an_unbind_tells_the_holder(rsa_key: rsa.RSAPrivateKey) -> None:
+    """ASVS 6.3.7, as on the bind: the holder's federated sign-in stopped working and their sessions
+    ended. The notice names the issuer, never the subject."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _CapturingNotifier()
+        service = await _service(store, rsa_key, notifier=notifier, bind="S-1-alice")
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+        await service.unbind_federated_subject(account.id, actor="admin")
+        [notice] = [e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_UNBOUND]
+        assert notice.username == "jdoe"
+        assert "S-1-alice" not in str(notice.detail)
+    finally:
+        await store.close()

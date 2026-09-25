@@ -197,9 +197,10 @@ async def test_bind_rebind_and_unbind_each_leave_an_audit_row_naming_the_actor(
     [
         ("unknown user", 404, "no such user"),
         ("local account", 400, "only a directory"),
-        ("same pair again", 400, "already bound to that identity"),
+        ("same pair again", 400, "already holds that identity"),
         ("held elsewhere", 409, "already bound to another account"),
         ("padded subject", 400, "exact sub"),
+        ("non-ASCII subject", 400, "printable ASCII"),
     ],
 )
 async def test_bind_refusals(
@@ -231,6 +232,8 @@ async def test_bind_refusals(
         await service.bind_federated_subject(holder, subject, actor="setup")
     elif case == "padded subject":
         subject = " S-1-a"
+    elif case == "non-ASCII subject":
+        subject = "S-1-\u00e9"
     async with _client(engine, service) as c:
         tok = await _admin(c, service)
         _r, tok = await _reauth(c, tok, purpose=ACTION)
@@ -293,3 +296,30 @@ async def test_the_body_refuses_unknown_keys_and_an_issuer(engine: Engine) -> No
     assert r.status_code == 422
     user = await engine.store.get_user(target)
     assert user is not None and user.oidc_subject is None
+
+
+async def test_an_administrator_cannot_change_their_own_binding(engine: Engine) -> None:
+    """As with the two reset routes: changing your own binding ends every session you hold, and on
+    a site where you sign in only through the IdP it can lock the last administrator out. The
+    CONTROL is the same call on another account, which succeeds."""
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        tok = await _admin(c, service)
+        root = await engine.store.get_user_by_username("root")
+        assert root is not None
+        for method in ("PUT", "DELETE"):
+            _r, tok = await _reauth(c, tok, purpose=ACTION)
+            r = await c.request(
+                method,
+                f"/users/{root.id}/federated-identity",
+                json={"subject": "S-1-self"} if method == "PUT" else None,
+                headers=_auth(tok),
+            )
+            assert r.status_code == 400, (method, r.text)
+            assert "your own binding" in r.json()["detail"]
+        target = await _ad_account(engine)
+        _r, tok = await _reauth(c, tok, purpose=ACTION)
+        ok = await c.put(
+            f"/users/{target}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+        )
+        assert ok.status_code == 200, ok.text

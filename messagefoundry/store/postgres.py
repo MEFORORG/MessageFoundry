@@ -7155,17 +7155,31 @@ class PostgresStore:
         return _rowcount(result) > 0
 
     async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015)."""
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015); see ``AuthStore``."""
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET oidc_issuer=$1, oidc_subject=$2, updated_at=$3 WHERE id=$4",
-            issuer,
-            subject,
-            now,
-            user_id,
+        sql = (
+            "UPDATE users SET oidc_issuer=$1, oidc_subject=$2, updated_at=$3 WHERE id=$4"
+            " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
+            if expect_unbound
+            else "UPDATE users SET oidc_issuer=$1, oidc_subject=$2, updated_at=$3 WHERE id=$4"
         )
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                sql,
+                issuer,
+                subject,
+                now,
+                user_id,
+            )
+        return _rowcount(result) > 0
 
     async def clear_user_federated_subject(
         self, user_id: str, *, now: float | None = None

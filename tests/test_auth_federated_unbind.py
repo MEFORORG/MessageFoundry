@@ -168,9 +168,10 @@ async def test_the_audit_row_names_the_pair_the_unbind_itself_cleared(
     afterwards clears ``S-1-carol``. The row has to name what was cleared; naming the pair that was
     there a moment earlier is a false record of whose access was withdrawn.
 
-    The wedge sits on ``get_user`` precisely BECAUSE the fixed code never calls it here: the test
-    fails loudly if that read comes back, and passes only while the reported pair is the
-    transaction's own.
+    The wedge sits on ``get_user`` BEFORE the clear, because the fixed code never reads the account
+    there: the test fails loudly if that read comes back, and passes only while the reported pair is
+    the transaction's own. The one read after the clear, for the holder's notice address, is let
+    through (BACKLOG #1143).
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -186,13 +187,29 @@ async def test_the_audit_row_names_the_pair_the_unbind_itself_cleared(
         await store.clear_user_federated_subject(account.id, now=10.0)
         await store.set_user_federated_subject(account.id, issuer, "S-1-carol", now=11.0)
 
-        async def unexpected_get_user(user_id: str) -> Any:
-            raise AssertionError(
-                "unbind_federated_subject read the account outside its transaction; the pair it"
-                " audits can then be one a concurrent rebind has already replaced"
-            )
+        # The wedge refuses a read BEFORE the clear. Since BACKLOG #1143 the unbind reads the
+        # account once AFTER the clear and its audit row, for the holder's notice address only; that
+        # read cannot change what the row names, so it is allowed through.
+        real_get_user = store.get_user
+        real_clear = store.clear_user_federated_subject
+        cleared = False
 
-        monkeypatch.setattr(store, "get_user", unexpected_get_user)
+        async def clear_and_mark(*args: Any, **kwargs: Any) -> Any:
+            nonlocal cleared
+            result = await real_clear(*args, **kwargs)
+            cleared = True
+            return result
+
+        async def get_user_only_after_the_clear(user_id: str) -> Any:
+            if not cleared:
+                raise AssertionError(
+                    "unbind_federated_subject read the account outside its transaction; the pair it"
+                    " audits can then be one a concurrent rebind has already replaced"
+                )
+            return await real_get_user(user_id)
+
+        monkeypatch.setattr(store, "clear_user_federated_subject", clear_and_mark)
+        monkeypatch.setattr(store, "get_user", get_user_only_after_the_clear)
         await service.unbind_federated_subject(account.id, actor="admin")
         monkeypatch.undo()
 

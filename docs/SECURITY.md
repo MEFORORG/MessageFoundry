@@ -315,7 +315,7 @@ bearer token, the must-change lockout and the permission.
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 93, not 91, because BOTH `/messages/export` routes require two).
+under `create_app()` (they sum to 95, not 93, because BOTH `/messages/export` routes require two).
 
 | Constant | Permission | PHI | Routes | Gates |
 |---|---|---|:--:|---|
@@ -594,7 +594,7 @@ tuple: they act only on the caller's own account.
 > minted a new `user_id` only when no mirror row survived, so on the default AD path the surviving row
 > was adopted and **its `user_id` re-bound to the new principal**. BACKLOG #1471 closed that: an AD
 > login now resolves its row by the directory's immutable identifier — the normalised `objectGUID`,
-> stored in `users.directory_object_id` — the way a federated login binds `(issuer, sub)`, and a
+> stored in `users.directory_object_id` — as a federated login is identified by `(issuer, sub)`, and a
 > principal whose identifier disagrees with the row holding its username is refused rather than handed
 > that row. A recycled name gets a new account with a new `user_id`.
 >
