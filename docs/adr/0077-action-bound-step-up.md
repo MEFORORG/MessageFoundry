@@ -16,7 +16,9 @@ weak default for the **factor-binding** operations specifically:
 
 1. **Login seeds the window.** `_issue_session(..., seed_reauth=mfa_verified)` writes
    `reauth_at = now` for a fully-authenticated session, so for the first 300s after login *every*
-   step-up-gated action is unlocked with **no fresh proof at all**.
+   step-up-gated action is unlocked with **no fresh proof at all**. (Since BACKLOG #1144 step 5,
+   `_issue_session` takes `seed_reauth` with no default, so every caller names it. Only a local
+   login that owes no second factor seeds the window, and no directory login does.)
 2. **The window is a single shared grant.** The one action-tied proof — `POST /me/reauth`'s
    `verify_current_password` — refreshes that same session-wide `reauth_at`, which any subsequent
    sensitive action then reuses. A proof gathered "to change my password" also unlocked "enroll an

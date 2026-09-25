@@ -71,10 +71,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except (binascii.Error, ValueError):
             await auth.audit_kerberos_reject("malformed_token")
             return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
-        # seed_reauth=False (ADR 0068 §9): the SSO proof is AMBIENT — the session must not
-        # be born with a free step-up window; the first sensitive action forces the
-        # directory-password step-up at /ui/reauth. ONE session per navigation into this
-        # route (the resync side effect fires here, never per page).
+        # NO STEP-UP WINDOW AT BIRTH: the SSO proof is AMBIENT, so the first sensitive action
+        # forces a step-up at /ui/reauth (a live directory re-bind) or a code at /ui/mfa. This
+        # route used to pass seed_reauth=False itself while POST /auth/negotiate took the seeding
+        # default; the engine now decides it for every directory login and takes no such argument
+        # (BACKLOG #1144, step 5). ONE session per navigation into this route (the resync side
+        # effect fires here, never per page).
         #
         # ASVS 7.2.4: ``supersedes`` ends the session this browser presented, as /ui/login does, once
         # the ticket is accepted. RESIDUAL: a cross-site link into this route (an intranet portal)
@@ -84,7 +86,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # leg's start page does for OIDC. A same-site navigation, such as the login page's own link,
         # carries the cookie and is covered.
         outcome = await auth.authenticate_kerberos(
-            token_bytes, client=client, seed_reauth=False, supersedes=session_token(request)
+            token_bytes, client=client, supersedes=session_token(request)
         )
         if not outcome.ok or outcome.token is None:
             # authenticate_kerberos audited the reject. NEVER a second 401 — no challenge

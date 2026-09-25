@@ -211,12 +211,17 @@ from typing import Any
 #: so a skew fails at the ``UiDeps`` construction; the digest moves and the handshake refuses it
 #: first. Unnumbered, as above.
 #:
+#: BACKLOG #1144 step 5 (ASVS 6.8.4): ``AuthService.authenticate_kerberos`` dropped its
+#: ``seed_reauth`` keyword, because the engine now withholds the step-up window on every directory
+#: login itself. ``GET /ui/sso`` passed ``seed_reauth=False``, so a console that still passes it
+#: gets a ``TypeError`` on every SSO sign-in. A signature the console calls, so it forces a bump.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "bb53be9768239508"
+ENGINE_UI_SEAM: str = "500b98c2d593db80"
 
 
 @dataclass(frozen=True, slots=True)

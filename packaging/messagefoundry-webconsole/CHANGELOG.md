@@ -75,6 +75,11 @@ under Changed says why engine 0.4.0 does not work with this console.
   `UiSeamMismatch`. Same one-value `SUPPORTED_ENGINE_SEAMS` rule as 0.2.15 (`BACKLOG #279`).
   **Migration:** upgrade the engine and the console together. Or set
   `[security].serve_web_console = false` on the engine to run its JSON API alone.
+- **`GET /ui/sso` no longer passes `seed_reauth=False` to the engine** (`BACKLOG #1144`, step 5).
+  The engine's `authenticate_kerberos` dropped the argument: it now withholds the step-up window
+  on every directory sign-in itself, the JSON `POST /auth/negotiate` included. What a user sees on
+  `/ui/sso` is unchanged. The engine UI seam moved with the signature, so `SUPPORTED_ENGINE_SEAMS`
+  holds the new value and the one-value rule above still applies.
 
 ### Fixed
 - **The reset-password page no longer fails with a `500` when the temporary password's deadline is

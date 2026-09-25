@@ -2140,8 +2140,10 @@ class AuthSettings(_Section):
     # active session. 0 = unlimited. Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
-    # re-verified its credential — at login or via POST /me/reauth — within this many seconds. The
-    # initial login counts as the first verification (sudo-timestamp model). Default 5 minutes.
+    # re-verified its credential -- at login, via POST /me/reauth, or with a code at
+    # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
+    # that owes no second factor counts as the first verification (sudo-timestamp model); a
+    # directory login (Kerberos, OIDC) does not (BACKLOG #1144). Default 5 minutes.
     step_up_max_age_seconds: int = 300
     # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), the durable-takeover
     # JSON routes — TOTP enroll/confirm, disable-MFA — require a fresh proof BOUND to

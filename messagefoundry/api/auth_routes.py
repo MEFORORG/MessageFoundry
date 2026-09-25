@@ -355,6 +355,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             token_bytes = base64.b64decode(header[len("Negotiate ") :], validate=True)
         except (binascii.Error, ValueError):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid SPNEGO token") from None
+        # BACKLOG #1144 step 5: the session is born with NO step-up window, exactly as GET /ui/sso's
+        # is. This route used to take the seeding default while the console passed False, so a
+        # bearer client got up to `step_up_max_age_seconds` of step-up-gated access on the login
+        # stamp alone. A session that owes a factor still meets X-MFA-Required first, and the code
+        # it proves opens the window (verify_mfa). One that owes none meets 403 +
+        # X-Step-Up-Required on its first gated action and answers with POST /me/reauth, a live
+        # directory re-bind.
         outcome = await service.authenticate_kerberos(token_bytes, client=_client(request))
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "SSO authentication failed")
