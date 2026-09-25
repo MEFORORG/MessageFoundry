@@ -53,9 +53,11 @@ section reference.
 | Sign-in & identity | `require_sign_in` | `true` |
 | | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
-| Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
 | | `sign_out_after_idle_minutes` | `30` |
 | | `max_session_hours` | `12` |
+| Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
+| Backend credentials | `require_nonstatic_credentials` | `false` (*not* a loosening — it TIGHTENS, refusing backend hops on a static credential or none. Opt-in by owner decision, because several hops have no compliant kind in the product) |
+| | `static_credential_accepted` | `{}` (each opt-out is a loosening while `require_nonstatic_credentials` is on, and is reported as `static_credential_accepted`; with the refusal off an opt-out does nothing and is not reported) |
 | Data handling | `block_unlisted_outbound` | `true` |
 | | `delete_message_bodies_after_days` | `30` (`0` = keep forever) |
 | | `allow_keeping_phi_indefinitely` | `false` |
@@ -63,18 +65,20 @@ section reference.
 | Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
 | Production tier | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
+| | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 
-**Six of these do not live in `[security]`.** `[store].aad_bind`,
-`[auth].ad_session_recheck_seconds` and `[secret_rotation].enforce_store_key_expiry` sit in their own
+**Seven of these do not live in `[security]`.** `[store].aad_bind`,
+`[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds` and
+`[secret_rotation].enforce_store_key_expiry` sit in their own
 sections for cohesion, and the last three are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
-first three are named by `security_loosenings()` from the loaded
+first four are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[secret_rotation]` sections; the last
 three are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
@@ -327,6 +331,26 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   gets an explicit `[security]` acknowledgment instead — the first verify-off hop governed that way.
 - **Still refused:** nothing here relaxes the connectors. This switch reaches the `[alerts]` cell only.
 
+### `static_credential_accepted` — a backend hop runs on an unchanging credential while the refusal is on
+This deviation exists only while `require_nonstatic_credentials = true`. With the refusal off, nothing
+is refused, so an opt-out does nothing and is not reported.
+
+- **What you lose:** for each hop you name, ASVS 13.2.1's ask that a backend hop use a service
+  account, a short-term token or a certificate. The named hop presents a password, an API key, a static
+  bearer token or a Vault token, or presents nothing at all. Whoever holds that credential can use it
+  until someone rotates it by hand.
+- **When acceptable:** the hop has no compliant credential kind in the product. Each hop's
+  `compliant_kind` says so. The alert webhook, DICOMweb, `Tcp`, `X12`, FTP, SMTP AUTH, a forward proxy,
+  a Postgres store, the Vault tokens, the AI broker key, the OIDC `client_secret` and the LDAP bind are
+  at least some of these. Where a compliant kind exists, move the hop to it rather than opting out.
+- **Compensating controls:** every opt-out needs a written reason, and a blank one is refused at load.
+  Serve logs each honoured opt-out at WARNING with the hop name and the reason, and it also logs an
+  opt-out that matches no hop. `security_loosenings()` names the opt-outs.
+  `GET /security/posture` marks each opted-out hop `accepted`, and `messagefoundry check` marks it
+  `[opted out]`.
+- **What the reports show:** each hop's detail names what it presents and its peer, as scheme, host
+  and port only. It never shows the credential, a URL path or a query.
+
 ### `enforcement = warn` — warn instead of refuse on the PHI serve-gate floor
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
@@ -344,7 +368,7 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   **AUDIT** line + posture view keep the deviation visible.
 - **Still refused (even at `warn`):** the **no-auth-to-the-network** hard refuse (`require_sign_in = false` on
   an exposed instance — a non-loopback bind, or a loopback bind behind a declared TLS terminator) is
-  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. `enforcement` is **binary** (no `off`), and **nothing silences a
+  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
   per-connection `cleartext_accepted` declaration is the way to cross one, recorded per hop.
@@ -391,6 +415,26 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, in both directions. Legacy `v1` rows always decrypt (dual-read) and
   `messagefoundry rotate-key` upgrades them `v1`→`v2` in place, so turning it back on does not strand an
   existing store. See [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) (2026-07-28 amendment).
+
+### `[store].allow_unmarked_ciphertext = true` — an unmarked value in an encrypted column reads back as plaintext
+- **What you lose:** the refusal that protects an encrypted column against a **downgrade**. On a keyed
+  store, a non-blank value with no `mfenc:` marker is a stripped marker or a planted plaintext row, and
+  with this off it is refused (`CipherError`) and alerted (`integrity_drift`, subject `store-cipher`).
+  With it on, that value is returned as the row's content, and the next keyed open or `rotate-key`
+  seals it into genuine ciphertext, after which no evidence of the substitution survives. Cell binding
+  (`aad_bind`) does not cover this: a moved ciphertext has a tag to fail, and a plaintext value has none
+  (ASVS 11.3.3, BACKLOG #1169).
+- **When acceptable:** a store that holds legitimate unmarked values beside ciphertext in one column —
+  for example rows written by a keyless run of a store that was keyed before. Turn it on for one keyed
+  open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
+- **Compensating controls:** database-level access control, because planting a row needs store write
+  access. Nothing in the engine detects the plant once this is on.
+- **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
+  it sealed while on stays sealed.
+- **Uploads too:** on a keyed store a plaintext uploaded file is refused until `rotate-key` seals it
+  (owner ruling 2026-09-23), alerting under its own subject `upload-cipher`. With this on, it is served as plaintext instead. Under
+  `cipher_provider = "vault_transit"` uploads pass through either way; [PHI.md](PHI.md) §3 says why.
+- **Not covered either way:** the DIRECT S/MIME connector's enveloped body.
 
 ### `[secret_rotation].enforce_store_key_expiry = false` — the store DEK's calendar expiry stops the engine no more
 - **What you lose:** the **hard stop** on a calendar-expired data-encryption key. With it on, a DEK past
@@ -635,6 +679,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `production_instance` (production tier) | V13 Configuration (risk-based) | **RA-2** Security Categorization | §164.308(a)(1) Risk Analysis / Management |
 | `enforcement` (refuse/warn dial) | V13 Configuration (secure defaults) | **CM-6** Configuration Settings · **CM-7** Least Functionality (secure-by-default) | §164.308(a)(1) Risk Analysis / Management |
 | `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
+| `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |

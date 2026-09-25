@@ -264,12 +264,14 @@ jobs:
             tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py
             tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py
             tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py
+            tests/test_security_doc_context_words.py
             tests/test_sds_rule_ids_are_stable.py
             tests/test_link_resolution.py tests/test_dast_claims.py
             tests/test_claude_section_citations.py tests/test_write_share_denominator.py
             tests/test_cutover_slug_rot.py
             tests/test_docs_cite_no_refused_config_keys.py
-            tests/test_operator_docs_no_warning_sign.py"
+            tests/test_operator_docs_no_warning_sign.py
+            tests/test_docs_upstream_hop_ack.py"
           # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
           # the ruling above says removing a guard is a different act from adding one. They were
           # test_backlog_status_check, test_backlog_citation_check, test_dangling_citation_check,
@@ -1825,6 +1827,38 @@ jobs:
         if: runner.os == 'Windows'
         run: npm test
 
+  # BACKLOG #1164, owner decision 2026-09-24: the TypeScript/JavaScript and PowerShell crypto
+  # OPERATION arms of the ASVS 11.1.3 gate run in their OWN small job so they can gate a merge.
+  # They used to be the last step of `ide` above, and that job is path-gated on a pull request, so a
+  # PR touching only the console's JS, a .ps1 or the gate script was not scanned until push-to-main.
+  # THAT GAP IS CLOSED: this job has no `needs:`, no job-level `if:` and no path gate, so it runs on
+  # every event this workflow triggers on -- pull_request, push-to-main and merge_group, and also the
+  # nightly cron and a manual dispatch, where it costs seconds. The merge_group arm is load-bearing:
+  # a required context with no queue leg never reports on a queued entry and wedges it. Do not add a
+  # job-level `if:` to trim the cron run; a skipped job is the context not reporting.
+  #
+  # Stdlib-only Python, no npm build, one Linux leg: the scan reads source text and is not
+  # platform-dependent. Deliberately NOT in ci-gate's `needs:`. It is a context of its own, like the
+  # `test` legs, rather than a leg of the roll-up.
+  #
+  # The job `name:` below IS the status-check context string, so renaming it is a branch-protection
+  # change. It blocks a merge only while branch protection requires that context, a server setting
+  # nothing here can see; `.github/required-contexts.txt` is the checked-in record of that set.
+  crypto-operations:
+    name: crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Crypto operation inventory (TypeScript/JavaScript + PowerShell arms)
+        # Stdlib-only (no install). Exits non-zero, failing the job, on any drift.
+        run: python scripts/security/crypto_inventory_check.py --non-python-operations
+
   # Path filter for the container-pulling server-DB leg(s). A docs/unrelated PR shouldn't pull the SQL
   # Server image (mcr.microsoft.com anonymous pulls are rate-limited — repeated PRs flake on
   # "toomanyrequests"). This job decides whether the SQL Server leg needs to run: ALWAYS true on
@@ -2093,12 +2127,13 @@ jobs:
           # packaging-build, via `docker`, `ide`, `tooling` and `packaging` below.
           #
           # BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING, because dropping either changes the
-          # answer. "Names merge_group nowhere" ALONE is true of SIX of this file's 13 jobs -- it also
-          # takes in `changes`, which has no `if:` at all, and `ci-gate`, which is `always()` and
-          # reads no output of this step. Neither is decided by anything emitted here. Scanned over
-          # all 13 job blocks rather than sampled, and tests/test_ci_merge_group_gate.py pins the
-          # sides of that scan BY MEMBERSHIP, not by count: the SEVEN jobs whose own job-level or
-          # step-level `if:` names merge_group, the SIX of this paragraph, and the FOUR named above.
+          # answer. "Names merge_group nowhere" ALONE is true of SEVEN of this file's 14 jobs -- it
+          # also takes in `changes` and `crypto-operations`, which have no `if:` at all, and
+          # `ci-gate`, which is `always()` and reads no output of this step. None of the three is
+          # decided by anything emitted here. Scanned over all 14 job blocks rather than sampled, and
+          # tests/test_ci_merge_group_gate.py pins the sides of that scan BY MEMBERSHIP, not by count:
+          # the SEVEN jobs whose own job-level or step-level `if:` names merge_group, the SEVEN of
+          # this paragraph, and the FOUR named above.
           # THE COUNTS IN THIS PARAGRAPH ARE NOT WHAT IS PINNED -- that module held a count until
           # 2026-09-22 and a count sits at six while a job key is renamed underneath it. It also
           # fails outright if either half of this predicate stops removing anything, which is the

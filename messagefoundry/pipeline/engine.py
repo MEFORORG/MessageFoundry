@@ -50,7 +50,11 @@ from messagefoundry.config.wiring import (
     connector_secret_env_values,
     load_config,
 )
-from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.pipeline.alerts import (
+    AlertSink,
+    LoggingAlertSink,
+    store_cipher_refusal_forwarder,
+)
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
 from messagefoundry.pipeline.cluster import (
     ClusterCoordinator,
@@ -236,6 +240,7 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
+        registry_guard: Callable[[Registry], None] | None = None,
         sandbox_settings: SandboxSettings | None = None,
         log_dir: str | None = None,
     ) -> None:
@@ -250,6 +255,11 @@ class Engine:
         # reload here — so a `serve --shard X` process keeps owning only shard X's inbounds across
         # reloads. None = identity (the whole graph, unchanged default).
         self._registry_filter = registry_filter
+        # An optional refusal over every graph this engine is about to run, called at the first load
+        # (by the managed app) and on every reload, dry runs included, before anything is swapped and
+        # before the shard filter, so it sees the whole graph. It raises WiringError to refuse. `serve` passes the opt-in
+        # [security].require_nonstatic_credentials gate here (BACKLOG #1182); None = no guard.
+        self._registry_guard = registry_guard
         # Cluster coordination seam (Track B Step 3). None → the no-op NullCoordinator, so single-node
         # (SQLite and single-node Postgres) is byte-identical: is_leader() is always True and
         # start()/stop() do nothing. A DbCoordinator (built by build_coordinator on an enabled [cluster]
@@ -351,6 +361,9 @@ class Engine:
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
         self._gcm_invocation_runner: GcmInvocationRunner | None = None
+        # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
+        # #1169); None until start() arms it, and again after stop() disarms it.
+        self._cipher_refusal_armed: Any = None
         # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — the secret-side twin of
         # cert_monitor. None (embedding/tests) → no reminder task; a no-op when warn_days=0 or nothing is
         # tracked. The tracked-secret set is derived at scan time from [secret_rotation] so a reload is
@@ -561,6 +574,7 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
+        registry_guard: Callable[[Registry], None] | None = None,
     ) -> Engine:
         """Open a SQLite-backed engine from a path (convenience for tests/embedding). The service
         path goes through :func:`~messagefoundry.store.open_store` (backend-agnostic). The SQLite
@@ -622,6 +636,7 @@ class Engine:
             coordinator=coordinator,
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
+            registry_guard=registry_guard,
         )
 
     # --- code-first wiring ---------------------------------------------------
@@ -1036,10 +1051,42 @@ class Engine:
             except Exception:  # an alert-sink failure must never break startup
                 log.warning("audit-chain integrity alert could not be delivered")
 
+    def _arm_cipher_refusal_alert(self) -> None:
+        """Forward every unmarked-value refusal by the store cipher to the AlertSink (BACKLOG #1169).
+
+        A keyed store refuses a non-blank unmarked value in a cipher column: a stripped marker or a
+        planted row. The read site contains the ``CipherError`` -- a claim dead-letters the row -- but
+        the store cannot reach the AlertSink, so the refusal would otherwise reach nobody but the log.
+        Reuses the ``integrity_drift`` channel the audit-chain tamper check uses, under its own
+        ``store-cipher`` subject so it throttles and routes independently of that check.
+
+        Tolerant of a store without ``cipher()`` and of a cipher without the hook (keyless, or a test
+        double), exactly like the GCM runner's refill hook. With no configured sink it falls back to
+        the logging sink, as that runner does. The serve path also arms a hook BEFORE the store opens
+        (``api/app.py``), so a refusal that blocks the open alerts too; this one replaces it for the
+        engine's lifetime. The forwarder hops onto the loop when a decrypt ran on another thread."""
+        getter = getattr(self.store, "cipher", None)
+        cipher = getter() if callable(getter) else None
+        setter = getattr(cipher, "set_refusal_hook", None)
+        if not callable(setter):
+            return
+        sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
+        setter(store_cipher_refusal_forwarder(sink, asyncio.get_running_loop()))
+        self._cipher_refusal_armed = cipher
+
+    def _disarm_cipher_refusal_alert(self) -> None:
+        cipher = self._cipher_refusal_armed
+        self._cipher_refusal_armed = None
+        setter = getattr(cipher, "set_refusal_hook", None)
+        if callable(setter):
+            setter(None)
+
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
         outbounds, then start the wired graph."""
         self.started_at = time.time()
+        # Before anything reads the store, so a refusal during recovery alerts too (BACKLOG #1169).
+        self._arm_cipher_refusal_alert()
         # All-stages recovery: returns any row a crash left `inflight` — ingress rows mid-route and
         # outbound rows mid-delivery alike — to `pending` so the staged workers re-claim them
         # (staged pipeline, ADR 0001). The handoff/delivery transactions make the re-run idempotent.
@@ -1688,6 +1735,14 @@ class Engine:
                         rr.registry.outbound[name], flagged=flagged
                     )
 
+    def guard_registry(self, registry: Registry) -> None:
+        """Run the engine's registry guard over ``registry``; raises ``WiringError`` to refuse it.
+
+        A no-op when no guard was configured. Public because the managed app calls it on the first
+        load, which reaches ``add_registry`` directly rather than through :meth:`reload_detail`."""
+        if self._registry_guard is not None:
+            self._registry_guard(registry)
+
     async def reload(
         self,
         config_dir: str | Path | None = None,
@@ -1801,6 +1856,9 @@ class Engine:
         # Off the event loop: load_config executes user config modules (arbitrary, potentially heavy
         # imports), which would otherwise stall every listener mid-reload (review low-3).
         registry = await asyncio.to_thread(load_config, path)  # raises WiringError on a bad config
+        # Before the shard filter, so a guard judges the WHOLE graph: an engine-shard process then
+        # reaches the same verdict as its siblings, over one shared config (BACKLOG #1182).
+        self.guard_registry(registry)
         if self._registry_filter is not None:
             # Re-apply this process's shard filter so a reload keeps owning only its shard's inbounds
             # (outbound/routers/handlers stay shared). Pure + cheap (sharding.filter_registry_for_shard).
@@ -1992,8 +2050,8 @@ class Engine:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-ingress an EDITED body as a fresh
         correlated ``RECEIVED`` message on the ORIGIN's channel, then wake the workers so the router
         drains the new ingress row promptly. The store (:meth:`QueueStore.reingress`) does the idempotent,
-        original-immutable, correlated insert; RBAC + step-up are the API's job. The original message row
-        is never written."""
+        original-immutable, correlated insert; RBAC + step-up are the API's job, and so are the origin
+        inbound's ingress guards (BACKLOG #1911). The original message row is never written."""
         outcome = await self.store.reingress(
             origin_message_id=message_id, raw=raw, idempotency_key=idempotency_key
         )
@@ -2021,7 +2079,8 @@ class Engine:
         This is deliberately **not** :meth:`edit_resend_reroute`/``reingress``: that presupposes an
         origin ``messages`` row (for its channel + correlation), which an uploaded, never-ingested file
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
-        validation (registered/running) + RBAC + audit are the API's job. Returns the new message id."""
+        validation (registered/running) + RBAC + audit are the API's job, and so are the target inbound's
+        ingress guards (BACKLOG #1911). Returns the new message id."""
         mid = await self.store.enqueue_ingress(
             channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata
         )
@@ -2034,8 +2093,9 @@ class Engine:
     ) -> ResendOutcome:
         """Edit-and-resubmit DIRECT power-path (ADR 0090 §9, BACKLOG #153): deliver an EDITED body
         straight to a chosen alternate outbound ``to`` (reusing #123's :meth:`QueueStore.resend_to` with
-        a ``body_override``), then wake the alternate lane. Target validation + RBAC are the API's job;
-        the origin row is only read, never written."""
+        a ``body_override``), then wake the alternate lane. Target validation + RBAC are the API's job,
+        and so are the engine-wide ingress guards (BACKLOG #1911); the origin row is only read, never
+        written."""
         outcome = await self.store.resend_to(
             message_id=message_id, to=to, idempotency_key=idempotency_key, body_override=raw
         )
@@ -2191,6 +2251,7 @@ class Engine:
         if self._gcm_invocation_runner is not None:
             await self._gcm_invocation_runner.stop()
             self._gcm_invocation_runner = None
+        self._disarm_cipher_refusal_alert()
         # Deregister cluster membership after the runner has quiesced but before the store closes (the
         # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
         # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.

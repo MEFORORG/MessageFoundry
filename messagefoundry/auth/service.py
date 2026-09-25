@@ -20,8 +20,12 @@ import logging
 import os
 import secrets
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+import urllib.parse
+import urllib.request
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, Final, TypeVar
 from uuid import uuid4
@@ -69,9 +73,16 @@ from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.store.base import AdminStore
-from messagefoundry.store.store import SessionRecord, UserRecord, WebAuthnCredential
+from messagefoundry.store.store import (
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
+    SessionRecord,
+    UserRecord,
+    WebAuthnCredential,
+)
+from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
 
@@ -104,7 +115,7 @@ def _warn_if_corpus_unreadable(path: str | None) -> None:
 
 def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     """Eagerly load (and cache) the BUNDLED breach corpus at startup, so a truncated or missing file
-    surfaces in the log at boot rather than as a 500 on somebody's first password change (BACKLOG
+    surfaces in the log at boot, before anyone meets it as a 500 on a password change (BACKLOG
     #1438). The twin of ``_warn_if_corpus_unreadable`` above, at a higher level for a reason.
 
     The OPERATOR corpus degrades to a warning because it is optional and the bundled list still screens
@@ -118,6 +129,12 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     on its own candidate -- see that call for why. Stated as that ONE path rather than as "nothing
     anywhere": the ``provision-first-administrator`` CLI still halts on this, and uncaught.
 
+    BACKLOG #1886: the message names the forced rotation a first ``serve`` now cannot finish. The
+    chain behind that is stated once, on :class:`BreachCorpusUnavailable`. This runs from
+    ``__init__``, before ``initialize`` decides whether to mint, so the claim is conditional. A
+    repaired file is read without a restart, since ``lru_cache`` does not cache an exception. The
+    setting is read once into ``PasswordPolicy``, so changing it needs a restart.
+
     Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
     """
     if not check_breached:
@@ -126,9 +143,16 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
         entries = _common_passwords()
     except BreachCorpusUnavailable as exc:
         _log.error(
-            "%s; local password creation and change will be REFUSED until it is repaired "
-            "(ASVS 6.2.4). Reinstall the messagefoundry wheel, or set [auth].password_check_breached "
-            "= false to accept unscreened passwords deliberately",
+            "%s; creating or changing a local password by hand will be REFUSED until it is "
+            "repaired (ASVS 6.2.4). An account that must change its password therefore cannot "
+            "finish that change, and the attempt fails with a server error. A `serve` against a "
+            "store with no users still creates the bootstrap admin, and that account must change "
+            "its password. An administrator's password reset leaves its user stuck the same way, "
+            "and `provision-admin` fails for this reason too. Repair the corpus before the deadline "
+            "in bootstrap-admin.txt, and keep that file until the change succeeds. To repair it, "
+            "reinstall the messagefoundry wheel; a repaired file is read without a restart. Or set "
+            "[auth].password_check_breached = false and restart, to accept unscreened passwords "
+            "deliberately",
             exc,
         )
         return
@@ -145,6 +169,14 @@ _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
 # Bound on the per-process new-client-IP dedup cache (WP-L3-13). It only debounces the audit/notify
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
 _NEW_IP_DEDUP_MAX = 4096
+# Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
+# its entry is younger than the absolute session lifetime, because evicting it would hand that session
+# a fresh budget. When the map is full, entries older than that lifetime go first; if it is still
+# full, a session with no entry yet is revoked on its first failed re-proof instead (fail closed). One
+# account may hold at most _REPROOF_SESSION_PER_USER entries, dropping its own oldest, so a single
+# account cannot fill the map.
+_REPROOF_SESSION_MAX = 4096
+_REPROOF_SESSION_PER_USER = 64
 
 #: ASVS 6.3.8 — the fixed budget every FAILED authentication response is held to, so the branch a
 #: challenge took cannot be read off its latency (BACKLOG #1140). Successes are never padded: a valid
@@ -284,12 +316,18 @@ class Elevation:
       body, cookie), or it has just made the session it elevated unreachable.
     * not ``ok``, ``session_lost`` False -- the proof was wrong (bad password, bad code, bad
       assertion). Nothing rotated, and the token the caller presented still authenticates.
-    * not ``ok``, ``session_lost`` True -- the proof was GOOD but the session was revoked or expired
-      underneath the ceremony, so there was no row to re-key. Fails CLOSED: no token is handed back
-      and the caller must sign in again. Held apart from a wrong proof so a route can say which one
-      happened rather than report a correct credential as incorrect.
+    * not ``ok``, ``session_lost`` True -- the session is gone, so the caller must sign in again.
+      Either the proof was GOOD but the session was revoked or expired underneath the ceremony, or
+      (password re-auth only, BACKLOG #1138) the session is revoked because it spent its re-proof
+      budget, in which case the proof was wrong or never checked. Fails CLOSED: no token is handed
+      back. Held apart from a wrong proof so a route answers 401 rather than re-prompting on a
+      session that no longer exists. The ``auth.reauth`` row's ``session_revoked`` says which.
 
     ``recovery_codes`` is populated only by :meth:`AuthService.confirm_mfa_enrollment` (shown once).
+
+    ``locked`` is set only by :meth:`AuthService.verify_mfa`, on a refusal made because the account
+    is locked. It qualifies the wrong-proof state, so a route can say "locked" rather than report a
+    correct code as incorrect. A password re-proof is never refused for a lock (BACKLOG #1138).
 
     ``ok`` is DERIVED, not stored, and that is load-bearing rather than tidiness. Held as a field it
     was a second spelling of ``token is not None`` -- true of all 19 constructions -- so the type
@@ -302,11 +340,24 @@ class Elevation:
     token: str | None = None
     session_lost: bool = False
     recovery_codes: tuple[str, ...] = ()
+    locked: bool = False
 
     @property
     def ok(self) -> bool:
         """Elevated: a new session token was minted. See the class docstring for the three states."""
         return self.token is not None
+
+
+class CurrentPasswordCheck(Enum):
+    """The answer :meth:`AuthService.verify_current_password` gives ``POST /me/password``.
+
+    ``SESSION_ENDED`` is held apart from ``WRONG`` for the reason :class:`Elevation` holds
+    ``session_lost`` apart: the route must answer 401 and send the caller to sign in, not re-prompt
+    for a password on a session that no longer exists (BACKLOG #1138)."""
+
+    OK = "ok"
+    WRONG = "wrong"
+    SESSION_ENDED = "session_ended"
 
 
 @dataclass(frozen=True)
@@ -384,6 +435,20 @@ class _FederatedBindingWithdrawn(Exception):
     """
 
 
+def _reproof_refusal_reason(proof: _Reproof) -> str:
+    """The closed-set ``reason`` a refused password-change re-proof is audited with."""
+    if proof.session_revoked:
+        return "session_revoked"
+    if proof.session_gone:
+        return "session_gone"
+    return "bad_password"
+
+
+def _live_lock(user: UserRecord, now: float) -> bool:
+    """Whether ``user`` is under a lockout that has not yet expired at ``now``."""
+    return user.locked_until is not None and now < user.locked_until
+
+
 def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
     """The closed-set reason a directory login must refuse ``user``'s mirror row, or ``None``.
 
@@ -400,6 +465,38 @@ def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
     if user.locked_until is not None and now < user.locked_until:
         return "locked"
     return None
+
+
+@dataclass(frozen=True)
+class _Reproof:
+    """The outcome of one post-session credential re-proof, checked under the login leg's lockout.
+
+    ``user`` is the row read BEFORE the verify, so ``user.failed_attempts`` is the count as it stood
+    at the start of the attempt -- the login leg's ``prior_failures``. ``just_locked`` and
+    ``attempts`` come from the one atomic store call; the caller audits its own row first and only
+    then records the lockout, so the order in the trail matches the login leg's. ``cleared`` says a
+    success reset the counter, which happens only at full authentication. ``session_revoked`` says
+    this attempt spent the session's re-proof budget; the caller audits it and then revokes the
+    session with :meth:`AuthService._revoke_for_budget`."""
+
+    ok: bool
+    session_revoked: bool = False
+    #: The session was already gone (revoked or rotated away) when the attempt got the lock. It was
+    #: not verified and this attempt revoked nothing.
+    session_gone: bool = False
+    user: UserRecord | None = None
+    attempts: int = 0
+    just_locked: bool = False
+    cleared: bool = False
+
+
+@dataclass
+class _ReproofLock:
+    """The per-account lock that serializes re-proofs, with a count of the tasks holding or awaiting
+    it so the entry can be dropped when the last one leaves."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
 @dataclass(frozen=True)
@@ -502,6 +599,69 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
     if ALL_CHANNELS in names:
         return None
     return frozenset(str(n) for n in names)
+
+
+#: The IdP legs' OWN way across. The connection-shaped default cannot reach this opener, which
+#: resolves no trust anchor; see :attr:`~messagefoundry.config.tls_policy.RevocationHopGuard.ways_across`.
+_IDP_WAYS_ACROSS = (
+    "Set [auth].oidc_tls_crl_file to a PEM file holding a CRL from each CA that issues the token "
+    "and JWKS endpoint certificates, so the engine checks revocation on both legs. Put only CRLs "
+    "in it: a certificate in that file becomes a trusted root for this hop."
+)
+
+#: Stands in for a URL with no host. NOT the empty string: `is_loopback_hop_host("")` is True, so an
+#: empty host would take the on-box carve-out and a guard that cannot name its host would ALLOW.
+_NO_HOST = "(no host)"
+
+
+def _refuse_idp_revocation(
+    settings: AuthSettings, opener: urllib.request.OpenerDirector, posture: HopPosture | None
+) -> None:
+    """Apply the #201 posture-keyed revocation guard to BOTH OIDC legs (BACKLOG #1887, ADR 0173 §4.3).
+
+    **Two guards, never one.** The token endpoint and the JWKS URI are validated one URL at a time
+    and nothing requires them to share a host (#1158), so they may differ in loopback status. A single
+    guard keyed on the token host would let an off-box JWKS cross unguarded. Each leg derives its own
+    ``host=`` from its own URL; both read the ONE context the shared opener carries.
+
+    Called with the FINISHED opener, which is the point of ``context=``: an ``oidc_tls_crl_file`` that
+    really loaded sets ``VERIFY_CRL_CHECK_LEAF`` on that context, and the guard reads the flag rather
+    than the setting. Guarding before the opener exists would refuse an operator who had already
+    closed the gap, while telling them to set the CRL they had set.
+
+    ``posture`` is PASSED, never read ambiently: ``AuthService`` is built in the API lifespan, outside
+    every ``active_hop_posture`` scope, which is the position ``auth/ldap.py`` is already in. ``None``
+    leaves both guards the shipped no-op.
+
+    ``attested=False`` because no per-hop revocation attestation exists for these legs. There is no
+    ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
+
+    Known limits of this placement (it fires after ``engine.start()``, and ``check``/``verify`` do
+    not reach it) are recorded once, in ADR 0173 AC-4. Two more are recorded only here: when both
+    legs refuse, only the token leg is named, because it is checked first; and the WARN arm logs with
+    no audit sink after ``configure_logging`` has set the root level, so a level above WARNING would
+    likely filter it, as ``logging_setup._refuse_forward_revocation`` measured for its hop."""
+    context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
+    for url, leg, carries in (
+        (
+            settings.oidc_token_endpoint,
+            "token endpoint",
+            "the client secret and authorization code",
+        ),
+        (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
+    ):
+        # _NO_HOST is reached only by unvalidated settings: the validator refuses a missing URL.
+        RevocationHopGuard.capture(
+            host=urllib.parse.urlsplit(url or "").hostname or _NO_HOST,
+            cell=f"[auth] OIDC {leg} (verified TLS, no revocation check)",
+            description=(
+                f"carries {carries} over verified TLS but performs no certificate revocation checking"
+            ),
+            attested=False,
+            context=context,
+            posture=posture,
+            ways_across=_IDP_WAYS_ACROSS,
+        ).enforce_construction()
 
 
 class AuthService:
@@ -612,6 +772,16 @@ class AuthService:
         # same accepted per-process caveat). Minted ONLY by reauth(purpose=...) — never by login or
         # verify_mfa — so a login-seeded step-up window can't authorize a durable factor-binding action.
         self._action_step_up_grants: dict[tuple[str, str], float] = {}
+        # One in-flight post-session re-proof per account (BACKLOG #1138): user_id -> [lock, users].
+        # Process-local like the caches above; an entry lives only while someone holds or awaits it.
+        self._reproof_locks: dict[str, _ReproofLock] = {}
+        # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
+        # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
+        # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
+        # oldest evicted) and carried across a rotation by _rekey_token_state. PROCESS-LOCAL, with the
+        # same accepted caveat as _action_step_up_grants: a restart forgets the counts, and a topology
+        # that serves the API from more than one process gives each process its own budget.
+        self._reproof_session_failures: dict[str, tuple[int, float, str]] = {}
         # Boot-time Kerberos acceptor preflight outcome (ADR 0068 §9): None = usable (or the
         # preflight never ran); a reason string = browser SSO degraded until restart.
         self._kerberos_unavailable_reason: str | None = None
@@ -657,6 +827,8 @@ class AuthService:
                 # trust anchor, so it carries its own CRL setting rather than inheriting [tls].crl_file.
                 crl_file=settings.oidc_tls_crl_file,
             )
+            # BACKLOG #1887: must follow the opener, whose finished context it reads.
+            _refuse_idp_revocation(settings, self._oidc_opener, hop_posture)
             self._oidc_jwks = oidc.JwksCache(
                 jwks_fetcher(settings.oidc_jwks_uri or "", self._oidc_opener),
                 ttl_seconds=settings.oidc_jwks_ttl_seconds,
@@ -1205,8 +1377,13 @@ class AuthService:
         *,
         provider: AuthProvider = AuthProvider.LOCAL,
         client: str | None = None,
+        supersedes: str | None = None,
     ) -> LoginOutcome:
         """The credential sign-in seam, with every failed outcome held to a fixed deadline.
+
+        ``supersedes`` is the session token the caller's browser presented, if any. On success it is
+        ended as part of the new session's mint (see :meth:`_issue_session`). Only a caller whose
+        response REPLACES that token passes it: the console legs do, the bearer routes never do.
 
         A wrapper rather than a pad threaded through the dispatch's returns, so that a failure branch
         added there later inherits the equaliser instead of quietly escaping it (BACKLOG #1140).
@@ -1220,7 +1397,9 @@ class AuthService:
         keeps ``_login*`` meaning exactly what it meant.
         """
         started = time.monotonic()
-        outcome = await self._dispatch_login(username, password, provider=provider, client=client)
+        outcome = await self._dispatch_login(
+            username, password, provider=provider, client=client, supersedes=supersedes
+        )
         return await self._equalize_failure(outcome, started, seam="login")
 
     async def _dispatch_login(
@@ -1230,6 +1409,7 @@ class AuthService:
         *,
         provider: AuthProvider = AuthProvider.LOCAL,
         client: str | None = None,
+        supersedes: str | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
             # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
@@ -1252,10 +1432,10 @@ class AuthService:
                 ok=False,
                 error="Directory password sign-in has been retired; use Windows SSO or OIDC",
             )
-        return await self._login_local(username, password, client=client)
+        return await self._login_local(username, password, client=client, supersedes=supersedes)
 
     async def _login_local(
-        self, username: str, password: str, *, client: str | None
+        self, username: str, password: str, *, client: str | None, supersedes: str | None = None
     ) -> LoginOutcome:
         # Enforce bootstrap expiry/supersession before the credential check: an unclaimed bootstrap
         # that lapsed (or was superseded) is disabled here, so the disabled-account path below refuses
@@ -1376,7 +1556,12 @@ class AuthService:
             # account. It is the MFA leg (``verify_mfa`` / ``finish_webauthn_assertion``) that clears
             # it when a factor is owed; this branch covers the accounts that owe none.
             await self._store.record_login_success(user.id, now=now)
-        token = await self._issue_session(user.id, client, mfa_verified=not mfa_required)
+        token = await self._issue_session(
+            user.id,
+            client,
+            mfa_verified=not mfa_required,
+            supersedes_hash=hash_token(supersedes) if supersedes else None,
+        )
         await self._audit(
             "auth.login_success",
             actor=user.username,
@@ -1426,7 +1611,12 @@ class AuthService:
         )
 
     async def authenticate_kerberos(
-        self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
+        self,
+        token: bytes,
+        *,
+        client: str | None = None,
+        seed_reauth: bool = True,
+        supersedes: str | None = None,
     ) -> LoginOutcome:
         """The browser/API Windows-SSO seam, with every failed outcome held to a fixed deadline.
 
@@ -1450,11 +1640,18 @@ class AuthService:
         identical for every principal and already disclosed in the redirect.
         """
         started = time.monotonic()
-        outcome = await self._authenticate_kerberos(token, client=client, seed_reauth=seed_reauth)
+        outcome = await self._authenticate_kerberos(
+            token, client=client, seed_reauth=seed_reauth, supersedes=supersedes
+        )
         return await self._equalize_failure(outcome, started, seam="kerberos")
 
     async def _authenticate_kerberos(
-        self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
+        self,
+        token: bytes,
+        *,
+        client: str | None = None,
+        seed_reauth: bool = True,
+        supersedes: str | None = None,
     ) -> LoginOutcome:
         # Audit every reject path so blocked/failed Windows-SSO attempts are not invisible to a
         # defender (AUTH-K-AUDIT). A sentinel actor is used until the principal is known.
@@ -1491,7 +1688,11 @@ class AuthService:
         # MFA-exempt set, so without an enrollment ceremony that accepts a directory account it is a
         # lockout rather than a control.
         return await self._complete_ad_login(
-            principal, client, mfa_verified=False, seed_reauth=seed_reauth
+            principal,
+            client,
+            mfa_verified=False,
+            seed_reauth=seed_reauth,
+            supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
 
     def _oidc_policy(self, nonce: str) -> oidc.OidcClaimPolicy:
@@ -1543,13 +1744,19 @@ class AuthService:
     def _oidc_redirect_uri(self, public_origin: str) -> str:
         return public_origin.rstrip("/") + self._settings.oidc_redirect_path
 
-    async def begin_oidc_login(self, *, client: str | None, public_origin: str) -> tuple[str, str]:
+    async def begin_oidc_login(
+        self, *, client: str | None, public_origin: str, prior_session: str | None = None
+    ) -> tuple[str, str]:
         """Stage a federated flow and return ``(flow_id, authorization_url)``.
 
         The PKCE verifier, ``state`` and ``nonce`` are minted here and stay SERVER-side in the flow
         cache; only the opaque ``flow_id`` goes to the browser. Raises
         :class:`~messagefoundry.auth.oidc.FlowCacheFullError` when the bounded cache is full — the
         caller must treat that as a flood signal, not an error to audit per request.
+
+        ``prior_session`` is the session token the browser presented on this start leg, if any. Only
+        its hash is staged, and nothing is revoked here: the callback's mint supersedes it once the
+        IdP proof succeeds (ASVS 7.2.4). Why the start leg: see ``PendingFlow.prior_session_hash``.
         """
         if not self.oidc_enabled or self._oidc_flows is None:
             raise oidc.FlowError("federated sign-in is not configured")
@@ -1558,6 +1765,7 @@ class AuthService:
             return_to="/ui",
             client_ip=client or "",
             ttl_seconds=self._settings.oidc_flow_ttl_seconds,
+            prior_session_hash=hash_token(prior_session) if prior_session else None,
         )
         challenge = oidc.pkce_challenge(flow.code_verifier)
         url = oidc.build_authorization_url(
@@ -1756,6 +1964,8 @@ class AuthService:
             },
             max_expires_at=max_expires_at,
             federated_subject=(principal_claims.issuer, principal_claims.subject),
+            # ASVS 7.2.4: the session the START leg saw (see PendingFlow.prior_session_hash).
+            supersedes_hash=flow.prior_session_hash,
         )
 
     async def _refuse_directory_row(
@@ -1800,6 +2010,7 @@ class AuthService:
         evidence: Mapping[str, object] | None = None,
         max_expires_at: float | None = None,
         federated_subject: tuple[str, str] | None = None,
+        supersedes_hash: str | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
         # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller stays
@@ -2003,7 +2214,7 @@ class AuthService:
             )
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
-        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups)
+        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
         identity = Identity.build(
             user_id=user.id,
             username=user.username,
@@ -2029,6 +2240,7 @@ class AuthService:
                 # INSERT lands just after it. The Kerberos and password legs pass nothing here, so
                 # they take no extra read and no extra statement.
                 require_federated_subject=federated_subject,
+                supersedes_hash=supersedes_hash,
             )
         except _FederatedBindingWithdrawn:
             await self._directory_reject_audit(
@@ -2075,13 +2287,28 @@ class AuthService:
         )
 
     async def _sync_ad_channel_scope(
-        self, user: UserRecord, roles: frozenset[Role], groups: Iterable[str]
+        self,
+        user: UserRecord,
+        roles: frozenset[Role],
+        groups: Iterable[str],
+        *,
+        client: str | None = None,
     ) -> UserRecord:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
-        requests (mirrors role sync). Administrators are always all-channels. If no group mapping
-        matches, the per-user scope is left untouched — opt-in, so it never clobbers a manual scope,
-        and since BACKLOG #1152 an untouched scope is a DENY rather than the whole estate. Returns
-        the (possibly refreshed) user record.
+        requests (mirrors role sync). Administrators are always all-channels. Returns the (possibly
+        refreshed) user record.
+
+        **A matching group is authoritative**: its scope replaces whatever is stored, an
+        administrator's included, and the scope is then the directory's.
+
+        **When no mapped group matches, the outcome depends on who wrote the stored scope (BACKLOG
+        #1927).** A scope an administrator set is left untouched, so on this branch the map stays
+        opt-in. Any other scope is WITHDRAWN to NULL, which denies (BACKLOG #1152); the rule is
+        stated on ``UserRecord.channel_scope_source``. This path used to return early for every
+        no-match login, so a user removed from their last scope-mapped group kept the channels the
+        directory had granted for as long as the account existed. A scope that already denies is
+        left as it is, because rewriting ``[]`` to NULL changes no decision and would revoke
+        sessions for nothing.
 
         A wildcard group row persists the explicit ``["*"]`` grant. It used to persist SQL NULL and
         rely on NULL meaning "all"; with an absent scope now denying, that collapse would have
@@ -2090,20 +2317,39 @@ class AuthService:
             return user
         channels = await self._store.channels_for_ad_groups(groups)
         if not channels:
-            return user
+            if user.channel_scope_source == SCOPE_SOURCE_MANUAL:
+                return user
+            if user.channel_scope is None or _allowed_channels(user, roles) == frozenset():
+                return user  # already a deny; nothing to withdraw
+            # Compare-and-set against the value read: an administrator or a concurrent login may
+            # have written the scope since ``user`` was read.
+            if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
+                return await self._store.get_user(user.id) or user
+            await self._store.revoke_user_sessions(user.id)
+            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
+            await self._audit(
+                "auth.ad_scope_resynced",
+                actor=user.username,
+                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
+                client=client,
+            )
+            return await self._store.get_user(user.id) or user
         wildcard = ALL_CHANNELS in channels
         specific = sorted(c for c in channels if c != ALL_CHANNELS)
         scope_json = _json([ALL_CHANNELS]) if wildcard else _json(specific)
-        if user.channel_scope == scope_json:
+        if user.channel_scope == scope_json and user.channel_scope_source == SCOPE_SOURCE_AD:
             return user
-        await self._store.set_user_channel_scope(user.id, scope_json)
-        await self._store.revoke_user_sessions(
-            user.id
-        )  # drop stale-scope tokens (new one issued after)
+        await self._store.set_user_channel_scope(user.id, scope_json, source=SCOPE_SOURCE_AD)
+        # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
+        # moved -- the directory taking over an identical manual scope changes no decision, so
+        # there is nothing stale to drop -- but that write is still audited below.
+        if scope_json != user.channel_scope:
+            await self._store.revoke_user_sessions(user.id)
         await self._audit(
             "auth.ad_scope_resynced",
             actor=user.username,
             detail=_json({"channels": ALL_CHANNELS if wildcard else specific}),
+            client=client,
         )
         return await self._store.get_user(user.id) or user
 
@@ -2768,9 +3014,17 @@ class AuthService:
         seed_reauth: bool | None = None,
         max_expires_at: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
+        supersedes_hash: str | None = None,
     ) -> str:
         """Mint a session token and persist the row. Callers passing
-        ``require_federated_subject`` must handle :class:`_FederatedBindingWithdrawn`."""
+        ``require_federated_subject`` must handle :class:`_FederatedBindingWithdrawn`.
+
+        ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
+        7.2.4, login side). It is ended after the new
+        row is safely written and BEFORE the per-user cap runs. That order is the point: ending it
+        after the cap would let the cap evict another device's oldest session to make room for a
+        session that was about to go anyway.
+        """
         token = mint_token()
         token_hash = hash_token(token)
         expires_at = time.time() + self._settings.session_absolute_hours * 3600
@@ -2808,6 +3062,8 @@ class AuthService:
             # never blocks it. An MFA-required login leaves it NULL until POST /auth/mfa-verify
             # (WP-14) -- including the Kerberos leg, which asserts nothing and mints at the minimum.
             await self._store.mark_session_mfa_verified(token_hash)
+        if supersedes_hash is not None:
+            await self._supersede_session_hash(supersedes_hash, client=client)
         cap = self._settings.max_sessions_per_user
         if cap and cap > 0:
             # Evict the oldest sessions beyond the cap (the just-created one is newest, so survives).
@@ -2817,8 +3073,8 @@ class AuthService:
     def _rekey_token_state(self, old_hash: str, new_hash: str) -> None:
         """Move every PROCESS-LOCAL entry keyed on a session's token hash onto the new hash.
 
-        The store row is re-keyed atomically by ``rotate_session``; these three in-memory maps are
-        not, and each strands differently if missed — so the set is enumerated here rather than
+        The store row is re-keyed atomically by ``rotate_session``; these in-memory maps are not,
+        and each strands differently if missed — so the set is enumerated here rather than
         handled at each call site:
 
         * ``_action_step_up_grants`` — a single-use ADR 0077 grant. Stranded ⇒ the ceremony the user
@@ -2827,6 +3083,8 @@ class AuthService:
           started before the rotation can never be finished, which is a dead end, not a retry.
         * ``_new_ip_seen`` — the WP-L3-13 dedupe. Stranded ⇒ a *second* new-IP step-up + audit row
           for an address the session already re-verified from.
+        * ``_reproof_session_failures`` — the BACKLOG #1138 per-session re-proof budget. Stranded,
+          any rotation would hand the session a fresh budget of guesses.
 
         Deadlines and values are carried, never refreshed: a rotation must not extend anything.
         """
@@ -2838,6 +3096,9 @@ class AuthService:
         seen = self._new_ip_seen.pop(old_hash, None)
         if seen is not None:
             self._new_ip_seen[new_hash] = seen
+        failures = self._reproof_session_failures.pop(old_hash, None)
+        if failures is not None:
+            self._reproof_session_failures[new_hash] = failures
 
     async def _rotate_session_token(self, token: str) -> str | None:
         """Re-key the caller's session to a FRESH token (ASVS 7.2.4); returns the new token.
@@ -2852,11 +3113,18 @@ class AuthService:
         nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
         """
         old_hash = hash_token(token)
-        new_token = mint_token()
-        if not await self._store.rotate_session(old_hash, new_token_hash=hash_token(new_token)):
+        session = await self._store.get_session(old_hash)
+        if session is None:
             return None
-        self._rekey_token_state(old_hash, hash_token(new_token))
-        return new_token
+        # Under the account's re-proof lock (BACKLOG #1138), so no rotation lands while a password
+        # re-proof on this session is mid-verify. Otherwise the re-proof would charge its failure to
+        # the hash the rotation just retired, and the live session would never count it.
+        async with self._account_reproof_lock(session.user_id):
+            new_token = mint_token()
+            if not await self._store.rotate_session(old_hash, new_token_hash=hash_token(new_token)):
+                return None
+            self._rekey_token_state(old_hash, hash_token(new_token))
+            return new_token
 
     async def _elevated(
         self,
@@ -2888,12 +3156,10 @@ class AuthService:
         authenticates once at handshake and its keepalive re-validates the token CAPTURED there, so
         on a first deployment a rotation would make that captured token stop resolving and the server
         would close the socket at the next revalidation tick -- indistinguishable from a revoke,
-        which is the fail-closed direction and the right one. The console does not reconnect it;
-        ``app.js`` wires ``ws.onclose`` to resume the 5-second HTTP poll, and that poll carries the
-        NEW cookie, so the dashboard would keep updating over the fallback until the next full page
-        load re-opened a socket. Completing MFA on the dashboard would therefore cost the live push
-        for the rest of that page's life -- a LIVENESS regression, not a correctness or data-loss
-        one, which is why a bounded reconnect is filed as follow-up rather than built here.
+        which is the fail-closed direction and the right one. ``app.js`` wires ``ws.onclose`` to
+        resume the 5-second HTTP poll and to re-open the socket a bounded number of times, and the
+        new handshake carries the NEW cookie, so the live push survives the rotation. That is a
+        client reconnect, never a server-side grace window for the old token.
         """
         rotated = await self._rotate_session_token(token)
         if rotated is None:
@@ -2980,6 +3246,55 @@ class AuthService:
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) — previously the
             # session was revoked silently, contradicting the doc and leaving a gap in the trail.
             await self._audit("auth.logout", actor=actor)
+
+    async def _supersede_session_hash(self, prior_hash: str, *, client: str | None) -> bool:
+        """End the session a browser presented at a fresh sign-in (ASVS 7.2.4, login side).
+
+        A console sign-in answers with a ``Set-Cookie`` that REPLACES the browser's session cookie, so
+        the server itself strands the prior session: this browser can never present it again, yet it
+        stays valid until idle or absolute expiry. The verb asks for the current token to be
+        terminated, and overwriting a cookie terminates nothing server-side.
+
+        Reached only from :meth:`_issue_session`, so only after a credential proof succeeded. It ends
+        exactly the one presented session and never the user's others: a whole-user revoke would
+        turn every sign-in into a forced sign-out of every other device.
+
+        The prior session may belong to a different user, for example on a shared workstation. It is
+        still ended. Anyone holding that token could already end it with ``POST /auth/logout``, so
+        this grants no new power. The audit row's actor is the session's OWNER, not whoever signed
+        in: ``/me/security-events`` selects rows by actor, so the event belongs in the feed of the
+        user whose session ended, and must not put that user's ids in anyone else's.
+
+        An unrevoked row is ALWAYS revoked, even one already over by expiry or idle: the per-user
+        cap counts every unrevoked row, so leaving a lapsed one would let the cap evict a live
+        device in its place. Only a session that was still LIVE gets an audit row, so the trail does
+        not record the ending of something that had already ended. ``revoke_session`` reports no
+        rowcount, so the row is read back: a rotation that re-keyed it between the read and the
+        revoke leaves the old hash absent, and then no row claims a revoke that never happened.
+        Returns True when it audited.
+        """
+        prior = await self._store.get_session(prior_hash)
+        if prior is None or prior.revoked_at is not None:
+            return False
+        now = time.time()
+        was_live = (
+            now <= prior.expires_at
+            and now - prior.last_used_at <= self._settings.session_idle_timeout_minutes * 60
+        )
+        await self._store.revoke_session(prior_hash, now=now)
+        if not was_live:
+            return False
+        after = await self._store.get_session(prior_hash)
+        if after is None or after.revoked_at is None:
+            return False
+        owner = await self._store.get_user(prior.user_id)
+        await self._audit(
+            "auth.session_revoked",
+            actor=owner.username if owner is not None else None,
+            detail=_json({"scope": "superseded", "session": prior_hash[:12]}),
+            client=client,
+        )
+        return True
 
     # --- session inventory + targeted revoke (WP-10, ASVS 7.5.2/7.4.5) -------
 
@@ -3068,12 +3383,250 @@ class AuthService:
     def password_violations(self, password: str, *, username: str | None = None) -> list[str]:
         return self._policy.violations(password, username=username)
 
-    async def verify_current_password(self, identity: Identity, password: str) -> bool:
-        """True iff ``password`` matches the local user's stored hash (self-service reauth)."""
+    async def verify_current_password(
+        self,
+        identity: Identity,
+        password: str,
+        *,
+        token: str | None,
+        client: str | None = None,
+    ) -> CurrentPasswordCheck:
+        """Check the current-password proof ``POST /me/password`` demands before a change.
+
+        **It counts toward the account lockout and is charged to the session (BACKLOG #1138, owner
+        ruling 2026-09-23).** It used to do neither and write no audit row, so a session holder could
+        guess here without limit and without trace. See :meth:`_reproof`. A failure is audited once,
+        as ``auth.password_change_failed``, and the attempt that crosses the threshold adds
+        ``auth.account_locked``, as a sign-in does; the lockout row carries no detail, because the
+        attempt's own row carries none beyond its reason. ``token`` is the caller's session, the one
+        the failure is charged to. Without one there is nothing to charge, so it fails closed.
+
+        It raises no ``auth.login_after_failures`` on success and leaves the counter to
+        ``set_password``: a completed change clears it and sends its own ``PASSWORD_CHANGED`` notice,
+        while a change refused by policy after a good proof would otherwise re-flag on every retry."""
+        if token is None:
+            # No session to charge a failure to, so no budget: refuse without verifying. Held apart
+            # from a revocation in the audit row, because nothing was revoked.
+            await self._audit(
+                "auth.password_change_failed",
+                actor=identity.username,
+                detail=_json({"reason": "no_session"}),
+                client=client,
+            )
+            return CurrentPasswordCheck.SESSION_ENDED
+        proof = await self._reproof(identity, password, directory=False, token=token, clear=False)
+        if proof.ok:
+            return CurrentPasswordCheck.OK
+        await self._audit(
+            "auth.password_change_failed",
+            actor=identity.username,
+            detail=_json({"reason": _reproof_refusal_reason(proof)}),
+            client=client,
+        )
+        await self._record_reproof_lockout(proof, client=client, audit_detail=None)
+        if proof.session_revoked:
+            await self._revoke_for_budget(hash_token(token))
+        if proof.session_revoked or proof.session_gone:
+            return CurrentPasswordCheck.SESSION_ENDED
+        return CurrentPasswordCheck.WRONG
+
+    async def _reproof(
+        self,
+        identity: Identity,
+        password: str,
+        *,
+        directory: bool,
+        token: str,
+        clear: bool = True,
+    ) -> _Reproof:
+        """Verify a post-session credential re-proof: counted on the ACCOUNT, capped per SESSION.
+
+        BACKLOG #1138 (ASVS 6.3.5), owner ruling 2026-09-23: *"Yes, count them. Engine lockout does
+        not lock the AD account itself, and unbounded guessing behind a stolen session is the worse
+        risk."* How this reads it (design E):
+
+        * A rejected credential goes through the login leg's atomic counter,
+          :meth:`_register_failure`, so it can lock the account and fire ``ACCOUNT_LOCKED``.
+        * The account lock gates SIGN-IN. It does not refuse a re-proof on a session that already
+          exists. If it did, anyone who knows a username could lock the account from the sign-in
+          page every lock window and hold the owner's live sessions out of step-up, the password
+          change and session termination indefinitely. That is the harm ``_reauth_limiter`` was
+          split out to prevent.
+        * Each session may fail ``lockout_threshold`` re-proofs; the one that reaches it revokes the
+          session. So a stolen session gets that many guesses in total, not that many per lock
+          window. The budget lives in ``_reproof_session_failures`` and is process-local.
+        * During a live lock a failure is charged to the session only. Registering it on the account
+          would re-arm or extend a lock the login leg's own pre-check never extends.
+
+        **ONE RE-PROOF PER ACCOUNT AT A TIME, in this process.** The body reads the session and the
+        account before the verify, and the verify waits for an argon2 slot or a directory round
+        trip. Serialized, a burst on one session is checked one at a time against its budget, and
+        requests queued behind the revoking one find the session gone and are never verified. It
+        does not order re-proofs across processes, and a cancelled request can release the lock
+        while its directory bind still runs in a worker thread. Both are reported with BACKLOG #1138.
+
+        ``directory`` re-proves by a live bind (:meth:`_reauth_ad`) instead of the stored hash;
+        nothing here writes to the directory. A directory that cannot be asked, or that cannot find
+        the principal, is a refusal but NOT a failure, on the account or the session: counting an
+        outage would lock every operator who tried to step up while a domain controller was down.
+
+        ``clear`` marks the re-auth leg, whose success rotates the session: only there does a success
+        reset the session's budget and the account counter. The account counter resets only at FULL
+        authentication (BACKLOG #1638's rule for the login leg): the session must have met its
+        second-factor requirement, and no lock may be live. The password-change leg leaves both to
+        the change itself, which revokes every session and clears the counter when it commits.
+
+        **The cap covers these password re-proofs only.** A wrong TOTP or recovery code
+        (``verify_mfa``) still counts on the account alone."""
+        async with self._account_reproof_lock(identity.user_id):
+            return await self._reproof_serialized(
+                identity, password, directory=directory, token=token, clear=clear
+            )
+
+    @asynccontextmanager
+    async def _account_reproof_lock(self, user_id: str) -> AsyncIterator[None]:
+        """Hold the per-account lock that orders password re-proofs and session rotations."""
+        entry = self._reproof_locks.setdefault(user_id, _ReproofLock())
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if entry.users == 0:
+                del self._reproof_locks[user_id]
+
+    def _session_reproof_failures(self, token_hash: str) -> int:
+        """How many failed re-proofs this session has been charged."""
+        entry = self._reproof_session_failures.get(token_hash)
+        return 0 if entry is None else entry[0]
+
+    def _charge_reproof_failure(self, token_hash: str, user_id: str) -> int:
+        """Charge one failed re-proof to a session; return its total. Synchronous on purpose: it runs
+        before any await after the verdict, so a store error later in the attempt cannot leave an
+        evaluated guess uncharged.
+
+        A live count is never evicted (see :data:`_REPROOF_SESSION_MAX`). When there is no room, the
+        answer is the cap itself, so the caller revokes this session rather than track it."""
+        now = time.monotonic()
+        failures = self._reproof_session_failures
+        existing = failures.get(token_hash)
+        if existing is not None:
+            count, first, _ = existing
+            failures[token_hash] = (count + 1, first, user_id)
+            return count + 1
+        mine = [h for h, (_, _, uid) in failures.items() if uid == user_id]
+        if len(mine) >= _REPROOF_SESSION_PER_USER:
+            # This account's own oldest entry goes; no other account's count is touched.
+            del failures[mine[0]]
+        if len(failures) >= _REPROOF_SESSION_MAX:
+            lifetime = self._settings.session_absolute_hours * 3600
+            for stale in [h for h, (_, seen, _) in failures.items() if now - seen > lifetime]:
+                del failures[stale]
+        if len(failures) >= _REPROOF_SESSION_MAX:
+            return max(self._policy.lockout_threshold, 1)
+        failures[token_hash] = (1, now, user_id)
+        return 1
+
+    async def _revoke_for_budget(self, token_hash: str, now: float | None = None) -> None:
+        """Revoke a session that spent its re-proof budget. The count is dropped only AFTER the revoke
+        commits: if the write fails, the count stays at the cap and the next attempt revokes again
+        instead of starting a fresh budget."""
+        await self._store.revoke_session(token_hash, now=now)
+        self._reproof_session_failures.pop(token_hash, None)
+
+    async def _reproof_serialized(
+        self,
+        identity: Identity,
+        password: str,
+        *,
+        directory: bool,
+        token: str,
+        clear: bool,
+    ) -> _Reproof:
+        """The body of :meth:`_reproof`, run under its per-account lock."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.password_hash is None:
-            return False
-        return await self._argon2(verify_password, user.password_hash, password)
+        if user is None:
+            return _Reproof(ok=False)
+        token_hash = hash_token(token)
+        session = await self._store.get_session(token_hash)
+        if session is None or session.revoked_at is not None or session.user_id != user.id:
+            # Revoked or rotated away while this attempt waited behind the lock -- by the budget,
+            # or by anything else. It is not verified, so a queued burst cannot outrun the budget.
+            self._reproof_session_failures.pop(token_hash, None)
+            return _Reproof(ok=False, session_gone=True, user=user)
+        # At least one guess, so a lockout_threshold of 0 (documented as "locks on the first
+        # failure") revokes on the first failure rather than on every re-proof.
+        threshold = max(self._policy.lockout_threshold, 1)
+        if self._session_reproof_failures(token_hash) >= threshold:
+            # Already at the cap with the session still live: the attempt that reached the cap has
+            # not revoked it yet, or its revoke failed. Revoke without verifying. The revocation is
+            # that earlier attempt's, so this one reports the session gone.
+            await self._revoke_for_budget(token_hash, time.time())
+            return _Reproof(ok=False, session_gone=True, user=user)
+        verdict: bool | None
+        if directory:
+            verdict = await self._reauth_ad(identity.username, password)
+        else:
+            verdict = user.password_hash is not None and await self._argon2(
+                verify_password, user.password_hash, password
+            )
+        if verdict is None:
+            return _Reproof(ok=False, user=user)
+        charged = self._charge_reproof_failure(token_hash, user.id) if not verdict else 0
+        # A fresh read and a fresh clock: the verify may have taken seconds, and another leg may have
+        # set a lock meanwhile.
+        now = time.time()
+        current = await self._store.get_user(user.id)
+        locked = current is not None and _live_lock(current, now)
+        if not verdict:
+            attempts, just_locked = 0, False
+            if current is not None and not locked:
+                attempts, just_locked = await self._register_failure(user, now)
+            if charged >= threshold:
+                # The caller audits this attempt, records any lockout, and only then revokes, so a
+                # failed revoke cannot lose those rows. Until the revoke lands the count stays at the
+                # cap, and any attempt that gets the lock first revokes the session unverified.
+                return _Reproof(
+                    ok=False,
+                    session_revoked=True,
+                    user=user,
+                    attempts=attempts,
+                    just_locked=just_locked,
+                )
+            return _Reproof(ok=False, user=user, attempts=attempts, just_locked=just_locked)
+        if current is None:
+            return _Reproof(ok=False, user=user)
+        if not clear:
+            # The password-change leg: nothing rotates here, and a change refused by policy leaves the
+            # session as it was, budget included.
+            return _Reproof(ok=True, user=current)
+        # The re-auth leg: a good proof resets this session's budget, and the success rotates it.
+        self._reproof_session_failures.pop(token_hash, None)
+        cleared = (
+            not locked
+            and (current.failed_attempts > 0 or current.locked_until is not None)
+            and await self.mfa_satisfied(token)
+        )
+        if cleared:
+            await self._store.record_login_success(user.id, now=now)
+        # The FRESH row, so the caller's login-after-failures check sees failures other legs added
+        # during the verify.
+        return _Reproof(ok=True, user=current, cleared=cleared)
+
+    async def _record_reproof_lockout(
+        self, proof: _Reproof, *, client: str | None, audit_detail: dict[str, Any] | None
+    ) -> None:
+        """Record the lockout a failed re-proof crossed. Called AFTER the attempt's own audit row,
+        which is the order the login leg writes them in. ``audit_detail`` mirrors that row."""
+        if proof.just_locked and proof.user is not None:
+            await self._record_suspicious_login(
+                ACCOUNT_LOCKED,
+                proof.user,
+                client=client,
+                audit_detail=audit_detail,
+                notice_detail={"failed_attempts": proof.attempts},
+            )
 
     async def reauth(
         self,
@@ -3097,12 +3650,24 @@ class AuthService:
 
         Returns an :class:`Elevation`: on success the session is re-keyed (ASVS 7.2.4) and the NEW
         token is in ``Elevation.token``. The three steps below are ORDER-CRITICAL -- see the inline
-        notes and :meth:`_rotate_session_token`."""
-        if identity.auth_provider is AuthProvider.AD:
-            ok = await self._reauth_ad(identity.username, password)
-        else:
-            ok = await self.verify_current_password(identity, password)
-        elevation = Elevation()
+        notes and :meth:`_rotate_session_token`.
+
+        **A failure counts toward the account lockout on BOTH providers, and each session may fail
+        at most ``lockout_threshold`` re-proofs before it is revoked (BACKLOG #1138).** See
+        :meth:`_reproof`. The account lock itself gates sign-in, not this. A revoked session answers
+        ``session_lost``. A success clears the counter only when the session has met its
+        second-factor requirement and no lock is live (BACKLOG #1638's rule for the login leg), and a
+        success that clears a run of failures is labelled ``auth.login_after_failures``."""
+        # The counter-clearing decision is made inside, against the OLD token, before the rotation
+        # below retires it.
+        proof = await self._reproof(
+            identity,
+            password,
+            directory=identity.auth_provider is AuthProvider.AD,
+            token=token,
+        )
+        ok = proof.ok
+        elevation = Elevation(session_lost=proof.session_revoked or proof.session_gone)
         grant_refused = False
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
@@ -3135,16 +3700,39 @@ class AuthService:
                     "ok": ok,
                     "provider": identity.auth_provider.value,
                     "purpose": purpose,
-                    # A good password on a session that vanished mid-ceremony is neither a success nor
-                    # a credential failure; without this the audit row would read as a clean re-auth.
+                    # The session is gone: a good password on a session that vanished mid-ceremony,
+                    # or (with session_revoked) one revoked by its re-proof budget.
                     "session_lost": elevation.session_lost,
                     # A good password whose purpose grant was refused (a pending session on an
                     # account with a factor). Without it the row reads as a granted re-proof.
                     "grant_refused": grant_refused,
+                    # This failure spent the session's re-proof budget, so it is revoked
+                    # (BACKLOG #1138). A session already gone reads session_lost alone.
+                    "session_revoked": proof.session_revoked,
                 }
             ),
             client=client,
         )
+        provider_detail = {"provider": identity.auth_provider.value}
+        await self._record_reproof_lockout(proof, client=client, audit_detail=provider_detail)
+        if proof.session_revoked:
+            await self._revoke_for_budget(hash_token(token))
+        # Flagged only on the success that CLEARED the counter. On a session still owing its second
+        # factor nothing clears, so flagging there would repeat the row and the notice on every
+        # re-auth. That session's clear happens later in verify_mfa, which flags nothing: the gap
+        # BACKLOG #1138 already records for a success after second-factor failures.
+        if (
+            proof.cleared
+            and proof.user is not None
+            and proof.user.failed_attempts >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+        ):
+            await self._record_suspicious_login(
+                LOGIN_AFTER_FAILURES,
+                proof.user,
+                client=client,
+                audit_detail=provider_detail,
+                notice_detail={"failed_attempts": proof.user.failed_attempts},
+            )
         return elevation
 
     #: The step-up actions a pending session may NOT be granted once its account HAS a factor. Every
@@ -3154,8 +3742,10 @@ class AuthService:
     #: - binding a new factor (``mfa_enroll``, ``mfa_confirm``, ``webauthn_enroll``) is a promotion
     #:   path, because both ceremonies mark the session MFA-satisfied on success;
     #: - ending sessions (``session_terminate``, BACKLOG #1951, ASVS 7.5.2) through the terminate
-    #:   routes would let a password holder sign the real user out without the second factor. That
-    #:   is these routes only: ``POST /me/password`` still revokes every session from a pending one.
+    #:   routes would let a password holder sign the real user out without the second factor.
+    #:
+    #: Changing the password does both at once, but it takes no grant and rides no reauth-only gate,
+    #: so it asks the same rule through :meth:`password_change_owes_factor` instead (BACKLOG #1954).
     #:
     #: A new action on either reauth-only action gate belongs here too. A test in
     #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
@@ -3190,6 +3780,15 @@ class AuthService:
         """
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
+        return await self._owes_enrolled_factor(token)
+
+    async def _owes_enrolled_factor(self, token: str | None, *, local_only: bool = False) -> bool:
+        """Whether the session is MFA-pending on an account that already HAS a second factor.
+
+        Fails closed (True) when the session or its user cannot be found. ``local_only`` answers
+        False for a directory account, whose password the engine does not hold. It names AD rather
+        than excluding everything that is not LOCAL: ``_build_identity`` maps an unrecognized
+        provider back to LOCAL, so the password handler treats that row as local and changes it."""
         if not token:
             return True  # no session to act on, so fail closed (as below)
         if await self.mfa_satisfied(token):
@@ -3200,7 +3799,21 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return True
+        if local_only and user.auth_provider == AuthProvider.AD.value:
+            return False
         return await self._second_factor_enrolled(user)
+
+    async def password_change_owes_factor(self, token: str | None) -> bool:
+        """Whether this session must prove its second factor before it may change the password.
+
+        BACKLOG #1954 (ASVS 6.3.3). A change revokes every session, so a password holder on a
+        pending session must not reach it on the password alone. True for a pending session on
+        an account that holds a factor, unless it is a directory (AD) account, and when the session
+        or its user cannot be found. An account with no factor has nothing to prove and
+        rotates as before, and a directory account is left to the route's 400, which changes
+        nothing. PUBLIC for the reason :meth:`factor_binding_is_blocked` gives: the JSON gate and
+        the web console's password and factor pages all ask it, so the planes cannot drift."""
+        return await self._owes_enrolled_factor(token, local_only=True)
 
     async def factor_binding_is_blocked(self, token: str | None, action: str) -> bool:
         """PUBLIC contract boundary over :meth:`_factor_binding_is_blocked`, for the ROUTE gates.
@@ -3252,15 +3865,35 @@ class AuthService:
         deadline = self._action_step_up_grants.pop((hash_token(token), action), None)
         return deadline is not None and deadline > now
 
-    async def _reauth_ad(self, username: str, password: str) -> bool:
-        """Re-verify an AD credential via a live directory re-bind (no session adopted)."""
+    async def _reauth_ad(self, username: str, password: str) -> bool | None:
+        """Re-verify an AD credential via a live directory re-bind (no session adopted).
+
+        Three answers, because only one of the two refusals is a guess (BACKLOG #1138): ``True`` =
+        bound; ``False`` = the directory REJECTED the password, which :meth:`_reproof` counts toward
+        the engine lockout; ``None`` = it could not be asked (no directory, an :class:`LdapError`)
+        or it has no such principal. Both refusals fail closed; only ``False`` is counted.
+
+        The principal check matters because ``authenticate`` answers ``None`` for a missing, renamed
+        or disabled principal as well as for a wrong password. Counting that would lock the engine
+        row of a user whose every re-bind fails whatever they type, and the lock is then enforced at
+        their Kerberos and OIDC sign-in. The extra lookup runs only after a refusal. A correct
+        password the DC refuses as expired still counts, which nothing here can tell apart."""
         if self._ldap is None:
-            return False
+            return None
         try:
             principal = await asyncio.to_thread(self._ldap.authenticate, username, password)
         except LdapError:
-            return False
-        return principal is not None
+            return None
+        if principal is not None:
+            return True
+        try:
+            known = await asyncio.to_thread(self._ldap.resolve_principal, username)
+        except LdapError:
+            # ``authenticate`` also answers None where no real bind was judged (an empty password, an
+            # unfound principal's equalizing bind, a DC too busy to answer the bind), so a lookup
+            # that then fails cannot show the password was checked. Not counted, like an outage.
+            return None
+        return False if known is not None else None
 
     async def has_recent_step_up(self, token: str | None) -> bool:
         """Whether the caller's session re-verified its credential within
@@ -3564,7 +4197,7 @@ class AuthService:
                 detail=_json({"reason": "locked"}),
                 client=client,
             )
-            return Elevation()
+            return Elevation(locked=True)
         if await self._verify_second_factor(user, code, client=client):
             # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only then
             # does the session rotate. Moving any of them after the rotation writes NOTHING and reports
@@ -4378,14 +5011,21 @@ class AuthService:
             actor=actor,
             detail=_json({"user_id": user_id, "username": user.username}),
         )
-        await self._notify_security(PASSWORD_RESET, username=user.username, email=user.notify_email)
         stamped = await self._store.get_user(user_id)
-        return IssuedCredential(
-            password=temp,
-            expires_at=self.initial_credential_deadline(
-                None if stamped is None else stamped.password_changed_at
-            ),
+        expires_at = self.initial_credential_deadline(
+            None if stamped is None else stamped.password_changed_at
         )
+        # BACKLOG #1141 slice 2: the notice goes to the HOLDER, the one party the return value never
+        # reaches, so it carries the same instant. It is sent after the read-back so the two cannot
+        # differ; sending it first left the only holder-facing surface with no deadline at all. A
+        # DISABLED account gets no deadline line: it tells the holder to sign in, and they cannot.
+        await self._notify_security(
+            PASSWORD_RESET,
+            username=user.username,
+            email=user.notify_email,
+            detail=None if expires_at is None or user.disabled else {"expires_at": expires_at},
+        )
+        return IssuedCredential(password=temp, expires_at=expires_at)
 
     async def unbind_federated_subject(self, user_id: str, *, actor: str) -> int:
         """Admin: remove an account's federated ``(issuer, sub)`` binding and revoke every live
@@ -4445,7 +5085,7 @@ class AuthService:
         :data:`~messagefoundry.auth.identity.ALL_CHANNELS` grants the whole estate. Administrators
         are all-channels by role, so a scope set on one still has no effect."""
         scope_json = None if channels is None else _json(sorted(set(channels)))
-        await self._store.set_user_channel_scope(user_id, scope_json)
+        await self._store.set_user_channel_scope(user_id, scope_json, source=SCOPE_SOURCE_MANUAL)
         await self._store.revoke_user_sessions(user_id)
         await self._audit(
             "user.channel_scope_changed",

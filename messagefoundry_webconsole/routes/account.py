@@ -180,11 +180,30 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             service, identity, request, notice=_ACCOUNT_NOTICES.get(m or "")
         )
 
+    async def _factor_first(
+        request: Request, service: AuthService, identity: Identity
+    ) -> Response | None:
+        """The /ui twin of the JSON gate's refusal on ``POST /me/password`` (BACKLOG #1954).
+
+        ``allow_mfa_pending`` on these two routes serves an account with NO factor, which must be
+        able to rotate. A pending session on an account that HAS one goes to the factor page first,
+        and the refusal is audited like ``require_ui``'s own. The JSON handler this page delegates
+        to is reached in-process, past its ``Depends`` gate, so the check has to live here too."""
+        if not await service.password_change_owes_factor(session_token(request)):
+            return None
+        await service.audit_mfa_denied(identity, request.url.path, client=_client(request))
+        return RedirectResponse("/ui/mfa", status_code=303)
+
     @app.get("/ui/account/password", response_class=HTMLResponse)
     async def ui_account_password_form(
-        service: AuthService = Depends(_service),
+        request: Request,
+        # identity BEFORE service: FastAPI resolves them in order, and require_ui's login redirect
+        # must answer a disabled-auth app before _service's bare 503 does.
         identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
-    ) -> HTMLResponse:
+        service: AuthService = Depends(_service),
+    ) -> Response:
+        if (refused := await _factor_first(request, service, identity)) is not None:
+            return refused
         # `forced` comes from the SERVER-side flag, never a query param (unspoofable).
         forced = identity.must_change_password
         return HTMLResponse(
@@ -205,6 +224,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
     ) -> Response:
         assert_same_origin(request)
+        if (refused := await _factor_first(request, service, identity)) is not None:
+            return refused
         # No throttle call here on purpose: this route DELEGATES to the JSON handler
         # (admin.change_password) below, which applies the per-actor ceremony budget and whose 429 is
         # re-raised intact. Charging here too would spend two tokens per submission.
@@ -231,13 +252,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 new_password=form.get("new_password", ""),
             )
             await admin.change_password(
-                body=body, request=request, service=service, identity=identity
+                body=body,
+                request=request,
+                service=service,
+                identity=identity,
+                # The cookie session a wrong current password is charged to (BACKLOG #1138).
+                session=session_token(request),
             )
         except ValidationError:
             return await _retry("invalid input")
         except HTTPException as exc:
             if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                 raise  # rate-limited — keep the Retry-After semantics
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                # The session is gone: this failure spent its re-proof budget (BACKLOG #1138), or
+                # it was revoked by other means while the request waited.
+                return login_redirect_response()
             return await _retry(str(exc.detail), exc.status_code)
         # Changed: the service revoked every session (incl. this cookie) — sign in again. This is the
         # WIDEST termination the console offers (every session for this user, the one an operator
@@ -355,6 +385,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # to identify the current session and drive the SERVICE directly (the ui_mfa_verify pattern).
     _SESSION_NOTICES = {
         "revoked": "Session revoked.",
+        "revoke_missed": (
+            "Nothing was revoked: that session is no longer listed under the id this page showed. "
+            "It may have ended, or it signed in again or re-verified and now has a new id. "
+            "Check the list below and revoke it again if it is still there."
+        ),
         "signed_out_others": "Signed out of your other sessions.",
     }
 
@@ -390,11 +425,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        # Ownership-checked in the service; an unknown/foreign id is a silent no-op (never
-        # confirms another user's session id). Revoking the CURRENT session logs the caller
-        # out — the next request finds no session and 303s to login.
-        await service.revoke_own_session(identity, session_id, actor=identity.username)
-        return RedirectResponse("/ui/account/sessions?m=revoked", status_code=303)
+        # Ownership-checked in the service; an unknown/foreign id revokes nothing and never confirms
+        # another user's session id. Revoking the CURRENT session logs the caller out — the next
+        # request finds no session and 303s to login.
+        #
+        # ASVS 7.2.4: the notice follows the RESULT. A session's id is its token hash, and rotation
+        # changes the hash at every re-verification, so an id this page rendered can be dead by the
+        # time the POST lands: the target may have completed MFA or a step-up on its own device in
+        # between. Reporting "revoked" then would tell the operator a session had ended while it was
+        # still live under its new id. An unknown id and a foreign id
+        # read the same, so the notice discloses nothing the JSON twin's 404 does not.
+        revoked = await service.revoke_own_session(identity, session_id, actor=identity.username)
+        outcome = "revoked" if revoked else "revoke_missed"
+        return RedirectResponse(f"/ui/account/sessions?m={outcome}", status_code=303)
 
     @app.post("/ui/account/sessions/revoke-others")
     async def ui_revoke_other_sessions(

@@ -369,6 +369,9 @@ _CONTEXTUAL_TOKENS = frozenset(
         # workflow dual control: operation x requester-vs-approver identity x hold age
         "approvals",
         "expiry_hours",
+        # the hold-age FLOOR beside that ceiling (ASVS 2.4.2, BACKLOG #287)
+        "min_dwell_seconds",
+        "approval.too_early",
         # observable outcomes
         "X-MessageFoundry-Denied",
         "client-network",
@@ -421,6 +424,9 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "oidc_flow_cache_max", 512, "**512**"),
     ("auth", "oidc_flow_ttl_seconds", 300, "300 s"),
     ("auth", "oidc_max_age_seconds", 43200, "43200 s"),
+    # The approval hold-age floor (ASVS 2.4.2). Provisional, so pinned: a change must move the row.
+    # Anchored on the "; " separator, because a bare "2 s" is also a substring of "12 s" and "0.2 s".
+    ("approvals", "min_dwell_seconds", 2.0, "; 2 s"),
 )
 
 #: Settings-name fragments that make a field a candidate contextual/environmental input. Every field
@@ -512,7 +518,7 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: whose tokens are shared with a sibling row (Sec-Fetch, bind/exposure, the DICOM construction
 #: gate), so the counts are pinned too: removing ANY row reds CI.
 _CONTEXT_TABLE_A_ROWS = 38
-_CONTEXT_TABLE_B_ROWS = 9
+_CONTEXT_TABLE_B_ROWS = 13
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with
 #: exactly one of these — the assertion that turns "no composite risk score" from a phrase the doc

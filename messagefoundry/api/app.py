@@ -39,6 +39,7 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -82,6 +83,8 @@ from messagefoundry.api.metrics import (
     render_metrics,
 )
 from messagefoundry.api.models import (
+    STATIC_CREDENTIAL_HOPS_COMPLETE,
+    STATIC_CREDENTIAL_HOPS_PARTIAL,
     STORE_PRIVILEGE_NOT_PROBED,
     AiChatRequest,
     AiChatResponse,
@@ -164,6 +167,7 @@ from messagefoundry.api.models import (
     SecurityLoosening,
     SecurityPosture,
     ServiceStatusInfo,
+    StaticCredentialHopView,
     StatsResetRequest,
     StatsResetResult,
     StatsResponse,
@@ -188,9 +192,11 @@ from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     authorize_ws,
     client_ip,
+    deadline_utc,
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
     optional_identity,
+    pending_credential_deadline,
     require,
     require_paced,
     require_phi_read,
@@ -269,6 +275,7 @@ from messagefoundry.config.settings import (
     SecretsSettings,
     SecurityEnforcement,
     SecuritySettings,
+    ServiceSettings,
     ServiceStatusSettings,
     ShadowSettings,
     StoreBackend,
@@ -279,6 +286,7 @@ from messagefoundry.config.settings import (
     hop_posture_from_ai,
     security_loosenings,
 )
+from messagefoundry.config.static_credentials import static_credential_hops
 from messagefoundry.config.tls_policy import (
     fips_attestation,
     kex_groups_report,
@@ -286,6 +294,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import (
     EnvRef,
+    InboundConnection,
     Registry,
     WiringError,
     accepted_cleartext_hops,
@@ -301,7 +310,11 @@ from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runt
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import (
+    AlertSink,
+    LoggingAlertSink,
+    store_cipher_refusal_forwarder,
+)
 from messagefoundry.pipeline.cluster import (
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
@@ -310,6 +323,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
+from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
     NotDeployedError,
@@ -350,6 +364,7 @@ from messagefoundry.uploads import (
     UploadRetentionRunner,
     UploadStore,
     UploadTooLargeError,
+    UploadUnreadableError,
     browse_messages,
     sanitize_filename,
     split_uploaded,
@@ -409,6 +424,10 @@ _NO_STORE_ROUTE_PATHS = frozenset(
         "/alerts/{alert_id}/resolve",
         "/alerts/{alert_id}/suspend",
         "/alerts/{alert_id}/resume",
+        # Not a PL-rated column: the static-credential inventory (BACKLOG #1182) names every backend
+        # hop on a weak credential and its peer, a map worth keeping out of a browser or proxy cache.
+        # Set here, not in the route, because the web console calls the route's handler directly.
+        "/security/posture",
     }
 )
 _log = logging.getLogger(__name__)
@@ -1194,6 +1213,58 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
     if backend == StoreBackend.SQLSERVER.value:
         return list(_SQLSERVER_PLAINTEXT_RESIDUAL)  # () since H4 — full parity, no residual
     return []
+
+
+#: The status a refused operator resubmission answers with, by the ingress guard that refused it
+#: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
+#: the same status the upload route gives a non-text file. A body the listener could not have decoded,
+#: an HL7 body ``Peek.parse`` refuses, or one a ``validation.strict`` inbound's strict hl7apy validation
+#: refuses or times out on, is 422.
+_INGRESS_GUARD_STATUS: dict[str, int] = {
+    "size": 413,
+    "type": 415,
+    "decode": 422,
+    "parse": 422,
+    "strict": 422,
+}
+
+
+async def _guard_resubmission(
+    engine: Engine,
+    identity: Identity,
+    request: Request,
+    *,
+    raw: str,
+    inbound: InboundConnection | None,
+    action: str,
+    channel_id: str | None,
+    detail: dict[str, object],
+) -> str:
+    """Admit a resubmitted body as the target inbound's listener would, or refuse it (BACKLOG #1911).
+
+    The upload resend and the edit-resend paths write the stage row directly, so the listener's size
+    ceiling, declared-type checks and strict validation never ran on them. This runs the same guards
+    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmission`) before anything is written
+    and returns the form to commit, which the caller writes instead of the body it was handed. A
+    refusal is an HTTP 4xx, an ``action`` audit row and a log line, and no message row is written, so
+    count-and-log holds: no body is accepted and then dropped. Off the event loop, because the body can
+    be as large as an upload.
+
+    The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
+    of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal counts hl7apy's
+    errors rather than quoting them, since that text can echo a field value."""
+    try:
+        return await admit_resubmission(raw, inbound)
+    except IngressGuardError as exc:
+        await engine.store.record_audit(
+            action,
+            actor=identity.username,
+            channel_id=channel_id,
+            detail=json.dumps({**detail, "phase": exc.phase, "reason": exc.reason}),
+            client=client_ip(request),
+        )
+        _log.warning("%s: refused by the ingress guards (phase=%s)", action, exc.phase)
+        raise HTTPException(_INGRESS_GUARD_STATUS[exc.phase], exc.reason) from None
 
 
 async def _audit_channel_denied(
@@ -1989,6 +2060,40 @@ def create_app(
                 engine.store.audit_chain_unkeyed(),
             )
         ]
+        # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
+        # read live off the running graph, like the loosenings above; the settings half from the resolved
+        # service configuration `serve` stashed. Either may be missing, and the scope then says which.
+        cred_settings = getattr(request.app.state, "static_credential_settings", None)
+        # An opt-out is honoured only while the refusal is on; with it off every entry is inert, and
+        # reporting it as accepted would contradict security_loosenings(), which does not name it.
+        opt_outs = (
+            security.static_credential_accepted if security.require_nonstatic_credentials else {}
+        )
+        static_hops = [
+            StaticCredentialHopView(**asdict(hop), accepted=hop.name in opt_outs)
+            for hop in static_credential_hops(
+                registry=runner.registry if runner is not None else None, settings=cred_settings
+            )
+        ]
+        unseen = [
+            half
+            for half, missing in (
+                ("the connection graph (none is loaded)", runner is None),
+                ("the service settings (none were stashed by serve)", cred_settings is None),
+                (
+                    "connections other engine shards own (messagefoundry check reads them all)",
+                    # Set only when the config has two or more engine shards (ADR 0073).
+                    runner is not None and runner.registry.all_shard_ids is not None,
+                ),
+            )
+            if missing
+        ]
+        if runner is None and cred_settings is None:
+            static_hops_scope = "not read: " + "; ".join(unseen)
+        elif unseen:
+            static_hops_scope = STATIC_CREDENTIAL_HOPS_PARTIAL + "; ".join(unseen)
+        else:
+            static_hops_scope = STATIC_CREDENTIAL_HOPS_COMPLETE
         store_privilege_view = (
             StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
             if store_privilege is None
@@ -2042,6 +2147,8 @@ def create_app(
             loosenings=loosenings,
             loosenings_scope=loosenings_scope,
             store_privilege=store_privilege_view,
+            static_credential_hops=static_hops,
+            static_credential_hops_scope=static_hops_scope,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
             kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?
@@ -4312,9 +4419,21 @@ def create_app(
                     raise HTTPException(409, _outbound_down_detail(rr, body.to))
             except KeyError:
                 raise HTTPException(404, f"no such outbound connection: {body.to}") from None
+            # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+            # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
+            admitted = await _guard_resubmission(
+                engine,
+                identity,
+                request,
+                raw=body.raw,
+                inbound=None,
+                action="message_edit_resend_reject",
+                channel_id=row["channel_id"],
+                detail={"message_id": message_id, "mode": "direct", "to": body.to},
+            )
             try:
                 direct = await engine.edit_resend_direct(
-                    message_id, to=body.to, raw=body.raw, idempotency_key=body.idempotency_key
+                    message_id, to=body.to, raw=admitted, idempotency_key=body.idempotency_key
                 )
             except ResendError as exc:
                 # Empty edited body / idempotency-key reused for a different target → 409. str(exc)
@@ -4350,9 +4469,31 @@ def create_app(
                 400,
                 "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
             )
+        # BACKLOG #1911: the re-route writes an INGRESS row on the origin channel, so the origin
+        # inbound's own ceiling and declared type apply. With no such inbound in THIS runner's registry
+        # (no config loaded, the inbound removed, or owned by another engine shard, whose registry is
+        # filtered to its own inbounds) there is nothing to guard with, so refuse rather than fail open.
+        rr = engine.registry_runner
+        origin = rr.registry.inbound.get(row["channel_id"]) if rr is not None else None
+        if origin is None:
+            raise HTTPException(
+                409,
+                f"origin inbound {row['channel_id']!r} is not registered on this engine; "
+                "re-route on the engine shard that owns it",
+            )
+        admitted = await _guard_resubmission(
+            engine,
+            identity,
+            request,
+            raw=body.raw,
+            inbound=origin,
+            action="message_edit_resend_reject",
+            channel_id=row["channel_id"],
+            detail={"message_id": message_id, "mode": "reroute"},
+        )
         try:
             outcome = await engine.edit_resend_reroute(
-                message_id, raw=body.raw, idempotency_key=body.idempotency_key
+                message_id, raw=admitted, idempotency_key=body.idempotency_key
             )
         except ResendError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -4433,6 +4574,18 @@ def create_app(
             return True
         return bool(meta.uploader_id) and meta.uploader_id == identity.user_id
 
+    # BACKLOG #1169: the store cipher refused the file. On a keyed store that is usually a plaintext
+    # upload stored before the key was enabled, which `rotate-key` seals (owner ruling 2026-09-23); it
+    # can also be a file under a key that is no longer configured. 423 Locked says the file exists and
+    # needs an operator, where an unhandled CipherError answered 500. It is not 409, which the resend
+    # route already spends on "inbound not running" and the web console maps to that text. No file
+    # detail is in the body.
+    _UPLOAD_UNREADABLE_STATUS = 423
+    _UPLOAD_UNREADABLE = (
+        "this uploaded file cannot be read under the configured store key; if it was stored before "
+        "the key was enabled, an operator must run 'messagefoundry rotate-key' to seal it"
+    )
+
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
     ) -> UploadedFileMeta:
@@ -4453,6 +4606,13 @@ def create_app(
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
+            raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
+            # for everyone but an override holder, who may see any file anyway and is the one who
+            # can act on it; the refused sidecar is not an existence oracle for anyone else.
+            if identity.has(Permission.FILES_ACCESS_ANY):
+                raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
             raise HTTPException(404, "no such uploaded file") from None
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
@@ -4727,6 +4887,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         result = await asyncio.to_thread(
             browse_messages,
             data,
@@ -4874,14 +5036,33 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         parts = await asyncio.to_thread(split_uploaded, data)
         if body.index >= len(parts):
             raise HTTPException(
                 404, f"no message at index {body.index} (file has {len(parts)} messages)"
             )
+        # BACKLOG #1911: the inject writes an INGRESS row directly, so run the target inbound's own
+        # ceiling and declared-type checks first. An upload may be larger than one message may be.
+        # Re-resolved rather than trusted from the check above: a reload during the awaits since then
+        # may have dropped or retyped the inbound, and guarding with no inbound would fail open.
+        target = rr.registry.inbound.get(body.to)
+        if target is None:
+            raise HTTPException(404, f"no such inbound connection: {body.to}")
+        admitted = await _guard_resubmission(
+            engine,
+            identity,
+            request,
+            raw=parts[body.index],
+            inbound=target,
+            action="upload.resend_reject",
+            channel_id=body.to,
+            detail={"file_id": file_id, "index": body.index, "to": body.to},
+        )
         mid = await engine.inject_message(
             channel_id=body.to,
-            raw=parts[body.index],
+            raw=admitted,
             source_type="upload",
             metadata=json.dumps({"upload_file_id": file_id, "upload_index": body.index}),
         )
@@ -4919,6 +5100,8 @@ def create_app(
             meta = await us.delete(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnreadableError:
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         await engine.store.record_audit(
             "upload.delete",
             actor=identity.username,
@@ -6654,6 +6837,93 @@ async def _bootstrap_expiry_reminder(auth: AuthService, sink: AlertSink) -> None
         await asyncio.sleep(_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL)
 
 
+_INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
+
+
+def _initial_credential_warn_lead(auth: AuthService) -> float | None:
+    """How long before an admin-issued credential's deadline to remind an operator, in seconds.
+
+    BACKLOG #1141 (ASVS 6.4.5). The last third of the window, capped at 24 hours: 24 hours at the
+    shipped 72, and a holder never gets reminded about a credential it was handed moments ago on a
+    short window. No setting, deliberately: the reminder is advisory and a knob would be one more
+    loosening to inventory. ``None`` when ``[auth].initial_password_expiry_hours`` is 0, where
+    nothing expires and there is nothing to remind about."""
+    window = auth.initial_credential_deadline(
+        0.0
+    )  # the window in seconds, from the gate's arithmetic
+    if window is None:
+        return None
+    return min(_INITIAL_CREDENTIAL_MAX_LEAD, window / 3)
+
+
+async def _remind_expiring_initial_credentials(
+    auth: AuthService,
+    sink: AlertSink,
+    *,
+    lead: float,
+    warned: dict[str, float],
+    now: float | None = None,
+) -> None:
+    """One pass: alert once for each unclaimed admin-issued credential inside its warn window.
+
+    The deadline is :func:`pending_credential_deadline`, the route-layer function the refusal and the
+    console pages read. It returns :meth:`AuthService.initial_credential_deadline` under the gate's
+    own ``must_change_password`` condition, so the reminder names the instant the gate refuses on. It
+    also leaves out the never-claimed bootstrap account, which :func:`_bootstrap_expiry_reminder`
+    covers against the EARLIER of its two bounds. A disabled account is skipped: it cannot sign in
+    whatever the credential does.
+
+    ``warned`` maps a user id to the deadline already reminded about. A new credential on the same
+    account has a new deadline, so it is reminded about again. An entry is dropped once its account
+    leaves every window (claimed, lapsed, disabled or deleted), so the map stays as small as the set
+    of live reminders."""
+    now = time.time() if now is None else now
+    live: set[str] = set()
+    for user in await auth.store.list_users():
+        if user.disabled:
+            continue
+        deadline = pending_credential_deadline(auth, user)
+        if deadline is None or not (deadline - lead <= now < deadline):
+            continue
+        live.add(user.id)
+        if warned.get(user.id) == deadline:
+            continue
+        expires = deadline_utc(deadline)
+        if expires is None:
+            continue
+        sink.initial_credential_expiring(
+            f"user:{user.username}",
+            expires_at=expires,
+            hours_remaining=max(0, int((deadline - now) // 3600)),
+        )
+        warned[user.id] = deadline
+    for user_id in warned.keys() - live:
+        del warned[user_id]
+
+
+async def _initial_credential_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
+    """Remind an operator before an admin-issued temporary password lapses unclaimed (ASVS 6.4.5,
+    BACKLOG #1141). The engine hands that credential to an ADMINISTRATOR and has no channel to its
+    holder, so the reminder goes to the ``[alerts]`` sink as ``initial_credential_expiring``.
+
+    The poll runs at half the warn lead, capped at an hour, so every window holds at least one pass.
+    The ``_bootstrap_expiry_reminder`` shape: API-lifespan-owned, and a failed pass is logged and
+    retried rather than ending the loop."""
+    lead = _initial_credential_warn_lead(auth)
+    if lead is None:
+        return
+    interval = min(3600.0, lead / 2)
+    warned: dict[str, float] = {}
+    while True:
+        try:
+            await _remind_expiring_initial_credentials(auth, sink, lead=lead, warned=warned)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception("initial credential reminder: pass failed; will retry next interval")
+        await asyncio.sleep(interval)
+
+
 def create_managed_app(
     *,
     db_path: str | Path | None = None,
@@ -6732,6 +7002,8 @@ def create_managed_app(
     trusted_proxies: Sequence[str] = (),
     phi_read_hop_secure: bool = True,
     registry_filter: Callable[[Registry], Registry] | None = None,
+    registry_guard: Callable[[Registry], None] | None = None,
+    static_credential_settings: ServiceSettings | None = None,
     log_dir: str | None = None,
     configured_log_level: str | None = None,
     trust_anchor_specs: Sequence[AnchorSpec] = (),
@@ -6749,6 +7021,10 @@ def create_managed_app(
     ``registry_filter`` (L3 sharding) is an optional pure transform applied to the loaded graph at
     startup AND on every reload — ``serve --shard X`` passes ``filter_registry_for_shard(.., X)`` so
     this process owns only shard X's inbounds; ``None`` = the whole graph (unchanged default).
+    ``registry_guard`` refuses a graph by raising ``WiringError``; it runs on the first load and on
+    every reload (the opt-in static-credential gate, BACKLOG #1182). ``static_credential_settings`` is
+    the resolved service configuration ``GET /security/posture`` reads the static-credential
+    inventory's settings half from; ``None`` makes that route say it could not read it.
     """
     if store_settings is None:
         if db_path is None:
@@ -6786,12 +7062,53 @@ def create_managed_app(
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
         # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
-        store = await open_store(
-            resolved,
-            create=True,
-            message_events=message_events,
-            posture=_hop_posture,
+        # Operational alert notifier (webhook/email). None when no transport is configured → the
+        # engine falls back to the logging sink. Its background dispatch task is owned by this
+        # lifespan: started here, drained + stopped after the engine in the finally below.
+        # Connector SecretProvider (ADR 0019 §5, BACKLOG #196): built once from [secrets] and threaded to
+        # every credential point (SMTP password → notifier/security-notifier, AD bind password →
+        # AuthService). None = [secrets].provider unset/'none' → env-sourced credentials, byte-identical.
+        # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
+        # startup rather than degrading to a blank credential.
+        secret_provider = (
+            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
         )
+        notifier = (
+            notifier_from_settings(
+                alerts_settings,
+                secret_provider=secret_provider,
+                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
+                # an estate on a private CA needs no per-alert CA path.
+                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
+                posture=_hop_posture,
+            )
+            if alerts_settings is not None
+            else None
+        )
+        # BACKLOG #1169: the notifier is built BEFORE the store opens so the cipher's refusal hook can
+        # reach it during the open. A planted `state`/`reference` value on a sealed surface aborts the
+        # open (those tables are read eagerly), and a planted row the at-open sweep finds is left in
+        # place; both raise `integrity_drift("store-cipher")`, naming only the table and column. With no
+        # notifier the logging sink carries it, as it does for the engine.
+        try:
+            store = await open_store(
+                resolved,
+                create=True,
+                message_events=message_events,
+                posture=_hop_posture,
+                refusal_hook=store_cipher_refusal_forwarder(
+                    notifier if notifier is not None else LoggingAlertSink(),
+                    asyncio.get_running_loop(),
+                ),
+            )
+        except BaseException:
+            if notifier is not None:
+                # The open failed before the notifier would normally start. Start and drain it, or
+                # an alert raised during the open (the reason the open failed) is never sent.
+                notifier.start()
+                await notifier.aclose()
+            raise
         # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
         # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
         # operator opts in; every uploaded-logs route 503s when None.
@@ -6817,30 +7134,6 @@ def create_managed_app(
                 # opened — this is the serve path, so it is the one that actually runs sharded.
                 store=store,
             )
-        # Operational alert notifier (webhook/email). None when no transport is configured → the
-        # engine falls back to the logging sink. Its background dispatch task is owned by this
-        # lifespan: started here, drained + stopped after the engine in the finally below.
-        # Connector SecretProvider (ADR 0019 §5, BACKLOG #196): built once from [secrets] and threaded to
-        # every credential point (SMTP password → notifier/security-notifier, AD bind password →
-        # AuthService). None = [secrets].provider unset/'none' → env-sourced credentials, byte-identical.
-        # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
-        # startup rather than degrading to a blank credential.
-        secret_provider = (
-            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
-        )
-        notifier = (
-            notifier_from_settings(
-                alerts_settings,
-                secret_provider=secret_provider,
-                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
-                # an estate on a private CA needs no per-alert CA path.
-                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
-                posture=_hop_posture,
-            )
-            if alerts_settings is not None
-            else None
-        )
         if notifier is not None:
             # Durable operator alert-state (ADR 0044, #56): wire the open store so every emit upserts a
             # resolvable alert instance (GET /alerts/active) and an inverse signal auto-resolves it. A
@@ -7003,13 +7296,28 @@ def create_managed_app(
             coordinator=coordinator,
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
+            registry_guard=registry_guard,
         )
         if config_dir is not None:
-            loaded = load_config(config_dir)
-            # L3 sharding: a `serve --shard X` process owns only shard X's inbounds (the filter is
-            # re-applied on every reload inside the engine). None = the whole graph (unchanged default).
-            if registry_filter is not None:
-                loaded = registry_filter(loaded)
+            # The first graph load, under the same teardown discipline as the preflights above: a
+            # refusal here (a bad config, the shard guard, or the BACKLOG #1182 static-credential
+            # guard) happens after the store and notifier are open and before the span below that
+            # tears them down, so they are closed here. Left open, aiosqlite's non-daemon worker keeps
+            # the process from exiting (#1257).
+            try:
+                loaded = load_config(config_dir)
+                # Before the shard filter, as the reload path does inside the engine: the guard judges
+                # the whole graph.
+                engine.guard_registry(loaded)
+                # L3 sharding: a `serve --shard X` process owns only shard X's inbounds (the filter is
+                # re-applied on every reload inside the engine). None = the whole graph.
+                if registry_filter is not None:
+                    loaded = registry_filter(loaded)
+            except BaseException:
+                if notifier is not None:
+                    await notifier.aclose()
+                await store.close()
+                raise
             engine.add_registry(loaded)
         # #1257: hoisted above the try because the finally below now guards STARTUP too, and it
         # reaches these names before it reaches engine.stop(). Left in place inside the span, a
@@ -7021,9 +7329,11 @@ def create_managed_app(
         reaper: asyncio.Task[None] | None = None
         reconciler: asyncio.Task[None] | None = None
         bootstrap_reminder: asyncio.Task[None] | None = None
+        # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
+        credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
-        # the engine, both notifiers, the retention runner, the three tasks -- was otherwise
+        # the engine, both notifiers, the retention runner, the tasks -- was otherwise
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
@@ -7051,6 +7361,8 @@ def create_managed_app(
             app.state.trust_anchor_specs = tuple(trust_anchor_specs)
             app.state.trust_anchors_enforcing = trust_anchors_enforcing
             app.state.store_settings = resolved  # back GET /security/posture (M5)
+            # BACKLOG #1182: the settings half of the static-credential inventory, for the same route.
+            app.state.static_credential_settings = static_credential_settings
             app.state.alerts_settings = alerts_settings
             # #143: expose the running notifier so POST /alerts/{id}/suspend|resume can update its in-memory
             # suspend cache live (None here in a JSON-only/no-transport deployment — the durable store governs).
@@ -7087,6 +7399,11 @@ def create_managed_app(
             # callback closes over the opened store so the leaf uploads module never imports it.
             _upload_store: UploadStore | None = getattr(app.state, "upload_store", None)
             if _upload_store is not None:
+                # BACKLOG #1169, owner ruling 2026-09-23: a keyed store refuses a plaintext upload
+                # until `rotate-key` seals it, and a refused file just drops out of the listing. Say
+                # how many are waiting (the count only, never a filename) so the operator knows to
+                # run it. Counting reads a few bytes per file; the engine never seals them here.
+                await _upload_store.warn_if_unsealed()
 
                 async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
                     # BACKLOG #1224: the retention runner has no operator and no request behind it, so
@@ -7223,6 +7540,13 @@ def create_managed_app(
                     bootstrap_reminder = asyncio.create_task(
                         _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
                     )
+                if _initial_credential_warn_lead(auth) is not None:
+                    # BACKLOG #1141 (ASVS 6.4.5): the same nudge for every OTHER unclaimed temporary
+                    # password an administrator issued. Gated on the predicate the task itself reads,
+                    # so the gate cannot drift from the task the way the bootstrap one did above.
+                    credential_reminder = asyncio.create_task(
+                        _initial_credential_expiry_reminder(auth, notifier or LoggingAlertSink())
+                    )
                 if auth.directory_reconcile_enabled:
                     # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
                     # ON whenever a directory is wired -- `ad_session_recheck_seconds` defaults to
@@ -7265,6 +7589,9 @@ def create_managed_app(
                 # gather(return_exceptions): absorb our cancellation + any stored exception so it can't
                 # propagate here and skip engine.stop() (the reaper precedent).
                 await asyncio.gather(bootstrap_reminder, return_exceptions=True)
+            if credential_reminder is not None:
+                credential_reminder.cancel()
+                await asyncio.gather(credential_reminder, return_exceptions=True)
             # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
             # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
             # called it, so every clean restart dropped the open hour's PHI-summary access audit --

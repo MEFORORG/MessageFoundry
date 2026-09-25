@@ -19,11 +19,13 @@ silently-dropped key leaves the setting it was meant to apply un-applied, with n
 reporting a problem. An unknown top-level **section** is still tolerated.
 
 The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
-oversight: the **env** and **CLI** layers still drop an unrecognized key silently. Env cannot be
-checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read straight from
-``os.environ`` by their consuming module and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``,
-``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership test would refuse a
-correctly-configured deployment; CLI keys are engine-written, never operator-spelled. The one
+oversight: the **env** layer and the ``cli`` mapping still drop an unrecognized key silently. Env
+cannot be checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read
+straight from ``os.environ`` by their consuming module and are not fields on any section
+(``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership
+test would refuse a correctly-configured deployment. ``cli`` keys are engine-written from parsed
+arguments, never operator-spelled; an operator's unknown flag never reaches them, because argparse
+refuses it first with exit 2. The one
 exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
 Anything stated to an operator about this refusal must carry that scope — see
 ``docs/CONFIGURATION.md``.
@@ -453,6 +455,17 @@ class StoreSettings(_Section):
     # to bind). Setting it false selects the frozen mfenc:v1 writer (byte-identical at rest, CRYPTO-1) and
     # is a LOOSENING — `security_loosenings()` names it, so the opt-out is never silent.
     aad_bind: bool = True
+    # Accept an UNMARKED value in a cipher-covered column of a KEYED store (BACKLOG #1169, ASVS 11.3.3).
+    # **Off by default**: a keyed store writes only `mfenc:` ciphertext there, and the at-open sweep
+    # seals legacy plaintext only on a (table, column) surface that holds no ciphertext yet, so a
+    # non-blank unmarked value beside sealed ones is a stripped marker or a planted row -- the cipher
+    # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
+    # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
+    # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
+    # a LOOSENING -- `security_loosenings()` names it. No effect without an encryption key. It also
+    # restores the passthrough for a plaintext UPLOADED FILE, which a keyed store otherwise refuses
+    # until `rotate-key` seals it, alerting under `upload-cipher` (owner ruling 2026-09-23).
+    allow_unmarked_ciphertext: bool = False
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
@@ -962,6 +975,16 @@ class ApiSettings(_Section):
     # non-loopback bind satisfy the exposed-gate WITHOUT in-process TLS — but only when trusted_proxies
     # is set (so the engine knows a terminator is really in front).
     tls_terminated_upstream: bool = False
+    # The operator's acknowledgement that, with tls_terminated_upstream and no tls_cert_file, the
+    # proxy-to-engine hop is PLAINTEXT by design (ADR 0172 decision 3): the engine mints no
+    # certificate there, so encrypting or isolating that hop is the DEPLOYING SITE's job. `serve`
+    # refuses to start that topology without it, in every mode -- enforcing or warn, loopback or
+    # not -- because only the operator can take on a hop the engine does not protect. With an
+    # operator tls_cert_file the engine serves that hop over TLS, so it is not required there (and
+    # harmless if set). It records who took the hop on; it secures nothing. Meaningful only with
+    # tls_terminated_upstream, so setting it without that is refused at load (a stray
+    # acknowledgement would read as a decision about a hop that does not exist). Default False.
+    plaintext_upstream_hop_acknowledged: bool = False
 
     # --- Posture-B (upstream TLS termination) attestations (#200, ADR 0002) --------
     # In Posture-B the proxy terminates browser TLS and the proxy→engine hop is a plaintext segment on
@@ -1123,6 +1146,14 @@ class ApiSettings(_Section):
         # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
+        # Refuse rather than ignore a stray acknowledgement, as ad_session_recheck_seconds without
+        # ad_enabled is refused: an operator who set it believes a proxy-to-engine hop exists and
+        # was considered, and without tls_terminated_upstream there is no such hop.
+        if self.plaintext_upstream_hop_acknowledged and not self.tls_terminated_upstream:
+            raise ValueError(
+                "[api].plaintext_upstream_hop_acknowledged requires [api].tls_terminated_upstream "
+                "(it acknowledges the plaintext proxy-to-engine hop that only that topology has)"
+            )
         # Validate the DECLARED Posture-B proxy TLS floor for internal coherence (#200, ASVS 11.6.2) —
         # an attestation, but a *coherent* one (a NIST version floor; forward-secret ciphers if named).
         validate_proxy_tls_posture(self.proxy_tls_min_version, self.proxy_tls_ciphers)
@@ -2198,7 +2229,7 @@ class AuthSettings(_Section):
     password_require_digit: bool = False
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    password_check_context: bool = True  # reject passwords containing app/vendor/HL7 terms
+    password_check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term
     password_check_username: bool = (
         True  # reject passwords containing the user's own username (6.2.11)
     )
@@ -3122,6 +3153,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
         # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
         "bootstrap_admin_expiring",
+        # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
+        # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)
+        "initial_credential_expiring",
         # #122 (ADR 0162): an application-log sink was rolled after a write failure (stage 1) or is
         # UNWRITABLE and this process's connections were stopped (stage 2). Routable on its own so an
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
@@ -3407,8 +3441,9 @@ class AlertsSettings(_Section):
     # security-notification channel exists — SMTP transport (the settings above) configured AND the
     # [auth].notify_security_events kill-switch on (both are what api/app.py needs to wire the notifier)
     # — so account-security events (lockout, password/roles change, new-IP admin action) always have a
-    # push channel, not just the pull-only /me/security-events feed. Set false to accept the pull-only
-    # feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
+    # push channel, not just the pull-only /me/security-events feed. That feed carries the user's own
+    # events, not an administrator's change to their account (auth/notifications.py states the rule).
+    # Set false to accept the pull-only feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
     # messagefoundry/__main__.py.
     security_notifications_required: bool = True
 
@@ -4172,13 +4207,28 @@ class ApprovalsSettings(_Section):
     2.3.5). **Off by default** so a single-operator deployment is never blocked. When ``enabled``, an
     action in ``operations`` is held as a pending request and must be released by a *distinct* second
     user holding ``approvals:approve`` — the requester can never approve their own. A request older than
-    ``expiry_hours`` can no longer be approved."""
+    ``expiry_hours`` can no longer be approved, and one younger than ``min_dwell_seconds`` cannot be
+    approved YET.
+
+    ``min_dwell_seconds`` is the FLOOR beside ``expiry_hours``' CEILING (ASVS 2.4.2, BACKLOG #287). An
+    approve that arrives sooner gets a 409 and an ``approval.too_early`` audit row.
+
+    **The default (2.0 s) is PROVISIONAL.** It comes from published human-timing research, not from a
+    timed session (owner ruling 2026-09-23). Source: Card, Moran and Newell, "The keystroke-level model
+    for user performance time with interactive systems", Communications of the ACM 23(7), 1980,
+    pp. 396-410. How the default follows from it, and what the floor does not do, is stated once in
+    docs/SECURITY.md under "Dual-control approval for high-value actions". Change the two together."""
 
     enabled: bool = False
     operations: list[str] = Field(default_factory=lambda: sorted(_DEFAULT_APPROVABLE_OPERATIONS))
-    expiry_hours: float = (
-        72.0  # a pending request expires this many hours after it's made (0 = never)
-    )
+    # A pending request expires this many hours after it's made (0 = never). allow_inf_nan=False because
+    # a non-finite expiry means something different on each store backend, and none of them is what an
+    # operator asked for. `nan > 0` is also False, so a nan expiry would skip the dwell cross-check below.
+    expiry_hours: float = Field(default=72.0, allow_inf_nan=False)
+    # Seconds a pending request must have existed before it may be approved (0 = no floor), measured
+    # from its own ``requested_at``. allow_inf_nan=False matters: nan compares False against everything,
+    # so `age < nan` would switch the floor OFF silently.
+    min_dwell_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
 
     @field_validator("operations")
     @classmethod
@@ -4196,7 +4246,27 @@ class ApprovalsSettings(_Section):
     def _check_expiry(cls, v: float) -> float:
         if v < 0:
             raise ValueError("approvals.expiry_hours must be >= 0 (0 = never expires)")
+        # A huge FINITE value still overflows to inf once guard() turns it into seconds, which is the
+        # non-finite expiry allow_inf_nan exists to refuse.
+        if v * 3600.0 == float("inf"):
+            raise ValueError("approvals.expiry_hours is too large to express in seconds")
         return v
+
+    @model_validator(mode="after")
+    def _dwell_inside_expiry(self) -> ApprovalsSettings:
+        # A floor at or past the ceiling leaves no moment when a request can be approved: each one is
+        # refused as too early and then as expired. Refuse that at startup, not at the first release.
+        # Only while dual control is ON: a disabled feature must not refuse startup over its defaults.
+        if (
+            self.enabled
+            and self.expiry_hours > 0
+            and self.min_dwell_seconds >= self.expiry_hours * 3600.0
+        ):
+            raise ValueError(
+                "approvals.min_dwell_seconds must be shorter than approvals.expiry_hours, or no "
+                "request could ever be approved"
+            )
+        return self
 
 
 #: The two snapshot mechanisms for the SQLite store backup (ADR 0049). ``vacuum_into`` (default) writes
@@ -4565,6 +4635,28 @@ class SecuritySettings(_Section):
     # names it, so the opt-out is never silent.
     allow_unverified_alert_smtp_tls: bool = False
 
+    # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
+    # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
+    # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
+    # any hop that config/static_credentials.py's static_credential_hops() names lacks an entry in
+    # static_credential_accepted below; the refuse/warn split is [security].enforcement, exactly like
+    # [store].require_managed_identity. The settings half (six sections: [store], [secrets],
+    # [alerts], [ai], [auth] and [logging]) is checked before anything starts; the graph half at every
+    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
+    # (among them the alert webhook, DICOMweb, Tcp, X12, a File alternate-share credential, a
+    # forward-proxy credential, FTP, SMTP AUTH, a Postgres store, Vault tokens, the AI broker key, OIDC
+    # client_secret and the LDAP bind; each hop's compliant_kind field is the source of record), so
+    # with this on they can only run under an opt-out. Not a loosening (it tightens).
+    # DIRECT-READ by the serve gate, not desugared: there is no legacy field it replaces.
+    require_nonstatic_credentials: bool = False
+    # The audited per-hop opt-outs: hop name -> the operator's reason, e.g.
+    # {"OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "..."}. Hop names
+    # are the ones `messagefoundry check`'s static-credentials line and GET /security/posture print.
+    # Read only when require_nonstatic_credentials is TRUE; each honoured entry is logged at startup
+    # (hop name and reason, never a secret) and named by security_loosenings(). A blank reason is
+    # refused at load: an opt-out must say why.
+    static_credential_accepted: dict[str, str] = Field(default_factory=dict)
+
     # ── Sign-in & identity ───────────────────────────────────────────
     require_sign_in: bool = True  # authenticate every request
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
@@ -4667,6 +4759,17 @@ class SecuritySettings(_Section):
                 )
             cleaned.append(item)
         return cleaned
+
+    @field_validator("static_credential_accepted", mode="after")
+    @classmethod
+    def _opt_outs_say_why(cls, value: dict[str, str]) -> dict[str, str]:
+        blank = sorted(name for name, reason in value.items() if not str(reason).strip())
+        if blank:
+            raise ValueError(
+                "[security].static_credential_accepted: every opt-out needs a reason; blank for "
+                + ", ".join(repr(name) for name in blank)
+            )
+        return value
 
     @field_validator("allowed_client_networks", mode="before")
     @classmethod
@@ -5240,6 +5343,7 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
+    ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), three per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a generic-ODBC ``DATABASE`` hop
@@ -5466,6 +5570,21 @@ def security_loosenings(
                 "between cells decrypts instead of failing its auth tag (no effect without a store key)",
             )
         )
+    # BACKLOG #1169 (ASVS 11.3.3). The substitution limb has a tag to fail; a downgrade to plaintext has
+    # none, and only the refusal this switch turns off protects it.
+    if store.allow_unmarked_ciphertext:
+        out.append(
+            (
+                "allow_unmarked_ciphertext",
+                "an UNMARKED value in an encrypted column reads back as plaintext instead of being "
+                "refused — anyone who can write the store can strip a ciphertext's marker or plant a "
+                "plaintext row and have the engine accept it as that row's content, and the next "
+                "rotate-key seals it as genuine ciphertext. It also serves a plaintext uploaded file: "
+                "anyone who can write [store].uploads_dir, with no store access at all, can drop a "
+                "sidecar with a chosen uploader and have it listed, browsed and resent "
+                "(no effect without a store key)",
+            )
+        )
     # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the
     # engine keeps starting on a key past its documented cadence, and the only remaining signal is an
     # alert nobody has to answer. Named here because a silent opt-out from a refusal is indistinguishable
@@ -5521,6 +5640,22 @@ def security_loosenings(
                 "allow_unverified_alert_smtp_tls",
                 "an unauthenticated [alerts] SMTP hop is permitted to start an enforcing PHI instance "
                 "— the serve gate that would otherwise refuse it is acknowledged away",
+            )
+        )
+    # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a
+    # deliberate departure from it, so the opt-outs are the loosening. With the refusal OFF (the shipped
+    # default, owner decision 2026-09-23) nothing is refused and an opt-out is inert, so it is not
+    # reported; the static-credential inventory itself is GET /security/posture's
+    # `static_credential_hops` and `messagefoundry check`'s static-credentials line.
+    if sec.require_nonstatic_credentials and sec.static_credential_accepted:
+        named = ", ".join(sorted(sec.static_credential_accepted))
+        out.append(
+            (
+                "static_credential_accepted",
+                f"{len(sec.static_credential_accepted)} opt-out(s) from the static-credential refusal "
+                f"are declared ({named}) — each named hop that exists runs on an unchanging "
+                "credential or none, which ASVS 13.2.1 asks backend hops not to do (the serve log "
+                "names any opt-out that matches no hop)",
             )
         )
     # --- the CONNECTION-scoped deviations (ADR 0153 decision 2; #333). None is a [security] switch, but

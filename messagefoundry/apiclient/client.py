@@ -254,10 +254,10 @@ def _seg(value: str | int) -> str:
     ``/``; ``tests/test_apiclient.py`` pins what it does hold.
 
     Applied at every interpolation site rather than only the ones carrying free text. Most of the
-    identifiers here are engine-minted hex ids, but four sites carry a CONNECTION NAME, which is
-    unconstrained: ``Registry._add`` (config/wiring.py) checks a new name only for a duplicate. The
-    alternative -- resting URL correctness on a data-grammar invariant that no URL-building line
-    asserts -- is the argument BACKLOG #1107 names as its live trap, so the encode is unconditional.
+    identifiers here are engine-minted hex ids, but four sites carry a CONNECTION NAME. The config
+    loader now refuses a name that fails the API's rule (BACKLOG #1107), but resting URL correctness
+    on a data-grammar invariant that no URL-building line asserts is the trap that item names, so
+    the encode stays unconditional.
 
     Ints are coerced because ``quote`` raises ``TypeError`` on a non-str and two alert routes take
     an ``int`` id. Encoding is idempotent for the identifiers actually in use (engine ids and
@@ -399,11 +399,18 @@ class EngineClient:
     """Blocking client for the MessageFoundry localhost API.
 
     Use as a context manager (or call :meth:`close`) to release the connection pool.
+
+    **The default ``base_url`` is https, because the engine serves TLS by default** (ADR 0172). A
+    stock engine presents a self-signed pair it minted beside its store database, and no trust store
+    holds that certificate. So a client for a stock engine also passes ``cacert=`` naming that file
+    (``api-generated-cert.pem``; ``messagefoundry cert inventory --service-config <toml>`` prints
+    its path). Without it the first request fails certificate verification. That failure is
+    deliberate: this client never turns verification off.
     """
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8765",
+        base_url: str = "https://127.0.0.1:8765",
         *,
         timeout: float = 5.0,
         allow_insecure: bool = False,

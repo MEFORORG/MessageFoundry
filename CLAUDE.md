@@ -321,6 +321,21 @@ korus `roles/COMMON.md`, section *"The seat registry is the only channel that cr
 carries the read side: how to find a live seat from any account, and why that search must sort by
 recency.
 
+**The fleet wiki is the memory every seat on every account can search.** Query it for the subject
+of your work before you act, and write a lesson, decision, gotcha or correction after; a miss never
+blocks. A note is advice: where it disagrees with the tree or an owner instruction, the tree wins,
+and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how.
+
+**Run korus's wiki scripts by path, FROM YOUR ENGINE WORKTREE.** This repository has no
+`ccx.config.json`, so without `-StateRoot` a query reads no inbox and still prints `no note`. Work
+the path out here, never in korus: from a korus directory it names korus's own coordination
+directory, where a write lands unseen. A query also takes `-RecordRepo` with a vault checkout at
+`origin/main`.
+
+    pwsh -NoProfile -File <korus checkout>/scripts/wiki/query.ps1 -Text "<subject>" `
+      -StateRoot "$(git rev-parse --path-format=absolute --git-common-dir)/mefor-coord" `
+      -RecordRepo <vault checkout>
+
 
 ### The KORUS roster, and only these seats
 
@@ -781,9 +796,9 @@ gates a merge**, and no seat has to clear one.
   cannot, because it exits first. The Lander owns the PR from the handover on and repairs it like
   any other, but dropping an item is a re-cut, and re-cuts go back to the Manager. Every other seat
   opens its own PR and may batch its own work the same way. **"Dispatched by a Manager" means running
-  as its SUBAGENT (decided 2026-09-23 under the owner's delegation).** A Builder in its own
-  session, started from a chip or spawned, has a report that reaches nobody, so it opens its own PR
-  even though a Manager wrote its brief. The steps, the PR
+  as its SUBAGENT (owner ruling 2026-09-24).** A Builder in its own session, started from a chip or
+  spawned, has a report that reaches nobody, so it opens its own PR even though a Manager wrote its
+  brief. The steps, the PR
   body shape and the traps are in korus `roles/MANAGER.md`, *When to cut a pull request*.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **Reading a diff before merging it is still the job; no check

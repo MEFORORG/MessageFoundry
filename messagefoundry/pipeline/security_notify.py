@@ -32,6 +32,7 @@ from messagefoundry.auth.notifications import (
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SecurityEvent,
+    deadline_utc,
 )
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AlertsSettings
@@ -89,6 +90,16 @@ def _build_body(event: SecurityEvent) -> str:
     failed = event.detail.get("failed_attempts")
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
+    if event.event_type == PASSWORD_RESET:
+        # BACKLOG #1141 (ASVS 6.4.5): the renewal instruction for an expiring credential, sent to the
+        # holder. `expires_at` is the instant the login gate refuses on, read off the stored stamp.
+        stamp = event.detail.get("expires_at")
+        expires = deadline_utc(stamp) if isinstance(stamp, (int, float)) else None
+        if expires is not None:
+            lines.append(
+                f"The temporary password stops working at {expires}. Sign in with it and choose "
+                "a new password before then."
+            )
     if event.event_type == EMAIL_CHANGED:
         # BACKLOG #1139: an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL, not a repoint, and
         # it must not render as the repoint wording minus a line. "Was changed" with the new value
@@ -139,10 +150,13 @@ def _build_body(event: SecurityEvent) -> str:
                 )
     if event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
-    lines += [
-        "",
-        "If this was you, no action is needed. If not, contact your MessageFoundry administrator.",
-    ]
+    if event.event_type == PASSWORD_RESET:
+        # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
+        # would contradict the deadline line above it (BACKLOG #1141).
+        closing = "If you did not expect this reset, contact your MessageFoundry administrator."
+    else:
+        closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."
+    lines += ["", closing]
     return "\n".join(lines)
 
 

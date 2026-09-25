@@ -86,6 +86,11 @@ class PendingFlow:
     return_to: str
     client_ip: str
     deadline: float
+    #: The hash of the session the browser presented at the START leg, if any (ASVS 7.2.4). The
+    #: callback cannot read it for itself: the session cookie is SameSite=Strict and the IdP's
+    #: redirect back is a cross-site navigation, so the browser withholds it there. Staged as a hash,
+    #: never the token, so a cache dump yields nothing that authenticates.
+    prior_session_hash: str | None = None
 
 
 class FlowCache:
@@ -155,6 +160,7 @@ def start_flow(
     client_ip: str,
     ttl_seconds: float = DEFAULT_FLOW_TTL_SECONDS,
     clock: Callable[[], float] = time.monotonic,
+    prior_session_hash: str | None = None,
 ) -> tuple[str, PendingFlow]:
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
@@ -169,6 +175,7 @@ def start_flow(
         return_to=return_to,
         client_ip=client_ip,
         deadline=clock() + ttl_seconds,
+        prior_session_hash=prior_session_hash,
     )
     cache.put(flow_id, flow)
     return flow_id, flow
@@ -253,7 +260,7 @@ def exchange_code(
 
     ``opener`` is injected (production supplies a hardened, CA-pinned, no-redirect opener). A
     confidential client sends ``client_secret_post``; a public client omits it and relies on PKCE.
-    Raises :class:`FlowError` on any non-2xx, oversized, or non-JSON response — PHI/secret-safe: the
+    Raises :class:`FlowError` on a non-2xx, misframed, oversized or non-JSON response — PHI/secret-safe: the
     secret, the ``code``, and the tokens never enter an exception message.
 
     The request line and header block are **measured before the POST** (ASVS 4.2.5, BACKLOG #1048).
@@ -300,15 +307,27 @@ def exchange_code(
         headers=headers,
         method="POST",
     )
+    # BACKLOG #1125 (ASVS 4.2.1): a reply whose length framing is ambiguous is refused before its
+    # body is read, by the rule read_bounded applies to connector replies. Imported here to match the
+    # length helper's import above; FlowError keeps it on the audited login-failure path.
+    from messagefoundry.transports.bounded_read import (  # noqa: PLC0415  (matches the import above)
+        reply_framing_fault,
+    )
+
     # Both raises sit OUTSIDE their handlers on purpose. `raise ... from None` clears `__cause__`
     # but leaves `__context__` populated, so the HTTPError — a readable response object whose body
     # may echo the request params, this POST's client secret among them — would still be reachable
     # by a chain-walking handler. See `encode_wire_body` in transports/base.py.
     http_status: int | None = None
     unreachable: str | None = None
+    misframed = False
+    body = b""
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
-            body = resp.read(_MAX_TOKEN_RESPONSE_BYTES + 1)
+            if reply_framing_fault(resp) is not None:
+                misframed = True
+            else:
+                body = resp.read(_MAX_TOKEN_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
         http_status = exc.code
@@ -318,6 +337,8 @@ def exchange_code(
         raise FlowError(f"token endpoint returned HTTP {http_status}")
     if unreachable is not None:
         raise FlowError(f"token endpoint unreachable: {unreachable}")
+    if misframed:
+        raise FlowError("token endpoint response framed its body length ambiguously")
     if len(body) > _MAX_TOKEN_RESPONSE_BYTES:
         raise FlowError("token endpoint response exceeds the size bound")
     try:

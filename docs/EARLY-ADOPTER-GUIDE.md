@@ -394,7 +394,9 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
 - [ ] **API off-loopback requires native TLS.** The API binds `127.0.0.1` by default. To reach it from
       another host, configure **in-process TLS** (`[api].tls_cert_file` + `[api].tls_key_file`,
       `tls_min_version` ≥ 1.2, opt-in mTLS via `tls_client_ca_file`) **or** front it with a TLS terminator
-      (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`). A non-loopback bind **without**
+      (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`, plus the required
+      `[api].plaintext_upstream_hop_acknowledged = true` when no `[api].tls_cert_file` is set: the
+      proxy-to-engine hop is then plaintext and securing it is your job). A non-loopback bind **without**
       TLS (or a trusted terminator) is **refused at startup**. **Never use `--allow-insecure-bind` for
       real PHI** — it is a loud dev-only escape that puts bearer tokens and PHI on the wire in cleartext.
       (With auth disabled, a non-loopback bind is refused unconditionally.)
@@ -757,7 +759,7 @@ lifespan to call `engine.stop()` for a clean drain. Always **drain → stop → 
   use **dead-letter replay** to recover messages that a bad transform stranded before the rollback.
 
 **Pre-1.0 cadence:** pin a released version (`messagefoundry==X.Y.Z`); the **latest release** is the
-supported target. Reproduce a problem against the latest release before filing an issue, and keep
+supported target. Reproduce a problem against the latest release first, and keep
 upgrades **small and frequent** rather than large and rare.
 
 ---
@@ -883,14 +885,15 @@ throughput — only the leader processes.
 
 ## 15. Getting help & reporting bugs
 
-- **Bugs & feature requests:** open a GitHub issue using the repository's issue templates
-  (`bug_report.md` / `feature_request.md`).
+- **Bugs, feature requests and questions:** not through GitHub Issues. `CONTRIBUTING.md`, section
+  "Finding something to work on", names the routes.
 - **Security vulnerabilities:** use the repository's **private security advisory** process per
   `.github/SECURITY.md` — do **not** open a public issue for a vulnerability.
-- **Before filing:** verify against current `main` (pre-1.0, latest-main-only support), and include the
-  engine version, config shape, and relevant **non-PHI** log excerpts.
-- 🔒 **Never attach real PHI** to an issue, log excerpt, or reproduction. Reproduce with a synthetic
-  corpus from `messagefoundry generate`.
+- **Before you share a problem:** verify it against current `main` (pre-1.0, latest-main-only
+  support). Include the engine version, config shape, and relevant **non-PHI** log excerpts.
+- **Never attach real PHI** to anything you share, including a log excerpt or a reproduction.
+  Redact hostnames, IP addresses and partner names. Reproduce with a synthetic corpus from
+  `messagefoundry generate`.
 
 ---
 

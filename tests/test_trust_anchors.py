@@ -15,6 +15,7 @@ import pytest
 
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.auth import trust_anchors as ta
+from messagefoundry.auth.anchor_path import PathVerdict
 from messagefoundry.auth.trust_anchors import (
     AUDIT_ACTION,
     AnchorSpec,
@@ -43,6 +44,12 @@ def _pem(tmp_path: Path, body: bytes = b"-----BEGIN CERTIFICATE-----\nAAAA\n") -
     p = tmp_path / "anchor.pem"
     p.write_bytes(body)
     return p
+
+
+def _path_ok(_p: object) -> PathVerdict:
+    """A path check that passes. The row-count tests stub it for the reason they stub the ACL read:
+    the real answer depends on the host's temp directory, not on the test (BACKLOG #1142)."""
+    return PathVerdict(True)
 
 
 async def _rows(store: MessageStore, label: str | None = None) -> list[dict]:
@@ -193,6 +200,368 @@ def test_dacl_read_pins_icacls_to_the_system_directory(monkeypatch: pytest.Monke
     assert os.path.dirname(program) == service_status._system_dir()
 
 
+# --- tri-state: "I could not determine this" is not "yes" (BACKLOG #1142, ASVS 6.7.1) -----------
+
+
+def test_icacls_empty_output_is_indeterminate() -> None:
+    # No output at all: the parser saw nothing it could attribute to a principal, so it must not
+    # assert owner-only storage. Before #1142 this returned True.
+    assert owner_only_from_icacls("", anchor_path=_PATH) is None
+
+
+def test_icacls_unparseable_output_is_indeterminate() -> None:
+    text = "this is not icacls output\nnor is this line\n"
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is None
+
+
+def test_icacls_trailer_without_any_ace_is_indeterminate() -> None:
+    # The success trailer alone proves icacls ran; it proves nothing about the DACL.
+    text = f"{_PATH}\n\nSuccessfully processed 1 files; Failed processing 0 files.\n"
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is None
+
+
+def test_icacls_ace_with_no_principal_token_is_indeterminate() -> None:
+    # A rights blob with nothing in front of it cannot be attributed to anybody.
+    text = f"{_PATH} :(F)\n\nSuccessfully processed 1 files; Failed processing 0 files.\n"
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is None
+
+
+def test_icacls_one_parsed_ace_is_determined() -> None:
+    # The control for the four tests above: one attributable ACE and no broad-principal write is a
+    # real, determined "owner-only".
+    assert owner_only_from_icacls(_icacls(r"DESKTOP-A\svc:(F)"), anchor_path=_PATH) is True
+
+
+# --- broad principals beyond Everyone / Users (BACKLOG #1142) -----------------------------------
+
+
+def test_icacls_interactive_modify_is_not_owner_only() -> None:
+    text = _icacls(r"DESKTOP-A\svc:(F)", r"NT AUTHORITY\INTERACTIVE:(I)(M)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+def test_icacls_service_modify_is_not_owner_only() -> None:
+    text = _icacls(r"DESKTOP-A\svc:(F)", r"NT AUTHORITY\SERVICE:(I)(M)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+def test_icacls_batch_modify_is_not_owner_only() -> None:
+    text = _icacls(r"DESKTOP-A\svc:(F)", r"NT AUTHORITY\BATCH:(I)(M)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+def test_icacls_creator_owner_grants_nobody_so_stays_owner_only() -> None:
+    # CREATOR OWNER (S-1-3-0) is a placeholder no logon token carries, so an ACE for it on a file
+    # grants nobody anything. wiring.py trusts it for the same reason. Reading it as broad would make
+    # enforce refuse a secure anchor.
+    text = _icacls(r"DESKTOP-A\svc:(F)", r"CREATOR OWNER:(I)(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+    text = _icacls(r"DESKTOP-A\svc:(F)", r"*S-1-3-0:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        r"NT AUTHORITY\NETWORK",
+        r"NT AUTHORITY\ANONYMOUS LOGON",
+        r"NT AUTHORITY\Local account",
+        r"BUILTIN\Guests",
+        r"CORP\Domain Users",
+        r"CORP\Domain Guests",
+    ],
+)
+def test_icacls_more_broad_names_write_is_not_owner_only(principal: str) -> None:
+    text = _icacls(r"DESKTOP-A\svc:(F)", f"{principal}:(M)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        r"DESKTOP-A\usersync",
+        r"CORP\everyone-admins",
+        r"NT AUTHORITY\Local account and member of Administrators group",
+        r"NT AUTHORITY\NETWORK SERVICE",
+    ],
+)
+def test_icacls_broad_names_match_whole_not_as_substrings(principal: str) -> None:
+    # A substring match read an ordinary account such as DESKTOP-A\usersync as \Users, and a false
+    # "broad" makes enforce refuse a secure anchor.
+    text = _icacls(r"DESKTOP-A\svc:(F)", f"{principal}:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+
+
+@pytest.mark.parametrize("rights", ["(D)", "(DE)", "(I)(DE,RC)"])
+def test_icacls_broad_delete_is_not_owner_only(rights: str) -> None:
+    # Delete-then-plant replaces the anchor, and wiring.py's write mask counts DELETE too.
+    text = _icacls(r"DESKTOP-A\svc:(F)", f"Everyone:{rights}")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+@pytest.mark.parametrize(
+    "sid",
+    [
+        "*S-1-5-4",
+        "*S-1-5-6",
+        "*S-1-5-3",
+        "*S-1-1-0",
+        "*S-1-5-11",
+        "*S-1-5-32-545",
+        "*S-1-5-32-546",
+        "*S-1-5-2",
+        "*S-1-5-7",
+        "*S-1-5-113",
+        "S-1-5-21-1-2-3-513",
+        "S-1-5-21-1-2-3-514",
+    ],
+)
+def test_icacls_broad_sid_write_is_not_owner_only(sid: str) -> None:
+    text = _icacls(r"DESKTOP-A\svc:(F)", f"{sid}:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+@pytest.mark.parametrize(
+    "sid", ["*S-1-5-32-544", "*S-1-5-18", "*S-1-5-64", "*S-1-5-114", "S-1-5-21-1-2-3-5130"]
+)
+def test_icacls_trusted_or_unrelated_sid_is_not_matched_as_broad(sid: str) -> None:
+    # A SID is matched WHOLE, never as a substring: "S-1-5-3" (BATCH) is a leading substring of
+    # "S-1-5-32-544" (BUILTIN\Administrators, deliberately trusted) and "S-1-5-6" (SERVICE) of
+    # "S-1-5-64", and "S-1-5-11" (Authenticated Users) of "S-1-5-114" (local administrators). A
+    # substring set would refuse the administrators ACE that ships on every anchor. The last case
+    # checks a domain RID is matched whole too: RID 5130 is not Domain Users (513).
+    text = _icacls(r"DESKTOP-A\svc:(F)", f"{sid}:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+
+
+def test_icacls_localized_broad_name_is_indeterminate_not_owner_only() -> None:
+    # icacls resolves SIDs to LOCALIZED names by default, so the name half of the broad-principal
+    # set cannot be complete across locales: a German "Jeder" (Everyone) is not recognised by name.
+    # It is a BARE name, though, and the owner always prints qualified (COMPUTER\user), so a bare
+    # name the parser does not know holding a write right is an unrecognised group: "cannot tell",
+    # never "owner-only". The SID form of the same principal is recognised and settles it.
+    assert owner_only_from_icacls(_icacls(r"Jeder:(F)"), anchor_path=_PATH) is None
+    assert owner_only_from_icacls(_icacls(r"*S-1-1-0:(F)"), anchor_path=_PATH) is False
+
+
+def test_icacls_unknown_bare_name_without_write_stays_owner_only() -> None:
+    # The control for the test above: the rule fires on a WRITE right, not on the bare name alone.
+    text = _icacls(r"DESKTOP-A\svc:(F)", r"Jeder:(RX)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+
+
+def test_icacls_bare_unresolved_sid_is_not_an_unknown_bare_name() -> None:
+    # Measured on Windows 11: plain icacls prints an unresolvable SID with no leading "*". It is a
+    # SID, not a bare display name, so the bare-name rule must not fire on it; only the well-known
+    # broad SIDs flag, as before.
+    text = _icacls(r"DESKTOP-A\svc:(F)", r"S-1-5-21-1-2-3-1001:(I)(M)", r"S-1-15-3-1-2:(I)(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+    assert owner_only_from_icacls(_icacls(r"S-1-1-0:(F)"), anchor_path=_PATH) is False
+
+
+def test_icacls_owner_rights_is_the_owner_not_an_unknown_bare_name() -> None:
+    # Measured on Windows 11: a pytest temp file lists SYSTEM, Administrators and OWNER RIGHTS only.
+    # OWNER RIGHTS (S-1-3-4) is the owner itself, so it must not make the read indeterminate.
+    text = _icacls(
+        r"NT AUTHORITY\SYSTEM:(I)(F)", r"BUILTIN\Administrators:(I)(F)", r"OWNER RIGHTS:(I)(F)"
+    )
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+
+
+def test_icacls_unknown_bare_name_does_not_outvote_a_recognised_broad_write() -> None:
+    # A recognised broad write is a determined False, whatever else the DACL holds.
+    text = _icacls(r"Jeder:(F)", r"BUILTIN\Users:(M)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+# The six raw inputs the BACKLOG #1142 slice-1 verification probed against the unfixed parser, which
+# returned True for the first four. Passed raw, with no path line, exactly as probed.
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", None),
+        ("garbage", None),
+        ("Jeder:(F)", None),
+        (r"NT AUTHORITY\INTERACTIVE:(I)(M)", False),
+        ("Everyone:(F)", False),
+        (r"BUILTIN\Users:(M)", False),
+    ],
+)
+def test_icacls_slice1_probes_never_read_as_owner_only(text: str, expected: bool | None) -> None:
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is expected
+
+
+@_windows_only
+def test_dacl_read_of_a_non_ascii_path_does_not_crash(tmp_path: Path) -> None:
+    # icacls writes the OEM code page. Decoded as ANSI, a u-umlaut came back as byte 0x81, stdout
+    # arrived as None, and the parse raised AttributeError, which no caller catches: a startup crash
+    # rather than a degrade. The echoed path must also decode to the path passed, so it is stripped
+    # and the verdict matches the same file under an ASCII name.
+    d = tmp_path / "Schlüssel"
+    d.mkdir()
+    p = _pem(d, b"x")
+    ascii_twin = _pem(tmp_path, b"x")
+    assert dacl_is_owner_only(p) == dacl_is_owner_only(ascii_twin)
+
+
+# --- line 1: the path echo icacls prints is not always the path we passed (BACKLOG #1142) --------
+# icacls echoes the path in the OEM code page. A character outside it comes back as "?" (two for a
+# character outside the BMP) or as a best-fit look-alike, so the exact path cannot be stripped from
+# line 1. Measured on Windows 11 (OEM 437): "icprobe_<CJK x2>" echoed "icprobe_??", an emoji "??",
+# and "<l-stroke><A-macron>" "lA". Continuation lines are padded to the ECHOED width.
+
+_CJK_PATH = "C:\\Users\\svc\\\u65e5\u672c\\anchor.pem"
+_CJK_ECHO = "C:\\Users\\svc\\??\\anchor.pem"
+
+
+def _icacls_echo(echo: str, *aces: str) -> str:
+    pad = " " * (len(echo) + 1)
+    body = "\n".join([f"{echo} {aces[0]}", *(pad + a for a in aces[1:])])
+    return body + "\n\nSuccessfully processed 1 files; Failed processing 0 files\n"
+
+
+@pytest.mark.parametrize(
+    "principal",
+    ["Everyone", r"NT AUTHORITY\INTERACTIVE", "*S-1-1-0", "S-1-1-0", r"BUILTIN\Users"],
+)
+def test_icacls_line1_broad_write_behind_an_oem_path_echo_is_not_owner_only(
+    principal: str,
+) -> None:
+    # The regression this slice's first cut introduced: the echo did not match the path passed, so
+    # nothing was stripped, the principal read as "<path> everyone", and whole-token matching missed
+    # it. The head before this fix answered True for Everyone; the base 8d08d420c answered False.
+    text = _icacls_echo(_CJK_ECHO, f"{principal}:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_CJK_PATH) is False
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        "Everyone",
+        r"NT AUTHORITY\INTERACTIVE",
+        "*S-1-1-0",
+        "S-1-5-21-1-2-3-513",
+        r"BUILTIN\Users",
+        r"CORP\Domain Users",
+    ],
+)
+def test_icacls_line1_broad_write_behind_an_echo_that_matches_nothing_is_not_owner_only(
+    principal: str,
+) -> None:
+    # Where not even the lenient pattern matches, nobody knows where the principal starts. A broad
+    # principal at the END of line 1 must still be seen: the principal always comes last.
+    text = _icacls_echo(r"C:\Other\place.pem", f"{principal}:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is False
+
+
+def test_icacls_unmatched_echo_does_not_read_a_multi_word_group_by_its_last_word() -> None:
+    # The fallback takes a group's leaf after the last backslash, never after the last space, so
+    # "Power Users" is not read as "Users". Its write is still unattributable, so None.
+    text = _icacls_echo(r"C:\Other\place.pem", r"CORP\Power Users:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is None
+
+
+def test_icacls_lenient_echo_match_must_agree_with_the_continuation_indent() -> None:
+    # An echo NARROWER than the path lets the lenient pattern run past it into a principal that has
+    # a space in it: five wildcards eat "?? NT", and "AUTHORITY\INTERACTIVE" is a name no set knows.
+    # The continuation indent is where icacls says the principal starts, so a disagreement is caught.
+    path = "C:\\x\\" + "\u65e5" * 5
+    echo = "C:\\x\\??"
+    text = _icacls_echo(echo, r"NT AUTHORITY\INTERACTIVE:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is False
+    # The same line with no continuation line to check against: the end-of-line check catches it.
+    single = f"{echo} NT AUTHORITY\\INTERACTIVE:(M)\n"
+    assert owner_only_from_icacls(single, anchor_path=path) is False
+    # A non-broad principal behind a disagreeing indent is unattributable, never owner-only. Without
+    # the indent check this read "AUTHORITY\SYSTEM", a qualified name, and answered True.
+    text = _icacls_echo(echo, r"NT AUTHORITY\SYSTEM:(F)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is None
+
+
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029", "\x85", "\x1c"])
+def test_icacls_path_holding_a_unicode_line_separator_stays_on_line_1(sep: str) -> None:
+    # str.splitlines() splits on these as well as on newline, so a path holding one split line 1
+    # in two and read its ACE as a continuation line with the path still on its front.
+    path = f"C:\\x\\a{sep}b\\anchor.pem"
+    text = _icacls_echo(path, "Everyone:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is False
+
+
+def test_icacls_unmatched_echo_of_a_long_non_bmp_path_does_not_backtrack() -> None:
+    # A one-or-two quantifier per character outside the BMP backtracked through 2^n splits on a
+    # failed match: measured 2 s at 28 emoji. The pattern is fixed-width now, so this is instant;
+    # the suite's 60 s per-test timeout is the guard.
+    path = "C:\\x\\" + "\U0001f600" * 40 + "\\a.pem"
+    text = _icacls_echo("C:\\x\\" + "?" * 80 + "\\b.pem", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is None
+
+
+@pytest.mark.parametrize(
+    ("path", "echo"),
+    [
+        (_CJK_PATH, _CJK_ECHO),
+        ("C:\\Users\\svc\\\U0001f600\\anchor.pem", "C:\\Users\\svc\\??\\anchor.pem"),
+        ("C:\\Users\\svc\\\u0142\u0100\\anchor.pem", "C:\\Users\\svc\\lA\\anchor.pem"),
+    ],
+)
+def test_icacls_line1_owner_behind_an_oem_echo_is_still_read(path: str, echo: str) -> None:
+    # The control for the test above: the echo is matched leniently, so the owner's line-1 ACE is
+    # still attributed and a clean DACL is a determined True, not an indeterminate one.
+    text = _icacls_echo(echo, r"DESKTOP-A\svc:(F)", r"NT AUTHORITY\SYSTEM:(I)(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is True
+    # And the lenient match is real: a broad write on line 1 is still seen through it.
+    text = _icacls_echo(echo, r"CORP\Domain Users:(M)", r"DESKTOP-A\svc:(F)")
+    assert owner_only_from_icacls(text, anchor_path=path) is False
+
+
+def test_icacls_line1_write_that_cannot_be_attributed_is_indeterminate() -> None:
+    # An echo that matches nothing leaves line 1's principal unknown. A write grant there must never
+    # read as owner-only, even when the principal it ends in is not a broad one.
+    text = _icacls_echo(r"C:\Other\place.pem", r"DESKTOP-A\svc:(F)", r"NT AUTHORITY\SYSTEM:(I)(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is None
+    # A line-1 ACE with no write right cannot grant write, whoever holds it.
+    text = _icacls_echo(r"C:\Other\place.pem", r"DESKTOP-A\svc:(RX)", r"NT AUTHORITY\SYSTEM:(I)(F)")
+    assert owner_only_from_icacls(text, anchor_path=_PATH) is True
+
+
+def test_icacls_path_is_stripped_from_line_1_only() -> None:
+    # A short relative path must not cut the front off a principal on a later line: "NT" stripped
+    # from "NT AUTHORITY\INTERACTIVE" left "AUTHORITY\INTERACTIVE", which no set knows.
+    text = _icacls_echo("NT", r"DESKTOP-A\svc:(F)", r"NT AUTHORITY\INTERACTIVE:(I)(M)")
+    assert owner_only_from_icacls(text, anchor_path="NT") is False
+
+
+@_windows_only
+def test_dacl_read_sees_a_line1_broad_write_on_a_path_outside_the_oem_code_page(
+    tmp_path: Path,
+) -> None:
+    # The end-to-end form of the tests above, on a real icacls read. An explicit ACE lists before
+    # the inherited ones, so the Everyone grant lands on line 1, behind a path echo of "??" wherever
+    # the OEM code page lacks these characters.
+    import subprocess
+
+    name = "\u65e5\u672c"
+    try:
+        name.encode("oem")
+    except UnicodeEncodeError:
+        pass
+    else:
+        pytest.skip("this host's OEM code page holds the path, so icacls echoes it verbatim")
+    d = tmp_path / name
+    d.mkdir()
+    p = _pem(d, b"x")
+    subprocess.run(["icacls", str(p), "/grant", "*S-1-1-0:(M)"], check=True, capture_output=True)
+    listing = subprocess.run(
+        ["icacls", str(p)], capture_output=True, encoding="oem", errors="replace", check=True
+    ).stdout
+    # Where icacls prints the English name, the grant must be seen: False. A host that localizes
+    # Everyone may answer None (an unrecognised bare name), but never True.
+    if " Everyone:(M)" in listing.split("\n", 1)[0]:
+        assert dacl_is_owner_only(p) is False
+    else:
+        assert dacl_is_owner_only(p) is not True
+
+
 @_posix_only
 def test_posix_mode_owner_only(tmp_path: Path) -> None:
     p = _pem(tmp_path, b"x")
@@ -261,8 +630,12 @@ async def test_preflight_dormant_writes_no_audit(store: MessageStore) -> None:
 
 
 async def test_preflight_baseline_then_unchanged_then_changed(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The row counts below are about fingerprints. Pin the ACL read so a host whose temp ACL reads
+    # as indeterminate (an extra acl_indeterminate row) cannot change them.
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)  # the path arm adds rows the same way
     p = _pem(tmp_path, b"v1")
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
 
@@ -286,8 +659,10 @@ async def test_preflight_baseline_then_unchanged_then_changed(
 
 
 async def test_preflight_pin_mismatch_refuses_at_reload_and_audits(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)  # same reason as the test above
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     p = _pem(tmp_path, b"orig")
     spec = AnchorSpec(
         "oidc", "[auth].oidc_tls_ca_cert_file", str(p), hashlib.sha256(b"orig").hexdigest()
@@ -326,6 +701,37 @@ async def test_preflight_acl_insecure_refuses_at_enforce_after_auditing(
         await run_anchor_preflight([spec], store, enforcing=True)
     # The violation is durably audited even though start is refused.
     assert "acl_insecure" in {r["event"] for r in await _rows(store, "ad")}
+
+
+async def test_preflight_acl_indeterminate_is_audited_and_does_not_refuse(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An undeterminable ACL read writes its own audit row (BACKLOG #1142). Before this it wrote
+    none at all, so the runbook's "alert on auth.trust_anchor" instruction was blind on exactly the
+    branch that cannot vouch for the anchor. It is VISIBLE, not fatal -- refusing here is a later,
+    separate step that must not ship before the verified bytes are bound to the loaded bytes."""
+    p = _pem(tmp_path, b"body")
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
+    await run_anchor_preflight([spec], store, enforcing=True)  # enforce: still no raise
+    rows = await _rows(store, "api_client")
+    events = {r["event"] for r in rows}
+    assert "acl_indeterminate" in events and "observed" in events
+    row = next(r for r in rows if r["event"] == "acl_indeterminate")
+    assert row["fingerprint"] == hashlib.sha256(b"body").hexdigest()
+    assert row["enforcing"] is True
+
+
+async def test_preflight_acl_determined_ok_writes_no_indeterminate_row(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control for the test above: a determined, owner-only read must stay silent.
+    p = _pem(tmp_path, b"body")
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
+    await run_anchor_preflight([spec], store, enforcing=True)
+    assert {r["event"] for r in await _rows(store, "api_client")} == {"observed"}
 
 
 # --- construction-site enforcement in build_api_ssl_context --------------------------------------

@@ -17,12 +17,11 @@ Your brief comes from a Manager. Usually you are a subagent inside its process, 
 report is the channel back -- put the question there. Either way the ANSWER arrives as the next
 Builder's brief, never as a reply to you.
 
-**Only a Manager's SUBAGENT leaves the PR to the Manager** (decided 2026-09-23 under the owner's
-delegation). If you are in your own session -- a chip started you, or the Manager spawned you --
-your report reaches nobody. So open your own one-item PR, even though a Manager wrote your brief:
-your report and head SHA in the body, your QA line as a comment, the `qa` label, and the handover to
-the Lander. Source of record: korus `roles/MANAGER.md`, *A Builder in its own session opens its own
-pull request*.
+**Only a Manager's SUBAGENT leaves the PR to the Manager** (owner ruling 2026-09-24). If you are in
+your own session -- a chip started you, or the Manager spawned you -- your report reaches nobody. So
+open your own one-item PR, even though a Manager wrote your brief: your report and head SHA in the
+body, your QA line as a comment, the `qa` label, and the handover to the Lander. Source of record:
+korus `roles/MANAGER.md`, *A Builder in its own session opens its own pull request*.
 
 ## What it must not do
 
@@ -60,17 +59,21 @@ because one arrived.
 ## On arrival
 
 1. Read `roles/COMMON.md`, then `roles/BUILDER.md`, from korus at `origin/main`.
-2. **Declare your seat.** You CAN, through the Bash tool -- measured 2026-09-02, a headless `-p`
+2. Query the fleet wiki for your brief's subject before you act. Cite any note you act on by id;
+   after, write a lesson, decision, gotcha or correction. A miss never blocks. Run korus's wiki
+   scripts by path with the stores CLAUDE.md section 5 names: the defaults fail here. How:
+   korus `roles/WIKI.md`.
+3. **Declare your seat.** You CAN, through the Bash tool -- measured 2026-09-02, a headless `-p`
    Builder did it. This card said the opposite until 2026-09-18, and that rule was self-confirming:
    a Builder told it cannot declare does not try, renders undeclared, and confirms the rule. Quote
    the Windows path; unquoted, the shell eats the backslashes.
    `pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat builder -Goal "<one line>"`
-3. Work in your own worktree. Two sessions in one tree clobber each other, and the primary is
+4. Work in your own worktree. Two sessions in one tree clobber each other, and the primary is
    blocked to you: `pwsh -NoProfile -File scripts/worktree/new.ps1 -Name <short-name>`.
-4. Check the merge base BEFORE reading a diff or pushing:
+5. Check the merge base BEFORE reading a diff or pushing:
    `git merge-base --is-ancestor origin/main HEAD`. Exit 0 means you contain the trunk tip.
-5. Check who else is in your files: `pwsh -NoProfile -File scripts/coord/overlap.ps1`.
-6. If you add a file under `tests/`, classify it in `tests/tooling_manifest.txt` in the same commit,
+6. Check who else is in your files: `pwsh -NoProfile -File scripts/coord/overlap.ps1`.
+7. If you add a file under `tests/`, classify it in `tests/tooling_manifest.txt` in the same commit,
    or the PR can never go green.
 
 ## Before you claim it works

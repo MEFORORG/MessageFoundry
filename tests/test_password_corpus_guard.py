@@ -25,9 +25,10 @@ import pytest
 from messagefoundry.auth import PasswordPolicy
 from messagefoundry.auth import policy as policy_module
 from messagefoundry.auth.policy import ASVS_6_2_4_MIN_CORPUS_ENTRIES, BreachCorpusUnavailable
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_admin
 
 #: A password the stand-in corpora below declare leaked. Holds no CONTEXT_WORDS entry and clears the
 #: default length, so the breach clause is the only one it can trip -- which is what lets an arm read
@@ -67,7 +68,8 @@ async def empty_store() -> AsyncIterator[MessageStore]:
     """An in-memory store with no users, so `initialize` takes the first-run branch (BACKLOG #1447).
 
     `_ensure_bootstrap_admin` returns early on `count_users() > 0`, so an empty store is a
-    precondition of every arm below and not an incidental detail of the fixture.
+    precondition of every arm below that calls `initialize()` on it, and not an incidental detail of
+    the fixture. The arms that use `create_admin` write their user first, so they skip that branch.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -145,6 +147,47 @@ def test_startup_reports_an_unusable_bundled_corpus_as_an_error(
         "an unusable bundled corpus logged nothing at startup"
     )
     assert "REFUSED" in caplog.records[0].getMessage()
+
+
+async def test_the_startup_error_names_the_rotation_a_first_serve_cannot_finish(
+    bundled_corpus: Callable[[Sequence[str] | None], None],
+    empty_store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #1886: the ERROR has to say what this boot hands the operator, not only what it refuses.
+
+    #1447 let a first run on an unusable corpus mint its bootstrap admin, born must-change, whose
+    rotation is screened by the corpus just reported unusable. The message and that behaviour were
+    changed in different pull requests, so this arm pins them together on ONE service. Drop the
+    sentence and the wording asserts fail. Change the behaviour -- the mint starts raising again, or
+    the rotation stops being refused -- and the behaviour asserts fail, which is the prompt to reword.
+    Why the wording is conditional is stated on `_error_if_bundled_corpus_unusable`.
+
+    SCOPE: this drives `AuthService` directly. It does not reach the must-change gate in
+    `api/security.py` or the `serve` lifespan in `api/app.py`, so a change there cannot fail it.
+    """
+    bundled_corpus([])
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+        service = AuthService(empty_store, AuthSettings())
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, errors
+    message = errors[0]
+    for phrase in (
+        "`serve` against a store with no users still creates the bootstrap admin",
+        "cannot finish that change",
+        "`provision-admin` fails",
+        "deadline in bootstrap-admin.txt",
+        "password_check_breached = false and restart",
+    ):
+        assert phrase in message, f"{phrase!r} missing from the startup ERROR: {message}"
+
+    boot = await service.initialize()
+    assert boot is not None
+    out = await service.login(BOOTSTRAP_USERNAME, boot.password)
+    assert out.ok and out.identity is not None
+    assert out.identity.must_change_password
+    with pytest.raises(BreachCorpusUnavailable):
+        await service.change_password(out.identity, "a-human-chosen-replacement-pass")
 
 
 def test_startup_is_silent_when_screening_is_turned_off(
@@ -261,14 +304,19 @@ async def test_a_user_password_change_still_refuses_while_the_same_service_mints
     """The tightest pairing available: ONE service, ONE unusable corpus, two paths through it.
 
     Environment is held constant to the point of being the same object, so nothing but the per-call
-    argument can explain the difference. The bootstrap mints; the human's replacement password is
-    refused. A blanket suppression makes the `raises` block fail.
+    argument can explain the difference. The generator mints a temporary credential through an admin
+    reset; the human's replacement password is refused. A blanket suppression makes the `raises` block
+    fail.
+
+    The mint leg used to be the first-run bootstrap account. ADR 0183 Amendment A retires that
+    account (BACKLOG #1136), so the leg now goes through `admin_reset_password`, the generator's other
+    caller. The pairing is the same: one generated credential, one human-chosen one.
     """
     bundled_corpus([])
     service = AuthService(empty_store, AuthSettings())
-    boot = await service.initialize()
-    assert boot is not None
-    out = await service.login("admin", boot.password)
+    admin = await create_admin(service)
+    issued = await service.admin_reset_password(admin.user_id, actor="test")
+    out = await service.login(admin.username, issued.password)
     assert out.ok and out.identity is not None
     with pytest.raises(BreachCorpusUnavailable):
         await service.change_password(out.identity, "a-human-chosen-replacement-pass")
@@ -279,7 +327,8 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
 ) -> None:
     """`admin_reset_password` reaches the same generator, so the same suppression covers it. Worth its
     own arm because it is a SECOND caller of `_generate_policy_password`: a fix applied at the
-    bootstrap call rather than inside the generator would pass every arm above and fail this one.
+    bootstrap call rather than inside the generator would fail this one. The pairing arm above now
+    mints through the same reset, so the two overlap; this arm keeps the length check.
 
     SCOPE, because the assertion is weaker than the test name suggests. This proves only that
     GENERATING the temporary credential no longer raises. It does NOT prove the reset is usable end to
@@ -291,10 +340,8 @@ async def test_an_admin_reset_issues_a_credential_on_an_unusable_corpus(
     """
     bundled_corpus([])
     service = AuthService(empty_store, AuthSettings())
-    assert await service.initialize() is not None
-    admin = await empty_store.get_user_by_username("admin")
-    assert admin is not None
-    issued = await service.admin_reset_password(admin.id, actor="admin")
+    admin = await create_admin(service)
+    issued = await service.admin_reset_password(admin.user_id, actor="test")
     assert issued.password and len(issued.password) >= 20
 
 

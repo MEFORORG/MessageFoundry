@@ -26,6 +26,7 @@ another action, such as the ``user.updated`` an administrator's email change or 
 
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -96,3 +97,19 @@ class SecurityNotifier(Protocol):
     must not raise into the auth path (the caller still guards it)."""
 
     async def notify(self, event: SecurityEvent) -> None: ...
+
+
+def deadline_utc(ts: float) -> str | None:
+    """A deadline instant as a UTC ISO-8601 stamp, for text a client shows to a person.
+
+    Lives here, in the dependency-free ``auth`` contract, so the ``api`` surfaces and the
+    ``pipeline`` notice body (BACKLOG #1141) state one string from one function.
+    ``api.security`` re-exports it.
+
+    ``None`` when the instant cannot be rendered. The expiry setting has no upper bound, and
+    ``fromtimestamp`` raises past year 9999, or past year 3000 on Windows. A deadline that far out
+    is not worth a 500 on the refusal that states it, so the caller drops the sentence instead."""
+    try:
+        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None

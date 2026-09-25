@@ -34,8 +34,12 @@ because one arrived.
 ## On arrival
 
 1. Read `roles/COMMON.md`, then `roles/STEWARD.md`, from korus at `origin/main`.
-2. Read usage from the instrument, not from a cached number.
-3. Report the account and the reading together. A number without its instrument is not a
+2. Query the fleet wiki for your subject before you act. Cite any note you act on by id; after,
+   write a lesson, decision, gotcha or correction. A miss never blocks. Run korus's wiki scripts by
+   path with the stores CLAUDE.md section 5 names: the defaults fail here. How:
+   korus `roles/WIKI.md`.
+3. Read usage from the instrument, not from a cached number.
+4. Report the account and the reading together. A number without its instrument is not a
    measurement.
 
 ## Before you claim it works
