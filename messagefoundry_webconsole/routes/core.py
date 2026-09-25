@@ -400,10 +400,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Parse the urlencoded login form with stdlib — the engine has no python-multipart dep, so
         # Form()/request.form() would fail; a same-origin login POST is always urlencoded here.
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
-        # L5b (ADR 0068 §8): browser AD-password login rides the SAME auth.login seam as the
-        # JSON surface — allow-listed provider values only; absent stays LOCAL (regression-
-        # pinned). ONE session is minted per form POST, so the AD role-resync/revocation side
-        # effect fires once at login, never per navigation.
+        # L5b (ADR 0068 §8): the form rides the SAME auth.login seam as the JSON surface, with
+        # allow-listed provider values only; absent stays LOCAL (regression-pinned). The browser
+        # AD-password sign-in is RETIRED (BACKLOG #1137): the login page renders no provider
+        # selector, and "ad" stays in the allow-list only so the ENGINE (_dispatch_login) is the
+        # single point that refuses and audits it. Directory accounts sign in by Windows SSO or
+        # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
+        # (and the JSON /me/reauth).
         provider_value = form.get("provider", "local")
         if provider_value not in ("local", "ad"):
             return RedirectResponse("/ui/login?e=bad", status_code=303)
