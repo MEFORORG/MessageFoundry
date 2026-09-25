@@ -21,6 +21,8 @@ thundering-herd polluting the steady-state measurement; stop is cooperative + gr
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
 from collections.abc import Sequence
 
 from harness.load.connscale.intake_audit import IntakeLedger
@@ -83,6 +85,11 @@ class ConnScaleDriver:
         # The send times of the sends a close left unconfirmed, collected only while a caller is
         # watching (the reload probe's window, BACKLOG #1292). None when nobody is.
         self._strand_log: list[int] | None = None
+        # The first-reply watch (BACKLOG #1292): when it started, when the first reply after that
+        # came, in seconds from the start, and an event set on that reply.
+        self._reply_watch_from = 0.0
+        self._first_reply_s: float | None = None
+        self._first_reply = asyncio.Event()
 
     @property
     def count(self) -> int:
@@ -170,6 +177,45 @@ class ConnScaleDriver:
         log = self._strand_log if self._strand_log is not None else []
         self._strand_log = None
         return log
+
+    @property
+    def drops(self) -> int:
+        """How many sockets the peer has closed or reset across all N connections, never counting
+        one this side closed on stop. Read it twice to count the closes between two moments."""
+        return sum(conn.drops for conn in self._conns)
+
+    @property
+    def queued(self) -> int:
+        """Sends handed to a connection and not yet written, across all N."""
+        return sum(conn.queued for conn in self._conns)
+
+    def watch_first_reply(self) -> None:
+        """Start timing the first reply (ACK or NAK) on any connection from now."""
+        self._reply_watch_from = time.perf_counter()
+        self._first_reply_s = None
+        self._first_reply = asyncio.Event()
+        for conn in self._conns:
+            conn.set_on_reply(self._on_reply)
+
+    def _on_reply(self) -> None:
+        if self._first_reply_s is None:
+            self._first_reply_s = time.perf_counter() - self._reply_watch_from
+            self._first_reply.set()
+        self.end_reply_watch()  # one reading is all the watch wants
+
+    def end_reply_watch(self) -> None:
+        """Stop the first-reply watch. Its reading, if any, is kept."""
+        for conn in self._conns:
+            conn.set_on_reply(None)
+
+    async def await_first_reply(self, timeout: float) -> float | None:
+        """Wait up to ``timeout`` for the watch's first reply. Return its time in seconds from
+        :meth:`watch_first_reply`, or None when none came in time. A reply already seen returns
+        at once, whatever the timeout."""
+        if not self._first_reply.is_set() and timeout > 0.0:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._first_reply.wait(), timeout)
+        return self._first_reply_s
 
     def generations(self) -> list[int]:
         """Each connection's open count, in port order. Snapshot it before an event that closes the

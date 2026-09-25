@@ -225,6 +225,13 @@ class ConnScaleRecord:
     reload_stranded: int | None = None
     reload_not_reconnected: int | None = None
     post_reload_extra_hold_s: float | None = None
+    # Seconds from every connection being back after the reload to the first reply the sender read,
+    # and how many sockets the engine closed from then to the end of the step's wait for that reply.
+    # A slow engine shows a large `post_reload_reply_s`; a silent one shows None beside a post-reload
+    # send; a close that took the replies shows `post_reload_drops` above 0. Both are None when no
+    # reload probe ran, and `post_reload_reply_s` is also None when no reply came inside the wait.
+    post_reload_reply_s: float | None = None
+    post_reload_drops: int | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -316,6 +323,8 @@ class ConnScaleRecord:
                 "stranded": self.reload_stranded,
                 "not_reconnected": self.reload_not_reconnected,
                 "extra_hold_s": _round_or_none(self.post_reload_extra_hold_s, 3),
+                "reply_s": _round_or_none(self.post_reload_reply_s, 3),
+                "drops_after": self.post_reload_drops,
             },
             "wall6_ack_ms": {
                 "p50": round(self.ack_p50_ms, 3),
@@ -653,6 +662,20 @@ DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
         lambda r: r.reload_stranded,
         "sends left unconfirmed when the reload probe closed every connection -- a slow reload "
         "strands most of a short step, which reads as intake loss unless it is counted here",
+    ),
+    DiagnosticField(
+        "post_reload_reply_s",
+        lambda r: r.post_reload_reply_s,
+        "slow engine vs silent engine after the reload: seconds from every connection being back "
+        "to the first reply; a dash means no reply inside the wait (one can still come in the stop "
+        "grace) or no reload probe",
+    ),
+    DiagnosticField(
+        "post_reload_drops",
+        lambda r: r.post_reload_drops,
+        "a second close vs no answer: sockets the engine closed from every connection being back "
+        "to the end of that wait; above 0 on a no-reply step means a close may have taken the "
+        "replies, 0 means none was closed",
     ),
     DiagnosticField(
         "fd_probe_ticks",

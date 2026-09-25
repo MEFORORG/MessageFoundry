@@ -124,6 +124,25 @@ _RELOAD_LOOKBACK_FLOOR_S = 0.25
 #: a hold behind it and this adds nothing. A slow one used to leave none: the step then had no send
 #: the reload did not touch. At the smoke's 1.5 s hold this is 0.375 s, 4 to 9 sends by lane.
 _POST_RELOAD_HOLD_FRACTION = 0.25
+#: How long a step waits, after its samplers stop and before the stop grace, for the FIRST reply read
+#: after every connection came back from the reload probe (BACKLOG #1292). The stop grace of
+#: `_STOP_GRACE` follows it, so an engine gets this plus 5 s to answer once before the step says it
+#: stopped answering. See `_await_post_reload_reply`.
+#:
+#: Why it exists. Merge-group run 36166728739 (windows-2025, 2026-09-25) failed N=24 on "9 send(s)
+#: after the reload probe drew no reply". Its post-mortem audit found a stored row for every one of
+#: the 45 sends, the 33 unconfirmed ones included: the engine READ and COMMITTED every post-reload
+#: frame, and no reply reached the sender inside the 5 s stop grace. A frame on a socket nobody
+#: served leaves no row, so the sends were not on a dead socket. What the 5 s could not tell apart
+#: is an engine that answered late on a loaded runner and one that never answered. This wait gives
+#: the first answer room, and `_ReloadAccount.reply_s` records when it came, so a slow engine is
+#: visible in the record rather than read as a dead one.
+#:
+#: It is spent in full only when no reply comes, which fails the step. 10 s keeps the smoke's four
+#: steps inside its 120 s module timeout even if every one of them waits in full: the fixture's
+#: setup took 40.8 s on that runner, and 4 x 10 s more is 80.8 s. That margin does NOT cover a step
+#: that also spends its reconnect wait, so the wait is skipped where a connection never came back.
+_POST_RELOAD_REPLY_WAIT_S = 10.0
 _HEALTH_TIMEOUT = 30.0
 # One spelling, because both audit moments report it and they must not drift into disagreeing about
 # why nothing ran -- a reader comparing the two moments of a disabled step reads the difference as
@@ -528,6 +547,12 @@ async def _run_one_step(
         # with it: how many of those readings the FLOOR had to supply past the hold's end.
         in_hold_samples = len(samples)
         in_hold_floor_ticks = sample_task.result()
+        if reload_account is not None:
+            # After the samplers, so the wait is not in the rate window; before the stop, so a slow
+            # first reply after the reload is waited for rather than read as none (BACKLOG #1292).
+            reload_account = await _await_post_reload_reply(
+                driver, metrics.counters, reload_account
+            )
         # Stop the driver FIRST (flush every queued send + grace the in-flight ACKs) BEFORE draining,
         # so all offered messages have reached the engine's ingress stage before we wait for the
         # pipeline to empty. Draining first would let a message still in the driver's send queue arrive
@@ -1169,6 +1194,19 @@ class _ReloadAccount:
     aged: int = 0  # sends the close stranded that were made BEFORE the window; not excused
     lookback_s: float = _RELOAD_LOOKBACK_FLOOR_S  # how far before the request the window opened
     reconnect_timeout_s: float = _RECONNECT_TIMEOUT  # the reconnect wait this step allowed
+    # Bookkeeping for `_await_post_reload_reply`: the driver's drop count when every connection
+    # was back, so the closes after that moment can be counted.
+    drops_at_back: int = 0
+    # Filled in by `_await_post_reload_reply`, which runs once the samplers have stopped. All three
+    # stay None on an account it did not see, so nobody reads an unmeasured 0 as a reading.
+    # `reply_s`: seconds from every connection being back to the first reply (ACK or NAK) the
+    # driver read after that, on any connection. Every socket then is one opened after the reload,
+    # so it is the engine answering after the reload, which is what `replies_after` asks too. None
+    # when none came inside the wait; the stop grace can still bring one after it.
+    reply_s: float | None = None
+    reply_wait_s: float | None = None  # how long the probe allowed for that first reply
+    # Sockets the engine closed or reset from every connection being back to the end of the wait.
+    drops_after: int | None = None
 
     def sent_after(self, final: Counters) -> int:
         return final.sent - self.after.sent
@@ -1194,11 +1232,14 @@ async def _reload_mid_hold(
     1. Snapshot each connection's open count, start watching strands, then fire the reload.
     2. Wait until every connection is serving a NEW socket, for `_reconnect_timeout`. Of the sends
        a close left unconfirmed in between, those written after the window opened are the ones the
-       reload stranded (see `_ReloadAccount`).
+       reload stranded (see `_ReloadAccount`). Start timing the first reply from that moment.
     3. Let the hold finish. Then offer more if the hold left less than `_POST_RELOAD_HOLD_FRACTION`
        of itself after the connections came back, or if it offered no send at all after that
        point. Without this a slow reload leaves the step with no send it did not strand, and
        nothing to judge intake by. `run_hold` emits its first send at once, so any extra offers one.
+
+    The caller then stops its samplers and hands the account to `_await_post_reload_reply`, which
+    waits for that first reply. Waiting here instead would put the wait inside the rate window.
 
     The wait runs whenever the reload may have swapped, which includes a reload that returned no
     reading: the client gives up after 5 s while the engine is still restarting its listeners, and
@@ -1229,12 +1270,16 @@ async def _reload_mid_hold(
             strand_sends = driver.end_strand_watch()
         stranded = sum(1 for ns in strand_sends if ns >= window_opens_ns)
         aged = len(strand_sends) - stranded
+        # No await between the snapshot and the watch, so no reply can fall between the two.
         after = counters.snapshot()
+        driver.watch_first_reply()
+        drops_at_back = driver.drops
         back_at = loop.time()
         emitted_at_back = driver.emitted
         await hold_task
     except BaseException:
         hold_task.cancel()
+        driver.end_reply_watch()
         raise
     offered_after = max(0.0, hold_started + hold_seconds - back_at)
     floor = hold_seconds * _POST_RELOAD_HOLD_FRACTION
@@ -1243,7 +1288,11 @@ async def _reload_mid_hold(
         # Enough TIME was left, but at a low rate no token fell due in it. Offer the floor anyway.
         extra = floor
     if extra > 0.0:
-        await run_hold(extra)
+        try:
+            await run_hold(extra)
+        except BaseException:
+            driver.end_reply_watch()
+            raise
     return _ReloadAccount(
         seconds,
         stranded,
@@ -1254,6 +1303,42 @@ async def _reload_mid_hold(
         aged=aged,
         lookback_s=lookback,
         reconnect_timeout_s=timeout,
+        drops_at_back=drops_at_back,
+    )
+
+
+async def _await_post_reload_reply(
+    driver: ConnScaleDriver,
+    counters: Counters,
+    account: _ReloadAccount,
+    *,
+    timeout: float | None = None,
+) -> _ReloadAccount:
+    """Wait for the first reply after the reload, and count the engine's closes up to then.
+
+    Run it after the samplers stop and before ``driver.stop``, so the wait is neither inside the
+    rate window nor cut short by the stop. It waits up to ``timeout`` (default
+    `_POST_RELOAD_REPLY_WAIT_S`), and returns at once when a reply has already come, which is the
+    healthy case. It excuses nothing: it only stops the step judging "no reply" before a slow
+    engine could answer.
+
+    It does not wait where waiting cannot change the verdict: a connection never came back, so the
+    step fails on that; or nothing was written or queued after the reload, so there is nothing to
+    answer and the "nothing was sent" guard judges the step.
+    """
+    wait = _POST_RELOAD_REPLY_WAIT_S if timeout is None else timeout
+    nothing_to_answer = counters.sent == account.after.sent and driver.queued == 0
+    if account.not_reconnected > 0 or nothing_to_answer:
+        wait = 0.0
+    try:
+        reply_s = await driver.await_first_reply(wait)
+    finally:
+        driver.end_reply_watch()
+    return replace(
+        account,
+        reply_s=reply_s,
+        reply_wait_s=wait,
+        drops_after=driver.drops - account.drops_at_back,
     )
 
 
@@ -1423,6 +1508,8 @@ def _build_record(
         reload_stranded=(None if ra is None else max(0, min(ra.stranded, c.timeouts, c.sent))),
         reload_not_reconnected=None if ra is None else ra.not_reconnected,
         post_reload_extra_hold_s=None if ra is None else ra.extra_hold_s,
+        post_reload_reply_s=None if ra is None else ra.reply_s,
+        post_reload_drops=None if ra is None else ra.drops_after,
     )
 
 
@@ -1641,12 +1728,8 @@ def _reconcile(
             f"nothing was sent after the reload probe, so intake after the reload was not "
             f"measured and the {stranded} send(s) it stranded cannot be excused on trust"
         )
-    if no_reply:
-        parts.append(
-            f"{sent_after} send(s) after the reload probe drew no reply at all (no ACK, no NAK) "
-            f"before the stop grace ended -- the engine stopped answering after the reload, or "
-            f"answered too slowly to measure"
-        )
+    if no_reply and reload is not None:
+        parts.append(_no_reply_detail(reload, sent_after))
     if over_budget:
         of_run = (
             f"three quarters of the {population} send(s) the reload probe did not strand"
@@ -1676,6 +1759,43 @@ def _reconcile(
         )
     detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
     return NoLoss(ok, sent, read, written, sink_received, backlog, detail)
+
+
+def _no_reply_detail(reload: _ReloadAccount, sent_after: int) -> str:
+    """The "drew no reply" text, with the readings that separate its causes (BACKLOG #1292).
+
+    The wait it allowed, and the sockets the engine closed over it. A close means one took the
+    replies; none means the engine held its sockets open and did not answer on them. Each reading
+    is named only where `_await_post_reload_reply` took it, so an account it never saw prints the
+    plain text rather than a 0 nobody measured.
+    """
+    waited = (
+        "before the stop grace ended"
+        if reload.reply_wait_s is None
+        else f"in {reload.reply_wait_s:g}s of waiting plus the stop grace"
+    )
+    text = (
+        f"{sent_after} send(s) after the reload probe drew no reply at all (no ACK, no NAK) "
+        f"{waited} -- the engine stopped answering after the reload, or answered too slowly to "
+        f"measure"
+    )
+    if reload.drops_after is None:
+        return text
+    # "After every connection was back" is true only where the reconnect wait saw each one on a new
+    # socket. Otherwise a close the reload itself made can be noticed late and counted here.
+    confirmed = reload.not_reconnected == 0 and not reload.not_applied
+    span = (
+        "after every connection was back" if confirmed else "after the reconnect wait ended"
+    ) + ", up to the end of that wait"
+    if reload.drops_after == 0:
+        return f"{text}; the engine closed no socket {span}"
+    text = (
+        f"{text}; the engine closed {reload.drops_after} socket(s) {span}, so a close may have "
+        f"taken the replies"
+    )
+    if not confirmed:
+        text += ", though the reload's own close may be among them"
+    return text
 
 
 def _empty_claim_rates(samples: list[EngineSample]) -> tuple[float, float, float]:
