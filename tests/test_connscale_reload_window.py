@@ -26,12 +26,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 
 import pytest
 
 from harness.load.connscale import probe, runner
 from harness.load.connscale.driver import ConnScaleDriver
-from harness.load.connscale.report import ConnScaleRecord
+from harness.load.connscale.report import ConnScaleRecord, NoLoss
 from harness.load.corpus import Outgoing
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import EnginePoller, EngineSample
@@ -498,7 +499,14 @@ def test_no_reload_probe_records_not_measured_rather_than_zero() -> None:
     assert rec.post_reload_reply_s is None
     assert rec.post_reload_drops is None
     assert rec.to_json_dict()["wall5_reload"]["stranded"] is None
-    assert rec.to_json_dict()["wall5_reload"]["drops_after"] is None
+    assert rec.to_json_dict()["wall5_reload"] == {
+        "seconds": None,
+        "stranded": None,
+        "not_reconnected": None,
+        "extra_hold_s": None,
+        "reply_s": None,
+        "drops_after": None,
+    }
 
 
 class _Conn:
@@ -721,7 +729,7 @@ class _AfterReloadEngine:
 
 async def _post_reload_step(
     engine: _AfterReloadEngine, *, reply_wait_s: float
-) -> tuple[runner._ReloadAccount, runner.NoLoss]:
+) -> tuple[runner._ReloadAccount, NoLoss]:
     """One connection: 2 sends ACKed before the reload, the reload closes the socket, and 3 sends go
     out on the new one. The step then stops with a 0.05 s grace, far shorter than the slow engine's
     delay, so only the probe's own wait can see a slow reply."""
@@ -873,3 +881,52 @@ async def test_the_reply_wait_times_the_first_reply_from_the_snapshot() -> None:
     await task
     assert got is not None
     assert 0.15 <= got < 1.0
+
+
+async def test_the_runner_waits_the_shipped_reply_wait_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The runner's own call passes no wait, so the constant is what CI gets. Pin that wiring: with no
+    # argument the probe allows `_POST_RELOAD_REPLY_WAIT_S`, here shrunk so the fake's unanswered
+    # send runs it out quickly.
+    monkeypatch.setattr(runner, "_POST_RELOAD_REPLY_WAIT_S", 0.05)
+    driver = _FakeDriver(1)
+    counters = Counters()
+    hold_task = asyncio.create_task(_emit_after_snapshot(driver))
+    account = await runner._reload_mid_hold(
+        driver=driver,  # type: ignore[arg-type]
+        counters=counters,
+        reload=_reconnecting_reload(driver),
+        run_hold=_no_extra_hold,
+        hold_task=hold_task,
+        hold_seconds=_HOLD,
+        hold_started=asyncio.get_running_loop().time(),
+    )
+    assert account.reply_wait_s == 0.05
+    assert account.reply_s is None
+
+
+def test_the_shipped_reply_wait_fits_the_smokes_module_timeout() -> None:
+    # The constant's own comment sizes it: the fixture's setup took 40.8 s on the failing runner, and
+    # four steps each waiting in full must still finish inside the module's 120 s timeout.
+    assert 40.8 + 4 * runner._POST_RELOAD_REPLY_WAIT_S < 120.0
+    assert runner._POST_RELOAD_REPLY_WAIT_S > runner._STOP_GRACE  # it must add to the grace
+
+
+async def _emit_after_snapshot(driver: _FakeDriver) -> None:
+    await driver.window_closed.wait()
+    driver.emitted_count += 1  # offered after every connection was back, never written or answered
+
+
+def _reconnecting_reload(
+    driver: _FakeDriver,
+) -> Callable[[], Awaitable[tuple[float | None, bool]]]:
+    async def reload() -> tuple[float | None, bool]:
+        driver.gens = [g + 1 for g in driver.gens]
+        return 0.01, False
+
+    return reload
+
+
+async def _no_extra_hold(seconds: float) -> None:
+    return None
