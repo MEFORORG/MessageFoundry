@@ -37,6 +37,7 @@ from messagefoundry.api.auth_models import (
     CustomRoleRequest,
     ElevatedResponse,
     FederatedIdentityRequest,
+    FederatedIdentityView,
     LoginRequest,
     LoginResponse,
     MfaConfirmRequest,
@@ -228,6 +229,21 @@ def _parse_channel_scope(raw: str | None) -> list[str] | None:
     except (ValueError, TypeError):
         return []
     return [str(c) for c in value] if isinstance(value, list) else []
+
+
+def _federated_identity_view(user: UserRecord, service: AuthService) -> FederatedIdentityView:
+    """Project one account's federated binding for the console (BACKLOG #1143, ADR 0184 slice B).
+
+    Sync, like :func:`_user_summary`, so the console never reads a ``UserRecord`` attribute itself.
+    Only the console's users:manage pages call it; no JSON route returns this view."""
+    return FederatedIdentityView(
+        user_id=user.id,
+        username=user.username,
+        auth_provider=user.auth_provider,
+        issuer=user.oidc_issuer,
+        subject=user.oidc_subject,
+        bind_issuer=service.oidc_issuer,
+    )
 
 
 def _user_summary(
@@ -1030,8 +1046,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     # would have let the next login bind whatever subject then presented.
     #
     # Action-bound, single-use and MFA-gated, like the password reset: which IdP identity may sign in
-    # as an account is an attribute that affects authentication (ASVS 7.5.1). The console leg is
-    # ADR 0184 slice B; until it lands these two routes are the whole surface.
+    # as an account is an attribute that affects authentication (ASVS 7.5.1). The console leg (ADR
+    # 0184 slice B, /ui/users/{id}/federated-identity) calls both handlers BY REFERENCE through
+    # AdminHandlers, which skips the Depends below, so it re-asserts the same action-bound gate.
 
     @app.put("/users/{user_id}/federated-identity", response_model=SimpleMessage)
     async def bind_user_federated_identity(
@@ -1322,6 +1339,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         set_channel_scope=set_channel_scope,
         reset_user_password=reset_user_password,
         reset_user_mfa=reset_user_mfa,
+        bind_user_federated_identity=bind_user_federated_identity,
+        unbind_user_federated_identity=unbind_user_federated_identity,
         admin_revoke_user_sessions=admin_revoke_user_sessions,
         delete_user=delete_user,
         create_custom_role=create_custom_role,
@@ -1338,5 +1357,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         list_audit=_audit_ui_list,
         my_security_events=my_security_events,
         user_summary=_user_summary,
+        federated_identity_view=_federated_identity_view,
         current_user=_current_user,
     )

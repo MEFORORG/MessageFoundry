@@ -98,6 +98,31 @@ class UserSummary(BaseModel):
     credential_expires_at: float | None = None
 
 
+class FederatedIdentityView(BaseModel):
+    """One account's federated binding, as the console's federated-identity screen renders it
+    (BACKLOG #1143 / #295, ADR 0184 slice B).
+
+    A view of its own rather than two more fields on :class:`UserSummary`. That model is what
+    ``GET /users`` returns under users:read, where the pair must not appear, and a field that is
+    always ``None`` there would read as "not linked" to any client that trusts it.
+
+    ``issuer`` and ``subject`` are the stored pair; either one set counts as linked, as it does in
+    :meth:`AuthService.unbind_federated_subject`. ``bind_issuer`` is the issuer a bind would use,
+    ``[auth].oidc_issuer``, or ``None`` when it is unset and every bind is refused.
+    """
+
+    user_id: str
+    username: str
+    auth_provider: str
+    issuer: str | None = None
+    subject: str | None = None
+    bind_issuer: str | None = None
+
+    @property
+    def linked(self) -> bool:
+        return self.issuer is not None or self.subject is not None
+
+
 class UserPermissions(BaseModel):
     """The FLATTENED effective permission set for an arbitrary user (BACKLOG #177 inspector).
 
