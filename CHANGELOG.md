@@ -115,27 +115,35 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ### Security
 - **BREAKING: a Windows SSO (Kerberos) sign-in through `POST /auth/negotiate` no longer opens a
-  step-up window.** Until now the engine stamped the new session as freshly re-verified, so the
-  engine's own sign-in stamp passed the step-up check for `[auth].step_up_max_age_seconds` (300
-  seconds by default). Nothing checked with the directory again. With `[security].require_mfa`
-  off, a bearer client could run step-up-gated actions on the ticket alone in that window, such as
-  purge, export, replay, config deploy and user admin. With it on (the default) the session still
-  owed a second factor, so the window reached only the routes that skip that gate, and only where
-  `[auth].require_action_step_up` is off: factor enrollment and session termination. The console's
-  `GET /ui/sso` never opened the window, so one sign-in method had two postures. Now no directory
-  sign-in opens it: Kerberos by either route, and the federated (OIDC) callback, which already did
-  not. **What a client now sees** depends on the second factor. A session that still owes one
-  meets `403` with `X-MFA-Required: 1` first, as before; the code it then sends to
-  `POST /auth/mfa-verify` opens the window, so nothing changes for it. The change shows on the
-  paths the window used to cover: with `require_mfa` off, and on factor enrollment and session
-  termination with `require_action_step_up` off. There the first step-up-gated action now returns
-  `403` with `X-Step-Up-Required: 1`. The client answers with `POST /me/reauth` and the account's
-  directory password, which the engine checks by a live bind. **A directory account with no
-  password it can bind with**, such as a smart-card-only account, cannot step up on either route.
-  ADR 0068 accepted that for `GET /ui/sso`, and it now holds for `POST /auth/negotiate` too.
-  Local password sign-in is unchanged. `AuthService.authenticate_kerberos` and
-  `AuthService.authenticate_oidc` no longer take a `seed_reauth` argument, so no caller can open
-  the window at sign-in. The web console seam moved with it. (`BACKLOG #1144`, step 5)
+  step-up window.** Now no directory sign-in opens it: Kerberos by either route, and the federated
+  (OIDC) callback, which already did not. Local password sign-in is unchanged.
+  (`BACKLOG #1144`, step 5)
+  - **What it was.** The engine stamped the new session as freshly re-verified, so its own sign-in
+    stamp passed the step-up check for `[auth].step_up_max_age_seconds` (300 seconds by default).
+    Nothing checked with the directory again. The console's `GET /ui/sso` never opened the window,
+    so one sign-in method had two postures.
+  - **Who it reached.** An account with no engine second factor. With `[security].require_mfa`
+    off, it owed no factor. A bearer client could then run the step-up-gated actions that use the
+    session window on the ticket alone, such as purge, export, replay, config deploy and user admin.
+  - **With `require_mfa` on, it reached further than it looked.** The session owed a factor first,
+    so the window reached only the routes that skip that gate, and only with
+    `[auth].require_action_step_up` off: at least factor enrollment and session termination. But
+    enrollment let the session bind its own TOTP and clear the MFA gate with it. The seeded window
+    then covered every window-gated action until it closed.
+  - **Accounts that hold an engine factor see no change.** The session meets `403` with
+    `X-MFA-Required: 1` first, as before. A TOTP or recovery code sent to `POST /auth/mfa-verify`
+    opens the window. That route takes no passkey.
+  - **Accounts with no engine factor now step up.** On the paths above, the first step-up-gated
+    action returns `403` with `X-Step-Up-Required: 1`. The client answers with `POST /me/reauth` and
+    the account's directory password, which the engine checks by a live bind.
+  - **A session from `POST /auth/negotiate` on an account with no engine factor and no password the
+    engine can bind with cannot step up.** A smart-card-only or passwordless AD account is one. ADR
+    0068 accepted the same limit for `GET /ui/sso`. An engine TOTP opens the session window at the
+    MFA gate, but a route that needs an action-bound proof still needs a bindable password. No
+    shipped client calls `POST /auth/negotiate`.
+  - `AuthService.authenticate_kerberos` and `AuthService.authenticate_oidc` no longer take a
+    `seed_reauth` argument, so no caller can open the window at sign-in. The web console seam moved
+    with it.
 - **BREAKING: a federated (OIDC) sign-in no longer links itself to an account. An administrator
   links it first, through the API.** The engine now picks the account by the identity provider's
   verified issuer and `sub`, before it reads any username. Before, it picked the account by the
