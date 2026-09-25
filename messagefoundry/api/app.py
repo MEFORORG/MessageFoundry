@@ -1320,6 +1320,22 @@ async def _record_control_audit(
     )
 
 
+#: What the connection-test routes return for a refused trust anchor, in place of its text.
+_ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
+
+
+def _caused_by_trust_anchor(exc: BaseException) -> bool:
+    """Whether ``exc`` wraps a :class:`TrustAnchorError`, however deep in its cause chain."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, TrustAnchorError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
@@ -1367,6 +1383,12 @@ async def _run_connection_test(
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
+        if _caused_by_trust_anchor(exc):
+            # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
+            # full text goes to the operator log, as the reload route's does; the caller and the
+            # audit row get a fixed line (BACKLOG #1142).
+            _log.warning("connection test refused %r (trust anchor): %s", name, exc)
+            return _result(supported=True, success=False, ms=0.0, detail=_ANCHOR_REFUSED_DETAIL)
         return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
     start = time.monotonic()
     supported, success, detail = True, False, None

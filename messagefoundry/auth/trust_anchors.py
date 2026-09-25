@@ -858,6 +858,23 @@ def oidc_anchor_spec(ca_cert_file: str, pin: str | None) -> AnchorSpec:
     )
 
 
+def connection_ca_pin(settings: Mapping[str, Any], setting: str) -> str | None:
+    """A connection's ``tls_ca_pin``, or ``None`` when the key is absent or ``None``.
+
+    **A pin that is present but blank refuses, never reads as no pin** (BACKLOG #1142). An
+    ``env()`` value set to nothing, or a blank literal, used to read as no pin: the config looked
+    pinned while nothing was checked. ``setting`` names the key for the message. Raises
+    ``ValueError``, which a connector build reports as a config error."""
+    from messagefoundry.config.settings import refuse_a_blank_anchor_pin
+
+    pin = settings.get("tls_ca_pin")
+    if pin is not None and not isinstance(pin, str):
+        raise ValueError(
+            f"{setting} must be text, the SHA-256 of the CA file; got a {type(pin).__name__}"
+        )
+    return refuse_a_blank_anchor_pin(pin, setting)
+
+
 def connection_anchor_spec(name: str, settings: Mapping[str, Any]) -> AnchorSpec | None:
     """The CA of one inbound connection whose server context requires a peer certificate, or ``None``.
 
@@ -868,18 +885,19 @@ def connection_anchor_spec(name: str, settings: Mapping[str, Any]) -> AnchorSpec
     keyed on ``intake_auth`` would reach the HTTP listener alone.
 
     ``settings`` must already have its ``env()`` references resolved. An unresolved one is skipped
-    here, and the connector's own build still checks the resolved value."""
+    here, and the connector's own build still checks the resolved value. A blank ``tls_ca_pin``
+    raises ``ValueError`` (:func:`connection_ca_pin`)."""
+    pin = connection_ca_pin(settings, f"inbound connection '{name}' tls_ca_pin")
     ca = settings.get("tls_ca_file")
     if isinstance(ca, os.PathLike):
         ca = os.fspath(ca)
     if not settings.get("tls") or not isinstance(ca, str) or not ca:
         return None
-    pin = settings.get("tls_ca_pin")
     return AnchorSpec(
         f"inbound:{name}",
         f"inbound connection '{name}' tls_ca_file",
         ca,
-        pin if isinstance(pin, str) and pin else None,
+        pin,
         f"inbound connection '{name}' tls_ca_pin",
     )
 
@@ -888,8 +906,9 @@ def refuse_an_unread_ca_pin(settings: Mapping[str, Any], *, inbound: bool, conne
     """Refuse a ``tls_ca_pin`` that nothing reads. It pins the CA an INBOUND listener verifies
     client certificates with, so it means something only with ``tls`` and ``tls_ca_file`` on an
     inbound connection. Anywhere else the config would read as pinned while nothing checks it, which
-    is worse than no pin. Raises ``ValueError``, which a connector build reports as a config error."""
-    if not settings.get("tls_ca_pin"):
+    is worse than no pin. Raises ``ValueError``, which a connector build reports as a config error.
+    A blank pin refuses here too, on every connection, whatever else it sets."""
+    if connection_ca_pin(settings, f"{connector}: tls_ca_pin") is None:
         return
     if inbound and connection_anchor_spec("", settings) is not None:
         return
@@ -1112,10 +1131,11 @@ def make_registry_anchor_preflight(
     the first load with a refused start. Dormant when no inbound names a CA."""
 
     async def preflight(registry: Registry, env_values: Mapping[str, Any]) -> None:
-        specs = registry_anchor_specs(registry, env_values)
-        if not specs:
-            return
         try:
+            # Inside the try: a blank tls_ca_pin raises ValueError while the specs are collected.
+            specs = registry_anchor_specs(registry, env_values)
+            if not specs:
+                return
             await run_anchor_preflight(specs, store, enforcing=enforcing)
         except (TrustAnchorError, OSError, ValueError) as exc:
             # ValueError too: an env()-supplied path with a NUL in it raises one from the read, and

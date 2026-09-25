@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import ssl
 from pathlib import Path
 
@@ -1165,3 +1166,102 @@ async def test_the_reload_route_audits_an_inbound_anchor_refusal_as_trust_anchor
         assert reasons == ["invalid_config", "trust_anchor"]
     finally:
         await engine.stop()
+
+
+# --- QA round two: a blank pin refuses, never reads as no pin (BACKLOG #1142) ----------------------
+
+_BLANK_PINS = [pytest.param("", id="empty"), pytest.param("   ", id="whitespace")]
+
+_SETTINGS_PINS = [
+    pytest.param(ApiSettings, "tls_client_ca_pin", "[api].tls_client_ca_pin", id="api-client"),
+    pytest.param(AuthSettings, "ad_tls_ca_cert_pin", "[auth].ad_tls_ca_cert_pin", id="ad"),
+    pytest.param(AuthSettings, "oidc_tls_ca_cert_pin", "[auth].oidc_tls_ca_cert_pin", id="oidc"),
+]
+
+
+@pytest.mark.parametrize("blank", _BLANK_PINS)
+@pytest.mark.parametrize(("model", "field", "setting"), _SETTINGS_PINS)
+def test_a_blank_settings_pin_refuses_at_load(
+    model: type, field: str, setting: str, blank: str
+) -> None:
+    """An empty or whitespace pin is a mistake, not "no pin". Absent is the only way to say none.
+    Red under: the validator removed, where the blank loads and waits for the anchor code."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match=re.escape(setting) + " is set but empty"):
+        model.model_validate({field: blank})
+    # The controls: absent means no pin, and a real pin loads unchanged.
+    assert getattr(model.model_validate({}), field) is None
+    assert getattr(model.model_validate({field: "ab" * 32}), field) == "ab" * 32
+
+
+def test_a_blank_settings_pin_from_the_environment_refuses(tmp_path: Path) -> None:
+    """The case the finding named: an environment variable set to nothing."""
+    from messagefoundry.config.settings import load_settings
+
+    toml = tmp_path / "m.toml"
+    toml.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match=re.escape("[auth].oidc_tls_ca_cert_pin is set but empty")):
+        load_settings(config_path=toml, environ={"MEFOR_AUTH_OIDC_TLS_CA_CERT_PIN": ""})
+    assert load_settings(config_path=toml, environ={}).auth.oidc_tls_ca_cert_pin is None
+
+
+def _mtls(pin: object) -> dict[str, object]:
+    return {"tls": True, "tls_ca_file": "ca.pem", "tls_ca_pin": pin}
+
+
+@pytest.mark.parametrize("blank", _BLANK_PINS)
+def test_a_blank_connection_pin_refuses_in_every_builder(blank: str) -> None:
+    """MLLP (and the HTTP listener, which uses its builder) and DICOM, both directions, with mTLS
+    on and with TLS off. Red under: the old ``if not settings.get("tls_ca_pin")`` early return,
+    which read the blank as no pin and built an unpinned context."""
+    from messagefoundry.transports.dicom import _client_ssl_context, _server_ssl_context
+    from messagefoundry.transports.mllp import _mllp_ssl_context
+
+    for s in (_mtls(blank), {"tls_ca_pin": blank}):
+        with pytest.raises(ValueError, match="MLLP listener: tls_ca_pin is set but empty"):
+            _mllp_ssl_context(dict(s), server=True)
+        with pytest.raises(ValueError, match="MLLP destination: tls_ca_pin is set but empty"):
+            _mllp_ssl_context(dict(s), server=False)
+        with pytest.raises(ValueError, match="DICOM listener: tls_ca_pin is set but empty"):
+            _server_ssl_context(dict(s))
+        with pytest.raises(ValueError, match="DICOM destination: tls_ca_pin is set but empty"):
+            _client_ssl_context(dict(s))
+
+
+@pytest.mark.parametrize("blank", _BLANK_PINS)
+def test_a_blank_connection_pin_refuses_where_the_spec_is_built(blank: str) -> None:
+    """The graph preflight reads the pin through connection_anchor_spec, so it refuses there too,
+    naming the connection. Absent still means no pin."""
+    with pytest.raises(ValueError, match="inbound connection 'adt-in' tls_ca_pin is set but empty"):
+        ta.connection_anchor_spec("adt-in", _mtls(blank))
+    with pytest.raises(ValueError, match="must be text"):
+        ta.connection_anchor_spec("adt-in", _mtls(123))
+    spec = ta.connection_anchor_spec("adt-in", {"tls": True, "tls_ca_file": "ca.pem"})
+    assert spec is not None and spec.pin is None
+    spec = ta.connection_anchor_spec("adt-in", _mtls(None))
+    assert spec is not None and spec.pin is None
+    ta.refuse_an_unread_ca_pin({"tls": True}, inbound=True, connector="x")  # absent: no refusal
+
+
+async def test_a_blank_env_pin_refuses_the_graph_load(store: MessageStore, tmp_path: Path) -> None:
+    """An env() pin whose value is empty. The preflight turns the refusal into a WiringError, which
+    the reload route answers with a 422 and an audit row, and writes no anchor row first."""
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    ca = _pem(tmp_path, _block(b"ca"))
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import MLLP, File, Send, env, handler, inbound, outbound, router\n"
+        f"inbound('ADT_IN', MLLP(port=21575, tls=True, tls_cert_file={str(ca)!r}, "
+        f"tls_ca_file={str(ca)!r}, tls_ca_pin=env('adt_pin')), router='r')\n"
+        f"outbound('OUT', File(directory={str(tmp_path / 'out')!r}))\n" + _GRAPH_TAIL,
+        encoding="utf-8",
+    )
+    preflight = ta.make_registry_anchor_preflight(store, enforcing=True)
+    with pytest.raises(
+        WiringError, match="inbound connection 'ADT_IN' tls_ca_pin is set but empty"
+    ):
+        await preflight(load_config(cfg), {"adt_pin": ""})
+    assert await _rows(store) == []

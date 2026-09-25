@@ -754,3 +754,86 @@ def test_the_inbound_sources_name_their_ca_after_the_connection(
         MLLPSource(Source(type=ConnectorType.MLLP, name="adt-in", settings=settings))
     with pytest.raises(TrustAnchorError, match="inbound connection 'orders-in' tls_ca_file"):
         HttpSource(Source(type=ConnectorType.HTTP, name="orders-in", settings=settings))
+
+
+# --- QA round two: the connection-test route follows the dial and echoes no path (BACKLOG #1142) ---
+
+
+async def _post_test(
+    tmp_path: Path, settings: dict[str, Any], *, enforcing: bool
+) -> tuple[Any, list[dict[str, Any]]]:
+    """POST /connections/IB/test on an engine at the given dial. Returns the response and the
+    connection_test audit rows."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+    from messagefoundry.pipeline import Engine
+
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection("IB", ConnectionSpec(ConnectorType.MLLP, settings), router="r")
+    )
+    reg.add_router("r", lambda m: [])
+    engine = await Engine.create(
+        tmp_path / f"route-{enforcing}.db", hop_posture=HopPosture(enforcing=enforcing)
+    )
+    try:
+        engine.add_registry(reg)
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post("/connections/IB/test")
+        rows = await engine.store.list_audit(action="connection_test", limit=10)
+    finally:
+        await engine.stop()
+    return r, rows
+
+
+async def test_the_connection_test_follows_the_warn_dial(
+    tmp_path: Path, cas: tuple[_Ca, _Ca], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ACL the engine could not read. The live listener serves under warn, so the test must build
+    too: an MLLP listener then answers "not supported", not a refused build. Red under: the build
+    left unstamped, which enforced and reported a serving listener as failed. The control is the
+    same config at enforce, which refuses."""
+    good, _ = cas
+    anchor = tmp_path / "peer-ca.pem"
+    anchor.write_bytes(good.pem)
+    _verdicts(monkeypatch, acl=None, path=True)
+    settings = {**_inbound(good, anchor), "port": 2575}
+
+    r, _ = await _post_test(tmp_path, settings, enforcing=False)
+    assert r.status_code == 200, r.text
+    assert r.json()["supported"] is False, r.text  # built; a listener has nothing to dial
+
+    r, _ = await _post_test(tmp_path, settings, enforcing=True)
+    assert r.json()["supported"] is True and r.json()["success"] is False
+    assert r.json()["detail"] == "trust anchor refused; see the server log"
+
+
+async def test_the_connection_test_echoes_no_anchor_path_or_hash(
+    tmp_path: Path, cas: tuple[_Ca, _Ca], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A pin mismatch refuses at either dial, and its text names the CA's path and SHA-256. The
+    caller and the audit row get a fixed line; the operator log gets the text. Red under: the route
+    returning safe_text(str(exc)), which carried both."""
+    good, evil = cas
+    anchor = tmp_path / "peer-ca.pem"
+    anchor.write_bytes(evil.pem)
+    loaded = hashlib.sha256(evil.pem).hexdigest()
+    settings = {
+        **_inbound(good, anchor, pin=hashlib.sha256(good.pem).hexdigest()),
+        "port": 2575,
+    }
+
+    for enforcing in (False, True):
+        caplog.clear()
+        r, rows = await _post_test(tmp_path, settings, enforcing=enforcing)
+        body = r.json()
+        assert body["success"] is False
+        assert body["detail"] == "trust anchor refused; see the server log"
+        for text in (r.text, rows[0]["detail"]):
+            assert "peer-ca.pem" not in text and tmp_path.name not in text
+            assert loaded not in text
+        # The detail is not lost: the operator log carries the path and the hash.
+        assert "peer-ca.pem" in caplog.text and loaded in caplog.text

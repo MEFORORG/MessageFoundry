@@ -2139,16 +2139,21 @@ class RegistryRunner:
         ic = self.registry.inbound.get(name)
         oc = self.registry.outbound.get(name)
         try:
-            if ic is not None:
-                source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
-                check_source_allowed(source_cfg, name, self._egress)
-                return "in", build_source(source_cfg)
-            if oc is not None:
-                dest_cfg = _dest_config(
-                    oc, self._env_values, self._trust_anchor_policy, self._egress
-                )
-                check_egress_allowed(dest_cfg, self._egress)
-                return "out", build_destination(dest_cfg)
+            # Stamped as the live builds are (_start_inbound_unsafe, _start_outbound), so each
+            # posture-keyed cell decides as it does for the running connector. Unstamped, the
+            # inbound CA check enforced under [security].enforcement = warn, and the test reported
+            # a listener that was serving as failed (BACKLOG #1142).
+            with active_hop_posture(self._hop_posture):
+                if ic is not None:
+                    source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+                    check_source_allowed(source_cfg, name, self._egress)
+                    return "in", build_source(source_cfg)
+                if oc is not None:
+                    dest_cfg = _dest_config(
+                        oc, self._env_values, self._trust_anchor_policy, self._egress
+                    )
+                    check_egress_allowed(dest_cfg, self._egress)
+                    return "out", build_destination(dest_cfg)
         except WiringError:
             raise
         except Exception as exc:
