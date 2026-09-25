@@ -73,7 +73,8 @@ async def _admin(c: httpx.AsyncClient, service: AuthService) -> str:
 
 
 async def _audit(engine: Engine, action: str) -> list[dict[str, object]]:
-    return [dict(a) for a in await engine.store.list_audit() if a["action"] == action]
+    """Every audit row with ``action``. Filtered by the store, and past its default 50-row cap."""
+    return [dict(a) for a in await engine.store.list_audit(action=action, limit=100_000)]
 
 
 async def _audit_mark(engine: Engine) -> int:
@@ -85,10 +86,11 @@ async def _audit_mark(engine: Engine) -> int:
 async def _federated_rows_since(engine: Engine, mark: int) -> list[dict[str, object]]:
     """Every ``auth.federated_subject_*`` audit row written after ``mark``, selected by id.
 
-    By id rather than by position: ``list_audit`` returns NEWEST FIRST, so a slice past the old
-    length picks the OLDEST rows. That slice passed only while the bootstrap admin's rows were the
-    oldest; once #1526 retired that account, the setup bind became the oldest row and the slice
-    reported it as written by the refusal."""
+    By id rather than by position, for two reasons. ``list_audit`` returns NEWEST FIRST, so a slice
+    past the old length picks the OLDEST rows. That passed only while the bootstrap admin's rows were
+    the oldest; once #1526 retired that account, the setup bind was the oldest row and the slice
+    reported it as written by the refusal. And ``list_audit`` stops at 50 rows by default, so on a log
+    of 50 or more the old slice was always empty and could never fire."""
     rows = await engine.store.list_audit(limit=100_000)
     return [
         dict(a)
@@ -243,7 +245,7 @@ async def test_bind_refusals(
     the pair already held would otherwise sign the account out for nothing."""
     service = await _service(engine)
     target = await _ad_account(engine)
-    holder = target
+    holder: str | None = None
     subject = "S-1-a"
     if case == "unknown user":
         target = ABSENT_USER_ID
@@ -265,19 +267,27 @@ async def test_bind_refusals(
         subject = " S-1-a"
     elif case == "non-ASCII subject":
         subject = "S-1-\u00e9"
+    if case != "unknown user":
+        await engine.store.create_session(
+            token_hash="t-target", user_id=target, expires_at=9e9, now=1.0
+        )
+    touched = [target] if holder is None else [target, holder]
     async with _client(engine, service) as c:
         tok = await _admin(c, service)
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         mark = await _audit_mark(engine)
-        pairs_before = await _pairs(engine, target, holder)
+        pairs_before = await _pairs(engine, *touched)
         r = await c.put(
             f"/users/{target}/federated-identity", json={"subject": subject}, headers=_auth(tok)
         )
     assert r.status_code == status, r.text
     assert fragment in r.json()["detail"]
-    assert await _pairs(engine, target, holder) == pairs_before, "a refused bind moved a binding"
+    assert await _pairs(engine, *touched) == pairs_before, "a refused bind moved a binding"
     written = await _federated_rows_since(engine, mark)
     assert written == [], f"a refused bind wrote {written!r}"
+    if case != "unknown user":
+        session = await engine.store.get_session("t-target")
+        assert session is not None and session.revoked_at is None, "a refused bind signed out"
 
 
 async def test_the_refusal_checks_catch_a_bind_written_after_the_mark(engine: Engine) -> None:
@@ -303,6 +313,15 @@ async def test_the_refusal_checks_catch_a_bind_written_after_the_mark(engine: En
     assert [(a["action"], a["actor"]) for a in written] == [
         ("auth.federated_subject_bound", "planted")
     ], "the audit check missed a bind"
+
+    # PLANTED, the holder half: a refusal that unbinds the account already holding the pair.
+    mark = await _audit_mark(engine)
+    holder_before = await _pairs(engine, older)
+    await service.unbind_federated_subject(older, actor="planted")
+    assert await _pairs(engine, older) != holder_before, "the pair check missed a holder unbind"
+    assert [a["action"] for a in await _federated_rows_since(engine, mark)] == [
+        "auth.federated_subject_unbound"
+    ], "the audit check missed a holder unbind"
 
 
 async def test_bind_refuses_when_no_issuer_is_configured(engine: Engine) -> None:
