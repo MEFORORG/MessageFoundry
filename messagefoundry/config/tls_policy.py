@@ -88,6 +88,7 @@ __all__ = [
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
+    "log_revocation_attestation",
     "kex_groups_report",
     "relax_verify_expiry",
     "requests_verify_from_anchor",
@@ -1298,6 +1299,42 @@ def cleartext_acceptance_audit_sink(
     return _record
 
 
+def log_revocation_attestation(
+    log: logging.Logger,
+    *,
+    crossing: str,
+    connection: str | None,
+    detail: str,
+    reason: str | None,
+    declaration: str = "tls_revocation_attested",
+) -> None:
+    """Record one hop that crossed an enforcing revocation refusal on an operator declaration (ADR 0173).
+
+    The ONE record builder for both directions: :meth:`RevocationHopGuard.enforce_construction` for a
+    verifying outbound hop and ``check_inbound_revocation`` for an mTLS listener. Shared for the reason
+    :func:`cleartext_acceptance_audit_sink` is shared -- a record forked per direction drifts, and an
+    auditor searching one marker then misses the other half.
+
+    ``connection`` names the declaring connection, and it is what makes the record actionable. The
+    outbound ``cell`` is a static family label and ``detail`` names a host, so two destinations to one
+    host produce the same line without it. ``None`` (a hop that is not a connection) renders as
+    ``(unnamed)`` rather than a blank. ``reason`` is operator-authored text: it is passed as a logging
+    parameter, never interpolated into the format string.
+
+    The marker is **lower-case** for the reason the cleartext sink's is: the PHI redaction filter
+    (``redaction._NAME_RUN``) scrubs two or more adjacent ALL-CAPS tokens, so a shouted marker would be
+    scrubbed out of the record it exists to make findable. The colon after the name keeps an upper-case
+    connection name from joining an upper-case token after it, since the run needs whitespace."""
+    log.warning(
+        "%s on operator attestation — connection %s: %s (%s; reason: %s)",
+        crossing,
+        connection or "(unnamed)",
+        detail,
+        declaration,
+        reason or "(none provided)",
+    )
+
+
 #: The instance posture in force during connector construction. Stamped by the construction gate
 #: (``build_check_registry`` via :func:`active_hop_posture`) so a cell built inside that scope reads the
 #: LOADED config's derived posture rather than guessing. ``None`` when unstamped (an embedding/test that
@@ -1514,6 +1551,9 @@ class RevocationHopGuard:
     #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
     #: a hop that carries no per-connection attestation.
     attested_reason: str | None = None
+    #: The declaring connection's name, recorded in the same audit line so an auditor can trace the
+    #: crossing to the declaration to fix. ``None`` for a hop that is not a connection.
+    connection: str | None = None
 
     @classmethod
     def capture(
@@ -1528,6 +1568,7 @@ class RevocationHopGuard:
         posture: HopPosture | None = None,
         ways_across: str | None = None,
         attested_reason: str | None = None,
+        connection: str | None = None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -1562,6 +1603,7 @@ class RevocationHopGuard:
             crl_checked=context_checks_revocation(context),
             ways_across=ways_across,
             attested_reason=attested_reason,
+            connection=connection,
         )
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
@@ -1609,15 +1651,16 @@ class RevocationHopGuard:
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
-            logger.warning(
-                "verified TLS hop crossed WITHOUT certificate revocation checking on operator "
-                "attestation — %s: %s (reason: %s)",
-                self.cell,
-                self._detail(),
-                # A proven terminator ALLOWs without any per-connection attestation, so say which.
-                (self.attested_reason or "(none provided)")
+            # A proven terminator ALLOWs without any per-connection attestation, so say which.
+            log_revocation_attestation(
+                logger,
+                crossing="verified TLS hop crossed without certificate revocation checking",
+                connection=self.connection,
+                detail=f"{self.cell}: {self._detail()}",
+                reason=self.attested_reason
                 if self.attested
                 else "revocation proven by a declared egress terminator",
+                declaration="tls_revocation_attested" if self.attested else "proxy_proven",
             )
         enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
 

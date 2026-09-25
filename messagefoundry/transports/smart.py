@@ -259,6 +259,7 @@ class SmartBackendTokenProvider:
             revocation_attested=revocation_attested,
             revocation_attested_reason=revocation_attested_reason,
             opener=self._opener,
+            connection=connection,
         )
         self._proxy_auth: dict[str, str] = (
             token_proxy.auth_headers() if token_proxy is not None else {}
@@ -503,7 +504,11 @@ def token_provider_from_settings(
         ),
         cleartext_accepted=accepted[0],
         cleartext_reason=accepted[1],
-        connection=accepted[2],
+        # Either mirror carries the name, and both carry the SAME one: `_dest_config` and the
+        # FhirLookup factory write each only when its own declaration is set, so read whichever is
+        # present. The revocation audit line needs it as much as the cleartext record does (ADR 0173).
+        connection=accepted[2]
+        or (None if (named := s.get("tls_revocation_attested_connection")) is None else str(named)),
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
         ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)
         # #1660: resolved against the TOKEN url, not the connection's data url -- the authorization

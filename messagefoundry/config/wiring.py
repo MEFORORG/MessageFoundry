@@ -783,6 +783,7 @@ def FhirLookup(
         # The same keys _dest_config mirrors for an outbound, read by token_provider_from_settings.
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
+        settings["tls_revocation_attested_connection"] = name
     spec = FhirLookupSpec(name, settings)
     _active_registry().add_fhir_lookup(spec)
     return spec

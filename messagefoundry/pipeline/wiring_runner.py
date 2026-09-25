@@ -79,6 +79,7 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
     current_hop_posture,
     is_loopback_hop_host,
+    log_revocation_attestation,
 )
 from messagefoundry.config.wiring import (
     InboundConnection,
@@ -7645,10 +7646,13 @@ def _dest_config(
         settings["cleartext_reason"] = oc.cleartext_reason
         settings["cleartext_connection"] = oc.name
     # ADR 0173: mirror the revocation attestation the same way, for the one settings-driven seam that
-    # reads it -- the SMART token-endpoint provider (transports/smart.py). Written only when set.
+    # reads it -- the SMART token-endpoint provider (transports/smart.py). Written only when set. The
+    # name rides with it for the same reason `cleartext_connection` does: the audit line that seam
+    # logs must name the declaring connection.
     if oc.tls_revocation_attested:
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = oc.tls_revocation_attested_reason
+        settings["tls_revocation_attested_connection"] = oc.name
     return Destination(
         name=oc.name,
         type=oc.spec.type,
@@ -8287,11 +8291,12 @@ def check_inbound_revocation(
         # condition RevocationHopGuard.enforce_construction audits on the outbound side. The Source
         # validator guarantees the reason is present.
         if posture is not None and posture.enforcing:
-            log.warning(
-                "inbound %r: mTLS listener that checks NO client-certificate revocation bound on "
-                "operator attestation (tls_revocation_attested; reason: %s)",
-                name,
-                source.tls_revocation_attested_reason,
+            log_revocation_attestation(
+                log,
+                crossing="mTLS listener that checks no client-certificate revocation bound",
+                connection=name,
+                detail="inbound listener requires and verifies a client certificate",
+                reason=source.tls_revocation_attested_reason,
             )
         return
     if _inbound_revocation_gap_permitted(posture=posture):

@@ -172,7 +172,7 @@ def test_an_authored_inbound_attestation_crosses_the_enforcing_refusal_and_is_au
         check_inbound_revocation(src, "IB", posture=_ENFORCING)  # no WiringError: the escape works
     audit = " ".join(r.getMessage() for r in caplog.records)
     assert "operator attestation" in audit
-    assert "'IB'" in audit and _REASON in audit
+    assert "connection IB:" in audit and _REASON in audit
 
 
 def test_the_same_inbound_unattested_is_still_refused(tmp_path: Path) -> None:
