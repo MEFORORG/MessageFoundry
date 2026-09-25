@@ -525,30 +525,31 @@ This section is kept rather than deleted, because the claim it used to make is t
 
 ### `tls_hop_attested = true` on a connection — a hop attested secure by means the engine cannot see
 > **Connection-scoped**, like `cleartext_accepted` above, and settable in both directions: a keyword on
-> `inbound(...)`, `outbound(...)` or `FhirLookup(...)`, or a top-level key on a `connections.toml`
-> `[[inbound]]` / `[[outbound]]` table. It needs a mandatory `tls_hop_attested_reason`. Owner ruling
+> `inbound(...)`, `outbound(...)`, `FhirLookup(...)`, `DatabaseLookup(...)` or `DatabaseRef(...)`, or a
+> top-level key on a `connections.toml` `[[inbound]]` / `[[outbound]]` table. It needs a mandatory `tls_hop_attested_reason`. Owner ruling
 > 2026-09-24; the attestation itself is [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
 > It is **not** a transport setting: writing it into a factory's `settings` dict is refused at load.
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
-  declaration that yields ALLOW rather than WARN. The crossing is logged with the reason, but the hop is
-  recorded as secure, not as an accepted risk. That covers at least a non-loopback
-  inbound bind without TLS, a cleartext egress hop, a verify-off egress hop and a weakened database TLS
+  declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
+  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off egress hop and a weakened database TLS
   hop. If the claim is false, the payload and any credential the connection carries cross in the clear,
   and nothing about the hop looks wrong afterwards.
 - **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
-  sidecar in front of the connection is the usual case (see `samples/ech-sidecar/`). An isolated,
-  point-to-point segment with its own link-layer encryption is the other.
+  sidecar in front of the connection is the usual case. An isolated, point-to-point segment with its
+  own link-layer encryption is the other.
 - **Do not use it for a hop that is not secure.** That is `cleartext_accepted`, which WARNs every time. An
   attestation about a plaintext hop on a flat network puts a false statement into the one field that
   exists to be trusted when audited.
 - **Compensating controls:** whatever the reason names. Keep it true: when the proxy or the segment
   changes, the attestation has to change with it.
-- **It is never silent:** every enforcing refusal the attestation suppresses logs a WARNING naming the
-  connection, the cell and the reason. `messagefoundry check` prints a `tls-hop-attested` line listing
-  the **whole** attested set, and `GET /security/posture` carries a `tls_hop_attested` loosening naming
-  every attesting connection (inbound, outbound and `FhirLookup`). The gate and both reports read the
-  same typed field, so a hop cannot be crossed on an attestation the reports do not name.
+- **It is never silent:** a suppressed enforcing refusal is logged at WARNING, and at least the
+  inbound bind gates and the connectors' hop guards put the reason on that line. The OAuth2 and SMART
+  token-endpoint seams do not. The complete record is the two reports. `messagefoundry check` prints a
+  `tls-hop-attested` line listing the **whole** attested set, and `GET /security/posture` carries a
+  `tls_hop_attested` loosening naming every attesting declaration of each kind above. Each gate and
+  both reports read the attestation from the same place, so a hop cannot be crossed on an attestation
+  the reports do not name.
 - **Where it is NOT reported, and why:** the same two gaps as `cleartext_accepted` above.
   `messagefoundry security show` never loads the connection graph, and the `serve`-time warning fires
   before the graph loads. Both say so in their scope text.

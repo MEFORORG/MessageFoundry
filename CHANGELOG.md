@@ -57,6 +57,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
 ### Security
+- **A connection can now attest its hop secure, and the attestation is reported.** `inbound()`,
+  `outbound()`, `FhirLookup()`, `DatabaseLookup()` and `DatabaseRef()` take `tls_hop_attested` with a
+  mandatory `tls_hop_attested_reason`. So do `connections.toml` inbound and outbound tables, as
+  top-level keys. `messagefoundry check` lists every attested hop on a `tls-hop-attested` line, and
+  `GET /security/posture` names them in a `tls_hop_attested` loosening. Before this, no factory took
+  the flag, but the engine read it straight out of a connection's transport settings. A config module
+  could write it there and pass the enforcing cleartext-bind refusal unreported. Those settings keys
+  are now refused at load, naming the supported surface. Owner ruling 2026-09-24; registry entry in
+  `docs/SECURITY-LOOSENING.md`.
 - **An approval can no longer be granted faster than a person could read it.** A new setting,
   `[approvals].min_dwell_seconds`, sets the youngest age at which a pending request may be
   approved. It defaults to 2.0 seconds, which is provisional and derived from the keystroke-level
