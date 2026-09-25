@@ -1,8 +1,8 @@
 # Users & Security (Authentication + RBAC)
 
 MessageFoundry authenticates every operator and authorizes every action with **role-based access
-control (RBAC)**. It supports **local users** and **Active Directory** (LDAP bind + optional Windows
-SSO), maps **AD security groups to roles**, and attributes every action to a unique user in the audit
+control (RBAC)**. It supports **local users** and **Active Directory** (sign-in by Windows SSO or
+OIDC; the directory-password sign-in is retired), maps **AD security groups to roles**, and attributes every action to a unique user in the audit
 trail. The design meets or exceeds Mirth Connect and Corepoint on the points that matter for a
 healthcare interface engine — notably: RBAC is built in (not a paid add-on), password policy ships
 with secure defaults, and AD-group→role mapping is automatic.
@@ -1161,11 +1161,16 @@ login, and a proxy that omits `X-Forwarded-Proto` would otherwise poison the who
 one-shot tripwire warns if a `/ui` request ever arrives `scheme=http` while a terminator is
 declared (proxy not sending `X-Forwarded-Proto`, or its peer IP not matched by `trusted_proxies`).
 
-**Browser AD login (L5b).** When AD is enabled, `/ui/login` offers a provider selector; an AD
-password verifies through the **same** `auth.login` directory-bind seam as the JSON surface —
-allow-listed provider values only, one session per form POST (the AD role-resync/revocation side
-effect fires once at login, never per navigation). MFA is **not** delegated: the engine's own second
-factor binds a directory account like any other (BACKLOG #1144).
+**Browser AD login (L5b).** The browser AD **password** sign-in is **retired** (BACKLOG #1137).
+`/ui/login` renders a local username and password form only, with no provider selector. A POST
+that still carries `provider=ad` reaches the **same** `auth.login` seam as the JSON surface, and the
+engine refuses it and audits the attempt, so the engine is the single place that refuses. Directory
+accounts sign in by **Windows SSO** (`GET /ui/sso`) or **OIDC** (`/ui/oidc/start`), and each such
+sign-in mints one session, so the AD role-resync and revocation side effect fires once at login,
+never per navigation. The directory bind **as the user** survives only as the step-up re-bind at
+`POST /ui/reauth` and `POST /me/reauth`, where it re-proves a session another pathway minted. MFA is
+**not** delegated: the engine's own second factor binds a directory account like any other
+(BACKLOG #1144).
 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
 documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
@@ -1453,7 +1458,7 @@ slack.
 | Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
 | Binding a NEW second factor, ending sessions, or changing the password | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`), ends sessions (`session_terminate`, BACKLOG #1951) or changes the password (`POST /me/password` and `/ui/account/password`, BACKLOG #1954) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, `/ui/mfa`, or the code/passkey leg of `/ui/reauth`); the password routes answer 403 + `X-MFA-Required` (console: 303 → `/ui/mfa`). An account with **no** factor still enrols its first one, ends its own sessions and changes its password from a password-only session; that carve-out is what the MFA gate's exemptions are for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
 | MFA state | `session.mfa_verified_at` × factor enrollment × account roles | the rule is **provider-blind** (BACKLOG #1144 — an AD account used to be exempt here, on a delegation the directory never asserted): enrolled → always required, whatever the scope says; un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every account despite the value's narrower name, or the Administrator role only under `administrators`. A directory session that was minted without an engine-verified factor is refused outright while the knob is on | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
-| Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window, and the engine MFA gate never fires for it | n/a | `[auth].ad_enabled` |
+| Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window. The provider does **not** exempt the identity from the engine MFA gate (see the MFA state row): a directory session minted without an engine-verified factor (every Kerberos session, and an OIDC one while `oidc_require_mfa_claim` is off) is refused while `[security].require_mfa` is on, whatever the scope, and with it off is refused only once the account has enrolled a factor. The gate does not fire for a session already minted MFA-verified, which is an OIDC sign-in whose signed `amr`/`acr` passed the claim gate, or one whose holder has since proven the engine factor | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | browser Kerberos SSO and the OIDC callback mint with `seed_reauth=False` | **CHALLENGE** — the session is born **without** step-up freshness, so its first sensitive action forces an explicit credential step-up (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
 | Session age | `created_at` / `last_used_at` / `expires_at` vs wall clock, on **every** request | idle > 30 min; past the absolute expiry (12 h, or a tighter federated cap: the signature-verified `id_token.exp`, or `auth_time + oidc_max_age_seconds`); or a **backward** wall-clock step (NTP step-back, VM snapshot revert) | **DENY** — the session is revoked in the store, then 401. The idle clock is refreshed only by user-driven requests, so a background poll cannot keep a session alive | 30 min / 12 h | `[security].sign_out_after_idle_minutes`, `max_session_hours` (the ADR 0118 homes; `[auth].session_idle_timeout_minutes` / `session_absolute_hours` are the retired aliases), plus `[auth].oidc_session_max_hours` for a tighter federated cap and `[auth].oidc_max_age_seconds` for the IdP-authentication recency cap |
 | Account state — disabled | `user.disabled` | the account is disabled | **DENY** — no identity is built on **any** plane | n/a | (no knob — an admin action) |
@@ -1992,7 +1997,9 @@ the console package is absent, and again when a non-explicit console would be ex
 Local and Kerberos survive that on their JSON routes (`POST /auth/login`, `POST /auth/negotiate`), so
 **OIDC — browser-only — is unavailable in a JSON-only deployment even with `oidc_enabled = true`.**
 `GET /auth/providers` reports **availability**, which is not the same as what is **configured**. Only
-`local` (always true) and `ad` (`[auth].ad_enabled`) are pure config. `kerberos` is
+`local` (always true) and `ad` (always false) are constants. `ad` no longer reads `[auth].ad_enabled`:
+the directory-password sign-in is retired (BACKLOG #1137), and the field stays in the response so a
+client built against the older contract hides its AD password form instead of failing to parse. `kerberos` is
 `kerberos_available` — enabled **and** the boot-once SPNEGO acceptor preflight having passed, sticky
 until restart (`AuthService.kerberos_available` in `auth/service.py`). `oidc` is `oidc_available` — `oidc_enabled` (which is
 `[auth].oidc_enabled` **and** a directory to resolve roles against, `AuthService.oidc_enabled`) **and** the last IdP

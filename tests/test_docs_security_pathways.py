@@ -586,6 +586,54 @@ def test_corrected_falsehoods_cannot_return() -> None:
     )
 
 
+def test_the_retired_directory_password_sign_in_is_not_described_as_live() -> None:
+    """ASVS 6.1.3 was held at partial a second time (BACKLOG #1133) on two older passages.
+
+    The L5b paragraph said ``/ui/login`` offers a provider selector and that an AD password signs
+    in, and the signal table said the engine MFA gate never fires for a directory identity. Both
+    were false against the code: the engine refuses ``provider=ad`` (BACKLOG #1137), the login page
+    renders no selector, ``GET /auth/providers`` reports ``ad`` as a constant false, and
+    ``mfa_satisfied`` refuses an un-verified directory session under ``require_mfa``. The code
+    premises are pinned first, so a change that revives the sign-in reds here instead of silently
+    making the old sentences true again.
+    """
+    from messagefoundry.api import auth_routes
+    from messagefoundry_webconsole import pages
+
+    dispatch = ast.parse(textwrap.dedent(inspect.getsource(AuthService._dispatch_login)))
+    assert any(
+        isinstance(n, ast.Constant) and n.value == "pathway_retired" for n in ast.walk(dispatch)
+    ), "_dispatch_login no longer refuses provider=ad; the retired-sign-in prose is stale."
+    assert "ad=False," in inspect.getsource(auth_routes), (
+        "GET /auth/providers no longer reports ad as a constant false; re-derive the providers prose."
+    )
+    form = str(pages.login(None, sso_enabled=True, oidc_enabled=True))
+    assert 'name="provider"' not in form and "<select" not in form, (
+        "/ui/login renders a provider selector again; the L5b paragraph says it does not."
+    )
+    satisfied = inspect.getsource(AuthService.mfa_satisfied)
+    assert "AuthProvider.AD.value and self._settings.require_mfa" in satisfied, (
+        "mfa_satisfied lost its directory floor; the signal-table AD row says when the gate fires."
+    )
+
+    # Whitespace-normalised: a phrase that wraps across a source line must still be caught.
+    text = " ".join(_doc_text().split())
+    for retired in (
+        "offers a provider selector",
+        "the engine MFA gate never fires for it",
+        "and `ad` (`[auth].ad_enabled`) are pure config",
+        "(LDAP bind + optional Windows SSO)",
+    ):
+        assert retired not in text, (
+            f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
+        )
+    raw = _doc_text()
+    l5b = raw[raw.index("**Browser AD login (L5b).**") :].split("\n\n", 1)[0]
+    assert "retired" in l5b and "`provider=ad`" in l5b, (
+        "the L5b paragraph must say the browser AD password sign-in is retired and refused."
+    )
+
+
 def test_local_row_scopes_the_second_factor_to_step_up_and_administrator() -> None:
     """The Factor column IS the comparative claim, so it must carry the scope qualifier.
 
