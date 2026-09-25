@@ -1288,6 +1288,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "compare:via messagefoundry.auth.oidc.claims",
             "hash:via messagefoundry.auth.oidc_http",
+            # BACKLOG #1142: the fed.idp_tls row reports the anchor's evaluate_anchor verdict, which
+            # fingerprints the anchor with SHA-256.
+            "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.auth.oidc.jwks",
             "key_cert:via messagefoundry.auth.oidc_http",
             "sign_verify:via messagefoundry.auth.oidc.claims",
