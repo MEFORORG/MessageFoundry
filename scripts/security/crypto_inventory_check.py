@@ -1696,14 +1696,18 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # arm's row for the same file, which is where the entropy argument lives).
     "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
     # The TLS floor the extension applies to every https request it makes to the engine:
-    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION }` (TLSv1.2), plus the operator-pinned
-    # engine CA as `ca` when one is configured. Certificate verification is never switched off. The
-    # value is a named constant, not a literal, so the token does not carry it.
-    "ide/src/engineClient.ts": frozenset({"tls_context:minVersion"}),
-    # Not a TLS use: the extension test that PINS the floor above, by asserting the options object
-    # `tlsOptions` returns. Listed rather than excluded, because pruning test directories from the
-    # walk would be a scope cut the randomness arm does not make either.
-    "ide/src/test/suite/engine-trust.test.ts": frozenset({"tls_context:minVersion[TLSv1.2]"}),
+    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS }`, plus the pinned
+    # engine CA as `ca` when one is configured. Certificate verification is never switched off. Both
+    # values are named constants, not literals, so the tokens do not carry them. `ciphers` pins the
+    # TLS 1.2 suites to a copy of the engine's approved AEAD list, which
+    # tests/test_tls_default_suites.py holds to config/tls_policy.py (BACKLOG #300).
+    "ide/src/engineClient.ts": frozenset({"tls_context:minVersion", "tls_context:ciphers"}),
+    # Not a TLS use: the extension test that PINS the floor and the suite list above, by asserting
+    # the options object `tlsOptions` returns. Listed rather than excluded, because pruning test
+    # directories from the walk would be a scope cut the randomness arm does not make either.
+    "ide/src/test/suite/engine-trust.test.ts": frozenset(
+        {"tls_context:minVersion[TLSv1.2]", "tls_context:ciphers"}
+    ),
     # The operator console's WebAuthn ceremonies (ADR 0068): navigator.credentials.create enrolls a
     # passkey and navigator.credentials.get asks the authenticator to SIGN the server's challenge.
     # The signature is checked server-side in auth/webauthn.py; this row records where the browser
