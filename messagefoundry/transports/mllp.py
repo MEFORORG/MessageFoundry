@@ -210,6 +210,27 @@ _CLIENT_SHUTDOWN_GRACE = 5.0
 # one must not silently shrink the other.
 _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 
+# Seconds a TLS listener waits for a new connection to finish its handshake (BACKLOG #1606).
+# `_on_client` runs only after the handshake, so until then a socket is outside `_clients` and the
+# `max_connections` count, and asyncio's own default of 60 s was the only bound on it. A peer that
+# opened sockets and never sent a ClientHello could hold each one that long, uncounted. A handshake
+# is a few round trips of engine-fixed work, so 10 s is generous even across a slow WAN hop.
+# A constant rather than a per-connection setting, for the reason `_ACK_DRAIN_GRACE` gives: there is
+# no feed-shaped traffic to size it against, and a setting would carry the `None`/`0` = "off" spelling
+# every cap here accepts, which would restore the unbounded window through a supported value.
+# **This bounds how LONG an unhandshaken socket lives, not how MANY there are.** A peer that keeps
+# opening them still holds about its connect rate times this window, outside `max_connections`,
+# `max_connections_per_host` and `source_ip_allowlist`, which all act only in `_on_client`. When it
+# fires, asyncio aborts the socket and logs that only in debug mode, so nothing reaches the log.
+_TLS_HANDSHAKE_TIMEOUT = 10.0
+
+# Seconds a closed TLS connection waits for the peer's close_notify before the socket is dropped
+# (BACKLOG #1606). asyncio's default is 30 s, and it runs AFTER the handler has freed the connection's
+# `max_connections` slot, so a peer that never answered held each socket that long uncounted. Equal
+# to the shutdown grace, and named apart from it for the reason `_ACK_DRAIN_GRACE` gives: shortening
+# teardown in a test must not silently shorten this too. stop() does not wait for it; see stop().
+_TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
+
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
 #: consumers of it are a log line, a dead-letter row's ``last_error`` and an alert, each of which
@@ -1789,7 +1810,8 @@ class MLLPSource(SourceConnector):
         # Carried only so a pacing report can name this connection (BACKLOG #290).
         self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
-        # is not listed is refused at accept time. Absent/empty = no restriction.
+        # is not listed is refused when its connection reaches `_on_client` -- with TLS on, that is
+        # after the handshake (see _TLS_HANDSHAKE_TIMEOUT). Absent/empty = no restriction.
         sa = s.get("source_ip_allowlist")
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # WP-13b: per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file). Built
@@ -1826,8 +1848,19 @@ class MLLPSource(SourceConnector):
         # a load balancer / per-node ports distribute inbound connections), so there is no
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
+        # Bound both ends of a TLS socket's life outside `_on_client` (BACKLOG #1606): the handshake
+        # before it, and the close_notify exchange after writer.close(), which otherwise holds the
+        # socket open for asyncio's default of 30 s after its slot is freed. Only when there is TLS,
+        # because asyncio refuses both arguments without `ssl`. Read at start() so a test can shorten
+        # them.
+        tls = self._ssl is not None
         self._server = await asyncio.start_server(
-            self._on_client, self.host, self.port, ssl=self._ssl
+            self._on_client,
+            self.host,
+            self.port,
+            ssl=self._ssl,
+            ssl_handshake_timeout=_TLS_HANDSHAKE_TIMEOUT if tls else None,
+            ssl_shutdown_timeout=_TLS_SHUTDOWN_TIMEOUT if tls else None,
         )
 
     @property
@@ -1849,6 +1882,23 @@ class MLLPSource(SourceConnector):
         # await the connection tasks with a bounded grace and cancel any stragglers (review H-2).
         for writer in list(self._clients):
             writer.close()
+        # Then close every transport the SERVER tracks, a wider set than `_clients` (BACKLOG #1606).
+        # A TLS socket still in its handshake never reached `_on_client`, so the loop above cannot see
+        # it, and wait_closed() below waits for it -- so stop() spent its whole grace there and left
+        # the socket open behind it. This comes BEFORE the task wait: during that wait such a socket
+        # could otherwise finish its handshake, reach `_on_client` and have a message handled
+        # mid-stop. For an established client this closes the raw socket under the writer just
+        # closed; its close_notify is already queued, and close() sends what is queued before it
+        # closes, so stop() does not wait out `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is
+        # untouched, as with writer.close(). It awaits nothing, so it cannot wedge on the Proactor
+        # (#55).
+        if self._server is not None:
+            self._server.close_clients()
+        # One loop turn, so a client task created but not yet started (its handshake completed in
+        # the same turn stop() began) registers itself in `_client_tasks` and joins the wait below,
+        # rather than first running after stop() has returned. That narrows the window to asyncio's
+        # own scheduling; it does not claim to close every interleaving.
+        await asyncio.sleep(0)
         pending = [task for task in self._client_tasks if not task.done()]
         if pending:
             _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
