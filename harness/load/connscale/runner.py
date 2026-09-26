@@ -32,7 +32,7 @@ import logging
 import os
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -667,6 +667,7 @@ async def _run_one_step(
             in_hold_samples=in_hold_samples,
             in_hold_floor_ticks=in_hold_floor_ticks,
             proc_readings=proc_readings,
+            fd_probe_root_pid=pid,
             drain_seconds=drain_seconds,
             reload_seconds=reload_seconds,
             audit_live=audit_live,
@@ -1393,6 +1394,7 @@ def _build_record(
     audit_live: IntakeAudit | None = None,
     audit_final: IntakeAudit | None = None,
     reload_account: _ReloadAccount | None = None,
+    fd_probe_root_pid: int | None = None,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -1485,6 +1487,11 @@ def _build_record(
         fd_probe_ticks=proc.probe_ticks,
         fd_probe_degraded_ticks=proc.probe_degraded_ticks,
         fd_probe_degraded=proc.probe_degraded,
+        fd_count_peak_pids=proc.handles_peak_pids,
+        # The PID the harness spawned and the probe walked from, so a reader can anchor the set above:
+        # every other member is meant to descend from it (BACKLOG #1210). On a Windows venv it is the
+        # launcher shim, and the engine interpreter is its child.
+        fd_probe_root_pid=fd_probe_root_pid,
         in_hold_samples=in_hold_samples,
         in_hold_floor_ticks=in_hold_floor_ticks,
         reload_seconds=reload_seconds,
@@ -1498,6 +1505,7 @@ def _build_record(
         cpu_util_cores_peak=proc.cpu_util_cores_peak,
         cpu_util_cores_mean=proc.cpu_util_cores_mean,
         working_set_peak_bytes=proc.working_set_peak_bytes,
+        working_set_peak_pids=proc.working_set_peak_pids,
         fuse_thread_hops=fuse_mode,
         batch_handoff_statements=batch_mode,
         intake_audit=post,
@@ -1940,10 +1948,13 @@ _CPU_FLAT_GAP_SPAN_S = 5.0
 class _ProcDerived:
     """Derived process-footprint gauges over the window (each None where the OS probe couldn't read).
 
-    The last three fields are the window's probe PROVENANCE, not gauges: they say how much of the
-    window the OS probe actually measured and, where it did not, WHY. Without them a ``None`` gauge is
-    indistinguishable across a starved host, a dead process tree and a broken enumerator — three
-    conditions with three different verdicts."""
+    ``probe_ticks``, ``probe_degraded_ticks`` and ``probe_degraded`` are the window's probe
+    PROVENANCE, not gauges: they say how much of the window the OS probe actually measured and, where
+    it did not, WHY. Without those three a ``None`` gauge is indistinguishable across a starved host,
+    a dead process tree and a broken enumerator — three conditions with three different verdicts.
+
+    The two ``*_peak_pids`` fields are a second kind of provenance: which processes each peak was
+    summed over (BACKLOG #1210)."""
 
     handles_peak: int | None
     cpu_seconds_total: float | None
@@ -1959,6 +1970,29 @@ class _ProcDerived:
     #: :class:`ProbeDegraded` members, carried as plain strings so the report layer need not import
     #: the probe. Empty when every tick read something.
     probe_degraded: tuple[str, ...]
+    #: The PIDs the tick that set ``handles_peak`` summed over, sorted (BACKLOG #1210). ``None`` when
+    #: there is no peak, or when the peak tick did not record its set. Without it a five-figure handle
+    #: count at a small N reads the same whether the subtree genuinely grew or the walk adopted an
+    #: unrelated one, and the FD SLO draws a verdict either way.
+    handles_peak_pids: tuple[int, ...] | None
+    #: The same for ``working_set_peak_bytes``. Its own field, because the RSS peak can land on a
+    #: different tick from the FD peak, and on POSIX the two sums can cover different PIDs.
+    working_set_peak_pids: tuple[int, ...] | None
+
+
+def _peak_with_pids(
+    pairs: Iterable[tuple[int | None, frozenset[int] | None]],
+) -> tuple[int | None, tuple[int, ...] | None]:
+    """The largest reading and the PID set of the tick that produced it (BACKLOG #1210).
+
+    The set is the PEAK tick's own, never a union across the window or the last tick's: the question
+    it answers is "which processes made up this number", and only the tick that set the number can say.
+    ``max`` keeps the earliest of equal readings, so a tie resolves to the first tick that reached it."""
+    read = [(value, pids) for value, pids in pairs if value is not None]
+    if not read:
+        return None, None
+    peak, pids = max(read, key=lambda pair: pair[0])
+    return peak, (None if pids is None else tuple(sorted(pids)))
 
 
 def _derive_proc(readings: list[ProcReading]) -> _ProcDerived:
@@ -1987,10 +2021,14 @@ def _derive_proc(readings: list[ProcReading]) -> _ProcDerived:
     how many of those were full gaps, and the distinct causes behind them. The gauges alone cannot
     express the difference between "the host was too slow to answer" and "the enumerator returned zero
     rows" — both are ``None`` — and a consumer that has to choose a verdict needs exactly that."""
-    handles = [r.proc.handles for r in readings if r.proc.handles is not None]
-    working_set = [
-        r.proc.working_set_bytes for r in readings if r.proc.working_set_bytes is not None
-    ]
+    # Each peak travels with the PID set of the tick that set it (BACKLOG #1210), so the report can tell
+    # a genuinely larger subtree from an adopted one.
+    handles_peak, handles_peak_pids = _peak_with_pids(
+        (r.proc.handles, r.proc.handles_pids) for r in readings
+    )
+    ws_peak, ws_peak_pids = _peak_with_pids(
+        (r.proc.working_set_bytes, r.proc.working_set_pids) for r in readings
+    )
     # A CPU reading is usable only when both its counter AND the PID set it summed are known — the set
     # is what lets us tell a clean interval from a membership-changed one (#220).
     cpu_readings = [
@@ -1998,9 +2036,6 @@ def _derive_proc(readings: list[ProcReading]) -> _ProcDerived:
         for r in readings
         if r.proc.cpu_seconds is not None and r.proc.cpu_pids is not None
     ]
-
-    handles_peak = max(handles) if handles else None
-    ws_peak = max(working_set) if working_set else None
 
     # Probe PROVENANCE for the window. A gauge that reads None because the host was starved and one
     # that reads None because the enumerator is broken are the same value and opposite findings, so the
@@ -2024,6 +2059,8 @@ def _derive_proc(readings: list[ProcReading]) -> _ProcDerived:
             probe_ticks=probe_ticks,
             probe_degraded_ticks=len(degraded),
             probe_degraded=causes,
+            handles_peak_pids=handles_peak_pids,
+            working_set_peak_pids=ws_peak_pids,
         )
 
     cpu_total: float | None = None

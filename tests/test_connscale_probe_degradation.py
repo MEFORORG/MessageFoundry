@@ -296,6 +296,19 @@ def test_a_read_that_parses_rows_records_no_cause(monkeypatch: pytest.MonkeyPatc
     assert (got.handles, got.working_set_bytes, got.cpu_pids) == (61, 6_500_000, frozenset({4242}))
 
 
+def test_a_windows_read_names_the_parsed_rows_as_the_covering_set_of_every_sum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #1210 arm 2. One `Get-Process` row carries all three gauges, so one set covers all three
+    # sums. That set is the rows that PARSED: a malformed row adds nothing to any sum and must not be
+    # named as covered, and a requested PID that returned no row is not covered either.
+    rows = "61 10000000 6000000 100\ngarbage row\n200 20000000 1000 900\n"
+    _with_subprocess(monkeypatch, lambda cmd, **kw: _Completed(stdout=rows))
+    got = FdSampler(100)._sample_windows([100, 900, 901])
+    assert (got.handles, got.working_set_bytes) == (261, 6_001_000)
+    assert got.handles_pids == got.working_set_pids == got.cpu_pids == frozenset({100, 900})
+
+
 def test_a_posix_read_with_nothing_readable_records_read_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -467,6 +480,7 @@ def _record(
     degraded_ticks: int = 0,
     degraded: tuple[str, ...] = (),
     mode: str = "fixed_aggregate",
+    pids: tuple[int, ...] | None = (4100,),
 ) -> ConnScaleRecord:
     return ConnScaleRecord(
         sweep_mode=mode,
@@ -499,6 +513,10 @@ def _record(
         fd_probe_ticks=ticks,
         fd_probe_degraded_ticks=degraded_ticks,
         fd_probe_degraded=degraded,
+        # A measured peak names its covering set, as the runner now records it (BACKLOG #1210); a gap
+        # has no peak and so no set.
+        fd_count_peak_pids=None if fd is None else pids,
+        fd_probe_root_pid=4100,
     )
 
 
@@ -519,10 +537,19 @@ def test_an_older_artifact_without_the_provenance_still_builds_a_record() -> Non
     # unchanged -- and reads as "the probe did not run", which is distinct from "it ran and failed".
     # Constructed by OMITTING them rather than by reading their declared defaults, because the property
     # that matters is that such a call still succeeds, not that a default is written down somewhere.
-    added = ("fd_probe_ticks", "fd_probe_degraded_ticks", "fd_probe_degraded")
+    # The two BACKLOG #1210 peak-provenance fields default the same way, to None ("not recorded").
+    added = (
+        "fd_probe_ticks",
+        "fd_probe_degraded_ticks",
+        "fd_probe_degraded",
+        "fd_count_peak_pids",
+        "working_set_peak_pids",
+        "fd_probe_root_pid",
+    )
     legacy: dict[str, Any] = {k: v for k, v in vars(_record()).items() if k not in added}
     r = ConnScaleRecord(**legacy)
     assert (r.fd_probe_ticks, r.fd_probe_degraded_ticks, r.fd_probe_degraded) == (0, 0, ())
+    assert (r.fd_count_peak_pids, r.working_set_peak_pids, r.fd_probe_root_pid) == (None,) * 3
 
 
 def test_the_console_names_the_mechanism_beside_the_n_a() -> None:
@@ -558,6 +585,29 @@ def test_a_measured_record_is_asserted_exactly_as_strictly_as_before() -> None:
     _assert_fd_probe([_record(count=12, fd=100, ticks=6), _record(count=24, fd=110, ticks=6)])
     with pytest.raises(AssertionError):
         _assert_fd_probe([_record(count=12, fd=0, ticks=6), _record(count=24, fd=110, ticks=6)])
+
+
+def test_a_measured_peak_that_names_no_covering_set_fails() -> None:
+    # BACKLOG #1210 arm 2. A positive count with no record of the processes it summed is the anonymous
+    # reading that let a stale-ppid adoption stand as the engine's FD count. Both the missing set and
+    # an empty one fail: an empty set would claim a sum over no process at all.
+    for pids in (None, ()):
+        with pytest.raises(AssertionError, match="UNATTRIBUTED PEAK"):
+            _assert_fd_probe(
+                [_record(count=12, fd=100, pids=pids), _record(count=24, fd=110, ticks=6)]
+            )
+
+
+def test_a_measured_peak_with_no_walk_root_fails() -> None:
+    # The set's anchor is part of its provenance: without the PID the walk started from, a reader
+    # cannot tell which member the harness spawned. A set that lacks the root is NOT failed, though:
+    # every member is a validated descendant, so that shape is a partial read of the right subtree.
+    no_root = dataclasses.replace(_record(count=12, fd=100), fd_probe_root_pid=None)
+    with pytest.raises(AssertionError, match="UNATTRIBUTED PEAK"):
+        _assert_fd_probe([no_root, _record(count=24, fd=110, ticks=6)])
+    _assert_fd_probe(
+        [_record(count=12, fd=100, pids=(7310, 7311)), _record(count=24, fd=110, ticks=6)]
+    )
 
 
 def test_a_spent_budget_gap_is_tolerated_beside_a_comparable_pair() -> None:
