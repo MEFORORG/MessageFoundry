@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.config.db_lookup import DbLookupError
@@ -114,7 +114,7 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES, PEEK_READ_FAULTS
 from messagefoundry.parsing.sniff import (
     _content_matches_declared,
     attachment_mime_agrees,
@@ -492,6 +492,39 @@ _DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
 _PENDING_STOP_SETTLE_SECONDS = 10.0
 
 
+class _IngressFields(NamedTuple):
+    """The peek reads an ingress commit records, taken once (see :func:`_read_ingress_fields`)."""
+
+    control_id: str | None
+    message_type: str | None
+    summary: str | None
+
+
+def _read_ingress_fields(peek: Peek) -> _IngressFields:
+    """Read every peek value the ingress commit needs, once, inside the caller's parse guard.
+
+    A field read on an accepted peek is not expected to raise. When one did (the blank-segment
+    ``IndexError`` of BACKLOG #1594), the read sat between the parse guard and ``enqueue_ingress`` with
+    no catch, so the message got no row and no NAK. Taking the reads here, where the caller already
+    catches, turns any such fault into a recorded ``ERROR``.
+    """
+    return _IngressFields(peek.control_id, peek.message_type, summarize(peek) or None)
+
+
+def _peek_read_fault(ic: InboundConnection, exc: Exception) -> str:
+    """Log a faulting peek read and return its value-free ``ERROR`` detail (BACKLOG #1594).
+
+    Only the exception TYPE is recorded or logged: a parser fault's message text is not vetted, and
+    this detail reaches the store.
+    """
+    log.warning(
+        "inbound %r: a field read on an accepted HL7 peek raised %s; recording ERROR",
+        ic.name,
+        type(exc).__name__,
+    )
+    return f"parse error: peek read failed ({type(exc).__name__})"
+
+
 def _peek_for_loopback(
     ic: InboundConnection, body: str
 ) -> tuple[str | None, str | None, str | None, bool]:
@@ -499,14 +532,18 @@ def _peek_for_loopback(
     (ADR 0013 Increment 2, Q5) — the re-ingress worker's parsing step, kept in ``pipeline/`` (not the
     store) so the store stays parsing-free, exactly as ``_handle_inbound`` peeks before
     ``enqueue_ingress``. An HL7V2 loopback runs ``Peek.parse`` (``peek_failed=True`` on ``HL7PeekError``
-    → the child is recorded RECEIVED→ERROR, not dropped); any other ``content_type`` (x12/text/json) is
-    relayed verbatim as a ``RawMessage`` — no parse, ``message_type`` = the content_type value."""
+    or a faulting field read → the child is recorded RECEIVED→ERROR, not dropped); any other
+    ``content_type`` (x12/text/json) is relayed verbatim as a ``RawMessage`` — no parse,
+    ``message_type`` = the content_type value."""
     if ic.content_type is ContentType.HL7V2:
         try:
-            peek = Peek.parse(body)
+            fields = _read_ingress_fields(Peek.parse(body))
         except HL7PeekError:
             return None, None, None, True
-        return peek.control_id, peek.message_type, (summarize(peek) or None), False
+        except PEEK_READ_FAULTS as exc:
+            _peek_read_fault(ic, exc)
+            return None, None, None, True
+        return fields.control_id, fields.message_type, fields.summary, False
     return None, ic.content_type.value, None, False
 
 
@@ -5094,12 +5131,17 @@ class RegistryRunner:
         streaming_over = self._streaming_over_threshold(ic, text)
         try:
             peek = Peek.parse(text, max_bytes=peek_max_bytes)
-        except HL7PeekError as exc:
+            fields = _read_ingress_fields(peek)
+        except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
             await self.store.record_received(
                 channel_id=ic.name,
                 raw=text,
                 status=MessageStatus.ERROR,
-                error=f"parse error: {safe_exc(exc)}",
+                error=(
+                    f"parse error: {safe_exc(exc)}"
+                    if isinstance(exc, HL7PeekError)
+                    else _peek_read_fault(ic, exc)
+                ),
                 source_type=src,
             )
             return None
@@ -5155,10 +5197,10 @@ class RegistryRunner:
         mid = await self.store.enqueue_ingress(
             channel_id=ic.name,
             raw=skeleton,
-            control_id=peek.control_id,
-            message_type=peek.message_type,
+            control_id=fields.control_id,
+            message_type=fields.message_type,
             source_type=src,
-            summary=summarize(peek) or None,
+            summary=fields.summary,
             attachment_refs=attachment_refs or None,
         )
         self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
@@ -5377,8 +5419,14 @@ class RegistryRunner:
         streaming_over = self._streaming_over_threshold(ic, text)
         try:
             peek = Peek.parse(text, max_bytes=peek_max_bytes)
-        except HL7PeekError as exc:
-            parse_err = f"parse error: {safe_exc(exc)}"
+            # Every peek read the ingress commit needs, taken inside this guard (BACKLOG #1594).
+            fields = _read_ingress_fields(peek)
+        except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
+            if isinstance(exc, HL7PeekError):
+                parse_err, nak_text = f"parse error: {safe_exc(exc)}", str(exc)
+            else:
+                # Not a contract error: a parser fault. The NAK text is fixed, never the fault's own.
+                parse_err, nak_text = _peek_read_fault(ic, exc), "peek read failed"
             mid = await self.store.record_received(
                 channel_id=ic.name,
                 raw=text,
@@ -5386,7 +5434,7 @@ class RegistryRunner:
                 error=parse_err,
                 source_type=src,
             )
-            ack = build_ack(text, code="AR", text=str(exc), ack_mode=ack_mode) if reply else None
+            ack = build_ack(text, code="AR", text=nak_text, ack_mode=ack_mode) if reply else None
             if ack is not None and self._capture_ack_enabled(ic):
                 await self._capture_ack(
                     mid, ic.name, ack_code="AR", ack_phase="parse", ack_body=None, detail=parse_err
@@ -5513,10 +5561,10 @@ class RegistryRunner:
         mid = await self.store.enqueue_ingress(
             channel_id=ic.name,
             raw=skeleton,
-            control_id=peek.control_id,
-            message_type=peek.message_type,
+            control_id=fields.control_id,
+            message_type=fields.message_type,
             source_type=src,
-            summary=summarize(peek) or None,
+            summary=fields.summary,
             attachment_refs=attachment_refs or None,
         )
         self._wake_lane(
