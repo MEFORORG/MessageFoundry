@@ -6,7 +6,7 @@
 # It does NOT stop the fetch, check a hash, or pin hatchling's own dependencies; BACKLOG #1546 records
 # that residual and the `--no-isolation` form that would close it. Nothing is known to bump this table
 # automatically, so bump it by hand.
-requires = ["hatchling==1.32.0"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 # Single source of truth for the version: hatchling reads __version__ from the package module, so the
@@ -391,7 +391,7 @@ ci-scanners = [
 # job, and a `--require-hashes -r <file>` install cannot be subset, so there is no cheaper one-lock form.
 release-tools = [
     "build==1.6.1",
-    "cyclonedx-bom~=7.3.1",
+    "cyclonedx-bom>=7.3.1,<7.5.0",
     "sigstore==4.4.0",
 ]
 # The ADVISORY measurement tools (quality-advisory.yml). Exact where something PARSES the tool's
