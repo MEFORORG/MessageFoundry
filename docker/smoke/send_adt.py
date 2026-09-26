@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import sys
 
-from messagefoundry.transports.mllp import MLLPDecoder, frame
+from messagefoundry.mllpcodec import MLLPDecoder, frame
 
 # Synthetic ADT^A01 (no PHI). \r segment terminators, as HL7 requires.
 ADT_A01 = (

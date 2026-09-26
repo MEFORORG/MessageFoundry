@@ -25,9 +25,11 @@ authorization decision reads one.
 
 from __future__ import annotations
 
+import ast
 import pathlib
 
 import pytest
+from _ast_sites import find_funcs
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SECURITY_MD = _ROOT / "docs" / "SECURITY.md"
@@ -94,9 +96,14 @@ def test_the_engine_ships_a_time_of_day_evaluator_this_pattern_can_see() -> None
             f"with a pattern that has not been shown to match anything. Either the evaluator moved "
             f"-- retarget both halves -- or the spelling changed."
         )
-    assert "def contains" in models and "def is_active" in models, (
-        "the window evaluator's entry points are gone; re-derive this guard rather than trusting it"
-    )
+    # The entry points are CODE, so they are found in the AST, where a docstring cannot stand in
+    # for a deleted def (BACKLOG #1818). The symbol loop above stays textual on purpose: it is the
+    # positive control for the textual absence check below, so it must use the same instrument.
+    classes = {node.name: node for node in ast.parse(models).body if isinstance(node, ast.ClassDef)}
+    assert all(
+        owner in classes and find_funcs(classes[owner], method)
+        for owner, method in (("ActiveWindow", "contains"), ("Schedule", "is_active"))
+    ), "the window evaluator's entry points are gone; re-derive this guard rather than trusting it"
 
 
 @pytest.mark.parametrize("symbol", _WINDOW_SYMBOLS)

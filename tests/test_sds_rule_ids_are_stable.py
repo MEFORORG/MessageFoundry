@@ -397,8 +397,7 @@ def _citation_sources() -> list[Path]:
         *sorted((_REPO / "messagefoundry").rglob("*.py")),
         *sorted((_REPO / "scripts").rglob("*.py")),
     ]
-    seen: set[Path] = set()
-    return [p for p in paths if p.is_file() and not (p in seen or seen.add(p))]
+    return list(dict.fromkeys(p for p in paths if p.is_file()))  # order-preserving de-dup
 
 
 def test_every_cited_id_resolves(rules: list[Rule], retired: list[Retired]) -> None:

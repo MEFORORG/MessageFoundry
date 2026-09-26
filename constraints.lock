@@ -212,7 +212,7 @@ pytest==9.1.1
     #   pytest-xdist
 pytest-asyncio==1.4.0
     # via messagefoundry
-pytest-rerunfailures==16.6.1
+pytest-rerunfailures==16.7
     # via messagefoundry
 pytest-timeout==2.4.0
     # via messagefoundry

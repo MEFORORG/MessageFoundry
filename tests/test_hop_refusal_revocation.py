@@ -233,13 +233,27 @@ def test_guard_keeps_the_blanket_env_apart_from_the_per_connection_flag(
 
 
 def test_the_connection_refusal_names_only_levers_an_operator_can_set() -> None:
-    """SDS-3.7 applied to the connection-shaped refusal TEXT. It offered ``tls_revocation_attested=true
-    on this connection``, but no ``outbound()`` factory parameter or ``connections.toml`` key sets that
-    field, so the remedy could not be performed. ``[tls].crl_file`` is a real setting and must stay."""
+    """SDS-3.7 applied to the connection-shaped refusal TEXT: every lever it names must be settable.
+    PR 1502 removed ``tls_revocation_attested`` from this text because nothing could author it; the
+    owner ruled on 2026-09-24 to build the surface instead (ADR 0173 §1.5 item 4), so the lever is back
+    AND this test proves both the flag and its mandatory reason are real ``outbound()`` parameters and
+    ``connections.toml`` keys -- the pairing is what stops the text drifting ahead of the surface."""
+    import inspect
+
+    from messagefoundry.config.connections_file import _OUTBOUND_KEYS
+    from messagefoundry.config.wiring import outbound
+
     with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused) as exc:
         _guard(REMOTE).enforce_construction()
-    assert "[tls].crl_file" in str(exc.value)
-    assert "tls_revocation_attested" not in str(exc.value)
+    text = str(exc.value)
+    assert "[tls].crl_file" in text
+    assert "tls_revocation_attested=true" in text and "tls_revocation_attested_reason" in text
+    params = inspect.signature(outbound).parameters
+    for key in ("tls_revocation_attested", "tls_revocation_attested_reason"):
+        assert key in params, f"{key} is named in the refusal but outbound() cannot set it"
+        assert key in _OUTBOUND_KEYS, (
+            f"{key} is named in the refusal but connections.toml rejects it"
+        )
 
 
 def test_guard_audits_attestation_that_suppresses_prod_refusal(caplog) -> None:
@@ -258,6 +272,9 @@ def mllp_cfg(host: str, *, revocation_attested: bool = False, **over: object) ->
         type=ConnectorType.MLLP,
         settings=settings,
         tls_revocation_attested=revocation_attested,
+        tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
+        if revocation_attested
+        else None,
     )
 
 
@@ -366,6 +383,9 @@ def _build_https(spec: tuple[object, object, str], *, revocation_attested: bool 
             type=ctype,  # type: ignore[arg-type]
             settings=factory(url=url).settings,
             tls_revocation_attested=revocation_attested,
+            tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
+            if revocation_attested
+            else None,
         )
     )
 
@@ -518,7 +538,7 @@ def test_the_store_refusal_names_a_lever_that_exists_for_it() -> None:
         _build_ssl(_pg(), posture=PROD_PHI)
     assert "[store].ssl_crl_file" in str(exc.value)
     assert "[store].ssl_root_cert" in str(exc.value)
-    assert "tls_revocation_attested=true on this connection" not in str(exc.value)
+    assert "tls_revocation_attested" not in str(exc.value)
 
 
 def test_the_default_store_path_has_no_context_for_a_crl_to_reach(crl_bundle: str) -> None:
@@ -575,6 +595,9 @@ def email_cfg(host: str, *, revocation_attested: bool = False, **over: object) -
         type=ConnectorType.EMAIL,
         settings=settings,
         tls_revocation_attested=revocation_attested,
+        tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
+        if revocation_attested
+        else None,
     )
 
 
@@ -1048,7 +1071,7 @@ def test_the_forwarder_refusal_names_a_lever_that_exists_for_it(crl_bundle: str)
     with pytest.raises(InsecureHopRefused) as exc:
         _build_tls_context(_forward(REMOTE, crl_bundle))
     assert "[logging].forward_tls_crl_file" in str(exc.value)
-    assert "tls_revocation_attested=true on this connection" not in str(exc.value)
+    assert "tls_revocation_attested" not in str(exc.value)
 
 
 def test_a_default_context_already_carries_the_strict_flag_a_raw_one_does_not() -> None:
@@ -1243,4 +1266,4 @@ async def test_the_oidc_refusal_names_a_lever_that_exists_for_it() -> None:
     with pytest.raises(InsecureHopRefused) as exc:
         await _oidc_service()
     assert "[auth].oidc_tls_crl_file" in str(exc.value)
-    assert "tls_revocation_attested=true on this connection" not in str(exc.value)
+    assert "tls_revocation_attested" not in str(exc.value)

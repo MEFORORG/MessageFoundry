@@ -72,6 +72,7 @@ from messagefoundry.config.models import (
     StallThreshold,
     Validation,
     _check_cleartext_acceptance,
+    _check_revocation_attestation,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
@@ -750,6 +751,11 @@ def FhirLookup(
     # to name — a deviation the registry cannot see is a second posture by the back door.
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    # ADR 0173: the per-connection revocation attestation for this lookup's SMART token hop, the one
+    # verifying hop on a lookup that carries the revocation refusal. That refusal names this lever, so
+    # it must be authorable here too.
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
 ) -> FhirLookupSpec:
     """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
     ``fhir_lookup(name, query, params)`` — a **read-only** read-by-id (``fhir_lookup(name,
@@ -784,12 +790,18 @@ def FhirLookup(
     plus an audit record at every construction, and an entry in ``security_loosenings()`` /
     ``GET /security/posture`` naming this connection. Same flag/reason coherence rules as an
     ``outbound()``: the flag without a reason, a blank reason, or a reason without the flag all fail
-    loud at load."""
+    loud at load.
+
+    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) attest that a
+    revocation-checking PKI covers the SMART token endpoint this lookup signs in to, so an enforcing
+    instance does not refuse that verifying hop. Same coherence rules, and the reason is recorded in
+    the WARNING logged when the attestation suppresses the refusal."""
     _reject_envref_headers("FhirLookup", headers)
     # ADR 0153: coherence-checked at the ONE authoring surface, exactly as build_outbound_connection
     # does for an outbound, so the declaration cannot reach the read executor unvalidated.
     try:
         _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
+        _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
         raise WiringError(f"fhir lookup {name!r}: {exc}") from exc
     settings: dict[str, Any] = {
@@ -809,6 +821,10 @@ def FhirLookup(
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
         settings["cleartext_connection"] = name
+    if tls_revocation_attested:
+        # The same keys _dest_config mirrors for an outbound, read by token_provider_from_settings.
+        settings["tls_revocation_attested"] = True
+        settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
     spec = FhirLookupSpec(name, settings)
     _active_registry().add_fhir_lookup(spec)
     return spec
@@ -3816,6 +3832,13 @@ class InboundConnection:
     # still declare flagged=True in Python, but the console flag-toggle refuses it (no TOML home). Default
     # False → byte-identical. Code-first AND connections.toml.
     flagged: bool = False
+    # ADR 0173 §1.5 item 4: the operator attests a revocation-checking PKI covers this mTLS listener's
+    # client certificates OUTSIDE the engine, so check_inbound_revocation does not refuse it. Needs a
+    # written reason, recorded in the audit line where it suppresses that refusal. Top-level, like
+    # cleartext_accepted: a hop-policy declaration, not a transport setting. Code-first AND
+    # connections.toml; threaded onto the Source by _source_config.
+    tls_revocation_attested: bool = False
+    tls_revocation_attested_reason: str | None = None
     source_file: str | None = None  # where it was declared (for IDE go-to-definition)
     source_line: int | None = None
 
@@ -3886,6 +3909,12 @@ class OutboundConnection:
     # plaintext on a flat network. Outbound-only. Threaded to the Destination by _dest_config.
     cleartext_accepted: bool = False
     cleartext_reason: str | None = None
+    # ADR 0173 §1.5 item 4: the operator attests a revocation-checking PKI covers this VERIFYING TLS
+    # hop, so the RevocationHopGuard ALLOWs it on an enforcing instance -- audited at construction with
+    # the mandatory reason. A different claim from cleartext_accepted (that hop has no TLS at all).
+    # Threaded to the Destination by _dest_config.
+    tls_revocation_attested: bool = False
+    tls_revocation_attested_reason: str | None = None
     source_file: str | None = None
     source_line: int | None = None
 
@@ -5033,6 +5062,8 @@ def build_inbound_connection(
     priority: Priority | None = None,
     shard: str | None = None,
     flagged: bool = False,
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> InboundConnection:
@@ -5201,6 +5232,12 @@ def build_inbound_connection(
             f"stream_threshold_bytes ({stream_threshold_bytes}) — a lower cap rejects every message "
             "the threshold would detach"
         )
+    # ADR 0173: the revocation-attestation pair is coherence-checked at this shared choke point, so a
+    # flag with no reason fails at `messagefoundry check` / dry-run on either authoring surface.
+    try:
+        _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
+    except ValueError as exc:
+        raise WiringError(f"inbound connection {name!r}: {exc}") from exc
     if shard is not None and not shard.strip():
         # A present-but-blank shard tag would silently collapse into its own nameless shard (the
         # supervisor would spawn a subprocess named ""), a config footgun — fail loud at wiring so
@@ -5236,6 +5273,8 @@ def build_inbound_connection(
         priority=priority,
         shard=shard,
         flagged=flagged,
+        tls_revocation_attested=tls_revocation_attested,
+        tls_revocation_attested_reason=tls_revocation_attested_reason,
         source_file=source_file,
         source_line=source_line,
     )
@@ -5269,6 +5308,8 @@ def inbound(
     priority: Priority | None = None,
     shard: str | None = None,
     flagged: bool = False,
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
 ) -> None:
     """Declare an inbound connection that feeds every received message to ``router``.
 
@@ -5321,7 +5362,14 @@ def inbound(
     ``graph --json`` still see it) while the engine never builds it, never resolves its ``env()`` values
     and never runs it — so a retired or not-yet-live feed can stay in the config repo without failing the
     build or degrading the engine. It is stronger than ``auto_start=False`` (deployed, just not up right
-    now — startable at runtime) and **wins** over it. Also a ``connections.toml`` key."""
+    now — startable at runtime) and **wins** over it. Also a ``connections.toml`` key.
+
+    ``tls_revocation_attested`` (ADR 0173) declares that a revocation-checking PKI covers this mTLS
+    listener's client certificates **outside** the engine, so an enforcing instance does not refuse a
+    listener that sets ``tls_ca_file`` without ``tls_crl_file``. It needs a written
+    ``tls_revocation_attested_reason``, recorded in the WARNING audit line logged whenever the
+    attestation suppresses that refusal. Prefer ``tls_crl_file``, which checks revocation in the engine.
+    Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(
@@ -5351,6 +5399,8 @@ def inbound(
             priority=priority,
             shard=shard,
             flagged=flagged,
+            tls_revocation_attested=tls_revocation_attested,
+            tls_revocation_attested_reason=tls_revocation_attested_reason,
             source_file=file,
             source_line=line,
         )
@@ -5378,6 +5428,8 @@ def build_outbound_connection(
     waiting_display_delay: float = 0.0,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> OutboundConnection:
@@ -5392,6 +5444,7 @@ def build_outbound_connection(
     # Destination model re-validates it independently (defense in depth for a hand-built Destination).
     try:
         _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
+        _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
         raise WiringError(f"outbound connection {name!r}: {exc}") from exc
     if dead_letter_days is not None and dead_letter_days < 0:
@@ -5626,6 +5679,8 @@ def build_outbound_connection(
         waiting_display_delay=waiting_display_delay,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        tls_revocation_attested=tls_revocation_attested,
+        tls_revocation_attested_reason=tls_revocation_attested_reason,
         source_file=source_file,
         source_line=source_line,
     )
@@ -5652,6 +5707,8 @@ def outbound(
     waiting_display_delay: float = 0.0,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
 ) -> None:
     """Declare an outbound connection that Handlers can ``Send`` to.
 
@@ -5688,7 +5745,15 @@ def outbound(
     ("this hop *is* secure by means the engine cannot see", which ALLOWs), and the two are deliberately
     separate so the audit trail can tell a proxy-terminated hop from plaintext on a flat network. For
     ``Tcp()``/``X12()``, which have no TLS support at all, it is a **permanent, structural** declaration
-    — there is no ``tls = true`` for them to migrate to (BACKLOG #311). Also a ``connections.toml`` key."""
+    — there is no ``tls = true`` for them to migrate to (BACKLOG #311). Also a ``connections.toml`` key.
+
+    ``tls_revocation_attested`` (ADR 0173) declares that a revocation-checking PKI covers **this**
+    outbound's *verifying* TLS hop, which the engine cannot check itself (stdlib ``ssl`` has no
+    OCSP/CRL fetch). It lets the hop cross the revocation refusal under ``[security].enforcement =
+    enforce``, and needs a written ``tls_revocation_attested_reason``, recorded in the WARNING audit
+    line logged at every construction where it suppresses that refusal. It is a different claim from
+    ``cleartext_accepted`` and never reaches a cleartext or verify-off hop. Also a
+    ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_outbound(
         build_outbound_connection(
@@ -5711,6 +5776,8 @@ def outbound(
             waiting_display_delay=waiting_display_delay,
             cleartext_accepted=cleartext_accepted,
             cleartext_reason=cleartext_reason,
+            tls_revocation_attested=tls_revocation_attested,
+            tls_revocation_attested_reason=tls_revocation_attested_reason,
             source_file=file,
             source_line=line,
         )

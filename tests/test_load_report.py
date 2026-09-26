@@ -9,6 +9,7 @@ engine poller's sample parsing against a fake client.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.metrics import Counters, Histogram
@@ -340,7 +341,7 @@ def test_engine_poller_parses_sample_from_client() -> None:
     poller = EnginePoller("http://x", None, origin=0.0)
     # Single-shard parse: one client in the list (the cluster path sums many; see
     # tests/test_enginepoll_aggregate.py). _sample_sync reads self._clients, not the old _client.
-    poller._clients = [  # type: ignore[list-item]
+    fake_clients: list[Any] = [  # duck-typed EngineClient
         SimpleNamespace(
             stats=lambda: SimpleNamespace(
                 outbox_by_status={"pending": 2, "inflight": 1, "done": 50, "dead": 3},
@@ -357,6 +358,7 @@ def test_engine_poller_parses_sample_from_client() -> None:
             ),
         )
     ]
+    poller._clients = fake_clients
     sample = poller._sample_sync()
     assert sample is not None
     assert sample.read == 100  # only inbound row contributes read

@@ -16,12 +16,17 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import InternalErrorPolicy, OrderingMode, RetryPolicy
+from messagefoundry.config.models import (
+    ConnectorType,
+    InternalErrorPolicy,
+    OrderingMode,
+    RetryPolicy,
+)
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     InboundConnection,
     Registry,
+    Send,
 )
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
@@ -77,7 +82,7 @@ def _registry(
     inbox: Path,
     route: Callable[..., list[str]] = _route_h,
     names: tuple[str, ...] = ("IB", "IB_LIVE"),
-    handler: Callable[..., list[object]] = lambda m: [],
+    handler: Callable[..., list[Send]] = lambda m: [],
 ) -> Registry:
     """Inbounds on one router: IB (the lane under test) and IB_LIVE (the live-worker control)."""
     reg = Registry()
@@ -258,7 +263,7 @@ async def test_a_stopping_transform_worker_releases_its_tail(
     batch-claimed routed rows, the STOP policy fails that head, and the worker returns. The other
     two must be PENDING, and their claim's ``attempts`` increment undone."""
 
-    def boom(m: object) -> list[object]:
+    def boom(m: object) -> list[Send]:
         raise RuntimeError("handler content fault")
 
     reg = _registry(tmp_path / "in", names=("IB",), handler=boom)
@@ -347,7 +352,7 @@ async def test_a_lane_the_outbound_dispatcher_holds_is_not_touched(
 
     runner = RegistryRunner(Registry(), store, claim_mode="per_lane")
     runner._workers.update({"OB_HELD": await _returned_task(), "OB_FREE": await _returned_task()})
-    monkeypatch.setitem(runner._dispatchers, Stage.OUTBOUND, _HoldingDispatcher())  # type: ignore[arg-type]
+    monkeypatch.setitem(runner._dispatchers, Stage.OUTBOUND, _HoldingDispatcher())
     held_row = await _seed_inflight_outbound(store, "IB_ANY", "OB_HELD")
     free_row = await _seed_inflight_outbound(store, "IB_ANY", "OB_FREE")
 

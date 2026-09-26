@@ -127,15 +127,15 @@ class MessageSearchRequest(RequestModel):
     """
 
     content: SearchText | None = None
-    field_path: str | None = Field(None, max_length=32)
+    field_path: str | None = Field(default=None, max_length=32)
     field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
     channel_id: ConnectionName | None = None
     status: StatusFilter | None = None
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(50, ge=1, le=500)
-    scan_limit: int | None = Field(None, ge=1)
+    limit: int = Field(default=50, ge=1, le=500)
+    scan_limit: int | None = Field(default=None, ge=1)
 
 
 class MessageExportRequest(MessageSearchRequest):
@@ -144,7 +144,7 @@ class MessageExportRequest(MessageSearchRequest):
     to the export route's own ceiling."""
 
     ids: list[ResourceId] = Field(default_factory=list, max_length=MAX_EXPORT_IDS)
-    limit: int = Field(1000, ge=1, le=100_000)
+    limit: int = Field(default=1000, ge=1, le=100_000)
 
 
 class UploadedMessageSearchRequest(RequestModel):
@@ -153,13 +153,13 @@ class UploadedMessageSearchRequest(RequestModel):
     :class:`MessageSearchRequest` rather than a subclass of it."""
 
     content: SearchText | None = None
-    field_path: str | None = Field(None, max_length=32)
+    field_path: str | None = Field(default=None, max_length=32)
     field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(50, ge=1, le=500)
-    offset: int = Field(0, ge=0)
+    limit: int = Field(default=50, ge=1, le=500)
+    offset: int = Field(default=0, ge=0)
 
 
 class OutboxInfo(PhiGatedModel):
@@ -511,7 +511,16 @@ class ConnectionRow(BaseModel):
     """One endpoint (a channel's source, or one of its destinations) for the connections
     dashboard. Fields are role-dependent: source rows carry read/inbound-errored/idle and the
     listen peer/port; destination rows carry queue/written/dead/backlog/delivered-age and the
-    remote peer/port. Unused fields are None so the UI can render blanks."""
+    remote peer/port. Unused fields are None so the UI can render blanks.
+
+    On a count, ``0`` means "measured as zero" and ``None`` means "not measured on this row". ``None``
+    never stands in for a zero (BACKLOG #1817). A count is ``None`` in at least these cases: the field
+    does not apply to this row's role, or the row is a standalone destination row (its outbound has no
+    edge row here) and the outbound has live traffic from an inbound this node does not run. A
+    standalone row whose outbound has no such traffic reports ``0``. A standalone row never reports
+    ``idle_seconds`` or ``delivered_age_seconds``, and on one ``backlog_seconds`` is ``0.0`` beside a
+    measured zero and ``None`` beside ``None`` counts. On an edge row, ``backlog_seconds`` ``None``
+    means queued with nothing draining, which can be a stall."""
 
     role: str  # "source" | "destination"
     channel_id: str
@@ -523,7 +532,8 @@ class ConnectionRow(BaseModel):
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
     port: int | None
-    queue_depth: int | None
+    queue_depth: int | None  # destination only: pending + inflight now
+    # Seconds since the last receipt (source) or the last delivery (destination); None = none yet.
     idle_seconds: float | None
     alerts_active: int  # count of OPEN alert instances for this connection (ADR 0044, #56)
     errored: int | None  # source: inbound errors; destination: dead-lettered
@@ -1576,14 +1586,14 @@ class SearchPresetCriteria(RequestModel):
     rest and every save/recall is step-up-gated + audited."""
 
     content: SearchText | None = None
-    field_path: str | None = Field(None, max_length=32)
+    field_path: str | None = Field(default=None, max_length=32)
     field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
     channel_id: ConnectionName | None = None
     status: StatusFilter | None = None
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(50, ge=1, le=500)
+    limit: int = Field(default=50, ge=1, le=500)
 
 
 class SearchPresetInfo(BaseModel):

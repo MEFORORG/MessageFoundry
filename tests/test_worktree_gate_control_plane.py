@@ -2020,7 +2020,7 @@ def test_a_pwsh_LAUNCH_timeout_is_reported_as_its_own_event(
     def never_returns(*args: object, **kwargs: object) -> None:
         raise subprocess.TimeoutExpired(cmd="pwsh", timeout=harness.GATE_TIMEOUT_S)
 
-    monkeypatch.setattr(harness.subprocess, "run", never_returns)
+    monkeypatch.setattr("tests.test_worktree_gate.subprocess.run", never_returns)
     with pytest.raises(AssertionError) as caught:
         run_gate(shell("git config core.hooksPath /nope", cwd=repo.wt), repo.repos)
 

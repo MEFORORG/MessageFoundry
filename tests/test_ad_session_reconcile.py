@@ -893,7 +893,7 @@ async def test_a_rename_and_a_role_change_in_one_pass_record_one_consistent_name
         ldap = _FakeLdap({"jdoe": _principal("jdoe", "cn=mf-admins,dc=test,dc=invalid")})
         service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
         notifier = _CapturingNotifier()
-        service._security_notifier = notifier  # type: ignore[assignment]
+        service._security_notifier = notifier
         await service.initialize()
         await service.set_ad_group_map([("cn=mf-admins,dc=test,dc=invalid", "operator")], actor="t")
         token = await _signed_in_ad_user(service, store, "jdoe")

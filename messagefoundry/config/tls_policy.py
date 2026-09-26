@@ -1577,13 +1577,10 @@ def revocation_hop_disposition(
 #: inheriting levers it cannot use (BACKLOG #1498). Deliberately **not** annotated with how many
 #: hops consume it: that is the hardened-count liability SDS-3.6 names, and this very change moved
 #: four documents off such a count. Find the consumers by symbol.
-#:
-#: It names no per-connection ``tls_revocation_attested``. That field is read by the guard but has
-#: no factory parameter and no ``connections.toml`` key, so an operator cannot set it, and
-#: docs/DEPLOYMENT.md forbids offering such a field as a lever (SDS-3.7).
 _CONNECTION_WAYS_ACROSS = (
-    "Configure [tls].crl_file so the engine checks a CRL on this hop, or terminate at a "
-    "revocation-checking egress proxy."
+    "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
+    "revocation-checking egress proxy, or set tls_revocation_attested=true with a "
+    "tls_revocation_attested_reason on this connection."
 )
 
 
@@ -1623,6 +1620,10 @@ class RevocationHopGuard:
     #: refusal whose remedy cannot be performed, which is the SDS-3.7 false-premise defect wearing a
     #: helpful voice. A non-connection hop passes the setting that actually closes its own gate.
     ways_across: str | None = None
+    #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
+    #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
+    #: a hop that carries no per-connection attestation.
+    attested_reason: str | None = None
 
     @classmethod
     def capture(
@@ -1636,6 +1637,7 @@ class RevocationHopGuard:
         context: ssl.SSLContext | None = None,
         posture: HopPosture | None = None,
         ways_across: str | None = None,
+        attested_reason: str | None = None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -1669,6 +1671,7 @@ class RevocationHopGuard:
             blanket_attested=tls_revocation_attested(),
             crl_checked=context_checks_revocation(context),
             ways_across=ways_across,
+            attested_reason=attested_reason,
         )
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
@@ -1718,9 +1721,13 @@ class RevocationHopGuard:
         ):
             logger.warning(
                 "verified TLS hop crossed WITHOUT certificate revocation checking on operator "
-                "attestation — %s: %s",
+                "attestation — %s: %s (reason: %s)",
                 self.cell,
                 self._detail(),
+                # A proven terminator ALLOWs without any per-connection attestation, so say which.
+                (self.attested_reason or "(none provided)")
+                if self.attested
+                else "revocation proven by a declared egress terminator",
             )
         enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
 
