@@ -68,11 +68,11 @@ from messagefoundry.store.base import (
     resolve_active_key,
     resolve_decrypt_keys,
 )
+from messagefoundry.store.cipher_cells import COMPOSITE_CIPHER_CELLS, CipherCell
 from messagefoundry.store.crypto import (
     MARKER_PREFIX,
     CipherError,
     StoreKeylessError,
-    cell_aad,
 )
 
 __all__ = [
@@ -1301,34 +1301,43 @@ def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[str, str, int]:
     same cell-bound AAD the store writes (ASVS 11.3.3), so a ciphertext moved between cells fails its tag
     here exactly as it would at a live read.
 
-    The cell list is the store's own ``MessageStore._CIPHER_COLUMNS`` — what the store declares
-    encrypted-at-rest — rather than a list invented here, so a column added to the cipher's coverage is
-    covered by this pass without a second edit. Its cipher-covered tables whose AAD binds to a
-    composite/natural key (``response``, ``state``, ``reference``, ``shared_body``, ``attachment_chunk``,
-    ``message_events``, ``connection_event``, ``alert_instance``) are NOT in that tuple and are therefore
-    out of scope here: each is a bespoke pass inside the store rather than data any caller can read.
-    Widening this means giving the store one declaration to publish, not copying its private passes into
-    this module."""
+    The cell list is the store's own ``MessageStore._CIPHER_COLUMNS`` (the id-keyed cells) plus
+    :data:`~messagefoundry.store.cipher_cells.COMPOSITE_CIPHER_CELLS` (the cells whose AAD binds a
+    composite or natural key: ``response``, ``state``, ``reference``, ``shared_body``,
+    ``attachment_chunk``, ``message_events``, ``connection_event``, ``alert_instance``). Both are
+    declared beside the store rather than here, and a parity test pins the second to the ``cell_aad``
+    calls in ``store.py``, so a cell added to the cipher's coverage cannot be missed by this pass
+    (BACKLOG #1719). A failure names the table, column and SQLite ``rowid``: never a key column, which
+    for ``state`` or ``reference`` can itself be PHI."""
     import sqlite3
 
     cipher = build_store_cipher(settings)
+    specs = (
+        *(CipherCell(table, column, ("id",)) for table, column in MessageStore._CIPHER_COLUMNS),
+        *COMPOSITE_CIPHER_CELLS,
+    )
     cells = 0
     conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
     try:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for table, column in MessageStore._CIPHER_COLUMNS:
+        for spec in specs:
+            table, column = spec.table, spec.column
             if table not in tables:
                 continue  # an older snapshot predating the table — not a verify failure
             names = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}  # constant table
-            if column not in names or "id" not in names:
+            if column not in names or not names.issuperset(spec.aad_columns):
                 continue
-            # table/column are constants from _CIPHER_COLUMNS; only the marker prefix is a parameter.
+            # table/column/key names are declared constants; only the marker prefix is a parameter.
+            keys = ", ".join(spec.aad_columns)
             rows = conn.execute(
-                f"SELECT id, {column} FROM {table} WHERE {column} LIKE ?", (f"{MARKER_PREFIX}%",)
+                f"SELECT rowid, {keys}, {column} FROM {table} WHERE {column} LIKE ?",
+                (f"{MARKER_PREFIX}%",),
             )
-            for row_id, stored in rows:
+            for rowid, *key, stored in rows:
                 try:
-                    plain = cipher.decrypt(str(stored), aad=cell_aad(table, column, row_id))
+                    plain = cipher.decrypt(
+                        str(stored), aad=spec.aad(dict(zip(spec.aad_columns, key, strict=True)))
+                    )
                 except CipherError as exc:
                     # FAIL, not KEY_MISMATCH: CipherError cannot separate a corrupted ciphertext from a
                     # key that was never supplied, and the keyring here is not empty (the keyless case
@@ -1336,7 +1345,7 @@ def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[str, str, int]:
                     # the reading that must not be talked down.
                     return (
                         "FAIL",
-                        f"{table}.{column} id={row_id} did not decrypt: {safe_exc(exc)}",
+                        f"{table}.{column} rowid={rowid} did not decrypt: {safe_exc(exc)}",
                         cells,
                     )
                 if cipher.is_encrypted(plain):
