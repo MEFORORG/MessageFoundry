@@ -1,6 +1,6 @@
 # 0098 — Four store-side scaling levers are measured dead ends
 
-> ⚠️ **TITLE CORRECTION (2026-07-12, same day).** The allocated filename still reads
+> **TITLE CORRECTION (2026-07-12, same day).** The allocated filename still reads
 > *"…transaction amortization is the only path to 45M/day."* **That title was WRONG and is withdrawn.** It asserted a
 > *positive* conclusion ("txn amortization is the path") that this ADR's evidence **does not support** — an
 > **elimination inference**: rule out four levers, crown the survivor. That is the precise error class
@@ -40,7 +40,7 @@ otherwise.** The last three are decisive and are the basis of this ADR:
 | run | question | result |
 |---|---|---|
 | **C5** | how hard can ONE shard be driven at N=8, latch-free? | **`R ∈ [2, 3)`** — 2/shard sustains; **3/shard collapses, reproduced**. The rate a cleared N=16 would need is **3.62/shard**. → **`R < 3.62`.** |
-| **C6** | is the collapse blocked on a resource **convoy**? | **AMBIGUOUS-STRUCTURAL.** The convoy floor was met in **0 of 288 samples**; largest suspended group **2**; max blocking-chain depth **1**. **No lock CONVOY, no shared latch/page CONVOY, no memory-grant CONVOY, no spill CONVOY.** ⚠️ **Keep the word "convoy."** The detector samples `dm_os_waiting_tasks` at a **10 s cadence** and is **blind by construction to any non-shared cost** — a per-query spill, a per-call CPU cost or scheduler queueing **cannot form a convoy** and would always return this null. **"No convoy observed" ≠ "not a spill."** |
+| **C6** | is the collapse blocked on a resource **convoy**? | **AMBIGUOUS-STRUCTURAL.** The convoy floor was met in **0 of 288 samples**; largest suspended group **2**; max blocking-chain depth **1**. **No lock CONVOY, no shared latch/page CONVOY, no memory-grant CONVOY, no spill CONVOY.** **CAUTION: keep the word "convoy."** The detector samples `dm_os_waiting_tasks` at a **10 s cadence** and is **blind by construction to any non-shared cost** — a per-query spill, a per-call CPU cost or scheduler queueing **cannot form a convoy** and would always return this null. **"No convoy observed" ≠ "not a spill."** |
 | **C7** | is the ceiling a **parallelism** config default? | **`MAXDOP=1` refuted as a removable cause — and parallelism is LOAD-BEARING.** DB-scoped `MAXDOP=1` made the collapse **worse** (49.4% → 20.6% delivered) **and degraded the N=8@2 rung** (→ 75.7%, 28,106 stranded) — against a baseline for that rung that is itself run-to-run variable (0–3,175 stranded). Direction credible; cross-session, no same-session control. |
 
 **C5 is decisive, not a rig artifact.** The pre-registered co-constraint bar is **85% `max_core%`, checked against
@@ -74,14 +74,14 @@ and no store-side tuning changes the count of them.
 1. **More engine shards (N-sizing) — DEAD as a standalone path.** C5: `R ∈ [2,3) < 3.62`. Even a *fully cleared* N=16
    would still miss 520.83 events/s. Adding shards cannot get there.
 2. **A contention / lock-granularity fix — NOT PURSUED.** C6 observed **no convoy** — no lock, latch, page, grant or
-   spill **convoy** — so there is no shared-resource blocker for such a fix to remove. ⚠️ **This is a null from an
+   spill **convoy** — so there is no shared-resource blocker for such a fix to remove. **CAUTION: this is a null from an
    instrument with two stated blind spots** (non-shared costs; a 10 s sampling cadence whose minimum detectable
    convoy duration was never established). **"No convoy observed" is not "there is nothing there,"** and it says
    nothing about a *per-query* spill. Not pursued — not proven absent.
 3. **A single-query CPU rewrite — NOT SUPPORTED, on cost and risk.** This covers the `claim_fifo_heads` rewrite, the
    `list_fifo_lanes` rewrite, **and** the whole-`StageDispatcher` lane-servicing-path rewrite. C6 observed **no
    convoy** to target, and **C5 showed the ceiling is below target even if one were removed** — that second leg is
-   the load-bearing one and it is artifact-backed. ⚠️ **The "claim-only rewrite is PROVEN insufficient" claim is
+   the load-bearing one and it is artifact-backed. **WARNING: the "claim-only rewrite is PROVEN insufficient" claim is
    WITHDRAWN.** It rested on C4's family map (claim #2 at 40.33%, behind `list_fifo_lanes` at 47.46%) plus a §3d
    coupling computation — but **C4's own reconciliation gate failed** (*"family precedence is not authoritative at
    any N"*), **§3d isolates only the per-read factor** while the dominant **4.3× read-count growth remains
@@ -89,7 +89,7 @@ and no store-side tuning changes the count of them.
    cost and risk. It is **not a proof.** **[ADR 0071](0071-cut-executor-round-trips-b5.md) is the cautionary
    precedent** — a prior fusion/round-trip-cut that was a **NO-GO to promote** and ships default-OFF.
 4. **`MAXDOP=1` (DB-scoped, at N=8 on this workload) — DEAD, and actively harmful.** C7: serial plans made things
-   worse and degraded a rung that passes under the default. **Do not set `MAXDOP=1` on the store.** ⚠️ **Scope: C7
+   worse and degraded a rung that passes under the default. **Do not set `MAXDOP=1` on the store.** **Scope: C7
    refutes `MAXDOP=1`, not the parallelism-tuning class.** MAXDOP=2/4, cost-threshold tuning and query hints are
    **UNTESTED** — and *"parallelism is load-bearing"* is what keeps them live.
 
@@ -149,7 +149,7 @@ happens next.** Do not read "last man standing" as "the answer."
 - **C7 is a standing warning that an intervention can make things WORSE.** `MAXDOP=1` was a plausible, cheap,
   well-reasoned change that *hurt*. Group-commit must be default-OFF and cleanly backoutable.
 - **The remaining gap is large — and larger than the raw number says.** Best *sustained* pooled fleet measured to
-  date is **144.0 events/s RAW** (C3 config, N=8 × 2/shard × 9) against a 520.83 target = 3.62× short. ⚠️ **RAW is
+  date is **144.0 events/s RAW** (C3 config, N=8 × 2/shard × 9) against a 520.83 target = 3.62× short. **WARNING: RAW is
   not PUBLISHABLE.** Under the project's **D4 publish rule** (*publish at ≤50% of the measured ceiling* —
   `docs/benchmarks/shardcert-ceiling-ladder.md`), the **publishable capability is 72.0 events/s and the honest gap
   is 7.23×.** **Quote 72.0 / 7.23×, not 144.0 / 3.62×.** *(The 3.62/shard **bar** C5 was tested against is derived
@@ -180,7 +180,7 @@ happens next.** Do not read "last man standing" as "the answer."
       against the PEAK**: the c5-b collapse **peaked at 59.7%** (mean 39.5 / p95 50.5) with the load-gen at **8.5%
       peak**; the carve-out did not fire (C5 §3.2). *(An earlier draft quoted the **mean** (~38%) against the bar —
       corrected. Always check the peak.)*
-- [x] Was a convoy **observed**? — **No.** 0/288 samples met the floor (C6). ⚠️ *Observed*, not *excluded*: the
+- [x] Was a convoy **observed**? — **No.** 0/288 samples met the floor (C6). **NOTE:** *Observed*, not *excluded*: the
       detector is blind to non-shared costs and samples at a 10 s cadence.
 - [x] Is it a parallelism config default? — **`MAXDOP=1` is not, and forcing serial plans is harmful** (C7).
       *(MAXDOP=2/4 and cost-threshold tuning remain UNTESTED.)*

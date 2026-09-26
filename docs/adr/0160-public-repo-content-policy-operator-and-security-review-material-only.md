@@ -33,7 +33,7 @@ came with it: remove Claude-Code plan-usage material, and stop citing `login.mic
 **None of that was in the repository.** A session grepped every local and remote ref for it and found
 nothing. That is the defect this ADR fixes, and the reason it is filed at all.
 
-⚠️ **It was enforced before it was recorded, and that is the part worth naming.** The coordinating
+**NOTE: it was enforced before it was recorded, and that is the part worth naming.** The coordinating
 session cited this policy as a constraint on four other sessions' work while it existed only in one
 conversation. That is precisely the standing that same session had **refused** from a peer earlier the
 same day — declining to arm a PR on a relayed owner ruling — so the rule was applied to others and not
@@ -95,7 +95,7 @@ were tracked in the **repository root** — session handoffs in the project's fr
 covered by a `/HANDOFF-*.md` rule rather than by their two filenames, so the next one fails closed
 instead of waiting to be noticed. **103 files** in total.
 
-⚠️ **A 104th followed, and the shape is the lesson.** `docs/releases/HANDOFF-232-router-steps.md`
+**NOTE: a 104th followed, and the shape is the lesson.** `docs/releases/HANDOFF-232-router-steps.md`
 entered `main` via **PR #225** *while the Phase 1 PR was open*. Phase 1 removed 101 paths **named
 individually**, so a file created after that commit was built was never in the list — and a
 `.gitignore` rule **does not untrack**, so `/docs/releases/` left it behind and the directory came
@@ -112,7 +112,7 @@ Gitignoring alone would have left 103 files as single **unversioned** copies —
 backup, erased by `git clean -xdf`. "Move to the vault" and "gitignore" are not alternatives: the
 first provides durability, the second keeps the paths working in place. Both were done.
 
-⚠️ **The inbound-citation surface is 23 files, and a single grep finds at most two thirds of it.**
+**CAUTION: the inbound-citation surface is 23 files, and a single grep finds at most two thirds of it.**
 Measured at `c90dcb5f`, excluding the directory itself:
 
 | Citation form | Files | Note |
@@ -150,7 +150,7 @@ because `tests/test_private_paths_stay_ignored.py` is the guard for exactly thos
 only under pytest). So `code=true` follows from the mechanism itself, not from which incidental
 files a phase happens to touch. **Confirmed on this PR rather than assumed.**
 
-⚠️ **`tests/test_feature_map_claims.py` is the guard for dangling links, and gitignore-in-place makes
+**WARNING: `tests/test_feature_map_claims.py` is the guard for dangling links, and gitignore-in-place makes
 it BLIND LOCALLY.** It resolves each relative link against the **filesystem**. Under this decision the
 removed files are still **on disk** (ignored, not deleted), so in any working tree the targets still
 `exist()` and the check passes on links that would 404 for a reader. Measured while executing Phase 1:
@@ -305,7 +305,7 @@ test docstring naming a path a reader would try to open. ⛔ **ADR 0160's own ci
 "cleaned"** — this is the ADR that removed the directory, and the paths are the evidence.
 
 **2. Twenty-two handoff DOCUMENTS outside `docs/releases/`** — 21 under `docs/benchmarks/`, one at
-`docs/quality-gates/HANDOFF-mutation-coverage.md`. ⚠️ A name-based sweep reports **155** matches
+`docs/quality-gates/HANDOFF-mutation-coverage.md`. **CAUTION:** a name-based sweep reports **155** matches
 here; **133 of those are benchmark DATA files** (json/txt) that merely sit inside directories named
 `HANDBACK_*`. Overstating the finding six-fold is the first trap. The second is that the bench
 handoffs carry the **measurement narrative** for the data beside them — removing them strips the
@@ -489,7 +489,7 @@ exercise it, so the check requires creating a real Claude Code worktree. It matt
 missing `alloc.ps1` means no ADR/BACKLOG number can be allocated — which the ledger gate turns into
 a **refused commit**.
 
-⚠️ **A third hazard applies to any phase, and Phase 1 CONFIRMED it rather than predicting it.**
+**WARNING: a third hazard applies to any phase, and Phase 1 CONFIRMED it rather than predicting it.**
 `git rm --cached` spares only the tree it runs in. Rebasing the Phase 1 branch onto `main` **deleted
 `docs/releases/` and both root handoffs from the working tree** — the same thing that happens to the
 primary and to every active worktree (52 at the time) when the removal lands. For documents that is

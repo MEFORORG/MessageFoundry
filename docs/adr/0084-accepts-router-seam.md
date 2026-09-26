@@ -73,7 +73,7 @@ This is the one semantic the owner must rule on, stated plainly.
 
 **What this ratification does and does not authorize.** It settles the *semantics* so the build lane is unblocked. It does **not** authorize the engine build — that remains BACKLOG #213, and the open items in §9 (predicate signature, payload sharing, hot-path cost, error-classification exactness) must still be resolved there.
 
-> ⚠️ **Sizing note added 2026-07-11 (why this seam now matters more, not less).** The capacity frontier
+> **Sizing note added 2026-07-11 (why this seam now matters more, not less).** The capacity frontier
 > (`docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` §8) establishes that clearing N=16 is **necessary but not
 > sufficient**: even a fully successful pooled-claim rewrite leaves the fleet ~1.81× short of 520.83 events/s at
 > the swept load. So the `txn/event` levers — this seam chief among them (estate 4.64 → 3.55 txn/event; ADT hub
