@@ -136,12 +136,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 - **BREAKING — the `Http()` inbound listener answers 422 to a body it refuses at ingress.** The
-  engine refuses a body after reading it when it cannot be decoded, carries a NUL, is over the ingress
-  ceiling, does not match its `content_type`, or fails an HL7 parse or strict validation. The receipt
+  engine refuses some bodies after reading them, for example one it cannot decode or one over the
+  ingress ceiling; `docs/CONNECTIONS.md` lists more. The receipt
   path answered that `202` with no `message_id`, which told the caller its body was accepted. It now
   answers `422` with `{"error":"message was not accepted"}`, the answer a `reply_from` inbound already
   gave. The message is still recorded with status `ERROR`. A committed body still gets `202` with its
-  `message_id`. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
+  `message_id`. On a `reply_from` inbound, that `422` now logs a `closed` connection event, which it
+  used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
 - **The Python engine client now ends the session a new sign-in replaces.** `EngineClient.login`
