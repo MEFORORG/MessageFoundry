@@ -72,7 +72,11 @@ async def test_the_v032_search_presets_table_is_refused(tmp_path: Path) -> None:
         "index 'ux_search_presets_owner_name' is on search_presets(owner, name) [unique],"
         " expected on search_presets(owner_user_id, name) [unique]"
     ) in text
-    assert "Recreate it" in text
+    # The remedy leads, because the paths that print an uncaught error cut it at about 200 chars.
+    assert text.startswith(
+        f"store {db} was created by an incompatible version and must be recreated"
+    )
+    assert isinstance(info.value, sqlite3.DatabaseError)  # so the CLI reports it and exits 2
     # Only search_presets differs from what this version builds, so nothing else is named.
     assert text.count("table '") == 1 and text.count("index '") == 1
 
@@ -87,6 +91,61 @@ async def test_the_refusal_releases_the_file_so_the_remedy_works(tmp_path: Path)
         if side.exists():
             side.rename(side.with_name(side.name + ".old"))
     await _fresh(db)
+
+
+async def test_a_refusal_rolls_the_migrations_back(tmp_path: Path) -> None:
+    # The pre-ADR-0060 FIFO index is one _migrate DROPs. Refused, the store must still hold it, so the
+    # file the remedy sets aside is the one the old version wrote rather than a half-upgraded one.
+    db = tmp_path / "rollback.db"
+    await _fresh(db)
+    _sql(
+        db,
+        "DROP TABLE search_presets;"
+        + _V032_SEARCH_PRESETS
+        + "CREATE INDEX ix_queue_fifo_in ON queue(stage, channel_id, created_at);",
+    )
+    with pytest.raises(SchemaMismatchError):
+        await MessageStore.open(db)
+    conn = sqlite3.connect(db)
+    try:
+        left = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'ix_queue_fifo_in'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert left == [(1,)]
+
+
+async def test_an_integer_primary_key_that_lost_its_row_id_is_refused(tmp_path: Path) -> None:
+    # CREATE TABLE AS SELECT keeps the columns and drops the key, so `id` stops being the row id and a
+    # new row gets NULL. No index exists to miss: an INTEGER PRIMARY KEY never has one.
+    db = tmp_path / "rowid.db"
+    await _fresh(db)
+    _sql(
+        db,
+        "CREATE TABLE ce_copy AS SELECT * FROM connection_event;"
+        " DROP TABLE connection_event;"
+        " ALTER TABLE ce_copy RENAME TO connection_event;",
+    )
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db)
+    assert "table 'connection_event' column 'id' is not its INTEGER PRIMARY KEY" in str(info.value)
+
+
+async def test_an_index_with_a_different_collation_is_refused(tmp_path: Path) -> None:
+    db = tmp_path / "coll.db"
+    await _fresh(db)
+    _sql(
+        db,
+        "DROP INDEX ix_queue_fifo_in_seq;"
+        " CREATE INDEX ix_queue_fifo_in_seq ON queue(stage, channel_id COLLATE NOCASE, status DESC);",
+    )
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db)
+    assert (
+        "index 'ix_queue_fifo_in_seq' is on queue(stage, channel_id COLLATE NOCASE, status DESC),"
+        " expected on queue(stage, channel_id, status)"
+    ) in str(info.value)
 
 
 async def test_an_index_name_taken_on_another_table_is_refused(tmp_path: Path) -> None:
@@ -162,7 +221,7 @@ def _shape(
     constraint: set[IndexShape] | None = None,
 ) -> SchemaShape:
     return SchemaShape(
-        {t: frozenset(c) for t, c in columns.items()}, named or {}, frozenset(constraint or ())
+        {t: frozenset(c) for t, c in columns.items()}, {}, named or {}, frozenset(constraint or ())
     )
 
 
@@ -184,3 +243,15 @@ def test_a_constraint_index_is_matched_by_shape_not_by_name() -> None:
     assert schema_differences(expected, _shape({"t": {"a", "b"}})) == [
         "table 't' is missing the constraint index on t(a, b) [unique]"
     ]
+
+
+async def test_a_table_whose_name_starts_with_sqlite_is_still_read(tmp_path: Path) -> None:
+    # `_` is a LIKE wildcard: an unescaped 'sqlite_%' would drop this table from the expected shape.
+    import aiosqlite
+
+    from messagefoundry.store.schema_verify import read_schema_shape
+
+    async with aiosqlite.connect(":memory:") as db:
+        await db.execute("CREATE TABLE sqlitex_meta (a TEXT)")
+        shape = await read_schema_shape(db)
+    assert shape.columns == {"sqlitex_meta": frozenset({"a"})}

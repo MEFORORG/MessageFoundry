@@ -4288,10 +4288,11 @@ class MessageStore:
             # can reach this connection yet.
             async with _writer_txn(db, asyncio.Lock()):
                 await cls._migrate(db)
+                # BACKLOG #1720: every CREATE is IF NOT EXISTS and every migration is additive, so an
+                # object an incompatible version left under an expected name was skipped, not fixed.
+                # Checked before the commit, so a refusal rolls the migrations back.
+                await verify_live_schema(db, schema=_SCHEMA, migrate=cls._migrate, path=path)
                 await db.commit()
-            # BACKLOG #1720: every CREATE above is IF NOT EXISTS and every migration is additive, so a
-            # table or index an incompatible version left under the same name was skipped, not fixed.
-            await verify_live_schema(db, schema=_SCHEMA, migrate=cls._migrate, path=path)
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
             # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
             # completes before anything is serving, so this one is consistency rather than a fix.
