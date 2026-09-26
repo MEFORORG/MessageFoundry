@@ -422,6 +422,10 @@ jobs:
       # checkout, its own `cla` check went green three times on the remote action it was deleting,
       # and on landing it blocked 7 of 21 open pull requests behind a required context whose repair
       # was itself gated by the broken check. This step runs on the branch's own file.
+      #
+      # IT ALSO FAILS ON A RUNTIME AND ON A DATE (BACKLOG #1868). It refuses a local action whose
+      # `runs.using` GitHub has retired, and a current one past its revisit date in the script. Read
+      # the step's own output; a red here on a pull request that touched no workflow is the date.
       - name: Workflow local-action references resolve
         if: runner.os == 'Linux'
         run: python scripts/quality/workflow_local_action_check.py
