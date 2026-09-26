@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.09.26.1"
+$GateVersion = "2026.09.26.2"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -600,10 +600,60 @@ function Get-ChdirTargetRaw([string]$Text) {
     $cds[0].Groups[1].Value.Trim()
 }
 
+# MAY RULE 3c ROOT THE INVOCATION'S OWN `-C` IN A FOLLOWED WINDOW CHDIR? (BACKLOG #1446)
+#
+# THE QUESTION IS NOT "WHAT DOES THIS TEXT NAME" BUT "IS GIT PROVABLY STANDING THERE WHEN IT RUNS", and
+# two rounds of adversarial review measured the difference. Every shape below DENIED on the pre-fix
+# gate, wrote the governed config for real, and ALLOWED once the fold was trusted on the text alone:
+#     git status || cd <ungoverned>; git -C . config <key> v       the cd never ran
+#     git bogus && cd <ungoverned>; git -C . config <key> v        the cd never ran, git still did
+#     git status && cd <ungoverned> | cat && git -C . config ...   the cd ran in a pipeline subshell
+#     git status && echo cd <ungoverned> &&cd . && git -C . ...    the helper read the ECHOED word
+#     git status && cd -P . && git -C . config ...                 an option read as the target
+#
+# SO THE CHAIN IS WHAT IS CHECKED, not only the target. The chdir must be entered from `&&` or `;`,
+# and every separator between it and the owning git token must be `&&`: then git runs only if the
+# chdir SUCCEEDED, so a verb the host does not have (`chdir` under bash), a target it cannot enter,
+# or a directory removed earlier on the line stops the write instead of mis-rooting it. Pipelines,
+# `||`, a bare `&` and a later `;` all fail that test and decline.
+#
+# EVERY NO KEEPS THE PRE-FIX CANDIDATE LIST, and so the pre-fix verdict, defect included: a declined
+# shape is UNCLOSED, not safe. And a YES only PUTS THE FOLD FIRST -- the resolver keeps the pre-fix list
+# behind it -- so a fold git cannot enter still falls through to the old answer. The checks here are
+# for the fold that git CAN enter but that is not where git stands.
+#
+# AT LEAST these decline, and the list is not a claim of completeness (CLAUDE.md section 11):
+#   * a separator inside the invocation's own window, so the chdir may follow the owning git token;
+#   * more than one chdir-verb token ANYWHERE in the window, in or out of command position;
+#   * a target carrying `~`, `$`, `%`, a backtick, a redirect, or a leading `-` or `+`;
+#   * a drive-relative target (`C:` or `C:foo`), which Windows roots against a per-drive cwd the
+#     hook cannot see and PowerShell treats as a no-op on the current drive.
+# NOT MODELLED, stated so no stronger claim is read in: bash's CDPATH, and an unquoted Windows path
+# under bash, whose backslashes the shell strips while the scan keeps them.
+function Test-WindowChdirUsable([string]$Followed, [string]$ChdirWin, [string]$OwnWin,
+                                [string]$ChdirVerbs) {
+    if (-not $Followed) { return $false }
+    if ($OwnWin -match '[;&|(){}]') { return $false }
+    $verbTokens = [regex]::Matches($ChdirWin, "(?:^|[\s;&|(){}])(?<verb>$ChdirVerbs)(?=\s|$)",
+                                   [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($verbTokens.Count -ne 1) { return $false }
+    $verb = $verbTokens[0].Groups['verb']
+    $before = $ChdirWin.Substring(0, $verb.Index).TrimEnd()
+    if ($before -notmatch '(?:(?<![&|])&&|(?<![;&|]);)$') { return $false }
+    $after = [regex]::Matches($ChdirWin.Substring($verb.Index + $verb.Length), '[;&|]+')
+    if ($after.Count -eq 0) { return $false }
+    foreach ($sep in $after) { if ($sep.Value -ne '&&') { return $false } }
+    if ($Followed -match '[~\x24\x25\x60<>]' -or $Followed -match '(?:^|[\\/\s])[-+]') { return $false }
+    if ([System.IO.Path]::IsPathRooted($Followed) -and
+        -not [System.IO.Path]::IsPathFullyQualified($Followed)) { return $false }
+    $true
+}
+
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw,
                                    [switch]$AllTargets, [switch]$BaseFallback,
                                    [switch]$ExplicitFirst, [string]$CarriedGitDir = "",
-                                   [switch]$RepositoryOnly) {
+                                   [switch]$RepositoryOnly,
+                                   [string]$WindowChdir = "", [string]$WindowScan = "") {
     <#
     THREE OPT-IN SWITCHES, ALL DEFAULT OFF. Rules 3 and 3d call this with three positional arguments
     and are therefore byte-identical to before; only rule 3c opts in. That is deliberate blast-radius
@@ -652,6 +702,27 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     append: rule 3 asks it only for a HEAD-moving verb, where the REPOSITORY a token names is exactly
     what decides whose HEAD moves. OFF IS BYTE-IDENTICAL, because the switch returns before either
     branch below is reached, so every existing caller sees the list it has always seen.
+
+    ``-WindowChdir`` with ``-WindowScan`` -- the chdir rule 3c followed in the span AFTER the first git
+    token (already composed over any prefix chdir), and the disarming invocation's own flag window, read
+    off the quote-blanked scan (BACKLOG #1446). Together they put ONE candidate ahead of the `-C`
+    list: the fold of that window's `-C` tokens, in order, over the window chdir. git resolves a
+    relative `-C` against the directory the shell is standing in, and that is the chdir; the prefix is
+    sliced at the first git token and cannot see it. The fold is composed ONLY into the window's own
+    tokens, never into a `-C` before the chdir: that decoy belongs to another command, and composing
+    into it is the wrong answer that sank both rounds of #1065.
+
+    IT IS AN ORDERING PARAMETER, NOT AN ADDITIVE ONE, and by this docstring's own rule it must say so:
+    it INSERTS first. So it moves verdicts in BOTH directions, deliberately -- a chdir into the governed
+    repo turns an ALLOW into a DENY, and a chdir away from it turns a DENY into an ALLOW -- because the
+    fold answers before the decoys and the session-cwd reading behind it. Everything behind it is the
+    pre-fix list, so a fold git cannot enter falls through to the pre-fix verdict. What the fold can
+    NOT survive is a base git can enter but is not standing in; rule 3c's Test-WindowChdirUsable is the
+    check for that, and its header says what it does not model.
+
+    IT DECLINES RATHER THAN GUESSES ON THE `-C` HALF. If the window holds no readable `-C`, or one the
+    scan blanked, or a drive-relative one, nothing is put first. EMPTY IS THE DEFAULT AND ITS OFF STATE
+    IS BYTE-IDENTICAL: rules 3 and 3d never pass it.
     #>
     $out = @()
 
@@ -736,6 +807,38 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     $postC = $cd
     foreach ($dashC in $dashCs) {
         $postC = $(if ($postC -and -not [System.IO.Path]::IsPathRooted($dashC)) { Join-Path $postC $dashC } else { $dashC })
+    }
+
+    # THE WINDOW FOLD, PUT FIRST (BACKLOG #1446). The disarming invocation's own `-C` tokens, read off
+    # its window, folded in order over the window chdir -- the one directory git stands in. It goes
+    # AHEAD of the list above, which is otherwise untouched, so when the fold names nothing git can
+    # enter the chain falls through to exactly the pre-fix candidates and the pre-fix verdict.
+    #
+    # THE FOLD AND NOT EACH TOKEN, because repeated `-C` are cumulative: `cd <ungoverned> && git -C .
+    # -C ../Primary config <key> v` writes the primary, while rooting each token alone let
+    # `<ungoverned>/.` answer first and allow. Measured on review.
+    #
+    # IT DECLINES RATHER THAN GUESSES on the `-C` half. A value the scan blanked (a spaced or
+    # `$`-bearing quoted one reads as `""` or `''`) or a drive-relative one (`C:foo`, which Windows
+    # roots against a per-drive cwd the hook cannot see) means the fold is not the invocation's own,
+    # so nothing is put first.
+    if ($WindowChdir) {
+        $windowCs = @([regex]::Matches($WindowScan, $dashCPattern) | ForEach-Object { $_.Groups[1].Value })
+        $readable = ($windowCs.Count -gt 0) -and
+                    ($windowCs.Count -eq [regex]::Matches($WindowScan, '(?:^|\s)-C\s').Count)
+        foreach ($wc in $windowCs) {
+            if ($wc -match "['`"]" -or ([System.IO.Path]::IsPathRooted($wc) -and
+                                         -not [System.IO.Path]::IsPathFullyQualified($wc))) {
+                $readable = $false
+            }
+        }
+        if ($readable) {
+            $fold = $WindowChdir
+            foreach ($wc in $windowCs) {
+                $fold = $(if (-not [System.IO.Path]::IsPathRooted($wc)) { Join-Path $fold $wc } else { $wc })
+            }
+            $dashCOut = @($fold) + $dashCOut
+        }
     }
 
     # ===================================================================================================
@@ -2315,9 +2418,16 @@ if ($tool -in @("Bash", "PowerShell")) {
         # It also removes a hazard rather than adding one: the note this replaces recorded that reading
         # $Matches after a second `-match` had already FAILED THIS RULE OPEN on its own positive control,
         # because `-match` replaces $Matches wholesale. A Match object cannot be clobbered that way.
-        $dis = [regex]::Match($seg.Scan, "(?<via>\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)",
-                              [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        $disarmPattern = "(?<via>\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)"
+        $dis = [regex]::Match($seg.Scan, $disarmPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if (-not $dis.Success) { continue }
+        # THIS RULE JUDGES THE FIRST DISARM ON A LINE AND NO OTHER, which is older than BACKLOG #1446 and
+        # not changed by it. It matters to #1446 because a followed chdir AWAY from the governed repo now
+        # ALLOWS that first disarm, so a second one later on the line -- `... && cd <primary> && git -C .
+        # config <key> v` -- would pass unread. Measured on review. So the window below is used only on a
+        # line holding ONE disarm, rather than widening this rule into a per-disarm loop #1446 did not scope.
+        $singleDisarm = ([regex]::Matches($seg.Scan, $disarmPattern,
+                                          [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)).Count -eq 1
         $badKey = $dis.Groups['key'].Value
         $rest = $dis.Groups['rest'].Value
         $via = $dis.Groups['via'].Value
@@ -2510,7 +2620,8 @@ if ($tool -in @("Bash", "PowerShell")) {
         # manufacturing a deny. If the disarming invocation carries its own `-C` or `--git-dir`, THAT
         # token decides where the write lands and the surrounding chdir does not -- appending it there
         # would let a governed chdir refuse a write aimed by an explicit token at an ungoverned repo,
-        # which is the #1085 shape this rule has already been fixed for twice.
+        # which is the #1085 shape this rule has already been fixed for twice. "DOES NOT DECIDE" IS NOT
+        # "DOES NOT MATTER": a RELATIVE `-C` is rooted in that chdir, which is the #1446 paragraph below.
         #
         # APPENDED LAST, NEVER FIRST. $where[0] is unchanged, so the unresolvable-target refusal below is
         # still decided on exactly the token it is decided on today, and a candidate that ANSWERS still
@@ -2527,15 +2638,36 @@ if ($tool -in @("Bash", "PowerShell")) {
         # blanked string the guard above tests; $pfx is the resolver's own argument and stays RAW so this
         # rule and the resolver compose the identical prefix. See Get-ChdirTargetRaw for exactly what
         # quoting costs on the scan side -- one bare word survives, a spacey quoted target does not.
+        #
+        # AND WHEN THE INVOCATION DOES CARRY ITS OWN `-C`, THE SAME FOLLOWED CHDIR IS ITS BASE (BACKLOG
+        # #1446). The gate above is right that the chdir must not OUTRANK an explicit token, but a
+        # RELATIVE `-C` is not independent of it: git resolves `-C .` against the directory the chdir
+        # moved the shell to. The resolver rooted it against the session cwd instead, so from an
+        # ungoverned clone `cd <primary> && git -C . config <key> v` ALLOWED while writing the governed
+        # config, and the mirror refused a write into the clone and named the primary. So the followed
+        # chdir is handed to the resolver as the base for the invocation's OWN `-C` tokens only.
+        #
+        # SCOPED TO RULE 3c's CALL, AND EVERY CONDITION BELOW DECLINES TO THE PRE-FIX LIST RATHER THAN
+        # GUESSING: the chdir is followable (one chdir, no popd / `cd -` / subshell, prefix followable);
+        # the invocation names no --git-dir (whose own relative base is a separate question); the line
+        # holds one disarm; Test-WindowChdirUsable passes, which is where the chain around the chdir is
+        # checked; and the resolver could read every `-C` in the window. A decline keeps the pre-fix
+        # verdict, and that includes the pre-fix DEFECT, so a declined shape is unclosed, not safe.
+        # Rules 3 and 3d never pass it.
         $chdirTarget = ""
-        if ($chdirBefore -and -not $ownDashC -and -not $ownGitDir) {
+        $windowChdir = ""
+        if ($chdirBefore -and -not $ownGitDir) {
             $winCd = Get-ChdirTargetRaw $chdirWin
             $pfxCd = Get-ChdirTargetRaw $pfx
             $pfxFollowable = $pfxCd -or ($pfx -notmatch "(?:^|\s)(?:$chdirVerbs)(?:\s|$)")
             if ($winCd -and $pfxFollowable) {
-                $chdirTarget = $(
+                $followed = $(
                     if ($pfxCd -and -not [System.IO.Path]::IsPathRooted($winCd)) { Join-Path $pfxCd $winCd }
                     else { $winCd })
+                if (-not $ownDashC) { $chdirTarget = $followed }
+                elseif ($singleDisarm -and (Test-WindowChdirUsable $followed $chdirWin $ownWin $chdirVerbs)) {
+                    $windowChdir = $followed
+                }
             }
         }
         # ===============================================================================================
@@ -2556,7 +2688,7 @@ if ($tool -in @("Bash", "PowerShell")) {
         # token must not end the question. The residual is stated rather than hidden: two `-C` tokens
         # inside one owning span are decided by whichever ANSWERS first, so a governed one can still win
         # over an ungoverned one. That errs CLOSED and is narrower than before this change.
-        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir)
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir -WindowChdir $windowChdir -WindowScan $ownWin)
         if ($where.Count -eq 0) { continue }
 
         # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block
@@ -2634,6 +2766,11 @@ What to do instead:
         # THE CHAIN CANNOT TURN A CURRENT DENY INTO AN ALLOW. If $where[0] resolves and git answers on it,
         # the verdict is computed from exactly the values it was computed from before. The chain is only
         # ever consulted where the old code had already given up and allowed.
+        # THAT SENTENCE IS ABOUT THE CHAIN, NOT ABOUT THE LIST IT WALKS. Under -WindowChdir (BACKLOG
+        # #1446) the list gains a new $where[0], and that DOES move DENY to ALLOW: on a chdir away from
+        # the governed repo deliberately, and on any followed chdir git can enter but is not standing
+        # in, which is what Test-WindowChdirUsable exists to decline. See its header for what it does
+        # not model.
         #
         # AND THE UNRESOLVABLE-TARGET REFUSAL STAYS FIRST AND STAYS DECIDED ON $where[0], immediately above,
         # before any candidate is tried. A draft of this fix DEFERRED that refusal behind "did any candidate

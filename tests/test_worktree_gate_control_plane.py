@@ -1256,6 +1256,233 @@ def test_ordinary_config_after_a_chdir_is_untouched(repo: SimpleNamespace) -> No
         assert run_gate(shell(command, cwd=repo.wt), repo.repos) is None
 
 
+# ------------- rule 3c: a RELATIVE own `-C` after a window chdir (BACKLOG #1446, #1065's remainder)
+#
+# The rows above append the followed chdir only when the disarming invocation names NO repository of
+# its own. When it carries its own RELATIVE `-C`, that token decides -- but git resolves it against the
+# directory the chdir moved the shell to, and the resolver rooted it against the SESSION cwd, because
+# its prefix is sliced at the FIRST git token and the chdir sits after it. One root cause, both
+# directions, measured on the pre-fix gate:
+#
+#     cwd UNGOVERNED:  git commit -C HEAD && cd <primary>   && git -C . config <key> /nope   ALLOW
+#     cwd PRIMARY:     git commit -C HEAD && cd <ungoverned> && git -C . config <key> /nope  DENY
+#
+# The first writes the GOVERNED shared config; the second refuses a write that lands in the ungoverned
+# clone and names the primary. The no-chdir controls below are what make those two readable: `-C .`
+# alone is judged correctly from both cwds, so the chdir is the only variable. A suite with only the
+# DENY row passes against a gate that denies everything; the ALLOW row is the half that stops that.
+#
+# ``unrelated`` is the fixture defined further down, in the explicit-target ordering section: an
+# independent repository OUTSIDE the governed root, so no path prefix can decide these rows.
+
+
+def test_a_relative_own_dashC_after_a_chdir_INTO_the_governed_repo_is_denied(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The fail-open direction. ``-C .`` means the PRIMARY here, because the ``cd`` put git there."""
+    command = f'git commit -C HEAD && cd "{repo.primary}" && git -C . config core.hooksPath /nope'
+    reason = assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_a_relative_own_dashC_after_a_chdir_AWAY_from_the_governed_repo_is_allowed(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The false-deny direction, and the row that actively misinformed the session reading it."""
+    command = f'git commit -C HEAD && cd "{unrelated}" && git -C . config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+
+
+def test_a_relative_own_dashC_is_composed_with_a_PREFIX_chdir_too(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The window chdir composes over a prefix chdir before the own ``-C`` composes over both.
+
+    ``cd <unrelated>`` then ``cd ../Primary`` lands in the primary, and ``-C .`` names it. The session
+    stands one level DEEPER, in ``Unrelated/sub``, so rooting the window ``cd`` against the session cwd
+    instead reads ``Unrelated/Primary``, which does not exist, and the row fails. With the session cwd
+    equal to the prefix target the two bases coincide and the row could not tell them apart.
+    """
+    deeper = unrelated / "sub"
+    deeper.mkdir()
+    command = (
+        f'cd "{unrelated}" && git commit -C HEAD && cd ../Primary'
+        " && git -C . config core.hooksPath /nope"
+    )
+    assert_denied(run_gate(shell(command, cwd=deeper), repo.repos))
+
+
+def test_repeated_own_dashC_tokens_are_FOLDED_over_the_window_chdir(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """git applies repeated ``-C`` cumulatively, so ``-C . -C ../Primary`` after ``cd <unrelated>``
+    stands in the primary. Rooting each token on its own let ``<unrelated>/.`` answer first and allow.
+    """
+    command = (
+        f'git commit -C HEAD && cd "{unrelated}"'
+        " && git -C . -C ../Primary config core.hooksPath /nope"
+    )
+    assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+
+
+def _msys(path: Path) -> str:
+    """A Git Bash spelling of a Windows path, drive ``C:`` as ``/c``. Unchanged off Windows."""
+    text = str(path)
+    if len(text) > 1 and text[1] == ":":
+        return "/" + text[0].lower() + text[2:].replace("\\", "/")
+    return text
+
+
+@pytest.mark.parametrize(
+    "chdir",
+    [
+        "cd . >/dev/null",
+        "pushd . >/dev/null",
+        "cd . 2>/dev/null",
+        "cd -P .",
+        "cd $PWD",
+        "MSYS",
+    ],
+)
+def test_a_window_chdir_the_gate_cannot_ENTER_keeps_the_old_deny(
+    repo: SimpleNamespace, chdir: str
+) -> None:
+    """The regression direction the first version of this fix opened, measured by adversarial review.
+
+    Every one of these really leaves git in the primary, and every one DENIED on the pre-fix gate. The
+    helper returns a "target" for each that names no directory Windows can enter -- a redirect, an
+    option, a variable, a Git Bash ``/c/...`` path Windows roots as a ``c`` folder on the current
+    drive. Using it as the ONLY base made git fail on the only candidate, so the chain ran out and
+    allowed. The fold now goes FIRST with the pre-fix list behind it, so such a fold falls through.
+    """
+    if chdir == "MSYS":
+        chdir = f"cd {_msys(repo.primary)}"
+    command = f"git status && {chdir} && git -C . config core.hooksPath /nope"
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+
+
+def test_an_ECHOED_chdir_word_is_not_mistaken_for_the_real_chdir(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """``&&cd`` with no space passes the guard but not the helper, which then picks the ECHOED word.
+
+    The real chdir is a no-op, so git stays in the primary; the echoed path is the ungoverned clone.
+    A spaced temp path would be blanked by the scan and never reach the helper, so the row would pass
+    without exercising the guard; it is skipped there rather than left green for the wrong reason.
+    """
+    if any(ch.isspace() for ch in str(unrelated)):
+        pytest.skip("needs a temp path without whitespace to reach the helper")
+    command = f'git status && echo cd "{unrelated}" &&cd . && git -C . config core.hooksPath /nope'
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "git status || cd {u}; git -C . config core.hooksPath /nope",
+        "git status || cd {u} && git -C . config core.hooksPath /nope",
+        "git bogus && cd {u} || git -C . config core.hooksPath /nope",
+        "git bogus && cd {u}; git -C . config core.hooksPath /nope",
+        "git status && cd {u} | cat && git -C . config core.hooksPath /nope",
+        "git status && cd {u} & git -C . config core.hooksPath /nope",
+    ],
+)
+def test_a_chdir_the_shell_may_NOT_HAVE_RUN_is_not_trusted(
+    repo: SimpleNamespace, unrelated: Path, shape: str
+) -> None:
+    """Round-two adversarial review: the target is real, but the shell never stood in it.
+
+    ``||`` skips the chdir when the command before it succeeds; ``cd ... ;`` after a failed ``&&``
+    skips it and still runs git; a pipeline or a bare ``&`` runs it in a subshell. In every shape git
+    writes the PRIMARY, measured by reading the config back, and every one DENIED on the pre-fix gate.
+    Only ``&&`` after the chdir guarantees git runs where the chdir put it.
+    """
+    command = shape.format(u=f'"{unrelated}"')
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+
+
+def test_a_SECOND_disarm_on_the_line_is_not_hidden_behind_an_allowed_first(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Rule 3c reads the first disarm on a line and no other, which predates this item.
+
+    Once a chdir away from the primary ALLOWS the first write, the second -- back in the primary --
+    would pass unread. The window is therefore used only on a line holding one disarm.
+    """
+    command = (
+        f'git status && cd "{unrelated}" && git -C . config core.hooksPath /x'
+        f' && cd "{repo.primary}" && git -C . config core.hooksPath /nope'
+    )
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+
+
+def test_a_target_the_shell_would_EXPAND_is_not_read_literally(repo: SimpleNamespace) -> None:
+    """``cd $PWD`` stays in the primary, but a directory literally named ``$PWD`` can exist.
+
+    Here it does, and it is an independent repository, so a fold through the literal text would answer
+    ungoverned first and allow. The character check declines it; the existence of the directory is what
+    makes this row able to fail, since a nonexistent fold would fall through anyway.
+    """
+    _init_independent_repo(repo.primary / "$PWD")
+    command = "git status && cd $PWD && git -C . config core.hooksPath /nope"
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+
+
+def test_the_positive_shape_holds_under_the_POWERSHELL_tool(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The host differs, so the scan's escape rules differ; the fail-open direction must still close."""
+    command = f'git status && cd "{repo.primary}" && git -C . config core.hooksPath /nope'
+    assert_denied(run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos))
+    away = f'git status && cd "{unrelated}" && git -C . config core.hooksPath /nope'
+    assert run_gate(shell(away, cwd=repo.primary, tool="PowerShell"), repo.repos) is None
+
+
+def test_a_decoy_dashC_BEFORE_the_chdir_does_not_decide(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The decoy that sank both rounds of #1065 is a ``-C`` that exists and ANSWERS, not ``HEAD``.
+
+    ``git -C . status`` runs where the session stands, before the ``cd``; only the config write's own
+    ``-C`` is after it. Both directions, because the decoy answering first used to decide either way.
+    """
+    into = f'git -C . status && cd "{repo.primary}" && git -C . config core.hooksPath /nope'
+    assert_denied(run_gate(shell(into, cwd=unrelated), repo.repos))
+    away = f'git -C . status && cd "{unrelated}" && git -C . config core.hooksPath /nope'
+    assert run_gate(shell(away, cwd=repo.primary), repo.repos) is None
+
+
+def test_the_no_chdir_controls_for_a_relative_own_dashC(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """``-C .`` with no chdir on the line is judged against the session cwd, from both cwds."""
+    command = "git commit -C HEAD && git -C . config core.hooksPath /nope"
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+    assert run_gate(shell(command, cwd=unrelated), repo.repos) is None
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #1446 residual: two chdirs are not followed, so the own -C keeps the session-cwd"
+    " base and this governed write is still ALLOWED",
+)
+def test_an_UNFOLLOWABLE_chdir_before_an_own_dashC_is_a_stated_residual(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """A stated residual, recorded as a STRICT xfail so it cannot read as endorsed.
+
+    Two chdirs are not a single token, so the helper declines and the ``-C`` is rooted against the
+    session cwd exactly as before -- and that leaves this write, which really lands in the governed
+    config, allowed. Guessing a base here would refuse or allow on a directory the gate did not
+    compute. The assertion states the CORRECT verdict; the day a fix makes it pass, strict xfail turns
+    this red so the marker has to come off.
+    """
+    command = (
+        f'git commit -C HEAD && cd "{repo.primary}" && cd . && git -C . config core.hooksPath /nope'
+    )
+    assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+
+
 # ---------------------- rule 3c: the READ exclusion belongs to ONE invocation (BACKLOG #1065)
 #
 # Same class as the rows above with a different token. The explicit read flags were matched against
