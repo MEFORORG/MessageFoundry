@@ -256,8 +256,44 @@ def test_the_frame_oracle_follows_the_decoder() -> None:
 
 
 def test_mutations_are_seeded_and_deterministic() -> None:
-    assert mutation_cases(318, 12, _CAP) == mutation_cases(318, 12, _CAP)
-    assert mutation_cases(318, 12, _CAP) != mutation_cases(319, 12, _CAP)
+    assert mutation_cases(318, 12, _CAP, "S") == mutation_cases(318, 12, _CAP, "S")
+    assert mutation_cases(318, 12, _CAP, "S") != mutation_cases(319, 12, _CAP, "S")
+
+
+def test_x12_mutations_still_form_interchanges() -> None:
+    """An edit inside the fixed-width ISA stops any interchange forming, so a mutator that touched it
+    would leave the X12 parse path unreached with nothing noticing."""
+    x12 = [c for c in mutation_cases(318, 48, _CAP, "S") if c.plane == "x12"]
+    decoded = sum(len(reference_frames("x12", c.payload, _CAP)[0]) for c in x12)
+    # Measured 5 of 12 at seed 318 once the ISA and IEA were held fixed, against 0 of 6 before. The
+    # rest are edits that legitimately break the interchange (a terminator inserted, a segment cut).
+    assert decoded >= len(x12) // 3, (decoded, len(x12))
+
+
+def test_the_at_cap_case_is_at_the_cap_and_not_over_it() -> None:
+    frames, overflow = reference_frames("mllp", _case("mllp", "exactly-at-cap").payload, _CAP)
+    assert not overflow
+    assert [len(f) for f in frames] == [_CAP]
+
+
+def test_a_known_defect_cannot_hide_a_second_defect_in_the_same_case() -> None:
+    """One blank-segment frame among three may explain ONE missing reply and row, never three."""
+    from scripts.security.dast_ingress_sweep import _explained
+
+    one_short = _result(frames=3, rows=2, accepted=2)
+    all_short = _result(frames=3, rows=0, accepted=0)
+    assert _explained(one_short, 1)
+    assert not _explained(all_short, 1)
+
+
+async def test_a_dropping_defect_explains_the_frames_after_it_and_no_earlier_one() -> None:
+    """The blank-segment drop loses the frames AFTER it on the same connection, never before."""
+    good = frame(b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|G1|P|2.5.1\rPID|1\r")
+    blank = _case("mllp", "blank-segment").payload
+    first = await _run_alone(Case("blank-first", "mllp", blank + good), _budget())
+    assert first.findings and all(f["known_defect"] == "blank-segment" for f in first.findings)
+    last = await _run_alone(Case("blank-last", "mllp", good + blank), _budget())
+    assert all(f["known_defect"] == "blank-segment" for f in last.findings), last.findings
 
 
 def test_each_known_defect_discriminator_matches_its_catalogue_case() -> None:

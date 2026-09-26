@@ -61,7 +61,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from fuzz.targets import KNOWN_FINDINGS, TARGETS  # noqa: E402
+from fuzz.targets import TARGETS  # noqa: E402
 from messagefoundry.logging_setup import _install_phi_filters  # noqa: E402
 from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, frame  # noqa: E402
 from messagefoundry.parsing.peek import Peek, normalize  # noqa: E402
@@ -88,8 +88,12 @@ STX, ETX = b"\x02", b"\x03"
 #: The seeds ADR 0191 fuzzes the parsers with in-process, reused here over a socket, and the one
 #: finding that harness has recorded, replayed at a live listener.
 _HL7_SEEDS = next(t for t in TARGETS if t.name == "hl7_peek").seeds
-_X12_SEED = next(t for t in TARGETS if t.name == "x12_peek").seeds[0]
-_BLANK_SEGMENT = next(k for k in KNOWN_FINDINGS if k.target == "hl7_peek").reproducer
+#: A COMPLETE interchange. `next` raises at import when the committed sample is missing, which is
+#: loud; falling back to the fuzz target's truncated literal would make every raw-TCP and X12
+#: liveness probe report a false engine finding.
+_X12_SEED = next(s for s in next(t for t in TARGETS if t.name == "x12_peek").seeds if b"IEA" in s)
+_ISA_LEN = 106  # the fixed-width ISA segment, terminator included
+_IEA_AT = _X12_SEED.rindex(b"IEA")  # the closing IEA segment, which frames the interchange
 
 
 class PolicyError(ValueError):
@@ -140,7 +144,7 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
         return _b(hl7(cid, sentinel, **kw))
 
     good = msg("DAST-OK")
-    pad = cap - len(good) - len("NTE|1||\r")
+    pad = cap - len(msg("DAST-CAP")) - len("NTE|1||\r")
     exact = _b(hl7("DAST-CAP", sentinel, extra="NTE|1||" + "X" * pad + "\r"))
     cases = [
         Case("well-formed", "mllp", frame(good)),
@@ -170,8 +174,13 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
         Case("truncation-char-27", "mllp", frame(msg("SEP4", enc="^~\\&#"))),
         Case("missing-msh", "mllp", frame(_b(f"PID|1||X||{sentinel}^CASE\r"))),
         Case("msh-only", "mllp", frame(b"MSH|^~\\&|")),
-        Case("blank-segment", "mllp", frame(_BLANK_SEGMENT)),
-        Case("blank-segment-invalid-utf8", "mllp", frame(_BLANK_SEGMENT.replace(b"X", b"\xc0", 1))),
+        # ADR 0191's recorded finding (an empty segment), rebuilt here around the sentinel.
+        Case("blank-segment", "mllp", frame(msg("BLANK", extra="\rPV1|1|I\r"))),
+        Case(
+            "blank-segment-invalid-utf8",
+            "mllp",
+            frame(msg("BLANK", extra="\rPV1|1|I\r").replace(b"CASE", b"CA\xc0E")),
+        ),
         Case("huge-repeat-count", "mllp", frame(msg("REP", extra="ZRP|" + "~" * 20000 + "\r"))),
         Case("deep-components", "mllp", frame(msg("DEEP", extra="ZDP|" + "^&" * 10000 + "\r"))),
         Case("many-segments", "mllp", frame(msg("SEGS", extra="NTE|1|\r" * 3000))),
@@ -255,15 +264,21 @@ def mutate(rng: random.Random, seed: bytes, limit: int) -> bytes:
     return bytes(data[:limit])
 
 
-def mutation_cases(seed: int, count: int, cap: int) -> list[Case]:
+def mutation_cases(seed: int, count: int, cap: int, sentinel: str) -> list[Case]:
+    """``count`` seeded mutations. HL7 seeds include one carrying the sentinel, so the log_body
+    detector can see a mutated body. X12 mutations edit only what lies between the fixed-width ISA
+    and the closing IEA: an edit inside the ISA moves the terminator and a lost IEA never closes the
+    interchange, and either way the X12 ingress path would go unreached."""
     rng = random.Random(seed)
     limit = cap // 2
+    hl7_seeds = (*_HL7_SEEDS, _b(hl7("MUTATE", sentinel)))
     cases = []
     for index in range(count):
         if index % 4 == 3:
-            plane, payload = "x12", mutate(rng, _X12_SEED, limit)
+            body = mutate(rng, _X12_SEED[_ISA_LEN:_IEA_AT], limit - len(_X12_SEED))
+            plane, payload = "x12", _X12_SEED[:_ISA_LEN] + body + _X12_SEED[_IEA_AT:]
         else:
-            plane, payload = "mllp", frame(mutate(rng, rng.choice(_HL7_SEEDS), limit))
+            plane, payload = "mllp", frame(mutate(rng, rng.choice(hl7_seeds), limit))
         cases.append(Case(f"mutation-{index}", plane, payload, origin=f"mutation:{seed}:{index}"))
     return cases
 
@@ -322,6 +337,9 @@ KNOWN_DEFECT_DISCRIMINATORS: dict[str, Callable[[bytes], bool]] = {
 #: The only detectors a known defect may silence. A liveness, time, resource or log finding on the
 #: same case is never tolerated: those would be a SECOND defect riding on the known one.
 KNOWN_DEFECT_DETECTORS = frozenset({"reply", "count_and_log"})
+#: Known defects whose failure closes the connection, measured: the listener's last-resort handler
+#: breaks out of the read loop, so pipelined frames after the defective one are never decoded.
+CONNECTION_DROPPING_DEFECTS = frozenset({"blank-segment"})
 
 
 def classify_replies(data: bytes) -> tuple[int, int, int]:
@@ -417,7 +435,7 @@ async def _read_replies(reader: asyncio.StreamReader, count: int, seconds: float
 
 
 async def _trickle(writer: asyncio.StreamWriter, data: bytes, delay: float) -> None:
-    with suppress(ConnectionError, OSError, RuntimeError):
+    with suppress(ConnectionError, OSError):  # the listener closing on us is the expected end
         for index in range(len(data)):
             writer.write(data[index : index + 1])
             await writer.drain()
@@ -547,9 +565,16 @@ async def _settle(target: IngressTarget, plane: str, seconds: float) -> bool:
 
 async def run_case(target: IngressTarget, case: Case, budget: Budget) -> CaseResult:
     payloads, overflow = reference_frames(case.plane, case.payload, budget.cap)
-    known = next(
-        (name for name, hit in KNOWN_DEFECT_DISCRIMINATORS.items() if any(map(hit, payloads))), ""
-    )
+    known, known_frames = "", 0
+    for name, hit in KNOWN_DEFECT_DISCRIMINATORS.items():
+        matches = [i for i, payload in enumerate(payloads) if hit(payload)]
+        if matches:
+            # A defect that drops the connection also loses every later frame on it, so those
+            # count as explained; any other defect explains only the frames it matched.
+            dropping = name in CONNECTION_DROPPING_DEFECTS
+            known = name
+            known_frames = len(payloads) - matches[0] if dropping else len(matches)
+            break
     result = CaseResult(case.name, case.plane, case.origin, len(payloads), overflow, known)
     before = await _counts(target, case.plane)
     events_before = await _oversize_events(target, case.plane) if overflow else 0
@@ -583,7 +608,28 @@ async def run_case(target: IngressTarget, case: Case, budget: Budget) -> CaseRes
     after = await _counts(target, case.plane)
     result.rows, result.error_rows = after.rows - before.rows, after.errors - before.errors
     _judge(result, got)
+    if known and not _explained(result, known_frames):
+        # A multi-frame case where the known frames cannot account for the whole shortfall: the
+        # rest is a SECOND defect riding on the known one, so nothing on this case is tolerated.
+        for f in result.findings:
+            f["known_defect"] = ""
     return result
+
+
+def _explained(result: CaseResult, known_frames: int) -> bool:
+    """Whether ``known_frames`` defective frames can account for every reply and row mismatch."""
+    replies = result.accepted + result.rejected + result.unreadable
+    nonerror = result.rows - result.error_rows
+    gaps = (
+        result.frames - replies,
+        result.frames - result.rows,
+        abs(result.accepted - nonerror),
+        abs(result.rejected - result.error_rows),
+        result.unreadable,
+    )
+    return all(0 <= gap <= known_frames for gap in gaps[:2]) and all(
+        gap <= known_frames for gap in gaps[2:]
+    )
 
 
 def _judge(result: CaseResult, got: bytes) -> None:
@@ -720,30 +766,43 @@ async def _quiesce(target: IngressTarget, budget: Budget) -> None:
 
 async def measure_resources(
     target: IngressTarget, cases: Sequence[Case], passes: int, budget: Budget
-) -> Resources:
-    """Warm up with one pass, then measure growth across ``passes`` more."""
+) -> tuple[Resources, list[dict[str, str]]]:
+    """Warm up with one pass, then measure growth across ``passes`` more. Every repeat is still
+    judged, and a liveness probe closes each pass, so a defect that shows only on a repeat or a
+    listener wedged by one is reported rather than discarded."""
+    findings: list[dict[str, str]] = []
+
+    async def one_pass(label: str) -> None:
+        for case in cases:
+            findings.extend(
+                (
+                    await run_case(target, replace(case, name=f"{label}:{case.name}"), budget)
+                ).findings
+            )
+        for plane in PLANES:
+            if (failure := await probe_liveness(target, plane, 0, budget)) is not None:
+                findings.append(finding("liveness", plane, label, failure))
+
     started_here = not tracemalloc.is_tracing()
     if started_here:
         tracemalloc.start()
     try:
-        for case in cases:
-            await run_case(target, case, budget)
+        await one_pass("resource-warmup")
         await _quiesce(target, budget)
         heap0, handles0, tasks0 = (
             tracemalloc.get_traced_memory()[0],
             _handles(),
             len(asyncio.all_tasks()),
         )
-        for _ in range(passes):
-            for case in cases:
-                await run_case(target, case, budget)
+        for number in range(passes):
+            await one_pass(f"resource-pass-{number + 1}")
         await _quiesce(target, budget)
         return Resources(
             passes=passes,
             heap_growth_bytes=tracemalloc.get_traced_memory()[0] - heap0,
             handle_growth=_handles() - handles0,
             task_growth=len(asyncio.all_tasks()) - tasks0,
-        )
+        ), findings
     finally:
         if started_here:
             tracemalloc.stop()
@@ -785,13 +844,13 @@ async def run_sweep(
     seed = int(policy["seed"]) if seed is None else seed
     sentinel = f"ZZDASTSENTINEL{seed:08X}"
     fixed = catalogue(sentinel, cap)
-    cases = fixed
+    cases = list(fixed)
     if canary is not None:
         wanted = policy["canary"].get("cases_by_canary", {}).get(canary, policy["canary"]["cases"])
         cases = [c for c in cases if f"{c.plane}:{c.name}" in wanted]
     else:
         cases += mutation_cases(
-            seed, int(policy["mutations"] if mutations is None else mutations), cap
+            seed, int(policy["mutations"] if mutations is None else mutations), cap, sentinel
         )
 
     # The watch hangs on the ENGINE's logger, not the root: a host that stops `messagefoundry` from
@@ -805,6 +864,8 @@ async def run_sweep(
     engine_logger.setLevel(logging.INFO)
     results: list[CaseResult] = []
     liveness: list[dict[str, str]] = []
+    resource_findings: list[dict[str, str]] = []
+    probes = 0
     resources = Resources()
     started = time.monotonic()
     try:
@@ -812,10 +873,12 @@ async def run_sweep(
         async with ingress_target(settings, canary=canary) as target:
 
             async def one(case: Case) -> None:
+                nonlocal probes
                 index = len(results)
                 results.append(await run_case(target, case, budget))
                 await target.after_case(index)
                 failure = await probe_liveness(target, case.plane, index, budget)
+                probes += 1
                 if failure is not None:
                     liveness.append(finding("liveness", case.plane, case.name, failure))
 
@@ -825,12 +888,12 @@ async def run_sweep(
                 rng_seed, extra = seed + 1, 0
                 deadline = time.monotonic() + mutation_seconds
                 while time.monotonic() < deadline:
-                    for case in mutation_cases(rng_seed, 16, cap):
-                        await one(
-                            replace(
-                                case, name=f"timed-{extra}", origin=f"mutation:{rng_seed}:{extra}"
-                            )
-                        )
+                    for case in mutation_cases(rng_seed, 16, cap, sentinel):
+                        if time.monotonic() >= deadline:
+                            break
+                        # origin is `mutation:<seed>:<index in its batch of 16>`, so
+                        # `--seed <seed> --mutations 16` regenerates it.
+                        await one(replace(case, name=f"timed-{extra}"))
                         extra += 1
                     rng_seed += 1
             if canary in (None, "leak"):
@@ -841,13 +904,15 @@ async def run_sweep(
                     if not c.stall and (wanted_r is None or f"{c.plane}:{c.name}" in wanted_r)
                 ]
                 passes = int(policy["resource_bounds"]["passes"])
-                resources = await measure_resources(target, resource_cases, passes, budget)
+                resources, resource_findings = await measure_resources(
+                    target, resource_cases, passes, budget
+                )
             posture_out = target.posture
     finally:
         engine_logger.removeHandler(watch)
         engine_logger.setLevel(saved_level)
 
-    findings = [f for r in results for f in r.findings] + liveness
+    findings = [f for r in results for f in r.findings] + liveness + resource_findings
     bounds = policy["resource_bounds"]
     for label, observed, bound in (
         ("heap", resources.heap_growth_bytes, bounds["max_heap_growth_bytes"]),
@@ -866,7 +931,7 @@ async def run_sweep(
         "posture": posture_out,
         "wall_seconds": round(time.monotonic() - started, 2),
         "planes": _plane_totals(results, liveness),
-        "liveness_probes": len(results),
+        "liveness_probes": probes,
         "mutation_cases": sum(1 for r in results if r.origin.startswith("mutation")),
         "log": {"records_seen": watch.seen, "sentinel_hits": len(watch.hits)},
         "resources": asdict(resources),
@@ -931,6 +996,10 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
     for plane, plane_floor in floors["cases_per_plane"].items():
         if receipt["planes"][plane]["cases"] < plane_floor:
             unmet.append(f"{plane} cases {receipt['planes'][plane]['cases']} < floor {plane_floor}")
+    for plane, plane_floor in floors["min_frames_decoded"].items():
+        if receipt["planes"][plane]["frames_decoded"] < plane_floor:
+            decoded = receipt["planes"][plane]["frames_decoded"]
+            unmet.append(f"{plane} frames decoded {decoded} < floor {plane_floor}")
     mllp_totals = receipt["planes"]["mllp"]
     for key in ("frames_decoded", "accepted_replies", "rejected_replies"):
         if mllp_totals[key] < floors[f"min_mllp_{key}"]:
@@ -1016,14 +1085,25 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    code, messages = evaluate(receipt, policy)
-    verdict = {0: "PASS", 1: "FINDINGS", 2: "COULD NOT MEASURE (fail closed)"}[code]
-    receipt["verdict"] = verdict
-    lines = receipt_lines(receipt, verdict)
+    try:
+        code, messages = evaluate(receipt, policy)
+        verdict = {0: "PASS", 1: "FINDINGS", 2: "COULD NOT MEASURE (fail closed)"}[code]
+        receipt["verdict"] = verdict
+        lines = receipt_lines(receipt, verdict)
+    except (KeyError, TypeError, ValueError) as exc:
+        # A policy missing a nested key must not escape as a traceback: that exits 1, the FINDINGS
+        # code, and the CI canary loop would read it as a detection.
+        print(
+            f"::error::{_PREFIX}: cannot evaluate the run: {exc!r} (fail closed)", file=sys.stderr
+        )
+        return 2
     print("\n".join(lines))
     if args.summary is not None:
-        with suppress(OSError), args.summary.open("a", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
+        try:
+            with args.summary.open("a", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError as exc:
+            print(f"::warning::{_PREFIX}: could not write the step summary: {exc}", file=sys.stderr)
     level = annotation_level(canary=args.canary, code=code)
     for message in messages:
         print(f"::{level}::{_PREFIX}: {message}", file=sys.stderr)

@@ -275,7 +275,9 @@ which the run tolerates only for the `reply` and `count_and_log` detectors:
    segment makes the MLLP listener's pre-ACK path raise `IndexError`. The connection closes, and the
    message is lost outside the count-and-log boundary. A deploying site's sender would retry into the
    same drop. ADR 0191 recorded the parser half and scoped its effect to loopback re-ingress; the live
-   listener is affected too.
+   listener is affected too. The listener also closes the connection, so frames pipelined after
+   the defective one are never decoded. Open engine PR 1579 fixes this at the parser; the strict
+   xfails here flip when it lands.
 2. **An alphanumeric MSH-1 gets an unreadable ACK.** The message is accepted, and the ACK echoes the
    letter separator, so MSA-1 (itself letters) cannot be read back.
 3. **The raw-TCP and X12 listeners have no frame deadline.** A peer trickling inside
