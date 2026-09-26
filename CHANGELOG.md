@@ -230,6 +230,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A connection can now attest its hop secure, and the attestation is reported.** `inbound()`,
+  `outbound()`, `FhirLookup()`, `DatabaseLookup()` and `DatabaseRef()` take `tls_hop_attested` with a
+  mandatory `tls_hop_attested_reason`. So do `connections.toml` inbound and outbound tables, as
+  top-level keys. `messagefoundry check` lists every attested hop on a `tls-hop-attested` line, and
+  `GET /security/posture` names them in a `tls_hop_attested` loosening. Before this, no factory took
+  the flag, but the engine read it straight out of a connection's transport settings. A config module
+  could write it there and pass the enforcing cleartext-bind refusal unreported. Those settings keys
+  are now refused at load, naming the supported surface. Owner ruling 2026-09-24; registry entry in
+  `docs/SECURITY-LOOSENING.md`.
 - **BREAKING: `zip_decompress` now refuses any bytes before or after the archive.** Stdlib
   `zipfile` finds the archive's end record by scanning back from the end of the input, and skips
   anything in front of the archive as prepended data. So an archive with up to about 64 KiB of extra

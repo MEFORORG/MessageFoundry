@@ -1039,25 +1039,24 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > at construction by `refuse_cleartext_egress`
 > ([`transports/rest.py`](../messagefoundry/transports/rest.py)). The authority's precedence, in the
 > order it is evaluated: a loopback / on-box hop is **allowed**; a `tls_hop_attested` hop is
-> **allowed** (the operator asserts it is secure by other means) — **but see the warning below: this
-> rung has no authoring surface, so it is not a lever you can reach**; a per-connection
+> **allowed** (the operator asserts it is secure by other means — see the note below); a per-connection
 > `cleartext_accepted` hop (+ a mandatory `cleartext_reason`) is **crossed with a loud, audited WARN**
 > (the operator accepts that it is not secure); a non-enforcing instance
 > (`[security].enforcement = warn`) **warns**; everything else is **refused** (fail-closed).
 >
-> ⚠️ **`tls_hop_attested` is not an operator lever — do not plan around it.** It is a field on the
-> internal connection model that the connectors read, but there is **no supported way to set it**: no
-> connector-factory keyword (`MLLP()`, `Rest()`, `Soap()`, … — check any signature in
-> [`config/wiring.py`](../messagefoundry/config/wiring.py)) and no `connections.toml` key (that
-> loader calls the factory with your `[settings]` table, so *the factory is the schema* and an
-> unknown key is rejected). It is listed here only because it is the first ALLOW arm in the
-> authority and would otherwise look like a missing case. **The one crossing you can actually
-> author on a connection is `cleartext_accepted = true` + `cleartext_reason = "…"`** — and it WARNs
-> and audits at every construction rather than crossing silently, which is the point. The
-> `[logging]` forwarder's `forward_hop_attested` (above) is a genuine, settable sibling; the
-> connection-level flag is not. The revocation gate is different: its per-connection
-> `tls_revocation_attested` **is** settable, with a mandatory `tls_revocation_attested_reason`, as an
-> `inbound()`/`outbound()` keyword or a top-level `connections.toml` key
+> **`tls_hop_attested` is a per-connection declaration, set with `tls_hop_attested_reason`** (owner
+> ruling 2026-09-24). It is a keyword on `inbound()` / `outbound()` / `FhirLookup()` /
+> `DatabaseLookup()` / `DatabaseRef()`, or a top-level key on a `connections.toml` table. It is **not**
+> a transport setting. Written into `[settings]` or a factory's settings dict, it is refused at load.
+> Use it only when the
+> hop really is secured by something the engine cannot see, such as a TLS-terminating proxy. A hop
+> that is simply not secure is `cleartext_accepted` + `cleartext_reason`, which WARNs at every
+> construction. Both are reported by `messagefoundry check` and `GET /security/posture`; see
+> [CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested). The `[logging]`
+> forwarder's `forward_hop_attested` (above) is its instance-level sibling. The revocation gate's
+> per-connection `tls_revocation_attested` is a different claim. It is also settable, with a mandatory
+> `tls_revocation_attested_reason`, as an `inbound()`/`outbound()` keyword or a top-level
+> `connections.toml` key
 > ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
 > It governs revocation on a *verifying* hop only and never reaches a cleartext or verify-off hop.
 >

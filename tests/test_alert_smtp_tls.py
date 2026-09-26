@@ -211,12 +211,13 @@ def _names(**kw: Any) -> list[str]:
             AuthSettings(),
             alerts,
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     ]
 
@@ -258,12 +259,13 @@ def test_an_unconfigured_alert_transport_reports_no_hop_deviation() -> None:
             AuthSettings(),
             bare,
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     ]
     assert "email_use_tls" not in names

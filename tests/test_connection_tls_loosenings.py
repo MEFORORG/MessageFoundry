@@ -298,6 +298,19 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
             tls_revocation_attested_reason="partner PKI runs OCSP at the edge",
         )
     )
+    # PR 1513's hop attestation, beside 1518's revocation one: the route must keep the two sets in
+    # their own entries, never one in the other's slot.
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_HOP_ATTESTED",
+            ConnectionSpec(
+                type=ConnectorType.TCP,
+                settings={"host": "10.0.0.5", "port": 5000},
+            ),
+            tls_hop_attested=True,
+            tls_hop_attested_reason="TLS terminates at the site's stunnel sidecar",
+        )
+    )
     reg.add_inbound(
         build_inbound_connection(
             "IB_MTLS",
@@ -322,6 +335,9 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
     assert "OB_PG_RESULTS" in switches["generic_odbc_tls_unenforced"]
     assert "OB_ATTESTED" in switches["tls_revocation_attested"]
     assert "inbound:IB_MTLS" in switches["tls_revocation_attested"]
+    assert "OB_HOP_ATTESTED" in switches["tls_hop_attested"]
+    assert "OB_HOP_ATTESTED" not in switches["tls_revocation_attested"]
+    assert "OB_ATTESTED" not in switches["tls_hop_attested"]
 
 
 async def test_posture_route_scope_names_every_connection_deviation(engine: Engine) -> None:
@@ -333,6 +349,7 @@ async def test_posture_route_scope_names_every_connection_deviation(engine: Engi
     assert "tls_allow_expired" in scope
     assert "DATABASE" in scope
     assert "tls_revocation_attested" in scope
+    assert "tls_hop_attested" in scope
 
 
 def _loosenings(body: dict[str, object]) -> list[dict[str, str]]:
