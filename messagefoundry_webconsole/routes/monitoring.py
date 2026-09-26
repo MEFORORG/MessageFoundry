@@ -47,7 +47,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             engine=engine, identity=identity, limit=ACTIVE_ALERTS_LIMIT
         )
         config = await core.alerts_rules(request, _user=identity)
-        return HTMLResponse(pages.alerts(instances, config))
+        return HTMLResponse(pages.alerts(instances, config, limit=ACTIVE_ALERTS_LIMIT))
 
     @app.get("/ui/events", response_class=HTMLResponse)
     async def ui_events(

@@ -4,6 +4,9 @@
 
 Small, escape-neutral formatters imported by the per-area page modules (``connections``,
 ``messages``, …) so the rendering conventions live in one place, never copy-pasted per module.
+A route may import one too when it renders the same words outside a page: ``routes.status``
+takes ``_failed_inbound_reason`` so the nav heart and the status page share one sentence
+(BACKLOG #1816), the way ``routes.core`` already takes ``_seg``.
 
 Some of these build a URL or a whole footer rather than format a cell — at least ``_seg`` for one
 path segment, ``_pager`` for a listing's Previous/Next query, and ``_window_note`` for a listing
@@ -98,7 +101,7 @@ def _pager(
     return el("p", *parts, class_="pager")
 
 
-def _window_note(shown: int, limit: int, noun: str) -> Markup:
+def _window_note(shown: int, limit: int, noun: str, *, total: int | None = None) -> Markup:
     """The footer for a listing that is CAPPED and cannot page — the sentence that separates "this
     is everything" from "this is the newest ``limit``" (BACKLOG #1743).
 
@@ -107,9 +110,24 @@ def _window_note(shown: int, limit: int, noun: str) -> Markup:
     count. Styled ``muted`` rather than ``pager``: ``pager`` is the class :func:`_pager` uses for a
     line that CARRIES links, and borrowing it here would dress a dead end up as navigation.
 
-    It lives beside :func:`_pager` rather than in the one page that calls it today, because the next
-    capped listing needs the same sentence and copying it is how the two pagers diverged."""
-    return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
+    ``total`` is for a capped listing whose model ALSO carries the whole count, so the line can say
+    "N of M" the way :func:`_pager` does without offering links the route cannot serve (BACKLOG
+    #1821, the alerts page). The cap is stated only when the window is FULL and rows are missing:
+    "3 of 3" is complete and needs no bound. ``total`` may be a SECOND read taken beside the rows
+    (``AlertInstanceList.total`` is), so it can race either way. Below ``shown`` it is floored,
+    because "200 of 199" reads as a broken page. Above ``shown`` on a window that is not full, the
+    gap is rows that arrived between the two reads and not the cap, so the cap is not blamed.
+
+    It lives beside :func:`_pager` rather than in each page that calls it, because the next capped
+    listing needs the same sentence and copying it is how the two pagers diverged."""
+    if total is None:
+        return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
+    total = max(total, shown)
+    if total > shown and shown >= limit:
+        return el(
+            "p", f"{shown} of {total} {noun} shown, capped at the newest {limit}.", class_="muted"
+        )
+    return el("p", f"{shown} of {total} {noun} shown.", class_="muted")
 
 
 # At most this many failed inbounds are named in the heart's reason; the rest become "and N more".

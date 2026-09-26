@@ -29,7 +29,7 @@ from messagefoundry.api.models import (
 )
 
 from .._html import Markup, el, page, register_nav, rows_table
-from ._common import _failed_inbound_reason
+from ._common import _failed_inbound_reason, _window_note
 
 __all__ = [
     "alerts",
@@ -161,10 +161,17 @@ def _alert_controls(a: AlertInstanceInfo, *, now: float) -> Markup:
     return el("div", *forms, class_="ctls") if forms else Markup("")
 
 
-def alerts(instances: AlertInstanceList, config: AlertsConfig | None, *, error: str = "") -> Markup:
+def alerts(
+    instances: AlertInstanceList, config: AlertsConfig | None, *, limit: int, error: str = ""
+) -> Markup:
     """The operator-alerts page: active (open + acknowledged) instances + the loaded rules (ADR 0044/0014).
 
     Metadata only — no PHI, no secrets (transports are reported present-or-not by the JSON handler).
+
+    ``limit`` is the cap the route fetched under. The list cannot page (``GET /alerts`` takes no
+    offset), so the footer is :func:`._common._window_note` with the store's ``total`` rather than
+    :func:`._common._pager`, whose Next link would lead nowhere. Without it the page listed the
+    newest ``limit`` silently while the nav bell above it reported the whole count (BACKLOG #1821).
 
     ``error`` renders a refusal banner above the tables — the shape ``pages.message_search`` uses when a
     write is refused rather than substituted (BACKLOG #1744). ``config`` is None for a caller that holds
@@ -208,6 +215,11 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig | None, *, error: 
         inst_rows,
     )
     empty = el("p", "No active alerts.", class_="muted") if not instances.alerts else Markup("")
+    count = (
+        _window_note(len(instances.alerts), limit, "alert(s)", total=instances.total)
+        if instances.alerts
+        else Markup("")
+    )
 
     return page(
         "Alerts",
@@ -216,6 +228,7 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig | None, *, error: 
         el("h2", "Active"),
         empty,
         inst_table,
+        count,
         *(_alert_rules_section(config) if config is not None else ()),
         active="alerts",
     )
