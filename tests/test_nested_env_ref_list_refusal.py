@@ -174,6 +174,17 @@ def test_a_reference_one_level_deeper_in_an_item_is_refused_too() -> None:
     assert SENTINEL not in str(excinfo.value)
 
 
+@pytest.mark.parametrize("shape", sorted(NESTED_SHAPES))
+def test_a_reference_inside_a_whole_setting_env_default_is_refused_too(shape: str) -> None:
+    """``resolve_env_settings`` returns a default unchanged, so a list default holding a reference
+    would reach the connector the same way a list item written directly does."""
+    whole = messagefoundry.env("capture_list", default=["x-a", NESTED_SHAPES[shape]()])
+    with pytest.raises(WiringError) as excinfo:
+        messagefoundry.Rest(url="https://example.invalid/x", capture_response_headers=whole)
+    assert "capture_response_headers env() default item 1" in str(excinfo.value)
+    assert SENTINEL not in str(excinfo.value)
+
+
 _OUTBOUND_HEAD = (
     "[[outbound]]\n"
     'name = "OB_ACME"\n'

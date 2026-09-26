@@ -435,14 +435,23 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
 
     Each factory calls this FIRST, ahead of its own validators, because at least one of them --
     ``Http``'s ``intake_client_subjects`` prefix check -- quotes the offending items in its message and
-    would print the default this refusal withholds. Offenders are named by setting and index only."""
-    offenders = [
-        f"{name} item {index}"
-        for name, value in settings.items()
-        if isinstance(value, list | tuple | set | frozenset)
-        for index, item in enumerate(value)
-        if _contains_envref(item)
-    ]
+    would print the default this refusal withholds. Offenders are named by setting and index only.
+
+    A whole-setting reference is scanned through its ``default``, because
+    :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
+    would otherwise arrive at the connector exactly as a list item written directly does. A list
+    that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
+    offenders: list[str] = []
+    for name, value in settings.items():
+        label = name
+        if isinstance(value, EnvRef):
+            label, value = f"{name} env() default", value.default
+        if isinstance(value, list | tuple | set | frozenset):
+            offenders += [
+                f"{label} item {index}"
+                for index, item in enumerate(value)
+                if _contains_envref(item)
+            ]
     if offenders:
         raise WiringError(
             f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "

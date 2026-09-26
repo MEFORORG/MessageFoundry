@@ -153,8 +153,9 @@ transport = "mllp"
   Write an array as `["a", "b"]`; a bare string is not an array, even where one string is all you
   want. The entry check is **not** a guarantee that every value in a table was examined — an `env()`
   reference written inside one is left to the connector's own rules. An `env()` reference written as
-  an array **item** is refused at load, in code and in this file: it may stand for a whole array,
-  never for one item of it, because only a top-level setting is resolved. No refusal ever repeats the
+  an array **item** is refused at load, in code and in this file, because only a top-level setting
+  is resolved: it may stand for a whole array, never for one item of it. (`http`'s
+  `intake_client_subjects` refuses a whole-array `env()` too, today.) No refusal ever repeats the
   value — a `[settings]` value can be a credential, and the message reaches the operator log and the
   support bundle.
   The remaining connectors (`X12`/`FHIR`/`DICOM`/`DICOMweb`/`Email`/`Direct`/
