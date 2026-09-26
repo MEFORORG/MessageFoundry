@@ -1394,8 +1394,7 @@ Three surfaces read that one list, so they cannot disagree:
 - `GET /security/posture` returns it as `static_credential_hops`, one entry per hop.
 - `serve` refuses on it, but only when you turn the refusal on.
 
-The list covers the hops named in the table below. It is not a promise about hops added later, or
-about plugin connector types.
+The list covers the hops named in the table below. It is not a promise about hops added later.
 
 **The refusal ships off.** Set `[security].require_nonstatic_credentials = true` to turn it on. `serve`
 then refuses to start while any listed hop has no opt-out. To keep a hop, name it with a reason:
