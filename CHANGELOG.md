@@ -108,6 +108,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A failed SMART token mint in `fhir_lookup` now raises `FhirLookupError`, not a raw
+  `DeliveryError`.** A lookup mints its bearer before the GET, outside the handling that maps
+  every other lookup failure. So a token endpoint that was down, refused the client, or sent a bad
+  reply let the provider's own error escape. A Handler that catches `FhirLookupError`, as the lookup
+  contract says to, would have missed it. The mint now maps to `FhirLookupError`, with the cause
+  chained. The message names the redacted token URL and a status or reason. It never carries the
+  client assertion or the reply body. An over-length configured token URL maps the same way, with
+  a fixed message. Three more raw errors reached a Handler from `fhir_lookup` and now map the same
+  way:
+  - A read that gets no result within the Handler's 30-second wait. That wait covers the token mint
+    and the GET together, and each has its own 30-second default. So a token endpoint that never
+    answers used to surface as a bare `TimeoutError`.
+  - A malformed status or header line from the FHIR server itself. The message names the error
+    class only.
+  - The same malformed reply from the token endpoint.
+
+  The SMART provider also raised errors outside its own `DeliveryError` contract: for a malformed
+  status line, a deeply nested reply, and an `expires_in` too large for a float. It now raises
+  `DeliveryError` for each. So a FHIR or REST destination using SMART would retry them as transient
+  failures rather than treat them as internal errors. An `expires_in` of `1e999` parses as infinity,
+  and the provider would have cached that token forever. It now caches a token for at most one hour
+  after the expiry skew, and treats a `NaN` lifetime as a missing one. A deeply nested FHIR reply to
+  a lookup now maps to `FhirLookupError` too. The lookup executor's probe method has no caller yet and
+  gets the same mappings.
+  (`BACKLOG #1980`)
 - **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
   it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
   `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals
