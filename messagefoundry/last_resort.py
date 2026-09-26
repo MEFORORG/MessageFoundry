@@ -26,6 +26,7 @@ from messagefoundry.redaction import safe_exc
 
 if TYPE_CHECKING:  # annotations only -- see the runtime note on install_loop_exception_handler
     import asyncio
+    from collections.abc import Coroutine
 
 _log = logging.getLogger("messagefoundry.last_resort")
 
@@ -57,12 +58,39 @@ def install_loop_exception_handler(loop: asyncio.AbstractEventLoop | None = None
     MEASURE THIS WITH WARM BYTECODE. The first import after editing this file recompiles it and read
     31.2 ms -- indistinguishable from the regression this removes, and it is an artifact of the edit.
 
-    The two loop functions are the only users, they run only under ``serve``, and ``serve`` has
-    already paid for ``asyncio`` through uvicorn by the time either is called.
+    THE LOOP FUNCTIONS DO NOT RUN ONLY UNDER ``serve`` ANY MORE. This text used to say they did.
+    Since BACKLOG #1789, :func:`run_guarded` runs every other loop the engine starts: at least a
+    dozen CLI subcommands and the library entry points they call. So the lazy import matters twice.
+    Importing this module stays cheap, and ``asyncio`` loads only when a loop is about to start,
+    which means the caller needs ``asyncio`` anyway.
     """
     import asyncio
 
     (loop or asyncio.get_running_loop()).set_exception_handler(_handle_loop_exception)
+
+
+def run_guarded[T](coro: Coroutine[Any, Any, T]) -> T:
+    """``asyncio.run(coro)``, with :func:`_handle_loop_exception` installed on the loop it creates.
+
+    Use this for EVERY event loop the engine starts outside ``serve`` (BACKLOG #1789). ``serve``
+    gets the handler from the API lifespan, inside the loop uvicorn owns. Any other loop, such as
+    ``supervise``, ``backup`` or a ``restore-verify`` open check, would otherwise report a task
+    exception nothing awaited through the stdlib default, which prints the raw exception text.
+
+    The handler is set in the ``loop_factory``, before the loop runs anything, so no task can raise
+    first. It could not be hoisted to ``main()`` the way the sync and thread hooks were (#1674): it
+    is per loop, and no loop exists there yet. ``tests/test_last_resort.py`` fails on a bare
+    ``asyncio.run(`` anywhere under ``messagefoundry/``, so a new site cannot skip this function.
+    ``asyncio`` is imported here for the cost reason given on
+    :func:`install_loop_exception_handler`."""
+    import asyncio
+
+    def _loop_with_handler() -> asyncio.AbstractEventLoop:
+        loop = asyncio.new_event_loop()
+        loop.set_exception_handler(_handle_loop_exception)
+        return loop
+
+    return asyncio.run(coro, loop_factory=_loop_with_handler)
 
 
 def _excepthook(

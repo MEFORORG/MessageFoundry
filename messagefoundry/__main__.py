@@ -3768,7 +3768,8 @@ def _serve(args: argparse.Namespace) -> int:
 
     # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
     # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
-    # serving lifespan, inside the running loop.
+    # serving lifespan, inside the loop uvicorn owns. Every other loop the CLI starts gets it from
+    # `last_resort.run_guarded` (BACKLOG #1789).
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -3782,9 +3783,8 @@ def _supervise(args: argparse.Namespace) -> int:
     config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
     API port. Monitors + restarts crashed shards, and stops them all cleanly on SIGINT/SIGTERM. A single
     (default) shard yields a single subprocess — identical to a plain `serve`."""
-    import asyncio
-
     from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.supervisor import supervise
 
     configure_logging("INFO")
@@ -3814,7 +3814,7 @@ def _supervise(args: argparse.Namespace) -> int:
         print(f"error: {detail}", file=sys.stderr)
         return 2
 
-    return asyncio.run(
+    return run_guarded(
         supervise(
             config,
             store_backend=settings.store.backend,
@@ -4838,9 +4838,9 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
     resolves the lockout, and a reset would hand whoever runs this a working account.
     """
-    import asyncio
     import getpass
 
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     settings = _host_gated_store_settings(args)
@@ -4869,7 +4869,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        outcome, was = asyncio.run(run())
+        outcome, was = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "no-such-user":
@@ -4979,7 +4979,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
     policy checks itself, so for those this ordering is a courtesy and not the control. The length
     limits are this command's alone: the service method does not apply them.
     """
-    import asyncio
     import getpass
 
     from pydantic import ValidationError
@@ -4992,6 +4991,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         ProvisionedAdministrator,
     )
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     cli: dict[str, dict[str, object]] = {}
@@ -5072,7 +5072,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.store.crypto import StoreKeylessError
 
     try:
-        exists = asyncio.run(administrator_exists())
+        exists = run_guarded(administrator_exists())
     except StoreKeylessError as exc:
         return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -5140,7 +5140,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        outcome, store_path = asyncio.run(run())
+        outcome, store_path = run_guarded(run())
     except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
         return _emit_error(str(exc), as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -5211,11 +5211,11 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     Re-running with the address already in place is a success that writes nothing, so an automated
     install step can be repeated.
     """
-    import asyncio
     import getpass
 
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.permissions import Role
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
     from messagefoundry.store.crypto import StoreKeylessError
     from messagefoundry.store.store import require_notify_email
@@ -5293,7 +5293,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        outcome, username, extra = asyncio.run(run())
+        outcome, username, extra = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     refusals = {
@@ -5390,11 +5390,10 @@ def _refuse_a_store_that_is_not_an_audit_log(
 
 
 def _audit_verify(args: argparse.Namespace) -> int:
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
@@ -5438,7 +5437,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        ok, message, count = asyncio.run(run())
+        ok, message, count = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; this catch is what a server backend and any error raised after the open
@@ -5475,11 +5474,10 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     gets one. The anchor is a row count plus a digest — no PHI, no secret — so it is safe to store in
     a ticket, an object store, or a compliance job's own database.
     """
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     cli: dict[str, dict[str, object]] = {}
@@ -5514,7 +5512,7 @@ def _audit_anchor(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        count, head = asyncio.run(run())
+        count, head = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     anchor = f"{count}:{head}"
@@ -5541,11 +5539,10 @@ def _rekey_audit(args: argparse.Namespace) -> int:
     FIRST re-verifies the existing keyless chain (refusing to bless a broken/forged one), then sets the
     keying watermark to the next id without rewriting any existing ``row_hash``. Run with the engine
     stopped so no concurrent append races the watermark move."""
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     cli: dict[str, dict[str, object]] = {}
@@ -5575,7 +5572,7 @@ def _rekey_audit(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        ok, message = asyncio.run(run())
+        ok, message = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path)
     print(("OK: " if ok else "FAIL: ") + message)
@@ -5600,12 +5597,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
     (so an interrupted rotation still accounts for everything it already re-encrypted — it cannot
     silently under-count the new key), and ``store.close()`` settles the remainder exactly.
     """
-    import asyncio
     from pathlib import Path
 
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.base import open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
@@ -5698,7 +5695,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        count, uploads, (rolled_ok, rolled_msg) = asyncio.run(run())
+        count, uploads, (rolled_ok, rolled_msg) = run_guarded(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -5758,12 +5755,11 @@ def _backup(args: argparse.Namespace) -> int:
     store, bundle the config dir, encrypt to a ``.mfbak`` archive at the destination, restore-verify,
     and prune to keep-N. PHI-safe output (paths/counts/fingerprints only — never a body or key bytes).
     Run any time; it is read-only against the live store and writes one ``dr_backup`` audit row."""
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry import __version__
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
     from messagefoundry.store.base import StoreNotFoundError, open_store
@@ -5809,7 +5805,7 @@ def _backup(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        result = asyncio.run(run())
+        result = run_guarded(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
     except StoreNotFoundError as exc:  # #1780: could not start, so exit 2 like #1670 below
@@ -5851,12 +5847,12 @@ def _restore_verify(args: argparse.Namespace) -> int:
     snapshot under THIS instance's real store settings (cipher, keyring, key provider) and decrypts +
     authenticates its cipher-covered cells. Reports ``PASS``/``FAIL``/``KEY_MISMATCH``; PHI-safe (counts
     + a reason only, never a body)."""
-    import asyncio
     from pathlib import Path
 
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import run_restore_verify
 
     if not Path(args.archive).is_file():
@@ -5872,7 +5868,7 @@ def _restore_verify(args: argparse.Namespace) -> int:
     # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
     # call is inside `_full_open_check`, which already catches broadly and reports FAIL with a
     # reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
-    result = asyncio.run(
+    result = run_guarded(
         run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
     )
     payload = {
@@ -5906,11 +5902,10 @@ def _restore(args: argparse.Namespace) -> int:
     refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. **Never
     overwrites:** an existing destination is refused rather than clobbered. PHI-safe output (paths,
     counts, fingerprints — never a body or key bytes)."""
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import BackupError, run_restore
 
     try:
@@ -5923,7 +5918,7 @@ def _restore(args: argparse.Namespace) -> int:
         # downgrade guard (a plaintext archive on a box that has a store key) stays at its strictest on
         # the one path that writes bytes to disk. It used to carry one this call withheld, and the
         # refusal then prescribed a setting this path never read.
-        result = asyncio.run(
+        result = run_guarded(
             run_restore(
                 args.archive,
                 dest_store_path=args.to,

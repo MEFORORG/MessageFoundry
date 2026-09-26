@@ -14,6 +14,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -175,3 +176,142 @@ async def test_mllp_handler_exception_is_caught_and_redacted(
     logged = " ".join(r.getMessage() for r in caplog.records)
     assert "failed unexpectedly" in logged and "ValueError" in logged  # caught + type kept
     assert "DOE" not in logged and "JANE" not in logged  # PHI redacted
+
+
+# --- every loop outside `serve` carries the handler (BACKLOG #1789) ---------------------------------
+
+_UNAWAITED_TASK_DRIVER = """\
+import asyncio, gc, json, logging, sys, types
+
+records = []
+
+
+class _Collect(logging.Handler):
+    def emit(self, record):
+        records.append({"level": record.levelname, "message": record.getMessage()})
+
+
+logging.getLogger("messagefoundry.last_resort").addHandler(_Collect())
+
+import messagefoundry.pipeline.dr_backup as dr
+
+
+async def _fake_restore_verify(archive, *, store_settings, full):
+    async def _fault():
+        raise RuntimeError(PHI)
+
+    task = asyncio.get_running_loop().create_task(_fault())
+    for _ in range(3):
+        await asyncio.sleep(0)  # let the task run and fail
+    del task  # nothing awaits it and nothing holds it now
+    gc.collect()  # collected WHILE the loop is alive, so the loop's handler is the one asked
+    return types.SimpleNamespace(
+        status="PASS", integrity_ok=True, row_counts={}, manifest_counts={},
+        decrypted_cells=0, reason="", ok=True,
+    )
+
+
+dr.run_restore_verify = _fake_restore_verify
+import messagefoundry.__main__ as m
+
+rc = m.main(["restore-verify", sys.argv[1]])
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    json.dump({"rc": rc, "records": records}, fh)
+"""
+
+
+def test_an_unawaited_task_exception_under_a_non_serve_subcommand_reaches_last_resort(
+    tmp_path: Path,
+) -> None:
+    """The PROPERTY, not the call: a task exception nothing awaits, in a loop a non-serve CLI
+    subcommand started, reaches the ``messagefoundry.last_resort`` logger redacted (BACKLOG #1789).
+
+    A child interpreter runs the real ``restore-verify`` dispatch through ``main``. Only the library
+    coroutine it awaits is replaced, with one that fails a task, drops the only reference and runs
+    ``gc.collect()`` while the loop is still alive. That is when asyncio asks the loop's exception
+    handler. Asserting that ``run_guarded`` was called would pass on a wrapper that installs nothing.
+
+    RED when: any site reverts to a bare ``asyncio.run``, or ``run_guarded`` stops setting the
+    handler. The stdlib default then logs to the ``asyncio`` logger instead, with the raw message
+    in its traceback, and nothing reaches this logger."""
+    import json
+    import subprocess
+    import sys
+
+    archive = tmp_path / "x.mfbak"
+    archive.write_bytes(b"not read: the verify coroutine is replaced")
+    out = tmp_path / "records.json"
+    driver = tmp_path / "unawaited_task.py"
+    driver.write_text(f"PHI = {PHI!r}\n" + _UNAWAITED_TASK_DRIVER, encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(driver), str(archive), str(out)],
+        cwd=tmp_path,  # away from the repo, so no stray ./messagefoundry.toml is picked up
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.is_file(), f"the driver did not finish: rc={proc.returncode}\n{proc.stderr}"
+    result = json.loads(out.read_text(encoding="utf-8"))
+    assert result["rc"] == 0, result
+    messages = [r["message"] for r in result["records"] if r["level"] == "ERROR"]
+    assert any("RuntimeError" in m and "never retrieved" in m for m in messages), (
+        f"the unawaited task's exception never reached last_resort: {result['records']}\n"
+        f"stderr: {proc.stderr}"
+    )
+    assert not any("DOE" in m or "JANE" in m for m in messages), "PHI reached the log unredacted"
+
+
+def _bare_asyncio_runs(source: str, filename: str) -> list[str]:
+    """Every ``asyncio.run(...)`` call, and every ``from asyncio import run``, in ``source``."""
+    import ast
+
+    def _is_bare_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "asyncio"
+        )
+
+    def _is_run_import(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "asyncio"
+            and any(alias.name in ("run", "Runner") for alias in node.names)
+        )
+
+    return [
+        f"{filename}:{getattr(node, 'lineno', 0)}"
+        for node in ast.walk(ast.parse(source, filename=filename))
+        if _is_bare_call(node) or _is_run_import(node)
+    ]
+
+
+def test_no_engine_module_starts_a_loop_without_run_guarded() -> None:
+    """Every loop the engine starts outside ``serve`` must come from ``last_resort.run_guarded``
+    (BACKLOG #1789). A bare ``asyncio.run`` gets the stdlib default handler, which prints a task's
+    raw exception text. The one allowed site is ``run_guarded`` itself.
+
+    Two controls keep a zero from being a dead instrument. The scanner must find the allowed site
+    in the REAL tree, and it must fire on a synthetic bare call."""
+    import messagefoundry
+
+    root = Path(messagefoundry.__file__).resolve().parent
+    allowed = root / "last_resort.py"
+    files = sorted(root.rglob("*.py"))
+    hits: list[str] = []
+    allowed_hits: list[str] = []
+    for path in files:
+        found = _bare_asyncio_runs(path.read_text(encoding="utf-8"), str(path))
+        (allowed_hits if path == allowed else hits).extend(found)
+
+    assert len(files) > 100, f"scanned only {len(files)} files under {root}"
+    assert len(allowed_hits) == 1, f"run_guarded's own call was not found: {allowed_hits}"
+    assert _bare_asyncio_runs("import asyncio\nasyncio.run(main())\n", "control.py") == [
+        "control.py:2"
+    ], "the scanner cannot see a bare asyncio.run"
+    assert hits == [], (
+        "a loop is started without the last-resort handler; call "
+        f"messagefoundry.last_resort.run_guarded instead of asyncio.run: {hits}"
+    )
