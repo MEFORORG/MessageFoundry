@@ -7,6 +7,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Dual control now flags a release whose approver account is new or was just taken over, and an
+  Administrator grant pages.** One Administrator can create or take over a second approver account,
+  so dual control cannot prove two people agreed; `docs/SECURITY.md` now says so, and ADR 0041's
+  "two colluding insiders" residual is corrected to one. A release whose approver account was
+  created, had its password changed, or enrolled TOTP after the request writes an
+  `approval.approver_provenance` audit row and raises the `approval_approver_provenance` alert. The
+  release still goes ahead. Creating an Administrator, promoting to it, or newly mapping a directory
+  group to it raises the `administrator_granted` alert. The `user.created` audit row now records the
+  creating administrator's address, and an account created with a notification address gets an
+  `account_created` notice. Both alert types can be targeted by `[[alerts.rules]]`.
+  (`BACKLOG #315`)
 - **`credential_expires_at` tells a client when an admin-issued temporary password stops working.**
   `POST /auth/login` returns it in `LoginResponse` when `must_change_password` is set. `POST /users`
   returns it in `UserSummary` for the account it creates. It is a Unix timestamp, read from the same
@@ -34,6 +45,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING — `length_of_stay` needs a zone for admit and discharge times that carry no offset.**
+  It used to subtract the two wall clocks. A stay spanning a daylight-saving change came back an hour
+  wrong, with no error: 48 hours for a 47-hour stay across the March change, 48 for a 49-hour stay
+  across the November one. `length_of_stay` and `Message.length_of_stay` now take an optional
+  `zone`, an IANA name such as `America/Chicago`. They read each offset-free stamp in that zone and
+  subtract in UTC. With no `zone`, they refuse with `ValueError` a pair where only one stamp has an
+  offset, and a pair with no offsets where either stamp has a time of day. A pair of date-only stamps
+  with no offsets still needs no zone and stays a whole number of days. A stamp on a daylight-saving
+  edge of the zone is refused as `convert_hl7_timestamp` refuses it, unless `on_dst_edge` names a
+  resolution. (`BACKLOG #1770`)
 - **BREAKING — the engine no longer creates an account on its own.** A `serve` on a store with no
   users used to create an enabled Administrator named `admin` and write its one-time password to
   `bootstrap-admin.txt` beside the store. It now creates no account and writes no file. Create the
@@ -87,6 +108,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
+  it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
+  `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals
+  group every queue row an outbound has. So when none of this outbound's rows is queued, or written
+  or dead-lettered since the engine started, the row now says `0`, and `backlog_seconds` says `0`.
+  The row keeps `null` in at least one case: its outbound has live traffic from an inbound this node
+  does not run. That inbound may belong to another engine shard, or have left the config. Folding
+  that traffic in would count it once per shard. The row still does not report `idle_seconds` or
+  `delivered_age_seconds`. ([BACKLOG #1817](docs/BACKLOG.md))
+- **A file destination now logs a WARNING when it cannot remove its `.part` temp file.** Each
+  delivery writes a temp file inside the destination directory, then hard-links or copies it to the
+  target name. The temp removal after that ignored every error. A failed removal left a full copy
+  of the message in a `.part` file there permanently, with nothing in the log. The delivery still
+  succeeds. The warning names the temp path and the OS error. The `overwrite` mode renames the temp
+  into place, so it has no temp left to remove and logs nothing. (`BACKLOG #1862`)
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
   `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other
@@ -140,6 +176,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **Startup attestation now checks the web console, not just the engine.** The console ships as its
+  own wheel, `messagefoundry-webconsole`, and runs inside the engine process. Attestation compared
+  only the engine wheel's files, so a console file edited, added or deleted in place went unseen.
+  When the engine has loaded the console, it now checks every console file against the console
+  wheel's own `RECORD`, under the same `[integrity]` rules. A console the engine has not loaded is
+  skipped. The engine's own operator-facing messages are unchanged. Subjects and details are in
+  [CONFIGURATION.md](docs/CONFIGURATION.md) under `[integrity]`. (`BACKLOG #1802`)
 - **BREAKING: a CRL file can no longer add trust anchors.** Each CRL setting loaded its file as
   a CA file, so any certificate in it became a trusted CA for the hop. That CA skipped the hop's
   pin and permission checks. It covers at least `[api].tls_client_crl_file`, an inbound
@@ -492,6 +535,39 @@ All notable changes to MessageFoundry are documented here. The format follows
   Docker Desktop bind mount does not, so there it answers indeterminate, and under `enforce` it
   refuses unless the pin matches.
   ([BACKLOG #1142](docs/BACKLOG.md))
+- **BREAKING: an HTTP-family reply is now refused when its header block or its chunked body breaks
+  the HTTP/1.1 grammar.** 0.4.0 read most of these as the partner's answer. A REST, SOAP, FHIR or DICOMweb delivery,
+  and an OAuth2 or SMART token request, now raises `AmbiguousFramingError`, a transient delivery
+  error that is retried and then dead-lettered. A `fhir_lookup` reply raises inside the Handler. The
+  OIDC token and JWKS reads refuse the same replies, and that sign-in fails as an unavailable IdP.
+  The OIDC token read now also refuses a body shorter than its `Content-Length`, as the connectors
+  already did. Newly refused, at least:
+  - a header line that is not a field line, such as a line with no colon or a space before the
+    colon. 0.4.0 dropped every header after that line. It then framed the body without them. So it
+    could return three bytes of raw chunk framing as the answer. Or it could read to close and take
+    in a second response as part of the body. This holds under any `Content-Type`. Under
+    `multipart/*` or `message/*`, 0.4.0 built the lost lines into MIME parts and read the body
+    without them all the same;
+  - a header line with no name, a first line that is a continuation, a `From ` line, a field
+    name that is not an RFC 9110 token, or a field value holding a control character such as NUL;
+  - a chunk-size line that is not plain hex digits, such as `-5`, `1_0`, `+5`, `0x5` or ` 5`
+    (whitespace before the size). Whitespace after the size, as in `5 `, is refused too, unless a
+    chunk extension follows it. `5 ;ext` still reads, because RFC 9112 allows whitespace before the
+    `;`. 0.4.0 parsed these with `int()`. On a negative size it read to the end of the stream, past
+    the reply's byte bound, and only then failed;
+  - a chunk line ended by a bare LF, or holding a bare CR, and chunk data not followed by CRLF;
+  - a trailer line that is not a field line, or more than 100 trailer lines, counting folded
+    continuations.
+
+  Chunk extensions, trailer fields (folded or not), upper-case hex and leading zeros still read.
+  So does a `multipart/*` reply, such as SOAP with MTOM. A chunked body still reads when its stream
+  ends cleanly after the last chunk, or between trailer lines, with no final CRLF. 0.4.0 read that
+  too. Still missed, at least: a bare CR followed by text that reads as a field line. The engine
+  sees only the header block the HTTP reader parsed, so any lost line that leaves no trace there
+  is missed the same way. Connection probes and the alert webhook discard the body and are not refused. They stop reading at the first bad
+  chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
+  send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
+  [BACKLOG #1979](docs/BACKLOG.md))
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
@@ -547,6 +623,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   time, so it runs in linear time, not quadratic. A bomb now stops at the ceiling, not up to one
   window past it. `gzip_decompress` and `zip_decompress` do not use this loop and are unchanged.
   ([BACKLOG #1964](docs/BACKLOG.md))
+- **The per-connection revocation attestation can now be set, in both directions (ADR 0173).**
+  `tls_revocation_attested` and a mandatory `tls_revocation_attested_reason` are new `inbound()` and
+  `outbound()` keywords and top-level `connections.toml` keys. The field sat on the connection models
+  with nothing that could set it, and on the inbound side the runner never filled it, so the attested
+  branch of the mTLS listener's revocation check could not fire. A flag without a reason fails at load.
+  Each time the attestation lets a hop through that an enforcing instance would refuse, the engine logs
+  a WARNING naming the hop and the reason. The revocation refusals name this lever again. It is not yet
+  listed by `messagefoundry check` or `security_loosenings()`.
 - **BREAKING — sign-in now checks a stored passkey with the same rule as registration.** This
   reverses two promises in the 0.4.0 notes: "Passkeys registered on 0.3.2 still work" and "A
   passkey already registered on another curve still signs in". Neither holds any more. A stored

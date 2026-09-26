@@ -218,10 +218,14 @@ host.
 | Extra | Pulls in | When |
 |---|---|---|
 | `postgres` | `asyncpg` (no OS dep; ships compiled wheels) | Using the PostgreSQL backend (recommended prod path) |
-| `console` | PySide6 + keyring | Running the desktop admin console |
+| `harness` | PySide6 | Running the standalone send/receive test harness (the operator console is the separate `messagefoundry-webconsole` wheel) |
 | `sftp` | paramiko | SFTP connectors |
 | `sqlserver` | `aioodbc` **+ OS-level Microsoft ODBC Driver 18** | The SQL Server *store* backend (`backend=sqlserver`, production) and the DATABASE connector family. |
-| `dev` | pytest/ruff/mypy/httpx | Development & CI |
+| `dev` | pytest/ruff/mypy | Development & CI |
+
+The table names the extras an operator reaches for first. The full list, including `fhir`, `dicom`,
+`x12`, `xml`, `webauthn`, `vault` and `otel`, is `[project.optional-dependencies]` in the engine's
+`pyproject.toml`.
 
 > ⚠️ There is **no friendly preflight** for the `postgres` extra: if you set `backend=postgres` but
 > forgot `pip install 'messagefoundry[postgres]'`, you get a raw `ImportError` at startup instead of a

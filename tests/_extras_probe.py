@@ -47,7 +47,8 @@ class SummaryWriter(Protocol):
 
     def write_line(self, line: str) -> None: ...
 
-    def write_sep(self, sep: str, title: str = "", **kwargs: object) -> None: ...
+    # `**kwargs: bool` is pytest's own markup-flag type; `object` there made TerminalReporter fail it.
+    def write_sep(self, sep: str, title: str = "", **kwargs: bool) -> None: ...
 
 
 def extra_is_installed(sentinels: tuple[str, ...]) -> bool:

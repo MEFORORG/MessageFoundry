@@ -39,9 +39,17 @@ from messagefoundry.store.store import UserRecord
 
 log = logging.getLogger(__name__)
 
-# ASVS 6.4.5: fallback sink so a service caller's expiring cert is still visible at WARNING on an
-# install with no [alerts] notifier wired. Module-level (not per-request) — it is stateless.
+# ASVS 6.4.5: fallback sink so an API-side alert (a service caller's expiring cert, an Administrator
+# grant) is still visible at WARNING on an install with no [alerts] notifier wired. Module-level (not
+# per-request) — it is stateless.
 _FALLBACK_ALERT_SINK: AlertSink = LoggingAlertSink()
+
+
+def alert_sink_for(state: Any) -> AlertSink:
+    """The running ``[alerts]`` notifier on ``app.state``, or the logging fallback when none is wired."""
+    sink: AlertSink | None = getattr(state, "notifier", None)
+    return sink if sink is not None else _FALLBACK_ALERT_SINK
+
 
 #: ``path`` reported for a handshake-observed cert: there is no PEM file on this arm (the operator can
 #: list one via ``[api].tls_client_cert_files`` for the file-based arm). Not a path — a provenance label.
@@ -526,8 +534,7 @@ def note_client_cert_expiry(request: Request, peercert: Mapping[str, Any], label
         if last is not None and now - last < settings.check_interval_seconds:
             return
         seen[key] = now
-        sink: AlertSink = getattr(state, "notifier", None) or _FALLBACK_ALERT_SINK
-        sink.cert_expiry(
+        alert_sink_for(state).cert_expiry(
             label,
             path=_HANDSHAKE_CERT_PATH,
             not_after=not_after_iso,

@@ -3182,6 +3182,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
         # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
         "approval_stale_requester",
+        # BACKLOG #315: a release by an approver account changed after the request, and an
+        # Administrator grant through the console API.
+        "approval_approver_provenance",
+        "administrator_granted",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
         "ad_reconcile_aborted",
@@ -3298,9 +3302,13 @@ class AlertRule(BaseModel):
     # --- match (all conditions must hold) ---
     event_type: str = "any"  # "any" | a member of _ALERT_EVENT_TYPES (validated below)
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
-    min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
+    # `default=` is spelled as a KEYWORD on every Field here, and must stay one: mypy's
+    # dataclass_transform support reads only the keyword, so a positional `Field(None, ...)` types
+    # the field as REQUIRED and every `AlertRule(...)` call that omits it reads as a missing
+    # argument. Runtime is identical either way (BACKLOG #1799 measured 207 such false errors).
+    min_depth: int | None = Field(default=None, ge=1)  # queue_buildup: match at/over this depth
     min_oldest_seconds: float | None = Field(
-        None, ge=0
+        default=None, ge=0
     )  # queue_buildup/message_stall: …or oldest-message age (s)
     # --- outcome ---
     severity: AlertSeverity = AlertSeverity.WARNING
@@ -3308,7 +3316,7 @@ class AlertRule(BaseModel):
         None  # None = every configured transport; [] = suppress entirely (event dropped, never sent)
     )
     cooldown_seconds: float | None = Field(
-        None, gt=0
+        default=None, gt=0
     )  # override realert_seconds for matching events
     # #146 (ADR 0014 amendment): per-rule EMAIL recipient override. None = the global [alerts].email_to
     # is used, byte-identical to before. A non-empty list re-targets the email transport for events this
@@ -4707,16 +4715,10 @@ class SecuritySettings(_Section):
     # An operator who needs a specific one relaxed uses that gate's own switch — allow_unencrypted_phi,
     # block_unlisted_outbound, allow_keeping_phi_indefinitely, allow_single_factor_admin_when_exposed,
     # allow_unverified_alert_smtp_tls, [alerts].security_notifications_required, a per-connection
-    # cleartext_accepted, the process-wide MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement
-    # dial. Each of those is separately named, separately audited and separately reported; the retired
-    # lever was none of those things, and it silenced nineteen gates at once. Setting it is now REFUSED
-    # at load with a message naming this decision (see `_REMOVED_KEYS`).
-    #
-    # NOT `tls_revocation_attested`, which this comment offered beside cleartext_accepted until it was
-    # re-read. The field exists on the outbound model and the connectors consume it, but it has no
-    # factory parameter and no connections.toml key, so an operator cannot author it — and
-    # docs/DEPLOYMENT.md's maintenance rule names that exact field and forbids offering it as a lever.
-    # The blanket env var is the only revocation attestation that can actually be set.
+    # cleartext_accepted or tls_revocation_attested (each with its mandatory reason), the process-wide
+    # MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Each of those is separately
+    # named and separately audited; the retired lever was neither, and it silenced nineteen gates at
+    # once. Setting it is now REFUSED at load with a message naming this decision (see `_REMOVED_KEYS`).
     #
     # The production TIER stays: it is a true property of the instance and it drives the AI
     # data-scope ceiling and the DEBUG-log refusal, neither of which is a PHI gate.
@@ -5143,10 +5145,10 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "(BACKLOG #1279). The PHI gates this used to relax as a group each have their own switch — "
         "[security].allow_unencrypted_phi, block_unlisted_outbound, allow_keeping_phi_indefinitely, "
         "allow_single_factor_admin_when_exposed, allow_unverified_alert_smtp_tls, "
-        "[alerts].security_notifications_required, a per-connection cleartext_accepted, the "
-        "process-wide MEFOR_TLS_REVOCATION_ATTESTED (there is no per-connection revocation lever an "
-        "operator can author), or the [security].enforcement dial. Relax the one you mean, or "
-        "delete this line"
+        "[alerts].security_notifications_required, a per-connection cleartext_accepted or "
+        "tls_revocation_attested (each with its reason), the process-wide "
+        "MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Relax the one you mean, "
+        "or delete this line"
     ),
     ("ai", "data_class"): (
         "the data class was removed, not relocated: every instance now carries patient data "

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 from harness.load.connscale.report import (
@@ -151,6 +152,34 @@ def test_json_curve_schema_keyed_by_count() -> None:
         "wall6_ack_ms",
     ):
         assert key in r0
+
+
+def test_the_fd_and_rss_peaks_carry_their_covering_pid_sets_into_the_json() -> None:
+    # BACKLOG #1210 arm 2. A peak is a SUM over a process subtree, and the artifact used to carry the
+    # number with no record of the processes behind it, so a genuine growth and a stale-ppid adoption
+    # read the same. Distinct sets on the two gauges, so a renderer that copied one field into both
+    # places fails here.
+    rec = dataclasses.replace(
+        _record(mode="fixed_aggregate", count=12, fd=35_600),
+        fd_count_peak_pids=(4100, 7310, 7311),
+        working_set_peak_pids=(4100,),
+        fd_probe_root_pid=4100,
+    )
+    d = json.loads(json.dumps(rec.to_json_dict()))
+    assert d["wall4_fd"]["count_peak"] == 35_600
+    assert d["wall4_fd"]["count_peak_pids"] == [4100, 7310, 7311]
+    # The anchor: which member of that set is the engine the walk started from.
+    assert d["wall4_fd"]["root_pid"] == 4100
+    assert d["working_set"]["peak_pids"] == [4100]
+
+
+def test_an_unrecorded_pid_set_stays_null_and_never_reads_as_empty() -> None:
+    # "The set was not recorded" and "the sum covered no process" are different claims. An older
+    # record, or a peak tick that did not record its set, must render as null, never as [].
+    d = json.loads(json.dumps(_record(mode="fixed_aggregate", count=12).to_json_dict()))
+    assert d["wall4_fd"]["count_peak_pids"] is None
+    assert d["wall4_fd"]["root_pid"] is None
+    assert d["working_set"]["peak_pids"] is None
 
 
 def test_coverage_note_is_honest_on_sqlite() -> None:

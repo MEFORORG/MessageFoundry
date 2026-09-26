@@ -705,10 +705,15 @@ attestation:
    left intact), and it still crosses an outbound hop on a **non-enforcing** instance, where the
    alternative is a warning rather than a refusal. An attestation that suppresses a would-be refusal
    is **logged at WARNING at every construction**, so it stays visible.
-   (A per-connection `tls_revocation_attested` field exists on the outbound model and the connectors do
-   read it — but like `tls_hop_attested` it has **no authoring surface**: no connector-factory parameter
-   and no `connections.toml` key, so it is unreachable from config today. The blanket env var is the
-   only attestation you can actually set. Do not plan a per-hop revocation posture around it.)
+   **The attestation that does cross an enforcing outbound hop is per-connection:**
+   `tls_revocation_attested = true` plus a mandatory `tls_revocation_attested_reason`, set on that one
+   connection (an `outbound()` keyword or a top-level `connections.toml` key, not a `[settings]` key —
+   [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
+   It names the hop whose PKI you reviewed, which is what the blanket variable cannot do. Each
+   construction it lets through on an enforcing instance logs a WARNING carrying your reason. The
+   same pair on an `inbound()` mTLS listener clears the listener-side revocation gate
+   (`check_inbound_revocation`) in the same way; `tls_crl_file` is still the better fix there,
+   because it checks revocation in the engine.
 3. **Stay on loopback**, which neither gate reaches.
 4. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
    outbound gate entirely** — ALLOW before the refuse arm, on every hop, with no per-hop record. It was
@@ -734,7 +739,10 @@ ungated, never covered by an "every verifying hop" sentence; a weakening with no
 (`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no refusal keys
 on it — **reported is not gated**, and the two must never be written as if either implied the other;
 and a field with no factory parameter and no `connections.toml`
-key (`tls_hop_attested`, `tls_revocation_attested`) must never be offered as an operator lever.
+key (`tls_hop_attested`) must never be offered as an operator lever. (`tls_revocation_attested` left
+this list when it gained both, under ADR 0173. `tests/test_hop_refusal_revocation.py` and
+`tests/test_hop_refusal_wiring.py` pin that this one lever is settable wherever the connection
+refusals name it; they do not check the other levers those refusals name.)
 Two more rules of thumb: state a control **with its default and its off-switch** (`require_sign_in`,
 `enforcement`), and never describe `[egress]` as bounding a *transform* —
 it bounds declared **destinations**.

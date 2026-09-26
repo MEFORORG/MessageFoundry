@@ -197,10 +197,11 @@ def test_release_load_bearing_canaries_present() -> None:
         # Sigstore keyless signing over the artifacts AND the SBOM + VEX (space-separated in the sign cmd)
         "Sigstore keyless sign": "python -m sigstore sign dist/*.tar.gz dist/*.whl",
         "Sigstore signs SBOM + VEX": "messagefoundry-sbom.cdx.json messagefoundry-vex.openvex.json",
-        # SLSA build provenance, gated to public repos (skip != fail on a private repo); subjects now also
-        # bind the SBOM + VEX (comma-separated in subject-path).
+        # SLSA build provenance; subjects now also bind the SBOM + VEX (comma-separated in
+        # subject-path). Its guard is checked on the step itself, not as a whole-file literal: the
+        # visibility half by `test_the_attestation_step_keeps_its_visibility_test`, the event-and-ref
+        # half by section (4b) (BACKLOG #1805).
         "SLSA attest action pinned": "uses: actions/attest-build-provenance@",
-        "SLSA gated to public repos": "if: ${{ !github.event.repository.private }}",
         "SLSA subjects incl SBOM + VEX": (
             'subject-path: "dist/*.tar.gz, dist/*.whl, '
             'messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"'
@@ -282,7 +283,7 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
     # text scoped to one step, which cannot see the JOB's `if` — so hoisting the pair to the job (the
     # DRY-er shape (4b) deliberately accepts, and already how `release-webconsole` gates itself)
     # would pass there and red here, two tests disagreeing about one invariant. (4b) parses the YAML,
-    # conjoins job and step, and covers all six publishing steps rather than this one; stating the
+    # conjoins job and step, and covers every publishing step rather than this one; stating the
     # rule once and linking is the whole of the fix. What stays here is what (4b) does NOT check:
     # that the publish is the LAST step, and the step ORDER below.
 
@@ -311,19 +312,17 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
 
 # --- (4b) every mutating step tests the EVENT as well as the ref (BACKLOG #1584) ---------------------
 
-#: Steps in release.yml that mutate a public sink BY PUBLISHING A RELEASE ARTIFACT -- the three PyPI
-#: publishes and the three GitHub-release mutations. Pinned as a count so a NEW one cannot be added
+#: Steps in release.yml that mutate a public sink BY PUBLISHING A RELEASE ARTIFACT OR ATTESTING ONE --
+#: the three PyPI publishes, the three GitHub-release mutations (BACKLOG #1584) and the SLSA
+#: build-provenance attestation (BACKLOG #1805). Pinned as a count so a NEW one cannot be added
 #: without either carrying the guard pair or landing here deliberately. An empty scan must never read
 #: as a pass.
 #:
-#: THIS IS A BOUNDED SCOPE, NOT AN INVENTORY OF EVERY PUBLIC WRITE THIS WORKFLOW MAKES. Two steps
-#: write to public, append-only sinks on a `workflow_dispatch` and are deliberately NOT counted here:
-#: `python -m sigstore sign` is unconditional and, being keyless, appends to the public Rekor
-#: transparency log; `actions/attest-build-provenance` is gated on `!github.event.repository.private`
-#: alone and writes to GitHub's attestation store. Both predate BACKLOG #1584 and both are filed as
-#: BACKLOG #1805 -- so read a green here as "no release ARTIFACT is published on a dispatch", never
-#: as "a dispatch writes nothing public".
-_EXPECTED_MUTATING_STEPS = 6
+#: Why the attestation is held to the same rule is stated in release.yml, in the comment above the
+#: attestation step. Why `python -m sigstore sign` is NOT is stated in the header's "THE DRY-RUN IS
+#: NOT SILENT" paragraph. Read a green here as "a dispatch neither publishes nor attests a release
+#: artifact", never as "a dispatch writes nothing public".
+_EXPECTED_MUTATING_STEPS = 7
 
 #: Actions that publish a release artifact, matched as a `uses:` prefix.
 _PUBLISHING_ACTIONS = (
@@ -331,6 +330,17 @@ _PUBLISHING_ACTIONS = (
     "softprops/action-gh-release@",
     "actions/create-release@",
 )
+
+#: Actions that write a GitHub artifact attestation, matched as a `uses:` prefix. Any of them needs the
+#: job's `attestations: write`. `actions/attest` is the general action the other two wrap, so a future
+#: switch to it, or an added SBOM attestation, is caught rather than silently uncounted.
+_ATTESTING_ACTIONS = (
+    "actions/attest-build-provenance@",
+    "actions/attest-sbom@",
+    "actions/attest@",
+)
+
+_MUTATING_ACTIONS = _PUBLISHING_ACTIONS + _ATTESTING_ACTIONS
 
 #: …and the same sinks reached from a shell line. `gh release view` is deliberately absent: it reads.
 _PUBLISHING_COMMANDS = re.compile(
@@ -341,13 +351,14 @@ _PUBLISHING_COMMANDS = re.compile(
 
 
 def _mutating_steps(job: dict) -> list[tuple[str, str]]:
-    """``(step name, EFFECTIVE if-expression)`` for every step in ``job`` that publishes an artifact.
+    """``(step name, EFFECTIVE if-expression)`` for every step in ``job`` that publishes or attests.
 
     Found by what a step DOES, never by its ``name:`` -- the names differ per distribution and a name
     is the one thing in these files that may be reworded freely. The routes it knows are the PyPI
-    publish actions (``pypa/gh-action-pypi-publish``, or a bare ``twine upload``) and the
+    publish actions (``pypa/gh-action-pypi-publish``, or a bare ``twine upload``), the
     GitHub-release ones (``gh release create|edit|upload``, ``gh api ...releases``, and the two
-    common release actions) in an EXECUTED shell line or a ``uses:``.
+    common release actions) in an EXECUTED shell line or a ``uses:``, and the GitHub
+    artifact-attestation actions in ``_ATTESTING_ACTIONS`` (BACKLOG #1805).
 
     THAT LIST IS NOT EXHAUSTIVE AND THE PINNED COUNT DOES NOT MAKE IT SO. Measured: a step running
     ``python -m twine upload`` used to slip past entirely, leaving the count at six and the suite
@@ -372,10 +383,10 @@ def _mutating_steps(job: dict) -> list[tuple[str, str]]:
         step = raw_step or {}
         name = step.get("name") or step.get("uses") or "<unnamed step>"
         uses = str(step.get("uses") or "")
-        publishes = uses.startswith(_PUBLISHING_ACTIONS)
+        mutates = uses.startswith(_MUTATING_ACTIONS)
         body = _executed_shell(str(step.get("run") or ""))
         releases = _PUBLISHING_COMMANDS.search(body) is not None
-        if publishes or releases:
+        if mutates or releases:
             step_if = str(step.get("if") or "").strip()
             effective = " && ".join(p for p in (job_if, step_if) if p)
             found.append((str(name), effective))
@@ -386,7 +397,8 @@ def test_every_mutating_release_step_gates_on_the_event_and_the_ref() -> None:
     """No mutating step may publish on a `workflow_dispatch`, however the run's ref is spelled.
 
     The header of release.yml promises a manual run is a dry-run: it "does NOT create a GitHub
-    release and does NOT publish to PyPI". A guard testing only `startsWith(github.ref, 'refs/tags/')`
+    release, does NOT publish to PyPI and does NOT write an SLSA attestation". A guard testing only
+    `startsWith(github.ref, 'refs/tags/')`
     does not keep that promise, because a dispatch can be pointed at a tag.
 
     Scope of the exposure, stated so this test is not read as more than it is: the publish action
@@ -395,13 +407,18 @@ def test_every_mutating_release_step_gates_on_the_event_and_the_ref() -> None:
     workflow_dispatch permission without tag-push permission. MessageFoundry has zero deployments and
     this workflow has never been dispatched against a tag, so nothing was published this way.
 
-    Scope of the RULE, which is narrower than "no mutating step": it covers the steps that publish a
-    release ARTIFACT. `_EXPECTED_MUTATING_STEPS` carries the two public writes that are deliberately
-    out (Sigstore's Rekor entry and the SLSA attestation, both BACKLOG #1805) so a green here is not
-    read as a claim about them.
+    The attestation arm (BACKLOG #1805) is NOT in that clean state. Its old guard admitted a dispatch
+    on any ref, and at least one dispatch did write an attestation; release.yml names the run above
+    the attestation step. This test holds only the copy of release.yml in this tree. It cannot
+    retract that attestation, and it cannot change an older ref's copy, which a dispatch still runs.
 
-    Mutation: drop either half of any of the six guards, or swap its `&&` for `||`. Red here, naming
-    the step.
+    Scope of the RULE, which is narrower than "no mutating step": it covers the steps that publish a
+    release ARTIFACT and, since BACKLOG #1805, the step that writes its SLSA build-provenance
+    attestation. At least one public write is left out on purpose, Sigstore's Rekor entry;
+    release.yml's header says why, so a green here is not read as a claim about it.
+
+    Mutation: drop either half of any guard, or swap its `&&` for `||`. Red here, naming the step.
+    Reverting the attestation step to its visibility-only guard is the #1805 arm.
     """
     yaml = pytest.importorskip("yaml")
     jobs = (yaml.safe_load(_release()) or {}).get("jobs") or {}
@@ -437,20 +454,52 @@ def test_every_mutating_release_step_gates_on_the_event_and_the_ref() -> None:
 
     # Liveness: report what was EXAMINED. "no offenders" and "nothing was scanned" otherwise produce
     # the same green, and this detector keys on step shape, which a refactor can move.
-    print(f"[release-pipeline] examined {checked} artifact-publishing step(s) in release.yml")
-    # OFFENDERS FIRST, count second. A seventh UNGUARDED step trips both; reported count-first it
+    print(f"[release-pipeline] examined {checked} publishing or attesting step(s) in release.yml")
+    # OFFENDERS FIRST, count second. A NEW unguarded step trips both; reported count-first it
     # reads as a bookkeeping nit whose natural fix is to raise the constant, and the real failure
     # surfaces only on the re-run. The actionable assert goes first; the count is the backstop.
     assert not offenders, (
-        "a release step that publishes an artifact does not test the EVENT as well as the ref, so a "
-        "workflow_dispatch pointed at a tag could reach it (BACKLOG #1584):\n  "
+        "a release step that publishes or attests an artifact does not test the EVENT as well as the "
+        "ref, so a workflow_dispatch could reach it (BACKLOG #1584, #1805):\n  "
         + "\n  ".join(offenders)
     )
     assert checked == _EXPECTED_MUTATING_STEPS, (
-        f"expected {_EXPECTED_MUTATING_STEPS} artifact-publishing steps in release.yml, found "
-        f"{checked}. A new publish or `gh release` step must carry {_EVENT_GUARD!r} AND "
+        f"expected {_EXPECTED_MUTATING_STEPS} publishing or attesting steps in release.yml, found "
+        f"{checked}. A new publish, `gh release` or attestation step must carry {_EVENT_GUARD!r} AND "
         f"{_REF_GUARD!r}, ANDed; if one was deliberately removed, lower the constant in the same "
         f"commit."
+    )
+
+
+def test_the_attestation_step_keeps_its_visibility_test() -> None:
+    """Every attestation step keeps `!github.event.repository.private` in its OWN `if:`, ANDed.
+
+    Section (4b) adds the event-and-ref pair; this keeps the older half. Without it, the step FAILS
+    on a private repository ("not available for user-owned private repositories"), and it sits before
+    the PyPI publish, so the whole release would abort there. Read from the step's parsed `if:` rather
+    than as a whole-file substring, so term order is free (it carries no meaning, as (4b) says) and
+    another step's guard cannot stand in for this one.
+    """
+    yaml = pytest.importorskip("yaml")
+    jobs = (yaml.safe_load(_release()) or {}).get("jobs") or {}
+    visibility = _despace("!github.event.repository.private")
+    found: list[str] = []
+    offenders: list[str] = []
+    for job_key, job in jobs.items():
+        for raw_step in (job or {}).get("steps") or []:
+            step = raw_step or {}
+            if not str(step.get("uses") or "").startswith(_ATTESTING_ACTIONS):
+                continue
+            name = str(step.get("name") or step.get("uses"))
+            found.append(f"{job_key}:{name}")
+            step_if = str(step.get("if") or "")
+            if visibility not in _despace(step_if) or "||" in step_if:
+                offenders.append(f"release.yml:{job_key} — step {name!r} guard {step_if!r}")
+    # Liveness: an empty scan must not read as a pass.
+    assert found, "no attestation step found in release.yml — the detector matched nothing"
+    assert not offenders, (
+        "an attestation step lost its repository-visibility test, or ORs it, so it would fail and "
+        "abort the release on a private repository:\n  " + "\n  ".join(offenders)
     )
 
 

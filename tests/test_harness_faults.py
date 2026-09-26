@@ -77,8 +77,8 @@ def _send_once(qapp: Any, port: int, message: str = _MSG) -> bytes:
             break
         if not chunk:  # peer closed without acknowledging
             break
-        for message in decoder.feed(chunk):
-            ack = message
+        for payload in decoder.feed(chunk):
+            ack = payload
             break
     client.close()
     return ack

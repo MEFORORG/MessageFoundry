@@ -26,12 +26,16 @@ principal's sessions without disabling the row, and it re-diffs roles only for p
 live session. So a directory-side disable, delete or demotion is seen here only once it has reached
 the engine's row. Probing the directory at release is not built.
 
+The gate cannot prove the approver is a second person (BACKLOG #315); what it flags instead is
+stated once, on :meth:`ApprovalGate._approver_changes`.
+
 The registry (op key -> executor) is populated by the API wiring, where the engine is in scope; this
 module owns only the generic hold/approve/reject mechanics over the ``pending_approvals`` store table.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -288,6 +292,9 @@ class ApprovalGate:
                 "the requester no longer holds the authority this operation requires; reject the "
                 "request, and have an authorized user request it again if it is still needed",
             )
+        # BACKLOG #315 (b): READ the approver's account now, before the transition, so no store read
+        # sits between 'approved' and the executor. The flag itself is written in the `finally` below.
+        changed = await self._approver_changes(approver_user_id, float(row["requested_at"]))
         # Transition to 'approved' FIRST (atomic, guards a double-approve race); only then execute.
         if not await self._store.decide_pending_approval(
             approval_id, status="approved", approver=approver, decided_at=self._clock()
@@ -315,6 +322,22 @@ class ApprovalGate:
                 client=client,
             )
             raise
+        finally:
+            # After the transition, so only a release that really happened is flagged, and in a
+            # `finally`, so the flag lands whether the executor succeeded, failed or was cancelled.
+            # Shielded: a cancellation re-delivered here (a request timeout inside a middleware task
+            # group) would otherwise cancel the audit write too, on exactly the release it describes.
+            if changed:
+                await asyncio.shield(
+                    self._flag_approver_provenance(
+                        approval_id,
+                        operation=operation,
+                        approver=approver,
+                        requester=str(row["requester"]),
+                        changed=changed,
+                        client=client,
+                    )
+                )
         await self._store.record_audit(
             "approval.approved",
             actor=approver,
@@ -396,6 +419,78 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not
             # turn the documented 409 into a 500. The audit row above is already written.
             log.exception("approval %s: the stale-requester alert failed to emit", approval_id)
+
+    async def _approver_changes(self, approver_user_id: str, requested_at: float) -> list[str]:
+        """Which of the approver account's credential facts changed AFTER the request (BACKLOG #315
+        limb b): a closed-set slug each for ``created_at``, ``password_changed_at`` and
+        ``totp_enrolled_at``. Empty when none did, or when the account cannot be read.
+
+        **Why this exists.** One Administrator can mint or take over a second approver account, and no
+        check can prove two accounts are two people (docs/SECURITY.md, "Dual-control approval").
+        ``created_at`` catches a minted account; the other two catch a takeover of an existing one,
+        which writes no ``user.created`` row. The result only FLAGS the release. A refusal would stop
+        only an attacker careless enough to mint AFTER the request, and would refuse an honest
+        directory approver whose engine row is created at first sign-in.
+
+        **What reads wrong.** ``requested_at`` is this gate's clock and the account stamps are the
+        store writer's, so the clock skew described at the dwell floor shifts this comparison too.
+        And a login that rehashes a password after an argon2 parameter change restamps
+        ``password_changed_at``, so the first release by each approver after such a change is flagged
+        with no credential change behind it.
+
+        **It must not block a release.** A read failure is logged and reads as "nothing changed"."""
+        try:
+            user = await self._store.get_user(approver_user_id)
+        except Exception:  # noqa: BLE001 - detection only; the release must not fail on it
+            log.exception("could not read approver account %s to check it", approver_user_id)
+            return []
+        if user is None:
+            return []
+        # Strictly after: a stamp equal to requested_at is the same instant, not a later change.
+        return [
+            slug
+            for slug, stamp in (
+                ("account_created", user.created_at),
+                ("password_changed", user.password_changed_at),
+                ("totp_enrolled", user.totp_enrolled_at),
+            )
+            if stamp is not None and stamp > requested_at
+        ]
+
+    async def _flag_approver_provenance(
+        self,
+        approval_id: str,
+        *,
+        operation: str,
+        approver: str,
+        requester: str,
+        changed: list[str],
+        client: str | None,
+    ) -> None:
+        """Audit and alert a release whose approver account changed after the request
+        (:meth:`_approver_changes`). Best effort: the release has already happened."""
+        try:
+            await self._store.record_audit(
+                "approval.approver_provenance",
+                actor=approver,
+                detail=json.dumps(
+                    {
+                        "approval_id": approval_id,
+                        "operation": operation,
+                        "requester": requester,
+                        "changed": changed,
+                    }
+                ),
+                client=client,  # ADR 0150: the approver's address, matching this row's actor
+            )
+        except Exception:  # noqa: BLE001 - see the docstring; the release continues
+            log.exception("approval %s: the approver-provenance audit row failed", approval_id)
+        try:
+            self._alert_sink.approval_approver_provenance(
+                f"approval:{approval_id}", operation=operation, changed=tuple(changed)
+            )
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+            log.exception("approval %s: the approver-provenance alert failed to emit", approval_id)
 
     async def _compensate_failed_execution(
         self,
