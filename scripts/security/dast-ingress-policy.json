@@ -1,0 +1,65 @@
+{
+  "_about": "Tunables for scripts/security/dast_ingress_sweep.py (ADR 0155, increment 2, ingress plane). Every floor is a MINIMUM with headroom under a measured value; below one the run exits 2 (could not measure), never 0. Every resource bound is a MAXIMUM with headroom over a measured value. Raise a floor when the real number grows; NEVER lower a floor or raise a bound to make a run pass.",
+  "_provenance": {
+    "measured": "2026-09-26 on Windows 11 against branch b100-dast-ingress (origin/main 58f15e31f merged with ddbfc16a6), seed 318, 24 mutations",
+    "remeasured_why": "The first measurement the same day (mllp 57 cases, 81 frames, 41 NAKs) was taken before the code review corrected the mutation corpus (a sentinel-bearing seed added, X12 mutations kept off the ISA) and the at-cap case (it was one byte over). Those numbers were a property of the old corpus, so the floors were re-cut from this measurement, not lowered to pass a run.",
+    "cases_per_plane": "measured mllp 58 (40 catalogue + 18 mutations), tcp 9, x12 15 (9 catalogue + 6 mutations)",
+    "min_frames_decoded": "measured tcp 7 and x12 9 (6 catalogue + 3 mutation)",
+    "min_mllp_frames_decoded": "measured 54 (36 catalogue + 18 mutation)",
+    "min_mllp_accepted_replies": "measured 39 (25 catalogue)",
+    "min_mllp_rejected_replies": "measured 10 in the catalogue (14 with mutations) after merging engine PR 1583, up from 8, because both blank-segment frames now get a NAK; the floor sits at the catalogue's own 10 so a mutation draw cannot trip it",
+    "min_liveness_probes": "measured 82, one per case",
+    "min_log_records_seen": "measured 32 INFO+ engine records; the floor only proves the watch was fed",
+    "resource_bounds": "measured heap growth between -50695 and +19628 bytes, handles +0 to +2, tasks +0 over 2 passes across four runs; the leak canary measured heap +8413697 and handles +32",
+    "wall_seconds": "measured about 7 for the seeded run"
+  },
+  "posture": {
+    "max_frame_bytes": 65536,
+    "receive_timeout": 0.5,
+    "max_frame_seconds": 1.0
+  },
+  "budget": {
+    "case_seconds": 5.0,
+    "stall_close_seconds": 3.0,
+    "trickle_delay": 0.1,
+    "settle_seconds": 3.0,
+    "connect_seconds": 1.0
+  },
+  "seed": 318,
+  "mutations": 24,
+  "floors": {
+    "cases_per_plane": {"mllp": 30, "tcp": 8, "x12": 8},
+    "min_frames_decoded": {"tcp": 5, "x12": 6},
+    "min_mllp_frames_decoded": 45,
+    "min_mllp_accepted_replies": 20,
+    "min_mllp_rejected_replies": 10,
+    "min_liveness_probes": 50,
+    "min_log_records_seen": 1
+  },
+  "known_defects": {
+    "blank-segment": "Engine defect 1 in ADR 0155's 2026-09-26 amendment, which is the one place its current behaviour is stated. Tolerated only when the frame the inbound handler faulted on carries a blank segment. Pinned by strict xfails in tests/test_dast_ingress_sweep.py.",
+    "alphanumeric-field-separator": "Engine defect found by this pass on 2026-09-26: a message whose MSH-1 is a letter or digit is accepted, and the ACK echoes that separator, so MSA-1 (AA/AE/AR, themselves letters) cannot be read back by the sender. Pinned by a strict xfail in tests/test_dast_ingress_sweep.py."
+  },
+  "resource_bounds": {
+    "passes": 2,
+    "max_heap_growth_bytes": 4194304,
+    "max_handle_growth": 16,
+    "max_task_growth": 2
+  },
+  "canary": {
+    "case_seconds": 0.75,
+    "stall_seconds": 1.75,
+    "cases": ["mllp:well-formed", "mllp:empty-frame", "mllp:pipelined-three"],
+    "_cases_note": "listener-down runs only the first two: every probe after the stop costs connect_seconds, and two refused probes plus one refused case already clear its floor.",
+    "cases_by_canary": {"listener-down": ["mllp:well-formed", "mllp:empty-frame"]},
+    "resource_cases": ["mllp:well-formed", "mllp:pipelined-three"],
+    "floors": {
+      "no-reply": 3,
+      "ack-and-drop": 3,
+      "log-body": 3,
+      "stall": 1,
+      "leak": 1,
+      "listener-down": 2
+    }
+  }
+}

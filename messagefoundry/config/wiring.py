@@ -72,10 +72,12 @@ from messagefoundry.config.models import (
     StallThreshold,
     Validation,
     _check_cleartext_acceptance,
+    _check_hop_attestation,
     _check_revocation_attestation,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.secretscrub import scrub_credentials
 
@@ -509,6 +511,80 @@ def code_set(name: str) -> CodeSet:
         raise WiringError(str(exc)) from exc
 
 
+# --- the per-connection hop attestation (ADR 0092, owner ruling 2026-09-24) -----
+# `tls_hop_attested` and its mandatory reason are authored on the declaration that owns the hop:
+# inbound()/outbound() (and their connections.toml tables), FhirLookup(), DatabaseLookup() and
+# DatabaseRef(). Never as a transport setting. The loosening report reads the same place each gate
+# reads, so no hop can be crossed on an attestation the report does not name.
+
+#: The two settings keys a hop attestation lands in. An inbound/outbound carries the pair as typed
+#: fields and refuses these keys in its transport settings (see :func:`refuse_raw_hop_attestation`).
+HOP_ATTESTATION_KEYS = ("tls_hop_attested", "tls_hop_attested_reason")
+
+
+def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> dict[str, Any]:
+    """Validate a declared attestation pair and return the settings entries it writes.
+
+    Empty when not attested, so an undeclared carrier's settings stay byte-identical. The flag must be a
+    real ``bool``: an ``env()`` reference is always truthy, so accepting one would attest the hop in
+    every environment whatever the value said. The reason is written into WARNING lines, so a control
+    character in it is refused rather than allowed to forge a log line."""
+    if not isinstance(attested, bool):
+        raise WiringError(
+            f"{where}: tls_hop_attested must be true or false, not {type(attested).__name__} "
+            "(an env() reference is not accepted on an attestation)"
+        )
+    if reason is not None and not isinstance(reason, str):
+        raise WiringError(
+            f"{where}: tls_hop_attested_reason must be a string, not {type(reason).__name__}"
+        )
+    if reason is not None and has_control_char(reason):
+        raise WiringError(f"{where}: tls_hop_attested_reason must not contain control characters")
+    try:
+        _check_hop_attestation(attested, reason)
+    except ValueError as exc:
+        raise WiringError(f"{where}: {exc}") from exc
+    return {"tls_hop_attested": True, "tls_hop_attested_reason": reason} if attested else {}
+
+
+def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:
+    """Refuse a declaration that claims its hop is both secure and not secure.
+
+    The disposition checks the attestation first, so with both set the acceptance's WARN and audit
+    record never fire, and the hop crosses silently while declaring an accepted risk."""
+    if attested and accepted:
+        raise WiringError(
+            f"{where}: tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
+            "secure) are opposite claims. Declare the one that is true"
+        )
+
+
+def refuse_raw_hop_attestation(settings: Mapping[str, Any], where: str) -> None:
+    """Refuse a hop attestation written into an inbound's or outbound's transport settings.
+
+    The typed field on the connection is the only carrier the gate reads there. Before the owner's
+    2026-09-24 ruling the gate read these keys straight out of the settings dict, so a config module
+    could write them past every factory and cross an enforcing refusal unreported."""
+    raw = [key for key in HOP_ATTESTATION_KEYS if key in settings]
+    if raw:
+        raise WiringError(
+            f"{where}: {', '.join(raw)} is not a transport setting. Declare tls_hop_attested=True with "
+            "a tls_hop_attested_reason on inbound()/outbound(), or as top-level keys on the "
+            "connections.toml table, so the attestation is validated and reported"
+        )
+
+
+def apply_hop_attestation(
+    settings: dict[str, Any], where: str, attested: bool, reason: str | None
+) -> None:
+    """Refuse the raw keys in a connection's resolved settings, then mirror its declared pair there.
+
+    The mirror is for the settings-driven seams (the SMART, OAuth2, Digest and FTP guards), which
+    receive only a settings mapping. Written only when declared."""
+    refuse_raw_hop_attestation(settings, where)
+    settings.update(_hop_attestation_entries(where, attested, reason))
+
+
 # --- reference sets (external-data enrichment, ADR 0006 Tier 1) ---------------
 # A reference set is declared in a wiring module with Reference(name, source=…); the engine's
 # ReferenceSyncRunner materializes the source OFF the message path into a versioned, encrypted store
@@ -560,6 +636,8 @@ def DatabaseRef(
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
 ) -> ReferenceSourceSpec:
     """A reference **source** backed by a SQL query (ADR 0006 increment 2; SQL Server via the
     ``[sqlserver]`` extra + ODBC Driver 18 — **production / supported**, like the DATABASE connector).
@@ -574,7 +652,12 @@ def DatabaseRef(
     ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
     the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
     last-good snapshot stays active and the AlertSink fires — the runner syncs sets sequentially, so
-    the bound is what stops one unresponsive server from stalling every other set's refresh."""
+    the bound is what stops one unresponsive server from stalling every other set's refresh.
+
+    ``tls_hop_attested`` with its mandatory ``tls_hop_attested_reason`` attests that this source's
+    database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
+    0092). It is reported as a loosening; see docs/SECURITY-LOOSENING.md."""
+    attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
     return ReferenceSourceSpec(
         "database",
         {
@@ -594,6 +677,7 @@ def DatabaseRef(
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
+            **attestation,
         },
     )
 
@@ -673,6 +757,8 @@ def DatabaseLookup(
     max_rows: int = 500,  # refuse a result larger than this; 0 = no ceiling (BACKLOG #1730)
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
 ) -> None:
     """Declare a named live-lookup database connection (SQL Server via the ``[sqlserver]`` extra + ODBC
     Driver 18 — **production / supported**, like the DATABASE connector). A Handler queries it at run time with
@@ -690,7 +776,13 @@ def DatabaseLookup(
 
         DatabaseLookup("clarity", server=env("clarity_host"), database="Clarity",
                        username=env("clarity_user"), password=env("clarity_pw"))
+
+    ``tls_hop_attested`` with its mandatory ``tls_hop_attested_reason`` attests that this lookup's
+    database hop is secure by means the engine cannot see (ADR 0092). It is reported as a loosening.
     """
+    attestation = _hop_attestation_entries(
+        f"database lookup {name!r}", tls_hop_attested, tls_hop_attested_reason
+    )
     _active_registry().add_lookup(
         DatabaseLookupSpec(
             name,
@@ -709,6 +801,7 @@ def DatabaseLookup(
                 "max_rows": max_rows,
                 "pool_max": pool_max,
                 "acquire_timeout": acquire_timeout,
+                **attestation,
             },
         )
     )
@@ -773,6 +866,10 @@ def FhirLookup(
     # to name — a deviation the registry cannot see is a second posture by the back door.
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    # Owner ruling 2026-09-24: the opposite claim, "this read hop IS secure by means the engine cannot
+    # see". Authorable here for the same reason as the pair above.
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
     # ADR 0173: the per-connection revocation attestation for this lookup's SMART token hop, the one
     # verifying hop on a lookup that carries the revocation refusal. That refusal names this lever, so
     # it must be authorable here too.
@@ -814,6 +911,10 @@ def FhirLookup(
     ``outbound()``: the flag without a reason, a blank reason, or a reason without the flag all fail
     loud at load.
 
+    ``tls_hop_attested`` / ``tls_hop_attested_reason`` (ADR 0092) make the opposite claim: this read hop
+    is secure by means the engine cannot see, so an enforcing refusal ALLOWs it. Same coherence rules,
+    and the same loosening report.
+
     ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) attest that a
     revocation-checking PKI covers the SMART token endpoint this lookup signs in to, so an enforcing
     instance does not refuse that verifying hop. Same coherence rules, and the reason is recorded in
@@ -843,6 +944,10 @@ def FhirLookup(
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
         settings["cleartext_connection"] = name
+    settings.update(
+        _hop_attestation_entries(f"fhir lookup {name!r}", tls_hop_attested, tls_hop_attested_reason)
+    )
+    _refuse_attested_and_accepted(f"fhir lookup {name!r}", tls_hop_attested, cleartext_accepted)
     if tls_revocation_attested:
         # A copy for code that reads spec.settings. The executor never trusts it: it gets the typed
         # fields below, re-mirrored by wiring_runner._fhir_lookup_settings.
@@ -3863,6 +3968,13 @@ class InboundConnection:
     # still declare flagged=True in Python, but the console flag-toggle refuses it (no TOML home). Default
     # False → byte-identical. Code-first AND connections.toml.
     flagged: bool = False
+    # ADR 0092, owner ruling 2026-09-24: the operator attests this listener's hop is secure by means the
+    # engine cannot see (a TLS-terminating proxy, an isolated segment), so an enforcing insecure-bind
+    # refusal ALLOWs it. Needs a written reason. Top-level, like cleartext_accepted: a hop-policy
+    # declaration, not a transport setting. Code-first AND connections.toml; threaded onto the Source
+    # by _source_config, which refuses the keys in the transport settings.
+    tls_hop_attested: bool = False
+    tls_hop_attested_reason: str | None = None
     # ADR 0173 §1.5 item 4: the operator attests a revocation-checking PKI covers this mTLS listener's
     # client certificates OUTSIDE the engine, so check_inbound_revocation does not refuse it. Needs a
     # written reason, recorded in the audit line where it suppresses that refusal. Top-level, like
@@ -3940,6 +4052,11 @@ class OutboundConnection:
     # plaintext on a flat network. Outbound-only. Threaded to the Destination by _dest_config.
     cleartext_accepted: bool = False
     cleartext_reason: str | None = None
+    # ADR 0092, owner ruling 2026-09-24: the operator attests this hop IS secure by means the engine
+    # cannot see, so an enforcing refusal ALLOWs it. Needs a written reason. Threaded to the Destination
+    # by _dest_config, which refuses the keys in the transport settings.
+    tls_hop_attested: bool = False
+    tls_hop_attested_reason: str | None = None
     # ADR 0173 §1.5 item 4: the operator attests a revocation-checking PKI covers this VERIFYING TLS
     # hop, so the RevocationHopGuard ALLOWs it on an enforcing instance -- audited at construction with
     # the mandatory reason. A different claim from cleartext_accepted (that hop has no TLS at all).
@@ -4623,6 +4740,47 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every declaration that ATTESTS its hop secure (``tls_hop_attested``), as ``(name, reason)``.
+
+    The sibling of :func:`accepted_cleartext_hops`, and the same contract: the SINGLE reader behind
+    ``messagefoundry check``'s ``tls-hop-attested`` line, ``security_loosenings()`` and
+    ``GET /security/posture``, so the three can never report different sets. Owner ruling 2026-09-24.
+
+    It walks every carrier a hop gate reads the attestation from, and reads each one where its gate
+    does: the typed field on an inbound or outbound connection (``_source_config`` / ``_dest_config``
+    refuse the keys in their transport settings), and the settings of a ``FhirLookup``, a
+    ``DatabaseLookup`` and a ``DatabaseRef`` reference source, whose executors read those settings. Names
+    other than an outbound's are prefixed with their table, because each table is its own namespace.
+
+    Pure: it reads the loaded graph and touches nothing else."""
+
+    def _reason(value: object) -> str:
+        return str(value) if value else "(none recorded)"
+
+    out = [
+        (f"inbound:{ic.name}", _reason(ic.tls_hop_attested_reason))
+        for ic in registry.inbound.values()
+        if ic.tls_hop_attested
+    ]
+    out += [
+        (oc.name, _reason(oc.tls_hop_attested_reason))
+        for oc in registry.outbound.values()
+        if oc.tls_hop_attested
+    ]
+    settings_carriers: list[tuple[str, Mapping[str, Any]]] = [
+        *((f"fhir_lookup:{s.name}", s.settings) for s in registry.fhir_lookups.values()),
+        *((f"db_lookup:{s.name}", s.settings) for s in registry.lookups.values()),
+        *((f"reference:{r.name}", r.source.settings) for r in registry.references.values()),
+    ]
+    out += [
+        (name, _reason(settings.get("tls_hop_attested_reason")))
+        for name, settings in settings_carriers
+        if settings.get("tls_hop_attested")
+    ]
+    return sorted(out)
+
+
 #: What :func:`_peer_label` says when an address does not parse as scheme, host and port. It is fixed
 #: text, so an address the label cannot read is never echoed, since that address may hold a secret.
 _WITHHELD_PEER = "(peer address withheld: it did not parse as a host and port)"
@@ -5130,6 +5288,8 @@ def build_inbound_connection(
     priority: Priority | None = None,
     shard: str | None = None,
     flagged: bool = False,
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
     tls_revocation_attested: bool = False,
     tls_revocation_attested_reason: str | None = None,
     source_file: str | None = None,
@@ -5300,6 +5460,14 @@ def build_inbound_connection(
             f"stream_threshold_bytes ({stream_threshold_bytes}) — a lower cap rejects every message "
             "the threshold would detach"
         )
+    # Owner ruling 2026-09-24: coherence-checked at this shared choke point, so a flag with no reason
+    # fails at `messagefoundry check` / dry-run on either authoring surface.
+    _hop_attestation_entries(
+        f"inbound connection {name!r}", tls_hop_attested, tls_hop_attested_reason
+    )
+    # Refused here so `load_config` and `check` fail on it, and again at build (_source_config),
+    # because the settings dict stays mutable after the declaration returns.
+    refuse_raw_hop_attestation(spec.settings, f"inbound connection {name!r}")
     # ADR 0173: the revocation-attestation pair is coherence-checked at this shared choke point, so a
     # flag with no reason fails at `messagefoundry check` / dry-run on either authoring surface.
     try:
@@ -5341,6 +5509,8 @@ def build_inbound_connection(
         priority=priority,
         shard=shard,
         flagged=flagged,
+        tls_hop_attested=tls_hop_attested,
+        tls_hop_attested_reason=tls_hop_attested_reason,
         tls_revocation_attested=tls_revocation_attested,
         tls_revocation_attested_reason=tls_revocation_attested_reason,
         source_file=source_file,
@@ -5376,6 +5546,8 @@ def inbound(
     priority: Priority | None = None,
     shard: str | None = None,
     flagged: bool = False,
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
     tls_revocation_attested: bool = False,
     tls_revocation_attested_reason: str | None = None,
 ) -> None:
@@ -5432,6 +5604,12 @@ def inbound(
     build or degrading the engine. It is stronger than ``auto_start=False`` (deployed, just not up right
     now — startable at runtime) and **wins** over it. Also a ``connections.toml`` key.
 
+    ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24) attests that this listener's hop is secure by
+    means the engine cannot see, such as a TLS-terminating proxy in front of it or an isolated segment.
+    An enforcing instance then ALLOWs a non-loopback bind without TLS. It needs a written
+    ``tls_hop_attested_reason``, which the bind WARNING records, and it is reported as a loosening.
+    Prefer ``tls=true``. Also a ``connections.toml`` key; never a transport setting.
+
     ``tls_revocation_attested`` (ADR 0173) declares that a revocation-checking PKI covers this mTLS
     listener's client certificates **outside** the engine, so an enforcing instance does not refuse a
     listener that sets ``tls_ca_file`` without ``tls_crl_file``. It needs a written
@@ -5467,6 +5645,8 @@ def inbound(
             priority=priority,
             shard=shard,
             flagged=flagged,
+            tls_hop_attested=tls_hop_attested,
+            tls_hop_attested_reason=tls_hop_attested_reason,
             tls_revocation_attested=tls_revocation_attested,
             tls_revocation_attested_reason=tls_revocation_attested_reason,
             source_file=file,
@@ -5496,6 +5676,8 @@ def build_outbound_connection(
     waiting_display_delay: float = 0.0,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
     tls_revocation_attested: bool = False,
     tls_revocation_attested_reason: str | None = None,
     source_file: str | None = None,
@@ -5515,6 +5697,13 @@ def build_outbound_connection(
         _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
         raise WiringError(f"outbound connection {name!r}: {exc}") from exc
+    _hop_attestation_entries(
+        f"outbound connection {name!r}", tls_hop_attested, tls_hop_attested_reason
+    )
+    _refuse_attested_and_accepted(
+        f"outbound connection {name!r}", tls_hop_attested, cleartext_accepted
+    )
+    refuse_raw_hop_attestation(spec.settings, f"outbound connection {name!r}")
     if dead_letter_days is not None and dead_letter_days < 0:
         # Per-connection dead-letter retention override (#34, ADR 0027). None = inherit
         # [retention].dead_letter_days; 0 = keep forever; >0 = days. A negative window is meaningless —
@@ -5747,6 +5936,8 @@ def build_outbound_connection(
         waiting_display_delay=waiting_display_delay,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        tls_hop_attested=tls_hop_attested,
+        tls_hop_attested_reason=tls_hop_attested_reason,
         tls_revocation_attested=tls_revocation_attested,
         tls_revocation_attested_reason=tls_revocation_attested_reason,
         source_file=source_file,
@@ -5775,6 +5966,8 @@ def outbound(
     waiting_display_delay: float = 0.0,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
     tls_revocation_attested: bool = False,
     tls_revocation_attested_reason: str | None = None,
 ) -> None:
@@ -5815,6 +6008,11 @@ def outbound(
     ``Tcp()``/``X12()``, which have no TLS support at all, it is a **permanent, structural** declaration
     — there is no ``tls = true`` for them to migrate to (BACKLOG #311). Also a ``connections.toml`` key.
 
+    ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24) is that opposite claim: this hop is secure
+    by means the engine cannot see, so an enforcing cleartext or verify-off refusal ALLOWs it. It needs
+    a written ``tls_hop_attested_reason`` and it is reported as a loosening. It cannot be combined with
+    ``cleartext_accepted``. Also a ``connections.toml`` key; never a transport setting.
+
     ``tls_revocation_attested`` (ADR 0173) declares that a revocation-checking PKI covers **this**
     outbound's *verifying* TLS hop, which the engine cannot check itself (stdlib ``ssl`` has no
     OCSP/CRL fetch). It lets the hop cross the revocation refusal under ``[security].enforcement =
@@ -5844,6 +6042,8 @@ def outbound(
             waiting_display_delay=waiting_display_delay,
             cleartext_accepted=cleartext_accepted,
             cleartext_reason=cleartext_reason,
+            tls_hop_attested=tls_hop_attested,
+            tls_hop_attested_reason=tls_hop_attested_reason,
             tls_revocation_attested=tls_revocation_attested,
             tls_revocation_attested_reason=tls_revocation_attested_reason,
             source_file=file,

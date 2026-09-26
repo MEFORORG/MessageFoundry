@@ -7,6 +7,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A DAST pass now sends hostile bytes to live MLLP, raw-TCP and X12 listeners and checks the
+  engine's ingress rules.** `scripts/security/dast_ingress_sweep.py` runs a real engine on loopback.
+  It sends broken framing, hostile HL7 and seeded mutations. Six detectors check each case: one reply
+  per decoded MLLP frame, one row per decoded frame, a listener that stays up, bounded time, bounded
+  heap, handle and task growth, and no message content logged at INFO or above. Each detector has a
+  canary that must trip it. The seeded run and the canaries run in the existing required test legs.
+  A new advisory `dast-ingress` job in `dast.yml` adds a nightly randomized budget. The first run
+  found three engine defects, each pinned by a strict xfail and not fixed here. A blank segment faults
+  the inbound handler. An alphanumeric MSH-1 gets an ACK whose MSA-1 cannot be read.
+  The raw-TCP and X12 listeners have no frame deadline. See ADR 0155's 2026-09-26 amendment.
+  (`BACKLOG #318`)
 - **Dual control now flags a release whose approver account is new or was just taken over, and an
   Administrator grant pages.** One Administrator can create or take over a second approver account,
   so dual control cannot prove two people agreed; `docs/SECURITY.md` now says so, and ADR 0041's
@@ -108,6 +119,32 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
+  stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
+  stage stopped draining while intake kept acknowledging, and the engine still read healthy. The
+  dispatcher now restarts a dead claimer or sweep task on the same lanes. The new claimer first
+  returns any rows the dead one had claimed but not dispatched, so a lane's next message cannot
+  overtake them. A task that keeps dying backs off instead of spinning, up to 30 seconds. While a
+  dead claimer has not recovered, `GET /status` names its stage in `engine.stages_degraded` and the
+  web console's health heart reads down. After one death that lasts until the new claimer runs.
+  After repeated deaths it lasts until the claimer has run cleanly for 30 seconds. A dead sweep
+  task is restarted and logged the same way, but is not reported there, because the claimers keep
+  draining without it. (`BACKLOG #1609`)
+- **Replay no longer re-queues a pass-through completion marker, so a replayed message that
+  delivered ends `PROCESSED`, not `ERROR`.** A handler `Send` into a pass-through inbound leaves an
+  already-finished marker row on the parent. Its lane is an inbound name, so no delivery worker
+  drains it. On a store with an encryption key, message replay put a delivered marker back to
+  pending. The parent then stayed `ROUTED`, even when its real delivery had gone out again. The next
+  start's sweep dead-lettered the marker and recorded the delivered message as `ERROR`. Bulk
+  dead-letter replay did the same to a marker that the depth cap had left dead: its parent went back
+  to `ROUTED`, and nothing could finish it before the next start. Markers now carry the stamp `@passthrough-marker` in
+  `handler_name`. Replay, bulk dead-letter replay and resend skip a row with that stamp, on SQLite,
+  PostgreSQL and SQL Server. The attachment clean-up no longer keeps an attachment alive for a dead
+  marker. Replay does not retransmit into a pass-through inbound, because the marker has no body. A
+  depth-capped marker stays dead, so its parent keeps `ERROR`. A resend with no source named no
+  longer calls a parent with one real delivery ambiguous. A pass-through-only parent now reports no
+  delivered body, not a purged one, and its replay refusal names the pass-through case.
+  ([BACKLOG #1580](docs/BACKLOG.md))
 - **A failed SMART token mint in `fhir_lookup` now raises `FhirLookupError`, not a raw
   `DeliveryError`.** A lookup mints its bearer before the GET, outside the handling that maps
   every other lookup failure. So a token endpoint that was down, refused the client, or sent a bad
@@ -215,6 +252,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A connection can now attest its hop secure, and the attestation is reported.** `inbound()`,
+  `outbound()`, `FhirLookup()`, `DatabaseLookup()` and `DatabaseRef()` take `tls_hop_attested` with a
+  mandatory `tls_hop_attested_reason`. So do `connections.toml` inbound and outbound tables, as
+  top-level keys. `messagefoundry check` lists every attested hop on a `tls-hop-attested` line, and
+  `GET /security/posture` names them in a `tls_hop_attested` loosening. Before this, no factory took
+  the flag, but the engine read it straight out of a connection's transport settings. A config module
+  could write it there and pass the enforcing cleartext-bind refusal unreported. Those settings keys
+  are now refused at load, naming the supported surface. Owner ruling 2026-09-24; registry entry in
+  `docs/SECURITY-LOOSENING.md`.
 - **BREAKING: `zip_decompress` now refuses any bytes before or after the archive.** Stdlib
   `zipfile` finds the archive's end record by scanning back from the end of the input, and skips
   anything in front of the archive as prepended data. So an archive with up to about 64 KiB of extra

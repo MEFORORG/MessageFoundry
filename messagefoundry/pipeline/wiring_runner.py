@@ -74,6 +74,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.config.tls_policy import (
+    HOP_ATTESTATION_LEVER,
     HopPosture,
     TrustAnchorPolicy,
     active_hop_posture,
@@ -88,6 +89,7 @@ from messagefoundry.config.wiring import (
     PortConflictError,
     Registry,
     WiringError,
+    apply_hop_attestation,
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
@@ -610,6 +612,15 @@ class _ItemOutcome(Enum):
     STOPPED = "stopped"
 
 
+# Which direction's operator hold a STOPPED lane on each pooled stage belongs to. RESPONSE is absent
+# because no operator-required STOP happens there (its only STOP is the missing-inbound exit).
+_HOLD_DIRECTION: dict[Stage, Direction] = {
+    Stage.INGRESS: "inbound",
+    Stage.ROUTED: "inbound",
+    Stage.OUTBOUND: "outbound",
+}
+
+
 def _to_lane_result(outcome: tuple[_ItemOutcome, float | None]) -> LaneItemResult:
     """Map a ``_process_*_item`` result (the per_lane control-flow carrier) onto the pooled
     dispatcher's :class:`LaneItemResult` (ADR 0066 §4.5): ``(PROCESSED, None)`` → ``RESOLVED``,
@@ -1113,11 +1124,20 @@ class RegistryRunner:
         # #147 (ADR 0095): per-connection active-window scheduler. `_schedule_clock` is injectable for
         # deterministic tests (returns an AWARE UTC datetime); `_schedule_tick` is the reconcile
         # granularity. `_schedule_workers` holds one cooperatively-cancellable task per SCHEDULED
-        # connection, spawned in start() and cancelled in _teardown_unsafe (empty = no scheduled
-        # connections = byte-identical always-on lifecycle).
+        # (direction, name), spawned in start() and cancelled in _teardown_unsafe (empty = no scheduled
+        # connections = byte-identical always-on lifecycle). Keyed by direction for the reason _failed
+        # is (#1813); this map's own fix is #1819. A dual-role name can schedule BOTH halves, and a
+        # bare-name key let whichever half spawned first hold the slot while the other's calendar
+        # silently never ran.
         self._schedule_tick = schedule_tick
         self._schedule_clock: Callable[[], datetime] = schedule_clock or (lambda: datetime.now(UTC))
-        self._schedule_workers: dict[str, asyncio.Task[None]] = {}
+        self._schedule_workers: dict[tuple[Direction, str], asyncio.Task[None]] = {}
+        # Lanes halted by a STOP that only an operator may lift: a credential fault (#109) or the
+        # internal-error STOP policy. The scheduler reads this so a window close or open never undoes
+        # one (see _schedule_holds, which also names every path that clears a record). Keyed by
+        # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
+        self._stop_held: set[tuple[Direction, str]] = set()
+        self._stop_hold_logged: set[tuple[Direction, str]] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
         # resolved in _start_pooled_dispatchers AFTER trying to open the sync pools + build the per-stage
@@ -1416,7 +1436,7 @@ class RegistryRunner:
             for stage in stages:
                 d = self._dispatchers.get(stage)
                 if d is not None:
-                    d.notify_work()
+                    self._broadcast_to(d, stage)
             if Stage.OUTBOUND in stages:
                 self._wake_worker_lanes()
             return
@@ -1427,6 +1447,28 @@ class RegistryRunner:
             for stage in stages:
                 for ev in list(self._lane_events[stage].values()):
                     ev.set()
+
+    def _broadcast_to(self, d: StageDispatcher, stage: Stage) -> None:
+        """``d.notify_work()``, which re-arms every STOPPED lane, and so lifts the operator holds on
+        exactly those. The STOPPED set is read BEFORE the broadcast: a hold whose lane has not reached
+        STOPPED yet (the STOP site records it first) is not re-armed by it, and must survive."""
+        kind = _HOLD_DIRECTION.get(stage)
+        rearmed = [n for k, n in self._stop_held if k == kind and d.stopped(n)]
+        d.notify_work()
+        if kind is not None:
+            for n in rearmed:
+                self._release_operator_hold(n, kind)
+
+    def _resume_pooled_lane(self, d: StageDispatcher, stage: Stage, name: str) -> None:
+        """``d.resume_lane(name)``, lifting the operator hold only when it re-arms something.
+        resume_lane re-arms a PAUSED lane and ignores a STOPPED one, so a start on a lane still at
+        STOPPED leaves its hold in place. A PAUSED lane has nothing in flight, so no STOP can land
+        behind this read."""
+        rearms = d.paused(name)
+        d.resume_lane(name)
+        kind = _HOLD_DIRECTION.get(stage)
+        if rearms and kind is not None:
+            self._release_operator_hold(name, kind)
 
     def notify_work(self) -> None:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
@@ -2000,6 +2042,19 @@ class RegistryRunner:
         Empty when every outbound came up."""
         return {name: reason for (kind, name), reason in self._failed.items() if kind == "outbound"}
 
+    def degraded_stages(self) -> dict[str, str]:
+        """Snapshot of ``{stage: reason}`` for pooled pipeline stages with a claimer that died and has
+        not recovered (BACKLOG #1609) -- the stage-level twin of :meth:`degraded_inbound`. See
+        :attr:`StageDispatcher.claimer_faults` for when an entry clears. It exists because nothing
+        else reports this: ``running`` and every connection read healthy while a stage has stopped
+        draining. Empty in ``per_lane`` mode, whose workers are respawned by their own supervisors."""
+        out: dict[str, str] = {}
+        for stage, dispatcher in self._dispatchers.items():
+            faults = dispatcher.claimer_faults
+            if faults:
+                out[stage.value] = "; ".join(faults[name] for name in sorted(faults))
+        return out
+
     def inbound_filtered(self, name: str) -> str | None:
         """The reason the DR run-profile parked this INBOUND (its resolved priority tier is below
         ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is **not**
@@ -2061,7 +2116,7 @@ class RegistryRunner:
         )
         return True
 
-    def _auto_start_enabled(self, name: str, kind: str) -> bool:
+    def _auto_start_enabled(self, name: str, kind: Direction) -> bool:
         """The connection's declared ``auto_start`` (#115), by role. ``True`` for a name the registry no
         longer declares (a reload-dropped outbound that is only draining) — there is nothing left to
         gate, and defaulting to False would park a lane the graph never asked to disable."""
@@ -2071,7 +2126,7 @@ class RegistryRunner:
         oc = self.registry.outbound.get(name)
         return oc.auto_start if oc is not None else True
 
-    def _deployed(self, name: str, kind: str) -> bool:
+    def _deployed(self, name: str, kind: Direction) -> bool:
         """The connection's declared ``deployed`` (#233, ADR 0111), by role — read from the REGISTRY (the
         graph), never from live runner state, because at-least-once (ADR 0001) requires a crash re-run to
         re-derive an identical decision.
@@ -2364,7 +2419,7 @@ class RegistryRunner:
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
-                d.resume_lane(name)
+                self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             self._outbound_resume.setdefault(name, asyncio.Event()).set()
 
@@ -2454,7 +2509,7 @@ class RegistryRunner:
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
-                d.resume_lane(name)
+                self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             # per_lane: release the loop-top gate; respawn the worker if it exited (STOP policy / crash).
             self._outbound_resume.setdefault(name, asyncio.Event()).set()
@@ -2466,8 +2521,8 @@ class RegistryRunner:
 
     def _start_schedulers(self) -> None:
         """Spawn one active-window scheduler task per scheduled inbound/outbound connection. Called
-        once from :meth:`start` under the reload lock; idempotent per name (a live task is not
-        re-spawned). Byte-identical no-op when no connection declares a ``schedule``."""
+        once from :meth:`start` under the reload lock; idempotent per (direction, name) (a live task
+        is not re-spawned). Byte-identical no-op when no connection declares a ``schedule``."""
         for ic in self.registry.inbound.values():
             if ic.schedule is not None:
                 self._spawn_scheduler(ic.name, "inbound", ic.schedule)
@@ -2475,15 +2530,16 @@ class RegistryRunner:
             if oc.schedule is not None:
                 self._spawn_scheduler(oc.name, "outbound", oc.schedule)
 
-    def _spawn_scheduler(self, name: str, kind: str, schedule: Schedule) -> None:
-        existing = self._schedule_workers.get(name)
+    def _spawn_scheduler(self, name: str, kind: Direction, schedule: Schedule) -> None:
+        key = (kind, name)
+        existing = self._schedule_workers.get(key)
         if existing is not None and not existing.done():
             return
-        self._schedule_workers[name] = asyncio.create_task(
+        self._schedule_workers[key] = asyncio.create_task(
             self._schedule_worker(name, kind, schedule)
         )
 
-    async def _schedule_worker(self, name: str, kind: str, schedule: Schedule) -> None:
+    async def _schedule_worker(self, name: str, kind: Direction, schedule: Schedule) -> None:
         """Reconcile ``name``'s live listen/deliver state against its active-window ``schedule`` every
         ``_schedule_tick`` seconds until the runner stops. Cooperatively cancellable (it sleeps via
         :meth:`_stop_or_sleep`, which returns True on stop). A reconcile error is logged and swallowed —
@@ -2495,11 +2551,13 @@ class RegistryRunner:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("schedule worker %r: reconcile failed; will retry next tick", name)
+                log.exception(
+                    "schedule worker %s %r: reconcile failed; will retry next tick", kind, name
+                )
             if await self._stop_or_sleep(self._schedule_tick):
                 return
 
-    async def _reconcile_schedule(self, name: str, kind: str, schedule: Schedule) -> None:
+    async def _reconcile_schedule(self, name: str, kind: Direction, schedule: Schedule) -> None:
         """Bring ``name`` up or park it to match its schedule at the current (injectable) clock — one
         idempotent step. Reuses the SAME per-connection lifecycle the API uses: an inbound is
         started/stopped by binding/unbinding its listener (its router/transform workers keep draining
@@ -2521,6 +2579,17 @@ class RegistryRunner:
             return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
+        # An operator-required STOP (#109 credential fault, or the internal-error STOP policy) outranks
+        # the calendar. The start branch must not re-arm it: that re-tries a bad credential at every
+        # window open, which is the partner lockout the STOP exists to prevent. The OUTBOUND park must
+        # not run either, because the park is a pause and a pause is what a window open resumes (and a
+        # pooled pause_lane overwrites the STOPPED phase outright). The INBOUND park still runs: it only
+        # unbinds the listener, which leaves the halted router/transform workers exactly as they are and
+        # keeps intake inside its window.
+        would_start = active and not running
+        would_park_outbound = kind == "outbound" and not active and running
+        if (would_start or would_park_outbound) and self._schedule_holds(name, kind):
+            return
         if active and not running:
             # Per-connection auto-start (#115): ``auto_start=False`` means the ENGINE never brings this
             # connection up on its own — only an explicit operator start does. A scheduler tick IS the
@@ -2530,17 +2599,66 @@ class RegistryRunner:
             # its calendar and closes the window cleanly.
             if not self._auto_start_enabled(name, kind):
                 return
-            log.info("schedule: connection %r entering active window — starting", name)
+            log.info("schedule: %s connection %r entering active window — starting", kind, name)
             if kind == "inbound":
                 await self.start_inbound(name)
             else:
                 await self.start_outbound(name)
         elif not active and running:
-            log.info("schedule: connection %r leaving active window — parking (clean stop)", name)
+            log.info(
+                "schedule: %s connection %r leaving active window — parking (clean stop)",
+                kind,
+                name,
+            )
             if kind == "inbound":
                 await self.stop_inbound(name)
             else:
                 await self.stop_outbound(name)
+
+    def _hold_for_operator(self, name: str, kind: Direction) -> None:
+        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (a #109
+        credential fault or the internal-error STOP policy). Called at the STOP site as its last step
+        before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
+        raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
+        to hold. The scheduler reads it through :meth:`_schedule_holds`."""
+        self._stop_held.add((kind, name))
+        self._stop_hold_logged.discard((kind, name))
+
+    def _release_operator_hold(self, name: str, kind: Direction) -> None:
+        """The lane was re-armed (or an operator asked for it), so the scheduler owns its calendar
+        again."""
+        self._stop_held.discard((kind, name))
+        self._stop_hold_logged.discard((kind, name))
+
+    def _schedule_holds(self, name: str, kind: Direction) -> bool:
+        """Whether the scheduler must leave ``name``'s ``kind`` lane alone because an operator-required
+        STOP halted it. Logs once per hold.
+
+        The record alone decides, and it is not cross-checked against the lane's live state. That check
+        was tried and it races: the STOP site records the hold before its lane reaches STOPPED (a pooled
+        lane read PROCESSING for about 100 ms after the record, measured), so a scheduler tick in that
+        gap would have read the hold as stale and dropped it.
+
+        So the record is cleared at the few primitives that actually re-arm a halted lane, not at the
+        doors that call them (a door list is a completeness claim nobody can check, and a door can
+        fail part way, as a reload that rolls back does): a fresh per_lane worker
+        (:meth:`_spawn_worker`, :meth:`_ensure_inbound_workers`), a pooled broadcast that re-arms a
+        lane it found STOPPED (:meth:`_broadcast_to`), a pooled resume of a PAUSED lane
+        (:meth:`_resume_pooled_lane`), and a full teardown. An operator start that re-arms nothing,
+        such as ``start_outbound`` on a pooled lane still at STOPPED, leaves the hold in place."""
+        key = (kind, name)
+        if key not in self._stop_held:
+            return False
+        if key not in self._stop_hold_logged:
+            self._stop_hold_logged.add(key)
+            log.warning(
+                "schedule: %s connection %r is held by an operator-required STOP; the schedule "
+                "leaves it stopped until it is re-armed (fix the cause, then restart the "
+                "connection or reload)",
+                kind,
+                name,
+            )
+        return True
 
     def _guard_port_conflict(self, ic: InboundConnection) -> None:
         """Refuse to bind ``ic`` if its resolved ``(host, port)`` collides with a reserved service
@@ -3151,7 +3269,7 @@ class RegistryRunner:
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
             dispatcher = self._dispatchers.get(stage)
             if dispatcher is not None:
-                dispatcher.resume_lane(name)
+                self._resume_pooled_lane(dispatcher, stage, name)
         return True
 
     async def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
@@ -3890,6 +4008,9 @@ class RegistryRunner:
         self._outbound_quiesced.clear()
         self._outbound_resume.clear()
         self._gate_parked.clear()
+        # start() re-arms every lane from scratch, so no STOP outlives a full teardown.
+        self._stop_held.clear()
+        self._stop_hold_logged.clear()
         self._rcsi_off_degraded = False
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
@@ -3974,6 +4095,12 @@ class RegistryRunner:
         task = asyncio.create_task(self._delivery_worker(name))
         task.add_done_callback(functools.partial(self._on_worker_done, name))
         self._workers[name] = task
+        # A fresh worker is what re-arms a lane whose worker a STOP returned, whichever door spawned
+        # it (an operator start, a reload), so the operator hold ends here. Every caller spawns only
+        # over a missing or finished worker, and a STOP records its hold before its worker returns.
+        # Not while the #122 delivery halt holds: the new worker returns at the claim gate.
+        if not self._delivery_halted:
+            self._release_operator_hold(name, "outbound")
 
     def _on_worker_done(self, name: str, task: asyncio.Task[None]) -> None:
         """A delivery worker should only finish on shutdown — its loop swallows + backs off on
@@ -4034,10 +4161,19 @@ class RegistryRunner:
         if ic is not None and ic.spec.type is ConnectorType.LOOPBACK:
             # ADR 0013: a loopback inbound also gets a RESPONSE worker draining its Stage.RESPONSE tokens.
             kinds.append("response")
+        rearmed = False
         for kind in kinds:
             task = self._inbound_worker_dict(kind).get(name)
             if task is None or task.done():
                 self._spawn_inbound_worker(kind, name)
+                rearmed = rearmed or kind != "response"
+        # A respawned router or transform worker re-arms the lane a STOP halted (only those two STOP
+        # on content), whichever door called this: an operator start, a reload, a rollback. Not when
+        # both were alive: a STOP records its hold before its worker returns, so that hold is live.
+        # Not while a #122 log halt holds the inbound either: the new worker returns at its halt gate
+        # on its first turn, so nothing was re-armed.
+        if rearmed and name not in self._log_halted:
+            self._release_operator_hold(name, "inbound")
 
     def _spawn_inbound_worker(self, kind: str, name: str) -> None:
         """Start the ``kind`` (router/transform) worker for one inbound connection."""
@@ -4349,8 +4485,8 @@ class RegistryRunner:
             dispatcher = self._make_dispatcher(Stage.RESPONSE)
             self._dispatchers[Stage.RESPONSE] = dispatcher
             await dispatcher.start()
-        for dispatcher in self._dispatchers.values():
-            dispatcher.notify_work()
+        for stage, dispatcher in self._dispatchers.items():
+            self._broadcast_to(dispatcher, stage)
         # ADR 0066 D4: the dispatchers do not speak for a worker-drained outbound lane, so nudge those
         # directly — otherwise a reload that added rows to one would leave it asleep until its backstop.
         self._wake_worker_lanes()
@@ -4652,6 +4788,7 @@ class RegistryRunner:
                 or name not in self._destinations
                 or old.outbound.get(name) is None
                 or old.outbound[name].spec != oc.spec
+                or _hop_policy(old.outbound[name]) != _hop_policy(oc)
             ):
                 # live worker but a missing/mismatched connector → (re)build it in place, close any old
                 # one. `failed` covers an outbound that failed to build at START (ADR 0031): its worker
@@ -6005,6 +6142,7 @@ class RegistryRunner:
                         name,
                         detail=f"credential fault ({exc.code}); lane stopped, queue retained (#109)",
                     )
+                    self._hold_for_operator(name, "outbound")
                     return _ItemOutcome.STOPPED, None
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
             elif exc.permanent:
@@ -6050,6 +6188,7 @@ class RegistryRunner:
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering {item.id}"
                 )
+                self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
             log.warning(
                 "delivery worker %r: internal error delivering %s (%s); dead-lettering",
@@ -6289,6 +6428,7 @@ class RegistryRunner:
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}"
                 )
+                self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
             log.warning(
                 "delivery worker %r: framing/internal error delivering a batch of %d (%s); dead-lettering",
@@ -6412,6 +6552,7 @@ class RegistryRunner:
             self._alert_sink.connection_stopped(
                 name, detail=f"router {type(exc).__name__} on {item.id}"
             )
+            self._hold_for_operator(name, "inbound")
             return _ItemOutcome.STOPPED, None
         log.warning(
             "router worker %r: router error on %s (%s); dead-lettering",
@@ -6446,6 +6587,7 @@ class RegistryRunner:
             self._alert_sink.connection_stopped(
                 name, detail=f"handler {type(exc).__name__} on {item.id}"
             )
+            self._hold_for_operator(name, "inbound")
             return _ItemOutcome.STOPPED, None
         log.warning(
             "transform worker %r: handler error on %s (%s); dead-lettering",
@@ -7691,6 +7833,12 @@ def _hl7_batch_timestamp(created_at: float | None) -> str:
 def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[str, Any]) -> Source:
     # Resolve any env() references first (a missing value raises WiringError here, before bind).
     settings = resolve_env_settings(ic.spec.settings, env_values)
+    # Owner ruling 2026-09-24: the hop attestation is the connection's typed field, never a transport
+    # setting, so the loosening report and the gate read the same thing. Refuse the raw keys, then
+    # mirror a declared pair for the settings-driven seams, as _dest_config does for cleartext_accepted.
+    apply_hop_attestation(
+        settings, f"inbound connection {ic.name!r}", ic.tls_hop_attested, ic.tls_hop_attested_reason
+    )
     # Inbound MLLP/TCP/X12 listeners never carry an author-supplied host (wiring rejects one) — they
     # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
@@ -7713,23 +7861,17 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
         name=ic.name,
         settings=settings,
         ack_mode=ic.ack_mode,
-        # #200 (ADR 0092): surface the per-connection insecure-hop attestation as a typed field so the
-        # cell (built inside build_check_registry's active_hop_posture scope) can ALLOW a legitimately-
-        # secure hop. Default False → keyed purely on posture; a bad attested/reason pair fails loud here.
-        tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
-        tls_hop_attested_reason=_hop_attested_reason(settings),
+        # #200 (ADR 0092): the per-connection insecure-hop attestation, so the cell (built inside
+        # build_check_registry's active_hop_posture scope) can ALLOW a legitimately-secure hop. Read off
+        # the InboundConnection (owner ruling 2026-09-24). Default False → keyed purely on posture.
+        tls_hop_attested=ic.tls_hop_attested,
+        tls_hop_attested_reason=ic.tls_hop_attested_reason,
         # ADR 0173: the mTLS listener's revocation attestation. A TOP-LEVEL inbound key, read off the
         # InboundConnection (not the env-resolved settings), so check_inbound_revocation's attested
         # branch is reachable from config. Default off -> byte-identical.
         tls_revocation_attested=ic.tls_revocation_attested,
         tls_revocation_attested_reason=ic.tls_revocation_attested_reason,
     )
-
-
-def _hop_attested_reason(settings: Mapping[str, Any]) -> str | None:
-    """The env-resolved ``tls_hop_attested_reason`` connector setting as ``str | None`` (#200)."""
-    reason = settings.get("tls_hop_attested_reason")
-    return None if reason is None else str(reason)
 
 
 def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings | None) -> None:
@@ -7831,6 +7973,14 @@ def _dest_config(
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = oc.cleartext_reason
         settings["cleartext_connection"] = oc.name
+    # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
+    # setting. Refuse the raw keys, then mirror a declared pair for the same settings-driven seams.
+    apply_hop_attestation(
+        settings,
+        f"outbound connection {oc.name!r}",
+        oc.tls_hop_attested,
+        oc.tls_hop_attested_reason,
+    )
     # ADR 0173: mirror the revocation attestation the same way, for the one settings-driven seam that
     # reads it -- the SMART token-endpoint provider (transports/smart.py).
     _mirror_revocation_attestation(
@@ -7850,9 +8000,10 @@ def _dest_config(
         # connections.toml setting) flips it. The MLLP connector reads config.hl7_raw_separators.
         hl7_raw_separators=bool(settings.get("hl7_raw_separators", False)),
         # #200 (ADR 0092): the per-outbound insecure-hop attestation, typed here so the cell can ALLOW a
-        # legitimately-secure egress hop even on production-PHI. Default False → keyed purely on posture.
-        tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
-        tls_hop_attested_reason=_hop_attested_reason(settings),
+        # legitimately-secure egress hop. Read off the OutboundConnection (owner ruling 2026-09-24).
+        # Default False → keyed purely on posture.
+        tls_hop_attested=oc.tls_hop_attested,
+        tls_hop_attested_reason=oc.tls_hop_attested_reason,
         # ADR 0153 decision 2: the per-outbound cleartext-hop ACCEPTANCE ("this hop is NOT secure and we
         # accept that"). A TOP-LEVEL outbound key, not a transport setting, so it is read off the
         # OutboundConnection rather than the env-resolved settings dict — one authoring surface, and no
@@ -8385,26 +8536,49 @@ def check_fhir_lookup_allowed(
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
-#: How the four inbound bind refusals below describe ``--allow-insecure-bind``. They name no
-#: per-connection ``tls_hop_attested``: :func:`_inbound_insecure_bind_permitted` reads it, but no
-#: supported surface sets it -- no factory parameter and no ``connections.toml`` key. Only the
-#: unsupported raw-settings escape hatch (writing ``spec.settings`` directly) reaches it, and a refusal
-#: must not steer an operator there (docs/DEPLOYMENT.md, SDS-3.7).
-_INSECURE_BIND_FLAG_CLAMP = (
+#: How the four inbound bind refusals below end, after "... on a trusted, firewalled network ".
+#: The flag's caveat first: an enforcing instance ignores it (:func:`_inbound_insecure_bind_permitted`).
+#: Then the per-connection attestation, named with its reason and its supported surface (owner ruling
+#: 2026-09-24), never as a transport setting, which the loader refuses. Unlike the flag it crosses an
+#: enforcing instance, so it is reported as a loosening.
+_INSECURE_BIND_REFUSAL_TAIL = (
     "(an enforcing instance, which is the default, ignores the flag; "
-    "[security].enforcement = warn lets it apply)"
+    "[security].enforcement = warn lets it apply). If a TLS-terminating proxy or an isolated segment "
+    f"secures this hop by means the engine cannot see, set {HOP_ATTESTATION_LEVER} on the inbound "
+    "connection (an inbound() parameter or a connections.toml key); the attestation is reported as "
+    "a security loosening."
 )
 
 
 def _insecure_bind_cause(source: Source) -> str:
     """What let an off-loopback cleartext bind cross, for its WARNING line.
 
-    It names ``tls_hop_attested`` only when the connection carries it, so the line reports a fact
-    rather than offering a field no supported surface sets (see :data:`_INSECURE_BIND_FLAG_CLAMP`)."""
+    An attestation is named WITH its reason (owner ruling 2026-09-24), so the log line records why the
+    operator vouched for the hop. Otherwise the cause is the flag."""
     if source.tls_hop_attested:
-        return "tls_hop_attested"
+        # Same shape and fallback as the MLLP guard's attestation line (transports/mllp.py).
+        return f"tls_hop_attested; reason: {source.tls_hop_attested_reason or '(none provided)'}"
     # serve folds [security].require_encryption_for_remote = false into the same flag (ADR 0118).
     return "--allow-insecure-bind / require_encryption_for_remote = false"
+
+
+def _hop_policy(oc: OutboundConnection) -> tuple[object, ...]:
+    """The hop-policy declarations an outbound carries OUTSIDE its ``spec``.
+
+    A reload rebuilds a live outbound's connector only when something it was built from changed. These
+    typed fields feed the hop gates at construction, so an edit to one of them alone must rebuild too.
+    Otherwise a withdrawn attestation keeps ALLOWing the hop until a restart, while every report,
+    reading the new registry, says it is gone."""
+    return (
+        oc.tls_hop_attested,
+        oc.tls_hop_attested_reason,
+        oc.cleartext_accepted,
+        oc.cleartext_reason,
+        # ADR 0173: the revocation guard is built from these too, so withdrawing the attestation alone
+        # must rebuild the connector, exactly as for tls_hop_attested above.
+        oc.tls_revocation_attested,
+        oc.tls_revocation_attested_reason,
+    )
 
 
 def _inbound_insecure_bind_permitted(
@@ -8556,7 +8730,7 @@ def check_mllp_tls_exposure(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; HL7 bodies would "
         "cross the network in cleartext. Set tls=true (+ tls_cert_file/tls_key_file) on the MLLP "
         "connection, or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
-        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
+        "firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 
@@ -8592,7 +8766,7 @@ def check_http_tls_exposure(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; POSTed bodies "
         "(frequently PHI) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the Http connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 
@@ -8825,7 +8999,7 @@ def check_dimse_tls_exposure(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; DICOM PHI (header "
         "+ pixel data) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the DICOM connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 
@@ -8865,7 +9039,7 @@ def check_tcp_tls_exposure(
         f"{source.type.value.upper()} listener; raw-TCP/X12 payloads (frequently PHI) would cross the "
         "network in cleartext. TCP/X12 listeners are plaintext-only (no TLS option) — bind loopback, "
         "or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
-        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
+        "firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 

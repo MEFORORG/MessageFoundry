@@ -298,6 +298,7 @@ from messagefoundry.config.wiring import (
     Registry,
     WiringError,
     accepted_cleartext_hops,
+    attested_secure_hops,
     expiry_relaxed_hops,
     load_config,
     redacted_settings,
@@ -2059,10 +2060,12 @@ def create_app(
         secret_rotation_settings = (
             getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
         )
-        # ADR 0153 + #333 + ADR 0173: the FOUR connection-scoped deviations. Read LIVE off the running
-        # graph (so a reload is reflected) — this route is where an operator learns a cleartext hop is
-        # being crossed by declaration, an expired certificate is being honoured, a generic DB hop has
-        # no verifying TLS keyword, or a revocation refusal is attested away, and a stale or absent list would understate the posture. An engine with no
+        # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
+        # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
+        # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
+        # being honoured, a generic DB hop has no verifying TLS keyword, a hop is attested secure, or a
+        # revocation refusal is attested away, and a stale or absent list would understate the
+        # posture. An engine with no
         # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
         # DECLARES that in `loosenings_scope` rather than returning a settings-only subset that reads as
         # the whole posture — the same discipline `messagefoundry security show` follows.
@@ -2071,15 +2074,17 @@ def create_app(
             cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
             expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
             db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
-            attested_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
+            attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
+            revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
         else:
-            cleartext_hops, expired_hops, db_hops, attested_hops = [], [], [], []
+            cleartext_hops, expired_hops, db_hops = [], [], []
+            attested_hops, revocation_hops = [], []
         loosenings_scope = (
             None
             if runner is not None
             else (
                 "settings only — no connection graph is loaded on this engine, so the per-connection "
-                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS / "
+                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS / tls_hop_attested / "
                 "tls_revocation_attested declarations are NOT included (see `messagefoundry check`)"
             )
         )
@@ -2096,13 +2101,14 @@ def create_app(
                 auth_settings,
                 alerts_settings,
                 secret_rotation_settings,
-                cleartext_hops,
-                expired_hops,
-                db_hops,
-                attested_hops,
-                store_privilege,
+                cleartext_hops=cleartext_hops,
+                expiry_relaxed_hops=expired_hops,
+                unverified_db_hops=db_hops,
+                attested_hops=attested_hops,
+                revocation_attested_hops=revocation_hops,
+                store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
-                engine.store.audit_chain_unkeyed(),
+                audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
             )
         ]
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
@@ -4339,10 +4345,13 @@ def create_app(
             # The message exists (checked above) but has no re-queueable outbox rows — it errored,
             # was filtered, or routed nowhere. Replaying is a no-op there; say so rather than report
             # a misleading 200/requeued=0 (and the store leaves its disposition intact — review M-2).
+            # A message whose only Sends went into a pass-through inbound lands here too: its
+            # completion markers are never replayed (BACKLOG #1580), so name that case as well.
             raise HTTPException(
                 409,
                 f"message {message_id} has no deliveries to replay "
-                "(it errored, was filtered, or routed nowhere)",
+                "(it errored, was filtered, routed nowhere, or its only sends went into a"
+                " pass-through inbound, which replay never retransmits)",
             )
         # An actual re-transmission of PHI: record who did it in the tamper-evident chain (review M-4).
         await engine.store.record_audit(
@@ -5789,6 +5798,9 @@ def create_app(
                 channels_failed_names=[
                     name for name in failed_in if _user.can_access_channel(name)
                 ],
+                # BACKLOG #1609: a pooled stage whose claimer died reads healthy everywhere
+                # else, so it is named here for the console's nav heart.
+                stages_degraded=rr.degraded_stages() if rr is not None else {},
             ),
             kpis=kpis,
             db=DbInfo(

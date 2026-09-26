@@ -341,7 +341,7 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `tls_key_file` | both | — | private key for `tls_cert_file`. |
 | `tls_ca_file` | both | — | trust anchor — **in:** verify client certs (opt-in mTLS → require a client cert); **out:** verify the server cert. |
 | `tls_ca_pin` | in | - | the SHA-256 of the inbound `tls_ca_file`, hex, `:` separators allowed. Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. It pins `tls_ca_file` only. A `tls_crl_file` is read by path with no pin, and a certificate in it that `tls_ca_file` does not already hold refuses the build (BACKLOG #1890). Set on an outbound connection, or without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
-| `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able and is **refused at construction**. `MEFOR_ALLOW_INSECURE_TLS=1` downgrades that refusal to a loud warning **only where the clamp allows it** (#200, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2): the escape is inert on an instance that is **both** PHI-classified **and** at `[security].enforcement = enforce`. That is the shipped default, so **on a stock instance the refusal stands with the variable set** — treat the env var as a lab tool, not a deployment option. Nothing else opens this hop: `cleartext_accepted` deliberately does **not** reach a verify-off hop (it has TLS — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted)), and `tls_hop_attested` has no authoring surface. If the partner's certificate has merely lapsed, `tls_allow_expired` below is the narrower lever — read that row before reaching for it. |
+| `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able and is **refused at construction**. `MEFOR_ALLOW_INSECURE_TLS=1` downgrades that refusal to a loud warning **only where the clamp allows it** (#200, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2): the escape is inert on an instance that is **both** PHI-classified **and** at `[security].enforcement = enforce`. That is the shipped default, so **on a stock instance the refusal stands with the variable set** — treat the env var as a lab tool, not a deployment option. Nothing else opens this hop: `cleartext_accepted` deliberately does **not** reach a verify-off hop (it has TLS — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted)), and the MLLP verify-off refusal does not read [`tls_hop_attested`](#attesting-a-hop-secure-tls_hop_attested) either. If the partner's certificate has merely lapsed, `tls_allow_expired` below is the narrower lever — read that row before reaching for it. |
 | `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). |
 | `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain + hostname + key-usage — the **granular** alternative to `tls_verify=false` for the narrow expired-cert case. It is genuinely narrower (a wrong-host or untrusted-chain peer is still rejected), but do not book it as "not MITM-able": **expiry is the control that retires a certificate**, so a hop that ignores it will keep authenticating a **compromised key indefinitely** — and on the two connectors with no revocation gate (**DICOM-SCU, FTPS**) nothing else would catch that certificate either. **No posture gate covers this setting at all.** It needs no `MEFOR_ALLOW_INSECURE_TLS`; `[security].enforcement = enforce` does not clamp it; verification stays on, so no #200 cleartext/verify-off refusal keys on it; and it is **absent from `security_loosenings()`**, so `GET /security/posture`, the serve-time loosening warning and `messagefoundry check` will **not** report a connection that has it set. The only disclosure is the WARNING logged at each connector build — so a "two-week bridge" set when a partner's cert lapses has nothing that expires it or surfaces it: record the connection name and a removal date in your own risk register. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). It is a factory parameter on **six** outbound connectors only — **MLLP, FTPS (`Ftp(tls=True)`), DICOM C-STORE SCU, REST, SOAP, FHIR** — and is **not** honoured by the engine's other verifying TLS hops, including **`DICOMweb()`** (which reuses the REST client but does not read it), the `Database(...)` destination / `DatabasePoll(...)` source, and the `Email()`/`Direct()` SMTP TLS legs. |
 | `encoding_characters` | out | — (off) | **(Corepoint `-override` parity)** re-encode each outgoing message with a different set of HL7 delimiters (the 5 MSH chars in MSH order — MSH-1 + the 4 MSH-2 chars, e.g. `"#@*!%"`) before framing. Validated at build (exactly 5, all distinct). Unset = payload **byte-identical**. |
@@ -1213,7 +1213,7 @@ one.
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — supply via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and `tls_hop_attested` has no authoring surface. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab |
+| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract and the same reporting gap as the [MLLP row](#mllp--mllp): **no posture gate, no escape variable, and `security_loosenings()` never reports it** |
 | `encoding` | `utf-8` | request-body charset |
 
@@ -1354,7 +1354,7 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > The warning above used to be the whole control, so a generic connection with no TLS keyword would
 > cross in plaintext with nothing stopping it. That arm now goes through the same cleartext-hop
 > authority every other cleartext transport uses, with the same owner-ratified precedence: an on-box
-> hop is allowed, a per-connection `tls_hop_attested` allows it (audited; no supported surface sets it),
+> hop is allowed, a per-connection `tls_hop_attested` with its `tls_hop_attested_reason` allows it (audited, and reported),
 > `cleartext_accepted` warns
 > and audits, a non-enforcing instance warns, and an **enforcing** instance **refuses** it. The refusal
 > lands at construction, so it fails `messagefoundry check` / dry-run / reload / the `serve` pre-flight
@@ -1363,8 +1363,9 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > What is gated is the case the classifier can judge: **no** ssl/tls/encrypt keyword, or one pinned to
 > a no-TLS value. A keyword set to anything outside that deny-list is still delegated, because the
 > engine cannot tell whether an arbitrary driver's value verifies the certificate — that residual is
-> unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound has no
-> supported per-connection relaxation: set a verifying keyword, or run at `[security].enforcement = warn`.
+> unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound's only
+> per-connection relaxation is `tls_hop_attested` with a `tls_hop_attested_reason`, for a hop secured by
+> other means. Otherwise set a verifying keyword, or run at `[security].enforcement = warn`.
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
@@ -1762,7 +1763,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
 | `username` | str / `env()` / None | `None` | SMTP `AUTH` user — put the secret in `env()`. |
 | `password` | str / `env()` / None | `None` | SMTP `AUTH` password — `env()` only. AUTH is sent **over TLS only**; a cleartext-credential config is refused. |
-| `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated. **The opt-in** is one of exactly two things you can actually set: `MEFOR_ALLOW_INSECURE_TLS` (process-global — it weakens *every* connector in the process, and it is read through the **clamped** check, so it cannot relax an enforcing production-PHI hop), or this connection's `cleartext_accepted = true` with its mandatory `cleartext_reason` (per-hop, audited — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted), and prefer it). **And** the hop then goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback ALLOWs, a `cleartext_accepted` hop **WARNs + audits** (never a silent allow), a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. The engine also honours a connection-level `tls_hop_attested` on this gate, but **no factory keyword and no `connections.toml` key sets it**, so it is not a route you can take — see the note in that section. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
+| `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated. **The opt-in** is one of exactly two things you can actually set: `MEFOR_ALLOW_INSECURE_TLS` (process-global — it weakens *every* connector in the process, and it is read through the **clamped** check, so it cannot relax an enforcing production-PHI hop), or this connection's `cleartext_accepted = true` with its mandatory `cleartext_reason` (per-hop, audited — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted), and prefer it). **And** the hop then goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback ALLOWs, a `cleartext_accepted` hop **WARNs + audits** (never a silent allow), a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. A connection whose hop is secured by other means can [attest it](#attesting-a-hop-secure-tls_hop_attested) instead, which ALLOWs it. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
 | `timeout_seconds` | float | `30.0` | |
 | `encoding` | str | `"utf-8"` | |
 
@@ -2393,12 +2394,10 @@ does. There are exactly three ways such a hop crosses:
 | `cleartext_accepted = true` + `cleartext_reason` | this hop is **not** secure, and we accept that | **WARN** — crossed, loudly logged **and recorded at every construction** |
 | `[security].enforcement = warn` | the instance-wide refuse/warn dial is at `warn` | WARN — but **only for the raw transports** (`MLLP()`, `Tcp()`, `X12()`, `DICOM()`, `Email()`, `Ftp()`). The HTTP family (`Rest()`, `Soap()`, `FHIR()`, `DICOMweb()`, `FhirLookup()`) shipped these refusals unconditionally, and ADR 0092 decision 5 forbids a cell getting weaker, so a no-loosen floor turns that WARN back into a REFUSE there. The dial is **not** a substitute for the declaration |
 
-A fourth route exists in the engine but has **no authoring surface on a connection today**:
-`tls_hop_attested` ("this hop *is* secure by means the engine cannot see" — proxy-terminated TLS, a
-genuinely isolated segment) yields a silent ALLOW, but no transport factory takes it and it is not a
-`connections.toml` key, so you cannot set it on an inbound or outbound. Do **not** reach for it; use
-`cleartext_accepted`. (The `[logging].forward_hop_attested` sibling in `messagefoundry.toml` *is*
-settable — see [CONFIGURATION.md](CONFIGURATION.md).)
+A fourth route makes the opposite claim: the hop *is* secure, by means the engine cannot see. That is
+[`tls_hop_attested`](#attesting-a-hop-secure-tls_hop_attested), below. (The `[logging].forward_hop_attested`
+sibling in `messagefoundry.toml` is the same claim for the log forwarder — see
+[CONFIGURATION.md](CONFIGURATION.md).)
 
 The two claims are deliberately **separate fields with opposite meanings**. Do not describe a peer that
 simply cannot do TLS as attested: that writes a false statement into the one field that exists to be
@@ -2456,6 +2455,54 @@ listing the **whole** accepted set, so a broad rollout is obvious in review), in
 construction WARN + audit record, and in `GET /security/posture`'s loosening list — with a deviation
 entry in [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). That visibility is the mitigation: nothing stops
 an operator declaring it on every destination, and the engine does not try to.
+
+## Attesting a hop secure (`tls_hop_attested`)
+
+`tls_hop_attested = true` with a mandatory `tls_hop_attested_reason` says a hop **is** secure, by means
+the engine cannot see. A TLS-terminating proxy or sidecar in front of the connection is the usual case.
+An isolated segment with its own link-layer encryption is the other. An enforcing refusal of a
+cleartext or verify-off hop then **ALLOWs** it
+([ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md), owner ruling
+2026-09-24). That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a
+verify-off HTTP-family egress hop and a weakened database TLS hop. It does **not** reach every
+verify-off refusal: at least the MLLP, FTPS and email `tls_verify = false` refusals do not read it.
+
+Set it on the declaration that owns the hop:
+
+```python
+inbound("IB_ACME_ADT", MLLP(port=2575), router="acme_adt_router", bind_address="0.0.0.0",
+        tls_hop_attested=True, tls_hop_attested_reason="TLS terminates at the stunnel sidecar")
+```
+
+```toml
+[[inbound]]
+name = "IB_ACME_ADT"
+transport = "mllp"
+router = "acme_adt_router"
+bind_address = "0.0.0.0"
+tls_hop_attested = true
+tls_hop_attested_reason = "TLS terminates at the stunnel sidecar"
+  [inbound.settings]
+  port = 2575
+```
+
+`outbound()` and a `[[outbound]]` table take the same pair, and so do `FhirLookup()`,
+`DatabaseLookup()` and `DatabaseRef()`. It is a top-level key, **not** a transport setting. Under
+`[settings]`, or written into a factory's settings dict from Python, it is refused at load. A flag with
+no reason, a blank reason, or a reason with no flag also fail at load. So does an `env()` value, and so
+does declaring it together with `cleartext_accepted`, which is the opposite claim.
+
+**Do not attest a hop that is not secure.** A peer that simply cannot do TLS is
+[`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted), which WARNs at every
+construction. An attested hop is recorded as secure, so a false attestation hides a plaintext hop.
+
+**It is reported.** `messagefoundry check` prints a `tls-hop-attested` line listing every attested hop
+with its reason, and `GET /security/posture` names them in a `tls_hop_attested` loosening. At least
+the inbound bind gates and the raw-TCP/MLLP hop guard also log a WARNING with the reason when they
+suppress a refusal. Not every cell does: the database weakened-TLS audit line omits the reason, and a
+`DatabaseRef` sync logs nothing. So those two reports are the complete record. The risk entry is in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). It does not reach a revocation refusal, which is
+`tls_revocation_attested`, or SMTP `AUTH` over cleartext, which is refused outright.
 
 ## Per-connection retention, document pruning & diagnostics overrides
 

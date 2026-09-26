@@ -1622,6 +1622,19 @@ def revocation_hop_disposition(
     return HopDisposition.WARN
 
 
+#: How a refusal names the per-connection hop attestation (ADR 0092, owner ruling 2026-09-24): the flag
+#: with its mandatory reason. One spelling, so every refusal a declaration can clear offers the same
+#: lever. Its surface is the declaration (``inbound()``, ``outbound()``, the lookups, a top-level
+#: ``connections.toml`` key), never a transport setting, which the loader refuses.
+HOP_ATTESTATION_LEVER = "tls_hop_attested=true with a tls_hop_attested_reason"
+
+#: The remedy the credential-bearing token-endpoint refusals share (OAuth2, HTTP Digest, SMART).
+CREDENTIAL_HOP_WAYS_ACROSS = (
+    f"use https, attest the hop as secure with {HOP_ATTESTATION_LEVER}, "
+    "or declare cleartext_accepted with a cleartext_reason"
+)
+
+
 #: The remediation sentence for a hop that IS a connection, which is most of them. Named so a
 #: non-connection hop can substitute its own via :attr:`RevocationHopGuard.ways_across` rather than
 #: inheriting levers it cannot use (BACKLOG #1498). Deliberately **not** annotated with how many

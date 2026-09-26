@@ -112,6 +112,14 @@ def _pointer_only_passages() -> dict[str, str]:
         ".github/workflows/dast.yml": _read(_REPO / ".github" / "workflows" / "dast.yml"),
         "scripts/security/dast_target.py": _read(_REPO / "scripts" / "security" / "dast_target.py"),
         "scripts/security/route_gates.py": _read(_REPO / "scripts" / "security" / "route_gates.py"),
+        # Increment 2's ingress-plane pass: implementation modules, swept so a paraphrase cannot hide
+        # in a docstring, exempt from the must-point rule below like the two above.
+        "scripts/security/dast_ingress_sweep.py": _read(
+            _REPO / "scripts" / "security" / "dast_ingress_sweep.py"
+        ),
+        "scripts/security/dast_ingress_target.py": _read(
+            _REPO / "scripts" / "security" / "dast_ingress_target.py"
+        ),
         # `docs/BACKLOG.md #318` was a carrier here until the ledger left this repository
         # (BACKLOG #1250). `_section` returns -1 for a heading that is not there, and the guard
         # correctly refused rather than scanning nothing. The item's DAST prose lives in the

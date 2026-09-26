@@ -32,12 +32,20 @@ name: Dependabot lock resync
 #  - NO project install/tests/build runs here, and "uv lock --check" (validate-only, never builds an
 #    sdist) + "uv export" (serializes the existing lock) execute NO package code — so no
 #    attacker-controlled build backend ever runs while the token is on the runner.
+#  - ONE repository script runs: scripts/security/runtime_closure.py (BACKLOG #1812), under the
+#    runner's own python3 with nothing installed. It is standard-library only (import names checked
+#    by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed there), reads two files, writes
+#    one. The checkout pins the SHA that triggered the run, and a "pull_request" run takes THIS
+#    workflow's definition from that same PR, so anyone able to change the script could already
+#    change the steps around it.
 
 on:
   pull_request:
     paths:
       - "uv.lock"
       - "pyproject.toml"
+      # Dependabot's security track may still write here (see the regenerate step below).
+      - "security/runtime-closure-core.txt"
 
 permissions:
   contents: read
@@ -109,10 +117,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ steps.app-token.outputs.token }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          # The SHA that triggered this run, not the branch tip. The regenerate step runs a script from
+          # this checkout, so a commit pushed to the branch after the trigger must not be what runs. If
+          # the branch has moved, the push below is refused as non-fast-forward (BACKLOG #1812).
+          ref: ${{ github.event.pull_request.head.sha }}
           # The App token is persisted as the git credential so the push below uses it WITHOUT the
           # token ever appearing in a command line / process table. Safe because no untrusted package
-          # code runs in this job (uv lock --check + uv export only).
+          # code runs in this job: uv lock --check, uv export, and one stdlib-only repository script
+          # (see SECURITY MODEL above).
 
       - name: Set up uv
         if: steps.creds.outputs.present == 'true'
@@ -139,6 +151,25 @@ jobs:
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
           uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
 
+      # security/runtime-closure-core.txt is the risky-component inventory's denominator, a copy of the
+      # core lock's pins, and tests/test_risky_component_designation.py fails when the two differ
+      # (BACKLOG #1812). A PR that moves a core package would otherwise be red with no bot-reachable path
+      # to green. dependabot.yml's exclude-paths keeps the version track from editing the file; the
+      # security track may ignore that key, so this rewrite is what actually holds it to the lock.
+      #
+      # It runs after the exports, so it copies the fresh core lock. It may FAIL: a per-platform fork in
+      # the core lock, which needs a human, or a PR head from before the script existed. Either way the
+      # re-exported locks must still be pushed, so a failure here does not skip the commit. The last
+      # step marks THIS run red. That red sits on the pre-push commit; on the new head, the signal is
+      # the closure test failing in the required test legs.
+      - name: Regenerate the runtime-closure inventory from the core lock
+        id: closure
+        if: steps.creds.outputs.present == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 scripts/security/runtime_closure.py
+
       - name: Commit and push the resynced locks
         if: steps.creds.outputs.present == 'true'
         env:
@@ -149,13 +180,20 @@ jobs:
           set -euo pipefail
           git config user.name 'dependabot[bot]'
           git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
-          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock; then
-            echo 'Exported lock files already in sync; nothing to push.'
+          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt; then
+            echo 'Exported lock files and the closure file already in sync; nothing to push.'
             exit 0
           fi
-          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
+          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt
           git commit -m 'chore(deps): resync exported lock files (DEP-1)'
           # Push with the persisted App-token credential (NOT GITHUB_TOKEN). An App-token push emits a
           # synchronize event so the required checks (DEP-1, ci.yml) re-run on the new commit; a
           # GITHUB_TOKEN push would leave them pending and the PR unmergeable.
-          git push origin "HEAD:${HEAD_REF}"
+          # Fully qualified: the checkout is a detached SHA, so HEAD has no branch to infer a name from.
+          git push origin "HEAD:refs/heads/${HEAD_REF}"
+
+      - name: Fail if the closure inventory could not be regenerated
+        if: steps.closure.outcome == 'failure'
+        run: |
+          echo "::error title=runtime-closure regeneration failed::scripts/security/runtime_closure.py failed; its log is in the step above. Any re-exported locks were still pushed, but security/runtime-closure-core.txt was not regenerated, so tests/test_risky_component_designation.py will fail on this PR until someone fixes it."
+          exit 1

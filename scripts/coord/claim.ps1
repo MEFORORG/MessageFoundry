@@ -72,7 +72,12 @@ param(
     # THIS IS NOT A RETREAT FROM THE $PSScriptRoot ANCHORING (BACKLOG #1060). That defect was a SILENT
     # read of the caller's cwd; this is an explicit argument, recorded in the claim, printed back on
     # every surface that shows a holder. Nothing changes unless someone asks for it.
-    [string]$AsWorktree
+    [string]$AsWorktree,
+    # Also ask the NETWORK for merged-work evidence on a directory-only claim (BACKLOG #1466): whether
+    # the holder's branch is on origin right now (`git ls-remote`) and whether it has a pull request
+    # (`gh`, when installed and signed in). Off by default, so `-List` stays offline. Each lookup is
+    # time-boxed, and a failure or timeout prints "unknown", never a guess.
+    [switch]$Online
 )
 
 $ErrorActionPreference = "Stop"
@@ -378,14 +383,343 @@ function Get-HolderLiveness([string]$HeldPath) {
     }
 }
 
+# MERGED-WORK EVIDENCE FOR A DIRECTORY-ONLY HOLDER (BACKLOG #1466).
+#
+# `unoccupied` is the state with no remedy on this host: the directory is there, nobody is placed in
+# it, and nothing can prove the session gone. What a reader there lacked was not a verb -- `-Force`
+# exists -- but any FACT to ground a decision on. The cheapest fact available offline is whether the
+# holder's branch still carries committed work that origin/main lacks -- the work a release could
+# leave with nobody claiming it.
+#
+# ***EVIDENCE, NOT AUTHORITY.*** Nothing below changes a refusal or recommends `-Force`. Landed work
+# does not prove the session gone either -- a live session can still be building on a merged branch --
+# so it is printed for the owner, whose call a directory-only claim remains. Treating it as a third
+# thing that settles the claim would be the automatic release this item declined.
+#
+# WHAT IT CAN SAY, AND WHAT IT CANNOT. It answers "does the branch carry work origin/main lacks?".
+# It does NOT answer "did THIS claim's work land": a branch that pulled main, or a reused branch whose
+# earlier work was squash-merged, also carries nothing main lacks, so no verdict below says "landed".
+# Pull requests here are SQUASH-merged, so a branch whose content is on main is usually NOT an
+# ancestor of it; `git merge-tree` catches that shape by asking whether merging the branch would
+# change origin/main at all. Whether anything was committed after the claim is folded in, because a
+# branch with nothing built on it carries nothing main lacks, trivially.
+#
+# BATCHED, BECAUSE A GIT CALL IS THE COST. Measured 2026-09-26 under fleet load: one `git rev-parse`
+# took over a second and one `merge-tree` five, while `-List` already spends a git call per claim. So
+# this makes a fixed handful of calls per REPOSITORY, never one per claim: `worktree list` for every
+# holder's HEAD and branch, one `for-each-ref` with `ahead-behind` for every branch, and one
+# `merge-tree --stdin` for every branch that is ahead. A holder can sit in another repository when
+# mefor.claimsRoot shares the registry, so origin/main is always the HOLDER's repository's own.
+# `merge-tree --write-tree` does write the merged trees into the object store as unreferenced loose
+# objects, which `git gc` prunes; it moves no ref and touches no claim.
+#
+# Offline by default. `-Online` adds `git ls-remote` (once per repository) and `gh` (once per branch),
+# each time-boxed, and the first TIMEOUT of either stops that tool for the rest of the run, so a dead
+# network costs one timeout rather than one per claim. A plain failure is that one lookup's UNKNOWN.
+$script:NetDown = @{}
+$EvidenceTimeoutMs = 8000
+
+function ConvertTo-PathKey([string]$Path) { ($Path -replace '\\', '/').TrimEnd('/').ToLowerInvariant() }
+
+# Runs one network command with a hard deadline. $null means "no answer" -- missing tool, non-zero
+# exit, timeout, anything -- and callers print that as unknown. An empty string is a real answer.
+function Invoke-Bounded([string]$Exe, [string[]]$ArgList, [string]$Cwd) {
+    if ($script:NetDown[$Exe]) { return $null }
+    try {
+        $cmd = Get-Command $Exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $cmd) { $script:NetDown[$Exe] = $true; return $null }
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($cmd.Source)
+        foreach ($a in $ArgList) { $psi.ArgumentList.Add($a) }
+        $psi.WorkingDirectory = $Cwd
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        # Nobody is there to answer a credential prompt, and one would hold the call to its deadline.
+        $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'
+        $psi.Environment['GCM_INTERACTIVE'] = 'never'
+        $psi.Environment['GH_PROMPT_DISABLED'] = '1'
+        $psi.Environment['GIT_SSH_COMMAND'] = 'ssh -o BatchMode=yes'
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $p.StandardInput.Close()
+        $out = $p.StandardOutput.ReadToEndAsync()
+        $null = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($EvidenceTimeoutMs)) {
+            try { $p.Kill($true) } catch { }
+            $script:NetDown[$Exe] = $true
+            return $null
+        }
+        if ($p.ExitCode -ne 0) { return $null }
+        # A grandchild can hold the pipe open after the process exits, so the read has a deadline too.
+        $left = [Math]::Max(1000, $EvidenceTimeoutMs - [int]$sw.ElapsedMilliseconds)
+        if (-not $out.Wait($left)) { $script:NetDown[$Exe] = $true; return $null }
+        return $out.Result
+    }
+    catch { $script:NetDown[$Exe] = $true; return $null }
+}
+
+# origin's owner/name when origin is on GitHub, else $null -- the parse in
+# scripts/worktree/prune-merged.ps1, with the https host anchored so a look-alike host cannot match. `gh` is always given `--repo` from this: this clone has more than
+# one GitHub remote, and gh's own pick of a default is not guaranteed to be origin.
+function Get-OriginSlug([string]$Repo) {
+    $url = & git -C $Repo remote get-url origin 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $url) { return $null }
+    if ("$url".Trim() -match '^(?:https?://(?:[^/@]*@)?github\.com/|git@github\.com:|ssh://git@github\.com/)(?<o>[^/]+)/(?<r>[^/]+?)(?:\.git)?/?$') {
+        return "$($Matches['o'])/$($Matches['r'])"
+    }
+    return $null
+}
+
+# One `git worktree list` per repository: every worktree it carries, with its HEAD and branch.
+function Add-WorktreeIndex([string]$From, [hashtable]$Index) {
+    $wt = $null
+    foreach ($line in @(& git -C $From worktree list --porcelain 2>$null)) {
+        if ($line -like 'worktree *') {
+            $wt = [pscustomobject]@{ Repo = $From; Head = $null; Branch = $null }
+            $Index[(ConvertTo-PathKey $line.Substring(9))] = $wt
+        }
+        elseif ($wt -and $line -like 'HEAD *') { $wt.Head = $line.Substring(5).Trim() }
+        elseif ($wt -and $line -like 'branch refs/heads/*') { $wt.Branch = $line.Substring(18).Trim() }
+    }
+}
+
+# The one-line verdict for a claim, from facts already gathered. $Ahead is commits on the branch that
+# origin/main lacks ($null when git could not count them); $Merged is the tree merging them would
+# produce, 'CONFLICT', or $null when merge-tree gave no answer for this head.
+# $NonMerge is how many of those commits are not merges ($null when not counted).
+function Format-LandedLine($Ahead, $HeadTime, $Claimed, $Merged, $Base, [string]$Short, $NonMerge = $null) {
+    $at = "origin/main @$($Base.Short)"
+    if ($null -eq $Ahead) { return "evidence: UNKNOWN -- git could not count branch head $Short against $at" }
+    # Whole seconds on both sides, and a TIE COUNTS AS BEFORE: %ct has no fraction, and for a commit in
+    # the claim's own second the safe reading is "nothing built", not "moved on".
+    $claimedAt = [System.DateTimeOffset]::new(([datetime]$Claimed).ToUniversalTime()).ToUnixTimeSeconds()
+    $after = ($HeadTime -gt $claimedAt)
+    if ($Ahead -eq 0 -or ($Merged -and $Merged -eq $Base.Tree)) {
+        if (-not $after -and $Ahead -eq 0) {
+            return "evidence: NOTHING BUILT -- branch head $Short carries nothing $at lacks, and nothing was committed on it after the claim was taken"
+        }
+        if (-not $after) {
+            return "evidence: NOTHING BUILT -- the branch has $Ahead commit(s) not on $at whose content is already there, all dated before the claim was taken"
+        }
+        # Merging main INTO the branch after the claim is the pulled-main case again, one commit ahead.
+        if ($Ahead -gt 0 -and $NonMerge -eq 0) {
+            return "evidence: NOTHING BUILT -- the branch's $Ahead commit(s) not on $at are all merges that add nothing to it"
+        }
+        if ($Ahead -eq 0) {
+            return "evidence: ON MAIN -- branch head $Short carries nothing $at lacks (it is an ancestor) and moved after the claim; a merged branch and one that pulled main look the same"
+        }
+        return "evidence: CONTENT ON MAIN -- the branch has $Ahead commit(s) not on $at, but merging them changes nothing: their content is already there, the shape a squash merge leaves"
+    }
+    if ($null -eq $Merged) { return "evidence: UNKNOWN -- git merge-tree gave no answer for branch head $Short" }
+    # A conflict is NOT "not on main": work that landed and was then edited on main conflicts too.
+    # Measured on the live registry the day this was written -- #1127's branch conflicts with main
+    # after its item merged -- so this says it cannot tell rather than picking the scarier verdict.
+    if ($Merged -eq 'CONFLICT') {
+        return "evidence: UNCLEAR -- the branch has $Ahead commit(s) not on $at, and they conflict with it; work that landed and was later edited looks the same, so this cannot say"
+    }
+    return "evidence: NOT ON MAIN -- the branch has $Ahead commit(s) whose changes are not on $at"
+}
+
+# Evidence lines for a SET of claims, keyed by each one's .Key. Per CLAIM, not per holder path: one
+# worktree often holds several claims, and "committed after the claim" differs between them. Never throws: a
+# failure is itself printed, because an evidence block that silently vanished would read as "nothing to
+# report". -WithStatus adds a per-worktree `git status`, which costs a call per holder and so is only
+# asked for where there is one holder (the -Release refusal).
+function Get-LandedEvidenceSet($Holders, [switch]$WithStatus) {
+    $out = @{}
+    $index = @{}
+    try { Add-WorktreeIndex $repo $index } catch { }
+    $groups = @{}
+    foreach ($h in $Holders) {
+        $k = ConvertTo-PathKey $h.Path
+        $out[$h.Key] = [System.Collections.Generic.List[string]]::new()
+        if (-not $index.ContainsKey($k)) {
+            # A holder in another repository (a shared registry): index THAT repository once.
+            try {
+                $top = & git -C $h.Path rev-parse --path-format=absolute --show-toplevel 2>$null
+                if ($top) { Add-WorktreeIndex "$top".Trim() $index }
+            }
+            catch { }
+        }
+        $w = $index[$k]
+        if (-not $w -or -not $w.Head) {
+            # Never fall back to `git -C <path>`: a directory git no longer lists as a worktree resolves
+            # to whatever checkout ENCLOSES it, which would report someone else's branch as this one's.
+            $out[$h.Key].Add("evidence: UNKNOWN -- git does not list this directory as a worktree, so its branch cannot be read")
+            continue
+        }
+        if (-not $groups.ContainsKey($w.Repo)) { $groups[$w.Repo] = [System.Collections.Generic.List[object]]::new() }
+        $groups[$w.Repo].Add([pscustomobject]@{ Key = $h.Key; Path = $h.Path; Claimed = $h.Claimed; Head = $w.Head; Branch = $w.Branch; Ahead = $null; HeadTime = 0L; Merged = $null })
+    }
+
+    foreach ($r in $groups.Keys) {
+        $items = $groups[$r]
+        try {
+            $names = @($items | Where-Object Branch | ForEach-Object Branch | Sort-Object -Unique)
+            $patterns = @('refs/remotes/origin/main') + @($names | ForEach-Object { "refs/heads/$_"; "refs/remotes/origin/$_" })
+            $fmt = '--format=%(refname)%09%(objectname)%09%(tree)%09%(committerdate:unix)%09%(ahead-behind:refs/remotes/origin/main)'
+            $refs = @{}
+            $refLines = @(& git -C $r for-each-ref $fmt @patterns 2>$null)
+            $refsOk = ($LASTEXITCODE -eq 0)
+            foreach ($l in $refLines) { $f = "$l" -split "`t"; $refs[$f[0]] = $f }
+            $main = $refs['refs/remotes/origin/main']
+            if (-not $refsOk -or -not $main) {
+                # Two causes print the same empty answer, so tell them apart before saying which.
+                $why = "this clone has no origin/main to compare against"
+                if (& git -C $r rev-parse --verify -q refs/remotes/origin/main 2>$null) {
+                    $why = "git could not compare branches here (for-each-ref failed; its ahead-behind field needs git 2.41 or later)"
+                }
+                foreach ($it in $items) { $out[$it.Key].Add("evidence: UNKNOWN -- $why") }
+                continue
+            }
+            $base = [pscustomobject]@{ Main = $main[1]; Tree = $main[2]; Short = $main[1].Substring(0, 9) }
+
+            foreach ($it in $items) {
+                $b = if ($it.Branch) { $refs["refs/heads/$($it.Branch)"] } else { $null }
+                if ($b -and $b[1] -eq $it.Head) {
+                    $cnt = ($b[4] -split ' ')[0]
+                    $ct = $b[3]
+                }
+                else {
+                    # Detached, or a ref that moved under us: two direct calls, and rare.
+                    $cnt = "$(& git -C $r rev-list --count "$($base.Main)..$($it.Head)" -- 2>$null)".Trim()
+                    $ct = "$(& git -C $r log -1 --format=%ct $it.Head -- 2>$null)".Trim()
+                }
+                # [int]"" is 0, which would print a failed count as "nothing main lacks". Digits or unknown.
+                if ("$cnt" -match '^\d+$' -and "$ct" -match '^\d+$') {
+                    $it.Ahead = [int]$cnt
+                    $it.HeadTime = [long]$ct
+                }
+            }
+
+            # One merge-tree for every branch that is ahead. Output per merge, NUL-separated:
+            # <1 clean|0 conflict>, <tree>, zero or more conflicted names, then an empty terminator.
+            # Once per distinct head: several claims can share one holder.
+            $aheadHeads = @($items | Where-Object { $_.Ahead -gt 0 } | ForEach-Object Head | Sort-Object -Unique)
+            if ($aheadHeads) {
+                $stdin = ($aheadHeads | ForEach-Object { "$($base.Main) $_" }) -join "`n"
+                $raw = (@($stdin | & git -C $r merge-tree --stdin --no-messages --name-only --allow-unrelated-histories 2>$null) -join "`n")
+                $tok = $raw -split "`0"
+                $merged = @{}
+                $i = 0
+                foreach ($hd in $aheadHeads) {
+                    # A merge git could not run at all ends the output early; every head after it stays
+                    # unknown rather than being read as a conflict.
+                    if ($i + 1 -ge $tok.Count -or $tok[$i] -notin @('0', '1')) { break }
+                    $merged[$hd] = if ($tok[$i] -eq '1') { $tok[$i + 1] } else { 'CONFLICT' }
+                    $i += 2
+                    while ($i -lt $tok.Count -and $tok[$i] -ne '') { $i++ }
+                    $i++
+                }
+                foreach ($it in $items) { if ($merged.ContainsKey($it.Head)) { $it.Merged = $merged[$it.Head] } }
+            }
+
+            $remoteHeads = $null
+            $prCache = @{}
+            $slug = $null
+            if ($Online) {
+                $slug = Get-OriginSlug $r
+                $ls = Invoke-Bounded 'git' @('ls-remote', '--heads', 'origin') $r
+                if ($null -ne $ls) {
+                    $remoteHeads = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                    foreach ($l in ($ls -split "`n")) {
+                        $ref = ($l -split "`t")[-1].Trim()
+                        if ($ref -like 'refs/heads/*') { [void]$remoteHeads.Add($ref.Substring(11)) }
+                    }
+                }
+            }
+
+            foreach ($it in $items) {
+                $lines = $out[$it.Key]
+                # Per holder, so one unreadable `claimed` stamp cannot fail every other holder's line.
+                $nonMerge = $null
+                if ($it.Ahead -gt 0 -and $it.Merged -eq $base.Tree) {
+                    # Rare (content already on main), so one direct call here rather than a batch.
+                    $nm = "$(& git -C $r rev-list --no-merges --count "$($base.Main)..$($it.Head)" -- 2>$null)".Trim()
+                    if ($nm -match '^\d+$') { $nonMerge = [int]$nm }
+                }
+                try { $lines.Add((Format-LandedLine $it.Ahead $it.HeadTime $it.Claimed $it.Merged $base $it.Head.Substring(0, 9) $nonMerge)) }
+                catch { $lines.Add("evidence: FAILED -- $($_.Exception.Message)") }
+                if ($WithStatus) {
+                    # --no-optional-locks: the holder may be live, and a plain status can take index.lock.
+                    $dirty = @(& git --no-optional-locks -C $it.Path status --porcelain --untracked-files=no 2>$null)
+                    if ($LASTEXITCODE -ne 0) { $lines.Add("evidence: uncommitted changes: UNKNOWN -- git status failed in the holder") }
+                    elseif ($dirty.Count -gt 0) { $lines.Add("evidence: the worktree has $($dirty.Count) uncommitted change(s) to tracked files, which no merge accounts for") }
+                    else { $lines.Add("evidence: the worktree has no uncommitted changes to tracked files") }
+                }
+                if (-not $it.Branch) {
+                    $lines.Add("evidence: the holder is on a detached HEAD, so there is no branch to look for on origin")
+                    continue
+                }
+                if (-not $Online) {
+                    # A tracking ref, not the branch: a fetch without --prune keeps one after a delete.
+                    if ($refs.ContainsKey("refs/remotes/origin/$($it.Branch)")) {
+                        $lines.Add("evidence: branch $($it.Branch) on origin: yes per this clone's tracking ref (last fetch; a deleted branch keeps one until a prune)")
+                    }
+                    else { $lines.Add("evidence: branch $($it.Branch) on origin: NO per this clone's tracking refs (last fetch)") }
+                    continue
+                }
+                if ($null -eq $remoteHeads) { $lines.Add("evidence: branch $($it.Branch) on origin: UNKNOWN -- git ls-remote did not answer") }
+                elseif ($remoteHeads.Contains($it.Branch)) { $lines.Add("evidence: branch $($it.Branch) on origin: yes (git ls-remote, just now)") }
+                else { $lines.Add("evidence: branch $($it.Branch) on origin: NO (git ls-remote, just now)") }
+                if (-not $slug) {
+                    $lines.Add("evidence: pull request: UNKNOWN -- origin is not a GitHub repository")
+                    continue
+                }
+                if (-not $prCache.ContainsKey($it.Branch)) {
+                    $prCache[$it.Branch] = Invoke-Bounded 'gh' @('pr', 'list', '--repo', $slug, '--head', $it.Branch, '--state', 'all', '--json', 'number,state,mergedAt,headRefOid', '--limit', '20') $it.Path
+                }
+                $json = $prCache[$it.Branch]
+                $prs = $null
+                if ($null -ne $json) { try { $prs = @($json | ConvertFrom-Json) } catch { $prs = $null } }
+                if ($null -eq $prs) { $lines.Add("evidence: pull request: UNKNOWN -- gh is missing, signed out, or did not answer") }
+                elseif ($prs.Count -eq 0) { $lines.Add("evidence: pull request: none from branch $($it.Branch) in $slug") }
+                else {
+                    # A PR from THIS head is the fact that matters; one from another head of the same
+                    # branch NAME says nothing about this head's commits, so it is labelled as such.
+                    # "Different", not "earlier": nothing here checks which way the two are related.
+                    # Within either set, a merged one first, then an open one, then any.
+                    $exact = @($prs | Where-Object { $_.headRefOid -eq $it.Head })
+                    $pool = if ($exact) { $exact } else { $prs }
+                    $pr = @(@($pool | Where-Object state -EQ 'MERGED') + @($pool | Where-Object state -EQ 'OPEN') + $pool)[0]
+                    $when = if ($pr.state -eq 'MERGED') { " at $(ConvertTo-Stamp $pr.mergedAt)" } else { '' }
+                    if ($exact) {
+                        $lines.Add("evidence: pull request #$($pr.number) from this exact head: $($pr.state)$when")
+                    }
+                    else {
+                        $was = "$($pr.headRefOid)"
+                        if ($was.Length -gt 9) { $was = $was.Substring(0, 9) }
+                        $lines.Add("evidence: pull request #$($pr.number) from branch $($it.Branch): $($pr.state)$when, but from a DIFFERENT head ($was); the holder is at $($it.Head.Substring(0, 9))")
+                    }
+                }
+            }
+        }
+        catch {
+            foreach ($it in $items) { $out[$it.Key].Add("evidence: FAILED -- $($_.Exception.Message)") }
+        }
+    }
+    return $out
+}
+
 function Show-List {
     $files = @(Get-ChildItem $claims -Filter *.json -EA SilentlyContinue | Sort-Object Name)
     if (-not $files) { Write-Host "No active claims."; return }
     $me = ($holder -replace '\\', '/').TrimEnd('/')
     Write-Host ""
     Write-Host "Active work claims ($($files.Count)):"
-    foreach ($f in $files) {
-        $c = Get-Content $f.FullName -Raw | ConvertFrom-Json
+    $rows = foreach ($f in $files) {
+        $state = $null
+        # Rows are now printed after every one is built, so one unreadable file would otherwise hide the
+        # whole listing instead of only the rows after it. Say so in its own row and carry on.
+        try {
+            $c = Get-Content $f.FullName -Raw | ConvertFrom-Json
+            if ($null -eq $c) { throw "the file is empty" }
+        }
+        catch {
+            [pscustomobject]@{ File = $f.Name; Claim = [pscustomobject]@{ key = $f.BaseName; note = "(claim file unreadable: $($_.Exception.Message))"; branch = '?' }; Held = '?'; Mine = ''; Age = ''; State = $null }
+            continue
+        }
         $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
         $mine = if ($held -ieq $me) { "  <-- THIS worktree" } else { "" }
         # LIVENESS, not age. This used to print "[STALE ~Nh -- release it if that session is gone]" once
@@ -401,6 +735,7 @@ function Show-List {
             # Shared with -Take and -Release, so all three surfaces answer "is the holder there?" the
             # same way. They used to disagree: this one probed, the other two did not probe at all.
             $live = Get-HolderLiveness $held
+            $state = $live.State
             switch ($live.State) {
                 'gone'    { $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]" }
                 'occupied' {
@@ -435,10 +770,29 @@ function Show-List {
             # what it could not. A claim whose liveness could not be determined must not look routine.
             $age = "  [liveness check FAILED -- treat as unknown, confirm before releasing]"
         }
-        Write-Host ("  {0,-34} {1}" -f $c.key, $c.note)
-        Write-Host ("      held by {0} [{1}]{2}{3}" -f $held, $c.branch, $mine, $age)
+        [pscustomobject]@{ File = $f.Name; Claim = $c; Held = $held; Mine = $mine; Age = $age; State = $state }
+    }
+    # BACKLOG #1466. One batched pass over every directory-only holder, not a git call per claim.
+    $unoccupied = @($rows | Where-Object State -EQ 'unoccupied')
+    $evidence = @{}
+    if ($unoccupied) {
+        $evidence = Get-LandedEvidenceSet @($unoccupied | ForEach-Object { [pscustomobject]@{ Key = $_.File; Path = $_.Held; Claimed = $_.Claim.claimed } })
+    }
+    foreach ($r in $rows) {
+        Write-Host ("  {0,-34} {1}" -f $r.Claim.key, $r.Claim.note)
+        Write-Host ("      held by {0} [{1}]{2}{3}" -f $r.Held, $r.Claim.branch, $r.Mine, $r.Age)
+        if ($r.State -eq 'unoccupied') {
+            foreach ($e in $evidence[$r.File]) { Write-Host "        $e" }
+        }
     }
     Write-Host ""
+    if ($unoccupied) {
+        # Said once, here, because the lines above read like verdicts and are not (BACKLOG #1466).
+        Write-Host "  The evidence lines are FOR THE OWNER, NOT AUTHORITY TO RELEASE. A directory-only claim is" -ForegroundColor Cyan
+        Write-Host "  still settled only by its item being closed or by the owner saying so. origin/main is read"
+        Write-Host "  as of this clone's last fetch.$(if (-not $Online) { ' Pass -Online to add origin and pull-request lookups.' })"
+        Write-Host ""
+    }
 }
 
 # Resolved for BOTH paths, not just -Take. A release record that names who released the claim is only
@@ -499,6 +853,13 @@ if ($Release) {
                 Write-Host ""
                 Write-Host "  A LONG QUIET PERIOD IS NOT A THIRD REASON. Age is not evidence: a session can be alive"
                 Write-Host "  and simply not committing, and this state is the one where you cannot tell."
+                Write-Host ""
+                # BACKLOG #1466. The facts the owner would ask for first, gathered so nobody has to.
+                Write-Host "  EVIDENCE FOR THE OWNER -- not authority to release, and not a third reason:" -ForegroundColor Cyan
+                $set = Get-LandedEvidenceSet @([pscustomobject]@{ Key = 'this'; Path = $info.Claim.worktree; Claimed = $info.Claim.claimed }) -WithStatus
+                foreach ($e in $set['this']) { Write-Host "    $e" }
+                Write-Host "  Landed work does not prove the session gone. Take this to point 1 or point 2 above."
+                if (-not $Online) { Write-Host "  Add -Online for origin and pull-request lookups." }
             }
             default {
                 Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow

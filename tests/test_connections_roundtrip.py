@@ -102,6 +102,10 @@ _INBOUND_CASES: dict[str, Any] = {
     "auto_start": False,
     "deployed": False,
     "flagged": True,  # #131 (ADR 0007 amendment): the object-of-interest flag round-trips too.
+    # Owner ruling 2026-09-24: the hop attestation pair. Dropping it on a save would turn an attested
+    # listener into a REFUSED one at the next reload.
+    "tls_hop_attested": True,
+    "tls_hop_attested_reason": "TLS terminates at the site's stunnel sidecar",
     # ADR 0173: the revocation attestation pair. Dropping it on a save would turn an attested mTLS
     # listener into a REFUSED one at the next reload.
     "tls_revocation_attested": True,
@@ -128,13 +132,21 @@ _OUTBOUND_CASES: dict[str, Any] = {
     # save would silently turn a declared, reviewed hop into a refused one at the next reload.
     "cleartext_accepted": True,
     "cleartext_reason": "legacy partner has no TLS listener",
+    # Owner ruling 2026-09-24: the hop attestation pair, same reasoning as the inbound case.
+    "tls_hop_attested": True,
+    "tls_hop_attested_reason": "TLS terminates at the site's stunnel sidecar",
     # ADR 0173: the revocation attestation pair, same reasoning as the inbound case.
     "tls_revocation_attested": True,
     "tls_revocation_attested_reason": "partner PKI runs OCSP at the site edge",
 }
 
 _IB_MAX: dict[str, Any] = {**_IB_BASE, **_INBOUND_CASES}
-_OB_MAX: dict[str, Any] = {**_OB_BASE, **_OUTBOUND_CASES}
+# The hop attestation and cleartext_accepted are opposite claims and refused together at load, so the
+# maximal outbound carries the acceptance only. Each attestation key still round-trips on its own below.
+_OB_MAX: dict[str, Any] = {
+    **_OB_BASE,
+    **{k: v for k, v in _OUTBOUND_CASES.items() if not k.startswith("tls_hop_attested")},
+}
 
 # Keys whose READ schema enforces a companion key (the per-key round-trip must still be load-legal):
 # a pruning size threshold does nothing without its window, so the loader rejects it alone.
@@ -144,6 +156,9 @@ _COMPANIONS: dict[str, dict[str, Any]] = {
     # loud), so each half needs the other for its single-key round-trip to be load-legal.
     "cleartext_accepted": {"cleartext_reason": "legacy partner has no TLS listener"},
     "cleartext_reason": {"cleartext_accepted": True},
+    # The hop attestation pair is validated together the same way, on both directions.
+    "tls_hop_attested": {"tls_hop_attested_reason": "TLS terminates at the site's stunnel sidecar"},
+    "tls_hop_attested_reason": {"tls_hop_attested": True},
     # ADR 0173's pair is validated together the same way, on both directions.
     "tls_revocation_attested": {
         "tls_revocation_attested_reason": "partner PKI runs OCSP at the site edge"
