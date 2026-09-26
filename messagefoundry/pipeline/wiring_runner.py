@@ -2256,8 +2256,9 @@ class RegistryRunner:
         """stop_outbound body without the reload lock (callers hold it). Sync + returns fast: it flags
         the pause and requests it in whichever claim mode is active, but NEVER awaits the in-flight
         drain (cooperative). NEVER ``task.cancel`` a worker/serializer — a cancelled mid-delivery row
-        strands INFLIGHT until the next start or promotion (a reload recovers only a worker that
-        RETURNED, never a cancelled one -- ADR 0157 Inc 2), defeating require-stopped."""
+        strands INFLIGHT until the next start, promotion or (clustered Postgres) lease sweep -- a
+        reload recovers only a worker that RETURNED, never a cancelled one (ADR 0157 Inc 2) --
+        defeating require-stopped."""
         self._validate_outbound(name)
         self._outbound_paused.add(name)
         # The OPERATOR now owns this lane's down state — a reload must not resume it (#115/#233): drop any
@@ -2931,8 +2932,9 @@ class RegistryRunner:
         it was never delivered, which makes the gap quiet rather than harmless.
 
         **Cooperative in both claim modes, and NEVER a ``task.cancel``** — a cancelled mid-item worker
-        strands its claimed row INFLIGHT until the next start or promotion (a reload recovers only
-        a worker that RETURNED, never a cancelled one -- ADR 0157 Inc 2):
+        strands its claimed row INFLIGHT until the next start, promotion or (clustered Postgres)
+        lease sweep; a reload recovers only a worker that RETURNED, never a cancelled one (ADR
+        0157 Inc 2):
 
         * **pooled** (the default): ``pause_lane`` per stage, the same primitive
           :meth:`_stop_outbound_unsafe` uses. A lane mid-episode reaches PAUSED at its quiesce point,
@@ -4677,7 +4679,12 @@ class RegistryRunner:
         It uses the ownership-scoped ``reset_stale_inflight`` (ADR 0073), which every backend
         implements, and never probes ``reclaim_expired_leases``, so the promotion path's
         ``hasattr`` gate cannot move. Best effort: a failure logs and leaves the rows for the next
-        start, and never rolls a reload back. Returns the number of rows re-pended."""
+        start, and never rolls a reload back. Returns the number of rows re-pended.
+
+        A node that is not the leader runs nothing: clustered mode never resets outside promotion,
+        because an ex-leader's rows belong to the successor (engine ``_start_graph``)."""
+        if not self._coordinator.is_leader():
+            return 0
 
         def returned(task: asyncio.Task[None]) -> bool:
             return task.done() and not task.cancelled() and task.exception() is None
@@ -4706,8 +4713,9 @@ class RegistryRunner:
                 recovered += await self.store.reset_stale_inflight(stage=stage.value, owned=owned)
         except Exception:  # noqa: BLE001 — best effort; see the docstring
             log.warning(
-                "reload: could not recover rows a stopped worker left in flight; they stay "
-                "INFLIGHT for reset_stale_inflight at the next start",
+                "reload: recovery of rows a stopped worker left in flight failed after %d "
+                "row(s); the rest stay INFLIGHT for reset_stale_inflight at the next start",
+                recovered,
                 exc_info=True,
             )
         if recovered:
@@ -4749,14 +4757,13 @@ class RegistryRunner:
                     name
                 )  # we hold _reload_lock — use the unsafe variant
 
-            # 1a. ADR 0157 Inc 2: re-pend what a RETURNED worker left in flight. HERE, and no later:
-            #     step 2's listener restart re-arms inbound workers (_start_inbound_unsafe ->
-            #     _ensure_inbound_workers) and step 3 respawns delivery workers, and a re-armed
-            #     worker may claim on the lane before the reset lands. The helper says why it is
-            #     safe.
-            await self._recover_stopped_worker_residue()
-
             try:
+                # 1a. ADR 0157 Inc 2: re-pend what a RETURNED worker left in flight. HERE, and no
+                # later: step 2's listener restart re-arms inbound workers (_start_inbound_unsafe
+                # -> _ensure_inbound_workers) and step 3 respawns delivery workers, and a re-armed
+                # worker may claim on the lane before the reset lands. Inside the try so anything
+                # that escapes it still restores the old intake.
+                await self._recover_stopped_worker_residue()
                 # 2. Swap the registry and restart inbound listeners from it (intake back up first).
                 self.registry = new_registry
                 # 2a. ADR 0066 D4: decide the OUTBOUND lane partition for every lane this reload ADDS,
@@ -5620,16 +5627,19 @@ class RegistryRunner:
         ``_run_lane`` tail release, so one ``internal_error`` STOP leaves the same queue state in both
         claim modes.
 
-        Every STOPPED path resolves its own head row first, and ``release_claimed`` touches only rows
-        still ``inflight``, so the caller passes its whole claimed batch. The tail was never
-        dispatched, so ``release_claimed`` (which undoes the claim's ``attempts`` increment) is the
+        The caller passes the rows after the one that stopped; ``release_claimed`` touches only
+        rows still ``inflight``, so a caller that cannot tell them apart may pass its whole batch.
+        NOT ON A NODE THAT HAS LOST LEADERSHIP: the release is unfenced, and those rows belong to
+        the successor's promotion recovery, which may already have re-claimed them. That path
+        keeps releasing only its own head. The tail was never dispatched, so ``release_claimed``
+        (which undoes the claim's ``attempts`` increment) is the
         right re-pend rather than ``reschedule_claimed``: a stopped lane has no worker to spin.
 
         Without this the tail stayed INFLIGHT, invisible to every claim, and a worker re-armed by an
         operator ``start_*`` / ``restart_*`` (or an alert rule's auto-restart) drained newer rows past
         it until the next start. A failure here logs and leaves the rows for the reload-time backstop
         (:meth:`_recover_stopped_worker_residue`) or the next start."""
-        if not ids:
+        if not ids or not self._coordinator.is_leader():
             return
         try:
             await self.store.release_claimed(list(ids))
@@ -5735,7 +5745,7 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
-                for item in items:
+                for i, item in enumerate(items):
                     # BACKLOG #82: pace this lane's egress BEFORE the send seam so ONE hook covers both
                     # the single-message and the batch body (below) — a paced batch counts as one
                     # interval. Sits between claim and send (outside the produce→complete transaction),
@@ -5749,7 +5759,7 @@ class RegistryRunner:
                     else:
                         outcome = await self._process_delivery_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
-                        await self._release_tail_on_stop("delivery", name, claimed)
+                        await self._release_tail_on_stop("delivery", name, claimed[i + 1 :])
                         return
             except asyncio.CancelledError:
                 raise
@@ -6332,10 +6342,10 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
-                for item in items:
+                for i, item in enumerate(items):
                     outcome = await self._process_ingress_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
-                        await self._release_tail_on_stop("router", name, claimed)
+                        await self._release_tail_on_stop("router", name, claimed[i + 1 :])
                         return
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # ingress backlog is building (a slow/hung router). Uses the global buildup threshold.

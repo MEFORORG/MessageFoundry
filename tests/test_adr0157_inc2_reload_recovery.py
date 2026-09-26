@@ -12,17 +12,19 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import InternalErrorPolicy, RetryPolicy
+from messagefoundry.config.models import InternalErrorPolicy, OrderingMode, RetryPolicy
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     ConnectorType,
     InboundConnection,
     Registry,
 )
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.cluster import NullCoordinator
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 from tests.test_ownership_scoped_reset import (
     _row_status,
@@ -185,12 +187,22 @@ async def test_reload_recovers_a_tail_the_stopping_worker_failed_to_release(
 
 
 async def test_a_worker_whose_inbound_was_removed_releases_its_tail(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The other way a worker returns mid-batch: a reload removed its inbound. It re-pends the head
     and exits, and the tail must be PENDING at once, not INFLIGHT until a restart. (ADR 0157 first
     scoped reload recovery to the OLD registry's names; the reload that restores IB would not have
     had IB in it.)"""
+    batch_sizes: list[int] = []
+    real_batch = store.claim_next_fifo_batch
+
+    async def spy_batch(*a: Any, **k: Any) -> Any:
+        got = await real_batch(*a, **k)
+        if a and a[0] == "IB":
+            batch_sizes.append(len(got))
+        return got
+
+    monkeypatch.setattr(store, "claim_next_fifo_batch", spy_batch)
     runner = RegistryRunner(
         _registry(tmp_path / "in"),
         store,
@@ -208,6 +220,8 @@ async def test_a_worker_whose_inbound_was_removed_releases_its_tail(
             await store.enqueue_ingress(channel_id="IB", raw=RAW)
         runner._ingress_work.set()
         assert await _wait_until(lambda: _done(runner._router_workers.get("IB")))
+        # The precondition: one claim took all three, so there WAS a tail to release.
+        assert 3 in batch_sizes, batch_sizes
         cur = await store._db.execute(
             "SELECT status, COUNT(*) AS n FROM queue WHERE stage='ingress' AND channel_id='IB'"
             " GROUP BY status"
@@ -343,16 +357,97 @@ async def test_a_lane_the_outbound_dispatcher_holds_is_not_touched(
 
 
 async def test_a_failed_backstop_does_not_fail_the_reload(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Best effort, like the #1611 re-pend: a store error here must not roll a routine reload back.
-    The residue stays for the next start, which is where it waited before this increment."""
+    """Best effort, like the #1611 re-pend: a store error in the backstop must not fail or roll back
+    a routine reload. Driven through reload() itself, with a returned worker in scope so the reset
+    is really attempted."""
+    attempts: list[str | None] = []
 
-    async def _boom(*a: object, **k: object) -> int:
+    async def _boom(*a: object, stage: str | None = None, **k: object) -> int:
+        attempts.append(stage)
         raise RuntimeError("store down")
 
-    runner = RegistryRunner(Registry(), store, claim_mode="per_lane")
-    runner._workers["OB_RET"] = await _returned_task()
-    monkeypatch.setattr(store, "reset_stale_inflight", _boom)
+    runner = RegistryRunner(
+        _registry(tmp_path / "in", names=("IB",)), store, claim_mode="per_lane", poll_interval=30.0
+    )
+    await runner.start()
+    try:
+        runner._workers["OB_RET"] = await _returned_task()
+        monkeypatch.setattr(store, "reset_stale_inflight", _boom)
+        await runner.reload(_registry(tmp_path / "in", names=("IB",)))
+        assert attempts == [Stage.OUTBOUND.value]  # the reset ran, and failed
+        assert "IB" in runner._sources  # and intake came back up regardless
+    finally:
+        await runner.stop()
 
+
+async def _seed_pending_outbound(store: MessageStore, dest: str, n: int) -> None:
+    for _ in range(n):
+        await store.enqueue_message(channel_id="IB_ANY", raw=RAW, deliveries=[(dest, RAW)])
+
+
+def _stop_on_first_item(
+    store: MessageStore,
+) -> Callable[..., Awaitable[tuple[_ItemOutcome, float | None]]]:
+    """A delivery body that resolves the head and returns STOPPED, as every STOPPED path does."""
+
+    async def fake(name: str, item: Any) -> tuple[_ItemOutcome, float | None]:
+        await store.mark_failed(item.id, "stop", RetryPolicy(max_attempts=None))
+        return _ItemOutcome.STOPPED, None
+
+    return fake
+
+
+async def _outbound_rows(store: MessageStore, dest: str) -> list[tuple[str, int]]:
+    cur = await store._db.execute(
+        "SELECT status, attempts FROM queue WHERE stage='outbound' AND destination_name=?"
+        " ORDER BY rowid",
+        (dest,),
+    )
+    return [(str(r["status"]), int(r["attempts"])) for r in await cur.fetchall()]
+
+
+async def test_a_stopping_delivery_worker_releases_its_unordered_tail(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The delivery worker's STOP path on an UNORDERED lane, whose claim_ready batch is the only
+    delivery claim with a multi-row tail. The head is failed by the body; the two rows behind it
+    must come back PENDING with the claim's ``attempts`` increment undone."""
+    runner = RegistryRunner(
+        Registry(), store, claim_mode="per_lane", ordering_default=OrderingMode.UNORDERED
+    )
+    await _seed_pending_outbound(store, "OB", 3)
+    monkeypatch.setattr(runner, "_process_delivery_item", _stop_on_first_item(store))
+    await asyncio.wait_for(runner._delivery_worker("OB"), 5.0)
+
+    rows = await _outbound_rows(store, "OB")
+    assert rows.count(("pending", 0)) == 2, rows
+    assert all(status != "inflight" for status, _ in rows), rows
+
+
+class _Follower(NullCoordinator):
+    def is_leader(self) -> bool:
+        return False
+
+
+async def test_a_node_that_is_not_leader_releases_and_resets_nothing(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both layers stand down off the leader. An ex-leader's rows belong to the successor's
+    promotion recovery, which may already have re-claimed them, and both writes are unfenced."""
+    runner = RegistryRunner(
+        Registry(),
+        store,
+        claim_mode="per_lane",
+        ordering_default=OrderingMode.UNORDERED,
+        coordinator=_Follower(),
+    )
+    await _seed_pending_outbound(store, "OB", 3)
+    monkeypatch.setattr(runner, "_process_delivery_item", _stop_on_first_item(store))
+    await asyncio.wait_for(runner._delivery_worker("OB"), 5.0)
+    assert [s for s, _ in await _outbound_rows(store, "OB")].count("inflight") == 2
+
+    runner._workers["OB"] = await _returned_task()
     assert await runner._recover_stopped_worker_residue() == 0
+    assert [s for s, _ in await _outbound_rows(store, "OB")].count("inflight") == 2
