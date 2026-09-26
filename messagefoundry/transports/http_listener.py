@@ -327,8 +327,8 @@ async def _read_head(
     because it is consulted earlier still, in ``_on_client``. Keep any new pre-body refusal here.
 
     Raises :class:`HttpRequestError` (carrying the status + connection-event kind) on an unbounded
-    header read, a malformed request line, or ambiguous framing, so the caller can answer
-    synchronously **before** any ingress row is written."""
+    header read, a malformed request line, ambiguous framing, or a missing or repeated ``Host``,
+    so the caller can answer synchronously **before** any ingress row is written."""
     # Request line + headers, bounded by max_header_bytes (so a peer can't stream headers forever).
     try:
         head = await reader.readuntil(b"\r\n\r\n")
@@ -472,6 +472,21 @@ async def _read_head(
         # request's clinical payload. 411 Length Required is the RFC 9110 status for a server that
         # refuses a request with no Content-Length.
         raise HttpRequestError(411, "Content-Length is required", kind="framing_error")
+
+    # HOST MUST APPEAR EXACTLY ONCE ON HTTP/1.1, AND NEVER TWICE ON ANY VERSION (RFC 9112 section
+    # 3.2, BACKLOG #1972). A server MUST answer 400 to either shape. This listener reads no Host
+    # value, so the refusal is RFC conformance first. It also helps a fronting proxy that does read
+    # Host. The dict above keeps only the last of two Host lines, while such a proxy may act on the
+    # first. This check runs after the framing refusals, so a smuggling probe keeps its own reason.
+    # HTTP/1.0 predates the field, so a 1.0 request with no Host still parses. Every other 1.x minor
+    # is read as 1.1 (RFC 9110 section 2.5). An EMPTY value counts as present, because RFC 9112 has
+    # a client send it when the target URI has no authority. The value's syntax is NOT checked here,
+    # and the refusal reason never carries the value.
+    host_count = header_counts.get("host", 0)
+    if host_count > 1:
+        raise HttpRequestError(400, "duplicate Host header", kind="framing_error")
+    if host_count == 0 and version != "HTTP/1.0":
+        raise HttpRequestError(400, "missing Host header", kind="framing_error")
 
     return HttpRequest(method, target, headers, b"")
 
