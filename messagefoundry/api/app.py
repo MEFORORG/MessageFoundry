@@ -7141,6 +7141,8 @@ def create_managed_app(
         # or a package loaded from outside the install root (BACKLOG #1679): a pass that compared zero
         # files cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
         # (`pip install -e .`), so dev is never bricked. Off only if [integrity].enabled=false.
+        # It attests the web console too when create_app has imported it (serve_ui on), against the
+        # console wheel's own RECORD under the same rules (BACKLOG #1802).
         integ = integrity_settings or IntegritySettings()
         if integ.enabled:
             try:

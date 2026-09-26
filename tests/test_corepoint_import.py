@@ -785,6 +785,61 @@ def test_loop_exit_outside_a_loop_degrades_to_a_marker() -> None:
     ast.parse(src)
 
 
+# --- a LoopExit is counted the way it is rendered (BACKLOG #1860) --------------------------------
+
+_CLEAR = '<Line Data="ItemClear %ADT/PID-19"/>'
+_LOOP_EXIT = '<Line Data="LoopExit"/>'
+
+
+def test_loop_exit_outside_a_loop_is_counted_unmapped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The render marks a ``LoopExit`` outside a loop, so the summary may not count it shipped."""
+    body = _CLEAR + _LOOP_EXIT
+    assert _count_steps(_handler_steps(body), in_loop=False) == (1, ["LoopExit"], 0)
+
+    # The control: inside a loop the render emits a real ``break``, and the count stays mapped.
+    loop = f"<Foreach>{_CLEAR}{_LOOP_EXIT}</Foreach>"
+    assert "        break  # Corepoint LoopExit" in _handler_source(loop)
+    assert _count_steps(_handler_steps(loop), in_loop=False) == (3, [], 0)
+
+    # The line a migrator reads: the stub is reported, not hidden under "0 left as TODO stubs".
+    from messagefoundry.__main__ import main
+
+    export = tmp_path / "loop_exit.xml"
+    export.write_text(_package(body), encoding="utf-8")
+    assert main(["import", "corepoint", str(export), "--out", str(tmp_path / "out")]) == 0
+    printed = capsys.readouterr().out
+    assert "(1 action(s) mapped, 1 left as TODO stubs):" in printed
+    assert "1 unmapped: LoopExit" in printed
+
+
+def test_loop_exit_count_follows_the_loop_context_through_nesting() -> None:
+    """A conditional passes its caller's loop context down; only a loop body is inside a loop."""
+    in_loop = f'<Foreach><If Data="If (a)">{_LOOP_EXIT}</If></Foreach>'
+    assert "            break  # Corepoint LoopExit" in _handler_source(in_loop)
+    assert _count_steps(_handler_steps(in_loop), in_loop=False) == (3, [], 0)
+
+    no_loop = f'<If Data="If (a)">{_LOOP_EXIT}</If>'
+    assert "# TODO: Corepoint LoopExit outside a loop" in _handler_source(no_loop)
+    assert _count_steps(_handler_steps(no_loop), in_loop=False) == (1, ["LoopExit"], 0)
+
+
+def test_loop_exit_in_a_stray_branch_of_a_loop_is_counted_unmapped() -> None:
+    """A loop's stray branch is inlined OUTSIDE the loop, so its ``LoopExit`` is a marker there."""
+    body = f'<Foreach>{_CLEAR}<Line Data="Catch"/>{_LOOP_EXIT}</Foreach>'
+    src = _handler_source(body)
+    assert "# TODO: Corepoint LoopExit outside a loop" in src
+    assert "break" not in src
+    assert _count_steps(_handler_steps(body), in_loop=False) == (2, ["LoopExit", "Catch"], 0)
+
+
+def test_loop_exit_marker_says_hand_finish_once() -> None:
+    """The marker carries the house ``_hint`` tail, not a doubled one."""
+    src = _handler_source('<Line Data="LoopExit early"/>')
+    assert "# TODO: Corepoint LoopExit outside a loop — hand-finish: LoopExit early\n" in src
+
+
 def test_try_without_catch_reraises_rather_than_swallowing() -> None:
     src = _handler_source('<Try><List><Line Data="ItemClear %ADT/PID-19"/></List></Try>')
     assert "except Exception:  # TODO: Corepoint Try with no Catch" in src
@@ -826,7 +881,7 @@ def test_a_stray_branch_under_try_keeps_its_body(tmp_path: Path) -> None:
 
     # And the summary must not claim the branch itself shipped: a marker-only element is unmapped,
     # exactly as ``exit`` and ``unknown`` are, while its body statements keep counting on normally.
-    assert _count_steps(_handler_steps(_STRAY_ELSE_UNDER_TRY)) == (5, ["Else"], 0)
+    assert _count_steps(_handler_steps(_STRAY_ELSE_UNDER_TRY), in_loop=False) == (5, ["Else"], 0)
 
     # The same accounting through the public entry point the CLI prints.
     export = tmp_path / "stray.xml"
@@ -850,7 +905,7 @@ def test_a_stray_branch_under_a_loop_keeps_its_body() -> None:
     assert "# TODO: Corepoint Catch cannot continue a Corepoint Foreach" in src
     assert 'set_field(msg, "PID-21", "")' in src
     ast.parse(src)
-    assert _count_steps(_handler_steps(body)) == (3, ["Catch"], 0)
+    assert _count_steps(_handler_steps(body), in_loop=False) == (3, ["Catch"], 0)
 
     # ``while`` reads its branches through the same render path.
     loop = body.replace("Foreach", "Loop")
@@ -859,7 +914,7 @@ def test_a_stray_branch_under_a_loop_keeps_its_body() -> None:
     assert "# TODO: Corepoint Catch cannot continue a Corepoint Loop" in loop_src
     assert '    set_field(msg, "PID-21", "")' in loop_src
     ast.parse(loop_src)
-    assert _count_steps(_handler_steps(loop)) == (3, ["Catch"], 0)
+    assert _count_steps(_handler_steps(loop), in_loop=False) == (3, ["Catch"], 0)
 
 
 def test_a_stray_branch_body_is_live_code_outside_the_loop_it_was_adopted_by() -> None:
@@ -910,7 +965,7 @@ def test_a_branch_marker_with_no_construct_is_counted_unmapped() -> None:
     src = _handler_source(body)
     assert "# TODO: Corepoint Else with no enclosing construct" in src
     assert 'set_field(msg, "PID-21", "")' in src
-    assert _count_steps(_handler_steps(body)) == (1, ["Else"], 0)
+    assert _count_steps(_handler_steps(body), in_loop=False) == (1, ["Else"], 0)
 
 
 def test_a_stray_branch_under_a_conditional_keeps_its_scope() -> None:
@@ -932,7 +987,7 @@ def test_a_stray_branch_under_a_conditional_keeps_its_scope() -> None:
     assert "    elif False:  # TODO: Corepoint Catch" in src
     assert '        set_field(msg, "PID-21", "")' in src
     ast.parse(src)
-    assert _count_steps(_handler_steps(body)) == (4, [], 0)
+    assert _count_steps(_handler_steps(body), in_loop=False) == (4, [], 0)
 
     # Same for a ``ChooseFrom``: its ``Matching`` arms and a stray marker alike become real arms.
     case = (
@@ -947,7 +1002,7 @@ def test_a_stray_branch_under_a_conditional_keeps_its_scope() -> None:
     case_src = _handler_source(case)
     assert "    if False:  # TODO: Corepoint Matching" in case_src
     assert "    elif False:  # TODO: Corepoint Catch" in case_src
-    assert _count_steps(_handler_steps(case)) == (6, [], 0)
+    assert _count_steps(_handler_steps(case), in_loop=False) == (6, [], 0)
 
 
 def test_exit_verbs_are_flagged_never_flattened() -> None:

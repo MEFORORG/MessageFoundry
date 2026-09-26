@@ -405,6 +405,51 @@ async def test_a_hostile_ack_control_id_is_bounded_too() -> None:
         assert identifier not in safe_exc(raised.value)
 
 
+async def test_a_hostile_ack_code_is_bounded_too() -> None:
+    """MSA-1 is the third peer-chosen field ``_check_ack`` writes into a raise (BACKLOG #1847).
+
+    MSA-1 is the acknowledgment code, and a peer can send one of any length. Every code other than
+    AA/CA reaches the ``NegativeAckError`` message. Before #1847 it went in whole: this arm's
+    4,194,304-character MSA-1 gave a 4,194,325-character message, measured on ``633c303a2``.
+
+    **The classification must not move.** The code is compared RAW, so an oversized MSA-1 is not AR
+    or CR and lands on the transient AE branch. Bounding only the text keeps it there. The fixture is
+    :func:`_hostile_control_id` because MSA-1, like MSA-2, ends at the first ``|``."""
+    hostile = _hostile_control_id()
+    peer = _NakPeer("", raw_ack=_ack_with_control_id(hostile, "M1"))
+    await peer.start()
+    dest = _dest(peer.port)
+    try:
+        with pytest.raises(NegativeAckError) as raised:
+            await dest.send(_msg("M1"))
+    finally:
+        await dest.aclose()
+        await peer.stop()
+
+    # THE NON-VACUITY CONTROL, as in the MSA-2 arm: the peer really sent a frame-cap-sized MSA-1.
+    assert len(peer.received) == 1, "the frame must have reached the peer"
+    sent_msa1 = (peer.raw_ack or "").split("\r")[1].split("|")[1]
+    assert sent_msa1 == hostile, (
+        f"the reply's MSA-1 is {len(sent_msa1)} characters, not the {len(hostile)} sent"
+    )
+    assert len(hostile) > _MAX_NAK_DETAIL_CHARS * 100, (
+        f"the hostile code is only {len(hostile)} characters, which the bound would not have had "
+        f"to cut -- this arm no longer measures a bound"
+    )
+
+    exc = raised.value
+    message = str(exc)
+    assert len(message) < _MAX_NAK_DETAIL_CHARS + 200, (
+        f"the NegativeAckError message is {len(message)} characters; MSA-1 reached it unbounded"
+    )
+    assert message.startswith("negative ACK (MSA-1=")
+    # Unchanged classification: not AR/CR, so transient AE, and retried rather than dead-lettered.
+    assert exc.code == "AE"
+    assert exc.permanent is False
+    for identifier in _IDENTIFIERS:
+        assert identifier not in safe_exc(exc)
+
+
 async def test_control_a_correlated_ack_still_succeeds() -> None:
     """THE CONTROL for the arm above. Bounding MSA-2 must not break the correlation it feeds: an
     ordinary ACK whose MSA-2 echoes the sent MSH-10 has to keep passing, or the bound would have

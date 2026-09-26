@@ -760,7 +760,7 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui_step_up` |
-| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui` |
+| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui_step_up` |
 | `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/upload-form` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
@@ -826,22 +826,26 @@ else would need its own authorization rule stated here.
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
    It draws the same bucket, but its 429 carries `Retry-After: 10` where the JSON floor sends `1`.
-3. **The uploaded-logs resend-confirm GET is weaker than its JSON equivalent, and cannot be
-   otherwise** (it is not the only weaker uploaded-logs GET — `GET /ui/uploaded-logs` is one too,
-   under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`, not this prose).
-   `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
-   permission-equivalent JSON browse route carries a step-up. It **cannot** carry one, because it is
-   the re-auth continuation itself — gating it would bounce the operator back to `/ui/reauth`
-   indefinitely. It is accepted because the page renders **no message body**: a filename, an ordinal
-   and a connection name, all three of which the operator supplied on the previous screen.
+3. **The uploaded-logs resend-confirm GET is no longer weaker than its JSON equivalent (BACKLOG
+   #1822).** `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is `require_ui_step_up`, like the
+   permission-equivalent JSON browse route. The one weaker uploaded-logs GET left is
+   `GET /ui/uploaded-logs`, under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`,
+   not this prose.
 
-   **The "cannot" above is inherited from BACKLOG #1227 and is now in doubt, so do not build on it.**
-   `GET /ui/uploaded-logs/upload-form` is also a registered re-auth continuation, is step-up-gated,
-   and does *not* bounce indefinitely: re-auth refreshes the window before redirecting back, so the
-   gated page renders. That is the same sequence resend-confirm would see. Whether resend-confirm
-   has a discriminator this text has not stated, or whether its divergence is simply closable, is an
-   open question against #1227 — it is recorded here rather than papered over, because a
-   compensating control resting on an unexamined premise is the defect this section exists to avoid.
+   **It was plain `require_ui` on a claim that turned out to be false.** BACKLOG #1227 held that the
+   page *could not* be gated because it is the re-auth continuation, so a gate there would bounce the
+   operator back to `/ui/reauth` indefinitely. It does not bounce: `/ui/reauth` refreshes the window
+   before it redirects back, so the gated page renders. `GET /ui/uploaded-logs/upload-form` already
+   showed this, and the stepdown and purge confirm pages are gated continuations of the same kind.
+   The one real difference from the upload form is that this page's selection (`index`, `to`) rides
+   the query. A gate's default continuation is the bare path, which would come back as a 422 with the
+   selection gone, so the page maps its re-auth to its own full URL, as the resend POST behind it
+   does. `test_resend_confirm_is_step_up_gated_and_reauth_returns_to_it_once` drives that sequence.
+
+   The same false claim sat on `GET /ui/messages/{message_id}/resend-confirm`, which stays plain
+   `require_ui` for a different reason. No JSON route with the same method and permission carries a
+   step-up, and the page reads nothing: it echoes the operator's own query. The POST behind it is the
+   step-up-gated act.
 
    **Both uploaded-logs WRITE divergences are closed**, and are recorded here because the reasoning
    that kept one of them open is worth not re-deriving. `POST /ui/uploaded-logs/file/{file_id}/resend`
@@ -893,7 +897,7 @@ else would need its own authorization rule stated here.
    a saved query, not PHI. It is flagged because `POST /search/presets`, same method and
    permission, carries `require_step_up`.
 
-Differences 3–5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
+Differences 4 and 5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
 
 > **Per-channel scoping (DLQ-SCOPE), and it DENIES BY DEFAULT (BACKLOG #1152, ASVS 8.2.2).**
