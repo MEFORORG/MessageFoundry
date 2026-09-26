@@ -2545,7 +2545,7 @@ def _serve(args: argparse.Namespace) -> int:
         import importlib.util
 
         if importlib.util.find_spec(WEBCONSOLE_IMPORT_NAME) is None:
-            if settings.api.serve_ui_explicit:
+            if settings.security.serve_web_console_explicit:
                 # (b) [security].serve_web_console was EXPLICITLY set true but the optional wheel is
                 # absent — keep the HARD refuse (ADR 0143 soft-degrade contract): the operator asked
                 # for the console by name, so a silent JSON-only downgrade would be surprising.
@@ -2621,7 +2621,11 @@ def _serve(args: argparse.Namespace) -> int:
         or settings.api.tls_terminated_upstream
         or bool(settings.api.public_origin)
     )
-    if settings.api.serve_ui and not settings.api.serve_ui_explicit and console_exposed:
+    if (
+        settings.api.serve_ui
+        and not settings.security.serve_web_console_explicit
+        and console_exposed
+    ):
         print(
             "warning: the web console is on by default (ADR 0143) for LOCAL loopback binds only; this "
             "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, or "

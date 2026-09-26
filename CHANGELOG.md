@@ -56,6 +56,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: `[api].serve_ui_explicit` is removed and refused at load, in the file and as
+  `MEFOR_API_SERVE_UI_EXPLICIT`.** The loader set it when `[security].serve_web_console` was
+  provided, so `serve` could tell an explicit console request from the default. It was an ordinary
+  field, so an operator could set it too, with `[security]` reporting no choice. Doing so turned the
+  console-absent warning into a hard refusal naming a switch nobody had set. On an exposed bind it
+  kept a default-on console on the `/ui` exposure checks, which can refuse start, instead of dropping
+  it. `serve` now reads whether `[security].serve_web_console` was provided directly, so that switch
+  behaves as before. (`BACKLOG #2000`)
 - **BREAKING — the `Http()` inbound listener answers 400 to a request with no `Host` or with two.**
   RFC 9112 section 3.2 requires a server to refuse both shapes. In the shipped code an HTTP/1.1
   request with no `Host` was accepted, and a second `Host` silently replaced the first. The listener
