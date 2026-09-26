@@ -93,12 +93,12 @@ def sink() -> Iterator[list[tuple[str, str]]]:
     def _build(config: Any) -> _RecordingDestination:
         return _RecordingDestination(config.name, recorded)
 
-    transport_base.register_destination(ConnectorType.FILE, _build)
+    transport_base.register_destination(ConnectorType.FILE, _build, replace=True)
     try:
         yield recorded
     finally:
         if original is not None:
-            transport_base.register_destination(ConnectorType.FILE, original)
+            transport_base.register_destination(ConnectorType.FILE, original, replace=True)
         else:  # pragma: no cover - FILE is always registered in practice
             transport_base._DESTINATIONS.pop(ConnectorType.FILE, None)
 

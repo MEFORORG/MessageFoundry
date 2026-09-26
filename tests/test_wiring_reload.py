@@ -176,6 +176,62 @@ async def test_reload_changes_outbound_directory(store: MessageStore, tmp_path: 
     assert (out_b / "MSG2.hl7").exists()  # new traffic went to the new directory
 
 
+async def test_reload_rebuilds_an_outbound_whose_hop_attestation_alone_changed(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The hop attestation and cleartext acceptance live outside `spec`, but the connector's hop gate
+    is built from them. An edit to one of them alone must rebuild the connector, or a withdrawn
+    attestation keeps ALLOWing the hop until a restart while every report says it is gone. The
+    unchanged reload is the control: it must keep the connector warm."""
+    import dataclasses
+
+    inbox, out = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    runner = RegistryRunner(_deliver_registry(inbox, out), store, poll_interval=0.02)
+    await runner.start()
+    try:
+        first = runner._destinations["file_out"]
+        await runner.reload(_deliver_registry(inbox, out))
+        assert runner._destinations["file_out"] is first  # nothing changed: kept warm
+
+        attested = _deliver_registry(inbox, out)
+        attested.outbound["file_out"] = dataclasses.replace(
+            attested.outbound["file_out"],
+            tls_hop_attested=True,
+            tls_hop_attested_reason="TLS terminates at the site's stunnel sidecar",
+        )
+        await runner.reload(attested)
+        assert runner._destinations["file_out"] is not first
+    finally:
+        await runner.stop()
+
+
+async def test_reload_rebuilds_an_outbound_whose_revocation_attestation_alone_changed(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The same rule for ADR 0173's ``tls_revocation_attested``, which also lives outside `spec` and
+    feeds the connector's revocation guard at construction. Withdrawing it alone must rebuild the
+    connector, or the old guard keeps crossing the hop until a restart."""
+    import dataclasses
+
+    inbox, out = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    attested = _deliver_registry(inbox, out)
+    attested.outbound["file_out"] = dataclasses.replace(
+        attested.outbound["file_out"],
+        tls_revocation_attested=True,
+        tls_revocation_attested_reason="partner PKI runs OCSP at the site edge",
+    )
+    runner = RegistryRunner(attested, store, poll_interval=0.02)
+    await runner.start()
+    try:
+        first = runner._destinations["file_out"]
+        await runner.reload(_deliver_registry(inbox, out))
+        assert runner._destinations["file_out"] is not first
+    finally:
+        await runner.stop()
+
+
 async def test_reload_preserves_inflight_outbox(store: MessageStore, tmp_path: Path) -> None:
     """Rows already claimed/sending when a reload happens must still be delivered (no loss)."""
     reg = Registry()

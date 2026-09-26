@@ -74,6 +74,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.config.tls_policy import (
+    HOP_ATTESTATION_LEVER,
     HopPosture,
     TrustAnchorPolicy,
     active_hop_posture,
@@ -88,6 +89,7 @@ from messagefoundry.config.wiring import (
     PortConflictError,
     Registry,
     WiringError,
+    apply_hop_attestation,
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
@@ -3668,7 +3670,9 @@ class RegistryRunner:
         This runs inside ``_reload_lock``, which ``reload()``, ``stop()``, the per-connection
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
         therefore wedge re-promotion, engine shutdown and the connection API for as long as a wedged
-        File/Database ``stop()`` runs (those gather with no cancel and no timeout).
+        File/Database ``stop()`` runs. (Database gathers with no cancel and no timeout. File now
+        cancels a poll task blocked on a share call after a grace, BACKLOG #1620, but still waits
+        without a bound while that task is inside a store call.)
 
         On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
         operator-recoverable), whereas refusing to re-promote strands the whole graph — and
@@ -4650,6 +4654,7 @@ class RegistryRunner:
                 or name not in self._destinations
                 or old.outbound.get(name) is None
                 or old.outbound[name].spec != oc.spec
+                or _hop_policy(old.outbound[name]) != _hop_policy(oc)
             ):
                 # live worker but a missing/mismatched connector → (re)build it in place, close any old
                 # one. `failed` covers an outbound that failed to build at START (ADR 0031): its worker
@@ -7689,6 +7694,12 @@ def _hl7_batch_timestamp(created_at: float | None) -> str:
 def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[str, Any]) -> Source:
     # Resolve any env() references first (a missing value raises WiringError here, before bind).
     settings = resolve_env_settings(ic.spec.settings, env_values)
+    # Owner ruling 2026-09-24: the hop attestation is the connection's typed field, never a transport
+    # setting, so the loosening report and the gate read the same thing. Refuse the raw keys, then
+    # mirror a declared pair for the settings-driven seams, as _dest_config does for cleartext_accepted.
+    apply_hop_attestation(
+        settings, f"inbound connection {ic.name!r}", ic.tls_hop_attested, ic.tls_hop_attested_reason
+    )
     # Inbound MLLP/TCP/X12 listeners never carry an author-supplied host (wiring rejects one) — they
     # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
@@ -7711,23 +7722,17 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
         name=ic.name,
         settings=settings,
         ack_mode=ic.ack_mode,
-        # #200 (ADR 0092): surface the per-connection insecure-hop attestation as a typed field so the
-        # cell (built inside build_check_registry's active_hop_posture scope) can ALLOW a legitimately-
-        # secure hop. Default False → keyed purely on posture; a bad attested/reason pair fails loud here.
-        tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
-        tls_hop_attested_reason=_hop_attested_reason(settings),
+        # #200 (ADR 0092): the per-connection insecure-hop attestation, so the cell (built inside
+        # build_check_registry's active_hop_posture scope) can ALLOW a legitimately-secure hop. Read off
+        # the InboundConnection (owner ruling 2026-09-24). Default False → keyed purely on posture.
+        tls_hop_attested=ic.tls_hop_attested,
+        tls_hop_attested_reason=ic.tls_hop_attested_reason,
         # ADR 0173: the mTLS listener's revocation attestation. A TOP-LEVEL inbound key, read off the
         # InboundConnection (not the env-resolved settings), so check_inbound_revocation's attested
         # branch is reachable from config. Default off -> byte-identical.
         tls_revocation_attested=ic.tls_revocation_attested,
         tls_revocation_attested_reason=ic.tls_revocation_attested_reason,
     )
-
-
-def _hop_attested_reason(settings: Mapping[str, Any]) -> str | None:
-    """The env-resolved ``tls_hop_attested_reason`` connector setting as ``str | None`` (#200)."""
-    reason = settings.get("tls_hop_attested_reason")
-    return None if reason is None else str(reason)
 
 
 def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings | None) -> None:
@@ -7829,6 +7834,14 @@ def _dest_config(
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = oc.cleartext_reason
         settings["cleartext_connection"] = oc.name
+    # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
+    # setting. Refuse the raw keys, then mirror a declared pair for the same settings-driven seams.
+    apply_hop_attestation(
+        settings,
+        f"outbound connection {oc.name!r}",
+        oc.tls_hop_attested,
+        oc.tls_hop_attested_reason,
+    )
     # ADR 0173: mirror the revocation attestation the same way, for the one settings-driven seam that
     # reads it -- the SMART token-endpoint provider (transports/smart.py).
     _mirror_revocation_attestation(
@@ -7848,9 +7861,10 @@ def _dest_config(
         # connections.toml setting) flips it. The MLLP connector reads config.hl7_raw_separators.
         hl7_raw_separators=bool(settings.get("hl7_raw_separators", False)),
         # #200 (ADR 0092): the per-outbound insecure-hop attestation, typed here so the cell can ALLOW a
-        # legitimately-secure egress hop even on production-PHI. Default False → keyed purely on posture.
-        tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
-        tls_hop_attested_reason=_hop_attested_reason(settings),
+        # legitimately-secure egress hop. Read off the OutboundConnection (owner ruling 2026-09-24).
+        # Default False → keyed purely on posture.
+        tls_hop_attested=oc.tls_hop_attested,
+        tls_hop_attested_reason=oc.tls_hop_attested_reason,
         # ADR 0153 decision 2: the per-outbound cleartext-hop ACCEPTANCE ("this hop is NOT secure and we
         # accept that"). A TOP-LEVEL outbound key, not a transport setting, so it is read off the
         # OutboundConnection rather than the env-resolved settings dict — one authoring surface, and no
@@ -8383,26 +8397,49 @@ def check_fhir_lookup_allowed(
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
-#: How the four inbound bind refusals below describe ``--allow-insecure-bind``. They name no
-#: per-connection ``tls_hop_attested``: :func:`_inbound_insecure_bind_permitted` reads it, but no
-#: supported surface sets it -- no factory parameter and no ``connections.toml`` key. Only the
-#: unsupported raw-settings escape hatch (writing ``spec.settings`` directly) reaches it, and a refusal
-#: must not steer an operator there (docs/DEPLOYMENT.md, SDS-3.7).
-_INSECURE_BIND_FLAG_CLAMP = (
+#: How the four inbound bind refusals below end, after "... on a trusted, firewalled network ".
+#: The flag's caveat first: an enforcing instance ignores it (:func:`_inbound_insecure_bind_permitted`).
+#: Then the per-connection attestation, named with its reason and its supported surface (owner ruling
+#: 2026-09-24), never as a transport setting, which the loader refuses. Unlike the flag it crosses an
+#: enforcing instance, so it is reported as a loosening.
+_INSECURE_BIND_REFUSAL_TAIL = (
     "(an enforcing instance, which is the default, ignores the flag; "
-    "[security].enforcement = warn lets it apply)"
+    "[security].enforcement = warn lets it apply). If a TLS-terminating proxy or an isolated segment "
+    f"secures this hop by means the engine cannot see, set {HOP_ATTESTATION_LEVER} on the inbound "
+    "connection (an inbound() parameter or a connections.toml key); the attestation is reported as "
+    "a security loosening."
 )
 
 
 def _insecure_bind_cause(source: Source) -> str:
     """What let an off-loopback cleartext bind cross, for its WARNING line.
 
-    It names ``tls_hop_attested`` only when the connection carries it, so the line reports a fact
-    rather than offering a field no supported surface sets (see :data:`_INSECURE_BIND_FLAG_CLAMP`)."""
+    An attestation is named WITH its reason (owner ruling 2026-09-24), so the log line records why the
+    operator vouched for the hop. Otherwise the cause is the flag."""
     if source.tls_hop_attested:
-        return "tls_hop_attested"
+        # Same shape and fallback as the MLLP guard's attestation line (transports/mllp.py).
+        return f"tls_hop_attested; reason: {source.tls_hop_attested_reason or '(none provided)'}"
     # serve folds [security].require_encryption_for_remote = false into the same flag (ADR 0118).
     return "--allow-insecure-bind / require_encryption_for_remote = false"
+
+
+def _hop_policy(oc: OutboundConnection) -> tuple[object, ...]:
+    """The hop-policy declarations an outbound carries OUTSIDE its ``spec``.
+
+    A reload rebuilds a live outbound's connector only when something it was built from changed. These
+    typed fields feed the hop gates at construction, so an edit to one of them alone must rebuild too.
+    Otherwise a withdrawn attestation keeps ALLOWing the hop until a restart, while every report,
+    reading the new registry, says it is gone."""
+    return (
+        oc.tls_hop_attested,
+        oc.tls_hop_attested_reason,
+        oc.cleartext_accepted,
+        oc.cleartext_reason,
+        # ADR 0173: the revocation guard is built from these too, so withdrawing the attestation alone
+        # must rebuild the connector, exactly as for tls_hop_attested above.
+        oc.tls_revocation_attested,
+        oc.tls_revocation_attested_reason,
+    )
 
 
 def _inbound_insecure_bind_permitted(
@@ -8554,7 +8591,7 @@ def check_mllp_tls_exposure(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; HL7 bodies would "
         "cross the network in cleartext. Set tls=true (+ tls_cert_file/tls_key_file) on the MLLP "
         "connection, or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
-        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
+        "firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 
@@ -8590,7 +8627,7 @@ def check_http_tls_exposure(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; POSTed bodies "
         "(frequently PHI) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the Http connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 
@@ -8823,7 +8860,7 @@ def check_dimse_tls_exposure(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; DICOM PHI (header "
         "+ pixel data) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the DICOM connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 
@@ -8863,7 +8900,7 @@ def check_tcp_tls_exposure(
         f"{source.type.value.upper()} listener; raw-TCP/X12 payloads (frequently PHI) would cross the "
         "network in cleartext. TCP/X12 listeners are plaintext-only (no TLS option) — bind loopback, "
         "or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
-        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
+        "firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 

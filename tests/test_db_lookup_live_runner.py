@@ -76,6 +76,11 @@ class _FakeCursor:
     async def fetchall(self) -> list[tuple[Any, ...]]:
         return list(self._rows)
 
+    async def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        # The executor fetches through here whenever max_rows is on, which is the shipped default.
+        out, self._rows = self._rows[:size], self._rows[size:]
+        return out
+
 
 class _FakeConn:
     def __init__(self, cursor: _FakeCursor) -> None:
@@ -130,7 +135,13 @@ async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
     await s.close()
 
 
-def _registry(inbox: Path, outdir: Path, route: _Route, handler: _Handler) -> Registry:
+def _registry(
+    inbox: Path,
+    outdir: Path,
+    route: _Route,
+    handler: _Handler,
+    lookup_settings: dict[str, Any] | None = None,
+) -> Registry:
     """A File-in → router → handler → File-out graph that declares a ``clarity`` DatabaseLookup (so the
     runner builds the live-lookup executor and the transform runs off-loop with the bridge active)."""
     reg = Registry()
@@ -155,7 +166,10 @@ def _registry(inbox: Path, outdir: Path, route: _Route, handler: _Handler) -> Re
     reg.add_router("r", route)
     reg.add_handler("npi", handler)
     reg.add_lookup(
-        DatabaseLookupSpec(name="clarity", settings={"server": "db.local", "database": "Clarity"})
+        DatabaseLookupSpec(
+            name="clarity",
+            settings={"server": "db.local", "database": "Clarity", **(lookup_settings or {})},
+        )
     )
     return reg
 
@@ -256,6 +270,26 @@ async def test_handler_db_lookup_error_dead_letters(
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
 
     runner = await _run(_registry(inbox, outdir, _route_to_npi, _npi_handler([])), store)
+    try:
+        await _until_status(store, MessageStatus.ERROR.value)
+    finally:
+        await runner.stop()
+    assert not (outdir / "NPI1.hl7").exists()
+
+
+async def test_handler_db_lookup_over_max_rows_dead_letters(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A statement that matches more rows than the lookup's max_rows is refused at the fetch, and the
+    # refusal takes the same path as any lookup failure: ERROR / dead-letter, nothing delivered. The
+    # Handler never sees a truncated result it could shape a message from (BACKLOG #1730).
+    _patch_pool(monkeypatch, rows=[("1999999999",), ("1888888888",)], columns=["npi"])
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+
+    reg = _registry(inbox, outdir, _route_to_npi, _npi_handler([]), {"max_rows": 1})
+    runner = await _run(reg, store)
     try:
         await _until_status(store, MessageStatus.ERROR.value)
     finally:

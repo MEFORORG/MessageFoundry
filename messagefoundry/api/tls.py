@@ -288,6 +288,11 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     generated pair. ``build_api_ssl_context`` performs no expiry check, so on day 366 the engine
     would serve an expired certificate every client rejects. The rotation shape is an open decision
     on #1276; until it lands, ``CertExpiryRunner`` alarms on this path like any other served cert.
+    That holds because ``serve`` hands the monitor the path this function RETURNS, not
+    ``[api].tls_cert_file``, which is empty exactly when a pair was minted -- so passing the config
+    value left the generated certificate unwatched. ``tests/test_api_tls.py`` pins the wiring. The
+    alarm fires from ``[cert_monitor].warn_days`` out (0 turns the monitor off), and it re-mints
+    nothing: the reuse branch below returns an expired pair unchanged on every later start.
     """
     # The branch order lives in plan_api_tls_material, so the read-only reporter and the minting
     # path cannot disagree about which certificate the bind presents. Two of the three branches

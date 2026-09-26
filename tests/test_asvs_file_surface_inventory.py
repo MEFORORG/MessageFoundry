@@ -67,6 +67,7 @@ from messagefoundry.parsing.x12.delimiters import DEFAULT_MAX_INTERCHANGE_BYTES
 from messagefoundry.pipeline import dr_backup, dryrun
 from messagefoundry.transports.base import _SOURCES, DEFAULT_MAX_ITEMS_PER_POLL
 from messagefoundry.transports.bounded_read import DEFAULT_MAX_RESPONSE_BYTES
+from messagefoundry.transports.database import DEFAULT_DB_LOOKUP_MAX_ROWS
 from messagefoundry.transports.dicom import DEFAULT_MAX_OBJECT_BYTES
 from messagefoundry.transports.file import DEFAULT_MAX_DECOMPRESSED_BYTES, DEFAULT_MAX_FILE_BYTES
 from messagefoundry.transports.http_listener import DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_HEADER_BYTES
@@ -748,6 +749,7 @@ QUOTED_CONSTANTS: dict[str, int] = {
     "DEFAULT_MAX_ITEMS_PER_POLL": DEFAULT_MAX_ITEMS_PER_POLL,
     "DEFAULT_MAX_MESSAGE_BYTES": DEFAULT_MAX_MESSAGE_BYTES,
     "DEFAULT_MAX_RESPONSE_BYTES": DEFAULT_MAX_RESPONSE_BYTES,
+    "DEFAULT_DB_LOOKUP_MAX_ROWS": DEFAULT_DB_LOOKUP_MAX_ROWS,
     "_MAX_REQUEST_BODY_BYTES": api_app._MAX_REQUEST_BODY_BYTES,
     "MAX_EXPORT_IDS": MAX_EXPORT_IDS,
     "_MAX_RESTORE_MEMBER_BYTES": dr_backup._MAX_RESTORE_MEMBER_BYTES,

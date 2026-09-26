@@ -259,6 +259,8 @@ def run_checks(
         # is not the surface anyone queries three months later. Advisory — see the checks.
         _check_expiry_relaxed(config_dir),
         _check_generic_db_tls(config_dir),
+        # Owner ruling 2026-09-24: every attested hop, the one per-hop declaration that ALLOWs. Advisory.
+        _check_hop_attested(config_dir),
         # ADR 0173: the per-connection revocation attestation, same shape and same reason. Its only
         # report was the WARNING logged where it suppresses a refusal. Advisory — see the check.
         _check_revocation_attested(config_dir),
@@ -1962,6 +1964,45 @@ def _check_cleartext_accepted(
     )
 
 
+def _check_hop_attested(config_dir: str | Path) -> CheckResult:
+    """Surface **the whole set** of declarations that attest their hop secure (``tls_hop_attested``).
+
+    The sibling of :func:`_check_cleartext_accepted`, with the opposite claim: an attested hop is
+    ALLOWed rather than warned, so this line is where a reviewer sees what the engine is taking on
+    trust. Owner ruling 2026-09-24. Advisory (``required=False``): an attestation with a written reason
+    is a legitimate choice, not a config error. It reads through ``attested_secure_hops``, the same
+    reader as ``security_loosenings()`` and ``GET /security/posture``.
+
+    SKIPs when the graph will not load, same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, attested_secure_hops, load_config
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "tls-hop-attested",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    attested = attested_secure_hops(registry)
+    if not attested:
+        return CheckResult(
+            "tls-hop-attested", ok=True, required=False, detail="no hop is attested secure"
+        )
+    listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    return CheckResult(
+        "tls-hop-attested",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(attested)} hop(s) are attested secure by means the engine cannot see, and are "
+            f"ALLOWed where an enforcing gate would refuse them — {listed}"
+        ),
+    )
+
+
 def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
     """Surface every outbound that declares ``tls_allow_expired`` (#129 / ADR 0094), with its peer.
 
@@ -2102,8 +2143,11 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
             "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
-            "instance REFUSES these off-loopback at build-check unless that outbound connection "
-            "declares cleartext_accepted with a cleartext_reason (an inbound DatabasePoll cannot)"
+            "instance REFUSES these off-loopback at build-check unless the connection declares "
+            # The spelling of config.tls_policy.HOP_ATTESTATION_LEVER, written out so this module
+            # does not import a crypto module for a string (the crypto-inventory gate).
+            "tls_hop_attested=true with a tls_hop_attested_reason (the hop is secure by other means), "
+            "or, on an outbound only, cleartext_accepted with a cleartext_reason"
         ),
     )
 

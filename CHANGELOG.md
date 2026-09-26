@@ -119,6 +119,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **Replay no longer re-queues a pass-through completion marker, so a replayed message that
+  delivered ends `PROCESSED`, not `ERROR`.** A handler `Send` into a pass-through inbound leaves an
+  already-finished marker row on the parent. Its lane is an inbound name, so no delivery worker
+  drains it. On a store with an encryption key, message replay put a delivered marker back to
+  pending. The parent then stayed `ROUTED`, even when its real delivery had gone out again. The next
+  start's sweep dead-lettered the marker and recorded the delivered message as `ERROR`. Bulk
+  dead-letter replay did the same to a marker that the depth cap had left dead: its parent went back
+  to `ROUTED`, and nothing could finish it before the next start. Markers now carry the stamp `@passthrough-marker` in
+  `handler_name`. Replay, bulk dead-letter replay and resend skip a row with that stamp, on SQLite,
+  PostgreSQL and SQL Server. The attachment clean-up no longer keeps an attachment alive for a dead
+  marker. Replay does not retransmit into a pass-through inbound, because the marker has no body. A
+  depth-capped marker stays dead, so its parent keeps `ERROR`. A resend with no source named no
+  longer calls a parent with one real delivery ambiguous. A pass-through-only parent now reports no
+  delivered body, not a purged one, and its replay refusal names the pass-through case.
+  ([BACKLOG #1580](docs/BACKLOG.md))
 - **A failed SMART token mint in `fhir_lookup` now raises `FhirLookupError`, not a raw
   `DeliveryError`.** A lookup mints its bearer before the GET, outside the handling that maps
   every other lookup failure. So a token endpoint that was down, refused the client, or sent a bad
@@ -159,6 +174,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   of the message in a `.part` file there permanently, with nothing in the log. The delivery still
   succeeds. The warning names the temp path and the OS error. The `overwrite` mode renames the temp
   into place, so it has no temp left to remove and logs nothing. (`BACKLOG #1862`)
+- **An MLLP listener now answers a store outage at intake with a NAK before it closes the
+  connection.** When the inbound handler faulted, for example because the store could not commit
+  the message, the listener closed the socket with no reply and logged the event as
+  `framing_error`. It now sends an `AE` (a `CE` in enhanced mode) with fixed text, then closes,
+  and records a new `handler_error` connection event. An inbound that sends no replies keeps its
+  socket, so frames already sent behind the failed one are still handled. The message is still
+  not accepted, and the sender resends it. The NAK has no message row, so it is not in the ACK
+  capture stream. ([BACKLOG #1619](docs/BACKLOG.md))
+- **`db_lookup` now refuses a result larger than the lookup's `max_rows`, and stops reading at the
+  ceiling.** It used to call `fetchall`, so a Handler's statement with a broad predicate held its whole
+  result set in the transform worker. `DatabaseLookup(...)` takes `max_rows`, default `500`. The
+  executor asks the driver for at most `max_rows + 1` rows. A larger result raises `DbLookupError`, and
+  the message goes to `ERROR`; the Handler never sees a truncated result. `max_rows=0` removes the
+  ceiling. ([BACKLOG #1730](docs/BACKLOG.md))
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
   `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other
@@ -212,6 +241,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A connection can now attest its hop secure, and the attestation is reported.** `inbound()`,
+  `outbound()`, `FhirLookup()`, `DatabaseLookup()` and `DatabaseRef()` take `tls_hop_attested` with a
+  mandatory `tls_hop_attested_reason`. So do `connections.toml` inbound and outbound tables, as
+  top-level keys. `messagefoundry check` lists every attested hop on a `tls-hop-attested` line, and
+  `GET /security/posture` names them in a `tls_hop_attested` loosening. Before this, no factory took
+  the flag, but the engine read it straight out of a connection's transport settings. A config module
+  could write it there and pass the enforcing cleartext-bind refusal unreported. Those settings keys
+  are now refused at load, naming the supported surface. Owner ruling 2026-09-24; registry entry in
+  `docs/SECURITY-LOOSENING.md`.
 - **BREAKING: `zip_decompress` now refuses any bytes before or after the archive.** Stdlib
   `zipfile` finds the archive's end record by scanning back from the end of the input, and skips
   anything in front of the archive as prepended data. So an archive with up to about 64 KiB of extra

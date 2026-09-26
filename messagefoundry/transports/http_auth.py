@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.tls_policy import (
+    CREDENTIAL_HOP_WAYS_ACROSS,
     SYSTEM_TRUST_ANCHOR,
     InsecureHopRefused,
     TrustAnchor,
@@ -208,8 +209,7 @@ class OAuth2ClientCredentialsProvider:
         except InsecureHopRefused as exc:
             raise HttpAuthError(
                 "OAuth2 token endpoint over cleartext http would expose the client_secret; refused by "
-                "the instance security posture (use https, or declare cleartext_accepted with a "
-                "cleartext_reason)"
+                f"the instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
             ) from exc
         if not client_id:
             raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_client_id' setting")
@@ -518,8 +518,7 @@ def digest_handler_from_settings(
     except InsecureHopRefused as exc:
         raise HttpAuthError(
             "HTTP Digest over cleartext http would expose the digest credential; refused by the "
-            "instance security posture (use https, or declare cleartext_accepted with a "
-            "cleartext_reason)"
+            f"instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
         ) from exc
     user = str(s.get("http_auth_user") or "")
     password = str(s.get("http_auth_password") or "")
