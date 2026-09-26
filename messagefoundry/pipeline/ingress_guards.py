@@ -10,7 +10,8 @@ check`` and the Test Bench previewed ``RECEIVED`` for fixtures the engine would 
 previewed ``ERROR``/mojibake for bodies the engine accepts (BACKLOG #1689).
 
 This module holds the rule once. It is **pure** — no store, no ACK, no event loop — which is exactly
-the subset both callers share: the live listener's remaining work (recording the ``ERROR`` row,
+the subset both callers share. The one exception is :func:`admit_resubmission`, the operator resend's
+async entry point, which only schedules the pure checks onto worker threads as the listener does: the live listener's remaining work (recording the ``ERROR`` row,
 building the AR/AE frame, capturing the ACK) is I/O the dry-run has no business simulating, so the
 seam sits at "decoded text, or the reason it was refused".
 
@@ -20,14 +21,15 @@ runner keeps its own inline copy of the sequence, and
 ``tests/test_ingress_guard_parity.py`` pins the two against each other so the copy cannot drift
 silently.
 
-**Two live guards are deliberately NOT mirrored here, and both omissions are by design:**
+**Two live guards are deliberately NOT mirrored for the dry-run, and both omissions are by design:**
 
 * **the strict-validation timeout.** The listener runs ``hl7apy`` off the event loop under
-  ``validation.strict_timeout_s`` and records ``ERROR`` + ``AE`` on expiry. Honouring it here would
-  force :func:`~messagefoundry.pipeline.dryrun.dry_run` to become ``async``, which ripples into
-  ``checks.py``, ``verify/smoke.py`` and ``dryrun_trace.py``. A dry-run therefore validates
-  **un-timed**: it can report ``RECEIVED``/``ERROR`` for a pathological body the engine would
-  ``AE``-NAK on a timeout instead.
+  ``validation.strict_timeout_s`` and records ``ERROR`` + ``AE`` on expiry. Honouring it in the
+  dry-run would force :func:`~messagefoundry.pipeline.dryrun.dry_run` to become ``async``, which
+  ripples into ``checks.py``, ``verify/smoke.py`` and ``dryrun_trace.py``. A dry-run therefore
+  validates **un-timed**: it can report ``RECEIVED``/``ERROR`` for a pathological body the engine
+  would ``AE``-NAK on a timeout instead. The operator resend (:func:`admit_resubmitted_body`) is
+  already off the loop, so it does honour the timeout.
 * **document detach** (``_detach_documents``, #149 / ADR 0105). It is ``async`` and it *writes*
   attachment rows, so there is no honest pure mirror of it. A dry-run consequently previews the
   whole body where a streaming inbound would have detached its documents.
@@ -35,24 +37,66 @@ silently.
 
 from __future__ import annotations
 
+import asyncio
+import codecs
+
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.wiring import InboundConnection
 from messagefoundry.parsing import RawMessage, normalize
-from messagefoundry.parsing.binary import is_marked
-from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+from messagefoundry.parsing.binary import BinaryCarriageError, is_marked
+from messagefoundry.parsing.binary import decode as decode_carriage
+from messagefoundry.parsing.peek import (
+    DEFAULT_MAX_MESSAGE_BYTES,
+    HL7PeekError,
+    Peek,
+    enforce_size_limits,
+)
+from messagefoundry.parsing.sniff import _content_matches_declared, text_sniff_head
+from messagefoundry.parsing.validate import validate
 from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "INGRESS_MAX_BYTES",
     "NUL_REJECTED_REASON",
+    "STRICT_VALIDATE_TIMEOUT_SECONDS",
     "IngressGuardError",
+    "admit_resubmission",
+    "admit_resubmitted_body",
     "carry_binary_ingress",
     "decode_ingress",
     "ingress_encoding",
     "ingress_size_error",
     "peek_max_bytes",
+    "raise_if_strictly_invalid",
     "store_safe_raw",
+    "streaming_over_threshold",
+    "strict_validate_timeout",
+    "strict_validation_due",
 ]
+
+# How long a single strict hl7apy validate may run before the message dead-letters (#89, DoS backstop).
+# Mirrors the _LOOKUP_RESULT_TIMEOUT_SECONDS rationale: a pathological body that makes hl7apy's
+# structure/cardinality parse spin can otherwise pin the listener's off-loop worker; the timeout frees
+# the listener and routes the message to ERROR/dead-letter. It CANNOT kill the worker thread (no
+# thread cancellation in CPython) — the orphaned validate leaks its thread until it returns, bounded by
+# the 16 MiB / segment caps enforce_size_limits fires BEFORE the slow parse (validate.py). Per-inbound
+# `validation.strict_timeout_s` overrides this; <= 0 there disables the backstop entirely. Owner-tunable.
+# The listener reads it as ``wiring_runner._STRICT_VALIDATE_TIMEOUT_SECONDS``; it lives here so the
+# resend (BACKLOG #1911) and the listener resolve it by one rule.
+STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
+
+
+def strict_validate_timeout(ic: InboundConnection) -> float | None:
+    """The effective wall-clock (seconds) for this inbound's strict validate, or ``None`` if disabled.
+
+    Resolves the per-connection ``validation.strict_timeout_s`` against the engine default (#89):
+    ``None`` inherits :data:`STRICT_VALIDATE_TIMEOUT_SECONDS`; ``<= 0`` disables the backstop (returns
+    ``None``, so the caller runs the validate un-timed, the pre-#89 behaviour). The value is trusted
+    config, not an HL7 field."""
+    configured = ic.validation.strict_timeout_s
+    effective = STRICT_VALIDATE_TIMEOUT_SECONDS if configured is None else configured
+    return effective if effective > 0 else None
+
 
 #: Engine-level ingress size ceiling (SEC-017, CWE-770). Mirrors ``wiring_runner._INGRESS_MAX_BYTES``;
 #: the HL7 path gets the same ceiling through ``Peek.parse`` -> ``enforce_size_limits`` instead, at the
@@ -70,6 +114,9 @@ class IngressGuardError(Exception):
 
     ``phase`` names which guard fired (``"decode"`` or ``"size"``) and matches the live listener's ACK
     phase labels, so a caller that records dispositions can map it onto the same one the engine writes.
+    :func:`admit_resubmitted_body` adds three more, ``"type"`` for the declared-type sniff,
+    ``"parse"`` for ``Peek.parse`` and ``"strict"`` for strict ``hl7apy`` validation; the dry-run entry
+    points never raise any of them.
     """
 
     def __init__(self, reason: str, *, phase: str) -> None:
@@ -109,6 +156,13 @@ def ingress_size_error(size: int) -> str | None:
     return None
 
 
+def _raise_if_oversize(size: int) -> None:
+    """Raise the ``size``-phase refusal when :func:`ingress_size_error` reports an overrun."""
+    oversize = ingress_size_error(size)
+    if oversize is not None:
+        raise IngressGuardError(oversize, phase="size")
+
+
 def store_safe_raw(raw: str | bytes, content_type: str, *, text: str | None = None) -> str:
     """A ``str`` view of a REJECTED body that a TEXT store can hold (INGEST-4 / ADR 0028).
 
@@ -126,6 +180,44 @@ def store_safe_raw(raw: str | bytes, content_type: str, *, text: str | None = No
     return RawMessage.from_bytes(data, content_type).raw
 
 
+def _encode_declared(raw: str, ic: InboundConnection) -> bytes:
+    """``raw`` in the inbound's declared charset, or the ``decode``-phase refusal when it cannot be.
+
+    A text a charset cannot hold is one the listener could never have decoded from a sender's bytes.
+    The reason names a position and never the character: ``str(UnicodeEncodeError)`` quotes the
+    offending character, which is a byte of the body."""
+    encoding = ingress_encoding(ic)
+    try:
+        return raw.encode(encoding)
+    except UnicodeEncodeError as exc:
+        raise IngressGuardError(
+            f"encode error ({encoding}): {exc.reason} at position {exc.start}", phase="decode"
+        ) from exc
+    except LookupError as exc:
+        raise IngressGuardError(
+            f"encode error ({encoding}): {safe_exc(exc)}", phase="decode"
+        ) from exc
+
+
+#: Codecs in which every ASCII character encodes, so an ASCII-only text needs no trial encode.
+_ASCII_SUPERSET_CODECS = frozenset({"ascii", "utf-8", "iso8859-1", "cp1252"})
+
+
+def _check_encodable(raw: str, ic: InboundConnection) -> None:
+    """Refuse ``raw`` when the inbound's declared charset cannot hold it (``decode`` phase).
+
+    An ASCII-only text in an ASCII-superset codec is skipped rather than encoded: a trial encode of an
+    upload-sized body is a full copy for an answer that is already known. Any other case, including
+    an unknown codec name, goes to :func:`_encode_declared`, which owns the refusal wording."""
+    try:
+        name: str | None = codecs.lookup(ingress_encoding(ic)).name
+    except LookupError:
+        name = None
+    if name in _ASCII_SUPERSET_CODECS and raw.isascii():
+        return
+    _encode_declared(raw, ic)
+
+
 def carry_binary_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     """Carry a BYTE-oriented body (``content_type.is_binary``) the way the listener does — no decode.
 
@@ -141,20 +233,12 @@ def carry_binary_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     if isinstance(raw, str):
         if is_marked(raw):
             return raw
-        encoding = ingress_encoding(ic)
-        try:
-            data = raw.encode(encoding)
-        except (UnicodeEncodeError, LookupError) as exc:
-            raise IngressGuardError(
-                f"encode error ({encoding}): {safe_exc(exc)}", phase="decode"
-            ) from exc
+        data = _encode_declared(raw, ic)
     else:
         data = raw
     # Measured on the RAW bytes, pre-base64-inflation, so the carriage codec cannot walk past the
     # ceiling — the same side of the encode the listener measures on.
-    oversize = ingress_size_error(len(data))
-    if oversize is not None:
-        raise IngressGuardError(oversize, phase="size")
+    _raise_if_oversize(len(data))
     return RawMessage.from_bytes(data, ic.content_type.value).raw
 
 
@@ -196,7 +280,163 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
     if "\x00" in text:
         raise IngressGuardError(NUL_REJECTED_REASON, phase="decode")
     if not hl7v2:
-        oversize = ingress_size_error(len(text))
-        if oversize is not None:
-            raise IngressGuardError(oversize, phase="size")
+        _raise_if_oversize(len(text))
     return text
+
+
+def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
+    """Admit an operator-resubmitted body the way the inbound ``ic`` admits a sender's (BACKLOG #1911).
+
+    The upload resend (``POST /uploads/{file_id}/resend``) and the edit-resend re-route write straight
+    to the ingress stage, so the listener never sees the body. This runs the listener's guards over it
+    first, raises :class:`IngressGuardError` for the first one that fails, and otherwise returns the
+    form the listener would have committed -- the caller commits that, not ``raw``:
+
+    * **decode** -- a text inbound's declared charset must be able to hold the text, since the listener
+      could only ever have produced it by decoding bytes in that charset; then the NUL rule. A binary
+      inbound's ``mfb64:v1:`` carriage must decode.
+    * **size** -- for an HL7 inbound, the size and segment caps ``Peek.parse`` enforces at
+      :func:`peek_max_bytes`, so a connection's own lower ``max_message_bytes`` holds, but never above
+      the engine ceiling (see below); the engine ceiling for any other type, in the listener's units.
+    * **type** -- the declared-type magic-byte sniff the listener applies to a non-HL7 body.
+    * **parse** -- an HL7 body must pass ``Peek.parse``, which is the listener's only HL7 type check.
+
+    Strict ``hl7apy`` validation is NOT run here, because the listener times it and a synchronous
+    function cannot time itself without a thread of its own. :func:`admit_resubmission` runs this and
+    then the strict step, timed as the listener times it; call that one.
+
+    The committed form is the ``\\r``-normalized text for HL7, the text verbatim for another text
+    type, and canonical ``mfb64:v1:`` carriage for a binary type.
+
+    ``ic`` is ``None`` when there is no inbound to guard for: the edit-resend direct path writes an
+    outbound row, and a re-route whose origin inbound is no longer registered has no declared type. Only
+    the engine-wide rules apply then, the NUL rule and the engine ceiling, and ``raw`` is returned as
+    is. Strict validation is an inbound's setting, so it never applies there either. Both callers today
+    already bound that body below the ceiling (``EditResendRequest.raw`` and the API's 1 MiB request
+    cap), so the ceiling there is a backstop.
+
+    **Not mirrored, and a resubmission can therefore still differ from a sender's body:** document
+    detach. A streaming inbound raises ``max_message_bytes`` to pay for a detach this path does not do,
+    so its HL7 ceiling here stays at the engine default rather than the raised value.
+
+    The reason never carries a byte of the body, so a caller may return it to the operator and audit it."""
+    if ic is None:
+        if "\x00" in raw:
+            raise IngressGuardError(NUL_REJECTED_REASON, phase="decode")
+        _raise_if_oversize(len(raw))
+        return raw
+    if ic.content_type.is_binary:
+        if is_marked(raw):
+            try:
+                data = decode_carriage(raw)
+            except BinaryCarriageError as exc:
+                raise IngressGuardError(
+                    f"binary carriage error: {safe_exc(exc)}", phase="decode"
+                ) from exc
+        else:
+            data = _encode_declared(raw, ic)
+        # Measured on the raw bytes, before base64 inflation, as the listener measures a binary body.
+        _raise_if_oversize(len(data))
+        _raise_if_mistyped(ic, data)
+        # A binary inbound's rows are carriage (ADR 0028); text committed bare would fail .raw_bytes.
+        # Re-encoded even when it arrived marked, so a non-canonical form (a line break inside the
+        # base64) is stored as the listener's canonical, unbroken carriage.
+        return RawMessage.from_bytes(data, ic.content_type.value).raw
+    _check_encodable(raw, ic)
+    text = decode_ingress(raw, ic)
+    if ic.content_type is ContentType.HL7V2:
+        # The listener's HL7 type check IS Peek.parse, and the magic-byte sniff is NOT applied here,
+        # as the listener does not apply it: the two disagree in BOTH directions (the sniff admits an
+        # FHS/BHS- or BOM-led body Peek refuses, and refuses a body led by NBSP or \x1c that Peek's
+        # str.lstrip() accepts). The size and segment caps run first, on their own, so an oversize
+        # body is told apart from a malformed one. The ceiling is capped at the engine
+        # default because a streaming inbound's raised max_message_bytes pays for a detach that this
+        # path does not do.
+        ceiling = min(peek_max_bytes(ic), DEFAULT_MAX_MESSAGE_BYTES)
+        try:
+            enforce_size_limits(text, max_bytes=ceiling)
+        except HL7PeekError as exc:
+            raise IngressGuardError(str(exc), phase="size") from exc
+        try:
+            Peek.parse(text, max_bytes=ceiling)
+        except HL7PeekError as exc:
+            raise IngressGuardError(f"parse error: {safe_exc(exc)}", phase="parse") from exc
+    else:
+        _raise_if_mistyped(ic, text_sniff_head(text))
+    return text
+
+
+def streaming_over_threshold(ic: InboundConnection, text: str) -> bool:
+    """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at or
+    above that threshold (#149, ADR 0105 Phase 1a). The listener gates its detach path on this, and
+    downgrades strict validation to header-only for such a body. Below threshold or unset, ``False``."""
+    threshold = ic.stream_threshold_bytes
+    return threshold is not None and len(text) >= threshold
+
+
+def strict_validation_due(ic: InboundConnection | None, text: str) -> bool:
+    """Whether the listener would run whole-body strict ``hl7apy`` validation on ``text`` for ``ic``.
+
+    It does when the inbound sets ``validation.strict``, unless the body is a streaming inbound's at or
+    over its threshold: there the listener validates the header only, which ``Peek.parse`` has already
+    done. With no inbound there is no setting to read, so never. The HL7 check restates what wiring
+    already enforces, since ``validation.strict`` is refused on any other content type."""
+    return (
+        ic is not None
+        and ic.content_type is ContentType.HL7V2
+        and ic.validation.strict
+        and not streaming_over_threshold(ic, text)
+    )
+
+
+def raise_if_strictly_invalid(text: str, ic: InboundConnection) -> None:
+    """Run the listener's strict ``hl7apy`` validate over ``text``; raise the ``strict`` refusal.
+
+    The same call the listener makes, :func:`~messagefoundry.parsing.validate.validate` against
+    ``validation.hl7_version``. Blocking and CPU-bound, so run it off the event loop.
+
+    The reason names no field and quotes no value. ``hl7apy``'s error text can carry a byte of the body
+    (it echoes an unsupported MSH-12 verbatim, for one), and ``safe_text`` does not scrub a bare token,
+    so the text is not carried at all. The reason counts the errors instead and points at the dry run,
+    which lists them to a caller that may see message content."""
+    result = validate(text, expected_version=ic.validation.hl7_version)
+    if not result.ok:
+        count = len(result.errors)
+        plural = "" if count == 1 else "s"
+        raise IngressGuardError(
+            f"strict-validation failed ({count} error{plural}); a dry run of the body against "
+            f"inbound {ic.name!r} lists them",
+            phase="strict",
+        )
+
+
+async def admit_resubmission(raw: str, ic: InboundConnection | None) -> str:
+    """Admit an operator-resubmitted body as the inbound ``ic``'s listener would (BACKLOG #1911).
+
+    :func:`admit_resubmitted_body` off the event loop, then, where :func:`strict_validation_due` says
+    the listener would, :func:`raise_if_strictly_invalid` in the listener's own shape: on a pooled
+    worker thread under :func:`strict_validate_timeout`. A timeout is the listener's refusal too, so it
+    raises the ``strict`` phase with the listener's wording. As on the listener, the timeout frees this
+    call and cannot stop the worker, which runs on until the size and segment caps let it finish.
+
+    Returns the form to commit; raises :class:`IngressGuardError` for the first guard that refuses."""
+    text = await asyncio.to_thread(admit_resubmitted_body, raw, ic)
+    if ic is not None and strict_validation_due(ic, text):
+        timeout = strict_validate_timeout(ic)
+        try:
+            await asyncio.wait_for(asyncio.to_thread(raise_if_strictly_invalid, text, ic), timeout)
+        except TimeoutError:
+            raise IngressGuardError(
+                f"strict-validation timed out after {timeout}s", phase="strict"
+            ) from None
+    return text
+
+
+def _raise_if_mistyped(ic: InboundConnection, head: bytes) -> None:
+    """Raise the ``type``-phase refusal when ``head`` contradicts the inbound's declared type."""
+    if not _content_matches_declared(ic.content_type, head):
+        raise IngressGuardError(
+            f"ingress body does not match its declared content type "
+            f"{ic.content_type.value!r} (no matching magic bytes)",
+            phase="type",
+        )

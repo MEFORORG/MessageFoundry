@@ -15,16 +15,21 @@ asyncio-native**, and its C-STORE callback runs on a foreign (acceptor) thread �
   ``future.result(timeout)``;
 * returns C-STORE **Success only after** the object is durably committed (**commit-before-SUCCESS**, the
   DIMSE analog of MLLP's commit-before-ACK; ADR 0001 / count-and-log). The bridged handler is the
-  pipeline's ``_handle_inbound``, which — because ``content_type="dicom"`` is a **binary** type — carries
-  the bytes as base64 via ``RawMessage.from_bytes`` (ADR 0028, the one encode) and commits them to the
-  ingress stage. A codec later recovers them via ``RawMessage.raw_bytes``.
+  pipeline's **receipt** handler (the one the HTTP listener uses), which — because
+  ``content_type="dicom"`` is a **binary** type — carries the bytes as base64 via
+  ``RawMessage.from_bytes`` (ADR 0028, the one encode), commits them to the ingress stage, and returns
+  the committed message id. A codec later recovers them via ``RawMessage.raw_bytes``. When the handler
+  instead refuses the object (it records ``ERROR`` and commits no ingress row), it returns ``None`` and
+  the SCP answers a DIMSE **failure**: Success for an object the engine did not accept is
+  accept-and-drop (BACKLOG #1910).
 
 **Timeout-failure policy (protects no-duplicate + count-and-log):** a ``future.result(timeout)`` timeout
 returns a DIMSE **failure** (never a false Success — a dropped/uncommitted object must be re-sent); the
 already-scheduled commit may still land, so a re-ingest **must be idempotent** (de-dupe on
 ``SOPInstanceUID`` is a future hardening — for now a re-send may yield a documented duplicate). Any
 **post-commit** failure (routing/transform/delivery) is an ``ERROR``/dead-letter disposition, never a
-DIMSE failure (the sender was already told Success).
+DIMSE failure (the sender was already told Success). A **pre-commit** refusal by the handler is the
+opposite case: nothing was committed, so the sender is told.
 
 **Security (§9):** the calling-AE allowlist (``require_calling_aet``, association-level) + a peer-IP
 allowlist (the per-connection ``source_ip_allowlist`` passed to ``inbound(...)`` — there is no
@@ -60,13 +65,15 @@ import time
 from collections.abc import Callable, Coroutine, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
+from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     apply_connection_tls_ciphers,
     build_verifying_client_context,
+    current_hop_posture,
     harden_cipher_suites,
     harden_crl_check,
     harden_kex_groups,
@@ -84,6 +91,7 @@ from messagefoundry.parsing.dicom._inflate import (
     guard_part10_deflate,
 )
 from messagefoundry.parsing.dicom.errors import DicomBombError
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -111,7 +119,19 @@ logger = logging.getLogger(__name__)
 #: Set before decode (see DicomScpSource._raw_over_cap) — what one received object costs in memory.
 #: max_pdu_size bounds a fragment, NOT the object: pynetdicom accumulates every fragment of an incoming
 #: object with no ceiling of its own. Overridable via DICOM(max_object_bytes=...).
+#:
+#: **The SCP never honours more than** :data:`_ENGINE_INGRESS_CEILING_BYTES`, whatever is configured
+#: here (BACKLOG #1910). This default still reaches the outbound SCU unchanged.
 DEFAULT_MAX_OBJECT_BYTES = 128 * 1024 * 1024
+
+#: The largest object the engine's binary ingress will commit. The pipeline records anything larger as
+#: ``ERROR`` and commits no ingress row, so an SCP that accepted one would answer Success for an object
+#: the engine never processes. The SCP's effective cap is therefore ``min(max_object_bytes, this)``,
+#: and an uncapped SCP (``0``/``None``) is capped here. The value mirrors
+#: ``messagefoundry.pipeline.wiring_runner._INGRESS_MAX_BYTES``; it is read from ``parsing.peek`` rather
+#: than imported from the pipeline because transports never import pipeline, and a test pins the two
+#: equal.
+_ENGINE_INGRESS_CEILING_BYTES = DEFAULT_MAX_MESSAGE_BYTES
 
 #: Association-rate pacing for the SCP ships OFF, for exactly the reason
 #: :data:`messagefoundry.transports.mllp.DEFAULT_MAX_MESSAGES_PER_SECOND` ships off (ruled 2026-08-11,
@@ -123,8 +143,10 @@ DEFAULT_MAX_ASSOCIATIONS_PER_SECOND: float | None = None
 # DIMSE C-STORE response statuses (DICOM PS3.4 Annex B). Success commits; the failures below all mean
 # "not stored — the SCU should re-send / give up" and never a silent drop.
 _STATUS_SUCCESS = 0x0000
-_STATUS_OUT_OF_RESOURCES = 0xA700  # over-cap, or a commit timeout/failure (re-send)
-_STATUS_CANNOT_UNDERSTAND = 0xC000  # the object would not decode/re-encode
+_STATUS_OUT_OF_RESOURCES = 0xA700  # over-cap, or a commit timeout (re-send)
+_STATUS_CANNOT_UNDERSTAND = (
+    0xC000  # would not decode/re-encode, commit raised, or ingress refused it
+)
 _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist
 
 #: Loopback bind interfaces that need no peer controls (the common dev/single-box case). Copied (not
@@ -133,7 +155,7 @@ _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
 
-def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
+def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext | None:
     """Build the SCP's server ``SSLContext`` for DICOM-over-TLS, or ``None`` when ``tls`` is off. Built
     once at construction so a bad cert/key fails at build (dry-run/``check``), not at bind. TLS 1.2+
     floor; ``tls_ca_file`` opts into mTLS (require + verify a calling peer's client cert). Mirrors the
@@ -141,7 +163,10 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
 
     ``tls_key_password`` decrypts a passphrase-encrypted private key (``env()``-sourced, mirroring
     MLLP's ``tls_key_password`` / the API listener's ``MEFOR_API_TLS_KEY_PASSWORD``); ``None`` (the
-    default) loads an unencrypted key exactly as before."""
+    default) loads an unencrypted key exactly as before.
+
+    ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
+    refuse_an_unread_ca_pin(s, inbound=True, connector="DICOM listener")
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
@@ -162,7 +187,13 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
     )
     ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
     if ca:  # opt-in mTLS: require + verify a calling peer's client cert against this trust anchor
-        ctx.load_verify_locations(cafile=str(ca))
+        # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then the bytes they read,
+        # never a second read of the file. This CA is the SCP's whole peer authentication decision
+        # (the CONNECTIONS.md DICOM section), so a swapped file would admit any peer. Outside the
+        # construction gate the check enforces, as mllp.py's does.
+        posture = current_hop_posture()
+        cadata = inbound_ca_cadata(name, s, enforcing=posture is None or posture.enforcing)
+        ctx.load_verify_locations(cadata=cadata)
         ctx.verify_mode = ssl.CERT_REQUIRED
         # Opt-in revocation (#1005), after the CA load and inside the mTLS branch -- see mllp.py.
         # An HTTP proxy can terminate neither DIMSE nor MLLP, so for this listener the documented
@@ -171,8 +202,8 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
             harden_crl_check(ctx, str(crl))
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
-    # apply_connection_tls_ciphers. Unset (the default) narrows nothing, leaving the line below the
-    # assertion this seam has always made on the inherited suite list.
+    # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites
+    # (BACKLOG #300, the ADR 0188 amendment); set, to the operator's validated string.
     apply_connection_tls_ciphers(ctx, s, connector="DICOM listener")  # opt-in per-hop suite list
     harden_cipher_suites(ctx, connector="DICOM listener")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
@@ -183,6 +214,10 @@ class DicomScpSource(SourceConnector):
     """Inbound C-STORE SCP (ADR 0025 Phase 1). A **listen** source: it binds its own per-node port
     (``[inbound].bind_host`` + the configured ``port``) and ignores ``leader_gate`` (no shared-resource
     double-read)."""
+
+    #: The C-STORE status must tell a committed object from a refused one, and only the receipt
+    #: handler's ``None`` means "refused" (BACKLOG #1910). See :attr:`SourceConnector.wants_receipt`.
+    wants_receipt: ClassVar[bool] = True
 
     def __init__(self, config: Source) -> None:
         s = config.settings
@@ -201,8 +236,19 @@ class DicomScpSource(SourceConnector):
         self._require_called_ae_title = bool(s.get("require_called_ae_title", True))
         sa = s.get("source_ip_allowlist")
         self._source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
+        # BACKLOG #1910: never accept an object the engine's ingress would refuse. The shipped 128 MiB
+        # default, and an uncapped SCP, both resolve to the ingress ceiling.
         mob = s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES)
-        self._max_object_bytes: int | None = int(mob) if mob else None
+        configured = int(mob) if mob else None
+        self._max_object_bytes: int = min(
+            configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
+        )
+        # The deflate guard keeps the CONFIGURED value. The ingress ceiling above measures the
+        # re-encoded bytes, which stay deflated, so it says nothing about how far they inflate;
+        # this bound is a memory bound on the pre-decode inflate and #1910 does not move it.
+        self._max_inflated_bytes: int = (
+            configured if configured is not None else DEFAULT_MAX_INFLATED_BYTES
+        )
         self._max_associations = int(s.get("max_associations", 10))
         self._max_pdu_size = int(s.get("max_pdu_size", 16384))
         self._timeout = float(s.get("timeout_seconds", 30.0))
@@ -228,7 +274,7 @@ class DicomScpSource(SourceConnector):
         #: Set by stop() so a paced connection's wait is cut short instead of holding up shutdown.
         self._stopping = threading.Event()
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
-        self._ssl = _server_ssl_context(s)
+        self._ssl = _server_ssl_context(s, name=config.name or "")
         # Fail-closed peer controls (SEC-012, deny-by-default; tightened by BACKLOG #316):
         # a non-loopback SCP with no VERIFIABLE peer control is refused at construction. DIMSE has no
         # transport auth of its own, so a remotely-reachable SCP must gate peers by the per-connection
@@ -441,9 +487,9 @@ class DicomScpSource(SourceConnector):
             # above cannot see what the preamble, DICM and file meta add. Still BEFORE the durable commit
             # (the X12 max_interchange_bytes analog): refuse an over-cap object rather than persist it
             # (count-and-log-safe; the SCU sees the failure).
-            if self._max_object_bytes is not None and len(object_bytes) > self._max_object_bytes:
+            if len(object_bytes) > self._max_object_bytes:
                 logger.warning(
-                    "DICOM C-STORE from %s (AE %r, SOP %s): object %d bytes over max_object_bytes %d",
+                    "DICOM C-STORE from %s (AE %r, SOP %s): object %d bytes over the SCP object cap %d",
                     peer_ip,
                     calling_ae,
                     sop_instance,
@@ -465,8 +511,6 @@ class DicomScpSource(SourceConnector):
         and file meta in front, so a raw length over the cap means an over-cap Part-10 object. Reads the
         length through ``getbuffer()``, which does not copy (unlike ``getvalue()``). PHI-safe: logs the cap
         + routing identifiers, never bytes."""
-        if self._max_object_bytes is None:
-            return None
         data_set = getattr(getattr(event, "request", None), "DataSet", None)
         if data_set is None:
             return None  # nothing received; the normal decode path handles an empty request
@@ -475,7 +519,7 @@ class DicomScpSource(SourceConnector):
         if raw_bytes <= self._max_object_bytes:
             return None
         logger.warning(
-            "DICOM C-STORE from %s (AE %r): raw data set %d bytes over max_object_bytes %d — "
+            "DICOM C-STORE from %s (AE %r): raw data set %d bytes over the SCP object cap %d — "
             "refusing before decode",
             peer_ip,
             calling_ae,
@@ -488,8 +532,10 @@ class DicomScpSource(SourceConnector):
         """ASVS 5.2.3 SCP guard. When the accepted context's transfer syntax is Deflated Explicit VR LE,
         bound-inflate the RAW ``event.request.DataSet`` bytes (BEFORE ``event.dataset`` decodes them) and
         return a DIMSE **failure** status if the object inflates past the cap — else ``None`` (proceed).
-        The bound is ``max_object_bytes`` (the object-size policy already enforced post-inflation), or the
-        16 MiB codec default when uncapped. PHI-safe: logs the cap + routing identifiers, never bytes."""
+        The bound is the configured ``max_object_bytes``, or the 16 MiB codec default when uncapped. It
+        is NOT clamped to the engine ingress ceiling (BACKLOG #1910): that ceiling measures the
+        re-encoded bytes, which stay deflated. PHI-safe: logs the cap + routing identifiers, never
+        bytes."""
         transfer_syntax = str(getattr(getattr(event, "context", None), "transfer_syntax", "") or "")
         if transfer_syntax != DEFLATED_EXPLICIT_VR_LE:
             return None
@@ -497,11 +543,7 @@ class DicomScpSource(SourceConnector):
         data_set = getattr(request, "DataSet", None)
         if data_set is None:
             return None  # nothing to inflate; the normal decode path handles an empty request
-        cap = (
-            self._max_object_bytes
-            if self._max_object_bytes is not None
-            else DEFAULT_MAX_INFLATED_BYTES
-        )
+        cap = self._max_inflated_bytes
         try:
             bounded_inflate_or_error(data_set.getvalue(), max_bytes=cap)
         except DicomBombError:
@@ -519,16 +561,22 @@ class DicomScpSource(SourceConnector):
         self, object_bytes: bytes, *, peer_ip: str, sop_instance: str, sop_class: str
     ) -> int:
         """Bridge the received bytes onto the loop-owned ingress and block THIS thread until durably
-        committed (commit-before-SUCCESS). Returns the DIMSE status."""
+        committed (commit-before-SUCCESS). Returns the DIMSE status.
+
+        The handler returns the committed message id, or ``None`` when it refused the object: it then
+        recorded ``ERROR`` and committed no ingress row. That refusal is a DIMSE failure, never Success
+        (BACKLOG #1910). It is Cannot Understand, the status the decode-failure path already answers for
+        an object the engine will not take, rather than the Out of Resources a commit timeout answers:
+        the refusal is deterministic, so the same object would be refused again on a re-send."""
         loop, handler = self._loop, self._handler
         if loop is None or handler is None:  # not started / already stopped
             return _STATUS_OUT_OF_RESOURCES
-        # _handle_inbound is an async def (a Coroutine), but InboundHandler is typed as the broader
+        # The runner's receipt handler is an async def (a Coroutine), but InboundHandler is typed as the
         # Awaitable; run_coroutine_threadsafe needs a Coroutine, so narrow it.
         coro = cast("Coroutine[Any, Any, str | None]", handler(object_bytes))
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         try:
-            future.result(self._timeout)  # block the worker thread (never the loop) on the commit
+            receipt = future.result(self._timeout)  # block the worker thread (never the loop)
         except FutureTimeoutError:
             # The scheduled commit may still land on the loop afterward, so DO NOT report Success — a
             # dropped/uncommitted object must be re-sent. Returning failure after a commit that DID land
@@ -547,6 +595,14 @@ class DicomScpSource(SourceConnector):
                 peer_ip,
                 sop_instance,
                 safe_exc(exc),
+            )
+            return _STATUS_CANNOT_UNDERSTAND
+        if receipt is None:
+            logger.warning(
+                "DICOM C-STORE refused by engine ingress from %s (SOP %s): recorded ERROR, "
+                "returning failure",
+                peer_ip,
+                sop_instance,
             )
             return _STATUS_CANNOT_UNDERSTAND
         logger.info(
@@ -588,6 +644,7 @@ def _client_ssl_context(
     CA per the resolved anchor. ``None`` (a direct test build) keeps the historical
     ``create_default_context(cafile=…)`` behaviour, byte-identical. It only selects WHICH roots verify the
     peer — verification is never disabled — so the internal CA never weakens a refusal."""
+    refuse_an_unread_ca_pin(s, inbound=False, connector="DICOM destination")
     if not s.get("tls"):
         return None
     ca = s.get("tls_ca_file")

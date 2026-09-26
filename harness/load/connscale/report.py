@@ -51,6 +51,13 @@ EXIT_SLO_VIOLATION = 1
 
 SCHEMA_VERSION = 1
 
+#: Which rate window the readings payload's rates were computed over (BACKLOG #1420). The window is
+#: defined once, in `harness.load.connscale.runner._empty_claim_rates`. This value names the one that
+#: EXCLUDES the post-drain final. A payload without the field was computed over the old window, which
+#: ran to that final, and its readings are not comparable with these. A harvest filters on this exact
+#: name and value, so do not rename either.
+RATE_WINDOW = "in_hold_excl_drain"
+
 # The shared rule (harness/_spreadsheet.py) — this module used to carry its own copy, and was the one
 # writer with no formula-injection test at all, which is how the copies drifted unnoticed.
 _CSV_FORMULA_TRIGGERS = SPREADSHEET_FORMULA_TRIGGERS
@@ -111,15 +118,14 @@ class ConnScaleRecord:
     pool_size_max: int | None
 
     # --- wall #3: idle-poll storm + thundering herd (SEPARATED, not summed) ---
-    empty_claims_per_s: float  # total empty claims/sec over the hold
+    empty_claims_per_s: float  # total empty claims/sec over the rate window
     idle_poll_per_s: float  # the steady poll-interval re-SELECT floor
     wake_fanout_per_s: (
         float  # the per-commit thundering-herd cost (the herd slope vs N is read here)
     )
-    # Empty claims PER MESSAGE absorbed, over the same first→last sample window as the rates above.
-    # That window is the hold PLUS the step's post-drain tail, and it is defined once, in
-    # `harness.load.connscale.runner._empty_claim_rates` (BACKLOG #1420). This line used to call it
-    # "in-hold", which the final sample is not.
+    # Empty claims PER MESSAGE absorbed, over the same rate window as the rates above. That window
+    # EXCLUDES the step's post-drain final, and it is defined once, in
+    # `harness.load.connscale.runner._empty_claim_rates` (BACKLOG #1420).
     # BACKLOG #1101: the per-SECOND form has wall clock in its denominator, so anything that slows the
     # run — CPU contention on a shared CI runner, or the O(N) reload probe firing mid-hold — collapses
     # it without the engine changing. Per-message is the quantity wall #3 actually means (the herd size
@@ -148,13 +154,13 @@ class ConnScaleRecord:
     # --- claim-mode A/B (ADR 0066) + achieved throughput + process footprint ---
     # All default so an older artifact / a single-arm record deserializes unchanged. ``claim_mode``
     # tags which pipeline claim mode this step ran (per_lane|pooled). Achieved throughput is the
-    # engine read/written delta over the hold window (msg/s actually absorbed/delivered, vs the
+    # engine read/written delta over the rate window (msg/s actually absorbed/delivered, vs the
     # OFFERED aggregate rate). CPU is expressed as total CPU-seconds consumed over the window plus the
     # peak/mean core-utilisation derived from it (a cumulative CPU-seconds counter isn't meaningfully
     # "averaged", so peak/mean are reported as cores busy).
     claim_mode: str = "per_lane"
-    achieved_read_per_s: float = 0.0  # engine intake msg/s over the hold (Δread / Δt)
-    achieved_written_per_s: float = 0.0  # engine delivery msg/s over the hold (Δwritten / Δt)
+    achieved_read_per_s: float = 0.0  # engine intake msg/s over the rate window (Δread / Δt)
+    achieved_written_per_s: float = 0.0  # engine delivery msg/s over the rate window (Δwritten/Δt)
     cpu_seconds_total: float | None = None  # CPU-seconds consumed over the measured window
     cpu_util_cores_peak: float | None = None  # peak per-interval CPU utilisation (cores busy)
     cpu_util_cores_mean: float | None = None  # mean CPU utilisation over the window (cores busy)
@@ -207,6 +213,25 @@ class ConnScaleRecord:
     intake_audit_live: IntakeAudit = field(
         default_factory=lambda: not_run("audit not wired", moment=MOMENT_LIVE)
     )
+    # --- wall #5's cost to the step's own traffic (BACKLOG #1292) ---
+    # The reload probe closes every inbound connection. `reload_stranded` is how many sends that
+    # close left unconfirmed AND that were written inside the reload window; the reconcile excuses
+    # them and says so. A stranded send written before the window is not in it: the budget judges
+    # it, and the reconcile detail names that count. `reload_not_reconnected` is how
+    # many connections were still down when the step stopped waiting for them. And
+    # `post_reload_extra_hold_s` is the offered time the step added so traffic followed the reload;
+    # it is 0.0 whenever the reload was quick. All three are None when no reload probe ran, and
+    # default to None so an older artifact deserializes as "not measured" rather than as a clean 0.
+    reload_stranded: int | None = None
+    reload_not_reconnected: int | None = None
+    post_reload_extra_hold_s: float | None = None
+    # Seconds from every connection being back after the reload to the first reply the sender read,
+    # and how many sockets the engine closed from then to the end of the step's wait for that reply.
+    # A slow engine shows a large `post_reload_reply_s`; a silent one shows None beside a post-reload
+    # send; a close that took the replies shows `post_reload_drops` above 0. Both are None when no
+    # reload probe ran, and `post_reload_reply_s` is also None when no reply came inside the wait.
+    post_reload_reply_s: float | None = None
+    post_reload_drops: int | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -234,8 +259,11 @@ class ConnScaleRecord:
                 "timeouts": self.timeouts,
                 "in_pipeline_peak": self.in_pipeline_peak,
                 "drain_seconds": self.drain_seconds,
-                # The SCOPE of every peak and rate above it: those are derived from the in-hold
-                # readings, and one reading is a peak over a single instant (BACKLOG #1430).
+                # The SCOPE of the engine-derived numbers: `achieved` and the `wall3_*` rates read
+                # the rate window, which holds these readings and excludes the post-drain final
+                # (BACKLOG #1420). `in_pipeline_peak` and the wall #1/#2 peaks read these readings
+                # PLUS that final (BACKLOG #1430). The cpu and working_set fields come from the OS
+                # probe's own readings and are scoped by `fd_probe_ticks` instead.
                 "in_hold_samples": self.in_hold_samples,
                 "in_hold_floor_ticks": self.in_hold_floor_ticks,
             },
@@ -290,7 +318,14 @@ class ConnScaleRecord:
                 "post_mortem": self.intake_audit.to_json_dict(),
                 "live": self.intake_audit_live.to_json_dict(),
             },
-            "wall5_reload": {"seconds": self.reload_seconds},
+            "wall5_reload": {
+                "seconds": self.reload_seconds,
+                "stranded": self.reload_stranded,
+                "not_reconnected": self.reload_not_reconnected,
+                "extra_hold_s": _round_or_none(self.post_reload_extra_hold_s, 3),
+                "reply_s": _round_or_none(self.post_reload_reply_s, 3),
+                "drops_after": self.post_reload_drops,
+            },
             "wall6_ack_ms": {
                 "p50": round(self.ack_p50_ms, 3),
                 "p95": round(self.ack_p95_ms, 3),
@@ -623,6 +658,26 @@ DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
         "the other half of that pair; None means the reload probe did not measure this step",
     ),
     DiagnosticField(
+        "reload_stranded",
+        lambda r: r.reload_stranded,
+        "sends left unconfirmed when the reload probe closed every connection -- a slow reload "
+        "strands most of a short step, which reads as intake loss unless it is counted here",
+    ),
+    DiagnosticField(
+        "post_reload_reply_s",
+        lambda r: r.post_reload_reply_s,
+        "slow engine vs silent engine after the reload: seconds from every connection being back "
+        "to the first reply; a dash means no reply inside the wait (one can still come in the stop "
+        "grace) or no reload probe",
+    ),
+    DiagnosticField(
+        "post_reload_drops",
+        lambda r: r.post_reload_drops,
+        "a second close vs no answer: sockets the engine closed from every connection being back "
+        "to the end of that wait; above 0 on a no-reply step means a close may have taken the "
+        "replies, 0 means none was closed",
+    ),
+    DiagnosticField(
         "fd_probe_ticks",
         lambda r: r.fd_probe_ticks,
         "how many intervals the FD walk actually sampled -- a low count is a coarse gauge, not a fault",
@@ -754,9 +809,10 @@ class ConnScaleReport:
         head.append(
             f"Recorded on every run, pass or fail (BACKLOG #1211). The band below is prior * "
             f"{1.0 - tolerance:.2f}. For this metric it is RECORDED AND NO LONGER ENFORCED -- an "
-            f"OUTSIDE BAND row here fails nothing. The width is left untouched so these rows stay "
-            f"directly comparable with the readings already harvested. What IS asserted, and the "
-            f"predicted floor that is not, are below."
+            f"OUTSIDE BAND row here fails nothing. The width is left untouched, but the VALUES "
+            f"changed window at BACKLOG #1420: readings harvested before that change are not "
+            f"comparable with these (the JSON copy carries `rate_window`). What IS asserted, and "
+            f"the predicted floor that is not, are below."
         )
         head.append("")
         if not rows:
@@ -875,9 +931,11 @@ class ConnScaleReport:
                 }
             )
         payload: dict[str, object] = {
-            # 2 adds the `herd_floor` block below. The RATIO rows above are byte-unchanged, so the
-            # version-1 payloads already harvested for BACKLOG #1211 stay directly comparable with
-            # everything written after this -- which is the point of not touching the recorded band.
+            # 2 adds the `herd_floor` block below. The RATIO rows above keep their SHAPE, so the
+            # version-1 payloads already harvested for BACKLOG #1211 still parse alongside everything
+            # written after this -- which is the point of not touching the recorded band. Their
+            # VALUES are a different matter: `rate_window` below marks the BACKLOG #1420 window
+            # change, and a payload without it is not comparable with one that carries it.
             # NOT the module-level `SCHEMA_VERSION`, which governs `to_json_dict`: two payloads, two
             # versions, and conflating them would silently rev the other artifact.
             "schema_version": 2,
@@ -887,6 +945,10 @@ class ConnScaleReport:
             "tolerance": tolerance,
             "band_floor_fraction": 1.0 - tolerance,
             "context": dict(context or {}),
+            # ADDITIVE, so `schema_version` stays 2: every row below keeps its shape. What changed is
+            # the window each value was computed over, and this field is how a harvest tells the
+            # two populations apart (BACKLOG #1420; see `RATE_WINDOW`).
+            "rate_window": RATE_WINDOW,
             "readings": readings,
         }
         if base_count is not None:

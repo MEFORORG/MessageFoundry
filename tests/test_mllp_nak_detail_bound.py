@@ -23,12 +23,16 @@ in isolation. Every fixture is synthetic HL7.
 from __future__ import annotations
 
 import asyncio
+import itertools
+import statistics
 import time
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.parsing.peek import Peek
 from messagefoundry.redaction import safe_exc
+from messagefoundry.transports import mllp
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.mllp import (
     _MAX_NAK_DETAIL_CHARS,
@@ -53,6 +57,34 @@ _HOSTILE_DETAIL_CHARS = 4 * 1024 * 1024
 #: budgets in ``tests/test_redaction.py`` and ``tests/test_logging.py`` because all three were derived
 #: the same way; nothing couples them, and re-deriving one does not move the others.
 _RENDER_BUDGET_SECONDS = 0.05
+
+#: The longest stretch the loop may go without a heartbeat tick while the rejection is handled, in
+#: units of what parsing the reply costs on the same runner. Written as a ratio because load slows
+#: both sides together, so a loaded runner does not fail it and a fast one does not either.
+#: The unit is the parse the delivery cannot avoid, so a slower ``Peek.parse`` moves both sides
+#: and this bound does not see it. It guards work added on top of the parse.
+#:
+#: Measured with this file's own helpers on ``d4fef06a4`` (BACKLOG #1908), py3.14 on 4-vCPU hosted
+#: runners, idle, as four concurrent copies, and beside four and eight CPU burners. A planted block
+#: is an unbounded redact of MSA-3 inside ``_check_ack``.
+#:
+#: - ubuntu-latest, runs 36093246607 and 36095932916: 1,350 healthy readings from 0.51 to 3.11;
+#:   390 planted from 9.6 to 76, every one failing the bound.
+#: - windows-2025, run 36095932916: 500 healthy from 0.78 to 2.16; 90 planted from 19.6 up.
+#: - windows-2022, run 36095932916: 500 healthy, 5 single readings over the bound beside four
+#:   burners and 19 beside eight; 90 planted from 16.5 up.
+#:
+#: Thread CPU time was tried instead of wall time and dropped. On Windows it counts in 15.6 ms steps,
+#: so a stall of about 20 ms read as anything up to 78 ms.
+_STALL_PER_PARSE = 5
+
+#: How many deliveries the heartbeat arm may take to read one stall under the bound. A block is in
+#: the code, so it shows on every attempt. A runner that deschedules the whole process shows on
+#: some: on hosted windows-2022 beside CPU burners, single readings reached 4-5 s.
+#:
+#: Measured, run 36095932916: beside four burners the arm failed 0 of 100 runs. Beside eight, twice
+#: oversubscribed, it failed 12 of 100, because a starved process stays starved across attempts.
+_STALL_ATTEMPTS = 3
 
 
 def _msg(control_id: str) -> str:
@@ -196,6 +228,61 @@ async def test_no_identifier_escapes_a_hostile_nak_detail() -> None:
         assert identifier not in rendered, f"{identifier!r} survived into {rendered!r}"
 
 
+def _parse_seconds(detail: str) -> float:
+    """What parsing this rejection costs the loop at all, read on this runner, now.
+
+    The median of three, so one preempted or one lucky sample does not set the scale. The delivery
+    path cannot avoid this parse, so it is the unit the stall bound is written in."""
+    ack = build_ack(_msg("M1"), code="AR", text=detail).encode()
+    samples = []
+    for _ in range(3):
+        start = time.perf_counter()
+        Peek.parse(ack)
+        samples.append(time.perf_counter() - start)
+    return statistics.median(samples)
+
+
+async def _longest_stall(detail: str) -> tuple[float, int, NegativeAckError]:
+    """Deliver a rejection carrying ``detail`` with a 1 ms heartbeat alongside.
+
+    Returns the longest stretch the loop went without a tick during the delivery, how many ticks
+    landed inside it, and the raise."""
+    stamps: list[float] = []
+    stop = asyncio.Event()
+
+    async def heartbeat() -> None:
+        while not stop.is_set():
+            stamps.append(time.perf_counter())
+            await asyncio.sleep(0.001)
+
+    beat = asyncio.create_task(heartbeat())
+    await asyncio.sleep(0)  # the heartbeat is ticking before the clock starts
+    start = time.perf_counter()
+    try:
+        exc = await _nak_from(detail)
+        end = time.perf_counter()
+    finally:
+        stop.set()
+        await beat
+    inside = [stamp for stamp in stamps if start <= stamp <= end]
+    stall = max(b - a for a, b in itertools.pairwise([start, *inside, end]))
+    return stall, len(inside), exc
+
+
+async def _stall_readings(detail: str) -> tuple[list[tuple[float, float, int]], NegativeAckError]:
+    """Deliver ``detail`` up to :data:`_STALL_ATTEMPTS` times, stopping at the first delivery whose
+    longest stall is under the bound. Returns ``(stall, parse, ticks)`` per attempt and the last
+    raise."""
+    readings: list[tuple[float, float, int]] = []
+    for _ in range(_STALL_ATTEMPTS):
+        parse = _parse_seconds(detail)
+        stall, ticks, exc = await _longest_stall(detail)
+        readings.append((stall, parse, ticks))
+        if ticks > 0 and stall < _STALL_PER_PARSE * parse:
+            break
+    return readings, exc
+
+
 async def test_a_hostile_nak_does_not_buy_the_event_loop() -> None:
     """AC-3, the row's responsiveness arm: delivering and rendering a 4 MiB rejection stays inside a
     budget the unbounded path could not.
@@ -203,32 +290,63 @@ async def test_a_hostile_nak_does_not_buy_the_event_loop() -> None:
     The heartbeat is the direct reading -- a task ticking every millisecond alongside the delivery --
     and the render timing is the indirect one. Both are here because they fail differently: a stall
     inside ``_check_ack`` shows up in the heartbeat, and one inside the redaction ``safe_exc`` runs
-    shows up in the elapsed time."""
-    ticks = 0
-    stop = asyncio.Event()
+    shows up in the elapsed time.
 
-    async def heartbeat() -> None:
-        nonlocal ticks
-        while not stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.001)
-
-    beat = asyncio.create_task(heartbeat())
-    try:
-        exc = await _nak_from(_hostile_detail())
-        start = time.perf_counter()
-        rendered = safe_exc(exc)
-        elapsed = time.perf_counter() - start
-    finally:
-        stop.set()
-        await beat
+    **The heartbeat asserted ``ticks > 5`` until BACKLOG #1908, and that floor measured nothing.**
+    The tick count follows how often the I/O path yields, not whether anything blocks. On hosted
+    ubuntu (run 36092660087) it sat at exactly 5 in 190 of 200 warm runs, so an idle runner failed
+    it. With an unbounded redact of MSA-3 planted inside ``_check_ack`` it rose to 6-10, and passed.
+    :data:`_STALL_PER_PARSE` holds the bound that replaced it."""
+    readings, exc = await _stall_readings(_hostile_detail())
+    start = time.perf_counter()
+    rendered = safe_exc(exc)
+    elapsed = time.perf_counter() - start
 
     assert elapsed < _RENDER_BUDGET_SECONDS, (
         f"rendering the rejection cost {elapsed:.4f}s of the event loop against a "
         f"{_RENDER_BUDGET_SECONDS}s budget"
     )
-    assert ticks > 5, f"the loop ticked only {ticks} times while a 4 MiB rejection was handled"
+    stall, parse, ticks = readings[-1]
+    # A dead heartbeat would report the whole delivery as one stall. That still bounds any block
+    # from above, so it cannot hide one, but it would blame the loop for the harness. Name it.
+    assert ticks > 0, "the heartbeat never ticked during the delivery, so no stall was measured"
+    shown = "; ".join(f"{s * 1000:.1f} ms stall, {p * 1000:.1f} ms parse" for s, p, _ in readings)
+    assert stall < _STALL_PER_PARSE * parse, (
+        f"in all {len(readings)} deliveries of a 4 MiB rejection, the loop went at least "
+        f"{_STALL_PER_PARSE} x the parse cost without a tick: {shown}"
+    )
     assert rendered.startswith("NegativeAckError: ")
+
+
+async def test_control_the_stall_reading_catches_a_loop_that_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE CONTROL for the heartbeat arm above: a planted block it must see.
+
+    A synchronous busy section goes inside ``_check_ack``'s field bound, sized at twice the bound.
+    If the heartbeat could tick through synchronous code, or the stall were read over the wrong
+    window, this reading would land under the bound, and the arm above would pass on nothing. The
+    block is sized from the same runner-local parse, so load moves both sides together."""
+    detail = _hostile_detail()
+    parse = _parse_seconds(detail)
+    block = 2 * _STALL_PER_PARSE * parse
+    bounded = mllp._bounded_ack_field
+
+    def blocking_bound(value: str | None) -> str:
+        until = time.perf_counter() + block
+        while time.perf_counter() < until:
+            pass
+        return bounded(value)
+
+    monkeypatch.setattr(mllp, "_bounded_ack_field", blocking_bound)
+    stall, ticks, _ = await _longest_stall(detail)
+    # Without a live heartbeat the stall is the whole delivery, which holds the block by
+    # construction, and this control would pass on a harness that measures nothing.
+    assert ticks > 0, "the heartbeat never ticked during the delivery, so no stall was measured"
+    assert stall >= _STALL_PER_PARSE * parse, (
+        f"a {block * 1000:.1f} ms synchronous block inside _check_ack read as a "
+        f"{stall * 1000:.1f} ms stall, so the reading missed it"
+    )
 
 
 async def test_control_an_ordinary_nak_reason_still_arrives_intact() -> None:

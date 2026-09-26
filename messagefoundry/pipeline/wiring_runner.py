@@ -124,6 +124,11 @@ from messagefoundry.parsing.sniff import (
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
+from messagefoundry.pipeline.ingress_guards import (
+    STRICT_VALIDATE_TIMEOUT_SECONDS,
+    streaming_over_threshold,
+    strict_validate_timeout,
+)
 from messagefoundry.pipeline.phase_timing import (
     # Explicit re-exports (`as`): the pre-#842 import surface — tests and the harness node-log parser
     # import these names from wiring_runner, not from phase_timing.
@@ -396,26 +401,11 @@ _BATCH_POLL_SECONDS = 0.02
 # pinning a worker thread forever; the orphaned query still completes on the loop and releases its conn.
 _LOOKUP_RESULT_TIMEOUT_SECONDS = 30.0
 
-# How long a single strict hl7apy validate may run before the message dead-letters (#89, DoS backstop).
-# Mirrors the _LOOKUP_RESULT_TIMEOUT_SECONDS rationale: a pathological body that makes hl7apy's
-# structure/cardinality parse spin can otherwise pin the listener's off-loop worker; the timeout frees
-# the listener and routes the message to ERROR/dead-letter. It CANNOT kill the to_thread worker (no
-# thread cancellation in CPython) — the orphaned validate leaks its thread until it returns, bounded by
-# the 16 MiB / segment caps enforce_size_limits fires BEFORE the slow parse (validate.py). Per-inbound
-# `validation.strict_timeout_s` overrides this; <= 0 there disables the backstop entirely. Owner-tunable.
-_STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
-
-
-def _strict_validate_timeout(ic: InboundConnection) -> float | None:
-    """The effective wall-clock (seconds) for this inbound's strict validate, or ``None`` if disabled.
-
-    Resolves the per-connection ``validation.strict_timeout_s`` against the engine default (#89):
-    ``None`` inherits ``_STRICT_VALIDATE_TIMEOUT_SECONDS``; ``<= 0`` disables the backstop (returns
-    ``None`` → the caller runs the validate un-timed, the pre-#89 behaviour). The value is trusted config,
-    not an HL7 field."""
-    configured = ic.validation.strict_timeout_s
-    effective = _STRICT_VALIDATE_TIMEOUT_SECONDS if configured is None else configured
-    return effective if effective > 0 else None
+# The strict-validate DoS backstop (#89) and its per-inbound resolution live in ingress_guards, so the
+# operator resend (BACKLOG #1911) times its strict validate by the same rule. Re-exported under the
+# names this module and the docs have always used.
+_STRICT_VALIDATE_TIMEOUT_SECONDS = STRICT_VALIDATE_TIMEOUT_SECONDS
+_strict_validate_timeout = strict_validate_timeout
 
 
 # Engine-level ingress size ceiling for NON-HL7 content types (SEC-017, CWE-770). The HL7 path already
@@ -2149,16 +2139,21 @@ class RegistryRunner:
         ic = self.registry.inbound.get(name)
         oc = self.registry.outbound.get(name)
         try:
-            if ic is not None:
-                source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
-                check_source_allowed(source_cfg, name, self._egress)
-                return "in", build_source(source_cfg)
-            if oc is not None:
-                dest_cfg = _dest_config(
-                    oc, self._env_values, self._trust_anchor_policy, self._egress
-                )
-                check_egress_allowed(dest_cfg, self._egress)
-                return "out", build_destination(dest_cfg)
+            # Stamped as the live builds are (_start_inbound_unsafe, _start_outbound), so each
+            # posture-keyed cell decides as it does for the running connector. Unstamped, the
+            # inbound CA check enforced under [security].enforcement = warn, and the test reported
+            # a listener that was serving as failed (BACKLOG #1142).
+            with active_hop_posture(self._hop_posture):
+                if ic is not None:
+                    source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+                    check_source_allowed(source_cfg, name, self._egress)
+                    return "in", build_source(source_cfg)
+                if oc is not None:
+                    dest_cfg = _dest_config(
+                        oc, self._env_values, self._trust_anchor_policy, self._egress
+                    )
+                    check_egress_allowed(dest_cfg, self._egress)
+                    return "out", build_destination(dest_cfg)
         except WiringError:
             raise
         except Exception as exc:
@@ -2684,11 +2679,13 @@ class RegistryRunner:
         await source.validate_startup()
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
-        # The HTTP listen source (ADR 0023) gets a receipt handler returning the committed message_id for
-        # its 202; every other source gets the standard handler whose str return is a wire reply/ACK.
-        make_handler = (
-            self._make_http_handler if ic.spec.type is ConnectorType.HTTP else self._make_handler
-        )
+        # A source that answers the sender with its own protocol status declares wants_receipt, and gets
+        # the receipt handler: the committed message_id, or None when the body was refused and recorded
+        # ERROR. The HTTP listener (ADR 0023) maps that to its 202; the DICOM C-STORE SCP maps None to a
+        # DIMSE failure (BACKLOG #1910). Every other source gets the standard handler, whose str return is
+        # a wire reply/ACK and whose None means both "committed" and "refused". The transport declares the
+        # contract rather than the runner keying on a connector type (CLAUDE.md sec. 4).
+        make_handler = self._make_http_handler if source.wants_receipt else self._make_handler
         try:
             await source.start(make_handler(ic), leader_gate=self._coordinator.is_leader)
         except OSError as exc:
@@ -4868,6 +4865,8 @@ class RegistryRunner:
         # the body was NOT committed: a recorded ERROR from a decode/size guard). The receipt semantics
         # (which the source maps to 202/4xx) are HTTP's own response logic, exactly as the HL7 ACK is
         # MLLP's — the ingress commit + count-and-log + disposition machine are the SAME as _handle_inbound.
+        # Every source declaring wants_receipt binds this handler, the DICOM SCP included (BACKLOG #1910),
+        # so None here must keep meaning "not committed": the SCP answers a DIMSE failure on it.
         async def on_request(raw: bytes) -> str | None:
             return await self._handle_inbound_http(ic, raw)
 
@@ -4923,7 +4922,11 @@ class RegistryRunner:
 
         Shares the SAME store calls, size ceiling, decode handling, and disposition machine as
         :meth:`_handle_inbound`; it differs only in returning the id instead of a wire ACK and in not
-        building an HL7 ACK frame (HTTP is the carrier, the 202 is the receipt)."""
+        building an HL7 ACK frame (HTTP is the carrier, the 202 is the receipt).
+
+        It is the receipt handler for EVERY source that declares ``wants_receipt``, not only HTTP. The
+        DICOM C-STORE SCP answers a DIMSE failure on ``None`` (BACKLOG #1910), so no path here may return
+        ``None`` after ``enqueue_ingress`` has committed, or an accepted object reads as refused."""
         src = ic.spec.type.value
         hl7v2 = ic.content_type is ContentType.HL7V2
 
@@ -4941,7 +4944,7 @@ class RegistryRunner:
                 )
                 return None
             if await self._declared_content_mismatch(ic, raw):
-                return None  # ERROR recorded; HTTP owns its own 202/4xx receipt (no HL7 ACK)
+                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
@@ -4999,7 +5002,7 @@ class RegistryRunner:
                 )
                 return None
             if await self._declared_content_mismatch(ic, raw, text=text):
-                return None  # ERROR recorded; HTTP owns its own 202/4xx receipt (no HL7 ACK)
+                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=text,
@@ -5093,9 +5096,9 @@ class RegistryRunner:
     def _streaming_over_threshold(self, ic: InboundConnection, text: str) -> bool:
         """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at/above
         that threshold — the gate for the over-threshold detach path (#149, ADR 0105 Phase 1a). Below
-        threshold or unset ⇒ False ⇒ the byte-identical no-detach fast path (and no strict downgrade)."""
-        threshold = ic.stream_threshold_bytes
-        return threshold is not None and len(text) >= threshold
+        threshold or unset ⇒ False ⇒ the byte-identical no-detach fast path (and no strict downgrade).
+        The rule lives in ``ingress_guards`` so the operator resend reads it the same way (#1911)."""
+        return streaming_over_threshold(ic, text)
 
     async def _detach_documents(self, ic: InboundConnection, text: str) -> tuple[str, list[str]]:
         """Detach every oversized OBX-5 ED base64 document from an over-threshold HL7 body into the

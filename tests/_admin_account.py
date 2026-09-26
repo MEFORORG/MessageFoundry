@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Give a test an enabled Administrator without leaning on the first-run bootstrap account.
+"""Give a test an enabled Administrator, since the engine creates none on its own.
 
-ADR 0183 Amendment A retires the bootstrap account that ``AuthService.initialize()`` mints on an
-empty store (BACKLOG #1136). Wave 1a moves the tests that merely NEEDED an administrator off it,
-before Wave 2 deletes it, so this helper must behave the same with and without the bootstrap.
+ADR 0183 Amendment A retired the first-run bootstrap account that ``AuthService.initialize()`` used
+to mint on an empty store (BACKLOG #1136). Waves 1a and 1b moved the tests that merely NEEDED an
+administrator onto this helper before Wave 2 deleted the account.
 
 **Why the store and not a service method.** The moved tests were written against the bootstrap's
 credential state: admin-issued, must change, never claimed. ``provision_first_administrator``
-builds the opposite state, claimed at birth. ``create_local_user`` ends by running the WP-3 sweep,
-which would disable the bootstrap in one mode only.
+builds the opposite state, claimed at birth, and ``create_local_user`` audits a ``user.created`` row
+the moved tests do not expect. Writing through the store keeps both the user table and the audit
+log as the tests were written against.
 
-**Why the user row goes in BEFORE ``initialize()``.** ``initialize()`` mints the bootstrap only on
-an empty users table, so writing the row first means it is never minted. The user table and the
-audit log then come out the same in both modes, with nothing to delete afterwards. The role is
-assigned after ``initialize()``, because that is where the role rows are seeded.
+:func:`create_admin` runs ``initialize()`` itself, because that is where the role rows it assigns
+are seeded. Calling ``initialize()`` again before or after it is harmless: it only re-seeds roles.
 
-So call :func:`create_admin` INSTEAD of ``initialize()``, not after it. It refuses a store that
-already holds the bootstrap, which is what a call after ``initialize()`` would find.
+Wave 2 dropped the guard that refused a store already holding a row named ``admin``. It existed so
+a test could not reach the bootstrap by accident while the bootstrap still existed; nothing creates
+that row now, and a test that makes an account named ``admin`` on purpose is making an ordinary one.
 """
 
 from __future__ import annotations
@@ -33,15 +33,12 @@ from messagefoundry.auth.service import AuthService
 
 __all__ = ["ADMIN_PASSWORD", "ADMIN_USERNAME", "AdminAccount", "create_admin", "login_admin"]
 
-# Not "admin": that name is the bootstrap's, and a test must never be able to reach it by accident.
+# Not "admin": a distinct name cannot collide with a test that makes an account named "admin" on
+# purpose, and keeps a failure message unambiguous about which account it means.
 ADMIN_USERNAME = "test-admin"
 # Synthetic, and clears the default policy, whose context screen refuses the word "admin". Kept
 # low-entropy on purpose: a random-looking literal trips the leak gate's generic-api-key rule.
 ADMIN_PASSWORD = "a-strong-operator-passphrase"
-
-# A literal, not the product's BOOTSTRAP_USERNAME: Wave 2 deletes that constant, and this module
-# must still import afterwards. Once no bootstrap exists the guard below simply never fires.
-_BOOTSTRAP_USERNAME = "admin"
 
 
 @dataclass(frozen=True)
@@ -56,16 +53,11 @@ class AdminAccount:
 async def create_admin(service: AuthService) -> AdminAccount:
     """Write an enabled local Administrator named ``test-admin``, then run ``initialize()``.
 
-    The credential state matches the bootstrap row's: ``must_change_password`` set and
-    ``password_claimed_at`` empty. The account is not the bootstrap, though. Branches keyed on the
-    bootstrap's NAME do not fire for it, so the WP-3 login gate skips it, and the pending-credential
-    deadline that the API reports is a real instant rather than None.
+    The credential state is an admin-issued one: ``must_change_password`` set and
+    ``password_claimed_at`` empty, so the pending-credential deadline the API reports is a real
+    instant.
     """
     store = service.store
-    if await store.get_user_by_username(_BOOTSTRAP_USERNAME) is not None:
-        raise RuntimeError(
-            "the bootstrap account already exists: call create_admin() instead of initialize()"
-        )
     user_id = uuid4().hex
     await store.create_user(
         user_id=user_id,
@@ -74,7 +66,7 @@ async def create_admin(service: AuthService) -> AdminAccount:
         password_hash=await asyncio.to_thread(hash_password, ADMIN_PASSWORD),
         must_change_password=True,
     )
-    await service.initialize()  # seeds the roles; mints no bootstrap, since the table is not empty
+    await service.initialize()  # seeds the roles the assignment below refers to
     await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")
     return AdminAccount(user_id=user_id, username=ADMIN_USERNAME, password=ADMIN_PASSWORD)
 
@@ -83,7 +75,7 @@ async def login_admin(service: AuthService) -> tuple[Identity, str, str]:
     """Create the Administrator, sign it in, and return ``(identity, token, password)``.
 
     This is what the per-file ``_bootstrap_login`` helpers did, in the same tuple shape, so a caller
-    moves by changing one name. Like :func:`create_admin`, call it instead of ``initialize()``.
+    moved by changing one name.
     """
     admin = await create_admin(service)
     out = await service.login(admin.username, admin.password)

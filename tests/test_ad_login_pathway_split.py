@@ -238,6 +238,8 @@ async def test_step_up_re_bind_treats_a_directory_outage_as_a_refusal() -> None:
             ldap=_Down(),  # type: ignore[arg-type]
         )
         await service.initialize()
-        assert await service._reauth_ad("sso-user", "synthetic-good") is False
+        # None, not False (BACKLOG #1138): a refusal either way, but an outage is not a guess, so the
+        # caller must not count it toward the engine lockout.
+        assert await service._reauth_ad("sso-user", "synthetic-good") is None
     finally:
         await store.close()

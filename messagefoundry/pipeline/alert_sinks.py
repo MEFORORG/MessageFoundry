@@ -284,7 +284,8 @@ def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
     build_asserted_https_handler` returns that same default handler with its context asserted forward-
     secret (ASVS 12.1.2). It substitutes nothing: see that function for why replacing the context
     would have changed the handshake. Handler-for-handler identical to the previous
-    ``build_opener(_NoRedirectHandler)``.
+    ``build_opener(_NoRedirectHandler)``. The suite list is the one deliberate change: it takes the
+    approved AEAD default every engine-built hop takes (BACKLOG #300).
 
     A named function, not an inline module-level expression, so a test can call the exact construction
     the shared opener is built from instead of reloading this module.
@@ -908,18 +909,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
-        # ASVS 6.4.5 arm 2: the UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline.
-        # The fixed label ("bootstrap-admin") stands in for "connection" so the realert throttle + subject
-        # keying + rule matching work uniformly; the payload carries only the ISO deadline + whole hours
-        # remaining (never the password or any secret — no PHI). The AuthService latch already collapses
-        # it to one emit per process; the (type, connection) throttle is a second belt.
+    def initial_credential_expiring(
+        self, name: str, *, expires_at: str, hours_remaining: int
+    ) -> None:
+        # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is unclaimed and near its
+        # deadline. `user:<username>` stands in for "connection", so the throttle and the alert
+        # instance key per account. Rules still match it: AlertRule.connection defaults to "*". So
+        # when a catch-all rule is the first match, its mute or transports=[] silences this reminder,
+        # and its control_action is dispatched at `user:<username>`, or, with control_target set, at
+        # that real connection, which it restarts. Scope such rules to real connection names or to
+        # one event_type. `reason` carries the deadline into the durable alert row. The payload is
+        # the ISO deadline and whole hours remaining only: never the password, no PHI.
         self._emit(
             {
-                "type": "bootstrap_admin_expiring",
+                "type": "initial_credential_expiring",
                 "connection": name,
                 "expires_at": expires_at,
                 "hours_remaining": hours_remaining,
+                "reason": f"unclaimed; stops working at {expires_at}",
             }
         )
 

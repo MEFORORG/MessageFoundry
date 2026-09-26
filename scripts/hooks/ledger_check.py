@@ -117,6 +117,54 @@ def _blob_id(spec: str) -> str | None:
     return (probe.stdout or "").strip() or None
 
 
+def index_row(readme: str, number: str) -> str:
+    """The docs/adr/README.md row for one ADR number, or "" when the index has none."""
+    return next((ln for ln in readme.splitlines() if ln.startswith(f"| [{number}]")), "")
+
+
+def row_names_file(row: str, basename: str) -> bool:
+    """True when an index row names this ADR file, as its own link or as a DECLARED COMPANION.
+
+    THE ONE DEFINITION OF COMPANION LEGALITY (BACKLOG #1516). check_adrs uses it at commit time to
+    tell a declared companion from an undeclared reuse of a number. adr_index_coverage uses it to ask
+    whether every existing file is represented. Two copies of this test would drift apart silently,
+    so there is one.
+    """
+    return basename.removesuffix(".md") in row
+
+
+class AdrCoverage(NamedTuple):
+    """What adr_index_coverage found. Every list holds basenames, sorted."""
+
+    #: Every `NNNN-*.md` file in the directory, one entry per FILE, never one per number.
+    files: list[str]
+    #: Files named inside their number's row that are not the row's own link (ADR 0013's second file).
+    companions: list[str]
+    #: Files their number's row does not name at all, or whose number has no row.
+    unrepresented: list[str]
+
+
+def adr_index_coverage(adr_dir: Path) -> AdrCoverage:
+    """Check that every ADR file in adr_dir is reachable from adr_dir/README.md (BACKLOG #1516).
+
+    check_adrs looks only at files a commit ADDS, which is the right scope for a commit-time gate.
+    This covers the whole corpus, and tests/test_adr_index_coverage.py asserts it. It enumerates
+    FILES, not numbers: keying on the number is how two audits of every ADR each dropped ADR 0013's
+    companion without an error. ADR_FILE decides what an ADR file is, here as in the gate.
+    """
+    readme = (adr_dir / "README.md").read_text(encoding="utf-8")
+    files = sorted(p.name for p in adr_dir.iterdir() if ADR_FILE.match(f"docs/adr/{p.name}"))
+    companions: list[str] = []
+    unrepresented: list[str] = []
+    for name in files:
+        row = index_row(readme, name[:4])
+        if not row_names_file(row, name):
+            unrepresented.append(name)
+        elif not row.startswith(f"| [{name[:4]}]({name})"):
+            companions.append(name)
+    return AdrCoverage(files, companions, unrepresented)
+
+
 class _RestoreEvidence(NamedTuple):
     """What one bounded history walk established about an ADR number (BACKLOG #1468).
 
@@ -521,7 +569,8 @@ class Ledger:
         WHAT IS GENUINELY UNCOVERED HERE, stated rather than implied: nothing checks the ROW -> FILE
         direction, so an index row in docs/adr/README.md can outlive the file it names and the number
         reads as live to every citation checker while naming nothing. That is an index-only question --
-        no parents, no base, no shallow reasoning -- and it belongs to its own row.
+        no parents, no base, no shallow reasoning -- and it belongs to its own row. The FILE -> ROW
+        direction over the existing corpus is covered, by adr_index_coverage (BACKLOG #1516).
         """
         base_adrs = self.base_adr_numbers()
         try:
@@ -542,10 +591,7 @@ class Ledger:
                 # A DECLARED COMPANION is legal: one number, one index row, two files — the row itself
                 # names the companion. ADR 0013 is exactly this and is CORRECT. Only an UNdeclared reuse
                 # is a collision.
-                row = next(
-                    (ln for ln in head_readme.splitlines() if ln.startswith(f"| [{number}]")), ""
-                )
-                if basename.removesuffix(".md") not in row:
+                if not row_names_file(index_row(head_readme, number), basename):
                     self.fail(
                         f"ADR {number} already exists on {self.base} as "
                         f"{_safe_for_message(base_adrs[number])}",
@@ -572,8 +618,8 @@ class Ledger:
                 if not seen.restores_lost_bytes:
                     self.fail(*self._ownership_refusal(number, seen))
 
-            # Only ADDED files are checked for an index row: three legacy ADRs (0077/0079/0080) shipped
-            # without one, and failing every unrelated commit over old debt is how a gate gets uninstalled.
+            # Only ADDED files are checked here, the right scope for a commit-time gate. The whole
+            # corpus is adr_index_coverage's, and it needs no legacy exemption: 0077/0079/0080 have rows.
             if number not in rows:
                 self.fail(
                     f"ADR {number} ({_safe_for_message(basename)}) has no row in docs/adr/README.md",

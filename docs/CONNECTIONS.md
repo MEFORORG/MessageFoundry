@@ -326,6 +326,7 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `tls_cert_file` | both | — | **in:** the server-identity cert (required when `tls`). **out:** a client cert for mTLS (optional). PEM path. |
 | `tls_key_file` | both | — | private key for `tls_cert_file`. |
 | `tls_ca_file` | both | — | trust anchor — **in:** verify client certs (opt-in mTLS → require a client cert); **out:** verify the server cert. |
+| `tls_ca_pin` | in | - | the SHA-256 of the inbound `tls_ca_file`, hex, `:` separators allowed. Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. It pins `tls_ca_file` only: a `tls_crl_file` is still read by path, and a certificate inside it is trusted unchecked. Set on an outbound connection, or without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
 | `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able and is **refused at construction**. `MEFOR_ALLOW_INSECURE_TLS=1` downgrades that refusal to a loud warning **only where the clamp allows it** (#200, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2): the escape is inert on an instance that is **both** PHI-classified **and** at `[security].enforcement = enforce`. That is the shipped default, so **on a stock instance the refusal stands with the variable set** — treat the env var as a lab tool, not a deployment option. Nothing else opens this hop: `cleartext_accepted` deliberately does **not** reach a verify-off hop (it has TLS — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted)), and `tls_hop_attested` has no authoring surface. If the partner's certificate has merely lapsed, `tls_allow_expired` below is the narrower lever — read that row before reaching for it. |
 | `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). |
 | `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain + hostname + key-usage — the **granular** alternative to `tls_verify=false` for the narrow expired-cert case. It is genuinely narrower (a wrong-host or untrusted-chain peer is still rejected), but do not book it as "not MITM-able": **expiry is the control that retires a certificate**, so a hop that ignores it will keep authenticating a **compromised key indefinitely** — and on the two connectors with no revocation gate (**DICOM-SCU, FTPS**) nothing else would catch that certificate either. **No posture gate covers this setting at all.** It needs no `MEFOR_ALLOW_INSECURE_TLS`; `[security].enforcement = enforce` does not clamp it; verification stays on, so no #200 cleartext/verify-off refusal keys on it; and it is **absent from `security_loosenings()`**, so `GET /security/posture`, the serve-time loosening warning and `messagefoundry check` will **not** report a connection that has it set. The only disclosure is the WARNING logged at each connector build — so a "two-week bridge" set when a partner's cert lapses has nothing that expires it or surfaces it: record the connection name and a removal date in your own risk register. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). It is a factory parameter on **six** outbound connectors only — **MLLP, FTPS (`Ftp(tls=True)`), DICOM C-STORE SCU, REST, SOAP, FHIR** — and is **not** honoured by the engine's other verifying TLS hops, including **`DICOMweb()`** (which reuses the REST client but does not read it), the `Database(...)` destination / `DatabasePoll(...)` source, and the `Email()`/`Direct()` SMTP TLS legs. |
@@ -603,6 +604,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `tls_cert_file` / `tls_key_file` | — | the server-identity cert + its private key (required when `tls`). A PEM **path** (a plain string — unlike `DICOM()`, these two are not typed for `env()`). |
 | `tls_key_password` | — | passphrase for an **encrypted** `tls_key_file` — a **secret**, supply via `env()`. |
 | `tls_ca_file` | — | trust anchor — opt-in **mTLS** (require + verify a client certificate). |
+| `tls_ca_pin` | - | the SHA-256 of `tls_ca_file`. Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. It pins `tls_ca_file` only: a `tls_crl_file` is still read by path, and a certificate inside it is trusted unchecked. Set on an outbound connection, or without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
 | `intake_auth` | `"none"` | **peer credential required to submit a message** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md) D6): `none` \| `api_key` \| `bearer` \| `mtls_subject`. A sibling of `source_ip_allowlist` — it authorises *submitting*, never *reading*; it mints no identity and opens no session. A missing or wrong credential is refused `401` **before any request body byte is read**, so it costs an anonymous peer nothing to be turned away. |
 | `intake_api_key` | — | the credential for `api_key`/`bearer` — a **secret**, `env()` only (a literal, a `default=` or a `cast=` is refused at the factory). |
 | `intake_api_key_next` | — | rotation slot, accepted **alongside** `intake_api_key` so a partner key rotates with no outage: set it, have the partner cut over, promote it, then clear it. Leaving it set keeps a retired credential live. |
@@ -816,8 +818,8 @@ figure stops matching the constant named beside it.
 | `tcp`: raw TCP listener ([Raw TCP](#raw-tcp--tcp)) | the inbound's declared `content_type` | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB | no unpacking on intake |
 | `x12`: X12 EDI listener ([X12 EDI](#x12-edi--x12)) | X12 interchanges | not applicable; a framed stream | `max_interchange_bytes`, default `DEFAULT_MAX_INTERCHANGE_BYTES` = 16 MiB (`parsing/x12/delimiters.py`) | no unpacking on intake |
 | `database`: database poller, `DatabasePoll(...)` ([Database source](#database-source--databasepoll)) | rows from `poll_statement`, each handed on as one body in the declared `content_type` | not applicable; table rows | no byte cap of its own; the engine's per-message ceiling below rejects an oversized row after it is read; `poll_max_rows`, default `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows per poll | no unpacking on intake |
-| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | off unless `[store].uploads_dir` is set. Plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file straight onto a chosen inbound's ingress stage, so that inbound's listener checks, including the per-message ceiling below, do not run on it | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
-| `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | not checked: the edited text is taken as typed. It re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. Either way the listener's checks do not run on it | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
+| `/uploads` (POST) and `/ui/uploaded-logs/upload`: uploaded diagnostic logs ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)) | off unless `[store].uploads_dir` is set. Plain text only, content-sniffed against the extension. A resend, `/uploads/{file_id}/resend`, puts one message from the file onto a chosen inbound's ingress stage. First it runs that inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; a check that the inbound's charset can hold the text; and, where the inbound sets `validation.strict`, the listener's strict `hl7apy` validation under the same `validation.strict_timeout_s` backstop, whose refusal counts the errors and quotes none. A refusal answers 413, 415 or 422, writes an `upload.resend_reject` audit row, and writes no message | `_ALLOWED_UPLOAD_EXTENSIONS`: `.hl7`, `.hl7v2`, `.txt`, `.xml` | `[store].max_upload_bytes`, default 25 MiB (`StoreSettings`) | not unpacked; see the uploaded-logs policy below |
+| `/messages/{message_id}/edit-resend` (POST) and its `/ui` delegate: an operator's edited message body | The edited body re-enters the origin channel's pipeline as a new message, or goes straight to a chosen outbound when `to` is set. A re-route first runs the origin inbound's ingress guards, `admit_resubmitted_body` (`pipeline/ingress_guards.py`): the inbound's size ceiling, never above `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB; `Peek.parse` for an HL7 inbound, or a match against the declared type for any other; the NUL rule; a check that the inbound's charset can hold the text; and, where the inbound sets `validation.strict`, the listener's strict `hl7apy` validation under the same `validation.strict_timeout_s` backstop, whose refusal counts the errors and quotes none. A re-route whose origin inbound this engine does not hold answers 409. The direct path has no inbound, so only the NUL rule and that ceiling apply, and strict validation, an inbound's setting, never does. A refusal answers 413, 415 or 422, writes a `message_edit_resend_reject` audit row, and writes no message | not applicable; the JSON field `raw` | `_MAX_REQUEST_BODY_BYTES` = 1 MiB, the API's request-body cap; `EditResendRequest.raw` also sets `max_length` 16,000,000 characters, which that cap reaches first | no unpacking |
 | `ide/src/testBench.ts` (Load Message Set) and `ide/src/stepsView.ts` (Use for Live Values): the IDE extension's local file pickers, a 5.1.1 upload feature by owner ruling of 2026-09-23 | any file: each picked path goes to `messagefoundry dryrun`, which runs it against an inbound's declared `content_type` | the dialog offers `.hl7` first and also "All files", so no extension is enforced | `MAX_FIXTURE_FILE_BYTES` = 16 MiB per file (`pipeline/dryrun.py`), raised to the largest `max_message_bytes` an inbound in the graph sets; refused with a message naming the file, before it is read whole. `dryrun` then applies the per-message ceiling below itself. The Steps view also reads its picked sample inside the extension to list its segments, and that read has no cap. The live-debug sample choice (`liveDebug.ts`, a pick list of `.hl7` files) feeds the same `dryrun` read | no unpacking |
 | `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop. A re-ingressed reply does not pass the `Loopback()` inbound's listener checks, so the read bound in this row is its bound | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound, both checked only after the whole result set is fetched | no unpacking on capture |
 
@@ -1094,7 +1096,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `remote_dir` | both | — (required) | remote directory to poll / upload into |
 | `username` | both | — (unset) | login user (unset = anonymous, FTP only) |
 | `password` | both | — (unset) | login password — a **secret**, via `env()`. Refused over plain `ftp`. |
-| `private_key` | both | — | **`Sftp` only** — PEM private-key text or a path; a **secret**, via `env()` |
+| `private_key` | both | — | **`Sftp` only** — the **text** of an **RSA** private key, not a path; a **secret**, via `env()`. See *RSA key text only* below the table. |
 | `key_password` | both | — | **`Sftp` only** — passphrase for an encrypted `private_key`; a **secret**, via `env()` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP |
@@ -1111,6 +1113,17 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber) |
 | `encoding` | out | `utf-8` | charset the payload is encoded with before upload (the **source** hands the retrieved bytes to the pipeline and never uses it) |
 
+- **RSA key text only.** The connector loads `private_key` with paramiko's `RSAKey` and nothing else.
+  Two encodings of an RSA key load: PKCS#1, whose PEM header names `RSA PRIVATE KEY`, and the
+  OpenSSH format, whose header names `OPENSSH PRIVATE KEY`. At least these are refused:
+  - an Ed25519 or ECDSA key, in either encoding;
+  - an RSA key in PKCS#8 form, whose header names only `PRIVATE KEY`;
+  - a file path, which is read as key text.
+
+  Building the connection does not parse the key. The error comes on the first connect,
+  before any network traffic, as a permanent `SFTP connection rejected: ...` error. Its wording can
+  mislead: an Ed25519 key in OpenSSH form reports `unpack requires a buffer of 4 bytes`. Measured
+  against paramiko 5.0.0, the locked version.
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).
@@ -1124,10 +1137,10 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `min_age_seconds` (above).
 - **Leader-gated.** The remote directory is a *shared* external resource, so in a cluster only the leader
   lists, downloads, or moves its files — otherwise two nodes would double-ingest the drop.
-- **No timeout knob.** Neither factory exposes one — the 30 s value is a hard-coded module fallback in
-  `transports/remotefile.py`, handed to `paramiko.SSHClient.connect(timeout=…)` (the **TCP connect only**;
-  the SFTP channel read/write is unbounded) and to `ftplib.FTP_TLS/FTP(timeout=…)` (the **whole socket**).
-  See [Table B](#table-b--per-service-resource-strategy-asvs-1313).
+- **No timeout knob.** Neither factory exposes one. The bounds these connections do have are hard-coded
+  in `transports/remotefile.py`. The "Timeouts are per-connector, not universal" paragraph under
+  [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each one
+  covers, and [Table B](#table-b--per-service-resource-strategy-asvs-1313) has the SFTP and FTP/FTPS rows.
 - **Egress allowlist.** `[egress].allowed_remote` gates the host in **both** directions — a poll dials out
   too, so the allowlist guards against polling an arbitrary server. Fail-closed once configured.
 - **At-least-once.** An upload may re-send, and a poll may re-emit a file that was handled but not yet
@@ -1234,7 +1247,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql)) |
-| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-db-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
+| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
@@ -1356,6 +1369,71 @@ reads through a stored procedure — which this gate refuses anyway.
 > database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
 > a credential the operator configures per connection.
 
+#### Static credentials on every backend hop
+
+ASVS 13.2.1 asks that every backend hop authenticate with an individual service account, a short-term
+token or a certificate, not with an unchanging credential. The engine keeps one list of the hops it
+dials that do not (BACKLOG #1182). A hop is on the list when it presents a static credential (a
+password, API key, static bearer token or Vault token) or no credential at all. A hop that presents
+only a compliant credential is never on it.
+
+Three surfaces read that one list, so they cannot disagree:
+
+- `messagefoundry check` prints it on the advisory `static-credentials` line. With a
+  `messagefoundry.toml` it also reads the service-settings hops, and it says when it could not.
+- `GET /security/posture` returns it as `static_credential_hops`, one entry per hop.
+- `serve` refuses on it, but only when you turn the refusal on.
+
+The list covers the hops named in the table below. It is not a promise about hops added later, or
+about plugin connector types.
+
+**The refusal ships off.** Set `[security].require_nonstatic_credentials = true` to turn it on. `serve`
+then refuses to start while any listed hop has no opt-out. To keep a hop, name it with a reason:
+
+```toml
+[security]
+require_nonstatic_credentials = true
+static_credential_accepted = { "OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "no credential field exists" }
+```
+
+Each opt-out is logged at start with the hop's name and your reason, never a secret, and
+`security_loosenings()` names the set. The refuse/warn split is `[security].enforcement`, as it is for
+`[store].require_managed_identity`. The settings hops are checked before anything starts. The graph
+hops are checked at the first graph load and at every `/config/reload`, where a refusal leaves the
+running graph in place.
+
+**Some hops have no compliant option today.** For those, the only way through with the refusal on is an
+opt-out. That is expected, and the table says which they are.
+
+| Hop | Named as | Compliant kind in the product |
+|-----|----------|-------------------------------|
+| `Rest(...)`, `FHIR(...)` | `<name>` | yes: SMART Backend Services or OAuth2 client credentials |
+| `FhirLookup(...)` | `fhir_lookup:<name>` | yes: SMART Backend Services |
+| `Soap(...)` | `<name>` | yes: client certificate, or OAuth2 |
+| `DICOMweb(...)` | `<name>` | **no** (static bearer or Basic only) |
+| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`, or a user and password in the proxy URL, its own or an inherited `[egress].proxy_url`) | `proxy:<name>`, or `proxy:fhir_lookup:<name>` for a lookup | **no** (Basic or Digest only) |
+| `MLLP(...)`, `DICOM(...)` outbound | `<name>` | yes: `tls=True` with `tls_cert_file` |
+| `Tcp(...)`, `X12(...)` outbound | `<name>` | **no** (no credential of any kind) |
+| `Email(...)`, `Direct(...)` SMTP AUTH | `<name>` | **no** |
+| `Sftp(...)` | `<name>` or `inbound:<name>` | yes: SSH private key |
+| `Ftp(...)` | `<name>` or `inbound:<name>` | **no** |
+| `File(...)` alternate-share credential | `<name>` or `inbound:<name>` | **no** (drop it to run as the service identity) |
+| the four database factories | see the table below | yes: `auth="integrated"` or `"entra"` |
+| `[store]` on SQL Server or Postgres | `settings:store` | SQL Server yes; Postgres **no** |
+| Vault token (store key, Transit, secrets) | `settings:vault.store_key`, `settings:vault.store_transit`, `settings:vault.secrets` | **no** |
+| `[alerts]` webhook | `settings:alerts.webhook` | **no** (the sink has no credential field) |
+| `[alerts]` SMTP | `settings:alerts.smtp` | **no** |
+| `[ai]` broker key | `settings:ai.broker` | **no** |
+| `[auth]` OIDC client secret | `settings:auth.oidc` | **no** |
+| `[auth]` AD/LDAP bind | `settings:auth.ad_bind` | **no** |
+| `[logging]` syslog forwarder | `settings:logging.forward` | yes: `forward_protocol = "tls"` with `forward_tls_client_cert` |
+
+Listeners are **not** on the list. On an inbound MLLP, TCP, X12, DICOM or HTTP listener the partner
+presents a credential to the engine, not the other way round. A connection declared with
+`deployed=False` is not on it either, because the engine never opens it. OAuth2 counts as compliant by
+the 2026-08-22 owner ruling, although its own token request still sends a static client secret; that
+token request is not listed as a separate hop.
+
 #### Static database credentials
 
 ASVS 13.2.1 asks that a backend hop authenticate with an individual service account, a short-term token
@@ -1363,10 +1441,11 @@ or a certificate rather than an unchanging credential. On SQL Server that means 
 gMSA or Windows machine principal) or `auth="entra"`; `auth="sql"`, the shipped default, is a static
 username and password.
 
-`messagefoundry check` prints an advisory **`static-db-credentials`** line naming every declared database
-hop that presents an unchanging credential, with its peer. It is an **inventory, not a gate** — it
-refuses nothing and blocks nothing. A named hop may be entirely legitimate, and a site whose database
-offers no managed-identity mode has no compliant option to move to.
+`messagefoundry check` names every declared database hop that presents an unchanging credential, with
+its peer, on its advisory **`static-credentials`** line. That line covers every backend hop, not only
+databases; see [Static credentials on every backend hop](#static-credentials-on-every-backend-hop)
+above. The line itself refuses nothing. The refusal is the opt-in
+`[security].require_nonstatic_credentials`, which is off by default.
 
 It covers **four** factories, because four of them dial a database with a credential:
 
@@ -1953,7 +2032,7 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `presentation_contexts` | `None` → SR + common image storage + Verification | the SOP classes the SCP negotiates (transfer syntaxes default to the standard set) |
 | `calling_ae_allowlist` | `None` → any (subject to the IP gate) | only these calling AE titles may associate (fail-closed when set) |
 | `require_called_ae_title` | `True` | a peer must address this engine's `ae_title` as the called AE |
-| `max_object_bytes` | `134217728` (128 MiB) | reject a single C-STORE object larger than this (OOM/DoS guard). It is charged **twice**: first against the **raw received Data Set**, before `pydicom` decodes it, so an over-cap object is refused without ever being decoded or re-encoded; then against the re-encoded Part-10 bytes, which the raw length cannot see (the preamble, `DICM` and file meta are added there). Both charges land **before** the durable commit. It is **also** the ceiling for the pre-decode **inflate** of a *Deflated Explicit VR LE* object, whose compressed raw length says nothing about how far it inflates: the SCP bound-inflates the raw received Data Set before pydicom touches it, so an over-cap deflate bomb is a DIMSE failure and is never decoded or committed. Note that `0`/`None` does not simply widen this — it removes the object-size check entirely **and tightens** the inflate ceiling to the codec default of **16 MiB**, which is what the guard falls back to when no object cap is configured |
+| `max_object_bytes` | `134217728` (128 MiB), **but the SCP never honours more than the engine's 16 MiB binary ingress ceiling** | reject a single C-STORE object larger than this (OOM/DoS guard). **The SCP's effective cap is the smaller of this value and 16 MiB**, because the engine records any larger object as `ERROR` and never processes it, and an SCP that accepted one would tell the sender Success for an object the engine dropped (BACKLOG #1910). So the shipped default resolves to 16 MiB on the SCP, and a larger value cannot raise it. It is charged **twice**: first against the **raw received Data Set**, before `pydicom` decodes it, so an over-cap object is refused without ever being decoded or re-encoded; then against the re-encoded Part-10 bytes, which the raw length cannot see (the preamble, `DICM` and file meta are added there). Both charges land **before** the durable commit. It is **also** the ceiling for the pre-decode **inflate** of a *Deflated Explicit VR LE* object, whose compressed raw length says nothing about how far it inflates: the SCP bound-inflates the raw received Data Set before pydicom touches it, so an over-cap deflate bomb is a DIMSE failure and is never decoded or committed. `0`/`None` does not remove the check on the SCP: it resolves to the same 16 MiB ceiling. An over-cap object is refused with **Out of Resources** (`0xA700`), before any commit, so nothing is recorded for it. If the engine's ingress still refuses an object the SCP passed, the engine records it `ERROR` and the SCP answers **Cannot Understand** (`0xC000`), never Success |
 | `max_associations` | `10` | cap on concurrent inbound associations (connection-flood guard) |
 | `max_associations_per_second` | **off** | sustained rate at which this SCP **accepts new associations** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). Over budget the SCP **waits before reading the association request**, so the peer is back-pressured by TCP and then served in full — **nothing is dropped, refused or answered differently**, and a rejected association charges nothing. **The unit is an association, not a message,** and that is a property of DIMSE: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object is already read and decoded, and pacing there would delay a message the count-and-log invariant has already obliged us to account for. **So an established association is NOT bounded in the objects it may push** — `max_object_bytes` and `timeout_seconds` bound those instead. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule, exactly as on the listen intakes: a guessed rate throttles a real modality, so the number has to come from your own feed profile. **Pair it with `max_associations`,** which must be large enough to hold the peers waiting behind a pace — and keep the resulting wait inside your senders' ACSE timeouts, or a paced modality aborts. |
 | `association_burst` | = the rate | tokens the bucket holds, i.e. how large a burst of associations passes unpaced before the sustained rate applies. Only meaningful with `max_associations_per_second` set. Floor of 1 so an SCP can always make progress. |
@@ -1963,6 +2042,7 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `tls_cert_file` / `tls_key_file` | — | the SCP's server-identity cert + private key (required when `tls=true`) |
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
 | `tls_ca_file` | — | opt-in **mTLS**: require + verify a calling peer's client certificate |
+| `tls_ca_pin` | - | the SHA-256 of `tls_ca_file`. Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. It pins `tls_ca_file` only: a `tls_crl_file` is still read by path, and a certificate inside it is trusted unchecked. Set on an outbound connection, or without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
 
 The **bind interface** is the service-level `[inbound].bind_host` (or a per-connection `bind_address`) and the **peer-IP gate** is the per-connection **`source_ip_allowlist`** — both are set on the `inbound(...)` call, not as `DICOM()` arguments. **NOTE: `source_ip_allowlist` is *not* a key of the `[inbound]` section in `messagefoundry.toml`.** That section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`, and an unrecognized key in a known section is **refused at load** — so writing `source_ip_allowlist` under `[inbound]` in the service TOML **fails the start** (`serve` exit 2), naming the section and the key. It used to be accepted silently and do nothing, which is the failure mode the refusal exists to remove. (Verified: `InboundSettings.model_fields` is exactly those three; `[inbound].source_ip_allowlist` raises `unrecognized config key(s)`, while a sibling `bind_host` loads.) `bind_address` is the same story — a per-connection keyword, not a `[inbound]` key. The reachable forms are `inbound("IB_…", DICOM(...), source_ip_allowlist=["10.20.0.0/16"])` and, for the transports available as data, the **top-level** `source_ip_allowlist` key in `connections.toml` (shown in the [`connections.toml` example](#connections-as-data--connectionstoml-adr-0007) above) — `DICOM()` is code-first only, so for a SCP it is the `inbound(...)` keyword. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). `serve --allow-insecure-bind` downgrades that refusal to a warning, but the flag is **clamped** exactly as it is for the MLLP/HTTP/TCP listeners: on a PHI-classified instance under the default `[security].enforcement = enforce` the bind is refused *even with it*, so on a stock instance `tls=true` is the only way to bind off-loopback. (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
 
@@ -2488,6 +2568,33 @@ auto_start = false        # deployed, but started at runtime, not at boot
 > value is moot. To bring a not-deployed connection online, set `deployed=true` (and supply any `env()`
 > values it needs), then reload — **no other change**.
 
+## Inline fast path — `inline` (code-first only, ADR 0057)
+
+**Leave `inline` off.** It is a per-inbound boolean on `inbound(...)`, default `False`.
+[ADR 0057](adr/0057-inline-step-a-fast-path.md) records that it ships default-off permanently. It cut
+commits per message as designed, and throughput moved by less than the measurement noise. It is
+documented here so a reader who meets it in code knows what it does.
+
+When it is `True`, the router worker runs the route and the transform for an eligible message itself.
+It then commits one handoff straight from the ingress stage to the outbound stage, skipping the routed
+stage. An inbound is eligible only when all of these hold:
+
+- the whole graph declares no live lookup (the database or FHIR lookups behind `db_lookup` and
+  `fhir_lookup`);
+- its `ack_after` resolves to `ingest`;
+- it is not a `Loopback()` inbound.
+
+Each message then faces its own checks. At least, the router must pick exactly one handler, and that
+handler must return one or more plain `Send`s to deployed outbound connections. A message that fails a check takes the
+ordinary staged path, which may run its transform a second time.
+
+```python
+inbound("IB_LAB_ORU", MLLP(port=2580), router="lab_router", inline=True)  # not recommended
+```
+
+**`connections.toml` has no `inline` key.** A `[[inbound]]` table that carries one fails to load with
+`unknown key(s) inline`, whether the value is `true` or `false`.
+
 ## Pipeline claim mode — `[pipeline].claim_mode` (default `pooled`, ADR 0066)
 
 How the engine drains the staged queue. This is a service setting in `messagefoundry.toml`, not a
@@ -2663,7 +2770,7 @@ connection-count knob** (the stdlib opener exposes none) — the same framing 13
 **Timeouts are per-connector, not universal.** Only the MLLP/TCP/X12/DICOM families expose both a
 `connect_timeout` and a `timeout_seconds`; the REST/SOAP/FHIR/DICOMweb HTTP family exposes
 `timeout_seconds` only (a single per-request wall clock — there is no separate connect timeout);
-REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument, and its bounds are hard-coded module values in `transports/remotefile.py`, not operator-configurable: a 30 s connect value on all three protocols, applied on SFTP to the banner and authentication phases as well, plus a `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` bound on each read from an established SFTP channel (BACKLOG #1195) that FTP and FTPS do not have;
+REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument, and its bounds are hard-coded module values in `transports/remotefile.py`, not operator-configurable. All three protocols start from a 30 s value. On FTP and FTPS it is a whole-socket timeout, on the control and data connections alike. On SFTP it covers the TCP connect, the SSH banner exchange and authentication; a separate `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` (120 s, BACKLOG #1195) then covers each read from the established SFTP channel. That read bound is per read, not per transfer, so a slow transfer that keeps making progress never trips it. **Opening the SFTP session, between those two steps, carries no engine bound.** A server that authenticates and then never answers the SFTP subsystem request would hold its worker thread;
 DATABASE exposes `connect_timeout` + `acquire_timeout` and no statement timeout; local FILE exposes
 none (filesystem I/O is unbounded by design). The MLLP/TCP/X12/HTTP listeners expose
 `receive_timeout`; the DICOM SCP instead applies `timeout_seconds` to its three pynetdicom timers. For
@@ -2726,12 +2833,15 @@ store, and only one of the pools carries a knob.
    - **Bounded infrastructure hops** — `db_lookup`, `fhir_lookup`, the AI broker POST, every SMTP send,
      every LDAP bind, the DICOM association work. Each carries a finite timeout (Table B), so *these*
      workers are released by their timeout rather than by any pool cap.
-   - **Unbounded-by-design file I/O** — local FILE and SFTP/FTP/FTPS channel reads and writes, whose
-     "timeout" posture is stated honestly per row in Table B.
+   - **File I/O** — local FILE, which is unbounded by design, and SFTP/FTP/FTPS, whose bounds are
+     hard-coded, differ by protocol and leave at least one SFTP step unbounded. The "Timeouts are
+     per-connector, not universal" paragraph above says what each covers; Table B has the per-row detail.
    - **Inbound strict validation** — the listener runs `hl7apy` strict validate off-loop via
      `asyncio.to_thread` (`pipeline/wiring_runner.py:3259`, `:3543`), bounded by the per-inbound
-     `validation.strict_timeout_s` (engine default `_STRICT_VALIDATE_TIMEOUT_SECONDS` = **5 s**,
-     `wiring_runner.py:285`). The timeout frees the *listener* but cannot kill the worker — an
+     `validation.strict_timeout_s` (engine default `STRICT_VALIDATE_TIMEOUT_SECONDS` = **5 s**, in
+     `pipeline/ingress_guards.py`, which `wiring_runner` re-exports as
+     `_STRICT_VALIDATE_TIMEOUT_SECONDS`). An operator resend into a strict inbound (BACKLOG #1911)
+     validates on this pool the same way, under the same timeout. The timeout frees the *listener* but cannot kill the worker — an
      orphaned validate holds its thread until it returns, bounded in turn by the 16 MiB / segment
      caps enforced before it.
    - **The store's own SQL Server I/O** — `aioodbc.create_pool()` is built with **no** `executor=`
@@ -2835,7 +2945,7 @@ reading this page already applies to a file the scan never opened.
 | SOAP destination | as REST — indirect via the lane budget | as REST | as REST |
 | FHIR destination + `fhir_lookup` | as REST; `fhir_lookup` additionally runs off the event loop on the thread executor | as REST; a lookup that cannot run raises into the Handler | transient → retry; a `fhir_lookup` failure fails the message, never silently degrades |
 | DICOMweb STOW-RS destination | as REST — indirect via the lane budget | as REST | as REST |
-| DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB | over the association cap pynetdicom rejects the association; `max_pdu_size` bounds a fragment rather than an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit | the modality re-sends; nothing is half-committed |
+| DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` bounds a fragment rather than an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit | the modality re-sends; nothing is half-committed |
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
@@ -2860,7 +2970,7 @@ reading this page already applies to a file the scan never opened.
 | Vault Transit — bulk at-rest cipher (`MEFOR_STORE_TRANSIT_KEY`, `[store].cipher_provider = vault_transit`, ADR 0138) | **one synchronous HTTPS round trip per encrypted CELL** on every store write and read, plus one `generate_hmac` per audit row; issued **on the event loop** (`_enc`/`_dec` are sync, with no `to_thread`). No concurrency cap of its own — the effective bound is the stage/lane budget | Vault's own rate limit or a slow Transit **stalls the event loop across the whole engine**; a per-operation failure raises `CipherError` and the stage errors/dead-letters that row | the store stays open; the row is retried by the normal stage re-claim |
 | Vault KV v2 (`MEFOR_SECRETS_VAULT_ADDR`) | one HTTPS request per secret resolution at config load / connector construction | fail-closed — the connection refuses to build | operator fixes Vault and reloads |
 | Alerts — SMTP sink (`[alerts].email_smtp_host`) | one connection per send, serialized on **its own** background drain task behind **its own** bounded 1000-item queue | over-cap events are **dropped with a warning** rather than growing the queue | a send failure is swallowed + logged; the alert is not retried |
-| Alerts — per-user security-event email (`[auth].notify_security_events`) | one connection per notification, serialized on a **second, independent** drain task with its **own** bounded 1000-item queue — so the SMTP relay sees up to **two** concurrent sessions from this engine, not one | at cap the event is **dropped with a warning**; the audited `GET /me/security-events` feed still records it | the send failure is swallowed + logged, never propagated onto the login or admin path; recovery is the pull feed |
+| Alerts — per-user security-event email (`[auth].notify_security_events`) | one connection per notification, serialized on a **second, independent** drain task with its **own** bounded 1000-item queue — so the SMTP relay sees up to **two** concurrent sessions from this engine, not one | at cap the event is **dropped with a warning**; the audited `GET /me/security-events` feed still records it when it is the user's own event, but not an administrator's change to their account (`auth/notifications.py` states the rule) | the send failure is swallowed + logged, never propagated onto the login or admin path; recovery is the pull feed, for the events it carries |
 | Alerts — webhook sink (`[alerts].webhook_url`) | one POST per event on the same single drain task and the same bounded 1000-item queue | as the SMTP sink — over-cap events are dropped with a warning | best-effort; a failure is swallowed + logged, never retried |
 | Syslog forwarder (`[logging].forward_host`) | a **single** socket, synchronous send, one record at a time | a stalled collector costs at most the socket timeout per record and the record is then **dropped** | an unreachable collector at startup is skipped with a warning and the service still starts |
 | SNTP clock-sync probe (`[logging].ntp_peer`) | exactly **one** datagram per process start; never on the message path | a silent peer raises `socket.timeout` | skew beyond `time_sync_max_skew_seconds` warns loudly, or refuses to start under `time_sync_fail_closed` |
@@ -2879,7 +2989,7 @@ reading this page already applies to a file the scan never opened.
 | HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408` | handler `finally` closes the connection with a shutdown grace | an over-size body is refused before buffering | n/a |
 | File endpoint — local filesystem | **none** — filesystem I/O is unbounded by design | file handles are context-managed; the source file is moved/deleted/left per `after_read` | an unreadable/oversize file is skipped or moved to `error_subdir` | `RetryPolicy` on the outbound write |
 | File endpoint — UNC / SMB share | **none engine-owned** — bounded only by the OS SMB redirector | the impersonation token is reverted (`RevertToSelf`) and the worker thread is per-endpoint isolated | a share failure surfaces as a transient poll/delivery error | `RetryPolicy` |
-| SFTP (remote-file) | 30 s on the **TCP connect only** — the hard-coded module fallback in `transports/remotefile.py` is passed to `paramiko.SSHClient.connect(timeout=…)`. The SSH banner and auth legs ride paramiko's own defaults (the engine sets neither `banner_timeout` nor `auth_timeout`), and the SFTP **channel read/write has no timeout at all**, so a server that stalls after connect blocks its `to_thread` worker until the engine restarts. `Sftp()` exposes no timeout argument, so none of this is operator-configurable | the `paramiko` session is closed in `finally` per poll or delivery | SSH failures map to transient | `RetryPolicy` |
+| SFTP (remote-file) | 30 s on the TCP connect, the SSH banner exchange and authentication (`timeout`, `banner_timeout` and `auth_timeout` on `paramiko.SSHClient.connect`), plus 120 s on **each read** from the established SFTP channel. All are hard-coded in `transports/remotefile.py`; `Sftp()` exposes no timeout argument, so none is operator-configurable. The bounds are **not complete**: the "Timeouts are per-connector, not universal" paragraph under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each covers and where the gap is | the `paramiko` session is closed in `finally` per poll or delivery | **Delivery:** at connect, any `paramiko.SSHException` is **permanent**. That covers a rejected host key, and also a banner timeout, which paramiko raises as `SSHException`. An authentication failure, a timeout included, is permanent and flagged as a credential fault. An `OSError`/`EOFError` at connect is transient. After connect, a missing remote path is permanent, and at least the read timeout is transient. With `validate_directory` on, the pre-upload directory check re-raises any failure as transient, these included. **Source:** the poller does not act on that split; a failed connect, listing or retrieve is logged and tried again on the next poll | `RetryPolicy` |
 | FTP / FTPS (remote-file) | 30 s **whole-socket** — the same hard-coded module fallback, handed to `ftplib.FTP_TLS(timeout=…)` / `ftplib.FTP(timeout=…)`, which sets it on the control **and** data connections. `Ftp()` exposes no timeout argument, so it is **not** operator-configurable | the `ftplib` session is closed in `finally` per poll or delivery | `ftplib.all_errors` maps to transient | `RetryPolicy` |
 | Reference-set sync (`FileRef`) | **none engine-owned** — filesystem / SMB-redirector I/O, the same posture as the File connector | the file handle is context-managed and closed per pass | a load error is logged and the previous encrypted snapshot is retained | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
