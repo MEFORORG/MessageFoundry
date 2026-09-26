@@ -1432,14 +1432,7 @@ class RegistryRunner:
             for stage in stages:
                 d = self._dispatchers.get(stage)
                 if d is not None:
-                    # The broadcast re-arms every STOPPED lane, so it lifts the operator holds on
-                    # exactly those. Read BEFORE the broadcast: a hold whose lane has not reached
-                    # STOPPED yet is not re-armed by it, and must survive.
-                    kind = _HOLD_DIRECTION.get(stage)
-                    rearmed = [(k, n) for k, n in self._stop_held if k == kind and d.stopped(n)]
-                    d.notify_work()
-                    for k, n in rearmed:
-                        self._release_operator_hold(n, k)
+                    self._broadcast_to(d, stage)
             if Stage.OUTBOUND in stages:
                 self._wake_worker_lanes()
             return
@@ -1450,6 +1443,28 @@ class RegistryRunner:
             for stage in stages:
                 for ev in list(self._lane_events[stage].values()):
                     ev.set()
+
+    def _broadcast_to(self, d: StageDispatcher, stage: Stage) -> None:
+        """``d.notify_work()``, which re-arms every STOPPED lane, and so lifts the operator holds on
+        exactly those. The STOPPED set is read BEFORE the broadcast: a hold whose lane has not reached
+        STOPPED yet (the STOP site records it first) is not re-armed by it, and must survive."""
+        kind = _HOLD_DIRECTION.get(stage)
+        rearmed = [n for k, n in self._stop_held if k == kind and d.stopped(n)]
+        d.notify_work()
+        if kind is not None:
+            for n in rearmed:
+                self._release_operator_hold(n, kind)
+
+    def _resume_pooled_lane(self, d: StageDispatcher, stage: Stage, name: str) -> None:
+        """``d.resume_lane(name)``, lifting the operator hold only when it re-arms something.
+        resume_lane re-arms a PAUSED lane and ignores a STOPPED one, so a start on a lane still at
+        STOPPED leaves its hold in place. A PAUSED lane has nothing in flight, so no STOP can land
+        behind this read."""
+        rearms = d.paused(name)
+        d.resume_lane(name)
+        kind = _HOLD_DIRECTION.get(stage)
+        if rearms and kind is not None:
+            self._release_operator_hold(name, kind)
 
     def notify_work(self) -> None:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
@@ -2373,7 +2388,7 @@ class RegistryRunner:
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
-                d.resume_lane(name)
+                self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             self._outbound_resume.setdefault(name, asyncio.Event()).set()
 
@@ -2463,16 +2478,13 @@ class RegistryRunner:
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
             if d is not None:
-                d.resume_lane(name)
+                self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             # per_lane: release the loop-top gate; respawn the worker if it exited (STOP policy / crash).
             self._outbound_resume.setdefault(name, asyncio.Event()).set()
             worker = self._workers.get(name)
             if worker is None or worker.done():
                 self._spawn_worker(name)
-        # A start is the operator lifting a STOP. The scheduler never reaches here on a held lane
-        # (_schedule_holds refuses first), so this runs only for a start it is free to make.
-        self._release_operator_hold(name, "outbound")
 
     # --- per-connection active-window scheduler (#147, ADR 0095) --------------
 
@@ -2574,8 +2586,10 @@ class RegistryRunner:
 
     def _hold_for_operator(self, name: str, kind: Direction) -> None:
         """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (a #109
-        credential fault or the internal-error STOP policy). Called at the STOP site, beside its
-        ``connection_stopped`` alert; the scheduler reads it through :meth:`_schedule_holds`."""
+        credential fault or the internal-error STOP policy). Called at the STOP site as its last step
+        before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
+        raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
+        to hold. The scheduler reads it through :meth:`_schedule_holds`."""
         self._stop_held.add((kind, name))
         self._stop_hold_logged.discard((kind, name))
 
@@ -2592,9 +2606,15 @@ class RegistryRunner:
         The record alone decides, and it is not cross-checked against the lane's live state. That check
         was tried and it races: the STOP site records the hold before its lane reaches STOPPED (a pooled
         lane read PROCESSING for about 100 ms after the record, measured), so a scheduler tick in that
-        gap would have read the hold as stale and dropped it. Every path that really re-arms the lane
-        clears the record instead: :meth:`_start_inbound_unsafe`, :meth:`_start_outbound_unsafe`, a
-        successful :meth:`reload`, a full teardown, and the pooled broadcast in :meth:`_wake_all`."""
+        gap would have read the hold as stale and dropped it.
+
+        So the record is cleared at the few primitives that actually re-arm a halted lane, not at the
+        doors that call them (a door list is a completeness claim nobody can check, and a door can
+        fail part way, as a reload that rolls back does): a fresh per_lane worker
+        (:meth:`_spawn_worker`, :meth:`_ensure_inbound_workers`), a pooled broadcast that re-arms a
+        lane it found STOPPED (:meth:`_broadcast_to`), a pooled resume of a PAUSED lane
+        (:meth:`_resume_pooled_lane`), and a full teardown. An operator start that re-arms nothing,
+        such as ``start_outbound`` on a pooled lane still at STOPPED, leaves the hold in place."""
         key = (kind, name)
         if key not in self._stop_held:
             return False
@@ -2824,9 +2844,6 @@ class RegistryRunner:
                 await self._stop_inbound_unsafe(name)
                 return
             self._ensure_inbound_workers(name)
-            # A start is the operator lifting a STOP (per_lane: the line above re-armed the workers it
-            # returned). The scheduler never reaches here on a held lane (_schedule_holds refuses first).
-            self._release_operator_hold(name, "inbound")
 
     async def _stop_inbound_unsafe(self, name: str) -> None:
         """stop_inbound body without the reload lock — for callers that already hold it."""
@@ -3220,7 +3237,7 @@ class RegistryRunner:
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
             dispatcher = self._dispatchers.get(stage)
             if dispatcher is not None:
-                dispatcher.resume_lane(name)
+                self._resume_pooled_lane(dispatcher, stage, name)
         return True
 
     async def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
@@ -4044,6 +4061,10 @@ class RegistryRunner:
         task = asyncio.create_task(self._delivery_worker(name))
         task.add_done_callback(functools.partial(self._on_worker_done, name))
         self._workers[name] = task
+        # A fresh worker is what re-arms a lane whose worker a STOP returned, whichever door spawned
+        # it (an operator start, a reload), so the operator hold ends here. Every caller spawns only
+        # over a missing or finished worker, and a STOP records its hold before its worker returns.
+        self._release_operator_hold(name, "outbound")
 
     def _on_worker_done(self, name: str, task: asyncio.Task[None]) -> None:
         """A delivery worker should only finish on shutdown — its loop swallows + backs off on
@@ -4104,10 +4125,17 @@ class RegistryRunner:
         if ic is not None and ic.spec.type is ConnectorType.LOOPBACK:
             # ADR 0013: a loopback inbound also gets a RESPONSE worker draining its Stage.RESPONSE tokens.
             kinds.append("response")
+        rearmed = False
         for kind in kinds:
             task = self._inbound_worker_dict(kind).get(name)
             if task is None or task.done():
                 self._spawn_inbound_worker(kind, name)
+                rearmed = rearmed or kind != "response"
+        # A respawned router or transform worker re-arms the lane a STOP halted (only those two STOP
+        # on content), whichever door called this: an operator start, a reload, a rollback. Not when
+        # both were alive: a STOP records its hold before its worker returns, so that hold is live.
+        if rearmed:
+            self._release_operator_hold(name, "inbound")
 
     def _spawn_inbound_worker(self, kind: str, name: str) -> None:
         """Start the ``kind`` (router/transform) worker for one inbound connection."""
@@ -4419,8 +4447,8 @@ class RegistryRunner:
             dispatcher = self._make_dispatcher(Stage.RESPONSE)
             self._dispatchers[Stage.RESPONSE] = dispatcher
             await dispatcher.start()
-        for dispatcher in self._dispatchers.values():
-            dispatcher.notify_work()
+        for stage, dispatcher in self._dispatchers.items():
+            self._broadcast_to(dispatcher, stage)
         # ADR 0066 D4: the dispatchers do not speak for a worker-drained outbound lane, so nudge those
         # directly — otherwise a reload that added rows to one would leave it asleep until its backstop.
         self._wake_worker_lanes()
@@ -4982,12 +5010,6 @@ class RegistryRunner:
                     except Exception:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
-
-            # A reload is the documented way to re-arm a STOPPED lane (the STOP sites' own log lines
-            # say so): step 2b re-arms the inbound workers or broadcasts to the pooled dispatchers, and
-            # step 3 respawns a STOP-exited delivery worker. So every operator hold is spent here.
-            self._stop_held.clear()
-            self._stop_hold_logged.clear()
 
             # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
             # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has

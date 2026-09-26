@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from collections.abc import Callable
 from datetime import UTC, datetime, time
 from pathlib import Path
 
@@ -413,6 +414,28 @@ async def test_credential_fault_stop_is_not_resumed_by_the_next_window(
         await runner.stop()
 
 
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+async def test_the_window_open_does_not_start_a_paused_lane_a_stop_holds(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    # The start refusal, which the test above never reaches: a STOPPED outbound still reads as
+    # running, so its window open has nothing to start. An operator pause of the held lane makes it
+    # read as not running. A pause is not a start, so the hold stands, and the window open must not
+    # resume the lane (pooled: the pause turned STOPPED into PAUSED, which a resume re-arms).
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    runner, faulty = await _start_credential_fault_rig(store, tmp_path, claim_mode, clock, schedule)
+    try:
+        await runner.stop_outbound("OB_SCHED")
+        assert not runner.outbound_running("OB_SCHED")
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)  # still in window
+        await asyncio.sleep(0.3)  # time for a re-armed lane to claim the retained row
+        assert faulty.sends == 1
+        assert not runner.outbound_running("OB_SCHED")
+    finally:
+        await runner.stop()
+
+
 async def test_a_pooled_broadcast_that_re_arms_a_stopped_lane_ends_its_hold(
     store: MessageStore, tmp_path: Path
 ) -> None:
@@ -446,11 +469,17 @@ async def test_content_stop_is_not_resumed_by_the_next_window(
     # operator-required STOP is the internal-error STOP policy on a router fault.
     schedule = _weekday_window()
     clock = _Clock(_IN_WINDOW)
-    reg = Registry()
-    reg.add_inbound(
-        build_inbound_connection("IB_SCHED", MLLP(port=_free_port()), router="r", schedule=schedule)
-    )
-    reg.add_router("r", _raising_router)
+    port = _free_port()
+
+    def _graph(router: Callable[[object], list[str]]) -> Registry:
+        reg = Registry()
+        reg.add_inbound(
+            build_inbound_connection("IB_SCHED", MLLP(port=port), router="r", schedule=schedule)
+        )
+        reg.add_router("r", router)
+        return reg
+
+    reg = _graph(_raising_router)
     sink = _StopSink()
     runner = RegistryRunner(
         reg,
@@ -476,12 +505,17 @@ async def test_content_stop_is_not_resumed_by_the_next_window(
 
         assert not runner.inbound_running("IB_SCHED")
         if claim_mode == "per_lane":  # and the router worker the STOP returned was not respawned
-            assert runner._router_workers["IB_SCHED"].done()
+            await _wait_until(lambda: runner._router_workers["IB_SCHED"].done())
+        else:
+            # The lane reaches STOPPED well after the STOP's alert (it read PROCESSING through the
+            # whole close/open above). A reload before that re-arms nothing, correctly, so wait.
+            ingress = runner._dispatchers[Stage.INGRESS]
+            await _wait_until(lambda: ingress.stopped("IB_SCHED"))
 
-        # Control: once the router is fixed and an operator starts the inbound, the calendar owns it
-        # again, and an ordinary close parks it and the next open brings it back.
-        runner.registry.routers["r"] = lambda m: []
-        await runner.start_inbound("IB_SCHED")
+        # Control: the operator fixes the router and reloads, the recovery the STOP's own log line
+        # names. That re-arms the lane in both claim modes, so the calendar owns it again: the
+        # reload binds it in window, an ordinary close parks it, and the next open brings it back.
+        await runner.reload(_graph(lambda m: []))
         assert runner.inbound_running("IB_SCHED")
         clock.set(_utc(2026, 7, 14, 18))
         await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)

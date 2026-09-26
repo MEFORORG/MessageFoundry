@@ -1418,9 +1418,9 @@ class StageDispatcher:
         return st is not None and st.phase is _LanePhase.PAUSED
 
     def stopped(self, key: str) -> bool:
-        """Whether ``key`` is in the STOPPED phase (a content or infra STOP not yet re-armed). The
-        runner's scheduler reads it so a window park never turns a STOP into a PAUSE. False for an
-        unknown lane."""
+        """Whether ``key`` is in the STOPPED phase (a STOP not yet re-armed). The runner reads it before
+        a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm. False
+        for an unknown lane."""
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.STOPPED
 
