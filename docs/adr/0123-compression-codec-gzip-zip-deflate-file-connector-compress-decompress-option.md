@@ -85,6 +85,15 @@ carve-out (a client may import it, like `parsing/binary.py` / `parsing/x12`). Pu
 > deflate guard (BACKLOG #1977), which stops at the end of its stream instead, because DICOM pads an
 > odd-length stream with one NUL.
 
+> **Amendment 2026-09-26 (BACKLOG #1978): `deflate_decompress_with_tail` returns what follows the
+> stream.** The #1964 amendment above told a Handler to strip a trailer before inflating. That is not
+> safe. Only the inflater knows where the stream ends, and a stream's last byte is a checksum byte
+> that can itself be a CR or LF, so stripping a PDF stream's end-of-line truncates that stream. The
+> new `deflate_decompress_with_tail(data, *, max_output_bytes) -> tuple[bytes, bytes]` returns the
+> inflated body and every byte after the end of the stream, unread. It runs the same shared loop
+> under the same ceiling, and a corrupt, truncated or over-ceiling stream still raises
+> `CompressionError`. `deflate_decompress` stays strict, so a caller has to ask for the tail by name.
+
 **Determinism (re-run purity).** `gzip_compress` fixes `mtime=0` in the header so the output is a pure
 function of `(data, level)` — a gzipping Handler stays re-run-stable. `zip_compress` fixes each entry's
 ZIP date to a constant. This is the load-bearing correctness point, not a nicety.

@@ -853,7 +853,9 @@ ceiling to what the IDE row feeds it. The second covers content from any row:
 - **Unpacking a payload.** When a Router or Handler parses a Deflated DICOM Part-10 payload,
   `guard_part10_deflate` caps the inflate at `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB, with no setting.
   For a Handler that unpacks content itself, the engine offers `gzip_decompress`,
-  `deflate_decompress` and `zip_decompress` (`parsing/compression.py`, [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)).
+  `deflate_decompress`, `deflate_decompress_with_tail` and `zip_decompress` (`parsing/compression.py`, [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)).
+  `deflate_decompress_with_tail` is for a stream with other data after it, and returns that data
+  unread beside the body; its ceiling bounds the one stream.
   Each takes `max_output_bytes` as a required keyword with no default, so the Handler author must
   choose the ceiling. Passing `None` removes it, and has to be written out. `zip_decompress` also caps
   the member count at `max_entries`, default 1024, and refuses the whole archive when one member's
