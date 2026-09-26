@@ -14,25 +14,33 @@ connection committed the half-body with its own work:
 * on a keyed (AES-GCM) store, ``close()`` alone committed the half-body, because its first act is
   the invocation-bound settlement write.
 
-The fix is :func:`messagefoundry.store.store._writer_txn`. ``tests/test_backlog1548_writer_txn_
-cancel_unwind.py`` covers ``route_handoff`` and ``ingress_handoff``. This file adds at least
-``transform_handoff``, the fused ADR 0057 ``handoff`` and ``enqueue_ingress``, on the inline path
-(group commit off, the default), plus the keyed ``close()`` case. It reuses that file's ``_Trap``,
-cancel-point names, fixtures and connection-clean probe rather than a second copy of any of them.
-The delivery-side grouped writers and the group-commit arms of these handoffs are NOT covered here.
+The fix is :func:`messagefoundry.store.store._writer_txn`.
+``tests/test_backlog1548_writer_txn_cancel_unwind.py`` covers ``route_handoff`` and
+``ingress_handoff``. This file adds ``transform_handoff``, the fused ADR 0057 ``handoff`` and
+``enqueue_ingress``, plus the keyed ``close()`` case. It reuses that file's ``_Trap``, cancel-point
+names, fixtures and connection-clean probe rather than a second copy of any of them.
+
+What this file does NOT cover includes at least: the group-commit arms of ``transform_handoff`` and
+``enqueue_ingress`` (the fused ``handoff`` takes ``_writer_txn`` directly, so it has none); a second
+cancellation landing inside the rollback; ``enqueue_ingress``'s ``attachment_refs`` incref path;
+``transform_handoff``'s pass-through, ``SetMeta`` and declined branches; and the delivery-side
+grouped writers.
 
 Each failure arm reads the durable state through a SECOND, read-only ``sqlite3`` connection. That
 connection sees only committed rows, so it cannot be fooled by the writer connection's own view of
 its uncommitted work.
 
-The POSITIVE CONTROLS at the end matter. Both probes this file relies on, the next short writer and
-``close()``'s settlement, are shown to commit a transaction deliberately left open. Without that, a
-clean result could mean the probe never wrote at all.
+The keyed POSITIVE CONTROL at the end is load-bearing. In the keyed-close test nothing checks
+``in_transaction`` before ``close()``, so the durable read is the only check, and it means something
+only if ``close()``'s settlement really would commit an open transaction. The control shows it does.
+The next-writer control documents the same mechanism for the probe the unkeyed tests run; there the
+``in_transaction`` assertion fails first, so that probe is a second line rather than the only one.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import sqlite3
 from collections.abc import Callable, Coroutine, Iterator
 from contextlib import contextmanager
@@ -120,7 +128,12 @@ async def _fail(call: Callable[[], Coroutine[Any, Any, Any]], trap: _Trap, arm: 
         reached.cancel()
         await task
         pytest.fail("the call completed without reaching the armed cancel point")
-    assert reached in done, "the call never reached the armed cancel point"
+    if reached not in done:
+        # Timed out. Cancel both so a stuck call cannot keep the writer lock and hang close().
+        for pending in (task, reached):
+            pending.cancel()
+        await asyncio.gather(task, reached, return_exceptions=True)
+        pytest.fail("the call never reached the armed cancel point")
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -160,6 +173,10 @@ def _outbound_rows(con: sqlite3.Connection, mid: str) -> int:
     )
 
 
+def _state_rows(con: sqlite3.Connection) -> int:
+    return int(_one(con, "SELECT COUNT(*) FROM state WHERE namespace=? AND key=?", STATE_KEY))
+
+
 def _assert_claim_survived(con: sqlite3.Connection, row_id: str) -> None:
     status = _one(con, "SELECT status FROM queue WHERE id=?", (row_id,))
     assert status is not None, "the failed handoff's guarded DELETE became durable -- work lost"
@@ -174,8 +191,7 @@ def _assert_transform_not_applied(path: Path, mid: str, routed_id: str) -> None:
     with _durable(path) as con:
         _assert_claim_survived(con, routed_id)
         assert _outbound_rows(con, mid) == 0, "an outbound row of the failed transform is durable"
-        state = _one(con, "SELECT COUNT(*) FROM state WHERE namespace=? AND key=?", STATE_KEY)
-        assert state == 0, "the failed transform's state write became durable"
+        assert _state_rows(con) == 0, "the failed transform's state write became durable"
 
 
 async def _assert_transform_recovers(store: MessageStore, path: Path, mid: str) -> None:
@@ -187,8 +203,7 @@ async def _assert_transform_recovers(store: MessageStore, path: Path, mid: str) 
     assert await _transform(store, mid, again.id)
     with _durable(path) as con:
         assert _outbound_rows(con, mid) == len(DELIVERIES)
-        state = _one(con, "SELECT COUNT(*) FROM state WHERE namespace=? AND key=?", STATE_KEY)
-        assert state == 1
+        assert _state_rows(con) == 1
     assert store._state_cache[STATE_KEY] == "v1"
 
 
@@ -322,7 +337,7 @@ def _persisted_invocations(path: Path) -> int:
     return int(rows[0][0])
 
 
-@pytest.mark.parametrize("handoff", ["route", "transform", "ingress"])
+@pytest.mark.parametrize("handoff", ["route", "fused", "transform", "ingress"])
 async def test_keyed_close_after_a_cancelled_handoff_commits_nothing(
     tmp_path: Path, handoff: str
 ) -> None:
@@ -330,8 +345,8 @@ async def test_keyed_close_after_a_cancelled_handoff_commits_nothing(
     on the writer connection. Straight after a cancelled handoff, that settlement must find no open
     transaction to commit.
 
-    The settlement is shown to have really committed: the persisted total drops from the reserved
-    block to the actual spend. So a clean result here is not a probe that never wrote."""
+    The settlement is shown to have really committed: the persisted total drops below the reserved
+    block. So a clean result here is not a probe that never wrote."""
     path = tmp_path / f"keyed-{handoff}.db"
     key = generate_key()
     store = await _open_keyed(path, key)
@@ -343,17 +358,22 @@ async def test_keyed_close_after_a_cancelled_handoff_commits_nothing(
         if handoff == "route":
             mid, row_id = await _prepare(store)
             trap = _Trap(store._db)
-            trap.arm(BODY)  # after the guarded ingress DELETE, before any routed row
-            call = lambda: _route(store, mid, row_id)  # noqa: E731
+            trap.arm(COMMIT)  # the whole body written: DELETE, routed row, disposition
+            call = functools.partial(_route, store, mid, row_id)
+        elif handoff == "fused":
+            mid, row_id = await _prepare(store)
+            trap = _InsertTrap(store._db, "INSERT INTO queue")
+            trap.arm(FIRST_INSERT)  # the DELETE and one of two outbound rows written
+            call = functools.partial(_fused, store, mid, row_id)
         elif handoff == "transform":
             mid, row_id = await _prepare_transform(store)
             trap = _InsertTrap(store._db, "INSERT INTO queue")
             trap.arm(FIRST_INSERT)  # one of two outbound rows written
-            call = lambda: _transform(store, mid, row_id)  # noqa: E731
+            call = functools.partial(_transform, store, mid, row_id)
         else:
             trap = _InsertTrap(store._db, "INSERT INTO messages")
             trap.arm(FIRST_INSERT)  # the message row written, its ingress row not yet
-            call = lambda: _ingress(store)  # noqa: E731
+            call = functools.partial(_ingress, store)
 
         reserved = _persisted_invocations(path)
         assert reserved >= GCM_RESERVE_BLOCK, "the open did not reserve a block to settle"
@@ -368,11 +388,15 @@ async def test_keyed_close_after_a_cancelled_handoff_commits_nothing(
     settled = _persisted_invocations(path)
     assert settled < reserved, "close() did not settle, so this proves nothing about its write"
 
-    if handoff == "route":
+    if handoff in ("route", "fused"):
         with _durable(path) as con:
             _assert_claim_survived(con, row_id)
-            routed = _one(con, "SELECT COUNT(*) FROM queue WHERE stage=?", (Stage.ROUTED.value,))
-            assert routed == 0
+            produced = _one(
+                con, "SELECT COUNT(*) FROM queue WHERE message_id=? AND id<>?", (mid, row_id)
+            )
+            assert produced == 0, "close() committed a row the cancelled handoff produced"
+            status = _one(con, "SELECT status FROM messages WHERE id=?", (mid,))
+            assert status == MessageStatus.RECEIVED.value
     elif handoff == "transform":
         _assert_transform_not_applied(path, mid, row_id)
     else:
@@ -381,11 +405,11 @@ async def test_keyed_close_after_a_cancelled_handoff_commits_nothing(
     # Reopen under the same key: the surviving rows still decrypt, and the interrupted work re-runs.
     store = await _open_keyed(path, key)
     try:
-        if handoff == "route":
+        if handoff in ("route", "fused"):
             assert await store.reset_stale_inflight(stage=Stage.INGRESS.value) >= 1
             again = await store.claim_next_fifo(CH, stage=Stage.INGRESS.value)
             assert again is not None and again.message_id == mid
-            assert await _route(store, mid, again.id)
+            assert await (_route if handoff == "route" else _fused)(store, mid, again.id)
             msg = await store.get_message(mid)
             assert msg is not None and msg["status"] == MessageStatus.ROUTED.value
         elif handoff == "transform":
