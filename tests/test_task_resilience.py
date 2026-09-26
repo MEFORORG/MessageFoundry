@@ -8,6 +8,7 @@ healthy."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
     Registry,
+    Send,
 )
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -327,3 +329,384 @@ async def test_every_per_lane_worker_repends_the_row_it_claimed(
             ev.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+# --- BACKLOG #1609: in pooled mode a dead stage claimer is respawned, and its stage keeps draining ---
+#
+# `pooled_claimers_per_stage` defaults to 1, so one claimer IS its whole stage. Measured 2026-09-11 by
+# injection: the INGRESS claimer died, nothing respawned it, five further messages were ACKed and all
+# sat at `received`, while `runner.running` and `dispatcher.running` read healthy.
+
+
+def _pooled_registry(inbox: Path, outdir: Path) -> Registry:
+    """Inbound 'IB' -> router 'r' -> handler 'h' -> outbound 'OB' (swapped for a collector)."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "IB",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 5.0},
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection("OB", ConnectionSpec(ConnectorType.FILE, {"directory": str(outdir)}))
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB", m))
+    return reg
+
+
+class _Collector:
+    """A recording outbound connector (non-capturing, so delivery marks the row done)."""
+
+    def __init__(self) -> None:
+        self.deliveries: list[str] = []
+
+    async def send(self, payload: str) -> None:
+        self.deliveries.append(payload)
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _hl7(control_id: str) -> bytes:
+    return f"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|{control_id}|P|2.5.1\r".encode()
+
+
+async def _inflight_rows(store: MessageStore) -> int:
+    cur = await store._db.execute("SELECT COUNT(*) AS c FROM queue WHERE status='inflight'")
+    return int((await cur.fetchone())["c"])
+
+
+async def _delivered_count(store: MessageStore) -> int:
+    return int((await store.stats()).get("done", 0))
+
+
+async def _start_runner(
+    tmp_path: Path, claim_mode: str
+) -> tuple[MessageStore, RegistryRunner, _Collector]:
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    outdir.mkdir()
+    store = await MessageStore.open(tmp_path / f"{claim_mode}.db")
+    runner = RegistryRunner(
+        _pooled_registry(inbox, outdir),
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        pooled_sweep_interval=0.05,
+    )
+    await runner.start()
+    collector = _Collector()
+    runner._destinations["OB"] = collector  # type: ignore[assignment]
+    return store, runner, collector
+
+
+def _kill_next_claims(
+    dispatcher: Any, monkeypatch: pytest.MonkeyPatch, times: int
+) -> dict[str, int]:
+    """Make the next ``times`` claim round-trips on ``dispatcher`` kill its claimer task.
+
+    The raise lands in ``_spawn_serializer``, which runs in the claimer's post-claim bookkeeping
+    AFTER ``claim_fifo_heads`` committed -- so the dying claimer leaves the lane reserved and its
+    rows INFLIGHT, the worst shape a claimer death can leave behind. Patched on ONE dispatcher
+    instance, so no other stage's claimer can take the injection."""
+    fired = {"n": 0}
+    real = dispatcher._spawn_serializer
+
+    def dying(lane: str, items: Any) -> None:
+        if fired["n"] < times:
+            fired["n"] += 1
+            raise RuntimeError("injected claimer death after a committed claim")
+        real(lane, items)
+
+    monkeypatch.setattr(dispatcher, "_spawn_serializer", dying)
+    return fired
+
+
+async def test_pooled_dead_ingress_claimer_is_respawned_and_its_stage_drains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Pin the capture on the dispatcher's own logger: a root level above ERROR filtered these
+    # records out of an earlier probe, which then passed without seeing the line it asserted on.
+    caplog.set_level(logging.ERROR, logger="messagefoundry.pipeline.stage_dispatcher")
+    store, runner, collector = await _start_runner(tmp_path, "pooled")
+    try:
+        dispatcher = runner._dispatchers[Stage.INGRESS]
+        first = dispatcher._claimers[0].task
+        assert first is not None and not first.done()
+        fired = _kill_next_claims(dispatcher, monkeypatch, times=1)
+
+        ib = runner.registry.inbound["IB"]
+        await runner._handle_inbound(ib, _hl7("M1609A"))  # its claim kills the claimer
+        await _until(first.done, timeout=5.0)
+        assert fired["n"] == 1 and first.exception() is not None  # the injection really killed it
+
+        # A replacement claimer is live, and the supervisor said so.
+        def _replaced() -> bool:
+            task = dispatcher._claimers[0].task
+            return task is not None and task is not first and not task.done()
+
+        await _until(_replaced, timeout=5.0)
+        assert "exited unexpectedly; respawning" in caplog.text
+
+        # A message enqueued AFTER the death reaches its outbound, and so does the one whose claim
+        # killed the claimer: its INFLIGHT row was released, not stranded until a restart.
+        await runner._handle_inbound(ib, _hl7("M1609B"))
+
+        async def _both_delivered() -> bool:
+            return await _delivered_count(store) >= 2
+
+        await _until_async(_both_delivered, timeout=10.0)
+        # In ORDER: had the replacement claimed before releasing, M1609B would overtake M1609A.
+        assert [p.split("|")[9] for p in collector.deliveries] == ["M1609A", "M1609B"]
+        assert await _inflight_rows(store) == 0
+        assert runner.degraded_stages() == {}  # recovered, so nothing is reported degraded
+    finally:
+        await runner.stop()
+        await store.close()
+
+
+async def test_pooled_claimer_death_shows_on_status_while_the_respawn_is_backing_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement that dies at once is not respawned in a spin: the second respawn backs off,
+    and for that whole window the stage reads degraded instead of healthy."""
+    from messagefoundry.pipeline import stage_dispatcher
+
+    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_BACKOFF_BASE_SECONDS", 60.0)
+    store, runner, _collector = await _start_runner(tmp_path, "pooled")
+    try:
+        dispatcher = runner._dispatchers[Stage.INGRESS]
+        fired = _kill_next_claims(dispatcher, monkeypatch, times=2)
+        assert runner.degraded_stages() == {}
+
+        await runner._handle_inbound(runner.registry.inbound["IB"], _hl7("M1609C"))
+        await _until(lambda: fired["n"] == 2, timeout=5.0)  # the first replacement died too
+        await _until(lambda: dispatcher.respawns == 2, timeout=5.0)
+
+        degraded = runner.degraded_stages()
+        assert set(degraded) == {"ingress"}, degraded
+        assert "claimer-0" in degraded["ingress"] and "RuntimeError" in degraded["ingress"]
+        # The second replacement is live but WAITING, not claiming: no third death in the window.
+        replacement = dispatcher._claimers[0].task
+        assert replacement is not None and not replacement.done()
+        await asyncio.sleep(0.3)
+        assert fired["n"] == 2 and dispatcher.respawns == 2
+        # The runner still reads running -- which is exactly why the degraded surface must exist.
+        assert runner.running
+        # The waiting replacement never got to release M1609C's claimed row. A stop in that window
+        # releases it itself, rather than leaving it in flight until the next start.
+        assert await _inflight_rows(store) >= 1
+        await runner.stop()
+        assert await _inflight_rows(store) == 0
+    finally:
+        await runner.stop()
+        await store.close()
+
+
+class _LaneStore:
+    """A minimal in-memory queue for driving one ``StageDispatcher`` directly: one pending row per
+    lane, claim moves rows to inflight, ``release_claimed`` moves them back. ``events`` records the
+    order of claims and releases, which is what the FIFO argument is about."""
+
+    def __init__(self, lanes: list[str]) -> None:
+        self.pending: dict[str, list[str]] = {lane: [f"{lane}-1"] for lane in lanes}
+        self.inflight: set[str] = set()
+        self.events: list[tuple[str, list[str]]] = []
+
+    async def claim_fifo_heads(
+        self, stage: str, lanes: Any, now: float | None = None, *, per_lane_limit: int = 1
+    ) -> Any:
+        from messagefoundry.store import ClaimedHeads
+
+        by_lane: dict[str, list[OutboxItem]] = {}
+        for lane in lanes:
+            if self.pending.get(lane):
+                row = self.pending[lane].pop(0)
+                self.inflight.add(row)
+                by_lane[lane] = [
+                    OutboxItem(
+                        id=row,
+                        message_id=row,
+                        channel_id=lane,
+                        destination_name=None,
+                        payload="x",
+                        attempts=1,
+                        stage=stage,
+                    )
+                ]
+        self.events.append(("claim", list(lanes)))
+        return ClaimedHeads(by_lane=by_lane, rearm=frozenset())
+
+    async def release_claimed(self, ids: Any, now: float | None = None) -> None:
+        ids = list(ids)
+        self.events.append(("release", ids))
+        for row in ids:
+            if row in self.inflight:
+                self.inflight.discard(row)
+                self.pending[row.rsplit("-", 1)[0]].insert(0, row)
+
+    async def list_fifo_lanes(self, *a: Any, **k: Any) -> list[tuple[str, float]]:
+        return []
+
+
+def _dispatcher(store: _LaneStore, lanes: list[str], processed: list[str]) -> Any:
+    from messagefoundry.pipeline.stage_dispatcher import (
+        LaneItemResult,
+        LaneResultKind,
+        StageDispatcher,
+    )
+
+    async def process(lane: str, item: OutboxItem) -> LaneItemResult:
+        store.inflight.discard(item.id)
+        processed.append(item.id)
+        return LaneItemResult(LaneResultKind.RESOLVED)
+
+    return StageDispatcher(
+        Stage.INGRESS,
+        store,  # type: ignore[arg-type]
+        process_item=process,
+        lane_provider=lambda: set(lanes),
+        per_lane_limit=1,
+        sweep_interval=10.0,
+    )
+
+
+async def test_a_claimer_that_dies_mid_chunk_releases_exactly_the_lanes_it_had_not_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three lanes in one claim; the claimer dies spawning the SECOND lane's serializer. The first
+    lane was dispatched and finishes on its own; the second (PROCESSING, no task) and the third
+    (still CLAIMING) are the abandoned set. Their rows, and only theirs, are released -- and the
+    release lands BEFORE the replacement's next claim."""
+    lanes = ["A", "B", "C"]
+    store = _LaneStore(lanes)
+    processed: list[str] = []
+    d = _dispatcher(store, lanes, processed)
+    spawns = {"n": 0}
+    real = d._spawn_serializer
+
+    def die_on_second(lane: str, items: Any) -> None:
+        spawns["n"] += 1
+        if spawns["n"] == 2:
+            raise RuntimeError("injected death mid-chunk")
+        real(lane, items)
+
+    monkeypatch.setattr(d, "_spawn_serializer", die_on_second)
+    await d.start()
+    try:
+        await _until(lambda: len(processed) == 3, timeout=5.0)
+        first_claim = store.events[0]
+        assert first_claim[0] == "claim" and sorted(first_claim[1]) == lanes
+        # The release names the rows of the lanes after the one that was dispatched, exactly.
+        assert store.events[1] == ("release", [f"{lane}-1" for lane in first_claim[1][1:]])
+        assert store.events[2][0] == "claim"  # and only then does the replacement claim
+        assert sorted(processed) == ["A-1", "B-1", "C-1"]  # each row once, none lost or doubled
+        assert d.respawns == 1 and d.busy_violations == 0
+        await _until(lambda: d.slots_free == d._max_processing_lanes, timeout=2.0)
+    finally:
+        await d.stop()
+
+
+async def test_a_claimer_that_keeps_dying_backs_off_and_never_resets_to_an_immediate_respawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every claim kills the claimer. The respawn delays climb and hold at the cap; none of them
+    returns to an immediate respawn while the deaths keep coming, and the fault stays reported."""
+    from messagefoundry.pipeline import stage_dispatcher
+
+    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_BACKOFF_BASE_SECONDS", 0.01)
+    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_BACKOFF_CAP_SECONDS", 0.04)
+    # A stable window just above the cap. The window must count HEALTHY running, not time since the
+    # spawn: measured from the spawn, the capped wait alone would pass it and reset the streak.
+    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_STABLE_SECONDS", 0.05)
+    store = _LaneStore(["L"])
+    d = _dispatcher(store, ["L"], [])
+    delays: list[float] = []
+    real_spawn_task = d._spawn_task
+
+    def record(index: Any, *, delay: float = 0.0) -> None:
+        delays.append(delay)
+        real_spawn_task(index, delay=delay)
+
+    def always_die(lane: str, items: Any) -> None:
+        raise RuntimeError("injected death on every claim")
+
+    monkeypatch.setattr(d, "_spawn_task", record)
+    await d.start()
+    monkeypatch.setattr(d, "_spawn_serializer", always_die)
+    d.mark_ready("L")
+    try:
+        await _until(lambda: d.respawns >= 7, timeout=5.0)
+        respawn_delays = delays[2:]  # the first two are start()'s claimer and sweep
+        assert respawn_delays[0] == 0.0  # the first respawn is immediate, like per_lane
+        assert respawn_delays[1:6] == [0.01, 0.02, 0.04, 0.04, 0.04], respawn_delays
+        assert d.claimer_faults, "a claimer that keeps dying must keep reading degraded"
+    finally:
+        await d.stop()
+    assert store.inflight == set()  # stop released whatever the last replacement had not
+
+
+async def test_status_names_a_pooled_stage_whose_claimer_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same death, read through ``GET /status`` -- the route the console's nav heart polls."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.auth import Role
+    from messagefoundry.auth.identity import ALL_CHANNELS
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.pipeline import Engine, stage_dispatcher
+
+    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_BACKOFF_BASE_SECONDS", 60.0)
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    outdir.mkdir()
+    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine.add_registry(_pooled_registry(inbox, outdir))
+    try:
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        pw = "Viewer-pw-1609-long-enough"
+        uid = await service.create_local_user(
+            username="vw",
+            password=pw,
+            display_name=None,
+            email=None,
+            roles=[Role.VIEWER.value],
+            actor="test",
+        )
+        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
+        u = await service.store.get_user(uid)
+        assert u is not None and u.password_hash is not None
+        await service.store.set_password(
+            uid, password_hash=u.password_hash, must_change_password=False
+        )
+        await engine.start()
+        runner = engine.registry_runner
+        assert runner is not None
+        dispatcher = runner._dispatchers[Stage.INGRESS]
+        fired = _kill_next_claims(dispatcher, monkeypatch, times=2)
+
+        transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.post(
+                "/auth/login", json={"username": "vw", "password": pw, "provider": "local"}
+            )
+            headers = {"Authorization": f"Bearer {r.json()['token']}"}
+            before = (await c.get("/status", headers=headers)).json()["engine"]
+            assert before["stages_degraded"] == {}
+
+            await runner._handle_inbound(runner.registry.inbound["IB"], _hl7("M1609D"))
+            await _until(lambda: fired["n"] == 2 and dispatcher.respawns == 2, timeout=5.0)
+            after = (await c.get("/status", headers=headers)).json()["engine"]
+        assert set(after["stages_degraded"]) == {"ingress"}, after
+        assert "claimer-0" in after["stages_degraded"]["ingress"]
+    finally:
+        await engine.stop()

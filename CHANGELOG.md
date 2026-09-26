@@ -108,6 +108,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
+  stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
+  stage stopped draining while intake kept acknowledging, and the engine still read healthy. The
+  dispatcher now restarts a dead claimer or sweep task on the same lanes. The new claimer first
+  returns any rows the dead one had claimed but not dispatched, so a lane's next message cannot
+  overtake them. A task that keeps dying backs off instead of spinning. Until the new task is
+  running, `GET /status` names the stage in `engine.stages_degraded`, and the web console's health
+  heart reads down. (`BACKLOG #1609`)
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
   `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other

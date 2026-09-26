@@ -5749,6 +5749,9 @@ def create_app(
                 channels_failed_names=[
                     name for name in failed_in if _user.can_access_channel(name)
                 ],
+                # BACKLOG #1609: a pooled stage whose claimer/sweep died reads healthy everywhere
+                # else, so it is named here for the console's nav heart.
+                stages_degraded=rr.degraded_stages() if rr is not None else {},
             ),
             kpis=kpis,
             db=DbInfo(
