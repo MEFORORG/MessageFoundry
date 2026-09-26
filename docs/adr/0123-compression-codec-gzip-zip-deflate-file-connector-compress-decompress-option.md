@@ -70,7 +70,8 @@ carve-out (a client may import it, like `parsing/binary.py` / `parsing/x12`). Pu
 > stream.** Its loop never checked for the end of the stream, so a multi-round stream followed by one
 > extra byte looped forever. A short one returned and dropped the extra bytes without a word. Both now
 > raise `CompressionError`. Stdlib `zlib.decompress` ignores such bytes, so a Handler that expects a
-> trailer, such as the end-of-line after a PDF stream, must strip it first. `gzip_decompress` keeps the
+> trailer, such as the end-of-line after a PDF stream, must strip it first. *(That advice is
+> withdrawn by the BACKLOG #1978 amendment below: stripping can truncate the stream.)* `gzip_decompress` keeps the
 > stdlib gzip rule: it reads further members, accepts NUL padding, and refuses anything else.
 
 > **Amendment 2026-09-26 (BACKLOG #1976): `zip_decompress` refuses bytes before or after the
