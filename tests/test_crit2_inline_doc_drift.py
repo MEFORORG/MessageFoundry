@@ -21,6 +21,7 @@ Synthetic only; no store, no I/O beyond reading the shipped source/doc files.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import os
 import warnings
@@ -107,14 +108,66 @@ def test_inline_config_default_is_off() -> None:
     assert factory_default is False  # the connections-authoring factory default matches
 
 
+def _wiring(source: str) -> tuple[bool, bool]:
+    """``(awaits self.store.handoff(...), _recompute_inline_ok reads ic.inline)``, read from CODE.
+
+    An AST walk, not a substring scan (BACKLOG #1818). ``wiring_runner.py`` also names ``ic.inline``
+    in a comment, so deleting the real read inside ``_recompute_inline_ok`` left the old scan green.
+    """
+    tree = ast.parse(source)
+    awaits_handoff = any(
+        isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "handoff"
+        and isinstance(node.value.func.value, ast.Attribute)
+        and node.value.func.value.attr == "store"
+        for node in ast.walk(tree)
+    )
+    gates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_recompute_inline_ok"
+    ]
+    reads_knob = len(gates) == 1 and any(
+        isinstance(node, ast.Attribute)
+        and node.attr == "inline"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "ic"
+        for node in ast.walk(gates[0])
+    )
+    return awaits_handoff, reads_knob
+
+
 def test_inline_fast_path_is_wired_not_dead_code() -> None:
     """Doc-drift / dead-code tripwire: the inline fast-path IS reached from the live pipeline — the
-    router worker calls `self.store.handoff(` and the eligibility cache ANDs in `ic.inline`. If this
-    wiring is ever removed the fast-path becomes dead code and the corrected docs go stale again."""
+    router worker awaits `self.store.handoff(...)` and the eligibility gate `_recompute_inline_ok`
+    ANDs in `ic.inline`. If this wiring is ever removed the fast-path becomes dead code and the
+    corrected docs go stale again."""
     src = (_REPO / "messagefoundry" / "pipeline" / "wiring_runner.py").read_text(encoding="utf-8")
-    assert "await self.store.handoff(" in src  # the fused CF commit, wiring_runner.py:4084
-    assert "def _recompute_inline_ok(" in src  # the per-inbound eligibility gate
-    assert "ic.inline" in src  # the config knob is ANDed into inline_ok (default False => off)
+    awaits_handoff, reads_knob = _wiring(src)
+    assert awaits_handoff, "no `await self.store.handoff(...)` call: the fused CF commit is gone"
+    assert reads_knob, "`_recompute_inline_ok` no longer reads `ic.inline` (default False => off)"
+
+
+def test_wiring_probe_ignores_mentions() -> None:
+    """The probe above reads code only: mentions are ABSENT, the real constructs PRESENT."""
+    mention = (
+        '"""The router worker calls await self.store.handoff( and ANDs in ic.inline."""\n'
+        "class Runner:\n"
+        "    def _recompute_inline_ok(self):\n"
+        "        # inline_ok = ic.inline and ...\n"
+        '        return "await self.store.handoff("\n'
+    )
+    assert _wiring(mention) == (False, False)
+    real = (
+        "class Runner:\n"
+        "    def _recompute_inline_ok(self):\n"
+        "        return [ic.inline for ic in self.inbounds]\n"
+        "    async def worker(self):\n"
+        "        await self.store.handoff(row)\n"
+    )
+    assert _wiring(real) == (True, True)
 
 
 def test_adr_0057_does_not_claim_unwired() -> None:
