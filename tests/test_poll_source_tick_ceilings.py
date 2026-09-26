@@ -18,8 +18,11 @@ the acts that could re-grade 2.4.1 are the owner's.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import posixpath
+import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -802,3 +805,149 @@ async def test_a_negative_ceiling_is_refused_at_build_on_every_poll_source(
         _remote_source(monkeypatch, _FakeRemoteClient({}), poll_max_files=-1)
     with pytest.raises(ValueError, match="positive number of items per poll"):
         _db_source(poll_max_rows=-1)
+
+
+# === the security record ======================================================
+#
+# ``docs/SECURITY.md``'s Ingest plane row is the operator-facing statement of this control. It drifted
+# once already: after PR 948 renamed the knob it still named ``max_files_per_poll`` at 1000 and called
+# the Database poll uncovered (BACKLOG #1518). The guard lives HERE, beside the behaviour it describes,
+# so a rename of the knob or a change of the default reds the doc check in the same module as the tests
+# that measure the ceiling. Everything it compares against is read from the code: the knob names from
+# the factory signatures, the default from ``DEFAULT_MAX_ITEMS_PER_POLL``.
+
+_SECURITY_DOC = Path(__file__).resolve().parent.parent / "docs" / "SECURITY.md"
+
+#: The four factories that take a per-tick ceiling. Listed, because "is a poll source" is a judgment;
+#: the KNOB each one takes is derived below rather than listed.
+_POLL_FACTORIES: tuple[Callable[..., Any], ...] = (File, Sftp, Ftp, DatabasePoll)
+
+#: The row's dated correction note describes the RETIRED knob and default on purpose. It sits at the
+#: end of item (2), directly before the "not covered" clause, and is cut out before the row's live
+#: claims are read -- otherwise the note would trip the retired-knob check it exists to explain.
+_CORRECTION_NOTE = re.compile(
+    r"\*Corrected \d{4}-\d{2}-\d{2}, BACKLOG #1518:\*.*?(?=\*\*Still not covered even when set:\*\*)",
+    re.DOTALL,
+)
+
+#: A backticked name shaped like a poll-ceiling knob in either word order (``poll_max_files``,
+#: ``max_files_per_poll``). Every one the row names must be a knob a factory really takes.
+_KNOB_SHAPED = re.compile(r"`([a-z_]*(?:max[a-z_]*poll|poll[a-z_]*max)[a-z_]*)`")
+
+_NOT_COVERED = "**Still not covered even when set:**"
+
+
+def _ingest_row() -> str:
+    doc = _SECURITY_DOC.read_text(encoding="utf-8")
+    return next(line for line in doc.splitlines() if line.startswith("| **Ingest plane**"))
+
+
+def _poll_ceiling_knobs() -> dict[str, str]:
+    """``{factory name: its per-tick ceiling knob}``, read from the signatures.
+
+    Exactly one ``poll_max_*`` parameter per factory, or this fails: a rename that dropped the prefix
+    would otherwise empty the set and let every check below pass vacuously."""
+    knobs: dict[str, str] = {}
+    for factory in _POLL_FACTORIES:
+        found = [n for n in inspect.signature(factory).parameters if n.startswith("poll_max_")]
+        assert len(found) == 1, (
+            f"{factory.__name__}() takes {found} as its poll ceiling; expected exactly one "
+            "poll_max_* parameter. Re-derive this guard against the new name."
+        )
+        knobs[factory.__name__] = found[0]
+    return knobs
+
+
+def _poll_row_complaints(row: str, knobs: dict[str, str], default: int) -> list[str]:
+    """Every way ``row`` contradicts the shipped poll ceiling. Empty means the row agrees.
+
+    A pure function of its inputs, so the planted-wording control below can prove each check fires."""
+    live = _CORRECTION_NOTE.sub("", row)
+    complaints: list[str] = []
+    if "BACKLOG #1518:*" in live:
+        complaints.append(
+            "the #1518 correction note no longer ends right before the 'not covered' clause, so it "
+            "cannot be told apart from the row's live claims"
+        )
+    live_knobs = set(knobs.values())
+    for name in sorted(set(_KNOB_SHAPED.findall(live)) - live_knobs):
+        complaints.append(f"the row names `{name}`, which no poll factory takes")
+    for factory, knob in sorted(knobs.items()):
+        if f"`{knob}`" not in live:
+            complaints.append(f"the row does not name `{knob}`, the ceiling {factory}() takes")
+    # The numbers stated after any knob-shaped name, live or stale, up to the end of its sentence or
+    # table cell. Two digits or more, so a "0 disables it" mention never reads as a stated default.
+    stated = {
+        int(n)
+        for m in re.finditer(_KNOB_SHAPED.pattern + r"(.*?)(?:\.\s|\||$)", live)
+        for n in re.findall(r"\b(\d{2,})\b", m.group(2))
+    }
+    if stated != {default}:
+        complaints.append(
+            f"the row states {sorted(stated)} beside the ceiling; the code ships {default}"
+        )
+    if _NOT_COVERED in live:
+        clause = re.split(r"\.\s", live.split(_NOT_COVERED, 1)[1], maxsplit=1)[0]
+        if "Database" in clause:
+            complaints.append(
+                "the row lists the Database poll as uncovered; DatabasePoll() takes a ceiling"
+            )
+    for phrase, why in (
+        ("finished, not candidates seen", "that the ceiling counts work finished, not candidates"),
+        ("deferred, not refused", "that the excess is deferred, not refused"),
+        ("refused when the connection is built", "that a bad value is refused before start"),
+    ):
+        if phrase not in live:
+            complaints.append(f"the row no longer says {why} ({phrase!r})")
+    return complaints
+
+
+def test_the_security_ingest_row_agrees_with_the_shipped_poll_ceiling() -> None:
+    """The SECURITY.md Ingest plane row names the real knobs, the real default and the Database
+    source, and keeps the three behaviours an operator relies on: work finished is what counts, the
+    excess waits for a later tick, and a bad value is refused before the connection starts.
+
+    Those three behaviours are measured earlier in this module, not here -- by
+    ``test_file_stuck_files_do_not_charge_the_ceiling``, the ``*_second_*_drains_*`` tests and
+    ``test_a_negative_ceiling_is_refused_at_build_on_every_poll_source``. This test holds the prose to
+    them. It restores the guard withdrawn from ``tests/test_dicom_association_intake_bound.py`` when
+    PR 948 renamed the knob (BACKLOG #1518)."""
+    knobs = _poll_ceiling_knobs()
+    for factory in _POLL_FACTORIES:
+        knob = knobs[factory.__name__]
+        assert inspect.signature(factory).parameters[knob].default == DEFAULT_MAX_ITEMS_PER_POLL, (
+            f"{factory.__name__}({knob}=...) defaults to a different number than the connector "
+            "constant, so the doc cannot state one default for both"
+        )
+    complaints = _poll_row_complaints(_ingest_row(), knobs, DEFAULT_MAX_ITEMS_PER_POLL)
+    assert not complaints, "docs/SECURITY.md Ingest plane row: " + "; ".join(complaints)
+
+
+def test_the_poll_row_guard_fires_on_the_wording_it_replaced() -> None:
+    """Proves the guard above can fail, by feeding it the item (2) wording #1518 replaced.
+
+    Each of that wording's errors must be seen: the retired knob, the missing live knobs, the wrong
+    default, and the Database poll listed as uncovered."""
+    retired = (
+        "(2) `max_files_per_poll` bounds one **poll tick** on the `File`, `Sftp` and `Ftp` sources, "
+        "and it **ships ON** (1000) -- the opposite default, deliberately, because those sources have "
+        "no sender to back-pressure and the excess is **deferred to the next tick, never refused**: the "
+        "files stay where they are and a later tick takes them, so a guessed number costs latency, "
+        "never a message. **Still not covered even when set:** the **Database poll** source (its "
+        "`fetchall` has no row ceiling), any **per-message** bound on the DICOM SCP."
+    )
+    knobs = _poll_ceiling_knobs()
+    complaints = " ".join(_poll_row_complaints(retired, knobs, DEFAULT_MAX_ITEMS_PER_POLL))
+    for expected in (
+        "`max_files_per_poll`, which no poll factory takes",
+        "does not name `poll_max_files`",
+        "does not name `poll_max_rows`",
+        "the row states [1000]",
+        "Database poll as uncovered",
+    ):
+        assert expected in complaints, f"the guard missed {expected!r}; it reported: {complaints}"
+    # A misplaced correction note must not silently exempt the rest of the row from the checks.
+    misplaced = _ingest_row().replace(_NOT_COVERED, "**Not covered:**")
+    assert "correction note no longer ends" in " ".join(
+        _poll_row_complaints(misplaced, knobs, DEFAULT_MAX_ITEMS_PER_POLL)
+    )

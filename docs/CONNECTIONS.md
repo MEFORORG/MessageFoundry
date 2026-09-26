@@ -2970,7 +2970,9 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 
 The three **poll** sources — `File(...)`, `Sftp(...)`/`Ftp(...)` and `DatabasePoll(...)` — each take at
 most **500 items per tick** (`poll_max_files`, `poll_max_rows`). The ceiling **ships on**, and `None` or `0`
-(in any spelling, including the text `"0"`) turns it off.
+(in any spelling, including the text `"0"`) turns it off. A negative or non-numeric value is refused when
+the connection is built, so a typo fails `messagefoundry check` instead of leaving a source that reports
+running and takes nothing.
 
 **It is a deferral, not a drop.** A file the scan does not reach is still in the drop directory; a row
 the poll does not fetch is still in the table, unmarked. The next tick takes it. Nothing is quarantined,
