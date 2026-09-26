@@ -23,8 +23,8 @@ carries a ready-to-return negative ack — no separate ack builder needed.
 (potential PHI) in its raw error string. This module **never** surfaces that: each
 :class:`X12SegmentError` carries only structural locators — the error code, the segment/element id, a
 schema-label *type name*, and the line/position — never the input value. The full interchange goes only
-to the secured store (CLAUDE.md §9). The pyx12 logger (which logs the raw, value-bearing strings at
-ERROR) is silenced for the duration of the validation pass.
+to the secured store (CLAUDE.md §9). The pyx12 logger tree (which logs the raw, value-bearing strings
+at ERROR) is muted from the first validation pass on, and never unmuted.
 
 Pure: no I/O to disk/network, no engine imports. ``pyx12``'s sole runtime dependency is ``defusedxml``
 (already in tree), used to parse its bundled, trusted map XML — not attacker input.
@@ -35,8 +35,6 @@ from __future__ import annotations
 import io
 import json
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,24 +74,57 @@ class X12ValidationResult:
     ack_transaction: str | None = None
 
 
-@contextmanager
-def _silence_pyx12_logger() -> Iterator[None]:
-    """Suppress pyx12's own logging during a pass. pyx12 logs each violation's *raw* error string —
-    which embeds the offending data value (potential PHI) — at ERROR, from child loggers under the
-    ``pyx12`` tree (e.g. ``pyx12.error_handler``). We extract our own value-free errors from pyx12's
-    structured JSON instead, so the whole ``pyx12.*`` tree is muted for the duration.
+#: The one handler the ``pyx12`` logger tree ends at. A single module-level instance, because
+#: ``Logger.addHandler`` skips a handler already attached, under logging's own lock.
+_PYX12_SINK = logging.NullHandler()
+#: Above CRITICAL, so a logger at this level builds no record at all.
+_MUTED = logging.CRITICAL + 1
 
-    Raising the ``pyx12`` parent logger's level above CRITICAL suppresses the children too: they sit at
-    NOTSET and inherit the parent's effective level, so their ERROR records are dropped at the source
-    (before any handler/propagation) — without touching the global ``logging.disable`` or other
-    loggers. The previous level is restored afterward, even on exception."""
-    logger = logging.getLogger("pyx12")
-    previous = logger.level
-    logger.setLevel(logging.CRITICAL + 1)
-    try:
-        yield
-    finally:
-        logger.setLevel(previous)
+
+def _mute_pyx12_logger() -> None:
+    """Mute the whole ``pyx12`` logger tree, and never unmute it (BACKLOG #1603).
+
+    pyx12 logs each violation's *raw* error string, which embeds the offending data value (potential
+    PHI), at ERROR from child loggers such as ``pyx12.error_handler``. We build our own value-free
+    errors from pyx12's structured JSON instead, so nothing pyx12 logs is wanted anywhere.
+
+    **No restore step, on purpose.** The old context manager raised the level for one pass and put
+    the previous level back afterwards. Two overlapping passes on two threads would interleave: the
+    first to finish would unmute the logger while the second was still logging. No caller runs
+    passes concurrently today (a Handler calls :func:`validate` synchronously on its transform
+    worker). But the fix costs nothing: every call writes the same muted state, so concurrent calls
+    cannot disagree. Calling it on every pass, not once at import, also re-mutes a tree that a later
+    logging reconfiguration has reset.
+
+    Two layers, in this order:
+
+    1. The ``pyx12`` parent stops propagation and ends at a :class:`~logging.NullHandler` sink, so
+       no record from anywhere in the tree reaches the root logger's handlers, which feed the
+       general log. The sink goes on first: a record that meets no handler at all goes to
+       :data:`logging.lastResort`, which prints WARNING and above to stderr, and NSSM keeps stderr.
+    2. Every ``pyx12`` logger that exists now is set above CRITICAL, so it builds no record at all.
+       Setting only the parent is not enough: ``pyx12.error_997``, ``pyx12.error_999`` and
+       ``pyx12.error_html`` pin their own level to DEBUG at import. A logger created later inherits
+       the parent's level; one that pins itself later is still held by layer 1.
+
+    Layer 1 does not reach a handler someone attaches directly to a ``pyx12`` logger. Layer 2
+    covers that for every logger that exists when a pass starts, until something re-pins a
+    logger's level; the next pass mutes it again.
+
+    Only a logger not already muted is written, because ``setLevel`` clears every logger's cache
+    under logging's global lock. This mutes pyx12 for the whole process, including a Handler that
+    imports pyx12 itself. That is the intent under the PHI rule (CLAUDE.md section 9)."""
+    parent = logging.getLogger("pyx12")
+    parent.addHandler(_PYX12_SINK)
+    parent.propagate = False
+    # ``copy()`` rather than iterating the live dict: another thread may create a logger meanwhile.
+    for name, logger in logging.Logger.manager.loggerDict.copy().items():
+        if (
+            (name == "pyx12" or name.startswith("pyx12."))
+            and isinstance(logger, logging.Logger)
+            and logger.level != _MUTED
+        ):
+            logger.setLevel(_MUTED)
 
 
 def _ack_transaction(ack_text: str) -> str | None:
@@ -186,13 +217,13 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     fd_ack = io.StringIO()
     fd_json = io.StringIO()
 
-    with _silence_pyx12_logger():
-        try:
-            valid = bool(x12n_document(params, io.StringIO(text), fd_ack, None, None, fd_json))
-        except Exception as exc:  # pyx12 raises bare Exception/EngineError on unwalkable input
-            raise X12ValidationError(
-                "strict X12 validation could not run: the bytes are not a parseable X12 interchange"
-            ) from exc
+    _mute_pyx12_logger()
+    try:
+        valid = bool(x12n_document(params, io.StringIO(text), fd_ack, None, None, fd_json))
+    except Exception as exc:  # pyx12 raises bare Exception/EngineError on unwalkable input
+        raise X12ValidationError(
+            "strict X12 validation could not run: the bytes are not a parseable X12 interchange"
+        ) from exc
 
     raw_json = fd_json.getvalue()
     if not raw_json.strip():

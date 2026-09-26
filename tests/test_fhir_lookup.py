@@ -37,6 +37,7 @@ from messagefoundry.config.wiring import (
     WiringError,
     build_inbound_connection,
 )
+from messagefoundry.parsing import FhirPeekError
 from messagefoundry.pipeline import dryrun, wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, check_fhir_lookup_allowed
 from messagefoundry.store import MessageStatus
@@ -864,12 +865,16 @@ async def test_a_malformed_fhir_reply_is_a_lookup_error(exc: Exception) -> None:
 
 
 async def test_a_deeply_nested_fhir_reply_is_a_lookup_error() -> None:
-    # BACKLOG #1980: json.loads raises RecursionError on a deeply nested body, which the FHIR codec
-    # does not map. 200 KB is far under the read bound.
+    # BACKLOG #1980: json.loads raises RecursionError on a deeply nested body. FhirPeek maps it to
+    # FhirPeekError since BACKLOG #1600, so the RecursionError is one link down the chain; the
+    # lookup's own RecursionError arm stays as the guard if that mapping ever regresses. 200 KB is
+    # far under the read bound.
     ex, _ = _executor(body=b"[" * 200_000)
     with pytest.raises(FhirLookupError, match="unparseable") as err:
         await ex.read("epic", "Patient/123")
-    assert isinstance(err.value.__cause__, RecursionError)
+    cause = err.value.__cause__
+    assert isinstance(cause, FhirPeekError)
+    assert isinstance(cause.__cause__, RecursionError)
 
 
 async def test_a_timeout_the_read_raised_is_not_called_a_bridge_wait(

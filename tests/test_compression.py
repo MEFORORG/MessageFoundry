@@ -651,6 +651,152 @@ def test_zip_multi_round_member_with_trailing_bytes_ends() -> None:  # #1964
     _returns_within(call)
 
 
+# --- #1598: every zipfile failure is a CompressionError that names no member ------
+
+# The filename is patient-shaped on purpose: zipfile's RuntimeError for an encrypted member and its
+# BadZipFile for a bad CRC both embed it.
+_PHI_NAME = "SMITH_JOHN_MRN123.txt"
+
+
+def _two_member_zip_with_second_patched(*, flag: int = 0, method: int | None = None) -> bytes:
+    """A stored two-member archive whose SECOND member has ``flag`` OR-ed into its 16-bit
+    general-purpose flags and, if given, ``method`` as its compression method, in both the local header and the
+    central directory. Stored bodies contain no ``PK`` signature, so the header search is exact."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("ok.txt", b"first")
+        zf.writestr(_PHI_NAME, b"second")
+    blob = bytearray(buf.getvalue())
+    # (signature, offset of the flags field, offset of the method field) for each header kind.
+    for signature, flag_at, method_at in ((b"PK\x03\x04", 6, 8), (b"PK\x01\x02", 8, 10)):
+        second = blob.index(signature, blob.index(signature) + 1)
+        blob[second + flag_at] |= flag & 0xFF
+        blob[second + flag_at + 1] |= flag >> 8
+        if method is not None:
+            blob[second + method_at : second + method_at + 2] = method.to_bytes(2, "little")
+    return bytes(blob)
+
+
+def test_zip_patch_helper_control_archive_still_decompresses() -> None:  # #1598
+    # Control: with nothing patched the helper's archive is well formed, so the refusals below come
+    # from the flag and the method, not from a helper that corrupts the archive.
+    assert zip_decompress(_two_member_zip_with_second_patched(), max_output_bytes=None) == {
+        "ok.txt": b"first",
+        _PHI_NAME: b"second",
+    }
+
+
+def _second_member_body_corrupted() -> bytes:
+    # One byte of the stored body changes, so zipfile's CRC check fails with a BadZipFile whose
+    # message is "Bad CRC-32 for file '<name>'".
+    blob = _two_member_zip_with_second_patched()
+    return blob.replace(b"second", b"Second", 1)
+
+
+def _second_member_name_not_utf8() -> bytes:
+    # The UTF-8 name flag, with a name byte that is not UTF-8, in both headers. zipfile raises a
+    # builtin UnicodeDecodeError whose .object holds the raw name bytes.
+    blob = _two_member_zip_with_second_patched(flag=0x0800)
+    return blob.replace(b"SMITH_", b"SMITH\xff")
+
+
+def _central_directory_offset_too_large() -> bytes:
+    # The end record claims the central directory starts 1000 bytes later than it does, so zipfile
+    # computes a negative member offset and BytesIO.seek raises ValueError("negative seek value").
+    # The #1976 layout check sees that offset first and refuses the archive before any member opens,
+    # so zip_decompress never reaches the seek. The case stays to pin that this refusal names no
+    # member either, and the control below pins that the shape still breaks zipfile itself.
+    blob = bytearray(_two_member_zip_with_second_patched())
+    eocd = blob.rindex(b"PK\x05\x06")
+    offset = int.from_bytes(blob[eocd + 16 : eocd + 20], "little")
+    blob[eocd + 16 : eocd + 20] = (offset + 1000).to_bytes(4, "little")
+    return bytes(blob)
+
+
+def _second_member_codec_corrupted(compress_type: int) -> bytes:
+    # A compressed member whose first stream bytes are garbage. Neither lzma.LZMAError nor
+    # compression.zstd.ZstdError is an OSError.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("ok.txt", b"first")
+        zf.writestr(zipfile.ZipInfo(_PHI_NAME), b"second" * 50, compress_type=compress_type)
+    blob = bytearray(buf.getvalue())
+    local = blob.index(b"PK\x03\x04", blob.index(b"PK\x03\x04") + 1)
+    name_len, extra_len = (
+        int.from_bytes(blob[local + 26 : local + 28], "little"),
+        int.from_bytes(blob[local + 28 : local + 30], "little"),
+    )
+    data_at = local + 30 + name_len + extra_len
+    # LZMA: the properties after zipfile's 4-byte version/size prefix. Zstandard: the frame magic.
+    start = 4 if compress_type == zipfile.ZIP_LZMA else 0
+    blob[data_at + start : data_at + start + 5] = b"\xff" * 5
+    return bytes(blob)
+
+
+def _second_member_zstd_corrupted() -> bytes:
+    pytest.importorskip("compression.zstd", reason="this Python build has no Zstandard support")
+    return _second_member_codec_corrupted(zipfile.ZIP_ZSTANDARD)
+
+
+_UNSUPPORTED = "member 2 uses a zip feature this reader does not support"
+
+
+@pytest.mark.parametrize(
+    ("build", "reason"),
+    [
+        pytest.param(
+            lambda: _two_member_zip_with_second_patched(flag=0x01),
+            _UNSUPPORTED,
+            id="encrypted-flag",
+        ),
+        pytest.param(
+            lambda: _two_member_zip_with_second_patched(method=98), _UNSUPPORTED, id="method-98"
+        ),
+        pytest.param(
+            _second_member_body_corrupted, r"member 2 is corrupt.*\(BadZipFile\)", id="bad-crc"
+        ),
+        pytest.param(
+            lambda: _second_member_codec_corrupted(zipfile.ZIP_LZMA),
+            r"member 2 is corrupt.*\(LZMAError\)",
+            id="lzma-corrupt",
+        ),
+        pytest.param(
+            _second_member_zstd_corrupted, r"member 2 is corrupt.*\(ZstdError\)", id="zstd-corrupt"
+        ),
+        pytest.param(
+            _second_member_name_not_utf8,
+            r"^zip archive is corrupt.*\(UnicodeDecodeError\)",
+            id="name-not-utf8",
+        ),
+        pytest.param(
+            _central_directory_offset_too_large,
+            r"^data before the start of the zip archive$",
+            id="cd-offset-past-archive",
+        ),
+    ],
+)
+def test_zip_unreadable_member_is_a_compression_error_naming_no_filename(
+    build: Callable[[], bytes], reason: str
+) -> None:  # #1598
+    blob = build()
+    with pytest.raises(CompressionError, match=reason) as exc:
+        zip_decompress(blob, max_output_bytes=None)
+    # PHI guard: the member name must not reach the message or anything chained to it. zipfile's own
+    # messages embed it, so a `from exc` would carry the name on __cause__, and a raise inside the
+    # handler would carry it on __context__.
+    assert "SMITH" not in str(exc.value)
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+
+
+def test_zip_negative_seek_shape_still_breaks_zipfile() -> None:  # #1598, #1976
+    # Control for the negative-seek case above: the layout check now refuses that archive first, so
+    # this pins that the shape itself is still the one zipfile fails on with a negative seek.
+    zf = zipfile.ZipFile(io.BytesIO(_central_directory_offset_too_large()))
+    with zf, pytest.raises(ValueError, match="negative seek value"):
+        zf.read(zf.infolist()[0])
+
+
 # --- #1977: one bounded-inflate primitive, two trailing rules ------------------------------------
 
 

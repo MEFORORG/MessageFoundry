@@ -605,8 +605,7 @@ def _parse_tree(msg: email.message.Message) -> tuple[object, ...]:
 #
 # The patterns are str, matched against each line decoded as latin-1 by _read_chunk_line, which maps
 # every byte to the code point of the same value. So \x80-\xff below means the same bytes it would
-# in a bytes pattern, and the static ReDoS scan in tests/test_security_static.py can read them; it
-# reads str only.
+# in a bytes pattern, and the static ReDoS scan in tests/test_security_static.py reads them.
 #
 # The extension group repeats POSSESSIVELY (*+). Each element has one parse: the token class and
 # the whitespace exclude ";", "=" and '"', and a quoted string ends at the first '"' that no

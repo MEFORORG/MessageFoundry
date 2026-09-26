@@ -1189,7 +1189,8 @@ class FhirLookupExecutor:
 
         try:
             return FhirPeek.parse(body).obj
-        # RecursionError: a deeply nested body, which FhirPeek does not map (BACKLOG #1980).
+        # RecursionError: a deeply nested body (BACKLOG #1980). FhirPeek maps it to FhirPeekError
+        # since BACKLOG #1600; this arm keeps the lookup safe if that mapping ever regresses.
         except (FhirPeekError, RecursionError) as exc:
             raise FhirLookupError(
                 f"fhir_lookup on {connection!r}: FHIR server returned an unparseable body (HTTP {status})"
