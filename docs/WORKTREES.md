@@ -1252,6 +1252,9 @@ pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Status
 pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall   # kill switch, takes effect at once
 ```
 
+The install and `-Status` both check the gate against `origin/main`; see
+[WORKTREE-GATE.md](WORKTREE-GATE.md) "Installing".
+
 [`install-gate.ps1`](../scripts/worktree/install-gate.ps1) copies
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1) into `~/.claude/hooks/` and
 registers it as a `PreToolUse` hook in the **user-scope** `~/.claude/settings.json`. It denies:
