@@ -41,8 +41,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   `zone`, an IANA name such as `America/Chicago`. They read each offset-free stamp in that zone and
   subtract in UTC. With no `zone`, they refuse with `ValueError` a pair where only one stamp has an
   offset, and a pair with no offsets where either stamp has a time of day. A pair of date-only stamps
-  with no offsets still needs no zone and stays a whole number of days. A stamp on a daylight-saving edge of the zone is refused as `convert_hl7_timestamp`
-  refuses it, unless `on_dst_edge` names a resolution. (`BACKLOG #1770`)
+  with no offsets still needs no zone and stays a whole number of days. A stamp on a daylight-saving
+  edge of the zone is refused as `convert_hl7_timestamp` refuses it, unless `on_dst_edge` names a
+  resolution. (`BACKLOG #1770`)
 - **BREAKING — the engine no longer creates an account on its own.** A `serve` on a store with no
   users used to create an enabled Administrator named `admin` and write its one-time password to
   `bootstrap-admin.txt` beside the store. It now creates no account and writes no file. Create the
