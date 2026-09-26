@@ -93,6 +93,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     SourceStartupError,
+    positive_cap,
     register_destination,
     register_source,
     resolve_poll_ceiling,
@@ -1161,8 +1162,12 @@ class RemoteFileSource(SourceConnector):
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
         self._validate_directory: bool = bool(s.get("validate_directory", False))
-        mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
-        self._max_file_bytes: int | None = int(mfb) if mfb else None
+        self._max_file_bytes: int | None = positive_cap(
+            s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES),
+            int,
+            knob="max_file_bytes",
+            transport="REMOTEFILE source",
+        )
         # Per-tick intake ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
         # poll source may default this on are stated once, in transports/base.py). Caps how many files
         # ONE poll disposes of; the rest stay on the remote share and the next poll takes them. A falsy

@@ -146,6 +146,10 @@ transport = "mllp"
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
+  **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
+  cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too, on
+  every connector. A negative cap, or `nan`, is refused at load in either spelling. The one cap with no
+  "off", the HTTP listener's `max_header_bytes`, refuses `0` in either spelling.
   A setting whose type is a **table** or an **array** — `headers`, `odbc_params`,
   `capture_response_headers`, `proxy_no_proxy` — is held to its shape, so `headers = 5` is refused;
   where the entries have a readable type it is held to those too, one level in, so
@@ -605,7 +609,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
 | `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited. |
-| `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). A falsy value falls back to the 64 KiB default — this one cap can't be switched off. |
+| `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). This one cap can't be switched off: unset or `None` takes the 64 KiB default, and `0` (or `"0"`) is refused at load rather than silently becoming the default (BACKLOG #1872). |
 | `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe and a refused request wait behind an outstanding debt but **charge nothing** — only a committed message spends budget, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so the listener can always make progress. |
 | `tls` | `false` | serve **HTTPS** (TLS 1.2+, the same per-connection inbound TLS builder MLLP uses). |

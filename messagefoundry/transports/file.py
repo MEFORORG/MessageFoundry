@@ -51,6 +51,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
+    positive_cap,
     register_destination,
     register_source,
     resolve_poll_ceiling,
@@ -429,8 +430,12 @@ class FileSource(SourceConnector):
         # Encoding used to re-encode split batch messages back to bytes for the handler. A single
         # (non-batch) message is handed off verbatim, so its bytes never round-trip through this.
         self.encoding: str = s.get("encoding", "utf-8")
-        mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
-        self.max_file_bytes: int | None = int(mfb) if mfb else None
+        self.max_file_bytes: int | None = positive_cap(
+            s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES),
+            int,
+            knob="max_file_bytes",
+            transport="file source",
+        )
         # Per-tick intake ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
         # poll source may default this on are stated once, in transports/base.py). Caps how many files
         # ONE scan disposes of; the rest stay in the drop directory and the next scan takes them. A
@@ -445,8 +450,12 @@ class FileSource(SourceConnector):
         self.decompress: str | None = _validate_compression(s.get("decompress"), "decompress")
         # Bounds the DECOMPRESSED output (a bomb guard `max_file_bytes` — a compressed-`st_size` cap —
         # cannot provide). A falsy value disables it. Only consulted when `decompress` is set.
-        mdb = s.get("max_decompressed_bytes", DEFAULT_MAX_DECOMPRESSED_BYTES)
-        self.max_decompressed_bytes: int | None = int(mdb) if mdb else None
+        self.max_decompressed_bytes: int | None = positive_cap(
+            s.get("max_decompressed_bytes", DEFAULT_MAX_DECOMPRESSED_BYTES),
+            int,
+            knob="max_decompressed_bytes",
+            transport="file source",
+        )
         self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
         self.error_dir = self.directory / s.get("error_subdir", ".error")
         self._handler: InboundHandler | None = None

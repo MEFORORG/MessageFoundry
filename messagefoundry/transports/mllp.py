@@ -83,10 +83,12 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     peer_ip_allowed,
+    positive_cap,
     probe_tcp_reachable,
     register_destination,
     register_source,
 )
+from messagefoundry.transports.base import cap_setting as _cap_setting
 
 __all__ = [
     "SB",
@@ -681,8 +683,12 @@ class MLLPDestination(DestinationConnector):
         # OBX-5.5 for an inline MDM) or a Handler-built large MDM streams inline to a receiver that does
         # not cap the frame (Epic). Raise/lower it per outbound only to bound a partner's ACK size; a
         # falsy value disables the ACK cap entirely (`max_frame_bytes=0`).
-        mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
-        self.max_frame_bytes: int | None = int(mf) if mf else None
+        self.max_frame_bytes: int | None = positive_cap(
+            s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES),
+            int,
+            knob="max_frame_bytes",
+            transport="MLLP destination",
+        )
         # ADR 0067: persistent outbound connection. Shipped OPT-IN this release (default OFF): the
         # adjudicated default is connect-per-message (today's proven posture, BACKLOG #82.1 "stays off
         # by default"); persistent=true is the documented opt-in that removes the per-message
@@ -690,10 +696,18 @@ class MLLPDestination(DestinationConnector):
         # → off; the two freshness knobs follow the receive_timeout convention: present-but-falsy
         # (None/0) = disabled.
         self.persistent: bool = bool(s.get("persistent", False))
-        it = s.get("idle_timeout_seconds", 60.0)
-        self.idle_timeout_seconds: float | None = float(it) if it else None
-        ma = s.get("max_connection_age_seconds")
-        self.max_connection_age_seconds: float | None = float(ma) if ma else None
+        self.idle_timeout_seconds: float | None = positive_cap(
+            s.get("idle_timeout_seconds", 60.0),
+            float,
+            knob="idle_timeout_seconds",
+            transport="MLLP destination",
+        )
+        self.max_connection_age_seconds: float | None = positive_cap(
+            s.get("max_connection_age_seconds"),
+            float,
+            knob="max_connection_age_seconds",
+            transport="MLLP destination",
+        )
         # BACKLOG #117 (ADR 0124): fire-and-forward. When True, send() writes + drains and finalizes
         # the delivery on the successful TCP write — it reads NO ACK and validates NO MSA-1
         # (at-most-once-confirmation; there is no NAK-/timeout-driven retry). Default False = today's
@@ -1560,42 +1574,13 @@ def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
     Burst defaults to one second's worth, so a peer that sends in bursts is not paced until it
     exceeds the SUSTAINED rate; it is meaningless when pacing is off.
     """
-    mps = settings.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND)
-    rate = float(mps) if mps else None
+    rate = positive_cap(
+        settings.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND),
+        float,
+        knob="max_messages_per_second",
+        transport="inbound",
+    )
     return rate, float(settings.get("message_burst") or rate or 0.0)
-
-
-def _cap_setting[NumT: (int, float)](value: Any, convert: Callable[[Any], NumT]) -> NumT | None:
-    """Read one inbound cap: a number, or ``None`` for the documented ``None``/``0`` disable.
-
-    **Decide "off" on the NUMBER, not on Python truthiness.** The older idiom ``int(v) if v else
-    None`` tests the RAW settings value, and a raw ``"0"`` is a non-empty string — truthy — so it
-    survives that test and becomes a live cap of zero. That spelling is reachable rather than
-    contrived: a
-    ``connections.toml`` ``env()`` reference without a ``cast`` hands the connector the environment's
-    TEXT (``docs/CONNECTIONS.md``), so an operator disabling a cap through the environment writes
-    ``"0"`` and gets the opposite of what they asked for — a listener that refuses every connection,
-    rejects every frame, or closes every socket the instant it opens, depending on which cap it was.
-
-    ``None`` and ``""`` short-circuit before either conversion, and both are needed: a key may be
-    absent, and ``resolve_env_settings`` tests membership rather than truthiness, so an env var that
-    is SET but empty arrives as ``""`` — which ``int()``/``float()`` would raise on.
-
-    **The zero test reads a ``float`` view, and the cap is built with the caller's own ``convert``.**
-    Testing the CONVERTED value instead would read anything that truncates to zero as "off": with
-    ``convert=int``, a ``max_connections_per_host`` of ``-0.5`` would silently disable a security cap
-    that the guard below is supposed to refuse at build. A float view answers "did the operator write
-    zero", which is the actual question, and leaves every sub-1 value to the caller's own guard.
-
-    A negative value is therefore returned as-is, for the callers that refuse one at build with a
-    message naming their own key. It is a different mistake with a different answer, and folding it
-    into "off" here would swallow the typo this connector exists to reject.
-    """
-    if value is None or value == "":
-        return None
-    if float(value) == 0:  # at least 0, 0.0, -0.0, False, "0", "0.0" and " 0 " reach this as off
-        return None
-    return convert(value)
 
 
 class MLLPSource(SourceConnector):
@@ -1626,9 +1611,9 @@ class MLLPSource(SourceConnector):
         # Every cap on THIS listener: key absent → secure default; None/0 → disabled, in whichever
         # spelling arrives. `_cap_setting` is what makes that last clause true — see it for why
         # deciding "off" before the conversion read a string `"0"` as a live cap of zero. All five go
-        # through it, so there is one rule here rather than a per-key convention to look up. The
-        # raw-TCP, X12 and HTTP listeners still read their own caps the older way, so this is a
-        # property of this connector and not yet of the transport layer.
+        # through it, so there is one rule here rather than a per-key convention to look up. It lives
+        # in transports/base.py now (BACKLOG #1872), where the raw-TCP, X12 and HTTP listeners read
+        # their caps through `positive_cap` on top of it.
         self.max_connections: int | None = _cap_setting(
             s.get("max_connections", DEFAULT_MAX_CONNECTIONS), int
         )
@@ -1666,6 +1651,21 @@ class MLLPSource(SourceConnector):
                 "MLLP max_frame_seconds must be a number of seconds, zero or more (use None or 0 to "
                 f"disable the frame deadline), got {self.max_frame_seconds}"
             )
+        # BACKLOG #1872: the three caps above with no guard of their own. `_cap_setting` passes a
+        # negative through on purpose, and each one refuses everything: a negative `receive_timeout`
+        # makes every peer look idle the moment it connects and closes it as an idle timeout, a
+        # negative `max_connections` admits no connection, and a negative `max_frame_bytes` rejects
+        # every frame. Written `not > 0` so NaN is refused with them. The same rule the other three
+        # listeners get from `positive_cap`, applied here without touching the call sites above.
+        for knob, cap in (
+            ("max_connections", self.max_connections),
+            ("receive_timeout", self.receive_timeout),
+            ("max_frame_bytes", self.max_frame_bytes),
+        ):
+            if cap is not None and not cap > 0:
+                raise ValueError(
+                    f"MLLP {knob}={cap!r} must be above zero (use None or 0 to disable it)"
+                )
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
@@ -1897,11 +1897,10 @@ class MLLPSource(SourceConnector):
         than falsy when it is off, so neither ordinary input can produce one. An earlier draft
         carried ``max(0.0, ...)`` and it was dead on those inputs, which is a claim nobody can check.
 
-        **One input CAN still be negative, and it is not defended here.** Unlike
-        ``max_frame_seconds``, ``receive_timeout`` has no build-time guard refusing a negative, so a
-        configured ``-1`` reaches this function and closes every peer at once as ``idle_timeout``.
-        That predates the frame deadline and is unchanged by it; the fix is a guard beside the other
-        two in ``__init__``, not a clamp here, because a clamp would turn a typo into a silent bound.
+        ``receive_timeout`` cannot be negative either: ``__init__`` refuses a negative or NaN one at
+        build (BACKLOG #1872). It used to reach this function and close every peer at once as
+        ``idle_timeout``. The guard sits in ``__init__`` rather than as a clamp here, because a clamp
+        would turn a typo into a silent bound.
         """
         if frame_left is None:
             return self.receive_timeout

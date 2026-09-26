@@ -42,7 +42,7 @@ import re
 import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import client_cert_principal, constant_time_match_any
@@ -53,6 +53,7 @@ from messagefoundry.transports.base import (
     ReplyOutcome,
     SourceConnector,
     peer_ip_allowed,
+    positive_cap,
     register_source,
 )
 from messagefoundry.transports.mllp import (
@@ -553,6 +554,26 @@ async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
 HttpReceiptHandler = Callable[[bytes], Awaitable[str | None]]
 
 
+def _header_cap(value: Any) -> int:
+    """Read ``max_header_bytes``, the one cap on this listener that cannot be switched off.
+
+    Unset, ``None`` and ``""`` (an env var that is set but empty) take the 64 KiB default. Anything
+    else must be a positive number of bytes, and zero is refused in every spelling (BACKLOG #1872).
+    Before that, a TOML ``0`` silently became the default while a string ``"0"`` became a cap of zero
+    that refused every request, because no request has a head of zero bytes: one number, two outcomes,
+    one of them a total outage. Both now refuse loudly, because an operator who writes 0 means "no cap",
+    and this listener does not offer one; silently substituting 64 KiB would hide that. Written
+    ``not ... >= 1`` so NaN and a sub-1 value that would truncate to zero are refused as well."""
+    if value is None or value == "":
+        return DEFAULT_MAX_HEADER_BYTES
+    if not float(value) >= 1:
+        raise ValueError(
+            f"HTTP source max_header_bytes={value!r} must be a positive number of bytes; this cap "
+            "cannot be switched off (leave it unset or None for the 64 KiB default)"
+        )
+    return int(value)
+
+
 class HttpSource(SourceConnector):
     """Listen for inbound HTTP/1.1 requests, commit each POSTed body to the ingress stage via the
     pipeline handler, and return a ``202`` respond-with-receipt once it is durably committed (ADR 0023).
@@ -571,15 +592,28 @@ class HttpSource(SourceConnector):
         # without TLS (check_http_tls_exposure). See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
-        # Caps below: key absent → secure default; present-but-falsy (None/0) → disabled where allowed.
-        mc = s.get("max_connections", DEFAULT_MAX_CONNECTIONS)
-        self.max_connections: int | None = int(mc) if mc else None
-        rt = s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT)
-        self.receive_timeout: float | None = float(rt) if rt else None
-        mb = s.get("max_body_bytes", DEFAULT_MAX_BODY_BYTES)
-        self.max_body_bytes: int | None = int(mb) if mb else None
-        mh = s.get("max_header_bytes", DEFAULT_MAX_HEADER_BYTES)
-        self.max_header_bytes: int = int(mh) if mh else DEFAULT_MAX_HEADER_BYTES
+        # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
+        # an uncast env() yields) → disabled where allowed; a negative or NaN → refused at build
+        # (BACKLOG #1872).
+        self.max_connections: int | None = positive_cap(
+            s.get("max_connections", DEFAULT_MAX_CONNECTIONS),
+            int,
+            knob="max_connections",
+            transport="HTTP source",
+        )
+        self.receive_timeout: float | None = positive_cap(
+            s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT),
+            float,
+            knob="receive_timeout",
+            transport="HTTP source",
+        )
+        self.max_body_bytes: int | None = positive_cap(
+            s.get("max_body_bytes", DEFAULT_MAX_BODY_BYTES),
+            int,
+            knob="max_body_bytes",
+            transport="HTTP source",
+        )
+        self.max_header_bytes: int = _header_cap(s.get("max_header_bytes"))
         # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
         # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. The
         # port changed REACHABILITY, never the default -- a stock HTTP inbound still has no bound.

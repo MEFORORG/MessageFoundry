@@ -38,6 +38,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     SourceConnector,
     peer_ip_allowed,
+    positive_cap,
     probe_tcp_reachable,
     register_destination,
     register_source,
@@ -145,8 +146,12 @@ class TcpDestination(DestinationConnector):
         self.connect_timeout: float = float(s.get("connect_timeout", 10.0))
         self.encoding: str = s.get("encoding", "utf-8")
         self.expect_reply: bool = bool(s.get("expect_reply", False))
-        mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
-        self.max_frame_bytes: int | None = int(mf) if mf else None
+        self.max_frame_bytes: int | None = positive_cap(
+            s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES),
+            int,
+            knob="max_frame_bytes",
+            transport="TCP destination",
+        )
         # ADR 0013: capture the framed reply. Requires expect_reply=True (enforced at wiring). A missing
         # reply is already a retryable DeliveryError (peer-close in _read_reply) and stays one — enabling
         # capture does NOT change delivery semantics, it only returns the frame that was already read.
@@ -156,10 +161,18 @@ class TcpDestination(DestinationConnector):
         # Same knobs/semantics as MLLP (ADR 0067) minus TLS (raw TCP has none). Key absent → off; the two
         # freshness knobs follow the receive_timeout convention (present-but-falsy None/0 = disabled).
         self.persistent: bool = bool(s.get("persistent", False))
-        it = s.get("idle_timeout_seconds", 60.0)
-        self.idle_timeout_seconds: float | None = float(it) if it else None
-        ma = s.get("max_connection_age_seconds")
-        self.max_connection_age_seconds: float | None = float(ma) if ma else None
+        self.idle_timeout_seconds: float | None = positive_cap(
+            s.get("idle_timeout_seconds", 60.0),
+            float,
+            knob="idle_timeout_seconds",
+            transport="TCP destination",
+        )
+        self.max_connection_age_seconds: float | None = positive_cap(
+            s.get("max_connection_age_seconds"),
+            float,
+            knob="max_connection_age_seconds",
+            transport="TCP destination",
+        )
         # Cached connection + freshness stamps (monotonic clock — a wall-clock jump must not expire a
         # healthy socket); cached only after a fully-successful transaction, discarded on any failure.
         self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
@@ -438,13 +451,26 @@ class TcpSource(SourceConnector):
         self.port: int = int(s["port"])
         self.codec = _codec_from_settings(s)
         self.encoding: str = s.get("encoding", "utf-8")
-        # Caps below: key absent → secure default; present-but-falsy (None/0) → disabled.
-        mc = s.get("max_connections", DEFAULT_MAX_CONNECTIONS)
-        self.max_connections: int | None = int(mc) if mc else None
-        rt = s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT)
-        self.receive_timeout: float | None = float(rt) if rt else None
-        mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
-        self.max_frame_bytes: int | None = int(mf) if mf else None
+        # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
+        # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).
+        self.max_connections: int | None = positive_cap(
+            s.get("max_connections", DEFAULT_MAX_CONNECTIONS),
+            int,
+            knob="max_connections",
+            transport="TCP source",
+        )
+        self.receive_timeout: float | None = positive_cap(
+            s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT),
+            float,
+            knob="receive_timeout",
+            transport="TCP source",
+        )
+        self.max_frame_bytes: int | None = positive_cap(
+            s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES),
+            int,
+            knob="max_frame_bytes",
+            transport="TCP source",
+        )
         # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
         # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. The
         # port changed REACHABILITY (raw TCP had no rate control in any configuration), never the

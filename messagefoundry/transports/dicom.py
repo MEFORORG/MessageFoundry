@@ -101,6 +101,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     peer_ip_allowed,
+    positive_cap,
     register_destination,
     register_source,
 )
@@ -238,8 +239,14 @@ class DicomScpSource(SourceConnector):
         self._source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # BACKLOG #1910: never accept an object the engine's ingress would refuse. The shipped 128 MiB
         # default, and an uncapped SCP, both resolve to the ingress ceiling.
-        mob = s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES)
-        configured = int(mob) if mob else None
+        # None/0 in any spelling reads as uncapped, so a string "0" can no longer reach the inflate
+        # bound below as a live zero that refuses every deflated object (BACKLOG #1872).
+        configured = positive_cap(
+            s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES),
+            int,
+            knob="max_object_bytes",
+            transport="DICOM SCP source",
+        )
         self._max_object_bytes: int = min(
             configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
         )
@@ -258,8 +265,12 @@ class DicomScpSource(SourceConnector):
         # bound is the one thing this transport cannot honestly offer. The OFF-default semantics are
         # still shared: _MessagePacer.for_rate is the single place "unset" is interpreted, so this
         # connector cannot drift from the other four on what an absent key means.
-        mas = s.get("max_associations_per_second", DEFAULT_MAX_ASSOCIATIONS_PER_SECOND)
-        self.max_associations_per_second: float | None = float(mas) if mas else None
+        self.max_associations_per_second: float | None = positive_cap(
+            s.get("max_associations_per_second", DEFAULT_MAX_ASSOCIATIONS_PER_SECOND),
+            float,
+            knob="max_associations_per_second",
+            transport="DICOM SCP source",
+        )
         self.association_burst: float = float(
             s.get("association_burst") or self.max_associations_per_second or 0.0
         )
@@ -719,8 +730,12 @@ class DicomScuDestination(DestinationConnector):
         called = s.get("called_ae_title")
         # pynetdicom's accept-any token when the peer AE title is left unset.
         self._called_ae_title = str(called) if called else "ANY-SCP"
-        mob = s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES)
-        self._max_object_bytes: int | None = int(mob) if mob else None
+        self._max_object_bytes: int | None = positive_cap(
+            s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES),
+            int,
+            knob="max_object_bytes",
+            transport="DICOM SCU destination",
+        )
         self._max_pdu_size = int(s.get("max_pdu_size", 16384))
         self._timeout = float(s.get("timeout_seconds", 30.0))
         self._connect_timeout = float(s.get("connect_timeout", 10.0))
