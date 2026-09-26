@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import time
 from datetime import UTC, datetime, timedelta
+from itertools import permutations
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "scripts" / "hooks" / "wiki-write-prompt.ps1"
+INSTALLER = ROOT / "scripts" / "coord" / "install-coordination.ps1"
+HOOK_REL = "scripts/hooks/wiki-write-prompt.ps1"
 
 # Below pyproject.toml's --timeout=60 so a hung child fails THIS test by name.
 TIMEOUT = 45
@@ -32,6 +35,8 @@ pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None or os.name != "nt",
     reason="the hook and its installer need pwsh on Windows",
 )
+
+_SRC = INSTALLER.read_text(encoding="utf-8")
 
 
 def _threshold(name: str) -> int:
@@ -43,6 +48,7 @@ def _threshold(name: str) -> int:
 
 MIN_TOOLS = _threshold("MinToolUses")
 COOLDOWN = _threshold("CooldownMinutes")
+WIKI_MARKER = re.search(r"\$WIKI_MARKER\s*=\s*\"([^\"]+)\"", _SRC).group(1)  # type: ignore[union-attr]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -506,3 +512,78 @@ def test_the_log_line_is_written_when_it_fires(env: Env) -> None:
     datetime.fromisoformat(line["utc"])
     # Never under the wiki scripts' own tree.
     assert not (env.coord / "wiki").exists()
+
+
+# --------------------------------------------------------------------------------------------------
+# The installer row
+# --------------------------------------------------------------------------------------------------
+
+
+def run_installer(settings: Path, *args: str) -> str:
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(INSTALLER),
+            "-SettingsPath",
+            str(settings),
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc.stdout
+
+
+def stop_cmds(settings: Path) -> list[str]:
+    data = json.loads(settings.read_text(encoding="utf-8-sig"))
+    return [h["command"] for g in data["hooks"].get("Stop", []) for h in g["hooks"]]
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Path:
+    p = tmp_path / "settings.json"
+    foreign = {"hooks": [{"type": "command", "command": "echo foreign-stop"}]}
+    p.write_text(json.dumps({"theme": "dark", "hooks": {"Stop": [foreign]}}), encoding="utf-8")
+    return p
+
+
+def test_every_marker_is_pairwise_non_containing() -> None:
+    markers = re.findall(r"^\$\w*MARKER\s*=\s*\"([^\"]+)\"", _SRC, re.MULTILINE)
+    print(f"markers: {markers}")
+    assert WIKI_MARKER in markers
+    assert len(markers) >= 6
+    for a, b in permutations(markers, 2):
+        assert a not in b, (
+            f"{a!r} is contained in {b!r}; Test-IsOurs would strip one with the other"
+        )
+
+
+def test_install_adds_exactly_one_wiki_stop_entry_idempotently(settings: Path) -> None:
+    run_installer(settings)
+    first = settings.read_text(encoding="utf-8-sig")
+    ours = [c for c in stop_cmds(settings) if WIKI_MARKER in c]
+    assert len(ours) == 1
+    assert f"'{HOOK_REL}'" in ours[0]
+    data = json.loads(first)
+    (entry,) = [g for g in data["hooks"]["Stop"] if WIKI_MARKER in g["hooks"][0]["command"]]
+    assert entry["hooks"][0]["timeout"] == 25
+    assert "async" not in entry["hooks"][0]
+    assert "matcher" not in entry
+    run_installer(settings)
+    assert settings.read_text(encoding="utf-8-sig") == first
+
+
+def test_uninstall_of_the_wiki_row_removes_only_it(settings: Path) -> None:
+    run_installer(settings)
+    before = stop_cmds(settings)
+    run_installer(settings, "-Script", "wiki-write-prompt", "-Uninstall")
+    after = stop_cmds(settings)
+    assert [c for c in after if WIKI_MARKER in c] == []
+    assert after == [c for c in before if WIKI_MARKER not in c]
+    assert "echo foreign-stop" in after

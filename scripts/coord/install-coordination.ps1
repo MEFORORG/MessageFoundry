@@ -34,6 +34,10 @@
       SessionStart                          -> scripts/worktree/session-context.ps1  (who is live, what they build)
       PreToolUse Edit|Write|MultiEdit|Notebook -> scripts/hooks/collision_gate.ps1   (refuse a file a live session is changing)
       UserPromptSubmit                      -> scripts/hooks/announce-session.ps1    (tell the peers you exist, and what you intend)
+      SessionStart, Stop                    -> scripts/hooks/mail-drain.ps1          (deliver session mail)
+      Stop                                  -> scripts/hooks/seat-record.ps1         (record this seat's episode)
+      Stop (async rewake)                   -> scripts/hooks/mail-watch.ps1          (wake an idle session for urgent mail)
+      Stop                                  -> scripts/hooks/wiki-write-prompt.ps1   (after real work, ask for one fleet wiki note)
 
     Idempotent: re-running replaces our own entries and leaves every other hook untouched.
 
@@ -149,6 +153,13 @@ $WAKE_MARKER = "mefor-wake"
 # (-Only Stop -Uninstall) without disarming the mail drain, which shares the Stop event.
 $SEAT_MARKER = "mefor-seat"
 
+# A SIXTH marker, for the fleet wiki write prompt (scripts/hooks/wiki-write-prompt.ps1). Same pairwise
+# rule, re-checked rather than assumed:
+#   mefor-coord / mefor-announce / mefor-mail / mefor-wake / mefor-seat / mefor-wiki
+# No one of the six contains another in either direction. Separate from mefor-seat, although both sit
+# on Stop, so the prompt can be removed (-Script wiki-write-prompt -Uninstall) and the recorder stays.
+$WIKI_MARKER = "mefor-wiki"
+
 # The shim. No installed copy: it locates the script in a checkout and runs it, so a `git pull` updates
 # the hook everywhere with nothing to fall stale. Silent and exit-0 outside a repo, because this file is
 # user-global and runs in every unrelated project on the machine.
@@ -231,7 +242,7 @@ function New-AnnounceShimCommand {
     )
 }
 
-# The SEAT shim. Deliberately NOT Shim='std', and the reason is the defect this whole layer is built
+# The NOTICE shim, first built for the seat recorder. Deliberately NOT Shim='std', and the reason is the defect this whole layer is built
 # to expose. The std shim is Test-Path-then-run: when the script is absent it produces ZERO BYTES and
 # exits 0, which is byte-identical to a healthy hook that had nothing to do. install-coordination.ps1
 # already records that exact class -- "byte-identical to a healthy hook with no peers, which is how a
@@ -245,19 +256,23 @@ function New-AnnounceShimCommand {
 # $mf gates the notice on "this is a MessageFoundry checkout": this file is user-global and runs in
 # every unrelated project on the machine, and a notice about a missing MEFOR script in someone's
 # unrelated repo is noise, not a signal.
-function New-SeatShimCommand {
-    $notice = "[seat] scripts/hooks/seat-record.ps1 is missing from this checkout -- the seat recorder is wired but resolving nothing, so this session is NOT being recorded and a cold start would not see it."
+#
+# The wiki write prompt needs the same shape for the same reason, so one builder serves any row that
+# sets Shim = "notice" and carries its own Notice text.
+function New-NoticeShimCommand([string]$RelativeScript, [string]$Marker, [string]$Notice) {
+    # The notice sits inside a single-quoted literal, so double any single quote it carries.
+    $Notice = $Notice.Replace("'", "''")
     return (
-        "# $SEAT_MARKER`n" +
+        "# $Marker`n" +
         '$c = (& git rev-parse --path-format=absolute --git-common-dir 2>$null); ' +
         'if ($LASTEXITCODE -eq 0 -and $c) { $c = $c.Trim(); ' +
         '$bases = @((Split-Path $c -Parent), (& git rev-parse --path-format=absolute --show-toplevel 2>$null)); ' +
         '$hit = $false; $mf = $false; ' +
         'foreach ($b in $bases) { if (-not $b) { continue } $b = $b.Trim(); ' +
         'if (Test-Path -LiteralPath (Join-Path $b ''scripts/coord/presence.ps1'')) { $mf = $true } ' +
-        '$s = Join-Path $b ''scripts/hooks/seat-record.ps1''; ' +
+        "`$s = Join-Path `$b '$RelativeScript'; " +
         'if (Test-Path -LiteralPath $s) { & $s; $hit = $true; break } } ' +
-        'if (-not $hit -and $mf) { Write-Output ' + "'$notice'" + ' } }'
+        'if (-not $hit -and $mf) { Write-Output ' + "'$Notice'" + ' } }'
     )
 }
 
@@ -280,7 +295,13 @@ $WIRING = @(
     # Stop, not UserPromptSubmit: the recorder is exercised at ACCOUNT-SWITCH frequency (days), so a
     # per-prompt spawn would be a standing tax for a rare path. Timeout 25 covers seat.ps1's git calls
     # -- roughly ten cheap plumbing commands plus a `stash create` -- with room on a loaded box.
-    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/seat-record.ps1"; Timeout = 25; Msg = "Recording this seat's episode"; Marker = $SEAT_MARKER; Shim = "seat" }
+    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/seat-record.ps1"; Timeout = 25; Msg = "Recording this seat's episode"; Marker = $SEAT_MARKER; Shim = "notice"
+        Notice = "[seat] scripts/hooks/seat-record.ps1 is missing from this checkout -- the seat recorder is wired but resolving nothing, so this session is NOT being recorded and a cold start would not see it." }
+    # The fleet wiki write prompt. Stop, because the end of a turn is where a lesson has just happened.
+    # It blocks the Stop only after real work, with a cooldown between prompts, and never while
+    # stop_hook_active is set. Timeout 25: the script caps its transcript read so it ends well inside that.
+    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/wiki-write-prompt.ps1"; Timeout = 25; Msg = "Checking for a fleet wiki note"; Marker = $WIKI_MARKER; Shim = "notice"
+        Notice = "[wiki] scripts/hooks/wiki-write-prompt.ps1 is missing from this checkout -- the fleet wiki write prompt is wired but resolving nothing." }
 
     # The URGENT tier: mail-watch.ps1, armed at Stop, which is the moment the session goes IDLE.
     #
@@ -422,7 +443,7 @@ foreach ($path in $SettingsPath) {
                         command       = $(
                             switch ($w.Shim) {
                                 "announce" { New-AnnounceShimCommand }
-                                "seat" { New-SeatShimCommand }
+                                "notice" { New-NoticeShimCommand $w.Script $w.Marker $w.Notice }
                                 "wake" { New-WakeShimCommand $w.Script $w.Marker }
                                 default { New-ShimCommand $w.Script $w.Marker }
                             }
