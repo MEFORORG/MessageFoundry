@@ -279,7 +279,7 @@ def test_api_error_fails_open_with_warning(
 
     # Force the load to take the Windows path regardless of host, then make that path "fail open".
     monkeypatch.setattr(wiring, "_assert_safe_config_source_windows", _boom)
-    monkeypatch.setattr(wiring.sys, "platform", "win32")
+    monkeypatch.setattr("messagefoundry.config.wiring.sys.platform", "win32")
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
         registry = load_config(tmp_path)

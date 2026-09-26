@@ -834,7 +834,7 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
 
 
 @pytest.fixture
-async def engine(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def engine(tmp_path: Path):
     eng = await Engine.create(tmp_path / "priv.db", poll_interval=0.02)
     yield eng
     await eng.stop()

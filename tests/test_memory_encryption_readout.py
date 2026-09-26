@@ -265,7 +265,9 @@ def test_linux_reads_cpuinfo_and_guest_devices(monkeypatch: pytest.MonkeyPatch) 
     # every console poll), so calling it here would either serve a stale answer or poison the cache
     # for the rest of the session.
     monkeypatch.setattr(me, "_read_cpuinfo_flags", lambda: frozenset({"fpu", "sev_snp"}))
-    monkeypatch.setattr(me.Path, "is_char_device", lambda self: False)
+    monkeypatch.setattr(
+        "messagefoundry.config.memory_encryption.Path.is_char_device", lambda self: False
+    )
     # Capability present, activation absent → capable but NOT active. Exactly the case a fused
     # boolean would get wrong.
     report = me.platform_memory_encryption_readout.__wrapped__()
@@ -295,7 +297,7 @@ def test_activation_requires_a_character_device_not_merely_a_path(
 
     monkeypatch.setattr(me, "GUEST_DEVICES", ((str(regular_file), "amd-sev-snp"),))
     monkeypatch.setattr(me, "_read_cpuinfo_flags", lambda: frozenset({"sev_snp"}))
-    monkeypatch.setattr(me.sys, "platform", "linux")
+    monkeypatch.setattr("messagefoundry.config.memory_encryption.sys.platform", "linux")
     report = me.platform_memory_encryption_readout.__wrapped__()
     assert report.active is False
 

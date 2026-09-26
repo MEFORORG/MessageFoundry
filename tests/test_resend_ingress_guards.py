@@ -45,7 +45,8 @@ from messagefoundry.pipeline.ingress_guards import (
     admit_resubmission,
     admit_resubmitted_body,
 )
-from messagefoundry.store.store import Stage
+from messagefoundry.store.base import Row
+from messagefoundry.store.store import MessageStore, Stage
 
 PW = "Correct-Horse-Battery-Staple-9"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN123^^^H^MR||DOE^JANE\r"
@@ -135,7 +136,7 @@ async def _message_count(engine: Engine, channel: str) -> int:
     return len(await engine.store.list_messages(channel_id=channel, limit=1000))
 
 
-async def _actions(engine: Engine, action: str) -> list[dict[str, object]]:
+async def _actions(engine: Engine, action: str) -> list[Row]:
     return [a for a in await engine.store.list_audit() if a["action"] == action]
 
 
@@ -303,7 +304,9 @@ async def test_edit_resend_direct_with_a_nul_is_refused(engine: Engine, tmp_path
     assert r.status_code == 422, r.text
     await _assert_nothing_committed(engine, mid, r)
     # The direct path's own artifact is an outbound row to OB2; the in1 count cannot see it.
-    async with engine.store._read() as db:
+    store = engine.store
+    assert isinstance(store, MessageStore)  # the pooled read below is SQLite-specific
+    async with store._read() as db:
         cur = await db.execute(
             "SELECT COUNT(*) FROM queue WHERE stage=? AND destination_name=?",
             (Stage.OUTBOUND.value, "OB2"),

@@ -570,7 +570,7 @@ def test_a_roll_up_that_is_the_only_failing_job_is_still_named() -> None:
 def test_a_cancelled_sibling_is_never_named_as_the_cause() -> None:
     """The merge queue cancels siblings on the way out, so counting one would misattribute every
     ejection -- the same rule the job's own `if:` applies to the run."""
-    cancelled = {
+    cancelled: dict[str, object] = {
         "name": "test (ubuntu-latest, py3.14)",
         "conclusion": "cancelled",
         "steps": [{"name": "Tests (pytest)", "conclusion": "cancelled"}],
@@ -758,7 +758,7 @@ def test_both_comments_read_one_rule_and_neither_keeps_a_copy() -> None:
 def test_a_job_name_cannot_break_out_of_its_code_span() -> None:
     """A fork's red reaches the tracker, and a fork chooses its own job and step names. A newline
     would start a new Markdown block and a backtick would close the code span early."""
-    hostile = {
+    hostile: dict[str, object] = {
         "name": "leg `x`\n\n@someone",
         "conclusion": "failure",
         "steps": [{"name": "step\r\n`y`", "conclusion": "failure"}],
@@ -789,7 +789,11 @@ def test_a_failing_job_with_no_name_is_still_named() -> None:
 def test_other_failing_legs_are_counted_so_one_cannot_hide_another() -> None:
     """Only the first leg is named. A flaky leg named first must not make a real failure beside it
     look like the same old flake, so the count of the others follows."""
-    second = {"name": "test (ubuntu-latest, py3.14)", "conclusion": "failure", "steps": []}
+    second: dict[str, object] = {
+        "name": "test (ubuntu-latest, py3.14)",
+        "conclusion": "failure",
+        "steps": [],
+    }
     answer = _blame([_REAL_TIMING_GATE_JOB, _REAL_ROLLUP_JOB, second])
     assert answer.endswith(" (and 1 more failing job)"), answer
 

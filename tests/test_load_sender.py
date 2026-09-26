@@ -50,7 +50,7 @@ def _profile(loop: str, *, rate: float = 0.0, conc: int = 1, dur: float = 0.4) -
     )
 
 
-async def _harness(loop: str, *, rate: float = 0.0, conc: int = 1, dur: float = 0.4):  # type: ignore[no-untyped-def]
+async def _harness(loop: str, *, rate: float = 0.0, conc: int = 1, dur: float = 0.4):
     m = LiveMetrics(Counters(), Histogram(), Histogram())
     correlator = Correlator(capacity=100_000, metrics=m)
 

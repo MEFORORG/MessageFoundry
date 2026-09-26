@@ -142,7 +142,9 @@ async def _dead(
 
 
 async def _raw(store: MessageStore, mid: str) -> str:
-    return (await store.get_message(mid))["raw"]
+    msg = await store.get_message(mid)
+    assert msg is not None
+    return str(msg["raw"])
 
 
 async def _payload(store: MessageStore, mid: str) -> str | None:

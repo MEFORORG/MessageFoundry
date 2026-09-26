@@ -205,6 +205,7 @@ def test_the_gate_does_not_untype_the_published_response_schema() -> None:
     for model_cls in PHI_FIELDS:
         schema = model_cls.model_json_schema(mode="serialization")
         assert schema.get("properties"), f"{model_cls.__name__} lost its serialization properties"
+        assert issubclass(model_cls, PhiGatedModel)  # pinned by the test above; narrows for mypy
         for prop in model_cls.phi_gated_properties:
             declared = schema["properties"][prop]
             assert declared.get("anyOf") == [{"type": "string"}, {"type": "null"}], (

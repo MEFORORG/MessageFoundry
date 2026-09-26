@@ -97,7 +97,7 @@ def test_classify_ui(status: int | None, expected: UiProbe) -> None:
     assert classify_ui(status) is expected
 
 
-def _client(handler) -> httpx.Client:  # type: ignore[no-untyped-def]
+def _client(handler) -> httpx.Client:
     return httpx.Client(base_url="http://127.0.0.1:8765", transport=httpx.MockTransport(handler))
 
 

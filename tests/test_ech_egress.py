@@ -25,6 +25,7 @@ import threading
 import urllib.request
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -411,7 +412,7 @@ class _RecordingOpener:
 _TOKEN_URL = "https://auth.partner.example/token"
 
 
-def _oauth2_rest(**extra: object) -> RestDestination:
+def _oauth2_rest(**extra: Any) -> RestDestination:
     return _rest(
         oauth2_token_url=_TOKEN_URL,
         oauth2_client_id="cid",
@@ -424,7 +425,7 @@ def _minted_request(d: RestDestination) -> urllib.request.Request:
     provider = d._token_provider
     assert provider is not None
     rec = _RecordingOpener()
-    provider._opener = rec  # type: ignore[attr-defined,assignment]
+    provider._opener = rec  # type: ignore[attr-defined]
     assert provider.access_token() == "t0k"
     assert rec.req is not None
     return rec.req

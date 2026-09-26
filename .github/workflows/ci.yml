@@ -270,6 +270,7 @@ jobs:
             tests/test_claude_section_citations.py tests/test_write_share_denominator.py
             tests/test_cutover_slug_rot.py
             tests/test_docs_cite_no_refused_config_keys.py
+            tests/test_install_docs_pin_the_current_version.py
             tests/test_operator_docs_no_warning_sign.py
             tests/test_docs_upstream_hop_ack.py"
           # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
@@ -470,6 +471,28 @@ jobs:
       - name: Type-check (mypy, strict — linux platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: mypy messagefoundry messagefoundry_webconsole --exclude 'messagefoundry/tray/'
+
+      # BACKLOG #1799: tests/ is type-checked. WHY THE SCOPE IS WHAT IT IS, so the next gap is not
+      # found by accident. This is the THIRD directory to fall outside a gate that reads as
+      # repo-wide: #327 fixed .gitignore, then docs/**/*.py sat exempt from lint, mypy and pytest
+      # directly below the note explaining the first (see the `changes` job, and its verdict "the
+      # instance was fixed and the class left open"). tests/ was the third: the engine steps name
+      # their packages and pre-commit runs no mypy, so nothing type-checked a test file.
+      #   * The scope is the DIRECTORY, not a file list, so a new test file is checked on arrival.
+      #     The exemptions, the profile it runs under and the reason for `--explicit-package-bases`
+      #     are stated once, in pyproject.toml's [tool.mypy] comments. tests/test_mypy_tests_scope.py
+      #     pins this step, the profile's key set and the exemption list's hygiene and ceiling.
+      #   * Linux platform only. The win32 pass below exists for SHIPPED win32 code; a test's win32
+      #     branch runs on the Windows pytest legs, where a defect in it fails the run.
+      #   * Placed straight after the linux engine pass so it reuses that pass's mypy cache; after
+      #     the win32 pass it re-analyses the engine modules the tests import.
+      #   * NOT REPO-WIDE. At least harness/, tee/, scripts/, samples/, docker/, fuzz/, docs/**/*.py
+      #     and packaging/messagefoundry-webconsole/tests/ are outside every mypy step. mypy follows a
+      #     test's import into harness/ or scripts/, but the editable install reports those modules
+      #     as silenced site-packages, so a green step says nothing about them.
+      - name: Type-check (mypy, tests — linux platform)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
+        run: mypy --explicit-package-bases tests
 
       # The win32 pass types messagefoundry/tray (now inside the messagefoundry package, so no separate
       # path argument) plus every other sys.platform=='win32' branch.

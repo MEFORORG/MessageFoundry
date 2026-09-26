@@ -25,7 +25,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
@@ -132,16 +132,14 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("GET", "/ui/messages/{message_id}/attachments/{attachment_id}"),
         ("GET", "/ui/messages/{message_id}/parse-tree"),
         ("GET", "/ui/uploaded-logs"),
-        # BACKLOG #1227: the resend CONFIRM page. It cannot be step-up-gated — it IS the re-auth
-        # continuation, so a step-up there bounces the operator back to /ui/reauth forever. It is
-        # safe to leave on plain require_ui because it renders NO message body: a filename, an
-        # ordinal and a connection name, all of which the operator just supplied.
-        ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
-        # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload"): it now carries
-        # `require_ui_step_up`, so the derivation below no longer flags it. See docs/SECURITY.md
-        # item 3 of the behavioural-differences block.
+        # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload") and BACKLOG #1822 removed
+        # ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"): both now carry
+        # `require_ui_step_up`, so the derivation below no longer flags them. The confirm page was
+        # listed on the claim that a gate on a re-auth continuation loops; it does not, and
+        # test_uploaded_logs_ui.py measures that. See docs/SECURITY.md item 3 of the
+        # behavioural-differences block.
     }
 )
 
@@ -884,7 +882,7 @@ def test_every_engine_route_appears_in_the_route_map_with_its_permission_and_gat
 
 
 def _row_mismatches(
-    derived: dict[tuple[str, str], _DocRow], documented: dict[tuple[str, str], _DocRow]
+    derived: Mapping[tuple[str, str], _DocRow], documented: Mapping[tuple[str, str], _DocRow]
 ) -> list[str]:
     """Every route whose documented permission set or gate wrapper disagrees with the live app."""
     out: list[str] = []

@@ -127,6 +127,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # BACKLOG #1093 (CWE-1121). The WHOLE repo, stated ONCE. Every C901 call below reads this; the
+      # argument used to be the literal `messagefoundry`, restated six times, so the scan never saw
+      # the shipped web console (one function there measured complexity 106 on 2026-09-25). What is
+      # excluded lives in pyproject's [tool.ruff] extend-exclude and .gitignore, as for the required
+      # ruff leg. The base-tree scan reads the MERGE BASE's copies of both, so a PR that edits either
+      # compares two different file sets and its delta can report pre-existing functions as new.
+      # tests/test_quality_advisory_invariants.py pins both halves.
+      C901_SCOPE: "."
     outputs:
       receipt: ${{ steps.receipt.outputs.receipt }}
     steps:
@@ -157,10 +166,10 @@ jobs:
         continue-on-error: true
         run: |
           echo "== functions over mccabe complexity 10 (advisory triage; NEVER a merge gate) =="
-          ruff check --select C901 --output-format=concise --exit-zero messagefoundry
+          ruff check --select C901 --output-format=concise --exit-zero "$C901_SCOPE"
           echo ""
           echo "== summary =="
-          ruff check --select C901 --statistics --exit-zero messagefoundry
+          ruff check --select C901 --statistics --exit-zero "$C901_SCOPE"
       - name: Complexity delta vs the merge base (advisory - never gates)
         # PR-only: there is no base ref to diff against on the cron or on workflow_dispatch, where the
         # whole-repo console triage above remains the full picture.
@@ -189,18 +198,19 @@ jobs:
             exit 0
           fi
           echo "merge base: $MERGE_BASE"
-          ruff check --select C901 --output-format=json --exit-zero messagefoundry > c901-head.json
+          ruff check --select C901 --output-format=json --exit-zero "$C901_SCOPE" > c901-head.json
           # A second checkout of the merge base, so the "before" numbers come from real ruff output
           # rather than a reconstruction. Its absolute paths differ from HEAD's by the extra directory;
           # c901_delta.py collapses both to repo-relative keys (regression-tested -- if it did not,
           # every function would report as new).
           git worktree add --detach base-tree "$MERGE_BASE"
-          ( cd base-tree && ruff check --select C901 --output-format=json --exit-zero messagefoundry ) \
+          ( cd base-tree && ruff check --select C901 --output-format=json --exit-zero "$C901_SCOPE" ) \
             > c901-base.json
           python3 scripts/quality/c901_delta.py \
             --base c901-base.json \
             --head c901-head.json \
             --repo-root . \
+            --base-root base-tree \
             --summary-file "$GITHUB_STEP_SUMMARY"
           # Written LAST, so it exists only if every step above actually completed. Its absence is
           # therefore proof the delta died somewhere, which the receipt reports as a dead gate.
@@ -224,8 +234,11 @@ jobs:
           # Units count what was EXAMINED, never what was found: a repo with zero functions over the
           # threshold is good news, and a liveness check that fires on good news gets muted.
           # `--show-files` lists exactly the files ruff would check, so it is non-zero iff ruff ran.
-          FILES="$(ruff check --select C901 --show-files messagefoundry 2>/dev/null | wc -l)"
-          FINDINGS="$(ruff check --select C901 --output-format=json --exit-zero messagefoundry \
+          # On a PR the delta step has checked the merge base out INSIDE the repo, as base-tree/. A
+          # whole-repo scan does not count it twice because .gitignore lists base-tree/ and ruff
+          # honours .gitignore -- remove that line and these counts double.
+          FILES="$(ruff check --select C901 --show-files "$C901_SCOPE" 2>/dev/null | wc -l)"
+          FINDINGS="$(ruff check --select C901 --output-format=json --exit-zero "$C901_SCOPE" \
             | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
           # THE DELTA IS THE POINT ON A PR, and until now this receipt could not see it. `--show-files`
           # proves ruff enumerated files, which is true whether or not the delta step ran -- so a delta

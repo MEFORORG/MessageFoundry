@@ -19,7 +19,7 @@ from messagefoundry.__main__ import main
 
 def _show(path: Path, capsys: pytest.CaptureFixture[str]) -> dict:
     assert main(["security", "show", "--service-config", str(path), "--json"]) == 0
-    return json.loads(capsys.readouterr().out)  # type: ignore[no-any-return]
+    return json.loads(capsys.readouterr().out)
 
 
 def _set(path: Path, updates: dict, capsys: pytest.CaptureFixture[str]) -> tuple[int, dict]:

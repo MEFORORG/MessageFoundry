@@ -10,12 +10,13 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, hash_token
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
@@ -1081,6 +1082,65 @@ async def test_resend_confirm_does_not_reflect_hostile_markup(
         # satisfy a bare "not in" assertion.
         assert hostile not in r.text
         assert "&lt;script&gt;" in r.text
+
+
+async def test_resend_confirm_is_step_up_gated_and_reauth_returns_to_it_once(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #1822 -- the resend CONFIRM page takes the step-up its JSON equivalent carries.
+
+    It used to be plain ``require_ui`` on the claim that it IS the re-auth continuation, so a step-up
+    there would bounce the operator back to /ui/reauth forever. This test is the measurement that
+    claim never had. ONE session, whose window is aged in the store rather than configured stale:
+    with ``step_up_max_age=-1`` re-auth could never make any window fresh, so every gated
+    continuation would "loop" and the test would prove nothing about this route.
+
+    The sequence is the one a browser follows: stale GET, the re-auth form, the re-auth POST, then
+    the Location it answers. The last hop is the assertion that carries the item -- a 200, not a
+    second 303 to /ui/reauth -- and the fresh arm before the ageing is its control.
+    """
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+        confirm = f"/ui/uploaded-logs/file/{fid}/resend-confirm?index=1&to=in1"
+
+        # CONTROL: inside a fresh window the page renders, so the refusal below is the window's doing.
+        fresh = await c.get(confirm, follow_redirects=False)
+        assert fresh.status_code == 200, fresh.headers.get("location")
+        assert "Resend this message?" in fresh.text
+
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        await service.store.mark_session_reauthed(hash_token(tok), now=0.0)
+        assert await service.has_recent_step_up(tok) is False
+
+        # The un-stepped session is sent to re-auth, and the continuation keeps BOTH parameters: a
+        # path-only `next` would come back as a 422 with the operator's selection gone.
+        stale = await c.get(confirm, follow_redirects=False)
+        assert stale.status_code == 303, stale.text
+        assert stale.headers["location"] == f"/ui/reauth?next={quote(confirm, safe='/')}"
+
+        # The re-auth page ACCEPTS that continuation. A rejected one 303s to /ui instead.
+        form = await c.get(stale.headers["location"], follow_redirects=False)
+        assert form.status_code == 200, form.headers.get("location")
+
+        r = await c.post(
+            "/ui/reauth",
+            data={"next": confirm, "password": PW},
+            headers={"Sec-Fetch-Site": "same-origin"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303, r.text
+        assert r.headers["location"] == confirm, r.headers["location"]
+
+        # NO LOOP. Re-auth refreshed the window before redirecting, so the gated page renders.
+        back = await c.get(r.headers["location"], follow_redirects=False)
+        assert back.status_code == 200, back.headers.get("location")
+        # The rendered sentence, not a bare "in1": the form's action URL also carries `to=in1`.
+        assert "message #1 from" in back.text
+        assert "inbound connection “in1”" in back.text
 
 
 async def test_resend_refused_by_the_target_inbounds_guards_names_its_own_cause(

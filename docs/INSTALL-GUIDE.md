@@ -318,7 +318,7 @@ instance.** You do **not** maintain per-environment branches. Each host differs 
         │ production=f  │  │ production=t  │  │ production=f  │
         │ MEFOR_* (test)│  │ MEFOR_* (prod)│  │ MEFOR_* (poc) │
         └───────────────┘  └───────────────┘  └───────────────┘
-       engine 0.1.0 wheel  engine 0.1.0 wheel  engine 0.1.0 wheel  (pinned, identical)
+       engine X.Y.Z wheel  engine X.Y.Z wheel  engine X.Y.Z wheel  (pinned, identical)
 ```
 
 Promotion = merge to `main` → deploy that commit everywhere. A Test instance resolves
@@ -345,7 +345,7 @@ There is simply no developer workflow that routes through engine source — by c
 
 ## 10. Upgrading the engine
 
-1. Bump the pin in `requirements.txt` (e.g. `messagefoundry==0.2.0`) on a branch.
+1. Bump the pin in `requirements.txt` (`messagefoundry==<new>`) on a branch.
 2. `pip install -r requirements.txt` and run `messagefoundry check` locally; open a PR — CI re-validates
    your whole config against the new engine.
 3. Merge, and roll the new commit to Test first, then Production. Because everything is pinned and your
