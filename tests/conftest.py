@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
+from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 
 # ---------------------------------------------------------------------------------------------------
@@ -525,23 +526,24 @@ def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
 # Scoped to files sitting DIRECTLY in tests/. The other testpath
 # (packaging/messagefoundry-webconsole/tests) is a separate suite with its own pytest config; keying
 # on the basename alone would let a same-named file there inherit a mark meant for this directory.
+#
+# THE PYTHON PARSER IS tests/_tooling_manifest.py (BACKLOG #1434). This hook used to carry its own
+# copy, one of three that nothing pinned against each other. ci.yml reads the file too, in shell;
+# that module's docstring says how the two are kept from disagreeing.
 # ---------------------------------------------------------------------------------------------------
 
 _TESTS_DIR = Path(__file__).resolve().parent
-_TOOLING_MANIFEST = _TESTS_DIR / "tooling_manifest.txt"
-
-
-def _tooling_basenames() -> frozenset[str]:
-    text = _TOOLING_MANIFEST.read_text(encoding="utf-8")  # raises if absent -- see above
-    return frozenset(
-        line.strip().rsplit("/", 1)[-1]
-        for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    )
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    names = _tooling_basenames()
+    # `tests` resolves through sys.path, and an editable install from ANOTHER worktree can put that
+    # checkout first. Its manifest would then mark this tree's tests with no error, so refuse.
+    if tooling_manifest.MANIFEST.parent != _TESTS_DIR:
+        raise RuntimeError(
+            f"the tooling manifest resolved to {tooling_manifest.MANIFEST}, outside {_TESTS_DIR}: "
+            "`tests` was imported from another checkout, so its list would mark this one's tests"
+        )
+    names = frozenset(tooling_manifest.names())  # raises if absent or malformed -- see above
     for item in items:
         path = getattr(item, "path", None)
         if path is not None and path.parent == _TESTS_DIR and path.name in names:
