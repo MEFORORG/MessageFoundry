@@ -511,7 +511,11 @@ class ConnectionRow(BaseModel):
     """One endpoint (a channel's source, or one of its destinations) for the connections
     dashboard. Fields are role-dependent: source rows carry read/inbound-errored/idle and the
     listen peer/port; destination rows carry queue/written/dead/backlog/delivered-age and the
-    remote peer/port. Unused fields are None so the UI can render blanks."""
+    remote peer/port. Unused fields are None so the UI can render blanks.
+
+    ``None`` never stands in for a zero (BACKLOG #1817): a measured count is reported even when it is
+    ``0``, on edge and standalone destination rows alike. ``None`` means the field does not apply to
+    this row's role, or, for an age or ETA, that there is nothing to measure."""
 
     role: str  # "source" | "destination"
     channel_id: str
@@ -523,7 +527,8 @@ class ConnectionRow(BaseModel):
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
     port: int | None
-    queue_depth: int | None
+    queue_depth: int | None  # destination only: pending + inflight now
+    # Seconds since the last receipt (source) or the last delivery (destination); None = none yet.
     idle_seconds: float | None
     alerts_active: int  # count of OPEN alert instances for this connection (ADR 0044, #56)
     errored: int | None  # source: inbound errors; destination: dead-lettered

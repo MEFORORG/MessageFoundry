@@ -1182,6 +1182,48 @@ async def test_connections_standalone_row_reads_stopped_when_the_graph_is_down(
     assert {r["role"]: r["status"] for r in rows} == {"source": "stopped", "destination": "stopped"}
 
 
+async def test_connections_standalone_row_reports_measured_zeros_not_nulls(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """BACKLOG #1817: a RUNNING standalone row carries its counters as measured values.
+
+    The store's outbound aggregate groups every outbound-stage queue row, so an outbound with no edge
+    has no queue row at all: zero queued, zero written, zero dead. Reporting those as null told a
+    console "not measured", which it cannot tell apart from a real zero. Idle stays null because no
+    delivery has happened to date it from -- the same null an edge row carries before its first one."""
+    await _started_outbound_engine(engine, tmp_path)
+    [row] = await _out1_rows(client)
+    assert row["channel_id"] == "out1" and row["status"] == "running"  # the standalone row
+    assert row["queue_depth"] == 0
+    assert row["written"] == 0
+    assert row["errored"] == 0
+    assert row["backlog_seconds"] == 0.0  # empty queue: nothing to clear, the edge row's rule
+    assert row["idle_seconds"] is None  # never delivered
+    assert row["delivered_age_seconds"] is None  # nothing queued
+    assert row["read"] is None  # a source-only field stays null on a destination row
+
+
+async def test_connections_standalone_row_counts_an_unshown_edges_backlog(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """BACKLOG #1817: the standalone row's zero is a reading, so a real backlog must show through.
+
+    A queue row whose inbound is not in the live graph (the shape a reload that drops an inbound
+    leaves behind) is skipped by the edge loop, so its outbound falls to a standalone row. The row
+    must report that queued message rather than a null (the old form) or a blanket zero (a constant
+    that would pass the test above without measuring anything)."""
+    await _started_outbound_engine(engine, tmp_path)
+    # Stop the lane first so the queued row stays queued and the reading is stable.
+    await _quiesced_stopped_outbound(engine, client)
+    await engine.store.enqueue_message(channel_id="gone", raw=ADT, deliveries=[("out1", ADT)])
+    [row] = await _out1_rows(client)
+    assert row["channel_id"] == "out1" and row["status"] == "stopped"  # still the standalone row
+    assert row["queue_depth"] == 1
+    assert row["written"] == 0
+    assert row["delivered_age_seconds"] is not None  # the queued row has an age
+    assert row["backlog_seconds"] is None  # queued with nothing draining: the edge row's rule
+
+
 async def test_engine_not_started_returns_503(tmp_path: Path) -> None:
     # App with no engine bound (and no lifespan to set one) → 503 on engine routes.
     transport = httpx.ASGITransport(app=create_app(allow_no_auth=True))
