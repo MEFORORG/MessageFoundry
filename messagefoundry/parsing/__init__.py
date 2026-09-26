@@ -25,6 +25,7 @@ from messagefoundry.parsing.compression import (
     CompressionError,
     deflate_compress,
     deflate_decompress,
+    deflate_decompress_with_tail,
     gzip_compress,
     gzip_decompress,
     zip_compress,
@@ -130,6 +131,7 @@ __all__ = [
     "gzip_decompress",
     "deflate_compress",
     "deflate_decompress",
+    "deflate_decompress_with_tail",
     "zip_compress",
     "zip_decompress",
     # HL7 v2 timestamp helpers (messagefoundry.timezone) — tolerant TS parse, DST-aware zone

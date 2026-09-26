@@ -31,6 +31,7 @@ from messagefoundry.parsing.compression import (
     CompressionError,
     deflate_compress,
     deflate_decompress,
+    deflate_decompress_with_tail,
     gzip_compress,
     gzip_decompress,
     zip_compress,
@@ -186,6 +187,7 @@ def test_top_level_reexports() -> None:
 
     assert mf.gzip_compress is gzip_compress
     assert mf.gzip_decompress is gzip_decompress
+    assert mf.deflate_decompress_with_tail is deflate_decompress_with_tail
     assert mf.CompressionError is CompressionError
 
 
@@ -203,6 +205,7 @@ def test_gzip_interops_with_stdlib() -> None:
     [
         (gzip_decompress, b""),
         (deflate_decompress, b""),
+        (deflate_decompress_with_tail, b""),
         (zip_decompress, b""),
     ],
 )
@@ -444,6 +447,15 @@ def test_zip_directory_entries_still_count_toward_member_cap() -> None:
 # The Lander's reproduction: an all-zero body whose output needs more than one output round.
 _MULTI_ROUND = b"\x00" * (3 * compression._CHUNK)
 _CAP = 16 * 1024 * 1024
+# Bytes after the end of a stream. One list, so the codec's refusal (#1964), the shared loop's two
+# rules (#1977) and the tail function (#1978) are all asked about the same shapes.
+_TRAILING = [
+    pytest.param(b"X", id="byte"),
+    pytest.param(b"\x00", id="nul-pad"),
+    pytest.param(b"\r\nendstream\r\nendobj\r\n", id="pdf-trailer"),
+    pytest.param(zlib.compress(b"second stream"), id="second-stream"),
+    pytest.param(b"T" * 70_000, id="tail-past-a-window"),
+]
 
 
 def _returns_within[T](fn: Callable[[], T], seconds: float = 10.0) -> T:
@@ -478,11 +490,7 @@ def test_deflate_multi_round_stream_with_a_trailing_byte_is_refused() -> None:  
 
 
 @pytest.mark.timeout(30)
-@pytest.mark.parametrize(
-    "trailing",
-    [b"X", b"\x00", zlib.compress(b"second stream")],
-    ids=["byte", "nul-pad", "second-stream"],
-)
+@pytest.mark.parametrize("trailing", _TRAILING)
 @pytest.mark.parametrize("body", [b"\x00" * 100, _MULTI_ROUND], ids=["one-round", "multi-round"])
 def test_deflate_refuses_any_bytes_after_the_end_of_the_stream(
     body: bytes, trailing: bytes
@@ -517,13 +525,17 @@ def _stored_stream_of_exact_length(length: int) -> bytes:
 
 @pytest.mark.timeout(30)
 @pytest.mark.parametrize("windows", [1, 2])
-def test_deflate_trailing_data_on_a_window_boundary(windows: int) -> None:  # #1964
+def test_deflate_trailing_data_on_a_window_boundary(windows: int) -> None:  # #1964, #1978
     # A stream that ends exactly on an input window leaves nothing in that window, so only the
-    # "a later window exists" half of the trailing check can see the extra byte.
+    # "a later window exists" half of the trailing check can see the extra byte. The tail function
+    # must put that byte in the tail and not in the stream.
     stream = _stored_stream_of_exact_length(windows * compression._CHUNK)
-    assert len(_returns_within(lambda: deflate_decompress(stream, max_output_bytes=None))) > 0
+    body = _returns_within(lambda: deflate_decompress(stream, max_output_bytes=None))
+    assert len(body) > 0
     with pytest.raises(CompressionError, match="trailing data"):
         _returns_within(lambda: deflate_decompress(stream + b"Z", max_output_bytes=None))
+    assert deflate_decompress_with_tail(stream, max_output_bytes=None) == (body, b"")
+    assert deflate_decompress_with_tail(stream + b"Z", max_output_bytes=None) == (body, b"Z")
 
 
 @pytest.mark.parametrize(
@@ -546,32 +558,25 @@ def test_deflate_error_leaves_a_bytearray_resizable(data: bytes, cap: int | None
     buf.extend(b"more")
 
 
+@pytest.mark.parametrize("fn", [deflate_decompress, deflate_decompress_with_tail])
 def test_deflate_bomb_stops_at_the_ceiling_not_a_window_past_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:  # #1964
+    fn: Callable[..., object], monkeypatch: pytest.MonkeyPatch
+) -> None:  # #1964, #1978
     # The module promises a bomb is refused after producing at most the ceiling. Asking zlib for a
     # whole window each round would overshoot a small ceiling by up to one window.
-    produced: list[int] = []
+    counters: list[_CountingDecompressor] = []
     real = zlib.decompressobj
 
-    class _Counting:
-        def __init__(self, *, wbits: int) -> None:
-            self._inner = real(wbits=wbits)
-
-        def decompress(self, data: bytes, max_length: int = 0) -> bytes:
-            piece = self._inner.decompress(data, max_length)
-            produced.append(len(piece))
-            return piece
-
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._inner, name)
+    def counting(*, wbits: int) -> _CountingDecompressor:
+        counters.append(_CountingDecompressor(real(wbits=wbits)))
+        return counters[-1]
 
     monkeypatch.setattr(
-        compression, "zlib", SimpleNamespace(decompressobj=_Counting, error=zlib.error)
+        compression, "zlib", SimpleNamespace(decompressobj=counting, error=zlib.error)
     )
     with pytest.raises(CompressionError, match="ceiling"):
-        deflate_decompress(zlib.compress(_MULTI_ROUND), max_output_bytes=1024)
-    assert sum(produced) == 1025
+        fn(zlib.compress(_MULTI_ROUND) + b"X", max_output_bytes=1024)
+    assert [counter.produced for counter in counters] == [1025]
 
 
 def test_deflate_stream_spanning_many_input_windows() -> None:  # #1964
@@ -976,11 +981,7 @@ def test_both_callers_run_the_one_shared_inflate_loop() -> None:  # #1977
 
 
 @pytest.mark.timeout(30)
-@pytest.mark.parametrize(
-    "trailing",
-    [b"X", b"\x00", zlib.compress(b"second stream")],
-    ids=["byte", "nul-pad", "second-stream"],
-)
+@pytest.mark.parametrize("trailing", _TRAILING)
 @pytest.mark.parametrize("body", [b"\x00" * 100, _MULTI_ROUND], ids=["one-round", "multi-round"])
 @pytest.mark.parametrize("keep_output", [True, False], ids=["keep", "discard"])
 @pytest.mark.parametrize("exact_ceiling", [True, False], ids=["exact", "window"])
@@ -1006,7 +1007,8 @@ def test_the_shared_loop_pins_both_trailing_rules(
     with pytest.raises(InflateTrailingData):
         _returns_within(lambda: run("refuse"))
     stopped = _returns_within(lambda: run("stop"))
-    assert stopped == InflateResult(body if keep_output else b"", len(body), eof=True)
+    end = len(stream) - len(trailing)
+    assert stopped == InflateResult(body if keep_output else b"", len(body), eof=True, end=end)
 
 
 def test_the_shared_loop_refuses_an_unknown_trailing_rule() -> None:  # #1977
@@ -1071,6 +1073,7 @@ def test_the_shared_loop_reports_a_truncated_stream_and_leaves_the_verdict_to_th
         exact_ceiling=True,
     )
     assert result.eof is False
+    assert result.end == len(stream)  # #1978: no end was found, so every byte was the stream's
 
 
 def test_dicom_guard_still_stands_aside_for_a_break_inside_the_crossing_window() -> None:  # #1977
@@ -1194,3 +1197,82 @@ def test_zip_refuses_bytes_before_an_empty_archive() -> None:  # #1976
     assert zip_decompress(empty, max_output_bytes=_CAP) == {}
     with pytest.raises(CompressionError, match="data before the start of the zip archive"):
         zip_decompress(b"J" * 10 + empty, max_output_bytes=_CAP)
+
+
+# --- #1978: an inflate that hands back what follows the stream ------------------------------------
+
+
+def _stream_ending_in(last: bytes) -> tuple[bytes, bytes]:
+    """A synthetic zlib stream whose own last byte, a checksum byte, is ``last``, and its body."""
+    rng = random.Random(1978)
+    for _ in range(10_000):
+        body = b"BT /F1 12 Tf 72 712 Td (" + rng.randbytes(8).hex().encode() + b") Tj ET"
+        stream = zlib.compress(body)
+        if stream[-1:] == last:
+            return stream, body
+    raise AssertionError(f"no stream ending in {last!r}")
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("trailing", _TRAILING)
+@pytest.mark.parametrize("body", [b"\x00" * 100, _MULTI_ROUND], ids=["one-round", "multi-round"])
+def test_deflate_with_tail_returns_the_body_and_the_tail(body: bytes, trailing: bytes) -> None:
+    # #1978: the same shapes deflate_decompress refuses. The multi-round body is the #1964 shape.
+    stream = zlib.compress(body) + trailing
+    got = _returns_within(lambda: deflate_decompress_with_tail(stream, max_output_bytes=_CAP))
+    assert got == (body, trailing)
+
+
+@pytest.mark.parametrize("body", [b"", b"\x00" * 100, _MULTI_ROUND], ids=["empty", "one", "multi"])
+def test_deflate_with_tail_returns_an_empty_tail_as_empty_bytes(body: bytes) -> None:  # #1978
+    assert deflate_decompress_with_tail(zlib.compress(body), max_output_bytes=_CAP) == (body, b"")
+
+
+def test_deflate_with_tail_returns_bytes_for_a_bytearray_input() -> None:  # #1978
+    # The signature says bytes, but nothing stops a Handler passing a bytearray at run time. The tail
+    # must still come back as bytes, not as a slice of the caller's own buffer type.
+    data = bytearray(zlib.compress(_BODY) + b"\r\n")
+    body, tail = deflate_decompress_with_tail(data, max_output_bytes=_CAP)  # type: ignore[arg-type]
+    assert (body, tail) == (_BODY, b"\r\n")
+    assert type(tail) is bytes
+
+
+@pytest.mark.parametrize("last", [b"\n", b"\r"], ids=["lf", "cr"])
+def test_deflate_with_tail_splits_a_stream_whose_own_last_byte_is_a_line_end(last: bytes) -> None:
+    # #1978, the reason this exists: a PDF stream is followed by an end-of-line, and the old advice
+    # was to strip it before calling deflate_decompress. When the stream's own checksum byte is a CR
+    # or LF, stripping takes that byte too and the stream no longer inflates.
+    stream, body = _stream_ending_in(last)
+    data = stream + b"\r\nendstream"
+    with pytest.raises(CompressionError, match="truncated"):
+        deflate_decompress(data.removesuffix(b"endstream").rstrip(b"\r\n"), max_output_bytes=_CAP)
+    assert deflate_decompress_with_tail(data, max_output_bytes=_CAP) == (body, b"\r\nendstream")
+
+
+def test_deflate_with_tail_walks_back_to_back_streams() -> None:  # #1978
+    bodies = [b"first", b"\x00" * (2 * compression._CHUNK), b"third"]
+    rest = b"".join(zlib.compress(body) for body in bodies)
+    got = []
+    while rest:
+        body, rest = deflate_decompress_with_tail(rest, max_output_bytes=_CAP)
+        got.append(body)
+    assert got == bodies
+
+
+@pytest.mark.parametrize("fn", [deflate_decompress, deflate_decompress_with_tail])
+@pytest.mark.parametrize(
+    "data",
+    [b"", zlib.compress(_BODY)[:10], zlib.compress(_BODY)[:-1], zlib.compress(_MULTI_ROUND)[:-4]],
+    ids=["empty", "head", "short-checksum", "multi-round-no-checksum"],
+)
+def test_deflate_refuses_a_truncated_stream(fn: Callable[..., object], data: bytes) -> None:
+    # #1978: a truncated stream has no end, so there is no tail to hand back and no body to pass.
+    with pytest.raises(CompressionError, match="truncated"):
+        fn(data, max_output_bytes=_CAP)
+
+
+def test_deflate_with_tail_still_refuses_corrupt_input_and_a_bad_ceiling() -> None:  # #1978
+    with pytest.raises(CompressionError, match="corrupt"):
+        deflate_decompress_with_tail(b"\xff\xff\xff\xff not deflate", max_output_bytes=None)
+    with pytest.raises(CompressionError, match="max_output_bytes"):
+        deflate_decompress_with_tail(zlib.compress(b"x"), max_output_bytes=-1)

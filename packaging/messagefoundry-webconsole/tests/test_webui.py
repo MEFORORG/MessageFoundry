@@ -3357,6 +3357,111 @@ async def test_the_all_channels_token_cannot_ride_in_through_the_textarea(engine
         assert user is not None and json_.loads(user.channel_scope or "null") == [ALL_CHANNELS]
 
 
+def test_scope_source_renders_in_words() -> None:
+    """BACKLOG #1958: every stored source has words, and one this console has not learned shows
+    as itself rather than vanishing from the page."""
+    from messagefoundry.api.auth_models import UserSummary
+    from messagefoundry_webconsole.pages.admin import _scope_source_text, users_page
+
+    def _u(source: str | None) -> UserSummary:
+        return UserSummary(
+            id="u",
+            username="u",
+            auth_provider="ad",
+            disabled=False,
+            roles=["operator"],
+            channel_scope=["IB_A"],
+            channel_scope_source=source,
+        )
+
+    assert _scope_source_text(_u("ad")) == "directory (AD group map)"
+    assert _scope_source_text(_u("manual")) == "set by an administrator"
+    assert _scope_source_text(_u(None)) == "not recorded"
+    assert _scope_source_text(_u("future")) == "future"
+    listing = str(users_page([_u("ad")]))
+    assert "<th>Scope source</th>" in listing
+    assert "directory (AD group map)" in listing
+
+
+def test_which_scopes_need_the_manual_confirmation() -> None:
+    """BACKLOG #1958: the tick is asked for exactly where a save stops the AD login sync withdrawing
+    the scope. That is a directory scope, and an AD account's scope with no recorded writer, which
+    the sync withdraws the same way. A local account is never synced, so it is never asked."""
+    from messagefoundry.api.auth_models import UserSummary
+    from messagefoundry_webconsole.pages.admin import needs_manual_scope_confirm
+
+    def _u(provider: str, scope: list[str] | None, source: str | None) -> UserSummary:
+        return UserSummary(
+            id="u",
+            username="u",
+            auth_provider=provider,
+            disabled=False,
+            roles=["operator"],
+            channel_scope=scope,
+            channel_scope_source=source,
+        )
+
+    assert needs_manual_scope_confirm(_u("ad", ["IB_A"], "ad"))
+    assert needs_manual_scope_confirm(_u("ad", ["IB_A"], None))  # unvouched: the sync withdraws it
+    assert not needs_manual_scope_confirm(_u("ad", ["IB_A"], "manual"))
+    assert not needs_manual_scope_confirm(_u("ad", None, None))  # nothing stored to withdraw
+    assert not needs_manual_scope_confirm(_u("local", ["IB_A"], None))  # never synced
+
+
+async def test_resaving_a_directory_scope_needs_a_confirmation(engine: Engine) -> None:
+    """BACKLOG #1958: a save turns a directory scope manual, even an unchanged one, and the login
+    sync never withdraws a manual scope. So the page warns and asks for a tick, and the route
+    refuses a save without it. The manual-scope arm is the control: it saves with no tick."""
+    import uuid
+
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    service = await _service(engine)
+    ada = uuid.uuid4().hex  # the shape a real account id has
+    await service.store.create_user(user_id=ada, username="ada", auth_provider="ad")
+    await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
+    resave = {"scope_mode": "list", "channels": "IB_A"}
+    same_origin = {"Sec-Fetch-Site": "same-origin"}
+    async with _boss_client(engine, service) as c:
+        detail = (await c.get(f"/ui/users/{ada}")).text
+        assert "Source: directory (AD group map)" in detail
+        assert "The directory owns this scope" in detail
+        assert 'name="confirm_manual_scope" value="yes" required' in detail
+
+        # The unchanged re-save, without the tick: refused, and the scope stays the directory's.
+        r = await c.post(f"/ui/users/{ada}/channel-scope", data=resave, headers=same_origin)
+        assert r.status_code == 400
+        assert "tick the box to confirm" in r.text
+        user = await service.store.get_user(ada)
+        assert user is not None and user.channel_scope_source == SCOPE_SOURCE_AD
+
+        # A tick with any other value is not a confirmation.
+        r = await c.post(
+            f"/ui/users/{ada}/channel-scope",
+            data={**resave, "confirm_manual_scope": "on"},
+            headers=same_origin,
+        )
+        assert r.status_code == 400
+
+        # With the tick it saves, and the scope is now the administrator's.
+        r = await c.post(
+            f"/ui/users/{ada}/channel-scope",
+            data={**resave, "confirm_manual_scope": "yes"},
+            headers=same_origin,
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user(ada)
+        assert user is not None
+        assert (user.channel_scope, user.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_MANUAL)
+        detail = (await c.get(f"/ui/users/{ada}")).text
+        assert "Source: set by an administrator" in detail
+        assert "confirm_manual_scope" not in detail  # no warning once it is manual
+
+        # The control: a manual scope saves with no tick.
+        r = await c.post(f"/ui/users/{ada}/channel-scope", data=resave, headers=same_origin)
+        assert r.status_code == 303
+
+
 async def test_reset_password_shows_temp_once(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "u2", Role.VIEWER)

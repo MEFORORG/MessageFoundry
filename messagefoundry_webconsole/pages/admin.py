@@ -92,6 +92,47 @@ def _scope_cell(user: UserSummary) -> str:
     return ", ".join(stored) or "(none)"
 
 
+#: Who last wrote a user's stored scope, in words (BACKLOG #1958). The keys are the values of
+#: ``UserSummary.channel_scope_source``; the rule they decide is on ``UserRecord.channel_scope_source``.
+#: A value this console has not learned renders as itself rather than being dropped.
+#: ``"ad"`` is the store's ``SCOPE_SOURCE_AD``, spelled here because the console does not import
+#: the store; ``test_resaving_a_directory_scope_needs_a_confirmation`` fails if the two drift.
+_SCOPE_SOURCE_DIRECTORY = "ad"
+_SCOPE_SOURCE_TEXT: dict[str | None, str] = {
+    None: "not recorded",
+    _SCOPE_SOURCE_DIRECTORY: "directory (AD group map)",
+    "manual": "set by an administrator",
+}
+
+
+#: The checkbox an administrator ticks to confirm that saving a directory scope makes it manual
+#: (BACKLOG #1958). The page and the route both decide with :func:`needs_manual_scope_confirm`.
+CONFIRM_MANUAL_SCOPE_FIELD = "confirm_manual_scope"
+CONFIRM_MANUAL_SCOPE_VALUE = "yes"
+
+
+def needs_manual_scope_confirm(user: UserSummary) -> bool:
+    """Whether a scope save must carry the confirmation tick: the AD login sync would withdraw the
+    stored scope today, and a save stops it doing so.
+
+    That is a directory scope, and also an AD account's scope with no recorded writer, which the
+    sync treats the same way. Such a row can only predate the source column: nothing backfilled it.
+    """
+    source = user.channel_scope_source
+    if source == _SCOPE_SOURCE_DIRECTORY:
+        return True
+    return (
+        source is None
+        and user.channel_scope is not None
+        and user.auth_provider == AuthProvider.AD.value
+    )
+
+
+def _scope_source_text(user: UserSummary) -> str:
+    source = user.channel_scope_source
+    return _SCOPE_SOURCE_TEXT.get(source, str(source))
+
+
 def users_page(users: Sequence[UserSummary]) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms."""
     rows: list[list[object]] = []
@@ -104,6 +145,7 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
                 u.email or "",
                 ", ".join(u.roles),
                 _scope_cell(u),
+                _scope_source_text(u),
                 "disabled" if u.disabled else "active",
             ]
         )
@@ -113,7 +155,16 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
         _admin_links("users"),
         el("p", el("a", "+ New user", href="/ui/users/new")),
         rows_table(
-            ["Username", "Provider", "Display name", "Email", "Roles", "Channel scope", "Status"],
+            [
+                "Username",
+                "Provider",
+                "Display name",
+                "Email",
+                "Roles",
+                "Channel scope",
+                "Scope source",
+                "Status",
+            ],
             rows,
         ),
         active="users",
@@ -281,8 +332,36 @@ def user_detail_page(
             ("none", "No channels (deny all)"),
         )
     ]
+    # BACKLOG #1958: any save here writes the scope as manual, even an unchanged one, and a manual
+    # scope is one the AD login sync no longer withdraws. So a directory scope carries a warning and
+    # a required tick box; the route refuses the save without the tick.
+    confirm_manual: list[object] = []
+    if needs_manual_scope_confirm(user):
+        confirm_manual = [
+            el(
+                "p",
+                "The directory owns this scope: a sign-in that matches no mapped AD group removes "
+                "it. Saving here, even unchanged, marks it as set by an administrator, and then "
+                "such a sign-in no longer removes it. A sign-in that matches a mapped group still "
+                "replaces it.",
+                class_="banner",
+            ),
+            el(
+                "label",
+                el(
+                    "input",
+                    type="checkbox",
+                    name=CONFIRM_MANUAL_SCOPE_FIELD,
+                    value=CONFIRM_MANUAL_SCOPE_VALUE,
+                    required=True,
+                ),
+                " Make this scope manual",
+                class_="check",
+            ),
+        ]
     scope = el(
         "form",
+        el("p", f"Source: {_scope_source_text(user)}", class_="muted"),
         el("label", "Scope", el("select", *mode_options, name="scope_mode")),
         el(
             "label",
@@ -295,6 +374,7 @@ def user_detail_page(
             "some. Administrators reach every channel regardless of this setting.",
             class_="muted",
         ),
+        *confirm_manual,
         el("button", "Save channel scope", type="submit"),
         method="post",
         action=f"/ui/users/{user.id}/channel-scope",
