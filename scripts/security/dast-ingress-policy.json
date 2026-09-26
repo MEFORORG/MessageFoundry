@@ -11,7 +11,18 @@
     "min_liveness_probes": "measured 82, one per case",
     "min_log_records_seen": "measured 32 INFO+ engine records; the floor only proves the watch was fed",
     "resource_bounds": "measured heap growth between -50695 and +19628 bytes, handles +0 to +2, tasks +0 over 2 passes across four runs; the leak canary measured heap +8413697 and handles +32",
-    "wall_seconds": "measured about 7 for the seeded run"
+    "wall_seconds": "measured about 7 for the seeded run",
+    "budget_headroom": "measured 2026-09-26 on a 20-core Windows 11 box already near full CPU, six runs, three of them beside a pytest -n 8 run: the slowest half-close close was 0.36s against case_seconds 5.0, the slowest stall close 1.02s against stall_close_seconds 3.0, the slowest settle 0.026s against settle_seconds 3.0, the slowest connect 0.002s against connect_seconds 1.0. Yet merge-group run 36242551283 (windows-2022, full suite) saw one raw-TCP pipelined-three case take more than 5.0s to close in the traced resource phase, so a hosted runner's tail is at least 14 times this box's worst. That is why the required leg runs the 'required' profile below."
+  },
+  "profiles": {
+    "_about": "A profile raises wall-clock bounds in 'budget' and nothing else; the sweep refuses any other key and any value below the strict one. With no --profile the strict budget above applies, and that is what the advisory nightly (dast.yml) runs. 'required' is what tests/test_dast_ingress_sweep.py runs inside the required pytest legs, where a loaded hosted runner has stalled one close past 5s: each bound there is five or six times the strict one, so only a listener that never closes, or one far slower than any load seen, is reported. It costs nothing on a healthy run, because every wait ends when the listener closes. The stall canary keeps its own canary.case_seconds under any profile, and the stall control in the test waits out the full required stall_close_seconds, so both halves of the time detector are still proven to fire under this profile.",
+    "required": {
+      "budget": {
+        "case_seconds": 30.0,
+        "stall_close_seconds": 15.0,
+        "settle_seconds": 15.0
+      }
+    }
   },
   "posture": {
     "max_frame_bytes": 65536,

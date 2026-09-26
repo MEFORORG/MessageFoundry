@@ -26,10 +26,13 @@ from messagefoundry.mllpcodec import frame
 from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT
 from scripts.security.dast_ingress_sweep import (
     KNOWN_DEFECT_DISCRIMINATORS,
+    PROFILE_BOUNDS,
     Budget,
     Case,
     CaseResult,
+    PolicyError,
     _judge,
+    apply_profile,
     catalogue,
     classify_replies,
     evaluate,
@@ -44,10 +47,18 @@ from scripts.security.dast_ingress_target import CANARIES, CANARY_DETECTOR, ingr
 _REPO = Path(__file__).resolve().parents[1]
 _POLICY_PATH = _REPO / "scripts" / "security" / "dast-ingress-policy.json"
 _CAP = 65536
+#: The profile every run in this file uses. The required legs share a loaded hosted runner, and the
+#: policy's ``profiles._about`` says why the strict budget flaked there and what this one keeps.
+_PROFILE = "required"
+_PROFILE_ARGS = ["--profile", _PROFILE]
+
+
+def _strict_policy() -> dict[str, Any]:
+    return load_policy(_POLICY_PATH)
 
 
 def _policy() -> dict[str, Any]:
-    return load_policy(_POLICY_PATH)
+    return apply_profile(_strict_policy(), _PROFILE)
 
 
 def _budget(**overrides: Any) -> Budget:
@@ -68,7 +79,7 @@ async def _run_alone(case: Case, budget: Budget, **posture: float) -> CaseResult
 def clean_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[int, dict[str, Any]]:
     """One seeded run against a real engine, shared by every test that reads its receipt."""
     receipt_path = tmp_path_factory.mktemp("dast-ingress") / "receipt.json"
-    code = main(["--policy", str(_POLICY_PATH), "--receipt", str(receipt_path)])
+    code = main(["--policy", str(_POLICY_PATH), *_PROFILE_ARGS, "--receipt", str(receipt_path)])
     return code, json.loads(receipt_path.read_text(encoding="utf-8"))
 
 
@@ -125,7 +136,17 @@ def test_every_tolerated_defect_still_reproduces_in_the_run(
 @pytest.mark.parametrize("canary", CANARIES)
 def test_each_canary_trips_its_own_detector(canary: str, tmp_path: Path) -> None:
     receipt_path = tmp_path / f"{canary}.json"
-    code = main(["--policy", str(_POLICY_PATH), "--canary", canary, "--receipt", str(receipt_path)])
+    code = main(
+        [
+            "--policy",
+            str(_POLICY_PATH),
+            *_PROFILE_ARGS,
+            "--canary",
+            canary,
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     detector = CANARY_DETECTOR[canary]
     fired = [f for f in receipt["findings"] if f["detector"] == detector]
@@ -142,11 +163,20 @@ def test_every_detector_has_a_canary() -> None:
 async def test_the_stall_bound_fires_when_the_frame_deadline_is_off() -> None:
     """The stall half of the time detector, controlled by SUPPORTED configuration: with
     ``max_frame_seconds`` off, a peer trickling inside a frame is never closed, and the case must say
-    so. Without this, a stall check that could not fire would pass every slowloris case."""
-    result = await _run_alone(
-        _case("mllp", "slowloris-in-frame"), _budget(stall_close_seconds=1.0), max_frame_seconds=0
+    so. Without this, a stall check that could not fire would pass every slowloris case.
+
+    It waits out the REQUIRED profile's whole stall bound, not a shortened one, because that bound is
+    the one the required legs rely on: a control run at a smaller number would prove nothing about it.
+    """
+    budget = _budget()
+    assert (
+        budget.stall_close_seconds
+        == _policy()["profiles"][_PROFILE]["budget"]["stall_close_seconds"]
     )
-    assert any(f["detector"] == "time" for f in result.findings), result.findings
+    assert budget.stall_close_seconds > _strict_policy()["budget"]["stall_close_seconds"]
+    result = await _run_alone(_case("mllp", "slowloris-in-frame"), budget, max_frame_seconds=0)
+    stalls = [f for f in result.findings if f["detector"] == "time" and "stalled" in f["detail"]]
+    assert stalls, result.findings
 
 
 def test_a_blind_canary_exits_2_not_1() -> None:
@@ -180,6 +210,46 @@ def test_a_blind_log_watch_exits_2(clean_run: tuple[int, dict[str, Any]]) -> Non
 
 def test_a_missing_policy_fails_closed(tmp_path: Path) -> None:
     assert main(["--policy", str(tmp_path / "absent.json")]) == 2
+
+
+def test_the_run_used_the_required_profile(clean_run: tuple[int, dict[str, Any]]) -> None:
+    _code, receipt = clean_run
+    assert receipt["profile"] == _PROFILE
+    assert receipt["budget"]["case_seconds"] == _policy()["budget"]["case_seconds"]
+
+
+def test_the_required_profile_only_raises_wall_clock_bounds() -> None:
+    """Everything a profile could weaken other than a time bound stays exactly the strict policy."""
+    strict, profiled = _strict_policy(), _policy()
+    raised = profiled["profiles"][_PROFILE]["budget"]
+    assert raised and set(raised) <= PROFILE_BOUNDS
+    for key, value in raised.items():
+        assert value > strict["budget"][key], key
+    for key in ("posture", "floors", "resource_bounds", "canary", "known_defects", "seed"):
+        assert profiled[key] == strict[key], key
+    assert {k: v for k, v in profiled["budget"].items() if k not in raised} == {
+        k: v for k, v in strict["budget"].items() if k not in raised
+    }
+
+
+@pytest.mark.parametrize(
+    ("profile", "why"),
+    [
+        ({"floors": {"min_liveness_probes": 0}}, "nothing else"),
+        ({"budget": {"trickle_delay": 5.0}}, "may not set"),
+        ({"budget": {"case_seconds": 0.1}}, "lowers"),
+        ({"budget": {"case_seconds": "soon"}}, "unusable"),
+    ],
+)
+def test_a_profile_can_only_raise_a_time_bound(profile: dict[str, Any], why: str) -> None:
+    policy = dict(_strict_policy(), profiles={"loose": profile})
+    with pytest.raises(PolicyError, match=why):
+        apply_profile(policy, "loose")
+
+
+def test_an_unknown_profile_fails_closed() -> None:
+    assert main(["--policy", str(_POLICY_PATH), "--profile", "no-such-profile"]) == 2
+    assert main(["--policy", str(_POLICY_PATH), "--profile", "_about"]) == 2
 
 
 def test_a_known_defect_never_silences_liveness_time_or_log() -> None:
@@ -439,6 +509,13 @@ def test_the_ingress_job_installs_no_scanner() -> None:
     for step in _ingress_job()["steps"]:
         run = str(step.get("run", ""))
         assert "pip install" not in run.replace("uv pip install --system --constraint", ""), step
+
+
+def test_the_nightly_keeps_the_strict_budget() -> None:
+    """The load-tolerant profile is for the required legs only; the advisory job keeps the strict
+    bounds, so a listener that is merely slow is still reported somewhere."""
+    for step in _ingress_job()["steps"]:
+        assert "--profile" not in str(step.get("run", "")), step
 
 
 def test_the_ingress_canaries_run_first_and_demand_exit_1() -> None:

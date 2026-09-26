@@ -23,7 +23,9 @@ the ingress path must do, and each judgement is a DETECTOR with a positive contr
 * ``liveness`` -- after every case a well-formed message on a fresh connection is accepted and
   persisted, so a listener that died or wedged on the previous case is named at that case.
 * ``time`` -- every case finishes inside a fixed budget, a stalled or trickling peer is closed by the
-  listener inside the stall bound, and a closed peer's connection is released.
+  listener inside the stall bound, and a closed peer's connection is released. The bounds are the
+  policy's strict ``budget`` unless ``--profile`` names a policy profile, which may only raise them;
+  the required test leg runs the ``required`` profile, and the policy says why.
 * ``resources`` -- heap, OS handles and asyncio tasks, measured across repeated passes of the
   catalogue after a warm-up pass, stay under a fixed growth bound. Instruments: ``tracemalloc``
   traced bytes, ``psutil`` handle (Windows) or descriptor (POSIX) count, ``len(asyncio.all_tasks())``.
@@ -798,8 +800,15 @@ class Resources:
 
 
 async def _quiesce(target: IngressTarget, budget: Budget) -> None:
+    """Let every connection finish before a resource snapshot. A released connection's task can
+    outlive its release by a store write, and on a loaded runner that write can take seconds, so the
+    wait is on the tasks themselves. A task that never finishes is still counted once the bound
+    passes: that is a leak, and hiding it is not this wait's job."""
     for plane in PLANES:
         await _settle(target, plane, budget.settle_seconds)
+    deadline = time.monotonic() + budget.settle_seconds
+    while target.connection_tasks() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
     await asyncio.sleep(0.05)
     gc.collect()
 
@@ -864,6 +873,43 @@ def load_policy(path: Path) -> dict[str, Any]:
         if key not in policy:
             raise PolicyError(f"the policy at {path} has no {key!r} section")
     return policy
+
+
+#: The only keys a profile may set: the wall-clock bounds the time, liveness and count detectors wait
+#: out. ``trickle_delay`` is an input to a case, not a bound, and floors, resource bounds, the posture
+#: and the canary section are never a profile's to change.
+PROFILE_BOUNDS = frozenset(
+    {"case_seconds", "stall_close_seconds", "settle_seconds", "connect_seconds"}
+)
+
+
+def apply_profile(policy: dict[str, Any], name: str | None) -> dict[str, Any]:
+    """``policy`` with profile ``name``'s bounds laid over its ``budget``; ``None`` = the strict budget.
+
+    A profile exists so the REQUIRED leg tolerates a loaded hosted runner (see the policy's
+    ``profiles._about``). It may only RAISE a listed bound. Anything else is refused, so a profile can
+    never lower a floor, loosen a resource bound or silence a detector.
+    """
+    merged = copy.deepcopy(policy)
+    merged["active_profile"] = name
+    if name is None:
+        return merged
+    profile = policy.get("profiles", {}).get(name)
+    if not isinstance(profile, dict) or name.startswith("_"):
+        raise PolicyError(f"the policy has no profile {name!r}")
+    if set(profile) != {"budget"} or not isinstance(profile["budget"], dict):
+        raise PolicyError(f"profile {name!r} may set 'budget' and nothing else")
+    for key, value in profile["budget"].items():
+        if key not in PROFILE_BOUNDS:
+            raise PolicyError(f"profile {name!r} may not set budget.{key}")
+        try:
+            raised, strict = float(value), float(policy["budget"][key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PolicyError(f"profile {name!r} budget.{key} is unusable: {exc!r}") from exc
+        if raised < strict:
+            raise PolicyError(f"profile {name!r} lowers budget.{key} below the strict {strict}")
+        merged["budget"][key] = raised
+    return merged
 
 
 def catalogue(sentinel: str, cap: int) -> list[Case]:
@@ -968,6 +1014,8 @@ async def run_sweep(
         "scope": "see docs/adr/0155-dast-dynamic-security-testing-of-the-running-engine.md, Scope boundary",
         "seed": seed,
         "canary": canary,
+        "profile": policy.get("active_profile"),
+        "budget": asdict(budget),
         "posture": posture_out,
         "wall_seconds": round(time.monotonic() - started, 2),
         "planes": _plane_totals(results, liveness),
@@ -1061,7 +1109,8 @@ def receipt_lines(receipt: dict[str, Any], verdict: str) -> list[str]:
     lines = [
         f"## DAST ingress plane: {verdict}",
         "",
-        f"Seed {receipt['seed']}, canary {receipt['canary'] or 'none'}, {receipt['wall_seconds']}s. "
+        f"Seed {receipt['seed']}, canary {receipt['canary'] or 'none'}, "
+        f"profile {receipt.get('profile') or 'strict'}, {receipt['wall_seconds']}s. "
         f"Scope: {receipt['scope']}.",
         "",
         "| plane | cases | frames decoded | accepted | rejected | rows | ERROR rows |",
@@ -1098,6 +1147,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--receipt", type=Path, default=None)
     parser.add_argument("--summary", type=Path, default=None)
     parser.add_argument("--canary", choices=sorted(CANARY_DETECTOR), default=None)
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="raise the wall-clock bounds to a named policy profile (the required test leg)",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--mutations", type=int, default=None)
     parser.add_argument(
@@ -1105,7 +1159,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        policy = load_policy(args.policy)
+        policy = apply_profile(load_policy(args.policy), args.profile)
         receipt = _run(
             run_sweep(
                 policy,
