@@ -19,9 +19,9 @@ Three safety properties are built in, in order of importance:
 2. **Two-strike before revoking.** ``resolve_principal`` collapses *disabled*, *deleted* and *the
    search matched nothing* into a single ``None``, so one ambiguous result must not revoke.
 3. **A mass-revoke circuit breaker.** A misconfigured search base, a moved OU, or a service account
-   that lost read rights returns "not found" for **every** user — indistinguishable from "everyone
-   was disabled". :func:`breaker_tripped` aborts such a pass wholesale rather than signing out the
-   estate. This is why the pass is planned in full before anything is written: an abort must leave
+   that lost read rights (on the entries, or on ``userAccountControl`` alone) returns "not found"
+   for **every** user — indistinguishable from "everyone was disabled". :func:`breaker_tripped`
+   aborts such a pass wholesale rather than signing out the estate. This is why the pass is planned in full before anything is written: an abort must leave
    the store byte-identical, including the role re-diff.
 """
 
@@ -42,10 +42,12 @@ class ProbeOutcome(Enum):
     """What one directory probe of one principal established."""
 
     #: The principal resolved — the account exists and is not disabled (``_find_user`` rejects
-    #: ``userAccountControl & 0x2``). Carries the current group set, so the role re-diff is free.
+    #: ``userAccountControl & 0x2``, and since BACKLOG #1639 an unreadable ``userAccountControl``
+    #: too). Carries the current group set, so the role re-diff is free.
     PRESENT = "present"
     #: The lookup succeeded but matched nothing. **Ambiguous**: disabled, deleted, moved out of the
-    #: search base, or a search base that was never right. Strikes, never revokes on its own.
+    #: search base, a search base that was never right, or an entry whose ``userAccountControl`` the
+    #: bind account cannot read (BACKLOG #1639). Strikes, never revokes on its own.
     ABSENT = "absent"
     #: The directory could not be consulted (``LdapError`` — connectivity/bind/config). Contributes
     #: nothing: no strike, no revocation, no strike reset.

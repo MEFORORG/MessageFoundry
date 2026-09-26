@@ -46,6 +46,10 @@ _LDAPS_CONNECTOR = "AD LDAPS bind"
 #: which is the whole reason the engine binds on it.
 _OBJECT_GUID_ATTR = "objectGUID"
 
+#: The directory attribute whose ACCOUNTDISABLE bit (0x2) marks a disabled account (review M-18).
+_UAC_ATTR = "userAccountControl"
+_ACCOUNTDISABLE = 0x2
+
 
 @dataclass(frozen=True)
 class AdPrincipal:
@@ -203,6 +207,59 @@ def _object_guid(entry: Any) -> str | None:
         # reader needs in order to fix the read.
         _warn_once_about_object_guid(f"unreadable {type(value).__name__}")
     return text
+
+
+#: Shapes of an unusable ``userAccountControl`` already reported by :func:`_account_enabled`. Same
+#: reasoning as the ``objectGUID`` latch above: the reconciler reads every signed-in user every pass,
+#: and a bind account that cannot read the attribute makes EVERY entry unusable at once.
+_uac_shapes_warned: set[str] = set()
+
+
+def _warn_once_about_user_account_control(shape: str) -> None:
+    """Report an unusable ``userAccountControl`` once per distinct ``shape``."""
+    if shape in _uac_shapes_warned:
+        return
+    _uac_shapes_warned.add(shape)
+    logger.warning(
+        "AD %s is unusable (%s), so the engine cannot tell whether these accounts are disabled; "
+        "their AD logins are refused and the session reconciler reads them as absent. Check that "
+        "the [auth].ad_bind_dn service account can read this attribute (BACKLOG #1639). Reported "
+        "once per shape.",
+        _UAC_ATTR,
+        shape,
+    )
+
+
+def _account_enabled(entry: Any) -> bool:
+    """Whether the entry's ``userAccountControl`` proves the account ENABLED. Fails closed.
+
+    BACKLOG #1639. ``True`` only for a readable integer with ACCOUNTDISABLE (0x2) clear. An absent,
+    empty or non-integer attribute is ``False``, the same answer a disabled account gets: the check
+    must not pass on a value it could not read. Before this, a bind account without read rights on
+    the attribute saw every principal as enabled, so a directory-disabled account would still sign
+    in and keep its sessions through the reconciler.
+
+    ``int()`` rather than ``str.isdigit()``: ``isdigit`` accepts characters such as superscript
+    digits that ``int`` then rejects, which would raise out of the lookup instead of refusing. The
+    value itself is never logged; the shape is what a reader needs in order to fix the read.
+    """
+    if _UAC_ATTR not in entry:
+        shape = "absent"
+    else:
+        value = entry[_UAC_ATTR].value
+        # bool is an int subclass, and True is not a flag word.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return not value & _ACCOUNTDISABLE
+        if isinstance(value, str | bytes) and value.strip():
+            try:
+                return not int(value) & _ACCOUNTDISABLE
+            except ValueError:
+                pass
+        # ldap3 hands back an empty list for an attribute it asked for and did not receive, so
+        # "empty" is usually the same fact as "absent", seen through a different connection option.
+        shape = "empty" if not value else f"non-numeric {type(value).__name__}"
+    _warn_once_about_user_account_control(shape)
+    return False
 
 
 def _multi(entry: Any, name: str) -> list[str]:
@@ -394,7 +451,7 @@ class LdapAuthenticator:
                 "displayName",
                 "mail",
                 "memberOf",
-                "userAccountControl",
+                _UAC_ATTR,
             ],
         )
         if not conn.entries:
@@ -402,9 +459,12 @@ class LdapAuthenticator:
         e = conn.entries[0]
         # ACCOUNTDISABLE (0x2): a disabled AD account must not authenticate. The local-user path
         # checks `disabled` up front; the AD password + Kerberos paths both go through here, so
-        # rejecting a disabled account at the lookup covers both (review M-18).
-        uac = _attr(e, "userAccountControl")
-        if uac and uac.isdigit() and (int(uac) & 0x2):
+        # rejecting a disabled account at the lookup covers both (review M-18). So does the session
+        # reconciler, whose probe reads this `None` as ABSENT: one check covers all three callers.
+        # An UNREADABLE attribute is refused the same way (BACKLOG #1639). Returning `None` rather
+        # than raising is deliberate: the reconciler reads an `LdapError` as UNAVAILABLE, which
+        # never revokes, and that would be the same fail-open in a new place.
+        if not _account_enabled(e):
             return None
         return {
             "dn": str(e.entry_dn),
