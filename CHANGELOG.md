@@ -112,6 +112,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   failure status where it used to get Success. A `max_object_bytes` above 16 MiB no longer raises
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
+- **`POST /users` answers `409 username already exists` when two creates race for one name.** The
+  route checks the name before it creates the account, but two requests can both pass that check.
+  The second insert then met the store's UNIQUE index, and that error reached the API's catch-all
+  handler as a `500`. The engine now catches it and answers `409` with the same text the check
+  gives. The web console's create-user form shows that text too. (`BACKLOG #1808`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`

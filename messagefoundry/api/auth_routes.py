@@ -104,6 +104,7 @@ from messagefoundry.auth.service import (
     FederatedSubjectHeld,
     InvalidNotifyEmail,
     NotifyEmailAlreadySet,
+    UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
@@ -833,14 +834,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
             )
-        user_id = await service.create_local_user(
-            username=body.username,
-            password=body.password,
-            display_name=body.display_name,
-            email=body.email,
-            roles=body.roles,
-            actor=identity.username,
-        )
+        try:
+            user_id = await service.create_local_user(
+                username=body.username,
+                password=body.password,
+                display_name=body.display_name,
+                email=body.email,
+                roles=body.roles,
+                actor=identity.username,
+            )
+        except UsernameTaken as exc:
+            # A concurrent create took the name after the check above (BACKLOG #1808).
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         user = await service.store.get_user(user_id)
         assert user is not None
         # BACKLOG #1141 (ASVS 6.4.5): the initial password is a must-change credential the login gate
