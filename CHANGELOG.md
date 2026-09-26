@@ -108,6 +108,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
+  it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
+  `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals
+  group every queue row an outbound has. So when none of this outbound's rows is queued, or written
+  or dead-lettered since the engine started, the row now says `0`, and `backlog_seconds` says `0`.
+  The row keeps `null` in at least one case: its outbound has live traffic from an inbound this node
+  does not run. That inbound may belong to another engine shard, or have left the config. Folding
+  that traffic in would count it once per shard. The row still does not report `idle_seconds` or
+  `delivered_age_seconds`. ([BACKLOG #1817](docs/BACKLOG.md))
 - **A file destination now logs a WARNING when it cannot remove its `.part` temp file.** Each
   delivery writes a temp file inside the destination directory, then hard-links or copies it to the
   target name. The temp removal after that ignored every error. A failed removal left a full copy
