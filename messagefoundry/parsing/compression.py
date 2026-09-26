@@ -243,15 +243,16 @@ def _member_codec_errors() -> tuple[type[Exception], ...]:
     return tuple(errors)
 
 
-# What a corrupt archive or member raises. UnicodeDecodeError is a member name flagged UTF-8 that is
-# not. It is named alone, never widened to ValueError: CompressionError is a ValueError, so a wider
-# name would catch the refusals the loop raises and relabel them.
+# What a corrupt archive or member raises. ValueError covers a member name flagged UTF-8 that is not
+# (UnicodeDecodeError) and a corrupt offset that makes zipfile seek to a negative position.
+# CompressionError is a ValueError too, so zip_decompress re-raises it in an arm AHEAD of this one;
+# without that arm the refusals its loop raises would be caught here and relabelled.
 _ZIP_CORRUPT_ERRORS: tuple[type[Exception], ...] = (
     zipfile.BadZipFile,
     OSError,
     EOFError,
     zlib.error,
-    UnicodeDecodeError,
+    ValueError,
     *_member_codec_errors(),
 )
 
@@ -327,8 +328,11 @@ def zip_decompress(
                         f"zip archive member {position} refused: {content_reason}"
                     )
                 result[info.filename] = body
-    except _ZIP_CORRUPT_ERRORS:
-        failure = "is corrupt or truncated"
+    except CompressionError:
+        raise  # a refusal from the loop is already the verdict; the ValueError arm must not relabel it
+    except _ZIP_CORRUPT_ERRORS as exc:
+        # The class name is a diagnostic that carries no member name; the message may carry one.
+        failure = f"is corrupt or truncated ({type(exc).__name__})"
     except RuntimeError:
         # NotImplementedError is a RuntimeError. zipfile raises RuntimeError for a member flagged as
         # encrypted and NotImplementedError for a compression method, a flag or a format version it

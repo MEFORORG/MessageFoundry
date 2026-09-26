@@ -699,12 +699,23 @@ def _second_member_name_not_utf8() -> bytes:
     return blob.replace(b"SMITH_", b"SMITH\xff")
 
 
-def _second_member_lzma_corrupted() -> bytes:
-    # An LZMA member whose properties header is garbage. lzma.LZMAError is not an OSError.
+def _central_directory_offset_too_large() -> bytes:
+    # The end record claims the central directory starts 1000 bytes later than it does, so zipfile
+    # computes a negative member offset and BytesIO.seek raises ValueError("negative seek value").
+    blob = bytearray(_two_member_zip_with_second_patched())
+    eocd = blob.rindex(b"PK\x05\x06")
+    offset = int.from_bytes(blob[eocd + 16 : eocd + 20], "little")
+    blob[eocd + 16 : eocd + 20] = (offset + 1000).to_bytes(4, "little")
+    return bytes(blob)
+
+
+def _second_member_codec_corrupted(compress_type: int) -> bytes:
+    # A compressed member whose first stream bytes are garbage. Neither lzma.LZMAError nor
+    # compression.zstd.ZstdError is an OSError.
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("ok.txt", b"first")
-        zf.writestr(zipfile.ZipInfo(_PHI_NAME), b"second" * 50, compress_type=zipfile.ZIP_LZMA)
+        zf.writestr(zipfile.ZipInfo(_PHI_NAME), b"second" * 50, compress_type=compress_type)
     blob = bytearray(buf.getvalue())
     local = blob.index(b"PK\x03\x04", blob.index(b"PK\x03\x04") + 1)
     name_len, extra_len = (
@@ -712,31 +723,58 @@ def _second_member_lzma_corrupted() -> bytes:
         int.from_bytes(blob[local + 28 : local + 30], "little"),
     )
     data_at = local + 30 + name_len + extra_len
-    blob[data_at + 4 : data_at + 9] = b"\xff" * 5  # after the 4-byte version/size prefix
+    # LZMA: the properties after zipfile's 4-byte version/size prefix. Zstandard: the frame magic.
+    start = 4 if compress_type == zipfile.ZIP_LZMA else 0
+    blob[data_at + start : data_at + start + 5] = b"\xff" * 5
     return bytes(blob)
 
 
+def _second_member_zstd_corrupted() -> bytes:
+    pytest.importorskip("compression.zstd", reason="this Python build has no Zstandard support")
+    return _second_member_codec_corrupted(zipfile.ZIP_ZSTANDARD)
+
+
+_UNSUPPORTED = "member 2 uses a zip feature this reader does not support"
+
+
 @pytest.mark.parametrize(
-    ("blob", "reason"),
+    ("build", "reason"),
     [
         pytest.param(
-            _two_member_zip_with_second_patched(flag=0x01),
-            "member 2 uses a zip feature this reader does not support",
+            lambda: _two_member_zip_with_second_patched(flag=0x01),
+            _UNSUPPORTED,
             id="encrypted-flag",
         ),
         pytest.param(
-            _two_member_zip_with_second_patched(method=98),
-            "member 2 uses a zip feature this reader does not support",
-            id="method-98",
+            lambda: _two_member_zip_with_second_patched(method=98), _UNSUPPORTED, id="method-98"
         ),
-        pytest.param(_second_member_body_corrupted(), "member 2 is corrupt", id="bad-crc"),
-        pytest.param(_second_member_lzma_corrupted(), "member 2 is corrupt", id="lzma-corrupt"),
-        pytest.param(_second_member_name_not_utf8(), "zip archive is corrupt", id="name-not-utf8"),
+        pytest.param(
+            _second_member_body_corrupted, r"member 2 is corrupt.*\(BadZipFile\)", id="bad-crc"
+        ),
+        pytest.param(
+            lambda: _second_member_codec_corrupted(zipfile.ZIP_LZMA),
+            r"member 2 is corrupt.*\(LZMAError\)",
+            id="lzma-corrupt",
+        ),
+        pytest.param(
+            _second_member_zstd_corrupted, r"member 2 is corrupt.*\(ZstdError\)", id="zstd-corrupt"
+        ),
+        pytest.param(
+            _second_member_name_not_utf8,
+            r"^zip archive is corrupt.*\(UnicodeDecodeError\)",
+            id="name-not-utf8",
+        ),
+        pytest.param(
+            _central_directory_offset_too_large,
+            r"^zip archive member 1 is corrupt.*\(ValueError\)",
+            id="negative-seek",
+        ),
     ],
 )
 def test_zip_unreadable_member_is_a_compression_error_naming_no_filename(
-    blob: bytes, reason: str
+    build: Callable[[], bytes], reason: str
 ) -> None:  # #1598
+    blob = build()
     with pytest.raises(CompressionError, match=reason) as exc:
         zip_decompress(blob, max_output_bytes=None)
     # PHI guard: the member name must not reach the message or anything chained to it. zipfile's own
