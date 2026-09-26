@@ -470,6 +470,8 @@ here:
   → `tests/test_restore_verify.py::test_full_verify_fails_on_a_corrupted_aead_cell`
   → `tests/test_restore_verify.py::test_full_verify_fails_when_the_snapshot_opens_without_its_key`
   → `tests/test_restore_verify.py::test_full_verify_passes_on_a_good_unencrypted_archive`
+  Also `tests/test_cipher_cells_readback.py` (BACKLOG #1719: the composite-key cells, `response` to
+    `alert_instance`, each written through its real writer and read back, PASS then FAIL on a flipped byte)
 
   **Why the keyless case is `KEY_MISMATCH` and a failed tag is not.** With no key resolved, nothing could
   have opened those cells: the archive is fine and the operator's key configuration is not, so `FAIL` would

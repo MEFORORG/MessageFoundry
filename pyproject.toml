@@ -486,6 +486,12 @@ extend-exclude = ["docs/benchmarks/results"]
 # mid-flight, because the event loop holds tasks weakly. It is at least one resource-release rule
 # ruff already ships that the families above do not select. Adopted with its single finding fixed
 # (store/base.py `_salvage_late_borrow`), so it gates from a clean baseline.
+#
+# B904 (from B) asks for `from err` or `from None` on a raise inside an except block. `from None` is
+# NOT a redaction tool: it leaves `__context__` populated, so the hidden exception is still reachable
+# (BACKLOG #1792). When the caught exception can carry payload or a secret, raise OUTSIDE the handler
+# instead, which B904 does not flag. tests/test_from_none_is_not_redaction.py holds every engine
+# `from None` to a reviewed list.
 extend-select = ["B", "C4", "SIM", "UP", "I", "RUF006"]
 
 [tool.ruff.lint.flake8-bugbear]

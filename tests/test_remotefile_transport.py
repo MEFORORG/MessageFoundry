@@ -89,8 +89,10 @@ class _FakeClient(_RemoteClient):
         self._rename_exc = rename_exc
         self._retrieve_exc = retrieve_exc
         self._list_exc = list_exc  # #114: an unreachable/missing remote_dir
+        self.list_calls = 0  # #1936: lets a test prove a path never listed
 
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
+        self.list_calls += 1
         if self._list_exc is not None:
             raise self._list_exc
         out: list[tuple[str, int]] = []
@@ -235,6 +237,64 @@ async def test_destination_no_silent_clobber(monkeypatch: pytest.MonkeyPatch) ->
     await dest.send("new")
     assert client.files["/in/msg.hl7"] == b"existing"  # original untouched
     assert client.files["/in/msg-1.hl7"] == b"new"  # uniquified, not clobbered
+
+
+@pytest.mark.parametrize(
+    "list_exc",
+    [
+        # The motivating case (BACKLOG #1936): a bounded SFTP session open that gave up after 120 s.
+        _RemoteError("SFTP session open timed out", permanent=False),
+        # A permanent listing refusal (an FTP 550 on a write-only drop box, a vanished dir) is retried
+        # too: the name cannot be checked, which is a reason to wait, not a verdict on the message.
+        _RemoteError("FTP rejected the operation: 550 permission denied", permanent=True),
+    ],
+    ids=["transient", "permanent"],
+)
+async def test_destination_unlistable_dir_fails_closed_without_writing(
+    monkeypatch: pytest.MonkeyPatch, list_exc: _RemoteError
+) -> None:
+    # Before #1936's follow-on, _unique swallowed a failed listing and returned the unsuffixed name, so
+    # the store + rename that followed would clobber a partner file already there on first deployment.
+    # overwrite=False must never write blind: the delivery fails retryably and nothing is written.
+    client = _FakeClient(files={"/in/msg.hl7": b"partner file"}, list_exc=list_exc)
+    dest = _dest(monkeypatch, client, filename="msg.hl7", overwrite=False)
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("new")
+    assert not isinstance(ei.value, NegativeAckError)  # transient -> the row retries
+    assert client.ops == []  # no store, no rename, no remove
+    assert client.files == {"/in/msg.hl7": b"partner file"}  # the partner file is untouched
+
+
+@pytest.mark.parametrize("validate_directory", [False, True])
+async def test_destination_unlistable_dir_keeps_the_credential_stop(
+    monkeypatch: pytest.MonkeyPatch, validate_directory: bool
+) -> None:
+    # A credential refusal on a send-path listing keeps its ADR 0095 marker, so the delivery worker
+    # still STOPs and retains rather than retrying into an account lockout. Both listings count: the
+    # collision check, and the validate_directory pre-flight that runs before it. Nothing is written.
+    client = _FakeClient(
+        list_exc=_RemoteError("auth failed", permanent=True, credential_fault=True)
+    )
+    dest = _dest(
+        monkeypatch,
+        client,
+        filename="msg.hl7",
+        overwrite=False,
+        validate_directory=validate_directory,
+    )
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("new")
+    assert ei.value.credential_fault is True
+    assert client.ops == []
+
+
+async def test_destination_overwrite_true_never_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Control: overwrite=True asks for no collision check, so an unlistable dir does not block it.
+    client = _FakeClient(list_exc=_RemoteError("no list permission", permanent=True))
+    dest = _dest(monkeypatch, client, filename="msg.hl7", overwrite=True)
+    await dest.send("new")
+    assert client.files["/in/msg.hl7"] == b"new"
+    assert client.list_calls == 0
 
 
 async def test_destination_overwrite_replaces(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1339,6 +1399,27 @@ async def test_dest_probe_ensures_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     await dest.test_connection()  # connect + ensure the upload dir; no file written
     assert "/in" in client.dirs
     assert not client.files
+
+
+async def test_dest_probe_lists_when_overwrite_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1936: overwrite=false deliveries list the directory and fail closed if they cannot, so the
+    # probe must list too, or it passes a write-only directory that no delivery can use.
+    client = _FakeClient(list_exc=_RemoteError("550 permission denied", permanent=True))
+    dest = _dest(monkeypatch, client, overwrite=False)
+    with pytest.raises(NegativeAckError):
+        await dest.test_connection()
+    assert client.dirs == ["/in"]  # it still ensured first
+    assert not client.files
+
+
+async def test_dest_probe_skips_the_listing_when_overwrite_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Control: overwrite=true deliveries never list, so neither does the probe.
+    client = _FakeClient(list_exc=_RemoteError("550 permission denied", permanent=True))
+    dest = _dest(monkeypatch, client, overwrite=True)
+    await dest.test_connection()
+    assert client.list_calls == 0
 
 
 async def test_dest_probe_permanent_error_is_negative_ack(monkeypatch: pytest.MonkeyPatch) -> None:

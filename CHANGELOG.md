@@ -56,6 +56,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING — the `Http()` inbound listener answers 400 to a request with no `Host` or with two.**
+  RFC 9112 section 3.2 requires a server to refuse both shapes. In the shipped code an HTTP/1.1
+  request with no `Host` was accepted, and a second `Host` silently replaced the first. The listener
+  routes on no `Host` value, but a fronting proxy that honoured the first `Host` would have disagreed
+  with it about the second. Both shapes are now refused while the request head is read, before any
+  body byte is read or anything is dispatched. Each is a `framing_error` event with no ingress row,
+  and the refusal never echoes the header's value. An HTTP/1.0 request with no `Host` is still
+  accepted, because that version predates the field, and so is an empty `Host:` value. A `Host`
+  value's syntax is not checked. **A deploying sender or health probe that sends HTTP/1.1 with no
+  `Host` would be refused**, and must send one. (`BACKLOG #1972`)
 - **BREAKING: `serve` now refuses to start when the credential reminders have no `[alerts]`
   recipient.** The unclaimed-temporary-password and cert-expiry reminders go to the `[alerts]`
   notifier. That notifier needs `webhook_url`, or `email_to` beside `email_smtp_host` and
@@ -137,6 +147,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   or the codec and position. The old one chained the encode error, whose `.object` is the whole body.
   `UnsupportedAlgorithm` and `InternalError` are now mapped too. The first was reported under a
   FIPS-enabled OpenSSL. Neither case was reproduced. (`BACKLOG #1918`, `#1919`, `#1920`, `#1921`)
+- **The shared redactor now scrubs FHIR JSON, DICOM tag dumps and XML, not only HL7.** Its passes
+  were HL7-shaped, so a structured payload handed them single tokens and a family name, an MRN or a
+  DICOM patient id went through a stored error, a log line, the support bundle and `GET /logs/tail`
+  unredacted. Three label-anchored passes now run after the HL7 ones, so they only add redaction.
+  JSON (and Python dict repr) values under `family`, `given`, `name`, `birthDate` and `address` are
+  scrubbed, and so is the `value` of an `identifier` or `telecom`, keeping `system` and `use`. DICOM
+  `(0010,00xx)` tag values and `PatientName=`/`PatientID=` labels are scrubbed, and so are XML
+  elements with the same vocabulary. Keys, tags and element names stay, so a reader sees which field
+  was withheld. A `<name>` placeholder in a usage hint is left alone. JSON escaped inside a JSON
+  string and DICOM identifiers outside `(0010,00xx)` are not covered.
+  ([BACKLOG #1711](docs/BACKLOG.md))
 - **A dual-control release can no longer run without an audit row, or be recorded as failed after
   it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
   that refused writes would have let a replay or a reload complete with no record of the release,
