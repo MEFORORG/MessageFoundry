@@ -992,8 +992,8 @@ def test_ui_pacing_gap_wording_flips_with_the_code() -> None:
     console parity (BACKLOG #287) lands a charge, this same test demands the sentence be removed — so
     the interim wording can never become a stale falsehood.
     """
-    console_charges = any(
-        "allow_admin_write" in module.read_text(encoding="utf-8")
+    console_charges = any(  # a CALL, not a mention: routes/core.py names it in a comment (#1818)
+        calls_to(ast.parse(module.read_text(encoding="utf-8")), {"allow_admin_write"})
         for module in _CONSOLE_ROUTES.parent.rglob("*.py")
     )
     # The SAME time-bound claim is written into BOTH artefacts, so it must be guarded in both:
@@ -1812,3 +1812,17 @@ def test_routes_documented_as_unpaced_really_charge_nothing() -> None:
         "Move them out of that row (the map documents the AUTH-SURFACE limiters; the floor is the "
         "2.1.3 table) rather than deleting the gate."
     )
+
+
+def test_console_charge_probe_reads_calls_not_mentions() -> None:
+    """``test_ui_pacing_gap_wording_flips_with_the_code`` asks whether the console CALLS
+    ``allow_admin_write``. A comment in ``routes/core.py`` names it, so the substring scan this
+    replaced stayed True with the real call deleted (BACKLOG #1818). Pinned both ways here."""
+    mention = (
+        '"""Charges allow_admin_write(user) before the write."""\n'
+        "# a throttled logout never charges `allow_admin_write`\n"
+        "LABEL = 'allow_admin_write('\n"
+    )
+    assert not calls_to(ast.parse(mention), {"allow_admin_write"})
+    real = "if not auth.allow_admin_write(identity.user_id):\n    raise Refused\n"
+    assert calls_to(ast.parse(real), {"allow_admin_write"})

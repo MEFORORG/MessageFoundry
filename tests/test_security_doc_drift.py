@@ -29,7 +29,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from _ast_sites import callee_name, calls_to, named_func
+from _ast_sites import call_sites, callee_name, calls_to, named_func
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from pydantic import BaseModel
 
@@ -1191,6 +1191,9 @@ def test_assignment_and_arm_helpers_ignore_mentions() -> None:
         'admin_exposed = instance_exposed or getattr(settings.api, "serve_ui")\n',
         "admin_exposed = instance_exposed or console_ui_exposed\n",
         "admin_exposed = instance_exposed\nadmin_exposed |= ui_exposed\n",
+        "admin_exposed: bool = instance_exposed or settings.api.serve_ui\n",
+        "if (admin_exposed := settings.api.serve_ui):\n    pass\n",
+        "admin_exposed, desc = settings.api.serve_ui, 'x'\n",
     ):
         assert _derives_from_console(derived), f"missed a console derivation: {derived!r}"
 
@@ -1203,6 +1206,8 @@ def test_assignment_and_arm_helpers_ignore_mentions() -> None:
         "    return 2\n"
     )
     arms = _approvals_arms(warn_only)
+    assert _arm_prints_its_warning(arms[0]), "the arm's warning print was not found"
+    assert not _arm_prints_its_warning(_approvals_arms(head + "    print('debug')\n")[0])
     assert len(arms) == 1 and not _arm_can_refuse(arms[0]), (
         "a mention of `return 2`, or a refusal in the else branch, was read as the arm refusing"
     )
@@ -1211,10 +1216,14 @@ def test_assignment_and_arm_helpers_ignore_mentions() -> None:
         assert _arm_can_refuse(arm[0]), f"the arm refusing via {refusal!r} was not detected"
 
 
-#: The BACKLOG #1818 census: this module and the sibling doc-drift and security-record modules that
-#: read engine source. ``test_source_probes_do_not_regress_to_a_substring_scan`` runs over all of them.
+#: Modules the substring-scan regression check covers: this one and at least the sibling doc-drift
+#: and security-record modules BACKLOG #1818 converted. NOT a census of ``tests/``: measured at this
+#: change, the same scanner flags 490 scopes in 215 test modules, 95 of them in 36 modules whose
+#: names mark them as doc, security or inventory guards. Most read prose; which of the rest decide a
+#: control from code is still to be triaged.
 _SOURCE_PROBE_MODULES = (
     "test_security_doc_drift.py",
+    "test_security_doc_rate_limits.py",
     "test_crit2_inline_doc_drift.py",
     "test_docs_security_pathways.py",
     "test_threat_model_doc_drift.py",
@@ -1237,9 +1246,6 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "test_the_engine_ships_a_time_of_day_evaluator_this_pattern_can_see",
     ): "positive control for the text instrument of the absence check, so it must share it",
     ("test_crit2_inline_doc_drift.py", "test_adr_0057_does_not_claim_unwired"): "ADR 0057 prose",
-    ("test_crypto_inventory_doc.py", "_accepted_cipher_providers"): (
-        "harvests provider literals; a mention can only add a provider the doc must name, not hide one"
-    ),
     ("test_crypto_inventory_doc.py", "_section4"): "slices the Phase 0 changes document",
     ("test_crypto_inventory_doc.py", "test_default_keyless_claim_is_absent_from_its_other_sites"): (
         "absence of a retired prose claim, in PHI.md and in audit_tee.py's docstrings"
@@ -1248,6 +1254,7 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "test_docs_security_pathways.py",
         "test_the_console_dependency_of_the_browser_legs_is_stated",
     ): ("absence over text: a mention of serve_ui can only over-fire"),
+    ("test_security_doc_rate_limits.py", "_config_section"): "slices CONFIGURATION.md prose",
     ("test_threat_model_doc_drift.py", "test_checks_py_only_names_os_system_as_a_lint_string"): (
         "the claim is about a string literal in checks.py"
     ),
@@ -1260,12 +1267,26 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
 #: Calls that turn raw text into code, so what they return is not raw text any more.
 _TEXT_TO_CODE = frozenset({"parse", "_parse", "_code_only", "_code_text"})
 #: Calls that return raw source or prose.
-_RAW_TEXT_READS = frozenset({"read_text", "getsource"})
+_RAW_TEXT_READS = frozenset({"read_text", "read_bytes", "getsource", "getsourcelines"})
 #: Regex functions that scan the raw text passed to them.
-_TEXT_SCANS = frozenset({"search", "match", "fullmatch", "findall", "finditer"})
+_TEXT_SCANS = frozenset(
+    {"search", "match", "fullmatch", "findall", "finditer", "split", "sub", "subn"}
+)
 #: String methods that scan the raw text they are called on.
 _TEXT_METHODS = frozenset(
-    {"count", "find", "rfind", "index", "rindex", "startswith", "endswith", "split", "splitlines"}
+    {
+        "count",
+        "find",
+        "rfind",
+        "index",
+        "rindex",
+        "startswith",
+        "endswith",
+        "split",
+        "splitlines",
+        "partition",
+        "rpartition",
+    }
 )
 
 
@@ -1286,63 +1307,74 @@ def _holds_raw_text(expr: ast.AST, names: set[str]) -> bool:
     return False
 
 
+def _raw_text_names(nodes: list[ast.AST], inherited: set[str]) -> set[str]:
+    """Names bound, in ``nodes``, from raw text or from a name already known to hold it."""
+    names = set(inherited)
+    while True:
+        before = len(names)
+        for node in nodes:
+            pairs: list[tuple[ast.AST, ast.AST | None]] = []
+            if isinstance(node, ast.Assign):
+                pairs = [(t, node.value) for t in node.targets]
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
+                pairs = [(node.target, node.value)]
+            elif isinstance(node, ast.For | ast.comprehension):
+                pairs = [(node.target, node.iter)]
+            for target, value in pairs:
+                if value is not None and _holds_raw_text(value, names):
+                    names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+        if len(names) == before:
+            return names
+
+
+def _scans_raw_text(node: ast.AST, names: set[str]) -> bool:
+    """Whether ``node`` tests raw text: ``in`` / ``not in``, a regex call, or a string method."""
+    if isinstance(node, ast.Compare):
+        return any(
+            isinstance(op, ast.In | ast.NotIn) and _holds_raw_text(right, names)
+            for op, right in zip(node.ops, node.comparators, strict=True)
+        )
+    if not isinstance(node, ast.Call):
+        return False
+    called = callee_name(node)
+    if called in _TEXT_SCANS and any(_holds_raw_text(arg, names) for arg in node.args):
+        return True
+    return (
+        called in _TEXT_METHODS
+        and isinstance(node.func, ast.Attribute)
+        and _holds_raw_text(node.func.value, names)
+    )
+
+
 def _substring_scans(tree: ast.Module) -> set[str]:
     """Scopes in ``tree`` that scan raw text: ``in`` / ``not in``, a regex, or a string method.
 
-    Raw text is a ``read_text`` or ``getsource`` result, or a name bound from one by assignment,
-    walrus, or loop or comprehension target, followed to a fixed point. Text passed through
-    ``ast.parse`` or ``_code_only`` is code and is not followed. It catches at least these
-    spellings; it is not a proof that no other spelling exists. Module-level statements are one
-    scope, named ``<module>``.
+    Raw text is a ``read_text``, ``read_bytes`` or ``getsource`` result, or a name bound from one by
+    assignment, walrus, or loop or comprehension target, followed to a fixed point. A module-level
+    binding counts inside every function. Text passed through ``ast.parse`` or ``_code_only`` is
+    code and is not followed. It catches at least these spellings; it is not a proof that no other
+    spelling exists. It does NOT follow raw text into a parameter, so ``def has(text, tok): return
+    tok in text`` called with a read is missed. Module-level statements, class bodies excluded, are
+    one scope, named ``<module>``.
     """
-    scopes: list[tuple[str, list[ast.AST]]] = [
-        (
-            "<module>",
-            [st for st in tree.body if not isinstance(st, ast.FunctionDef | ast.AsyncFunctionDef)],
-        )
+    module_nodes = [
+        node
+        for st in tree.body
+        if not isinstance(st, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+        for node in ast.walk(st)
     ]
+    module_names = _raw_text_names(module_nodes, set())
+    scopes: list[tuple[str, list[ast.AST], set[str]]] = [("<module>", module_nodes, set())]
     scopes += [
-        (func.name, [func])
+        (func.name, list(ast.walk(func)), module_names)
         for func in ast.walk(tree)
         if isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef)
     ]
     offenders: set[str] = set()
-    for scope, roots in scopes:
-        nodes = [node for root in roots for node in ast.walk(root)]
-        names: set[str] = set()
-        while True:
-            before = len(names)
-            for node in nodes:
-                pairs: list[tuple[ast.AST, ast.AST | None]] = []
-                if isinstance(node, ast.Assign):
-                    pairs = [(t, node.value) for t in node.targets]
-                elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
-                    pairs = [(node.target, node.value)]
-                elif isinstance(node, ast.For | ast.comprehension):
-                    pairs = [(node.target, node.iter)]
-                for target, value in pairs:
-                    if value is not None and _holds_raw_text(value, names):
-                        names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
-            if len(names) == before:
-                break
-        for node in nodes:
-            if isinstance(node, ast.Compare) and any(
-                isinstance(op, ast.In | ast.NotIn) and _holds_raw_text(right, names)
-                for op, right in zip(node.ops, node.comparators, strict=True)
-            ):
-                offenders.add(scope)
-            elif isinstance(node, ast.Call):
-                called = callee_name(node)
-                if (
-                    called in _TEXT_SCANS
-                    and any(_holds_raw_text(a, names) for a in node.args)
-                    or (
-                        called in _TEXT_METHODS
-                        and isinstance(node.func, ast.Attribute)
-                        and _holds_raw_text(node.func.value, names)
-                    )
-                ):
-                    offenders.add(scope)
+    for scope, nodes, inherited in scopes:
+        names = _raw_text_names(nodes, inherited)
+        if any(_scans_raw_text(node, names) for node in nodes):
+            offenders.add(scope)
     return offenders
 
 
@@ -1367,6 +1399,13 @@ def test_source_probes_do_not_regress_to_a_substring_scan() -> None:
         "def parsed_is_fine():\n"
         "    return 'X' in names(ast.parse(PATH.read_text()))\n"
         "HITS = {p for p in PATHS if 'X' in p.read_text()}\n"
+        "_SRC = PATH.read_text()\n"
+        "def module_bound():\n"
+        "    assert 'CERT_REQUIRED' in _SRC\n"
+        "def by_bytes_and_split():\n"
+        "    return re.split(b'X', PATH.read_bytes())\n"
+        "def by_partition():\n"
+        "    return inspect.getsourcelines(f)[0][0].partition('X')\n"
     )
     assert _substring_scans(planted) == {
         "<module>",
@@ -1374,6 +1413,9 @@ def test_source_probes_do_not_regress_to_a_substring_scan() -> None:
         "annotated",
         "by_regex",
         "by_walrus",
+        "module_bound",
+        "by_bytes_and_split",
+        "by_partition",
     }, "the regression check cannot fire on a spelling it claims to catch"
     found: set[tuple[str, str]] = set()
     for module in _SOURCE_PROBE_MODULES:
@@ -2111,25 +2153,29 @@ def test_contextual_prefixed_settings_force_a_documented_decision() -> None:
 
 
 def _admin_exposed_values(source: str) -> list[ast.expr]:
-    """The value of every ``admin_exposed =`` and augmented ``admin_exposed |=`` in ``source``.
+    """The value of every binding of ``admin_exposed`` in ``source``: ``=``, ``|=``, ``: bool =``,
+    ``:=`` and tuple unpacking. For an unpacking the whole right-hand side is returned.
 
     An AST read, so a wrapped right-hand side is read whole. The line slice it replaced saw only the
     first physical line, so ``admin_exposed = (`` over a continuation line naming ``serve_ui`` left
     the guard green (BACKLOG #1818).
     """
-    return [
-        node.value
-        for node in ast.walk(_parse(source))
-        if (
-            isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "admin_exposed" for t in node.targets)
+    values: list[ast.expr] = []
+    for node in ast.walk(_parse(source)):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
+            targets = [node.target]
+        else:
+            continue
+        binds = any(
+            isinstance(n, ast.Name) and n.id == "admin_exposed"
+            for t in targets
+            for n in ast.walk(t)
         )
-        or (
-            isinstance(node, ast.AugAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "admin_exposed"
-        )
-    ]
+        if binds and node.value is not None:
+            values.append(node.value)
+    return values
 
 
 def _derives_from_console(source: str) -> bool:
@@ -2152,7 +2198,7 @@ def _approvals_arms(source: str) -> list[ast.If]:
     """Every ``if`` whose TEST reads ``admin_exposed`` and ``approvals.enabled``: the #189 arm."""
     return [
         node
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(_parse(source))
         if isinstance(node, ast.If)
         and {"admin_exposed", "approvals", "enabled"} <= _referenced_names(node.test)
     ]
@@ -2161,16 +2207,25 @@ def _approvals_arms(source: str) -> list[ast.If]:
 def _arm_can_refuse(arm: ast.If) -> bool:
     """Whether the arm's own body can stop startup: any ``return``, any ``raise``, or an exit call.
 
-    The direct spellings, not only the literal ``return 2`` the text slice looked for: ``raise
-    SystemExit(2)``
-    and ``sys.exit(2)`` refuse just as well, and the slice was green for both (BACKLOG #1818). The
-    ``else`` branch is not the arm and is not read. A refusal hidden inside a helper the arm calls
-    is NOT seen: the guard reads the arm, not the functions it calls.
+    The direct spellings, not only the literal ``return 2`` the text slice looked for. ``raise
+    SystemExit(2)`` and ``sys.exit(2)`` refuse just as well, and the slice was green for both
+    (BACKLOG #1818). The ``else`` branch is not the arm and is not read. A refusal hidden inside a
+    helper the arm calls is NOT seen: the guard reads the arm, not the functions it calls.
     """
     return any(
         bool(calls_to(stmt, {"exit", "_exit", "abort"}))
         or any(isinstance(node, ast.Return | ast.Raise) for node in ast.walk(stmt))
         for stmt in arm.body
+    )
+
+
+def _arm_prints_its_warning(arm: ast.If) -> bool:
+    """Whether the arm's own body prints text containing ``warning:``, as the WARN action says."""
+    return any(
+        isinstance(node, ast.Constant) and isinstance(node.value, str) and "warning:" in node.value
+        for stmt in arm.body
+        for call in call_sites(stmt, "print")
+        for node in ast.walk(call)
     )
 
 
@@ -2220,7 +2275,7 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
     source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
     arms = _approvals_arms(source)
     # Liveness receipt: the assertion below is vacuous unless it is reading the real arm.
-    assert len(arms) == 1 and any(calls_to(stmt, {"print"}) for stmt in arms[0].body), (
+    assert len(arms) == 1 and _arm_prints_its_warning(arms[0]), (
         f"expected exactly one `if admin_exposed and not settings.approvals.enabled` arm that prints "
         f"its warning; found {len(arms)}. Re-locate the arm before trusting the assertion below."
     )

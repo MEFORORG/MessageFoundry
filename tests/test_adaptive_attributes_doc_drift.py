@@ -99,10 +99,11 @@ def test_the_engine_ships_a_time_of_day_evaluator_this_pattern_can_see() -> None
     # The entry points are CODE, so they are found in the AST, where a docstring cannot stand in
     # for a deleted def (BACKLOG #1818). The symbol loop above stays textual on purpose: it is the
     # positive control for the textual absence check below, so it must use the same instrument.
-    tree = ast.parse(models)
-    assert find_funcs(tree, "contains") and find_funcs(tree, "is_active"), (
-        "the window evaluator's entry points are gone; re-derive this guard rather than trusting it"
-    )
+    classes = {node.name: node for node in ast.parse(models).body if isinstance(node, ast.ClassDef)}
+    assert all(
+        owner in classes and find_funcs(classes[owner], method)
+        for owner, method in (("ActiveWindow", "contains"), ("Schedule", "is_active"))
+    ), "the window evaluator's entry points are gone; re-derive this guard rather than trusting it"
 
 
 @pytest.mark.parametrize("symbol", _WINDOW_SYMBOLS)
