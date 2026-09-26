@@ -86,12 +86,13 @@ updates:
     # and blocks only the minor bump the ruling declined.
     #
     # `cyclonedx-bom` is the same WIDENED-CAP case as annotated-types and ruff, not a sigstore-style
-    # ruling. PR 1552 rewrote the release-tools `~=7.3.1` to `>=7.3.1,<7.5.0` and locked 7.4.0, which
-    # silently lifted a deliberate ceiling. Why the ceiling exists is the cyclonedx-bom note above
-    # `release-tools` in pyproject.toml; read it there. The range leaves the 7.3.x patch track open.
-    # The trade-off note above holds: security.yml runs pip-audit over ci/locks/release-tools.lock,
-    # and if that audit line is ever removed, REMOVE THIS ENTRY WITH IT, as for sigstore. Lift this
-    # entry in the same PR that moves the pyproject spec to a validated 7.4.
+    # ruling. PR 1552 rewrote the release-tools `~=7.3.1` to `>=7.3.1,<7.5.0` and locked 7.4.0,
+    # lifting a deliberate ceiling. test_floored_group_pins_stay_declared caught the spec and redded
+    # the whole batch, so this entry keeps benign bumps from being held behind it, as the two above
+    # do. Why the ceiling exists is the cyclonedx-bom note above `release-tools` in pyproject.toml;
+    # read it there. The range leaves the 7.3.x patch track open. The trade-off note above holds:
+    # security.yml runs pip-audit over ci/locks/release-tools.lock. Lift this entry in the same PR
+    # that moves the pyproject spec to a validated 7.4.
     ignore:
       - dependency-name: "annotated-types"
         versions: [">=0.8.0"]

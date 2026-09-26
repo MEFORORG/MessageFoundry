@@ -221,10 +221,11 @@ jobs:
           # here, so from 2026-08-29 until this line landed the release signing closure was the only
           # committed lock nothing audited -- hash-pinned, therefore sticky, therefore exactly the
           # "pinned, stale, unpatched is worse than floating" case the two lines above exist to stop.
-          # It is also load-bearing for .github/dependabot.yml's `sigstore` and `cyclonedx-bom` ignore
-          # entries: each suppresses the security track for its range (>=4.5.0, >=7.4.0), and is only
-          # acceptable while this audit can still see an advisory in the pinned closure. REMOVE THIS
-          # LINE AND YOU MUST REMOVE BOTH ENTRIES -- the comments there say so from the other side.
+          # It is also load-bearing for .github/dependabot.yml's `sigstore` ignore entry: that entry
+          # suppresses the security track for >=4.5.0, and is only acceptable while this audit can
+          # still see an advisory in the pinned closure. REMOVE THIS LINE AND YOU MUST REMOVE THAT
+          # ENTRY -- the comment there says so from the other side. The `cyclonedx-bom` entry there
+          # (>=7.4.0) leans on this line too: without it, a fix that entry withholds goes unseen.
           #
           # Same REQUIRED-context consequence as the two above, and a better-earned one: a CVE in
           # sigstore's closure reds the merge gate. That closure signs the wheel, the sdist, the SBOM
@@ -1491,10 +1492,11 @@ jobs:
           # here, so from 2026-08-29 until this line landed the release signing closure was the only
           # committed lock nothing audited -- hash-pinned, therefore sticky, therefore exactly the
           # "pinned, stale, unpatched is worse than floating" case the two lines above exist to stop.
-          # It is also load-bearing for .github/dependabot.yml's `sigstore` and `cyclonedx-bom` ignore
-          # entries: each suppresses the security track for its range (>=4.5.0, >=7.4.0), and is only
-          # acceptable while this audit can still see an advisory in the pinned closure. REMOVE THIS
-          # LINE AND YOU MUST REMOVE BOTH ENTRIES -- the comments there say so from the other side.
+          # It is also load-bearing for .github/dependabot.yml's `sigstore` ignore entry: that entry
+          # suppresses the security track for >=4.5.0, and is only acceptable while this audit can
+          # still see an advisory in the pinned closure. REMOVE THIS LINE AND YOU MUST REMOVE THAT
+          # ENTRY -- the comment there says so from the other side. The `cyclonedx-bom` entry there
+          # (>=7.4.0) leans on this line too: without it, a fix that entry withholds goes unseen.
           #
           # Same REQUIRED-context consequence as the two above, and a better-earned one: a CVE in
           # sigstore's closure reds the merge gate. That closure signs the wheel, the sdist, the SBOM

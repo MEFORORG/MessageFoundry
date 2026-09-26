@@ -9,8 +9,8 @@
 # until those two are moved by hand in the same PR. Read the backend's changes, not only its version:
 # 1.32.4 writes core-metadata `Version:` in the spelling the version root was TYPED in, where 1.32.0
 # wrote the PEP 440 canonical form. The release.yml version gates compare PEP 440 versions, so none
-# reds on that, but prose in release.yml and tests/test_release_pipeline.py that says the backend
-# canonicalises `Version:` now holds only for an already-canonical __version__.
+# reds on that, but prose that says the backend canonicalises `Version:` (at least in release.yml,
+# tests/test_release_pipeline.py and tests/test_version.py) now holds only for a canonical __version__.
 requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
