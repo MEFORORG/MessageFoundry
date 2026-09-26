@@ -292,8 +292,10 @@ def drain_bounded(
     a negative chunk size inside the byte bound (BACKLOG #1979). A drain stops at the first line it
     cannot parse and does not raise. It logs a WARNING instead, so the stop is recorded rather than
     silent. The WARNING carries a fixed reason, the request method and the status code, and nothing
-    else. It leaves ``connector`` out on purpose: every caller builds it from a configured URL, and
-    a log line should not depend on each caller's redaction being complete.
+    else. It leaves ``connector`` out on purpose. Callers build it from configuration, at least a
+    redacted URL or a webhook host, and this log line should not depend on each caller's redaction
+    being complete. The cost is that the line does not name the hop. The exceptions this module
+    raises still carry ``connector``, and so rely on the caller's redaction.
     """
     try:
         _read_capped(reader, limit, connector)
@@ -303,8 +305,8 @@ def drain_bounded(
         method = getattr(reader, "_method", None)
         status = getattr(reader, "status", None)
         logger.warning(
-            "A %s reply with status %s had a malformed body (%s); the drain stopped there, and "
-            "the call is not failed because the body is discarded",
+            "The reply to a %s request had a malformed body (status %s, %s); the drain stopped "
+            "there, and the call is not failed because the body is discarded",
             method if method in _LOGGED_METHODS else "HTTP",
             status if isinstance(status, int) else "unknown",
             exc.reason,
@@ -312,8 +314,9 @@ def drain_bounded(
 
 
 #: The request methods the drain WARNING may name. Anything else is logged as "HTTP", so the line
-#: holds only text from this module.
-_LOGGED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+#: holds only text from this module. HEAD is absent because a HEAD reply is never decoded, so it
+#: cannot reach the WARNING.
+_LOGGED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 
 
 #: Statuses whose reply has no body (RFC 9112 section 6.3, rule 1). See reply_framing_fault.
@@ -506,7 +509,8 @@ def _truncated_error(connector: str) -> TruncatedResponseError:
 
 #: An RFC 9110 section 5.6.2 token, the grammar of a field name and of a chunk extension name.
 _TCHARS = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
-_FIELD_NAME = re.compile(f"[{_TCHARS}]+")
+_TOKEN = f"[{_TCHARS}]+"
+_FIELD_NAME = re.compile(_TOKEN)
 #: A folded line break inside a raw field value, which RFC 9112 section 5.2 lets a user agent
 #: accept in a response, and the controls RFC 9110 section 5.5 forbids in a value (HTAB allowed).
 _OBS_FOLD = re.compile(r"\r?\n[ \t]")
@@ -599,15 +603,18 @@ def _parse_tree(msg: email.message.Message) -> tuple[object, ...]:
 #   chunk-ext-val = token / quoted-string
 
 #
-# The patterns are str, matched against each line decoded as latin-1, which maps every byte to the
-# code point of the same value. So \x80-\xff below means the same bytes it would in a bytes pattern,
-# and the static ReDoS scan in tests/test_security_static.py can read them; it reads str only.
+# The patterns are str, matched against each line decoded as latin-1 by _read_chunk_line, which maps
+# every byte to the code point of the same value. So \x80-\xff below means the same bytes it would
+# in a bytes pattern, and the static ReDoS scan in tests/test_security_static.py can read them; it
+# reads str only.
 #
-# The extension group repeats POSSESSIVELY (*+). Every repetition starts at a ";" that neither the
-# token class nor the whitespace before it can match, so there is one parse of any line and nothing
-# to give back. Possessive says so to the regex engine and to the scan.
+# The extension group repeats POSSESSIVELY (*+). Each element has one parse: the token class and
+# the whitespace exclude ";", "=" and '"', and a quoted string ends at the first '"' that no
+# backslash escapes, because its plain text excludes both '"' and "\". So a ";" inside a quoted
+# value cannot start a repetition, and giving one back can never lead to a match. Possessive says
+# so to the regex engine and to the scan. If _QUOTED ever admits '"' or "\" in its plain text, or
+# loses its closing quote, that no longer holds: possessive would then refuse legal lines.
 
-_TOKEN = f"[{_TCHARS}]+"
 _QUOTED = r'"(?:[\t \x21\x23-\x5b\x5d-\x7e\x80-\xff]|\\[\t \x21-\x7e\x80-\xff])*"'
 _CHUNK_EXT = (
     r"(?:[ \t]*;[ \t]*" + _TOKEN + r"(?:[ \t]*=[ \t]*(?:" + _TOKEN + "|" + _QUOTED + r"))?)*+"
@@ -669,7 +676,7 @@ def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
         line = _read_chunk_line(fp, connector)
         if line is None:
             raise _truncated_error(connector)
-        match = _CHUNK_SIZE_LINE.fullmatch(line.decode("latin-1"))
+        match = _CHUNK_SIZE_LINE.fullmatch(line)
         if match is None:
             raise _framing_error(connector, "a chunk-size line that is not plain hexadecimal")
         size = int(match.group(1), 16)
@@ -699,20 +706,20 @@ def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
             # too. The last chunk has arrived by then, so the body is settled. http.client accepts
             # this ending as well, because some servers send it.
             return bytes(body)
-        text = line.decode("latin-1")
-        if _TRAILER_LINE.fullmatch(text) is not None:
+        if _TRAILER_LINE.fullmatch(line) is not None:
             field_seen = True
-        elif not (field_seen and _TRAILER_FOLD.fullmatch(text)):
+        elif not (field_seen and _TRAILER_FOLD.fullmatch(line)):
             raise _framing_error(connector, "a trailer line that is not a header field")
     # Folded continuation lines count toward the limit too, which keeps the loop bounded.
     raise _framing_error(connector, "more trailer lines than the reader allows")
 
 
-def _read_chunk_line(fp: _SupportsReadline, connector: str) -> bytes | None:
-    """One CRLF-terminated line of the chunked framing, without its CRLF.
+def _read_chunk_line(fp: _SupportsReadline, connector: str) -> str | None:
+    """One CRLF-terminated line of the chunked framing, without its CRLF, decoded as latin-1.
 
-    ``None`` when the stream ended cleanly before the line began. A line cut part-way is a
-    truncation.
+    Decoded here, once, so every grammar check gets the str its pattern needs. latin-1 maps each
+    byte to one code point and cannot fail. ``None`` when the stream ended cleanly before the line
+    began. A line cut part-way is a truncation.
     """
     line = fp.readline(_MAX_LINE + 1)
     if not line:
@@ -723,7 +730,7 @@ def _read_chunk_line(fp: _SupportsReadline, connector: str) -> bytes | None:
         raise _truncated_error(connector)
     if not line.endswith(b"\r\n"):
         raise _framing_error(connector, "a chunked-body line not ended by CRLF")
-    return line[:-2]
+    return line[:-2].decode("latin-1")
 
 
 def read_bounded_text(

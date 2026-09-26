@@ -683,6 +683,10 @@ _BAD_CHUNKS: dict[str, bytes] = {
     "trailer-not-a-field": _TE + b"5\r\nhello\r\n0\r\nnot a field\r\n\r\n",
     # read b"hello": a fold with no field line before it
     "trailer-fold-first": _TE + b"5\r\nhello\r\n0\r\n b\r\n\r\n",
+    # A byte from 0x80 up is not a hex digit, even where latin-1 decodes it to a letter or a digit
+    # sign. The grammar matches decoded lines, so these pin that the decode widens nothing.
+    "size-high-byte": _TE + b"5\xb5\r\nhello\r\n0\r\n\r\n",
+    "extension-name-high-byte": _TE + b"5;n\xe9=1\r\nhello\r\n0\r\n\r\n",
 }
 
 #: Chunked framings that are legal and must still read as b"hello".
@@ -694,6 +698,12 @@ _CHUNK_CONTROLS: dict[str, bytes] = {
     "leading-zeros": _TE + b"0005\r\nhello\r\n000\r\n\r\n",
     "trailer-section": _TE + b"5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Other: 1\r\n\r\n",
     "trailer-folded": _TE + b"5\r\nhello\r\n0\r\nX-A: 1\r\n b\r\n\r\n",
+    # obs-text, bytes 0x80 to 0xFF, is legal in a quoted extension value and in a trailer value.
+    # A decode other than latin-1 would raise on these or stop matching them.
+    "extension-quoted-obs-text": _TE + b'5;n="caf\xe9 \xff"\r\nhello\r\n0\r\n\r\n',
+    "trailer-obs-text": _TE + b"5\r\nhello\r\n0\r\nX-A: caf\xe9\xff\r\n\r\n",
+    # A ";" inside a quoted value starts no new extension. The possessive group relies on that.
+    "extension-quoted-semicolon": _TE + b'5;n="a;b";m=1\r\nhello\r\n0\r\n\r\n',
 }
 
 
@@ -848,11 +858,20 @@ def test_drain_bounded_stops_at_malformed_chunk_framing(
     with caplog.at_level(logging.WARNING):
         drain_bounded(resp, limit=1000, connector="https://h.example.test/p?token=SECRET")
     assert stream.tell() <= min(len(raw), len(_TE) + 40)
-    assert "A GET reply with status 200 had a malformed body" in caplog.text
+    assert "The reply to a GET request had a malformed body (status 200, " in caplog.text
     assert "is not failed" in caplog.text
     assert "refusing" not in caplog.text
-    # The connector is built from a configured URL, so the WARNING leaves it out entirely.
+    # The connector is built from configuration, so the WARNING leaves it out entirely.
     assert "h.example.test" not in caplog.text
+    assert "SECRET" not in caplog.text
+
+
+def test_the_drain_warning_names_only_a_known_method(caplog: pytest.LogCaptureFixture) -> None:
+    """A method outside the allow-list is logged as "HTTP", so the line holds only module text."""
+    resp, _stream = _wire_counted(_BAD_CHUNKS["size-0x5"], method="X-SECRET-VERB")
+    with caplog.at_level(logging.WARNING):
+        drain_bounded(resp, limit=1000, connector="c")
+    assert "The reply to a HTTP request had a malformed body (status 200, " in caplog.text
     assert "SECRET" not in caplog.text
 
 
