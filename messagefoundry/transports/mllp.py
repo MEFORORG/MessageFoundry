@@ -1450,6 +1450,8 @@ class MLLPDestination(DestinationConnector):
                         f"!= sent MSH-10={sent_control_id!r}"
                     )
             if self.capture_response:
+                # Unbounded on purpose: this branch runs only when msa1 is exactly AA or CA, so the
+                # peer cannot size it here (BACKLOG #1847 bounds the one that can, below).
                 return DeliveryResponse(
                     body=ack_bytes.decode(self.encoding, errors="replace"),
                     outcome="accepted",
@@ -1475,8 +1477,15 @@ class MLLPDestination(DestinationConnector):
         # capture. AR/CR (reject) is permanent (fail-fast); AE/CE (error) and any unrecognized negative
         # code are treated as transient (retry), the conservative choice when the intent is unclear.
         code, permanent = ("AR", True) if msa1 in ("AR", "CR") else ("AE", False)
+        # BACKLOG #1847, the sibling of MSA-2 and MSA-3 above: every code that is not AA/CA lands
+        # here, so the peer sizes MSA-1 in this message too. Bounded for the TEXT only, after the
+        # comparisons: they must see the code the peer actually sent, or a clamp that rewrote it could
+        # move a reply from one branch to another. str() keeps an absent MSA-1 rendering as "None",
+        # as it did before, where the helper alone would print it as an empty field.
         raise NegativeAckError(
-            f"negative ACK (MSA-1={msa1}): {detail}".rstrip(": "), code=code, permanent=permanent
+            f"negative ACK (MSA-1={_bounded_ack_field(str(msa1))}): {detail}".rstrip(": "),
+            code=code,
+            permanent=permanent,
         )
 
 
