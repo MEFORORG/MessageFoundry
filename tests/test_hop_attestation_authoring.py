@@ -138,7 +138,8 @@ def test_the_bind_warning_records_the_attestation_reason(caplog: pytest.LogCaptu
     flagged = _source_config(_open_mllp_inbound(), "127.0.0.1", {})
     with caplog.at_level("WARNING"):
         check_mllp_tls_exposure(flagged, "IB", allow_insecure_bind=True, posture=None)
-    assert "(--allow-insecure-bind)" in caplog.text
+    # PR 1510's wording: serve folds require_encryption_for_remote = false into the same flag.
+    assert "(--allow-insecure-bind / require_encryption_for_remote = false)" in caplog.text
     assert "tls_hop_attested" not in caplog.text
 
 
@@ -356,12 +357,12 @@ def _loosening_names(attested_hops: tuple[str, ...]) -> list[str]:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            attested_hops,
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=attested_hops,
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     ]
 

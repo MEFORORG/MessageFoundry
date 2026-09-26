@@ -71,12 +71,12 @@ def _names(
             auth or AuthSettings(),
             alerts or AlertsSettings(),
             rotation or SecretRotationSettings(),
-            cleartext_hops,
-            expiry_hops,
-            db_hops,
-            attested_hops,
-            None,
-            None,
+            cleartext_hops=cleartext_hops,
+            expiry_relaxed_hops=expiry_hops,
+            unverified_db_hops=db_hops,
+            attested_hops=attested_hops,
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     ]
 
@@ -108,12 +108,12 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "aad_bind" in named
@@ -134,12 +134,12 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "no effect without a store key" in named["aad_bind"]
@@ -157,12 +157,12 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             auth,
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "ad_session_recheck_seconds" in named
@@ -549,12 +549,12 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            ("OB_LEGACY", "OB_LAB"),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=("OB_LEGACY", "OB_LAB"),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "cleartext_accepted" in named
@@ -586,12 +586,12 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            ("OB_PARTNER_ADT", "OB_LAB_ORU"),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=("OB_PARTNER_ADT", "OB_LAB_ORU"),
+            unverified_db_hops=(),
+            attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "tls_allow_expired" in named
@@ -615,12 +615,12 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            ("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
+            attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "generic_odbc_tls_unenforced" in named

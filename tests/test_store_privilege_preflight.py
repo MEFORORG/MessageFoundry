@@ -761,12 +761,12 @@ def _names(store_privilege: StorePrivilegePosture | None) -> dict[str, str]:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            (),
-            store_privilege,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            store_privilege=store_privilege,
+            audit_chain_unkeyed=None,
         )
     )
 
@@ -820,12 +820,12 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
                 AuthSettings(),
                 AlertsSettings(),
                 SecretRotationSettings(),
-                (),
-                (),
-                (),
-                (),
-                None,
-                None,
+                cleartext_hops=(),
+                expiry_relaxed_hops=(),
+                unverified_db_hops=(),
+                attested_hops=(),
+                store_privilege=None,
+                audit_chain_unkeyed=None,
             )
         )
         == {}

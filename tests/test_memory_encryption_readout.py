@@ -64,12 +64,12 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         AuthSettings(),
         AlertsSettings(),
         SecretRotationSettings(),
-        (),
-        (),
-        (),
-        (),
-        None,
-        None,
+        cleartext_hops=(),
+        expiry_relaxed_hops=(),
+        unverified_db_hops=(),
+        attested_hops=(),
+        store_privilege=None,
+        audit_chain_unkeyed=None,
     )
 
 

@@ -2175,12 +2175,12 @@ def _serve(args: argparse.Namespace) -> int:
         settings.auth,
         settings.alerts,
         settings.secret_rotation,
-        (),
-        (),
-        (),
-        (),
-        None,
-        None,
+        cleartext_hops=(),
+        expiry_relaxed_hops=(),
+        unverified_db_hops=(),
+        attested_hops=(),
+        store_privilege=None,
+        audit_chain_unkeyed=None,
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
@@ -6717,7 +6717,17 @@ def _security(args: argparse.Namespace) -> int:
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
-                sec, _store, _auth, _alerts, _rotation, (), (), (), (), None, None
+                sec,
+                _store,
+                _auth,
+                _alerts,
+                _rotation,
+                cleartext_hops=(),
+                expiry_relaxed_hops=(),
+                unverified_db_hops=(),
+                attested_hops=(),
+                store_privilege=None,
+                audit_chain_unkeyed=None,
             )
         ]
 

@@ -5350,6 +5350,7 @@ def security_loosenings(
     auth: AuthSettings,
     alerts: AlertsSettings,
     secret_rotation: SecretRotationSettings,
+    *,
     cleartext_hops: Sequence[str],
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
@@ -5390,7 +5391,9 @@ def security_loosenings(
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
     posture by the back door. An optional parameter is a detector that silently fails to fire; a required
-    one makes omission a type error at every call site.
+    one makes omission a type error at every call site. Everything after ``secret_rotation`` is
+    keyword-only: the connection-scoped sequences all share the type ``Sequence[str]``, so a
+    positional call could pass one set in another's slot and still type-check.
 
     ``store_privilege`` is the store-principal privilege OBSERVATION (#1008, ASVS 13.2.2), for the same
     reason and in the same plain shape: it is what the principal actually holds, produced by the

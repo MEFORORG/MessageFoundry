@@ -2080,13 +2080,13 @@ def create_app(
                 auth_settings,
                 alerts_settings,
                 secret_rotation_settings,
-                cleartext_hops,
-                expired_hops,
-                db_hops,
-                attested_hops,
-                store_privilege,
+                cleartext_hops=cleartext_hops,
+                expiry_relaxed_hops=expired_hops,
+                unverified_db_hops=db_hops,
+                attested_hops=attested_hops,
+                store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
-                engine.store.audit_chain_unkeyed(),
+                audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
             )
         ]
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
