@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import webbrowser
 
 import pytest
@@ -184,6 +185,8 @@ def test_tray_app_reports_a_refused_console_url_as_a_toast(
 ) -> None:
     # The tray reports a failed action as a balloon, the way `control.outcome_toast` does. The
     # balloon and the log line are fixed text and never echo the URL, which could carry a secret.
+    from messagefoundry import logging_setup
+    from messagefoundry.redaction import redact
     from messagefoundry.tray import app as tray_app
     from messagefoundry.tray.config import TrayConfig
 
@@ -201,12 +204,30 @@ def test_tray_app_reports_a_refused_console_url_as_a_toast(
     )
     monkeypatch.setattr(tray, "_shell", _Shell(), raising=False)
 
-    with caplog.at_level("WARNING", logger="messagefoundry.tray.app"):
-        tray._open_console()
+    # Put the engine's PHI filter chain in front of caplog on purpose. The chain rewrites the
+    # shared record in place, so caplog reads the redacted text whenever an earlier test left a
+    # filtered root handler behind. That made this assertion pass alone and fail under the full
+    # suite on all three CI legs, when the old wording "Open Console refused" read as a name run.
+    # Installing the chain here makes the result the same in either order (BACKLOG #1993).
+    logger = logging.getLogger("messagefoundry.tray.app")
+    filtered = logging_setup.build_stderr_handler()
+    logger.addHandler(filtered)
+    try:
+        with caplog.at_level("WARNING", logger="messagefoundry.tray.app"):
+            tray._open_console()
+    finally:
+        logger.removeHandler(filtered)
+        filtered.close()
 
     assert opened == []
     assert len(notes) == 1
     title, body = notes[0]
-    assert "Open Console refused" in body
-    assert "Open Console refused" in caplog.text
+    assert body.startswith("Console not opened: ")
+    records = [r for r in caplog.records if r.name == "messagefoundry.tray.app"]
+    assert len(records) == 1, records
+    logged = records[0].getMessage()
+    assert logged == body
+    # The line must pass the redactor unchanged, so a future redactor rule that eats it fails here
+    # by name rather than turning the operator's only clue into "[redacted]".
+    assert redact(logged) == logged
     assert "s3cr3t" not in title + body + caplog.text
