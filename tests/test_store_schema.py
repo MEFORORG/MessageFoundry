@@ -81,6 +81,50 @@ async def test_the_v032_search_presets_table_is_refused(tmp_path: Path) -> None:
     assert text.count("table '") == 1 and text.count("index '") == 1
 
 
+# A plausible Windows service data path, long enough that the 200-character cut in safe_exc bites.
+_SERVICE_PATH = r"C:\ProgramData\MessageFoundry\data\messagefoundry.db"
+
+
+async def test_a_keyed_refusal_names_a_new_store_key(tmp_path: Path) -> None:
+    # The AES-GCM use count and the key-age clock live in the store file, so a fresh store under the
+    # SAME key starts both at zero -- the reset gcm_bound.py refuses to offer. The keyed remedy must
+    # send the operator to a new key instead.
+    from messagefoundry.redaction import safe_exc
+    from messagefoundry.store.crypto import generate_key, make_cipher
+
+    db = tmp_path / "keyed.db"
+    _sql(db, _V032_SEARCH_PRESETS)
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    text = str(info.value)
+    lead = (
+        "is from an incompatible version: move it and its -wal/-shm aside, then restart under a NEW"
+        " store key (`messagefoundry gen-key`)."
+    )
+    assert text.startswith(f"store {db} {lead}")
+    assert text.endswith(
+        "Keep the old key only to read the moved file: restarting under it would reset its AES-GCM"
+        " use count and key-age clock, which live in the store."
+    )
+    # The whole lead survives the cut that an uncaught-error path applies, on a real service path.
+    rendered = safe_exc(SchemaMismatchError(text.replace(str(db), _SERVICE_PATH)))
+    assert f"store {_SERVICE_PATH} {lead}" in rendered
+
+
+async def test_a_keyless_refusal_does_not_mention_a_key(tmp_path: Path) -> None:
+    from messagefoundry.redaction import safe_exc
+
+    db = tmp_path / "keyless.db"
+    _sql(db, _V032_SEARCH_PRESETS)
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db)
+    text = str(info.value)
+    assert "gen-key" not in text
+    assert "key" not in text.split(" Differences: ")[0].removeprefix(f"store {db} ")
+    lead = text.split(" Differences: ")[0].replace(str(db), _SERVICE_PATH)
+    assert lead in safe_exc(SchemaMismatchError(text.replace(str(db), _SERVICE_PATH)))
+
+
 async def test_the_refusal_releases_the_file_so_the_remedy_works(tmp_path: Path) -> None:
     db = tmp_path / "v032.db"
     _sql(db, _V032_SEARCH_PRESETS)

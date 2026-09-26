@@ -46,11 +46,24 @@ log = logging.getLogger(__name__)
 
 Migrate = Callable[[aiosqlite.Connection], Awaitable[None]]
 
-# Short and first in the message: the paths that print an uncaught error cut it at about 200
-# characters, and the differences that follow it are the part an operator can afford to lose.
+# Short and first in the message: the paths that print an uncaught error cut it at 200 characters
+# (redaction.safe_exc), and the differences that follow it are the part an operator can afford to lose.
 _REMEDY = (
     "is from an incompatible version; recreate it: move the file and its -wal and -shm files aside,"
     " then restart."
+)
+# A keyed store must not be recreated under the key it already uses. The per-key AES-GCM invocation
+# count (cipher_meta, ASVS 11.3.4) and the DEK's key-age clock (secret_rotation_meta) live in the store
+# file, so a fresh file under the same key starts both at zero: the reset gcm_bound.py refuses to offer.
+# A new key has no count by construction. `gen-key`, not `rotate-key`: rotate-key re-encrypts an
+# existing store under the active key, and a fresh store has nothing to re-encrypt.
+_REMEDY_KEYED = (
+    "is from an incompatible version: move it and its -wal/-shm aside, then restart under a NEW store"
+    " key (`messagefoundry gen-key`)."
+)
+_KEYED_TAIL = (
+    " Keep the old key only to read the moved file: restarting under it would reset its AES-GCM"
+    " use count and key-age clock, which live in the store."
 )
 
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
@@ -249,7 +262,12 @@ def schema_differences(expected: SchemaShape, live: SchemaShape) -> list[str]:
 
 
 async def verify_live_schema(
-    db: aiosqlite.Connection, *, schema: str, migrate: Migrate, path: object
+    db: aiosqlite.Connection,
+    *,
+    schema: str,
+    migrate: Migrate,
+    path: object,
+    keyed: bool = False,
 ) -> None:
     """Refuse a live store whose schema lacks anything ``schema`` plus ``migrate`` would build.
 
@@ -257,11 +275,15 @@ async def verify_live_schema(
     that differs. The caller runs this inside the migration transaction, so a refusal rolls the
     migrations back and leaves the file as the old version wrote it, apart from the objects the
     schema script created, which are all new tables and indexes.
+
+    ``keyed`` picks the remedy: true when the store runs a local AES-GCM key, the only cipher whose
+    use the store counts, and then the operator is told to start the fresh store under a new key.
     """
     expected = await _expected_shape(schema, migrate)
     live = await read_schema_shape(db, sorted(expected.columns))
     problems = schema_differences(expected, live)
     if problems:
+        remedy, tail = (_REMEDY_KEYED, _KEYED_TAIL) if keyed else (_REMEDY, "")
         raise SchemaMismatchError(
-            f"store {path} {_REMEDY} Differences: " + "; ".join(problems) + "."
+            f"store {path} {remedy} Differences: " + "; ".join(problems) + "." + tail
         )
