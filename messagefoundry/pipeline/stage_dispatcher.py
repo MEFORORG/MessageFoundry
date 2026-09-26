@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Protocol
 
+from messagefoundry.log_backoff import FailureRun
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.phase_timing import (
     _DELIVERY_PHASE_EMIT_INTERVAL,  # the ONE definition of this package's log-throttle window
@@ -168,6 +169,9 @@ class _Claimer:
     ready_set: set[str] = field(default_factory=set)
     event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[None] | None = None
+    # BACKLOG #1844: this claimer's run of failed claims, so a store outage logs on a backoff rather
+    # than a traceback per _CLAIM_ERROR_BACKOFF_SECONDS. Per claimer, because each retries on its own.
+    faults: FailureRun = field(default_factory=FailureRun)
 
 
 @dataclass(frozen=True)
@@ -316,6 +320,9 @@ class StageDispatcher:
         self._lane_episode_stats = LaneEpisodeTiming(logger=log)
         self._sweep_task: asyncio.Task[None] | None = None
         self._sweep_now = asyncio.Event()
+        # BACKLOG #1844: the sweep retries every sweep_interval (0.25 s by default), so an outage would
+        # otherwise log four tracebacks a second per stage. See messagefoundry.log_backoff.
+        self._sweep_faults = FailureRun()
         # Per-lane coalesced timer handles + their armed deadlines (earliest-wins refresh).
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._timer_deadline: dict[str, float] = {}
@@ -619,8 +626,23 @@ class StageDispatcher:
             claimer.ready.clear()
             claimer.ready_set.clear()
             claimer.task = None
+            claimer.faults = self._abandon(claimer.faults, "claim")
+        self._sweep_faults = self._abandon(self._sweep_faults, "sweep")
         self._slots_free = self._max_processing_lanes
         self._running = False
+
+    def _abandon(self, run: FailureRun, what: str) -> FailureRun:
+        """The clean run a restart-in-place begins with (#1844), saying so if one was open: without
+        the line, the last word on a claimer or sweep stopped mid-outage is its last fault record,
+        which reads the same as a fault that never ended."""
+        if run.count:
+            log.warning(
+                "StageDispatcher %s %s: stopped with %d consecutive failures and no recovery",
+                self._stage.value,
+                what,
+                run.count,
+            )
+        return FailureRun()
 
     def _on_task_done(self, name: str, task: asyncio.Task[None]) -> None:
         """Claimer/sweep supervision — these should only finish on shutdown (their loops swallow +
@@ -714,7 +736,7 @@ class StageDispatcher:
             result: ClaimedHeads = await self._store.claim_fifo_heads(
                 self._stage.value, lanes, now=now, per_lane_limit=self._per_lane_limit
             )
-        except Exception:  # noqa: BLE001 — a store error must not kill the claimer loop
+        except Exception as exc:  # noqa: BLE001 — a store error must not kill the claimer loop
             # Return the whole chunk to READY, release the reserved slots, back off this partition.
             err_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
             for lane in lanes:
@@ -725,15 +747,24 @@ class StageDispatcher:
                 # so it is booked as `dropped` (occupancy), never as `episode` (service).
                 self._drop_lane_episode(st, err_ns)
                 self._to_ready(lane, woken=st.ready_woken)
-            log.warning(
+            # BACKLOG #1844: on a backoff, with the running count (messagefoundry.log_backoff).
+            claimer.faults = claimer.faults.record(
+                log,
+                exc,
                 "StageDispatcher %s claim failed for %d lane(s); backing off %.1fs",
                 self._stage.value,
                 len(lanes),
                 _CLAIM_ERROR_BACKOFF_SECONDS,
-                exc_info=True,
+                level=logging.WARNING,
             )
             await self._sleep_or_stop(_CLAIM_ERROR_BACKOFF_SECONDS)
             return
+        if claimer.faults.count and result.lock_timeout is None:
+            # A claim that returned is the end of a run of RAISED claims -- unless it yielded on a
+            # lock timeout (#1270), which is the store still in trouble, reported on its own line.
+            claimer.faults = claimer.faults.clear(
+                log, "StageDispatcher %s claim", self._stage.value, level=logging.WARNING
+            )
         if self._claim_phase_timing:
             # Recorded synchronously (no await between the read and the counter writes), so a sibling
             # claimer at K>1 can never interleave a partial update. Counts only — a lane is a
@@ -1319,8 +1350,19 @@ class StageDispatcher:
                 await self._run_sweep_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 — a sweep error must not kill the backstop
-                log.warning("StageDispatcher %s sweep failed", self._stage.value, exc_info=True)
+            except Exception as exc:  # noqa: BLE001 — a sweep error must not kill the backstop
+                self._sweep_faults = self._sweep_faults.record(
+                    log,
+                    exc,
+                    "StageDispatcher %s sweep failed",
+                    self._stage.value,
+                    level=logging.WARNING,
+                )
+            else:
+                if self._sweep_faults.count:
+                    self._sweep_faults = self._sweep_faults.clear(
+                        log, "StageDispatcher %s sweep", self._stage.value, level=logging.WARNING
+                    )
 
     async def _run_sweep_once(self) -> None:
         """Page ``list_fifo_lanes`` (after-cursor), intersect EACH page with this engine's registry lanes
