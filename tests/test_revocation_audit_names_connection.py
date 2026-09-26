@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -32,7 +31,7 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
     cleartext_acceptance_audit_sink,
 )
-from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap, load_config
+from messagefoundry.config.wiring import FHIR, ConnectionSpec, DICOMweb, Rest, Soap, load_config
 from messagefoundry.pipeline.wiring_runner import (
     _dest_config,
     _source_config,
@@ -117,9 +116,9 @@ def test_two_attested_outbounds_to_one_host_each_line_names_its_own(
 
 # --- every outbound call site passes the name ------------------------------------------------------
 
-# Annotated because the four factories share no common type: mypy joins them to `object`, and
-# the tests-wide mypy pass (#1799) then refuses the call.
-_HTTP: dict[str, tuple[ConnectorType, Callable[..., Any], str]] = {
+# Annotated because the four factories differ in their parameters: mypy joins them to `object`,
+# and the tests-wide mypy pass (#1799) then refuses the call. All four return a ConnectionSpec.
+_HTTP: dict[str, tuple[ConnectorType, Callable[..., ConnectionSpec], str]] = {
     "REST": (ConnectorType.REST, Rest, f"https://{_HOST}/x"),
     "SOAP": (ConnectorType.SOAP, Soap, f"https://{_HOST}/svc"),
     "FHIR": (ConnectorType.FHIR, FHIR, f"https://{_HOST}/fhir"),
