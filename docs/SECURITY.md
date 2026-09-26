@@ -997,6 +997,14 @@ server-side, not a client confirmation). On release the captured operation is **
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`.
 
+**The audit log must accept a release before the operation runs.** Just before it releases a
+request, the gate writes an `approval.release_attempted` row against the approver, naming the
+requester. If the audit log refuses that write, the approve returns **503**, nothing runs, and the
+request stays pending. `approval.approved` is written after the operation, with its result. If only
+that later write fails, the error is logged and the release still succeeds, because the operation
+has already run. A release that loses a race with another approve or a reject leaves an
+`approval.release_attempted` row with no outcome row after it; the request's status says what won.
+
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
 gets **409** and writes an `approval.too_early` audit row against the approver, with the request's age
