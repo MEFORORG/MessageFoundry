@@ -300,11 +300,12 @@ fingerprint+git-HEAD covers more cheaply for now.
 > same single write.
 
 - **AC-15** — WHERE the web console package is loaded in the engine process, WHEN the engine starts,
-  THE SYSTEM SHALL apply AC-9 to AC-14 to the loaded console files (`.py`, `.js`, `.css`) against the
-  `messagefoundry-webconsole` distribution's own `RECORD`, recording and alerting under console
-  subjects, and SHALL record and alert for every failed arm before refusing. WHERE the console is not
-  loaded, THE SYSTEM SHALL NOT attest it.
+  THE SYSTEM SHALL apply AC-9 to AC-14 to every loaded console file against the
+  `messagefoundry-webconsole` distribution's own `RECORD`, SHALL treat a `RECORD` row with no file as
+  drift, SHALL record and alert under console subjects, and SHALL record and alert for every failed arm
+  before refusing. WHERE the console is not loaded, THE SYSTEM SHALL NOT attest it.
   → `tests/test_startup_attestation.py::test_console_tamper_is_detected_recorded_and_fails_closed`
+  → `tests/test_startup_attestation.py::test_a_deleted_console_file_is_missing_drift`
   → `tests/test_startup_attestation.py::test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine`
   → `tests/test_startup_attestation.py::test_console_absent_changes_nothing_even_under_fail_closed`
   → `tests/test_startup_attestation.py::test_the_engine_arm_text_is_unchanged`
@@ -321,13 +322,25 @@ fingerprint+git-HEAD covers more cheaply for now.
 >    serves is one that is attested.
 > 2. **Loaded but unattestable fails the same way the engine does (AC-13).** A console with no
 >    distribution metadata, a stripped `RECORD`, or files outside its install root is attested-nothing.
->    A console that declares itself editable keeps the AC-12 no-op, so a dev checkout is never bricked.
-> 3. **It walks by suffix instead of keeping a file list.** A list would ship in the engine wheel and
->    be compared against the console's `RECORD`, which is versioned apart, so it would go stale.
+>    A console that declares itself editable keeps the AC-12 no-op. So does a console with no
+>    distribution beside an engine that declares itself editable: that is a checkout that installed
+>    only the engine, and the engine's exemption already concedes everything this one would.
+> 3. **It attests the whole package, not a suffix list or a file list.** A native module or a
+>    sourceless `.pyc` planted beside a `.py` is imported in its place, so every file with no `RECORD`
+>    row is drift, and so is every console `RECORD` row with no file. A file list would ship in the
+>    engine wheel and be compared against the console's `RECORD`, which is versioned apart.
 >
 > The engine arm's log lines, alert subjects, audit detail and refusal text are unchanged, and a test
-> pins them word for word. The trust-domain residual in D3 applies to the console unchanged: this
-> detects an inconsistent in-place edit, not one that also re-seals the console's `RECORD`.
+> pins them word for word. It is also acted on before the console arm runs, so a console arm that
+> fails cannot cost the engine its evidence. The trust-domain residual in D3 applies to the console
+> unchanged: this detects an inconsistent in-place edit, not one that also re-seals the console's
+> `RECORD`.
+>
+> **Two residuals, recorded rather than fixed here.** The engine arm still resolves each file before
+> comparing it, so an engine module swapped for a symlink to a file outside the install root is
+> skipped rather than compared; the console arm resolves only directories and does not have this gap.
+> And neither arm reads `__pycache__`, because `RECORD` carries no hash for compiled caches: a crafted
+> cache whose header matches its `.py` is imported without either arm looking at it.
 
 ## Options considered
 

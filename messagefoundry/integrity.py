@@ -21,7 +21,8 @@ separate, separately versioned wheel (``messagefoundry-webconsole``) mounted in-
 run with the engine's own privileges while the engine's ``RECORD`` never lists them. It gets its own
 arm, :func:`attest_console`, run against the console distribution's own ``RECORD`` under the same
 classifier and the same posture below. A console this process never imported is not attested: its
-bytes never ran here, and importing it to look would run them.
+bytes never ran here, and importing it to look would run them. ADR 0041 AC-15 and its 2026-09-25
+amendment are the record of what the arm covers and why.
 
 Posture (ADR 0017 amendment, 2026-06-27):
 
@@ -159,19 +160,20 @@ _ATTESTED_ASSETS: tuple[str, ...] = (
 _CONSOLE_DIST_NAME = "messagefoundry-webconsole"
 _CONSOLE_PACKAGE = "messagefoundry_webconsole"
 
-#: What the console arm hashes: its Python source plus the browser code it serves. The static
-#: ``.js``/``.css`` files run inside an operator's signed-in browser session, so editing one in place
-#: tampers with the console with no ``.py`` touched -- the gap BACKLOG #1432 closed for the engine's
-#: data assets.
+#: The console arm attests EVERY file in the loaded package (bytecode caches aside), not only ``.py``.
+#: Its static ``.js``/``.css`` run inside an operator's signed-in browser session, so editing one in
+#: place tampers with the console with no ``.py`` touched. A native module or a sourceless ``.pyc``
+#: planted beside a ``.py`` is imported in its place, so a suffix filter would hash the untouched
+#: ``.py`` and report clean. Walking everything makes any file with no ``RECORD`` row ``missing`` drift.
+#: The engine declined a whole-package scope because a wheel might one day ship a file an operator edits
+#: in place (BACKLOG #1432); the console ships none. It is not an explicit list like
+#: :data:`_ATTESTED_ASSETS` either: that list would ship in the ENGINE wheel and be compared against the
+#: CONSOLE's ``RECORD``, and the two are versioned apart, so it would go stale.
 #:
-#: **A suffix walk, not an explicit list like** :data:`_ATTESTED_ASSETS`, **because of version skew.**
-#: That list ships in the same wheel as the ``RECORD`` it is compared against. A console list here
-#: would ship in the ENGINE wheel and be compared against the CONSOLE's ``RECORD``, and the two are
-#: versioned apart. A console release that added a file would leave it unattested, and one that
-#: dropped a file would read as drift. A walk has no list to go stale, and a planted file still
-#: surfaces as ``missing`` drift. The engine declined a walk because a wheel might one day ship a file
-#: an operator edits in place; the console ships none.
-_CONSOLE_ATTESTED_SUFFIXES: tuple[str, ...] = (".py", ".js", ".css")
+#: ``__pycache__`` is skipped because ``RECORD`` carries no hash for compiled caches. That leaves a
+#: residual shared with the engine arm: a crafted cache whose header matches its ``.py`` is imported
+#: without either arm looking at it.
+_BYTECODE_CACHE_DIR = "__pycache__"
 
 
 #: Why an attestation pass compared **nothing** (``checked == 0``). Only ``declared_editable`` is a
@@ -217,8 +219,9 @@ class DriftEntry:
 @dataclass(frozen=True)
 class AttestationResult:
     """Outcome of one attestation pass. ``editable``/``no_record`` are the classifier's verdicts on the
-    install; ``checked`` counts the files actually compared (loaded engine modules + declared security
-    assets); ``drift`` is the (possibly empty) list of mismatches.
+    install; ``checked`` counts the files actually compared (for the engine, loaded modules + declared
+    security assets; for the web console, its loaded files); ``drift`` is the (possibly empty) list of
+    mismatches.
 
     ``unattested_reason`` is the field a caller must read alongside ``drift`` (BACKLOG #1679): an empty
     ``drift`` list on its own cannot tell **attested clean** from **attested nothing**, and the second
@@ -416,9 +419,16 @@ def _console_loaded_files() -> list[Path] | None:
     serves is a console that is attested.
 
     Sourced from the module's ``__path__`` like :func:`_loaded_module_files`, so it attests the files
-    this process imported, and a file planted beside them is walked too. A module with no ``__path__``
-    (a single file shadowing the package name) contributes its own ``__file__``; one with neither
-    contributes nothing, which leaves the pass comparing nothing -- attested-nothing, not clean.
+    this process imported, and every file planted beside them is walked too (see
+    :data:`_BYTECODE_CACHE_DIR` for the one directory skipped). A module with no ``__path__`` (a single
+    file shadowing the package name) contributes its own ``__file__``; one with neither contributes
+    nothing, which leaves the pass comparing nothing -- attested-nothing, not clean.
+
+    **Directories are resolved, the file name is not.** A file swapped for a symlink therefore keeps its
+    place under the install root, and hashing it reads the bytes the symlink points at, which is what
+    an import would run. Resolving the file itself would move it outside the root, where the comparison
+    skips it. ``Path.walk`` does not follow a symlinked directory; it reports it as a file, which has no
+    ``RECORD`` row and so is drift.
     """
     module = sys.modules.get(_CONSOLE_PACKAGE)
     if module is None:
@@ -428,14 +438,14 @@ def _console_loaded_files() -> list[Path] | None:
     if search is None:
         origin = getattr(module, "__file__", None)
         if origin:
-            files.add(Path(origin).resolve())
+            path = Path(origin)
+            files.add(path.parent.resolve() / path.name)
         return sorted(files)
     for root in search:
-        base = Path(root)
-        for suffix in _CONSOLE_ATTESTED_SUFFIXES:
-            for path in base.rglob(f"*{suffix}"):
-                if path.is_file():
-                    files.add(path.resolve())
+        for dirpath, dirnames, filenames in Path(root).walk():
+            dirnames[:] = [name for name in dirnames if name != _BYTECODE_CACHE_DIR]
+            directory = dirpath.resolve()
+            files.update(directory / name for name in filenames)
     return sorted(files)
 
 
@@ -470,8 +480,9 @@ def _nothing_attested(
 ) -> AttestationResult:
     """One attested-nothing result (``checked == 0``, no drift), carrying the reason.
 
-    Every early exit of :func:`attest_engine` goes through here so the invariant a caller depends on --
-    ``checked == 0`` always names why -- cannot be broken by a new exit that forgets to set it."""
+    Every early exit of :func:`_attest_distribution`, which both arms share, goes through here so the
+    invariant a caller depends on -- ``checked == 0`` always names why -- cannot be broken by a new exit
+    that forgets to set it."""
     return AttestationResult(
         attested=False, editable=editable, no_record=no_record, checked=0, unattested_reason=reason
     )
@@ -504,6 +515,10 @@ def attest_console() -> AttestationResult | None:
     other pass that compares nothing is attested-nothing (AC-13), which
     :func:`run_startup_attestation` treats exactly as it treats the engine's. Same blocking-I/O
     contract as :func:`attest_engine`.
+
+    Unlike the engine arm it also reads every console row in ``RECORD``, so a DELETED console file is
+    ``missing`` drift. The engine arm cannot do that without a list that could go stale; the console's
+    own ``RECORD`` ships in the same wheel as its files, so it can.
     """
     files = _console_loaded_files()
     if files is None:
@@ -511,17 +526,27 @@ def attest_console() -> AttestationResult | None:
             "integrity: %s is not loaded in this process; nothing to attest", _CONSOLE_PACKAGE
         )
         return None
-    return _attest_distribution(_CONSOLE_DIST_NAME, _CONSOLE_PACKAGE, lambda: files)
+    return _attest_distribution(
+        _CONSOLE_DIST_NAME, _CONSOLE_PACKAGE, lambda: files, every_record_row=True
+    )
 
 
 def _attest_distribution(
-    dist_name: str, package: str, attested_files: Callable[[], list[Path]]
+    dist_name: str,
+    package: str,
+    attested_files: Callable[[], list[Path]],
+    *,
+    every_record_row: bool = False,
 ) -> AttestationResult:
     """Compare ``attested_files()`` against the ``RECORD`` of installed distribution ``dist_name``,
     whose source sits under the top-level ``package`` directory. The one classifier both arms share,
     so the engine and the console cannot drift apart on what counts as attested.
 
-    ``attested_files`` is called only once a usable baseline is known to exist.
+    ``attested_files`` is called only once a usable baseline is known to exist. ``every_record_row``
+    additionally reports each hashed ``RECORD`` row under ``package/`` that no attested file matched as
+    ``missing`` drift -- a deleted file. It applies only when at least one file was compared, so a
+    package loaded from outside the install root stays attested-nothing rather than turning into a
+    list of every file it did not load.
     """
     try:
         dist = metadata.distribution(dist_name)
@@ -560,15 +585,17 @@ def _attest_distribution(
 
     drift: list[DriftEntry] = []
     checked = 0
+    seen: set[str] = set()
     for file in attested_files():
         rel = _record_relpath(file, install_root)
         if rel is None:
             continue  # loaded from outside the install root — not attestable against this RECORD
+        seen.add(rel)
         expected = record.get(rel)
         if expected is None:
-            # A loaded engine module with no RECORD row — an in-place-added file (a planted backdoor
-            # module is exactly this) is drift, not a silent pass. A declared asset lands here only if
-            # it was dropped from the wheel it is compared against, which is itself worth an alert.
+            # A loaded file with no RECORD row — an in-place-added file (a planted backdoor module is
+            # exactly this) is drift, not a silent pass. A declared engine asset lands here only if it
+            # was dropped from the wheel it is compared against, which is itself worth an alert.
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
         checked += 1
@@ -579,6 +606,14 @@ def _attest_distribution(
             continue
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
+    if every_record_row and checked:
+        prefix = f"{package}/"
+        cache = f"/{_BYTECODE_CACHE_DIR}/"
+        drift.extend(
+            DriftEntry(path=rel, reason="missing")
+            for rel in sorted(record)
+            if rel.startswith(prefix) and cache not in rel and rel not in seen
+        )
     return AttestationResult(
         attested=True,
         editable=False,
@@ -791,30 +826,42 @@ async def run_startup_attestation(
     row and the alert are in **addition** to the refusal, never instead of it, so an operator who has not
     opted into hard enforcement still sees that attestation proved nothing.
 
-    **The console arm** (BACKLOG #1802) runs only when this process has loaded the console; otherwise
-    :func:`attest_console` returns ``None`` and nothing about the console is logged above DEBUG, recorded
-    or alerted. Its audit row carries ``"distribution": "messagefoundry-webconsole"`` and its alerts use
-    the ``webconsole-*`` subjects; the engine's row, subjects and messages are unchanged. Both arms record
-    and alert before either refuses, and a refusal names every arm that failed. The return value is the
-    ENGINE's result, as it always was.
+    **The console arm** (BACKLOG #1802) runs only when this process has loaded the console, and only
+    after the engine's result is logged, recorded and alerted, so nothing the console arm does can cost
+    the engine's evidence. Both arms record and alert before either refuses, and a refusal names every
+    arm that failed, the engine's first. The engine's text, subjects and audit detail are unchanged. The
+    return value is the ENGINE's result, as it always was.
+
+    A console with no distribution of its own, loaded beside an engine that DECLARES itself editable,
+    takes the engine's AC-12 exemption: that is a dev checkout that installed only the engine. It costs
+    nothing the engine's exemption did not already concede, because a declared-editable engine attests
+    nothing either.
 
     Wire it into the engine/serve startup *before* listeners bind.
     """
     import asyncio
 
     result = await asyncio.to_thread(attest_engine)
-    console = await asyncio.to_thread(attest_console)
-
-    arms: list[tuple[AttestationResult, _Arm]] = [(result, _ENGINE_ARM)]
-    if console is not None:
-        arms.append((console, _CONSOLE_ARM))
-    refusals: list[str] = []
-    for arm_result, arm in arms:
-        refusal = await _act_on(
-            arm_result, arm, store, alert_sink, fail_closed_on_drift=fail_closed_on_drift
+    refusals = [
+        await _act_on(
+            result, _ENGINE_ARM, store, alert_sink, fail_closed_on_drift=fail_closed_on_drift
         )
-        if refusal is not None:
-            refusals.append(refusal)
-    if refusals:
-        raise IntegrityError("; ".join(refusals))
+    ]
+
+    console = await asyncio.to_thread(attest_console)
+    if console is not None:
+        if (
+            result.declared_editable
+            and console.unattested_reason == "not_an_installed_distribution"
+        ):
+            console = _nothing_attested("declared_editable", editable=True)
+        refusals.append(
+            await _act_on(
+                console, _CONSOLE_ARM, store, alert_sink, fail_closed_on_drift=fail_closed_on_drift
+            )
+        )
+
+    failed = [refusal for refusal in refusals if refusal is not None]
+    if failed:
+        raise IntegrityError("; ".join(failed))
     return result

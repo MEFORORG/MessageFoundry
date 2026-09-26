@@ -1026,26 +1026,82 @@ async def test_console_tamper_is_detected_recorded_and_fails_closed(
         await store.close()
 
 
-def test_a_file_planted_in_the_loaded_console_is_missing_drift(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The REAL walk over the loaded package's ``__path__``: a script dropped beside the shipped ones
-    has no RECORD row, so it is drift. A file of a suffix the arm does not attest is ignored."""
-    console_root = _install_engine_and_console(tmp_path, monkeypatch)
-    package_dir = console_root / _CONSOLE_PKG
-    (package_dir / "static" / "extra.js").write_bytes(b"fetch('/steal');\n")
-    (package_dir / "static" / "notes.txt").write_bytes(b"not attested\n")
+def _load_fake_console(monkeypatch: pytest.MonkeyPatch, package_dir: Path) -> None:
+    """Put a stand-in for the console into ``sys.modules`` and restore the REAL file lookup, so the
+    walk over ``__path__`` is what runs."""
     fake = types.ModuleType(_CONSOLE_PKG)
     fake.__path__ = [str(package_dir)]
     monkeypatch.setitem(sys.modules, _CONSOLE_PKG, fake)
     monkeypatch.setattr(integ, "_console_loaded_files", _REAL_CONSOLE_LOADED_FILES)
 
+
+def test_every_file_planted_in_the_loaded_console_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The REAL walk: any file dropped into the package has no RECORD row, so it is drift, whatever its
+    suffix. A native module is the sharp case, because the import system loads it INSTEAD of the
+    untouched ``.py`` beside it. The bytecode cache directory is the one place skipped."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    (package_dir / "static" / "extra.js").write_bytes(b"fetch('/steal');\n")
+    (package_dir / "mount.cp314-win_amd64.pyd").write_bytes(b"MZ not really\n")
+    (package_dir / "static" / "evil.JS").write_bytes(b"fetch('/steal');\n")
+    (package_dir / "__pycache__").mkdir()
+    (package_dir / "__pycache__" / "mount.cpython-314.pyc").write_bytes(b"cache\n")
+    _load_fake_console(monkeypatch, package_dir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert sorted((d.path, d.reason) for d in console.drift) == [
+        (f"{_CONSOLE_PKG}/mount.cp314-win_amd64.pyd", "missing"),
+        (f"{_CONSOLE_PKG}/static/evil.JS", "missing"),
+        (f"{_CONSOLE_PKG}/static/extra.js", "missing"),
+    ]
+    assert console.checked == len(_CONSOLE_FILES)
+
+
+def test_a_deleted_console_file_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting a shipped file is tampering too (the csp-probe script is the example: without it the
+    'CSP not enforced' banner never shows). The console's own RECORD names it, so its absence is
+    drift."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    (package_dir / "static" / "app.js").unlink()
+    _load_fake_console(monkeypatch, package_dir)
+
     console = integ.attest_console()
     assert console is not None
     assert [(d.path, d.reason) for d in console.drift] == [
-        (f"{_CONSOLE_PKG}/static/extra.js", "missing")
+        (f"{_CONSOLE_PKG}/static/app.js", "missing")
     ]
-    assert console.checked == len(_CONSOLE_FILES)
+    assert console.checked == len(_CONSOLE_FILES) - 1
+
+
+def test_a_console_file_swapped_for_a_symlink_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink to a file outside the install root is what an import follows, so the arm must hash
+    the target in the file's own place rather than skip it as out-of-root."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    evil = tmp_path / "outside" / "evil.py"
+    evil.parent.mkdir()
+    evil.write_bytes(b"def mount_ui(app, deps):\n    raise SystemExit\n")
+    target = package_dir / "mount.py"
+    target.unlink()
+    try:
+        target.symlink_to(evil)
+    except OSError as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    _load_fake_console(monkeypatch, package_dir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert [(d.path, d.reason) for d in console.drift] == [
+        (f"{_CONSOLE_PKG}/mount.py", "hash_mismatch")
+    ]
 
 
 def test_a_single_file_module_shadowing_the_console_is_unattestable(
@@ -1100,6 +1156,72 @@ async def test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine(
         assert detail["distribution"] == "messagefoundry-webconsole"
         assert detail["unattested_reason"] == expected_reason and detail["checked"] == 0
         assert [event[0] for event in sink.events] == ["webconsole-unattested"]
+    finally:
+        await store.close()
+
+
+async def test_a_console_arm_failure_never_costs_the_engine_its_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine arm is acted on BEFORE the console arm runs. If the console arm raises, the engine's
+    drift row and alert are already recorded, and the start still does not go ahead."""
+    _install_engine_and_console(tmp_path, monkeypatch)
+    (tmp_path / "engine" / "mfengine" / "core.py").write_bytes(b"SAFE = False\n")
+
+    def _console_arm_breaks() -> None:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(integ, "attest_console", _console_arm_breaks)
+
+    store = await open_store(sqlite_settings(str(tmp_path / "order.db")), create=True)
+    sink = _RecordingSink()
+    try:
+        with pytest.raises(UnicodeDecodeError):
+            await run_startup_attestation(store, sink, fail_closed_on_drift=False)
+        assert len(_startup_rows(await store.list_audit())) == 1
+        assert [event[0] for event in sink.events] == ["engine-integrity"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("engine_editable", [True, False])
+async def test_a_dev_checkout_console_inherits_the_engine_editable_exemption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine_editable: bool
+) -> None:
+    """``pip install -e .`` alone leaves the console importable from the checkout with no distribution
+    of its own. Beside a declared-editable engine that is a dev checkout, and it must not be refused.
+    THE PAIRED ARM: beside a wheel-installed engine the same console is unattestable and refused."""
+    engine_pkg = "mfengine"
+    engine_dist, engine_loaded = _build_wheel_install(
+        tmp_path / "engine",
+        pkg=engine_pkg,
+        files={f"{engine_pkg}/__init__.py": b"VERSION = '1.0'\n"},
+        editable=engine_editable,
+    )
+    _patch(monkeypatch, engine_dist, engine_loaded, engine_pkg)
+
+    def _distribution(name: str) -> PathDistribution:
+        if name == engine_pkg:
+            return engine_dist
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(integ.metadata, "distribution", _distribution)
+    loose = tmp_path / "checkout" / _CONSOLE_PKG / "__init__.py"
+    loose.parent.mkdir(parents=True)
+    loose.write_bytes(b"__version__ = '1.0'\n")
+    monkeypatch.setattr(integ, "_console_loaded_files", lambda: [loose.resolve()])
+
+    store = await open_store(sqlite_settings(str(tmp_path / "devcheckout.db")), create=True)
+    sink = _RecordingSink()
+    try:
+        if engine_editable:
+            await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+            assert _startup_rows(await store.list_audit()) == []
+            assert sink.events == []
+        else:
+            with pytest.raises(IntegrityError, match="not_an_installed_distribution"):
+                await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+            assert [event[0] for event in sink.events] == ["webconsole-unattested"]
     finally:
         await store.close()
 

@@ -1543,13 +1543,14 @@ engine hashes every **loaded** first-party `messagefoundry` module file against 
 a hash-chained `startup_integrity` audit row and fires the `AlertSink`. It also attests a short explicit set
 of shipped security **data** assets (`_ATTESTED_ASSETS` in `messagefoundry/integrity.py`, BACKLOG #1432) --
 the bundled common-password corpus and the packaged Semgrep handler rules -- because emptying one of those
-neuters a control with no engine module edited at all. When the engine has loaded the **web console**
-(`[security].serve_web_console` on), it attests that too: every `.py`, `.js` and `.css` file of the
-loaded `messagefoundry_webconsole` package, against the `messagefoundry-webconsole` wheel's own
-`RECORD`, under the same rules and the same two keys (BACKLOG #1802). A console that is not installed,
-or installed but not served, is not attested, because its code never ran. Its audit row carries
-`"distribution": "messagefoundry-webconsole"`, and its alerts use the subjects `webconsole-integrity`
-and `webconsole-unattested`. It complements ADR 0036 (which guards
+neuters a control with no engine module edited at all. When the engine has **loaded** the web
+console (`[security].serve_web_console` on), it attests that too: every file of the loaded
+`messagefoundry_webconsole` package against the `messagefoundry-webconsole` wheel's own `RECORD`, under
+the same rules and the same two keys (BACKLOG #1802). A console the engine has not loaded is not
+attested, because its code never ran here. A loaded console that cannot be attested is treated like an
+engine that cannot. Its audit row carries `"distribution": "messagefoundry-webconsole"`, and its alerts
+use the subjects `webconsole-integrity` and `webconsole-unattested`. What the console arm covers, and
+why, is ADR 0041 AC-15. It complements ADR 0036 (which guards
 the *config dir*) by covering the installed *site-packages* an admin with venv-write + restart rights could
 edit in place. Both keys default **safe**: attestation is on but **alert-only** (it never blocks startup), and
 an **editable** install (`pip install -e .` — no RECORD baseline) is a **no-op**, so dev is never bricked.
