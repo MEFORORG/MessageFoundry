@@ -15,7 +15,9 @@ than against a second copy of it. Every value is synthetic (CLAUDE.md section 9)
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -26,24 +28,18 @@ from messagefoundry.pipeline import dr_backup
 from messagefoundry.pipeline.dr_backup import BackupRunner, run_restore_verify
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.base import build_store_cipher
-from messagefoundry.store.cipher_cells import COMPOSITE_CIPHER_CELLS, CipherCell
-from messagefoundry.store.crypto import MARKER_PREFIX, generate_key
+from messagefoundry.store.cipher_cells import (
+    COMPOSITE_CIPHER_CELLS,
+    SQLITE_CIPHER_CELLS,
+    CipherCell,
+)
+from messagefoundry.store.crypto import _V2_PREFIX, MARKER_PREFIX, generate_key
 from messagefoundry.store.store import Stage
 
-#: Plaintexts the writers seal. The FAIL reason must never carry any of them.
-_SECRETS = (
-    "SYNTH-REPLY-BODY",
-    "SYNTH-REPLY-DETAIL",
-    "SYNTH-HDR-VALUE",
-    "SYNTH-SHARED-BODY",
-    "SYNTH-CHUNK-ONE",
-    "SYNTH-CONN-REASON",
-    "SYNTH-ALERT-REASON",
-    "SYNTH-REF-VALUE",
-)
-
-#: The AAD-bound at-rest marker. A v1 value carries no AAD, so it would open under any declaration.
-_V2 = "mfenc:v2:"
+#: Every value the fixture writes, keys included, carries this. A FAIL reason must never contain it:
+#: that would be a plaintext, or a composite key column (a ``state`` or ``reference`` key can be PHI).
+_SYNTH = "SYNTH-"
+_RAW = "MSH|^~\\&|SYNTH-RAW"
 
 _IDS = [f"{c.table}.{c.column}" for c in COMPOSITE_CIPHER_CELLS]
 
@@ -54,7 +50,7 @@ async def _populate(store: MessageStore) -> None:
     # 'received' event carries a sealed message_events.detail.
     await store.enqueue_message(
         channel_id="IB_SYNTH",
-        raw="MSH|^~\\&|SYNTH",
+        raw=_RAW,
         deliveries=[
             ("OB_A", "SYNTH-SHARED-BODY"),
             ("OB_B", "SYNTH-SHARED-BODY"),
@@ -71,14 +67,14 @@ async def _populate(store: MessageStore) -> None:
     )
 
     # state.value rides the transform handoff, the way a live transform writes it.
-    mid = await store.enqueue_ingress(channel_id="IB_STATE", raw="MSH|^~\\&|SYNTH")
+    mid = await store.enqueue_ingress(channel_id="IB_STATE", raw=_RAW)
     ingress = await store.claim_next_fifo("IB_STATE", stage=Stage.INGRESS.value)
     assert ingress is not None
     await store.route_handoff(
         ingress_id=ingress.id,
         message_id=mid,
         channel_id="IB_STATE",
-        handlers=[("H", "MSH|^~\\&|SYNTH")],
+        handlers=[("H", _RAW)],
         disposition=MessageStatus.ROUTED,
     )
     routed = await store.claim_next_fifo("IB_STATE", stage=Stage.ROUTED.value)
@@ -87,12 +83,12 @@ async def _populate(store: MessageStore) -> None:
         routed_id=routed.id,
         message_id=mid,
         channel_id="IB_STATE",
-        deliveries=[("OB_D", "OUT|SYNTH")],
-        state_ops=[("ns", "synth-key", {"seq": 7})],
+        deliveries=[("OB_D", "SYNTH-OUT")],
+        state_ops=[("ns", "SYNTH-KEY", {"seq": 7})],
     )
 
     await store.write_reference_snapshot(
-        name="synth_ref", version="1", rows={"CODE1": "SYNTH-REF-VALUE"}
+        name="synth_ref", version="1", rows={"SYNTH-CODE": "SYNTH-REF-VALUE"}
     )
     await store.put_attachment(["SYNTH-CHUNK-ONE", "SYNTH-CHUNK-TWO"], "text/plain")
     await store.record_connection_event(
@@ -110,15 +106,45 @@ async def _populate(store: MessageStore) -> None:
     )
 
 
-def _sealed_count(db: Path, table: str, column: str, prefix: str = MARKER_PREFIX) -> int:
-    conn = sqlite3.connect(db)
-    try:
-        row = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE {column} LIKE ?",  # declared constants
-            (f"{prefix}%",),
-        ).fetchone()
-    finally:
-        conn.close()
+@pytest.fixture(scope="module")
+def _template(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, StoreSettings]:
+    """One populated, closed, keyed store, built once and copied per test.
+
+    Built the way ``open_store`` builds one, so it writes the AAD-bound ``mfenc:v2`` format.
+    ``make_cipher``'s own default is v1, which binds NO AAD: a fixture on it would pass every AAD
+    assertion here without checking one."""
+    db = tmp_path_factory.mktemp("cipher-cells") / "msg.db"
+    settings = StoreSettings(path=str(db), encryption_key=generate_key())
+
+    async def _build() -> None:
+        store = await MessageStore.open(db, cipher=build_store_cipher(settings))
+        try:
+            await _populate(store)
+        finally:
+            await store.close()
+
+    asyncio.run(_build())
+    return db, settings
+
+
+def _copy(template: tuple[Path, StoreSettings], tmp_path: Path) -> tuple[Path, StoreSettings]:
+    src, settings = template
+    db = tmp_path / src.name
+    for suffix in ("", "-wal", "-shm"):
+        if Path(f"{src}{suffix}").exists():
+            shutil.copyfile(f"{src}{suffix}", f"{db}{suffix}")
+    return db, settings.model_copy(update={"path": str(db)})
+
+
+async def _open(db: Path, settings: StoreSettings) -> MessageStore:
+    return await MessageStore.open(db, cipher=build_store_cipher(settings))
+
+
+def _sealed_count(conn: sqlite3.Connection, cell: CipherCell, prefix: str = MARKER_PREFIX) -> int:
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM {cell.table} WHERE {cell.column} LIKE ?",  # declared constants
+        (f"{prefix}%",),
+    ).fetchone()
     return int(row[0])
 
 
@@ -148,17 +174,6 @@ def _flip_one_aead_byte(db: Path, cell: CipherCell) -> int:
     return int(rowid)
 
 
-async def _keyed_store(tmp_path: Path) -> tuple[MessageStore, Path, StoreSettings]:
-    """A keyed store built the way ``open_store`` builds one, so it writes the AAD-bound ``mfenc:v2``
-    format. ``make_cipher``'s own default is v1, which binds NO AAD: a fixture on it would pass every
-    AAD assertion here without checking one."""
-    db = tmp_path / "msg.db"
-    settings = StoreSettings(path=str(db), encryption_key=generate_key())
-    store = await MessageStore.open(db, cipher=build_store_cipher(settings))
-    await _populate(store)
-    return store, db, settings
-
-
 async def _backup(store: MessageStore, settings: StoreSettings, dest: Path) -> str:
     runner = BackupRunner(
         store,
@@ -171,29 +186,32 @@ async def _backup(store: MessageStore, settings: StoreSettings, dest: Path) -> s
     return result.archive_path
 
 
-async def test_every_composite_cell_is_written_and_read_back(tmp_path: Path) -> None:
+async def test_every_composite_cell_is_written_and_read_back(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
     """PASS on a good archive, and the count proves every sealed value was opened.
 
-    The count is compared to the number of sealed values in the source, over BOTH lists, so a cell the
-    verify silently skipped (a wrong column name, a missing table) cannot hide inside a nonzero total.
+    The count is compared to the number of sealed values in the source over EVERY declared cell, so a
+    cell the verify silently skipped (a wrong column name, a missing table) cannot hide inside a
+    nonzero total.
     """
-    store, db, settings = await _keyed_store(tmp_path)
+    db, settings = _copy(_template, tmp_path)
+    conn = sqlite3.connect(db)
     try:
         for cell in COMPOSITE_CIPHER_CELLS:
-            sealed = _sealed_count(db, cell.table, cell.column)
+            sealed = _sealed_count(conn, cell)
             assert sealed >= 1, (
                 f"the fixture wrote no sealed {cell.table}.{cell.column}, so nothing below proves "
                 "the verify reads it"
             )
             # Every one AAD-bound, or the PASS below says nothing about the declared AAD columns.
-            assert _sealed_count(db, cell.table, cell.column, _V2) == sealed, cell
-        expected = sum(
-            _sealed_count(db, t, c)
-            for t, c in (
-                *MessageStore._CIPHER_COLUMNS,
-                *((cell.table, cell.column) for cell in COMPOSITE_CIPHER_CELLS),
-            )
-        )
+            assert _sealed_count(conn, cell, _V2_PREFIX) == sealed, cell
+        expected = sum(_sealed_count(conn, cell) for cell in SQLITE_CIPHER_CELLS)
+    finally:
+        conn.close()
+
+    store = await _open(db, settings)
+    try:
         archive = await _backup(store, settings, tmp_path / "b")
     finally:
         await store.close()
@@ -205,7 +223,7 @@ async def test_every_composite_cell_is_written_and_read_back(tmp_path: Path) -> 
 
 @pytest.mark.parametrize("cell", COMPOSITE_CIPHER_CELLS, ids=_IDS)
 async def test_a_flipped_byte_in_each_composite_cell_fails_the_full_verify(
-    tmp_path: Path, cell: CipherCell
+    tmp_path: Path, _template: tuple[Path, StoreSettings], cell: CipherCell
 ) -> None:
     """One bit-flipped value per cell is FAIL, and the reason names the cell without its plaintext.
 
@@ -214,7 +232,8 @@ async def test_a_flipped_byte_in_each_composite_cell_fails_the_full_verify(
     the snapshot, so for those two the open may report the failure first; the direct test below proves
     this pass catches them on its own.
     """
-    store, db, settings = await _keyed_store(tmp_path)
+    db, settings = _copy(_template, tmp_path)
+    store = await _open(db, settings)
     try:
         _flip_one_aead_byte(db, cell)
         archive = await _backup(store, settings, tmp_path / "b")
@@ -229,46 +248,64 @@ async def test_a_flipped_byte_in_each_composite_cell_fails_the_full_verify(
     reason = res.reason or ""
     if cell.table not in ("state", "reference"):
         assert f"{cell.table}.{cell.column} rowid=" in reason, reason
-    for secret in _SECRETS:
-        assert secret not in reason, f"the FAIL reason leaked a plaintext: {reason}"
+    assert _SYNTH not in reason, f"the FAIL reason leaked a plaintext or a key: {reason}"
 
 
 @pytest.mark.parametrize("cell", COMPOSITE_CIPHER_CELLS, ids=_IDS)
-async def test_the_decrypt_pass_itself_names_each_corrupted_cell(
-    tmp_path: Path, cell: CipherCell
+def test_the_decrypt_pass_itself_names_each_corrupted_cell(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], cell: CipherCell
 ) -> None:
     """The walk alone, on the store file, with no open in front of it to catch anything first.
 
     This is what proves the declaration's AAD for ``state`` and ``reference``, whose corruption the
-    full verify's open would otherwise report before this pass ran.
+    full verify's open would otherwise report before this pass ran. The clean-file PASS it starts from
+    is the first test above.
     """
-    store, db, settings = await _keyed_store(tmp_path)
-    await store.close()
-
-    status, _, cells = dr_backup._decrypt_check(db, settings)
-    assert status == "PASS" and cells >= len(COMPOSITE_CIPHER_CELLS)
-
+    db, settings = _copy(_template, tmp_path)
     rowid = _flip_one_aead_byte(db, cell)
     status, message, _ = dr_backup._decrypt_check(db, settings)
     assert status == "FAIL", message
     assert f"{cell.table}.{cell.column} rowid={rowid} did not decrypt" in message, message
-    for secret in _SECRETS:
-        assert secret not in message, f"the FAIL reason leaked a plaintext: {message}"
+    assert _SYNTH not in message, f"the FAIL reason leaked a plaintext or a key: {message}"
 
 
-async def test_a_value_moved_between_rows_fails_its_tag(tmp_path: Path) -> None:
+def test_an_id_keyed_failure_still_names_the_row_id(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """An id-keyed cell keeps naming its synthetic ``id``, which an operator can look up, rather than
+    an internal ``rowid``. Only a composite key is withheld."""
+    db, settings = _copy(_template, tmp_path)
+    raw = next(c for c in SQLITE_CIPHER_CELLS if (c.table, c.column) == ("messages", "raw"))
+    rowid = _flip_one_aead_byte(db, raw)
+    conn = sqlite3.connect(db)
+    try:
+        (mid,) = conn.execute("SELECT id FROM messages WHERE rowid = ?", (rowid,)).fetchone()
+    finally:
+        conn.close()
+
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "FAIL", message
+    assert f"messages.raw id={mid} did not decrypt" in message, message
+
+
+async def test_a_value_moved_between_rows_fails_its_tag(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
     """The AAD is what makes this a per-cell check. Two sealed ``connection_event.reason`` values are
     individually valid; swapped between rows, each must fail, because each is bound to its own row's
     natural key. A declaration that bound nothing, or bound the wrong columns, would pass this."""
-    store, db, settings = await _keyed_store(tmp_path)
-    await store.record_connection_event(
-        connection="IB_OTHER",
-        transport="mllp",
-        direction="inbound",
-        kind="closed",
-        reason="SYNTH-CONN-REASON-2",
-    )
-    await store.close()
+    db, settings = _copy(_template, tmp_path)
+    store = await _open(db, settings)
+    try:
+        await store.record_connection_event(
+            connection="IB_OTHER",
+            transport="mllp",
+            direction="inbound",
+            kind="closed",
+            reason="SYNTH-CONN-REASON-2",
+        )
+    finally:
+        await store.close()
 
     conn = sqlite3.connect(db)
     try:

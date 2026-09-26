@@ -63,7 +63,7 @@ import re
 import pytest
 
 import messagefoundry
-from messagefoundry.store.cipher_cells import COMPOSITE_CIPHER_CELLS
+from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
 from messagefoundry.store.store import MessageStore
 
 _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"
@@ -488,26 +488,26 @@ class S:
 def test_the_readback_declaration_names_every_composite_cipher_cell() -> None:
     """The full restore-verify's cell list must be exactly the store's covered cells (BACKLOG #1719).
 
-    ``_decrypt_check`` walks ``MessageStore._CIPHER_COLUMNS`` plus ``COMPOSITE_CIPHER_CELLS``. The
-    first is the store's own tuple. The second is a declaration beside the store, and a declaration is
-    the thing that drifts, so pin it here against the same instrument the sweeps are held to: every
-    literal ``cell_aad`` cell in ``store.py``. A new composite cipher cell with no entry reds this, and
-    so does an entry naming a cell the store no longer seals.
+    ``_decrypt_check`` walks ``SQLITE_CIPHER_CELLS``: the store's own ``_CIPHER_COLUMNS`` plus a
+    declaration of the composite-key cells beside the store. A declaration is the thing that drifts, so
+    pin it here against the same instrument the sweeps are held to: every literal ``cell_aad`` cell in
+    ``store.py``. A new composite cipher cell with no entry reds this, and so does an entry naming a
+    cell the store no longer seals.
 
     Equality, not a subset: an entry with no writer would make the verify look for a column that holds
-    nothing, and pass over it without saying so. Whether each entry's AAD COLUMNS match the writer is a
-    runtime question, answered by ``tests/test_cipher_cells_readback.py``.
+    nothing, and pass over it without saying so. No duplicates either, which also rules out a cell in
+    both halves being read twice. Whether each entry's AAD COLUMNS match the writer is a runtime
+    question, answered by ``tests/test_cipher_cells_readback.py``.
     """
     covered = _covered_cells(_parsed("store.py"))
     id_keyed = set(MessageStore._CIPHER_COLUMNS)
-    declared = [(cell.table, cell.column) for cell in COMPOSITE_CIPHER_CELLS]
+    declared = [(cell.table, cell.column) for cell in SQLITE_CIPHER_CELLS]
 
     assert len(declared) == len(set(declared)), f"a cell is declared twice: {sorted(declared)}"
-    assert not id_keyed & set(declared), (
-        f"declared in both lists, so the verify reads it twice: {sorted(id_keyed & set(declared))}"
-    )
-    assert covered - id_keyed == set(declared), (
+    assert id_keyed <= set(declared), sorted(id_keyed - set(declared))
+    composite = set(declared) - id_keyed
+    assert covered - id_keyed == composite, (
         "messagefoundry/store/cipher_cells.py has drifted from store.py's cell_aad calls.\n"
-        f"  sealed by store.py, not declared: {sorted(covered - id_keyed - set(declared))}\n"
-        f"  declared, not sealed by store.py: {sorted(set(declared) - (covered - id_keyed))}"
+        f"  sealed by store.py, not declared: {sorted(covered - id_keyed - composite)}\n"
+        f"  declared, not sealed by store.py: {sorted(composite - (covered - id_keyed))}"
     )
