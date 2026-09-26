@@ -30,15 +30,24 @@ and the cleartext-hop authority) apply to a loopback-bound engine **exactly** as
 one. What follows about *binding* is what changes when you deliberately put a listener on a routable
 address.
 
-**Fail-closed rule (ADR 0002 §0):** a non-loopback **API** bind is *refused at startup* unless TLS is
-configured (or an upstream TLS terminator is trusted), and every inbound **listen** type — MLLP, HTTP,
-DICOM C-STORE SCP, raw TCP/X12 — is refused off-loopback without TLS at wiring time.
+**Fail-closed rule (ADR 0002 §0):** a non-loopback **API** bind is *refused at startup* unless you
+configure a certificate (`[api].tls_cert_file`) or trust an upstream TLS terminator, and every inbound
+**listen** type — MLLP, HTTP, DICOM C-STORE SCP, raw TCP/X12 — is refused off-loopback without TLS at
+wiring time.
 
-**The cleartext-bind escapes are clamped shut on the shipped posture** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
+**The API refusal is not about cleartext.** With no certificate configured, the engine still serves
+TLS: it mints a self-signed placeholder on first run
+([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+The placeholder has no chain of trust, so a remote client cannot authenticate the engine. That is why
+an exposed bind is refused until a real certificate is configured (BACKLOG #1672). The inbound
+listeners are different: without `tls` they really are cleartext.
+
+**The bind escapes are clamped shut on the shipped posture** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
 ADR 0092 decision 2). `serve --allow-insecure-bind` — and its config twin
 `[security].require_encryption_for_remote = false` — only warn-and-cross while the instance is **not**
-enforcing. `[security].enforcement` defaults `enforce`, so a **stock instance refuses the cleartext
-bind even with the flag**. Crossing it is a deliberate, recorded loosening: set
+enforcing. For the API, crossing means serving off-loopback on the self-signed placeholder; for an
+inbound listener, it means a cleartext bind. `[security].enforcement` defaults `enforce`, so a **stock
+instance refuses the bind even with the flag**. Crossing it is a deliberate, recorded loosening: set
 `[security].enforcement = warn`. That is now the only way — the synthetic declaration that also did it
 was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md), and it is not a supported production setting either.
 
@@ -537,10 +546,12 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
 ## Bind-guard behavior (summary)
 
 - **API** ([`__main__.py`](../messagefoundry/__main__.py)): a non-loopback bind is refused unless
-  in-process TLS is configured, or `tls_terminated_upstream` + `trusted_proxies` are set; also refused if
-  `[security].require_sign_in = false`, which no flag covers. Override (dev only):
-  `serve --allow-insecure-bind` — **clamped inert on an enforcing PHI instance**, i.e. on the shipped
-  default.
+  `[api].tls_cert_file` is configured, or `tls_terminated_upstream` + `trusted_proxies` are set; also
+  refused if `[security].require_sign_in = false`, which no flag covers. The refusal is not a cleartext
+  one: without a certificate the engine would serve TLS on its self-signed placeholder, which no remote
+  client can authenticate. Override (dev only): `serve --allow-insecure-bind`, which serves
+  off-loopback on that placeholder — **clamped inert on an enforcing PHI instance**, i.e. on the
+  shipped default.
   **This is not the whole API gate.** At least three further `return 2` refusals layer on top of that
   ladder, and **none is covered by `--allow-insecure-bind`**: an in-process-TLS off-loopback bind also needs
   `MEFOR_TLS_REVOCATION_ATTESTED=1` ([ADR 0078](adr/0078-certificate-revocation-posture.md) — see

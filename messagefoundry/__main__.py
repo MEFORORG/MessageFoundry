@@ -185,10 +185,14 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument(
         "--allow-insecure-bind",
         action="store_true",
-        help="permit a non-loopback bind address WITHOUT TLS (bearer tokens and PHI would cross the "
-        "network in cleartext); a dev override for a trusted, firewalled network. Prefer configuring "
-        "[api].tls_cert_file (+ tls_key_file) for in-process TLS, which is allowed off-loopback "
-        "without this flag. Does not relax the no-auth refuse.",
+        help="a dev override for a trusted, firewalled network, honoured only under "
+        "[security].enforcement=warn. For the API it permits a non-loopback bind with NO operator "
+        "certificate: the engine then serves TLS on its generated self-signed placeholder, which has "
+        "no chain of trust, so a remote client cannot authenticate the engine. For inbound MLLP, "
+        "HTTP, DICOM SCP, raw-TCP and X12 listeners it permits a non-loopback CLEARTEXT bind, and PHI "
+        "crosses the network unencrypted. Prefer [api].tls_cert_file (+ tls_key_file), which is "
+        "allowed off-loopback without this flag, and per-connection tls. Does not relax the no-auth "
+        "refuse or the /ui refuse.",
     )
 
     supervise = sub.add_parser(
@@ -1743,7 +1747,8 @@ def _serve(args: argparse.Namespace) -> int:
     enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
 
     # ADR 0118: [security].require_encryption_for_remote=false is the config-file twin of
-    # --allow-insecure-bind (accept cleartext for off-machine access). It rides the SAME exposed-bind
+    # --allow-insecure-bind (accept off-machine access on the API's self-signed placeholder, and on a
+    # cleartext inbound listener; BACKLOG #1672). It rides the SAME exposed-bind
     # gate + the SAME ADR 0092 production-PHI clamp below — it can never relax a production-PHI cleartext
     # bind. Fold both escapes into one flag the exposed-gate + create_managed_app read.
     insecure_bind_ok = (
@@ -2267,10 +2272,19 @@ def _serve(args: argparse.Namespace) -> int:
         env_file,
     )
     # A non-loopback API bind puts bearer tokens + PHI on the wire. The exposed-gate (ADR 0002 §0):
-    # TLS configured → the first-class secure path (allow); no TLS but --allow-insecure-bind → a loud
-    # dev override (warn); otherwise → refuse fail-closed. The auth-disabled case is refused above
-    # regardless of this flag — serving full-privilege admin to the network is never one "I accept the
-    # risk" away.
+    # an operator certificate → the first-class secure path (allow); none but --allow-insecure-bind →
+    # a loud dev override (warn); otherwise → refuse fail-closed. The auth-disabled case is refused
+    # above regardless of this flag — serving full-privilege admin to the network is never one "I
+    # accept the risk" away.
+    #
+    # BACKLOG #1672: WITHOUT AN OPERATOR CERTIFICATE THE HOP IS NOT CLEARTEXT. The unconditional
+    # ensure_api_tls_material call further down (ADR 0172) mints a self-signed pair and serves
+    # https on it, so every no-certificate arm below would still encrypt. The reason to refuse is
+    # that the placeholder has no chain of trust and authenticates the engine to no remote client.
+    # Owner ruling 2026-08-17, amendment to ruling 3 (vault docs/security/OWNER-RULINGS-2026-08-17.md):
+    # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
+    # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
+    # messages say why.
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
             # WP-13a: TLS terminates in-process, so tokens + PHI are encrypted on the wire and HSTS
@@ -2288,26 +2302,34 @@ def _serve(args: argparse.Namespace) -> int:
                 settings.api.trusted_proxies,
             )
         elif insecure_bind_ok and not enforcing:
+            # The engine goes on to serve https on the minted placeholder (ADR 0172), which
+            # tests/test_api_tls.py::test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder
+            # proves by handshaking the context uvicorn is handed. Keep this wording true to that.
             print(
                 f"warning: API bound to non-loopback host {settings.api.host!r} with "
-                "--allow-insecure-bind and NO TLS; bearer tokens and PHI cross the network in "
-                "cleartext — configure [api].tls_cert_file (+ tls_key_file) for real remote access.",
+                "--allow-insecure-bind and NO operator certificate; it serves TLS on the engine's "
+                "generated self-signed placeholder, which has no chain of trust, so a remote client "
+                "cannot authenticate the engine and an on-path attacker could present a certificate "
+                "of its own. Configure [api].tls_cert_file (+ tls_key_file) for real remote access.",
                 file=sys.stderr,
             )
         elif insecure_bind_ok:
             # #200 (ADR 0092, decision 2) + [security].enforcement: --allow-insecure-bind is CLAMPED
-            # shut while the security dial is ENFORCING — a PHI listener refuses cleartext even WITH the
-            # flag (a staging PHI instance under the default enforce refuses exactly like prod; the same
-            # decoupling as every other posture gate — set [security].enforcement=warn to accept the
-            # risk). Serving bearer tokens + PHI in the clear under strict enforcement is never one
-            # "I accept the risk" away.
+            # shut while the security dial is ENFORCING — the API refuses an off-loopback bind on the
+            # unauthenticated placeholder even WITH the flag (a staging instance under the default
+            # enforce refuses exactly like prod; the same decoupling as every other posture gate — set
+            # [security].enforcement=warn to accept the risk). Serving bearer tokens + PHI behind a
+            # certificate no client can verify, under strict enforcement, is never one "I accept the
+            # risk" away.
             print(
                 "error: refusing to serve the API on non-loopback host "
-                f"{settings.api.host!r} without TLS on a PHI instance under "
-                f"[security].enforcement=enforce ({env_name!r}) — --allow-insecure-bind cannot relax a "
-                "PHI cleartext bind under strict enforcement (#200). Configure [api].tls_cert_file for "
-                "in-process TLS, set [api].tls_terminated_upstream (+ trusted_proxies) if a proxy "
-                "terminates TLS, or set [security].enforcement=warn to accept the cleartext risk on a "
+                f"{settings.api.host!r} without an operator certificate under "
+                f"[security].enforcement=enforce ({env_name!r}). The only certificate available is "
+                "the engine's generated self-signed placeholder, which has no chain of trust, so a "
+                "remote client cannot authenticate the engine; --allow-insecure-bind cannot relax "
+                "that under strict enforcement (#200). Configure [api].tls_cert_file for in-process "
+                "TLS, set [api].tls_terminated_upstream (+ trusted_proxies) if a proxy terminates "
+                "TLS, or set [security].enforcement=warn to accept serving on the placeholder on a "
                 "trusted, firewalled network.",
                 file=sys.stderr,
             )
@@ -2315,10 +2337,13 @@ def _serve(args: argparse.Namespace) -> int:
         else:
             print(
                 "error: refusing to serve the API on non-loopback host "
-                f"{settings.api.host!r} without TLS; bearer tokens and PHI would cross the network in "
-                "cleartext. Configure [api].tls_cert_file for in-process TLS, set "
-                "[api].tls_terminated_upstream (+ trusted_proxies) if a proxy terminates TLS, or pass "
-                "--allow-insecure-bind to accept the cleartext risk on a trusted, firewalled network.",
+                f"{settings.api.host!r} without an operator certificate. The only certificate "
+                "available is the engine's generated self-signed placeholder, which has no chain of "
+                "trust, so a remote client cannot authenticate the engine. Configure "
+                "[api].tls_cert_file for in-process TLS, set [api].tls_terminated_upstream "
+                "(+ trusted_proxies) if a proxy terminates TLS, or, under "
+                "[security].enforcement=warn, pass --allow-insecure-bind to accept serving on the "
+                "placeholder on a trusted, firewalled network.",
                 file=sys.stderr,
             )
             return 2

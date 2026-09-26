@@ -823,8 +823,9 @@ def test_serve_custom_env_with_posture_starts(
 def test_serve_refuses_non_loopback_bind_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Auth is enabled by default, so this exercises the cleartext-bind refuse, not the no-auth gate:
-    # Phase 1 has no API TLS, so a non-loopback bind must fail closed unless the operator opts in.
+    # Auth is enabled by default, so this exercises the exposed-bind refuse, not the no-auth gate:
+    # with no operator certificate the only one available is the self-signed placeholder, so a
+    # non-loopback bind must fail closed unless the operator opts in (BACKLOG #1672).
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet and only the bind gate decides.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
@@ -836,7 +837,10 @@ def test_serve_refuses_non_loopback_bind_by_default(
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
-    assert "refusing to serve the API on non-loopback" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "refusing to serve the API on non-loopback" in err
+    # BACKLOG #1672: the hop would be TLS on the minted pair, so the refusal must not call it cleartext.
+    assert "self-signed placeholder" in err and "cleartext" not in err
 
 
 def test_serve_allows_non_loopback_bind_with_flag(
@@ -864,7 +868,9 @@ def test_serve_allows_non_loopback_bind_with_flag(
         == 0
     )
     err = capsys.readouterr().err
-    assert "--allow-insecure-bind" in err and "cleartext" in err  # warned, but served
+    # Warned, but served -- on the minted placeholder, which test_api_tls.py's
+    # test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder proves by handshake.
+    assert "--allow-insecure-bind" in err and "self-signed placeholder" in err
 
 
 def test_serve_loopback_bind_needs_no_flag(
@@ -1011,7 +1017,7 @@ def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
         == 2
     )
     err = capsys.readouterr().err
-    assert "enforcement=enforce" in err and "cannot relax a PHI cleartext bind" in err
+    assert "enforcement=enforce" in err and "--allow-insecure-bind cannot relax" in err
     # enforcement=warn reproduces the historical non-production dial: the same bind warns + serves.
     (tmp_path / "messagefoundry.toml").write_text(
         base + 'security.enforcement = "warn"\n', encoding="utf-8"

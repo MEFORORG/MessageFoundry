@@ -301,6 +301,71 @@ def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(
     assert (tmp_path / "api-generated-key.pem").exists()
 
 
+def test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1672: the warn-plus-flag off-loopback arm serves HTTPS, so its warning must say so.
+
+    The warning used to read "NO TLS ... cleartext" while the engine went on to serve https on the
+    minted pair (ADR 0172). The new wording makes two claims, and this test proves each against
+    the context uvicorn is actually handed, not against the message:
+
+    1. it serves TLS on the generated placeholder -- a client that pins the minted certificate
+       completes a real handshake with the factory's context;
+    2. the placeholder has no chain of trust -- a client on the stock trust store refuses it.
+
+    Arm 2 is also the control for arm 1: a harness that admitted every client would pass arm 1
+    and fail here.
+    """
+    import uvicorn
+
+    from messagefoundry.store.crypto import generate_key
+
+    captured: dict[str, Any] = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
+    # The flag is clamped inert under the default enforce (#200), so the dial is turned down here.
+    (tmp_path / "messagefoundry.toml").write_text(
+        'security.enforcement = "warn"\n'
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n',
+        encoding="utf-8",
+    )
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "dev"]
+    assert main(argv) == 0
+
+    warnings = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        # Another exposure advisory shares the "API bound to" prefix; the flag names this one.
+        if line.startswith("warning: API bound to non-loopback host")
+        and "--allow-insecure-bind" in line
+    ]
+    assert len(warnings) == 1, warnings
+    assert "self-signed placeholder" in warnings[0]
+    assert "cleartext" not in warnings[0].lower() and "NO TLS" not in warnings[0]
+
+    # uvicorn is handed a TLS context factory under the kwarg it reads, so the socket speaks https.
+    assert uvicorn.Config(app=object(), **captured).is_ssl
+    server = captured["ssl_context_factory"](None, None)
+    assert isinstance(server, ssl.SSLContext)
+
+    minted = tmp_path / _GENERATED_CERT_NAME
+    assert minted.exists()
+    pinned = ssl.create_default_context(cafile=str(minted))
+    pinned.minimum_version = ssl.TLSVersion.TLSv1_2  # pinned floor -- see _verifying_client_ctx
+    assert _handshake(server, pinned, client_cert=None, server_hostname="0.0.0.0")  # claim 1
+
+    stock = ssl.create_default_context()
+    stock.minimum_version = ssl.TLSVersion.TLSv1_2
+    with pytest.raises(ssl.SSLError, match="self.signed|unable to get local issuer"):  # claim 2
+        _handshake(server, stock, client_cert=None, server_hostname="0.0.0.0")
+
+
 # --- WP-15: reverse-proxy / upstream TLS termination -------------------------
 
 
