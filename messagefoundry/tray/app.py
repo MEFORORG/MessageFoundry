@@ -128,7 +128,12 @@ class TrayApp:
             self._shell.request_quit()
 
     def _open_console(self) -> None:
-        actions.open_console(self._config.engine_url)
+        try:
+            actions.open_console(self._config.engine_url)
+        except actions.ConsoleUrlRefused as exc:
+            # Fixed text: it never echoes the URL, which could carry a secret (BACKLOG #1993).
+            log.warning("Open Console refused: %s", exc)
+            self._shell.request_notify("MessageFoundry", f"Open Console refused: {exc}")
 
     def _open_repo(self) -> None:
         if self._config.repo_path and self._vscode:
