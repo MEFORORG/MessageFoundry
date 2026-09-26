@@ -131,6 +131,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   socket, so frames already sent behind the failed one are still handled. The message is still
   not accepted, and the sender resends it. The NAK has no message row, so it is not in the ACK
   capture stream. ([BACKLOG #1619](docs/BACKLOG.md))
+- **`db_lookup` now refuses a result larger than the lookup's `max_rows`, and stops reading at the
+  ceiling.** It used to call `fetchall`, so a Handler's statement with a broad predicate held its whole
+  result set in the transform worker. `DatabaseLookup(...)` takes `max_rows`, default `500`. The
+  executor asks the driver for at most `max_rows + 1` rows. A larger result raises `DbLookupError`, and
+  the message goes to `ERROR`; the Handler never sees a truncated result. `max_rows=0` removes the
+  ceiling. ([BACKLOG #1730](docs/BACKLOG.md))
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
   `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other

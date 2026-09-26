@@ -669,6 +669,7 @@ def DatabaseLookup(
     connect_timeout: int = 15,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
+    max_rows: int = 500,  # refuse a result larger than this; 0 = no ceiling (BACKLOG #1730)
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
 ) -> None:
@@ -676,6 +677,11 @@ def DatabaseLookup(
     Driver 18 — **production / supported**, like the DATABASE connector). A Handler queries it at run time with
     ``db_lookup(name, statement, params)`` (a ``SELECT``/``WITH`` read; ``EXEC`` is refused); the rows
     come back as ``{column: value}`` dicts. Side-effecting, like :func:`Reference`/:func:`inbound`.
+
+    ``max_rows`` mirrors transports.database.DEFAULT_DB_LOOKUP_MAX_ROWS (500) and **ships on**. A call
+    whose statement selects more rows than this raises ``DbLookupError`` and the message goes to
+    ``ERROR``; the result is never truncated. The ceiling is charged at the fetch, so an over-broad
+    statement does not buffer its whole result in the transform worker first. ``0`` removes it.
 
     Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
     ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
@@ -699,6 +705,7 @@ def DatabaseLookup(
                 "connect_timeout": connect_timeout,
                 "app_name": app_name,
                 "odbc_driver": odbc_driver,
+                "max_rows": max_rows,
                 "pool_max": pool_max,
                 "acquire_timeout": acquire_timeout,
             },
