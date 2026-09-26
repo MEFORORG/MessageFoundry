@@ -7,6 +7,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A DAST pass now sends hostile bytes to live MLLP, raw-TCP and X12 listeners and checks the
+  engine's ingress rules.** `scripts/security/dast_ingress_sweep.py` runs a real engine on loopback.
+  It sends broken framing, hostile HL7 and seeded mutations. Six detectors check each case: one reply
+  per decoded MLLP frame, one row per decoded frame, a listener that stays up, bounded time, bounded
+  heap, handle and task growth, and no message content logged at INFO or above. Each detector has a
+  canary that must trip it. The seeded run and the canaries run in the existing required test legs.
+  A new advisory `dast-ingress` job in `dast.yml` adds a nightly randomized budget. The first run
+  found three engine defects, each pinned by a strict xfail and not fixed here. A blank segment faults
+  the inbound handler. An alphanumeric MSH-1 gets an ACK whose MSA-1 cannot be read.
+  The raw-TCP and X12 listeners have no frame deadline. See ADR 0155's 2026-09-26 amendment.
+  (`BACKLOG #318`)
 - **Dual control now flags a release whose approver account is new or was just taken over, and an
   Administrator grant pages.** One Administrator can create or take over a second approver account,
   so dual control cannot prove two people agreed; `docs/SECURITY.md` now says so, and ADR 0041's
