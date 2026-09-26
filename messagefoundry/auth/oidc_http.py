@@ -110,6 +110,15 @@ def build_idp_opener(
     warns about. A revoked IdP certificate matters more here than on a data hop: this is the leg that
     carries the client secret, the authorization code and the identity assertion, so accepting a
     revoked-but-unexpired IdP cert would be an authentication-material exposure.
+
+    **One CRL file serves both legs, and a CRL that misses one leg's issuer fails that leg CLOSED
+    (BACKLOG #1925).** The revocation guard reads ``VERIFY_CRL_CHECK_LEAF`` off this one context, so
+    a CRL from the token leg's CA alone marks the JWKS leg checked too. That does not let the JWKS leg
+    cross unchecked: OpenSSL refuses a leaf whose issuer has no CRL in the store, with ``unable to get
+    certificate CRL``. Measured on CPython 3.14.6 / OpenSSL 3.5.7, and pinned by
+    ``tests/test_hop_refusal_revocation.py::test_a_crl_that_misses_one_legs_issuer_fails_that_leg_closed``.
+    The cost is availability: the gap shows at the first login on that leg, not at start. So
+    ``crl_file`` must hold a CRL from the CA of each leg.
     """
     # Both branches are plain stdlib contexts: no shared mutable verification state, so this opener is
     # safe to share across the asyncio.to_thread workers that drive the two IdP legs. See the module

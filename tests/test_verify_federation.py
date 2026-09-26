@@ -468,6 +468,8 @@ def test_a_loaded_crl_passes(bare_crl: str) -> None:  # noqa: F811 -- the import
     row = _revocation_result(_settings(oidc_tls_crl_file=bare_crl))
     assert row.status is Status.PASS
     assert row.detail.count("against [auth].oidc_tls_crl_file") == 2
+    # BACKLOG #1925: a PASS on a loaded CRL must not read as "each leg's CA is covered".
+    assert row.detail.count("unable to get certificate CRL") == 2
 
 
 def test_a_warn_posture_is_manual_and_logs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:

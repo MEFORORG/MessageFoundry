@@ -392,7 +392,13 @@ def _revocation_row(
                     "because [security].enforcement is not enforce. Set [auth].oidc_tls_crl_file"
                 )
             elif guard.crl_checked:
-                note = "checks the leaf certificate against [auth].oidc_tls_crl_file"
+                # BACKLOG #1925: the flag says a CRL loaded, not that it covers this leg's CA. A
+                # leg it does not cover is refused at the handshake, never waved through.
+                note = (
+                    "checks the leaf certificate against [auth].oidc_tls_crl_file (confirm the "
+                    "file holds a CRL from this leg's CA: without one, every handshake on it "
+                    "fails with 'unable to get certificate CRL')"
+                )
             elif is_loopback_hop_host(guard.host):
                 note = (
                     "is on this host, so it crosses with no revocation check, as the engine allows"

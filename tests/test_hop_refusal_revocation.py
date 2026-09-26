@@ -25,13 +25,19 @@ hop — the two gates key on disjoint conditions and never double-refuse one hop
 
 from __future__ import annotations
 
+import datetime
 import ssl
 from pathlib import Path
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from fastapi import FastAPI
 
 from messagefoundry.api import create_managed_app
+from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.settings import AiSettings, AuthSettings, StoreBackend, StoreSettings
@@ -1342,3 +1348,167 @@ async def test_the_oidc_refusal_names_a_lever_that_exists_for_it() -> None:
         await _oidc_service()
     assert "[auth].oidc_tls_crl_file" in str(exc.value)
     assert "tls_revocation_attested" not in str(exc.value)
+
+
+# --- BACKLOG #1925: one CRL on the shared context, two legs whose CAs differ ----------------------
+#
+# Both OIDC legs share ONE context, and each guard reads VERIFY_CRL_CHECK_LEAF off it. That flag says
+# a CRL loaded, not that the CRL covers each leg's issuer, so a CRL from one CA marks both legs
+# checked. The item asked whether that lets the other leg cross unchecked. Measured here through a
+# real handshake on the context build_idp_opener returns: it does not. OpenSSL refuses a leaf whose
+# issuer has no CRL in the store ("unable to get certificate CRL"), so the uncovered leg fails closed
+# at its first handshake instead of crossing. The cost is availability, found at first login rather
+# than at start, and not a revocation bypass. These arms pin the OpenSSL behaviour the guard's
+# presence test relies on.
+
+
+def _crl_coverage_ca(cn: str) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
+    """A throwaway CA. Synthetic."""
+    now = datetime.datetime.now(datetime.UTC)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(False, False, False, False, False, True, True, False, False),
+            critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    return key, cert
+
+
+def _crl_coverage_server(
+    issuer_key: ec.EllipticCurvePrivateKey, issuer: x509.Certificate, host: str, directory: Path
+) -> ssl.SSLContext:
+    """A server context presenting a leaf for ``host`` issued by the given CA. Synthetic."""
+    now = datetime.datetime.now(datetime.UTC)
+    key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
+        .issuer_name(issuer.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=10))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+            critical=False,
+        )
+        .sign(issuer_key, hashes.SHA256())
+    )
+    cert_path, key_path = directory / f"{host}.crt", directory / f"{host}.key"
+    cert_path.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server.load_cert_chain(cert_path, key_path)
+    return server
+
+
+def _handshake(client: ssl.SSLContext, server: ssl.SSLContext, host: str) -> str:
+    """Drive one in-memory handshake. Returns ``"accepted"`` or the client's verify message."""
+    c_in, c_out, s_in, s_out = (ssl.MemoryBIO() for _ in range(4))
+    c = client.wrap_bio(c_in, c_out, server_hostname=host)
+    s = server.wrap_bio(s_in, s_out, server_side=True)
+    for _ in range(10):
+        for side in (c, s):
+            try:
+                side.do_handshake()
+            except ssl.SSLWantReadError:
+                pass
+            except ssl.SSLCertVerificationError as exc:
+                return str(exc.verify_message)
+            except ssl.SSLError:
+                pass  # the server's view of a client refusal; the client's is the one reported
+        s_in.write(c_out.read())
+        c_in.write(s_out.read())
+        try:
+            c.do_handshake()
+        except ssl.SSLWantReadError:
+            continue
+        except ssl.SSLCertVerificationError as exc:
+            return str(exc.verify_message)
+        return "accepted"
+    return "incomplete"
+
+
+def test_a_crl_that_misses_one_legs_issuer_fails_that_leg_closed(tmp_path: Path) -> None:
+    """The token leg's CA publishes the only CRL; the JWKS leg's CA publishes none. The guard reads
+    one flag for both, so both cross the guard. The JWKS handshake must then REFUSE, not accept."""
+    token_ca_key, token_ca = _crl_coverage_ca("mefor-1925-token-ca")
+    jwks_ca_key, jwks_ca = _crl_coverage_ca("mefor-1925-jwks-ca")
+    now = datetime.datetime.now(datetime.UTC)
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(token_ca.subject)
+        .last_update(now - datetime.timedelta(hours=1))
+        .next_update(now + datetime.timedelta(days=7))
+        .sign(token_ca_key, hashes.SHA256())
+    )
+    anchor = tmp_path / "both_cas.pem"
+    anchor.write_bytes(
+        token_ca.public_bytes(serialization.Encoding.PEM)
+        + jwks_ca.public_bytes(serialization.Encoding.PEM)
+    )
+    crl_path = tmp_path / "token_ca.crl.pem"
+    crl_path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+
+    opener = build_idp_opener(str(anchor), enforcing=False, crl_file=str(crl_path))
+    ctx = opener_tls_context(opener, connector="test")
+    assert ctx is not None
+    # The premise: one flag, set by a CRL from the token leg's CA alone, answers for both legs.
+    assert context_checks_revocation(ctx) is True
+
+    token = _crl_coverage_server(token_ca_key, token_ca, "token.idp.test", tmp_path)
+    jwks = _crl_coverage_server(jwks_ca_key, jwks_ca, "jwks.idp.test", tmp_path)
+    # CONTROL: the covered leg completes, so the refusal below is about coverage, not the harness.
+    assert _handshake(ctx, token, "token.idp.test") == "accepted"
+    # THE ARM: the uncovered leg is refused, not waved through unchecked.
+    assert _handshake(ctx, jwks, "jwks.idp.test") == "unable to get certificate CRL"
+
+
+def test_a_revoked_leaf_on_the_covered_leg_is_refused(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the arm above: the loaded CRL really is consulted. Without it, a
+    refusal on the uncovered leg could come from a context that refuses everything."""
+    ca_key, ca = _crl_coverage_ca("mefor-1925-revoking-ca")
+    server = _crl_coverage_server(ca_key, ca, "token.idp.test", tmp_path)
+    served = x509.load_pem_x509_certificate((tmp_path / "token.idp.test.crt").read_bytes())
+    now = datetime.datetime.now(datetime.UTC)
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.subject)
+        .last_update(now - datetime.timedelta(hours=1))
+        .next_update(now + datetime.timedelta(days=7))
+        .add_revoked_certificate(
+            x509.RevokedCertificateBuilder()
+            .serial_number(served.serial_number)
+            .revocation_date(now - datetime.timedelta(hours=2))
+            .build()
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    anchor = tmp_path / "ca.pem"
+    anchor.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    crl_path = tmp_path / "ca.crl.pem"
+    crl_path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+
+    opener = build_idp_opener(str(anchor), enforcing=False, crl_file=str(crl_path))
+    ctx = opener_tls_context(opener, connector="test")
+    assert ctx is not None
+    assert _handshake(ctx, server, "token.idp.test") == "certificate revoked"
