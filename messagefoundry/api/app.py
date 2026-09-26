@@ -4325,10 +4325,13 @@ def create_app(
             # The message exists (checked above) but has no re-queueable outbox rows — it errored,
             # was filtered, or routed nowhere. Replaying is a no-op there; say so rather than report
             # a misleading 200/requeued=0 (and the store leaves its disposition intact — review M-2).
+            # A message whose only Sends went into a pass-through inbound lands here too: its
+            # completion markers are never replayed (BACKLOG #1580), so name that case as well.
             raise HTTPException(
                 409,
                 f"message {message_id} has no deliveries to replay "
-                "(it errored, was filtered, or routed nowhere)",
+                "(it errored, was filtered, routed nowhere, or its only sends went into a"
+                " pass-through inbound, which replay never retransmits)",
             )
         # An actual re-transmission of PHI: record who did it in the tamper-evident chain (review M-4).
         await engine.store.record_audit(
