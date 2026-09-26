@@ -3873,8 +3873,6 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> N
     derived store-hop posture serve's lifespan opens it with. A failure to open propagates, as it
     would in serve: the WARNING the renewal logged, with both fingerprints, is then its record.
     """
-    import asyncio
-
     from messagefoundry.api.tls import (
         GeneratedPairReplaced,
         ensure_api_tls_material,
@@ -3883,6 +3881,7 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> N
     )
     from messagefoundry.config.anchor import resolve_project_root
     from messagefoundry.config.settings import hop_posture_from_ai
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store import open_store
 
     store_path = Path(db_base)
@@ -3913,7 +3912,7 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> N
         finally:
             await store.close()
 
-    asyncio.run(_audit())
+    run_guarded(_audit())
 
 
 def _supervise(args: argparse.Namespace) -> int:
