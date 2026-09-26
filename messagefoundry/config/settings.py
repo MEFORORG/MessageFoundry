@@ -248,6 +248,23 @@ def refuse_a_blank_anchor_pin(value: str | None, setting: str) -> str | None:
     return value
 
 
+def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
+    """Refuse a CRL path that names no file, at load, naming ``setting`` (BACKLOG #1997).
+
+    ``harden_crl_check`` would catch it when the hop's context is built, but its refusals hard-code
+    the prefix ``[tls] crl file`` for every call site, so a bad path on any other CRL knob would be
+    reported against the wrong config section. A path, not a secret.
+
+    A blank value is refused too, as ``refuse_a_blank_anchor_pin`` refuses a blank pin. ``None`` is
+    the only spelling of "no CRL": some consumers test ``is not None`` and would hand ``""`` to
+    ``harden_crl_check``, while others test truthiness and would silently read it as unset."""
+    if value is not None and not value.strip():
+        raise ValueError(f"{setting} is set but empty. Remove it for no CRL, or name a CRL file")
+    if value is not None and not Path(value).is_file():
+        raise ValueError(f"{setting} path does not exist or is not a file: {value!r}")
+    return value
+
+
 class _Section(BaseModel):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
     # (_reject_unknown_file_keys). A model-level extra="forbid" would refuse the engine's OWN writes:
@@ -834,17 +851,8 @@ class StoreSettings(_Section):
     @field_validator("ssl_crl_file")
     @classmethod
     def _ssl_crl_file_exists(cls, value: str | None) -> str | None:
-        """Fail loud at load if the CRL path is missing, the ``_ssl_root_cert_exists`` shape (#299).
-
-        ``harden_crl_check`` would catch it at store open, but its three refusals hard-code the
-        prefix ``[tls] crl file`` for every call site, so a bad ``[store].ssl_crl_file`` would be
-        reported against the wrong config section. Statting it here names the setting the operator
-        actually set. A path, not a secret."""
-        if value and not Path(value).is_file():
-            raise ValueError(
-                f"[store].ssl_crl_file path does not exist or is not a file: {value!r}"
-            )
-        return value
+        """Fail loud at load if the CRL path is missing or blank (#299); why is on the helper."""
+        return _refuse_a_missing_crl_file(value, "[store].ssl_crl_file")
 
     @model_validator(mode="after")
     def _ssl_crl_file_reachable(self) -> StoreSettings:
@@ -1141,6 +1149,11 @@ class ApiSettings(_Section):
     def _refuse_a_blank_client_ca_pin(cls, v: str | None) -> str | None:
         return refuse_a_blank_anchor_pin(v, "[api].tls_client_ca_pin")
 
+    @field_validator("tls_client_crl_file")
+    @classmethod
+    def _tls_client_crl_file_exists(cls, v: str | None) -> str | None:
+        return _refuse_a_missing_crl_file(v, "[api].tls_client_crl_file")
+
     @field_validator("tls_min_version")
     @classmethod
     def _check_tls_min_version(cls, v: str) -> str:
@@ -1252,6 +1265,13 @@ class TlsSettings(_Section):
     # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
     # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
     crl_file: str | None = None
+
+    @field_validator("crl_file")
+    @classmethod
+    def _crl_file_exists(cls, v: str | None) -> str | None:
+        # Only the first hop to resolve a trust anchor would otherwise stat this path, so a typo
+        # would surface at that hop's construction rather than at load.
+        return _refuse_a_missing_crl_file(v, "[tls].crl_file")
 
     @model_validator(mode="after")
     def _check_pinned_requires_internal_ca(self) -> TlsSettings:
@@ -1883,6 +1903,11 @@ class LoggingSettings(_Section):
         if not 1 <= value <= 65535:
             raise ValueError("[logging].forward_port must be between 1 and 65535")
         return value
+
+    @field_validator("forward_tls_crl_file")
+    @classmethod
+    def _forward_tls_crl_file_exists(cls, value: str | None) -> str | None:
+        return _refuse_a_missing_crl_file(value, "[logging].forward_tls_crl_file")
 
     @field_validator("time_sync_max_skew_seconds")
     @classmethod
@@ -2548,6 +2573,11 @@ class AuthSettings(_Section):
     @classmethod
     def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
         return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
+
+    @field_validator("oidc_tls_crl_file")
+    @classmethod
+    def _oidc_tls_crl_file_exists(cls, v: str | None) -> str | None:
+        return _refuse_a_missing_crl_file(v, "[auth].oidc_tls_crl_file")
 
     @field_validator("kerberos_spn")
     @classmethod
