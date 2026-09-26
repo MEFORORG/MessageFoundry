@@ -2599,8 +2599,8 @@ def slow(*args, **kwargs):
     return pair
 pki.make_self_signed = slow
 
-state, go = Path(sys.argv[1]), Path(sys.argv[2])
-print("ready", flush=True)
+state, go, ready = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+ready.touch()
 deadline = time.monotonic() + 60
 while not go.exists():
     if time.monotonic() > deadline:
@@ -2608,6 +2608,16 @@ while not go.exists():
     time.sleep(0.01)
 print(ensure_api_tls_material(ApiSettings(), state_dir=state), flush=True)
 """
+
+
+def _wait_until_ready(children: list[subprocess.Popen[str]], readies: list[Path]) -> None:
+    """Wait, with a deadline, for every child to touch its ready file; fail fast if one dies."""
+    deadline = time.monotonic() + 120
+    while not all(ready.exists() for ready in readies):
+        dead = [child.communicate()[1] for child in children if child.poll() is not None]
+        assert dead == [], dead
+        assert time.monotonic() < deadline, "a child never became ready"
+        time.sleep(0.05)
 
 
 def test_concurrent_first_starts_in_separate_processes_share_one_pair(tmp_path: Path) -> None:
@@ -2618,19 +2628,18 @@ def test_concurrent_first_starts_in_separate_processes_share_one_pair(tmp_path: 
     single instant rather than staggered by import time."""
     state = tmp_path / "state"
     go = tmp_path / "go"
+    readies = [tmp_path / f"ready-{n}" for n in range(4)]
     children = [
         subprocess.Popen(  # nosec B603 -- our own interpreter and a literal script
-            [sys.executable, "-c", _SHARD_START, str(state), str(go)],
+            [sys.executable, "-c", _SHARD_START, str(state), str(go), str(ready)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        for _ in range(4)
+        for ready in readies
     ]
     try:
-        for child in children:
-            assert child.stdout is not None
-            assert child.stdout.readline().strip() == "ready"
+        _wait_until_ready(children, readies)
         go.touch()
         outcomes = [child.communicate(timeout=120) for child in children]
     finally:
@@ -2652,14 +2661,28 @@ def test_a_start_arriving_mid_mint_waits_instead_of_discarding_the_key_being_wri
 
     Before the lock, B read A's lone key as crash debris, deleted it, and minted a full pair of its
     own; A then wrote its cert over B's. Both calls returned success and the pair on disk failed to
-    load with KEY_VALUES_MISMATCH -- and the reuse branch never checked, so every later start failed.
+    load with KEY_VALUES_MISMATCH -- and the reuse branch never checked, so every later start
+    failed.
 
     Mutation: drop the lock. Red: the final pair will not load, and B was not waiting."""
     import messagefoundry.__main__ as cli
+    from messagefoundry.api import tls as tls_mod
 
     real_write = cli._write_private_key
     key_written = threading.Event()
     release = threading.Event()
+    refused = threading.Event()
+    real_try_lock = getattr(tls_mod, "_try_lock", None)
+
+    def observed_try_lock(fd: int) -> bool:
+        assert real_try_lock is not None
+        taken: bool = real_try_lock(fd)
+        if not taken:
+            refused.set()  # someone asked for the lock while another start held it
+        return taken
+
+    # raising=False so the parent commit, which has no lock, still runs to the real defect below.
+    monkeypatch.setattr(tls_mod, "_try_lock", observed_try_lock, raising=False)
 
     def paused_write(path: Path, pem: bytes) -> None:
         real_write(path, pem)
@@ -2682,8 +2705,9 @@ def test_a_start_arriving_mid_mint_waits_instead_of_discarding_the_key_being_wri
     assert key_written.wait(30)
     second = threading.Thread(target=start, args=("b",))
     second.start()
-    second.join(timeout=1.0)
-    waiting = second.is_alive()  # read BEFORE the release, or the answer is always False
+    # B must be REFUSED the lock A holds. An event, not `is_alive()`, because a thread a loaded
+    # runner has not yet scheduled is also alive, and that would pass with no lock at all.
+    waiting = refused.wait(timeout=10)
     release.set()
     first.join(timeout=30)
     second.join(timeout=30)
@@ -2813,15 +2837,72 @@ def test_a_hung_mint_holder_times_out_with_a_named_lock_and_mints_nothing(
     assert not (tmp_path / tls_mod._GENERATED_KEY_NAME).exists()
 
 
-def test_a_lock_file_left_by_a_dead_holder_does_not_block_the_next_start(tmp_path: Path) -> None:
+_HOLD_THE_LOCK = """
+import sys, time
+from pathlib import Path
+from messagefoundry.api.tls import _generated_pair_lock
+
+state, ready = Path(sys.argv[1]), Path(sys.argv[2])
+with _generated_pair_lock(state):
+    ready.touch()
+    time.sleep(300)
+"""
+
+
+def test_a_killed_lock_holder_does_not_block_the_next_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Why an OS lock and not an O_EXCL lock file: a SIGKILL or a power loss leaves the FILE, and
-    the kernel has already released the LOCK. A leftover file must cost nothing."""
+    the kernel releases the LOCK with the process. So a holder that dies mid-mint costs nothing.
+
+    CONTROL first: while the holder lives, a start really is refused, or the second half proves
+    nothing about a lock at all."""
     from messagefoundry.api import tls as tls_mod
 
-    (tmp_path / tls_mod._GENERATED_LOCK_NAME).write_bytes(b"")
+    ready = tmp_path / "ready"
+    holder = subprocess.Popen(  # nosec B603 -- our own interpreter and a literal script
+        [sys.executable, "-c", _HOLD_THE_LOCK, str(tmp_path), str(ready)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_until_ready([holder], [ready])
+        monkeypatch.setattr(tls_mod, "_MINT_LOCK_TIMEOUT_S", 0.3)
+        with pytest.raises(TimeoutError):
+            ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
+    finally:
+        holder.kill()
+        holder.communicate(timeout=60)
+
+    assert (tmp_path / tls_mod._GENERATED_LOCK_NAME).exists()  # the file outlives its holder
+    monkeypatch.setattr(tls_mod, "_MINT_LOCK_TIMEOUT_S", 30.0)
     material = ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
     assert material is not None
     _load_pair(*material)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a sharing violation is Windows behaviour")
+def test_a_cert_held_open_elsewhere_is_waited_out_during_recovery(tmp_path: Path) -> None:
+    """On Windows another process holding the certificate open (the tray pinning it, a backup, an
+    antivirus scan) refuses its deletion. Recovery must ride out that brief hold, not crash on it.
+
+    Mutation: make `_unlink_generated` a bare `path.unlink()`. Red: PermissionError [WinError 32]."""
+    api = ApiSettings()
+    material = ensure_api_tls_material(api, state_dir=tmp_path)
+    assert material is not None
+    cert, key = material
+    Path(cert).write_bytes(b"")  # unusable, so the next start must replace it
+    # Python opens without delete sharing, as a reader would. The timer closes it mid-recovery.
+    with Path(cert).open("rb") as handle:
+        closer = threading.Timer(0.5, handle.close)
+        closer.start()
+        try:
+            again = ensure_api_tls_material(api, state_dir=tmp_path)
+        finally:
+            closer.cancel()
+    assert again == (cert, key)
+    _load_pair(cert, key)
 
 
 def test_the_minted_pair_builds_a_serving_context(tmp_path: Path) -> None:

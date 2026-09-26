@@ -210,8 +210,10 @@ def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
 
     Called only under :func:`_generated_pair_lock`, once the reuse branch has established that BOTH
     files are not present, so at most one of these exists. The lock is what makes "a lone half" mean
-    DEBRIS: without it, a lone key could be another process's mint in progress (BACKLOG #1276). A half-pair is unusable -- reuse needs both -- and the key half is also a
-    TRAP: the mint falls through, :func:`_write_private_key`'s ``O_EXCL`` refuses the surviving key,
+    DEBRIS: without it, a lone key could be another process's mint in progress (BACKLOG #1276).
+
+    A half-pair is unusable -- reuse needs both -- and the key half is also a TRAP: the mint falls
+    through, :func:`_write_private_key`'s ``O_EXCL`` refuses the surviving key,
     and the engine fails to start. On EVERY start, permanently, naming no file to delete. ADR 0172
     makes the generated pair the default first-run path, so that is a fresh deployment that never
     comes up rather than an edge case.
@@ -236,7 +238,32 @@ def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
             "unusable and would refuse every later start. Re-minting both.",
             orphan,
         )
-        orphan.unlink()
+        _unlink_generated(orphan)
+
+
+#: Windows ERROR_SHARING_VIOLATION: another process holds the file open without delete sharing.
+_WINERROR_SHARING_VIOLATION = 32
+_UNLINK_RETRY_S = 2.0
+
+
+def _unlink_generated(path: Path) -> None:
+    """Delete one generated file, riding out a brief Windows sharing violation.
+
+    On Windows a file another process holds open cannot be deleted, and a certificate is exactly the
+    file other processes open: the tray pins it, and backup or antivirus may scan it. That hold is
+    momentary, so a refusal is retried for :data:`_UNLINK_RETRY_S` before it propagates. Any other
+    error, and every error off Windows, propagates at once.
+    """
+    deadline = time.monotonic() + _UNLINK_RETRY_S
+    while True:
+        try:
+            path.unlink()
+            return
+        except PermissionError as exc:
+            shared = getattr(exc, "winerror", None) == _WINERROR_SHARING_VIOLATION
+            if not shared or time.monotonic() >= deadline:
+                raise
+        time.sleep(_MINT_LOCK_POLL_S)
 
 
 def _why_generated_pair_is_unusable(cert_path: Path, key_path: Path) -> str | None:
@@ -266,8 +293,8 @@ def _discard_unusable_pair(cert_path: Path, key_path: Path, reason: str) -> None
 
     Reached only under :func:`_generated_pair_lock`, with both files present and
     :func:`_why_generated_pair_is_unusable` naming a content refusal. **This is not a rotation.** A
-    pair that loads is never replaced; this one cannot serve, and reusing it failed every start until
-    someone deleted it by hand. The mismatched shape is exactly what two processes minting into one
+    pair that loads is never replaced; this one cannot serve, and reusing it failed every start
+    until someone deleted it by hand. The mismatched shape is exactly what two processes minting into one
     state dir used to leave (BACKLOG #1276), and a disk fault can leave the others.
 
     Logged at WARNING, per ADR 0172 decision 6: replacing a key on disk is never silent. The reason
@@ -280,8 +307,10 @@ def _discard_unusable_pair(cert_path: Path, key_path: Path, reason: str) -> None
         key_path,
         reason,
     )
-    cert_path.unlink()
-    key_path.unlink()
+    # Cert first. Should the key's unlink still fail, a lone key is left, which the next start
+    # discards as a half-pair, so no ordering leaves anything a later start cannot recover.
+    _unlink_generated(cert_path)
+    _unlink_generated(key_path)
 
 
 def _try_lock(fd: int) -> bool:
@@ -330,8 +359,8 @@ def _unlock(fd: int) -> None:
 def _generated_pair_lock(state_dir: Path) -> Iterator[None]:
     """Hold the ONE-WRITER lock for the generated pair in ``state_dir``, waiting a bounded time.
 
-    **Why the pair needs one.** ``serve --shards`` starts N engine processes that all derive the same
-    state dir, so on a first run they all find no pair at once. Unserialised, one process won the
+    **Why the pair needs one.** ``serve --shards`` starts N engine processes that all derive the
+    same state dir, so on a first run they all find no pair at once. Unserialised, one process won the
     key's ``O_EXCL`` create and every other died with ``FileExistsError``; worse, a process arriving
     between another's key and cert writes read a lone key as debris, deleted it, and minted its own,
     and the first then overwrote that cert, leaving a mismatched pair that failed every later start.
@@ -339,7 +368,8 @@ def _generated_pair_lock(state_dir: Path) -> Iterator[None]:
 
     **One shared pair for all shards** is what this keeps, and it is correct: the minted identity is
     ``[api].host`` and shards differ only by port. The lock does not choose it over one pair per
-    shard; it removes the crash and the corruption from the answer the shared state dir already gave.
+    shard; it removes the crash and the corruption from the answer the shared state dir already
+    gave.
 
     Raises ``TimeoutError`` naming the lock file when a holder outlives
     :data:`_MINT_LOCK_TIMEOUT_S`, rather than waiting forever on a hung process.
@@ -352,9 +382,9 @@ def _generated_pair_lock(state_dir: Path) -> Iterator[None]:
         while not _try_lock(fd):
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"another engine process has held {lock_path} for over "
-                    f"{_MINT_LOCK_TIMEOUT_S:g}s while minting the API TLS pair; if no engine is "
-                    "running, the holder is hung -- stop it and start again"
+                    f"{lock_path} has been held for over {_MINT_LOCK_TIMEOUT_S:g}s by another "
+                    "start minting the API TLS pair; if no other engine start is running, the "
+                    "holder is hung -- stop it and start again"
                 )
             time.sleep(_MINT_LOCK_POLL_S)
         try:
@@ -415,10 +445,11 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     only the certificate, is then made readable by local users so the tray can pin it
     (:func:`_let_local_users_read_cert`).
 
-    **ONE WRITER (BACKLOG #1276).** Every ``serve --shards`` shard shares this state dir, so the
-    reuse check, any discard, and the mint all run under :func:`_generated_pair_lock`. A process
-    that loses the race waits, then reuses the winner's pair; it neither crashes nor deletes a key
-    another process is still writing.
+    **ONE WRITER (BACKLOG #1276).** Every ``serve --shards`` shard shares this state dir, so any
+    discard and the mint run under :func:`_generated_pair_lock`, after the reuse check is repeated
+    there. A process that loses the race waits, then reuses the winner's pair; it neither crashes
+    nor deletes a key another process is still writing. A pair that already loads is reused before
+    the lock is taken (:func:`_loads_without_the_lock`).
 
     **REUSE MEANS THE PAIR LOADS, not that two files exist.** A pair that fails
     :func:`_why_generated_pair_is_unusable` (a cert that is not the key's, a truncated file) is
@@ -456,10 +487,12 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
         return plan.material()
 
     cert_path, key_path = _generated_pair(state_dir)
+    if _loads_without_the_lock(cert_path, key_path):
+        return str(cert_path), str(key_path)
     state_dir.mkdir(parents=True, exist_ok=True)
     with _generated_pair_lock(state_dir):
-        # Re-decided UNDER the lock, every time: a process that waited here finds the pair the
-        # holder just minted, and reuses it.
+        # Re-decided UNDER the lock: a process that waited here finds the pair the holder just
+        # minted, and reuses it. Only here may a failed check lead to a discard.
         if cert_path.exists() and key_path.exists():
             reason = _why_generated_pair_is_unusable(cert_path, key_path)
             if reason is None:
@@ -469,6 +502,25 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
             _discard_half_minted_pair(cert_path, key_path)
         _mint_generated_pair(api, cert_path, key_path)
     return str(cert_path), str(key_path)
+
+
+def _loads_without_the_lock(cert_path: Path, key_path: Path) -> bool:
+    """True when the pair already loads, read WITHOUT the lock. Every other answer is ``False``.
+
+    Safe because a pair that loads is never replaced, so seeing one is final. A read that races a
+    mint in progress sees a partial or vanishing file and answers ``False``, and the caller then
+    decides again under the lock. So nothing here raises and nothing here deletes. The point of
+    reading first is that the common start -- a pair minted long ago -- needs no write access to the
+    state dir and no OS lock support, which is what it needed before the lock existed.
+    """
+    try:
+        return (
+            cert_path.exists()
+            and key_path.exists()
+            and _why_generated_pair_is_unusable(cert_path, key_path) is None
+        )
+    except OSError:
+        return False
 
 
 def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> None:
