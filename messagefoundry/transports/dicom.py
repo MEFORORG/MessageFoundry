@@ -331,6 +331,19 @@ class DicomScpSource(SourceConnector):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ae: Any = None
         self._server: Any = None
+        # BACKLOG #1962: say so when an operator's own setting is clamped. It runs after the last
+        # refusal above, so a connection that never builds logs nothing about its limits. The factory
+        # always passes the shipped default, so that value cannot be told from an explicit one. It
+        # stays silent, because a warning on every default SCP would teach operators to ignore this.
+        if configured != self._max_object_bytes and configured != DEFAULT_MAX_OBJECT_BYTES:
+            logger.warning(
+                "DICOM SCP %r: max_object_bytes %s is above the engine's binary ingress ceiling of "
+                "%d bytes, so the SCP refuses any larger object; the deflate inflate bound is %d bytes",
+                config.name or "",
+                "uncapped" if configured is None else configured,
+                self._max_object_bytes,
+                self._max_inflated_bytes,
+            )
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None

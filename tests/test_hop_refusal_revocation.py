@@ -25,13 +25,22 @@ hop — the two gates key on disjoint conditions and never double-refuse one hop
 
 from __future__ import annotations
 
+import datetime
 import ssl
+from pathlib import Path
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
+from fastapi import FastAPI
 
+from messagefoundry.api import create_managed_app
+from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import AiSettings, AuthSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
     HopDisposition,
@@ -47,6 +56,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.logging_setup import SyslogForward, _build_tls_context
+from messagefoundry.pipeline.engine import Engine
 from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination
@@ -1115,6 +1125,19 @@ def test_the_verifying_forwarder_context_asserts_strict_path_validation(crl_bund
 # no posture must all construct.
 
 
+def _oidc_leg_settings(*, token_host: str, jwks_host: str, **over: object) -> AuthSettings:
+    """OIDC settings with each leg on its own host. Shared by the guard arms and the lifespan arms,
+    so both describe the same two legs."""
+    return _oidc_settings(
+        oidc_issuer=f"https://{REMOTE}",
+        oidc_authorization_endpoint=f"https://{REMOTE}/authorize",
+        oidc_token_endpoint=f"https://{token_host}:8443/token",
+        oidc_jwks_uri=f"https://{jwks_host}:8443/jwks",
+        oidc_allowed_endpoints=[REMOTE, LOOPBACK],
+        **over,
+    )
+
+
 async def _oidc_service(
     *,
     token_host: str = REMOTE,
@@ -1128,14 +1151,7 @@ async def _oidc_service(
     earlier construction check can stand in for their verdict. The opener opens no socket, so an
     unreachable host is fine here. The directory is the OIDC suite's fake: a real LdapAuthenticator
     would bring its own LDAPS hop into these arms, a second guard that could fire in place of these."""
-    settings = _oidc_settings(
-        oidc_issuer=f"https://{REMOTE}",
-        oidc_authorization_endpoint=f"https://{REMOTE}/authorize",
-        oidc_token_endpoint=f"https://{token_host}:8443/token",
-        oidc_jwks_uri=f"https://{jwks_host}:8443/jwks",
-        oidc_allowed_endpoints=[REMOTE, LOOPBACK],
-        **over,
-    )
+    settings = _oidc_leg_settings(token_host=token_host, jwks_host=jwks_host, **over)
     store = await MessageStore.open(":memory:")
     try:
         return AuthService(store, settings, ldap=_FakeLdap(), hop_posture=posture)  # type: ignore[arg-type]
@@ -1259,6 +1275,71 @@ async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> 
         await store.close()
 
 
+def _oidc_managed_app(tmp_path: Path, *, host: str) -> FastAPI:
+    """A serve-shaped managed app with OIDC on and both legs on ``host``. ``ai_settings`` is what
+    makes the lifespan derive a posture at all, and the default enforcement is enforce. The AD
+    server is on loopback so the directory's own hop cannot be the thing that refuses."""
+    settings = _oidc_leg_settings(
+        token_host=host, jwks_host=host, enabled=True, ad_server=f"ldaps://{LOOPBACK}"
+    )
+    return create_managed_app(
+        db_path=tmp_path / "oidc1923.db",
+        poll_interval=0.05,
+        auth_settings=settings,
+        ai_settings=AiSettings(),
+        public_origin="https://ops.example",
+    )
+
+
+def _record_engine_start(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace ``Engine.start`` with a probe that records the call and then fails startup, and wrap
+    ``Engine.stop`` to record it. Failing is what lets the control arm stop before any connection
+    or listener, while still proving that the lifespan reached the start."""
+    calls: list[str] = []
+    real_stop = Engine.stop
+
+    async def _probe(self: Engine) -> None:
+        calls.append("engine.start")
+        raise RuntimeError("PROBE: engine.start reached")
+
+    async def _stop(self: Engine) -> None:
+        # Recorded, then the real stop, which closes the store (the #1257 teardown).
+        calls.append("engine.stop")
+        await real_stop(self)
+
+    monkeypatch.setattr(Engine, "start", _probe)
+    monkeypatch.setattr(Engine, "stop", _stop)
+    return calls
+
+
+async def test_the_lifespan_refuses_the_oidc_legs_before_engine_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1923. The refusal used to fire when the lifespan built AuthService, AFTER
+    ``engine.start()`` had started every connection. It must now come first."""
+    calls = _record_engine_start(monkeypatch)
+    app = _oidc_managed_app(tmp_path, host=REMOTE)
+    with pytest.raises(InsecureHopRefused, match="OIDC token endpoint"):
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover -- startup must not reach here
+    # Never started, and still torn down: the refusal now fires on a path inside the teardown's
+    # span that no earlier test reached with auth on, and a skipped stop leaves the store open.
+    assert calls == ["engine.stop"]
+
+
+async def test_the_lifespan_reaches_engine_start_when_the_oidc_legs_cross(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE CONTROL for the arm above. Same app with both legs on loopback, so the guard lets them
+    cross. The probe must fire here, or the empty list above proves nothing about the ordering."""
+    calls = _record_engine_start(monkeypatch)
+    app = _oidc_managed_app(tmp_path, host=LOOPBACK)
+    with pytest.raises(RuntimeError, match="PROBE: engine.start reached"):
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover -- the probe fails startup
+    assert calls == ["engine.start", "engine.stop"]
+
+
 async def test_the_oidc_refusal_names_a_lever_that_exists_for_it() -> None:
     """SDS-3.7 applied to the refusal TEXT. The default remediation names ``[tls].crl_file`` and a
     connection's ``tls_revocation_attested``, and neither reaches this opener: it resolves no trust
@@ -1267,3 +1348,161 @@ async def test_the_oidc_refusal_names_a_lever_that_exists_for_it() -> None:
         await _oidc_service()
     assert "[auth].oidc_tls_crl_file" in str(exc.value)
     assert "tls_revocation_attested" not in str(exc.value)
+
+
+# --- BACKLOG #1925: one CRL on the shared context, two legs whose CAs differ ----------------------
+#
+# The finding is recorded once, in the build_idp_opener docstring. These arms pin the OpenSSL
+# behaviour it rests on, through a real handshake on the context that function returns.
+
+
+def _crl_coverage_ca(cn: str) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
+    """A throwaway CA. Synthetic."""
+    now = datetime.datetime.now(datetime.UTC)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(False, False, False, False, False, True, True, False, False),
+            critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    return key, cert
+
+
+def _crl_coverage_server(
+    issuer_key: ec.EllipticCurvePrivateKey, issuer: x509.Certificate, host: str, directory: Path
+) -> ssl.SSLContext:
+    """A server context presenting a leaf for ``host`` issued by the given CA. Synthetic."""
+    now = datetime.datetime.now(datetime.UTC)
+    key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
+        .issuer_name(issuer.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=10))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+            critical=False,
+        )
+        .sign(issuer_key, hashes.SHA256())
+    )
+    cert_path, key_path = directory / f"{host}.crt", directory / f"{host}.key"
+    cert_path.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server.load_cert_chain(cert_path, key_path)
+    return server
+
+
+def _handshake(client: ssl.SSLContext, server: ssl.SSLContext, host: str) -> str:
+    """Drive one in-memory handshake. Returns ``"accepted"`` or the client's verify message."""
+    c_in, c_out, s_in, s_out = (ssl.MemoryBIO() for _ in range(4))
+    c = client.wrap_bio(c_in, c_out, server_hostname=host)
+    s = server.wrap_bio(s_in, s_out, server_side=True)
+    for _ in range(10):
+        for side in (c, s):
+            try:
+                side.do_handshake()
+            except ssl.SSLWantReadError:
+                pass
+            except ssl.SSLCertVerificationError as exc:
+                return str(exc.verify_message)
+            except ssl.SSLError:
+                pass  # the server's view of a client refusal; the client's is the one reported
+        s_in.write(c_out.read())
+        c_in.write(s_out.read())
+        try:
+            c.do_handshake()
+        except ssl.SSLWantReadError:
+            continue
+        except ssl.SSLCertVerificationError as exc:
+            return str(exc.verify_message)
+        return "accepted"
+    return "incomplete"
+
+
+def test_a_crl_that_misses_one_legs_issuer_fails_that_leg_closed(tmp_path: Path) -> None:
+    """The token leg's CA publishes the only CRL; the JWKS leg's CA publishes none. The guard reads
+    one flag for both, so both cross the guard. The JWKS handshake must then REFUSE, not accept."""
+    token_ca_key, token_ca = _crl_coverage_ca("mefor-1925-token-ca")
+    jwks_ca_key, jwks_ca = _crl_coverage_ca("mefor-1925-jwks-ca")
+    now = datetime.datetime.now(datetime.UTC)
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(token_ca.subject)
+        .last_update(now - datetime.timedelta(hours=1))
+        .next_update(now + datetime.timedelta(days=7))
+        .sign(token_ca_key, hashes.SHA256())
+    )
+    anchor = tmp_path / "both_cas.pem"
+    anchor.write_bytes(
+        token_ca.public_bytes(serialization.Encoding.PEM)
+        + jwks_ca.public_bytes(serialization.Encoding.PEM)
+    )
+    crl_path = tmp_path / "token_ca.crl.pem"
+    crl_path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+
+    opener = build_idp_opener(str(anchor), enforcing=False, crl_file=str(crl_path))
+    ctx = opener_tls_context(opener, connector="test")
+    assert ctx is not None
+    # The premise: one flag, set by a CRL from the token leg's CA alone, answers for both legs.
+    assert context_checks_revocation(ctx) is True
+
+    token = _crl_coverage_server(token_ca_key, token_ca, "token.idp.test", tmp_path)
+    jwks = _crl_coverage_server(jwks_ca_key, jwks_ca, "jwks.idp.test", tmp_path)
+    # CONTROL: the covered leg completes, so the refusal below is about coverage, not the harness.
+    assert _handshake(ctx, token, "token.idp.test") == "accepted"
+    # THE ARM: the uncovered leg is refused, not waved through unchecked.
+    assert _handshake(ctx, jwks, "jwks.idp.test") == "unable to get certificate CRL"
+
+
+def test_a_revoked_leaf_on_the_covered_leg_is_refused(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the arm above: the loaded CRL really is consulted. Without it, a
+    refusal on the uncovered leg could come from a context that refuses everything."""
+    ca_key, ca = _crl_coverage_ca("mefor-1925-revoking-ca")
+    server = _crl_coverage_server(ca_key, ca, "token.idp.test", tmp_path)
+    served = x509.load_pem_x509_certificate((tmp_path / "token.idp.test.crt").read_bytes())
+    now = datetime.datetime.now(datetime.UTC)
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.subject)
+        .last_update(now - datetime.timedelta(hours=1))
+        .next_update(now + datetime.timedelta(days=7))
+        .add_revoked_certificate(
+            x509.RevokedCertificateBuilder()
+            .serial_number(served.serial_number)
+            .revocation_date(now - datetime.timedelta(hours=2))
+            .build()
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    anchor = tmp_path / "ca.pem"
+    anchor.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    crl_path = tmp_path / "ca.crl.pem"
+    crl_path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+
+    opener = build_idp_opener(str(anchor), enforcing=False, crl_file=str(crl_path))
+    ctx = opener_tls_context(opener, connector="test")
+    assert ctx is not None
+    assert _handshake(ctx, server, "token.idp.test") == "certificate revoked"

@@ -183,6 +183,9 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/transports/file.py": _KEYLESS,
     "messagefoundry/tray/probe.py": _VERIFY_ONLY,
     "messagefoundry/verify/smoke.py": _VERIFY_ONLY,
+    # BACKLOG #1923: reads the OIDC revocation guard's decision off the tls_policy seam. The IdP
+    # context it inspects is built by auth/oidc_http.py from a CA anchor and a CRL, neither a key.
+    "messagefoundry/verify/federation.py": _POSTURE_ONLY,
     "messagefoundry_webconsole/_security.py": _EPHEMERAL + " (the per-response CSP nonce)",
     "tee/mefor_api.py": _VERIFY_ONLY,
     "scripts/asvs/scorecard.py": _KEYLESS,

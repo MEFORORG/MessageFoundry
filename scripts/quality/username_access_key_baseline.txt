@@ -39,6 +39,11 @@ auth_routes.py::get_user_by_username::arg0
 auth_routes.py::password_violations::username
 auth_routes.py::create_local_user::username
 
+# BACKLOG #2021: `POST /users/directory` hands the administrator-typed name to the directory lookup,
+# which is the only way to find an account that has no engine row yet. The row it creates is keyed
+# by a new `user_id` and carries the objectGUID the directory returned; the name scopes nothing.
+auth_routes.py::create_directory_account::arg0
+
 # ---- CONFIRMED INSTANCE, ROUTED ONWARD, NOT FIXED HERE -------------------------------------------
 
 # `GET /me/security-events` -> AuthService.security_events_for(identity.username) ->

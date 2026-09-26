@@ -70,6 +70,12 @@ re-read here. ``tests/test_worktree_prune_merged.py`` is the next candidate by e
 evidence yet: its ``test_disqualifiers`` arms are the tier's longest tests at 102-106s against a 120s
 per-test bound. Sweeping it in on that alone is the hunch this paragraph refuses.
 
+``tests/test_announce_hook.py``, named above as unwrapped, FOLLOWED ON ITS OWN CI EVIDENCE on
+2026-09-26. Single hook launches timed out at 45s on the windows-2025 leg in at least four jobs, so
+all four of its launch sites now take the shared side, and ``tests/test_spawn_lock.py`` gates it
+beside ``test_coord_usage.py``. It also carries a 300s per-test bound, because its tests make up to
+four launches and each may wait here. Its own docstring carries the run ids.
+
 EVERY FAILURE MODE HERE DEGRADES TO TODAY'S BEHAVIOUR, WHICH IS THE PROPERTY THAT MAKES IT SAFE TO
 LAND. No lock directory, a saturated wait, a stale entry reaped while its owner is in fact alive, an
 ``OSError`` on any filesystem call -- each one proceeds WITHOUT the lock. The worst case is the

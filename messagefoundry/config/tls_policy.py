@@ -1745,6 +1745,14 @@ class RevocationHopGuard:
             connection=connection,
         )
 
+    def disposition(self) -> HopDisposition | None:
+        """What :meth:`enforce_construction` would do, without logging, auditing or raising.
+
+        ``None`` when the posture is unstamped, where that method no-ops. For a report such as
+        ``messagefoundry verify`` (BACKLOG #1923), which must say what the engine would decide
+        without adding the engine's log lines to its own output."""
+        return None if self.posture is None else self._disposition(self.posture)
+
     def _disposition(self, posture: HopPosture) -> HopDisposition:
         return revocation_hop_disposition(
             enforcing=posture.enforcing,

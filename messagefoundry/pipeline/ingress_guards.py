@@ -39,10 +39,12 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import re
 
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.wiring import InboundConnection
 from messagefoundry.parsing import RawMessage, normalize
+from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.parsing.binary import BinaryCarriageError, is_marked
 from messagefoundry.parsing.binary import decode as decode_carriage
 from messagefoundry.parsing.peek import (
@@ -68,6 +70,7 @@ __all__ = [
     "ingress_size_error",
     "peek_max_bytes",
     "raise_if_strictly_invalid",
+    "reingress_size_error",
     "store_safe_raw",
     "streaming_over_threshold",
     "strict_validate_timeout",
@@ -164,6 +167,47 @@ def ingress_size_error(size: int) -> str | None:
     if size > INGRESS_MAX_BYTES:
         return f"ingress exceeds max size ({size} > {INGRESS_MAX_BYTES} bytes)"
     return None
+
+
+#: Unbroken, canonically padded base64: the only carriage form sized by the bytes it carries.
+_CANONICAL_B64 = re.compile(r"[A-Za-z0-9+/]*={0,2}")
+
+
+def _canonical_carried_size(payload: str) -> int | None:
+    """The byte count ``payload`` carries if it is canonical base64, else ``None``.
+
+    Whitespace is not stripped first. A decoder tolerates it, but here it would let padding of any
+    length measure as nothing, so a padded or otherwise noncanonical payload has no byte count."""
+    if len(payload) % 4 or _CANONICAL_B64.fullmatch(payload) is None:
+        return None
+    padding = 2 if payload.endswith("==") else int(payload.endswith("="))
+    return len(payload) // 4 * 3 - padding
+
+
+def reingress_size_error(ic: InboundConnection, body: str) -> str | None:
+    """The oversize text for a loopback re-ingress ``body`` (BACKLOG #1914), or ``None`` when it fits.
+
+    A loopback has no listener, so the re-ingress worker applies the engine ceiling itself. Canonical
+    ``mfb64:v1:`` carriage on a binary loopback is sized by the bytes it carries, as the listener
+    sizes a binary body. Every other body is held and routed as text, so it is sized in characters,
+    as the listener sizes a text body. That includes the decoded text a capturing transport hands a
+    binary loopback, and carriage that is padded or corrupt. An HL7 body always returns ``None``
+    here: ``Peek.parse`` in the re-ingress step already refuses one over the engine ceiling, after it
+    normalizes line endings, so measuring the raw text first could refuse a body the peek admits.
+
+    The reason carries only a length, never a byte of the body."""
+    if ic.content_type is ContentType.HL7V2:
+        return None
+    if ic.content_type.is_binary and is_marked(body):
+        payload = body[len(CARRIAGE_MARKER) :]
+        if 3 * len(payload) // 4 <= INGRESS_MAX_BYTES:
+            # No base64 this short can carry more than the ceiling, and whitespace only shortens it.
+            # That also bounds a padded or corrupt carriage to the length of a ceiling-size one.
+            return None
+        carried = _canonical_carried_size(payload)
+        if carried is not None:
+            return ingress_size_error(carried)
+    return ingress_size_error(len(body))
 
 
 def _raise_if_oversize(size: int) -> None:

@@ -350,7 +350,7 @@ def test_a_repeated_chunked_coding_is_named_as_such() -> None:
 #
 # Not an outbound connection, but the same stdlib reader on a reply the engine asked for. The token
 # leg raises FlowError (a ValueError) and the JWKS leg an http.client.HTTPException. Both reach the
-# (OSError, ValueError, HTTPException) arm in auth/service.py's authenticate_oidc, which records an
+# (OSError, ValueError, HTTPException) arm in auth/service.py's _authenticate_oidc, which records an
 # unavailable IdP. The JWKS leg must NOT raise JwksError: claims.py retypes that as
 # ClaimsError("unknown_kid"), a token-verification reject. These tests pin the types, not the
 # service mapping.
