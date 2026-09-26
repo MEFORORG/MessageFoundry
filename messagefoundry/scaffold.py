@@ -246,6 +246,9 @@ api-generated-key.pem
 api-generated-cert.pem
 # ...and the empty lock file that serialises that first-run mint across engine shards
 api-generated.lock
+# ...and the new pair a startup renewal stages beside the live one before replacing it
+api-generated-key.pem.renewing
+api-generated-cert.pem.renewing
 .env
 .env.*
 /out/

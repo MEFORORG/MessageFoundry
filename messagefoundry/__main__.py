@@ -3658,10 +3658,17 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
     # DAST target each decide it their own way, which is the defect this item exists to remove.
-    from messagefoundry.api.tls import ensure_api_tls_material, generated_state_dir
+    from messagefoundry.api.tls import (
+        GeneratedPairReplaced,
+        ensure_api_tls_material,
+        generated_state_dir,
+    )
 
+    # A renewal or recovery of the generated pair is reported here and audited by the lifespan once
+    # the store is open, which is after this point (ADR 0172 decision 6: never silent).
+    _replaced: list[GeneratedPairReplaced] = []
     _material = ensure_api_tls_material(
-        settings.api, state_dir=generated_state_dir(settings.store.path)
+        settings.api, state_dir=generated_state_dir(settings.store.path), replacements=_replaced
     )
     # Minted HERE, before the app is built, so the expiry monitor below watches the certificate this
     # listener actually presents. [api].tls_cert_file is the PRE-mint config value and is empty
@@ -3725,6 +3732,7 @@ def _serve(args: argparse.Namespace) -> int:
         backup_settings=settings.backup,
         dr_settings=settings.dr,
         api_tls_cert_file=_served_api_cert,  # the SERVED cert, generated or operator (#1276)
+        api_tls_replacements=_replaced,  # audited once the store opens (ADR 0172 decision 6)
         # ASVS 6.4.5: operator-held copies of inbound service callers' client certs — watched by the same
         # [cert_monitor] scan, so a caller's cert cannot expire unnoticed while it has stopped connecting.
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
