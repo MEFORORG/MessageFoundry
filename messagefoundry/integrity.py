@@ -170,17 +170,17 @@ _CONSOLE_PACKAGE = "messagefoundry_webconsole"
 #: :data:`_ATTESTED_ASSETS` either: that list would ship in the ENGINE wheel and be compared against the
 #: CONSOLE's ``RECORD``, and the two are versioned apart, so it would go stale.
 #:
-#: ``__pycache__`` is skipped because ``RECORD`` carries no hash for compiled caches. That leaves a
-#: residual shared with the engine arm: a crafted cache whose header matches its ``.py`` is imported
-#: without either arm looking at it.
+#: ``__pycache__`` is skipped because ``RECORD`` carries no hash for compiled caches. The residual that
+#: leaves is recorded in ADR 0041's 2026-09-25 amendment.
 _BYTECODE_CACHE_DIR = "__pycache__"
 
 
 #: Why an attestation pass compared **nothing** (``checked == 0``). Only ``declared_editable`` is a
 #: sanctioned no-op — a dev checkout that has no baseline by design (ADR 0041 AC-12). Every other value
 #: is an install whose tripwire is disarmed, which a fail-closed site refuses to start on (BACKLOG
-#: #1679). A ``Literal`` rather than a bare ``str`` so a typo in one of the six construction sites is a
-#: type error instead of a reason nobody can match on.
+#: #1679). A ``Literal`` rather than a bare ``str`` so a typo at a construction site is a type error
+#: instead of a reason nobody can match on. ``console_attestation_raised`` is the web console arm's
+#: alone (BACKLOG #1802): its pass raised, so it compared nothing that can be trusted.
 UnattestedReason = Literal[
     "declared_editable",
     "not_an_installed_distribution",
@@ -188,6 +188,7 @@ UnattestedReason = Literal[
     "record_has_no_package_rows",
     "install_root_unresolvable",
     "no_attested_file_under_install_root",
+    "console_attestation_raised",
 ]
 
 
@@ -445,8 +446,21 @@ def _console_loaded_files() -> list[Path] | None:
         for dirpath, dirnames, filenames in Path(root).walk():
             dirnames[:] = [name for name in dirnames if name != _BYTECODE_CACHE_DIR]
             directory = dirpath.resolve()
-            files.update(directory / name for name in filenames)
+            files.update(
+                directory / name for name in filenames if not _is_special_file(directory / name)
+            )
     return sorted(files)
+
+
+def _is_special_file(path: Path) -> bool:
+    """Whether ``path`` (or what a symlink at it points to) is neither a regular file nor a directory:
+    a FIFO, a device or a socket. Reading one can block forever or never end, so the console walk never
+    hands one to the hash. Left out of the walk, one that sits at a ``RECORD`` path still surfaces as
+    ``missing`` drift, because :func:`_attest_distribution` reports every row nothing matched."""
+    try:
+        return path.exists() and not (path.is_file() or path.is_dir())
+    except OSError:
+        return False
 
 
 def _record_relpath(file: Path, install_root: Path) -> str | None:
@@ -544,8 +558,8 @@ def _attest_distribution(
 
     ``attested_files`` is called only once a usable baseline is known to exist. ``every_record_row``
     additionally reports each hashed ``RECORD`` row under ``package/`` that no attested file matched as
-    ``missing`` drift -- a deleted file. It applies only when at least one file was compared, so a
-    package loaded from outside the install root stays attested-nothing rather than turning into a
+    ``missing`` drift -- a deleted file. It applies only when at least one attested file sat under the
+    install root, so a package loaded from outside it stays attested-nothing rather than turning into a
     list of every file it did not load.
     """
     try:
@@ -606,7 +620,7 @@ def _attest_distribution(
             continue
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
-    if every_record_row and checked:
+    if every_record_row and seen:
         prefix = f"{package}/"
         cache = f"/{_BYTECODE_CACHE_DIR}/"
         drift.extend(
@@ -835,7 +849,10 @@ async def run_startup_attestation(
     A console with no distribution of its own, loaded beside an engine that DECLARES itself editable,
     takes the engine's AC-12 exemption: that is a dev checkout that installed only the engine. It costs
     nothing the engine's exemption did not already concede, because a declared-editable engine attests
-    nothing either.
+    nothing either. It is silent, because the engine arm has already said what an operator needs.
+
+    A console arm that RAISES is attested-nothing (``console_attestation_raised``), not a crash: it
+    warns, records and alerts, and refuses only under the opt-in, like every other console shape.
 
     Wire it into the engine/serve startup *before* listeners bind.
     """
@@ -848,13 +865,21 @@ async def run_startup_attestation(
         )
     ]
 
-    console = await asyncio.to_thread(attest_console)
-    if console is not None:
-        if (
-            result.declared_editable
-            and console.unattested_reason == "not_an_installed_distribution"
-        ):
-            console = _nothing_attested("declared_editable", editable=True)
+    try:
+        console = await asyncio.to_thread(attest_console)
+    except Exception:  # noqa: BLE001 — a broken console pass is a signal, never a crash or a pass
+        log.exception("startup integrity: the web console attestation pass raised")
+        console = _nothing_attested("console_attestation_raised")
+    inherits_engine_exemption = (
+        console is not None
+        and result.declared_editable
+        and console.unattested_reason == "not_an_installed_distribution"
+    )
+    if inherits_engine_exemption:
+        log.debug(
+            "integrity: console has no distribution beside a declared-editable engine; exempt"
+        )
+    elif console is not None:
         refusals.append(
             await _act_on(
                 console, _CONSOLE_ARM, store, alert_sink, fail_closed_on_drift=fail_closed_on_drift

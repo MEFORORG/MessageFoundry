@@ -27,6 +27,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import sys
 import types
 from collections.abc import Sequence
@@ -1160,11 +1161,13 @@ async def test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine(
         await store.close()
 
 
-async def test_a_console_arm_failure_never_costs_the_engine_its_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("fail_closed", [False, True])
+async def test_a_console_arm_that_raises_is_attested_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_closed: bool
 ) -> None:
-    """The engine arm is acted on BEFORE the console arm runs. If the console arm raises, the engine's
-    drift row and alert are already recorded, and the start still does not go ahead."""
+    """A console pass that raises (a non-UTF-8 console RECORD is one way) must neither crash an
+    alert-only start nor replace the engine's refusal. It is attested-nothing: recorded and alerted
+    after the engine's evidence, and refused only under the opt-in, with the engine's text first."""
     _install_engine_and_console(tmp_path, monkeypatch)
     (tmp_path / "engine" / "mfengine" / "core.py").write_bytes(b"SAFE = False\n")
 
@@ -1173,20 +1176,51 @@ async def test_a_console_arm_failure_never_costs_the_engine_its_evidence(
 
     monkeypatch.setattr(integ, "attest_console", _console_arm_breaks)
 
-    store = await open_store(sqlite_settings(str(tmp_path / "order.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / f"raises-{fail_closed}.db")), create=True
+    )
     sink = _RecordingSink()
     try:
-        with pytest.raises(UnicodeDecodeError):
+        if fail_closed:
+            with pytest.raises(IntegrityError) as refused:
+                await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+            assert str(refused.value).startswith("engine integrity attestation failed: 1 ")
+            assert "(console_attestation_raised)" in str(refused.value)
+        else:
             await run_startup_attestation(store, sink, fail_closed_on_drift=False)
-        assert len(_startup_rows(await store.list_audit())) == 1
-        assert [event[0] for event in sink.events] == ["engine-integrity"]
+        rows = _startup_rows(await store.list_audit())
+        assert len(rows) == 2
+        assert [event[0] for event in sink.events] == ["engine-integrity", "webconsole-unattested"]
     finally:
         await store.close()
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+def test_a_fifo_at_a_record_path_is_drift_and_never_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reading a FIFO blocks forever, which would hang startup. The walk leaves special files out, and
+    the RECORD row it leaves unmatched is reported as missing drift instead."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    target = package_dir / "static" / "app.js"
+    target.unlink()
+    os.mkfifo(target)
+    _load_fake_console(monkeypatch, package_dir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert [(d.path, d.reason) for d in console.drift] == [
+        (f"{_CONSOLE_PKG}/static/app.js", "missing")
+    ]
+
+
 @pytest.mark.parametrize("engine_editable", [True, False])
 async def test_a_dev_checkout_console_inherits_the_engine_editable_exemption(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine_editable: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    engine_editable: bool,
 ) -> None:
     """``pip install -e .`` alone leaves the console importable from the checkout with no distribution
     of its own. Beside a declared-editable engine that is a dev checkout, and it must not be refused.
@@ -1215,9 +1249,13 @@ async def test_a_dev_checkout_console_inherits_the_engine_editable_exemption(
     sink = _RecordingSink()
     try:
         if engine_editable:
-            await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+            with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+                await run_startup_attestation(store, sink, fail_closed_on_drift=True)
             assert _startup_rows(await store.list_audit()) == []
             assert sink.events == []
+            warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+            # Only the ENGINE's AC-14 warning: no console install exists to name.
+            assert len(warnings) == 1 and "this install DECLARES" in warnings[0], warnings
         else:
             with pytest.raises(IntegrityError, match="not_an_installed_distribution"):
                 await run_startup_attestation(store, sink, fail_closed_on_drift=True)

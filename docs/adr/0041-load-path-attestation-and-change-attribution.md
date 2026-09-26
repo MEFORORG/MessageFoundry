@@ -330,13 +330,20 @@ fingerprint+git-HEAD covers more cheaply for now.
 >    row is drift, and so is every console `RECORD` row with no file. A file list would ship in the
 >    engine wheel and be compared against the console's `RECORD`, which is versioned apart.
 >
-> The engine arm's log lines, alert subjects, audit detail and refusal text are unchanged, and a test
-> pins them word for word. It is also acted on before the console arm runs, so a console arm that
+> The engine arm's rendered log text at INFO and above, its alert subjects, audit detail and refusal
+> text are unchanged, and a test pins them word for word. Its DEBUG lines now name the distribution.
+> It is also acted on before the console arm runs, so a console arm that
 > fails cannot cost the engine its evidence. The trust-domain residual in D3 applies to the console
 > unchanged: this detects an inconsistent in-place edit, not one that also re-seals the console's
 > `RECORD`.
 >
-> **Two residuals, recorded rather than fixed here.** The engine arm still resolves each file before
+> A console pass that raises is attested-nothing (`console_attestation_raised`), not a crash. The arm
+> never opens a FIFO, device or socket; one at a `RECORD` path is `missing` drift.
+>
+> **Three residuals, recorded rather than fixed here.** The console arm keys on `sys.modules`, so
+> console code that has already run can remove itself from it and be skipped; that is the D3
+> trust-domain residual again, since such code could as easily rewrite this module. The engine arm
+> still resolves each file before
 > comparing it, so an engine module swapped for a symlink to a file outside the install root is
 > skipped rather than compared; the console arm resolves only directories and does not have this gap.
 > And neither arm reads `__pycache__`, because `RECORD` carries no hash for compiled caches: a crafted

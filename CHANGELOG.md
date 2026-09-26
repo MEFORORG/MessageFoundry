@@ -145,7 +145,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   only the engine wheel's files, so a console file edited, added or deleted in place went unseen.
   When the engine has loaded the console, it now checks every console file against the console
   wheel's own `RECORD`, under the same `[integrity]` rules. A console the engine has not loaded is
-  skipped. The engine's own messages are unchanged. Subjects and details are in
+  skipped. The engine's own operator-facing messages are unchanged. Subjects and details are in
   [CONFIGURATION.md](docs/CONFIGURATION.md) under `[integrity]`. (`BACKLOG #1802`)
 - **BREAKING: a CRL file can no longer add trust anchors.** Each CRL setting loaded its file as
   a CA file, so any certificate in it became a trusted CA for the hop. That CA skipped the hop's

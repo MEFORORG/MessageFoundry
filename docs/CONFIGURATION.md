@@ -1548,7 +1548,9 @@ console (`[security].serve_web_console` on), it attests that too: every file of 
 `messagefoundry_webconsole` package against the `messagefoundry-webconsole` wheel's own `RECORD`, under
 the same rules and the same two keys (BACKLOG #1802). A console the engine has not loaded is not
 attested, because its code never ran here. A loaded console that cannot be attested is treated like an
-engine that cannot. Its audit row carries `"distribution": "messagefoundry-webconsole"`, and its alerts
+engine that cannot, with one exception: a console with no distribution of its own beside an engine that
+declares itself editable is a checkout that installed only the engine, and shares its exemption. Its
+audit row carries `"distribution": "messagefoundry-webconsole"`, and its alerts
 use the subjects `webconsole-integrity` and `webconsole-unattested`. What the console arm covers, and
 why, is ADR 0041 AC-15. It complements ADR 0036 (which guards
 the *config dir*) by covering the installed *site-packages* an admin with venv-write + restart rights could
