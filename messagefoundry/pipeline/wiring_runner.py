@@ -98,7 +98,7 @@ from messagefoundry.config.wiring import (
     resolved_encoding_problems,
 )
 from messagefoundry.fhirsearch import FhirSearchParams
-from messagefoundry.log_backoff import FailureRun
+from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
 from messagefoundry.logging_guard import LogSinkEvent
 from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.parsing import (
@@ -346,7 +346,7 @@ _WORKER_ERROR_BACKOFF_SECONDS = 1.0
 _FAULT_RUN_QUIET_SECONDS = 10.0
 
 # What a worker run counts. Not "consecutive": a run may span healthy passes (see _WorkerFaultLog).
-_WORKER_RUN_COUNT = "failures in this run"
+_WORKER_RUN_COUNT = IN_THIS_RUN
 
 
 class _WorkerFaultLog:
@@ -5938,7 +5938,9 @@ class RegistryRunner:
         # stable for the worker's life (never replaced), so a sticky set survives a respawn.
         wait_ev = self._lane_event(Stage.OUTBOUND, name) if self._per_lane_wake else self._work
         # #1611: the rows THIS loop claimed, for the except arm's re-pend. A batching outbound
-        # coalesces further rows inside _process_delivery_batch; those are not tracked here.
+        # coalesces further rows inside _process_delivery_batch; on a fault it appends their ids
+        # here, so the arm re-pends head and extras in one write (#1579, #1844). Only a raising
+        # pass appends, so the STOPPED tail slice below never sees them.
         claimed: list[str] = []
         faults = _WorkerFaultLog("delivery", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
@@ -6035,15 +6037,15 @@ class RegistryRunner:
                     batch_cfg = self._batch.get(name)
                     if batch_cfg is not None:
                         outcome = await self._process_delivery_batch(
-                            name, item, batch_cfg, faults=faults
+                            name, item, batch_cfg, extras_out=claimed
                         )
                     else:
                         outcome = await self._process_delivery_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
                         await self._release_tail_on_stop("delivery", name, claimed[i + 1 :])
                         return
+                claimed = []  # #1844: resolved, before anything else in the pass can raise
                 faults.healthy()
-                claimed = []  # #1844: resolved; a later claim fault holds nothing
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -6396,7 +6398,7 @@ class RegistryRunner:
         head: OutboxItem,
         cfg: BatchConfig,
         *,
-        faults: _WorkerFaultLog | None = None,
+        extras_out: list[str] | None = None,
     ) -> tuple[_ItemOutcome, float | None]:
         """Deliver a contiguous FIFO head-prefix as ONE ``BHS``…``BTS`` envelope (#134 / ADR 0082) —
         the batch counterpart of :meth:`_process_delivery_item`, shared by the per_lane worker and the
@@ -6426,16 +6428,19 @@ class RegistryRunner:
         ``max_count`` sequential claims) — a deliberate, opt-in trade of a held slot for envelope size.
 
         **Member ownership on a fault (BACKLOG #1579).** The coalesced members past the head are claimed
-        *here* and named nowhere else: the pooled dispatcher's T17 arm re-pends only the head it handed
-        in, and the per_lane worker's #1611 arm re-pends only the row IT claimed. So an exception
-        escaping the body would leave ``members[1:]`` INFLIGHT with **no recovery owner** — invisible to
-        every claim path (all select ``status='pending'``) and to ``pending_depth``, waiting for
-        ``reset_stale_inflight`` at the next service start. The guard below hands those extras back and
-        re-raises. It re-pends **the extras only**: the head already has an owner in both claim modes,
-        and re-pending it twice would be a second defect.
+        *here*, and the caller's fault arm re-pends only the head it holds (the pooled dispatcher's
+        T17 arm, or the per_lane worker's #1611 arm). So an exception escaping the body would leave
+        ``members[1:]`` INFLIGHT with **no recovery owner** — invisible to every claim path (all select
+        ``status='pending'``) and to ``pending_depth``, waiting for ``reset_stale_inflight`` at the next
+        service start. The guard below hands the extras on and re-raises. It hands on **the extras
+        only**: the head already has an owner in both claim modes, and re-pending it twice would be a
+        second defect.
 
-        ``faults`` is the per-lane worker's :class:`_WorkerFaultLog`, so a failing re-pend here is
-        logged on that worker's backoff (BACKLOG #1844). The pooled adapter passes none."""
+        Where they go depends on ``extras_out`` (BACKLOG #1844). The pooled adapter passes none, and
+        the guard re-pends the extras itself. The per_lane worker passes its own claimed list: the
+        guard appends the extras' ids to it, and the worker's arm re-pends head and extras in ONE
+        write. Two writes for one failed pass would record twice on the worker's backoff, doubling
+        its count and pinning the extras' line to positions the schedule never emits."""
         members: list[OutboxItem] = [head]
         try:
             return await self._deliver_coalesced_batch(name, cfg, members)
@@ -6445,9 +6450,11 @@ class RegistryRunner:
             # would re-pend rows that legitimately completed. ``reschedule_claimed`` being
             # ``status='inflight'``-guarded is what makes this safe over a PARTIALLY resolved set —
             # it is not a licence to run the re-pend unconditionally.
-            await self._repend_claimed_on_fault(
-                "batch delivery", name, [it.id for it in members[1:]], faults=faults
-            )
+            extras = [it.id for it in members[1:]]
+            if extras_out is not None:
+                extras_out.extend(extras)  # the caller's re-pend owns them now
+            else:
+                await self._repend_claimed_on_fault("batch delivery", name, extras)
             raise
 
     async def _deliver_coalesced_batch(
@@ -6642,6 +6649,9 @@ class RegistryRunner:
                     if outcome[0] is _ItemOutcome.STOPPED:
                         await self._release_tail_on_stop("router", name, claimed[i + 1 :])
                         return
+                # #1844: resolved. Cleared BEFORE the buildup check, whose store reads can raise, so
+                # its fault does not re-pend rows this pass already handed off.
+                claimed = []
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # ingress backlog is building (a slow/hung router). Uses the global buildup threshold.
                 now = time.time()
@@ -6651,7 +6661,6 @@ class RegistryRunner:
                         name, stage=Stage.INGRESS.value, threshold=self._buildup_default
                     )
                 faults.healthy()
-                claimed = []  # #1844: resolved; a later claim fault holds nothing
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -6978,8 +6987,8 @@ class RegistryRunner:
                 outcome = await self._process_response_item(name, item)
                 if outcome[0] is _ItemOutcome.STOPPED:
                     return
+                claimed = []  # #1844: resolved, before anything else in the pass can raise
                 faults.healthy()
-                claimed = []  # #1844: resolved; a later claim fault holds nothing
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -7083,6 +7092,9 @@ class RegistryRunner:
                 if await self._process_routed_batch(name, items):
                     await self._release_tail_on_stop("transform", name, claimed)
                     return
+                # #1844: resolved. Cleared BEFORE the buildup check, whose store reads can raise, so
+                # its fault does not re-pend rows this pass already handed off.
+                claimed = []
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # routed (transform) backlog is building behind a slow/hung handler — reported separately
                 # from the ingress lane.
@@ -7093,7 +7105,6 @@ class RegistryRunner:
                         name, stage=Stage.ROUTED.value, threshold=self._buildup_default
                     )
                 faults.healthy()
-                claimed = []  # #1844: resolved; a later claim fault holds nothing
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

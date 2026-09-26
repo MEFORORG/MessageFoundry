@@ -546,6 +546,117 @@ async def test_a_claim_fault_after_a_good_pass_re_pends_nothing(
     assert store.rescheduled == []
 
 
+class _OneRowThenIdleStore:
+    """Pass 1 claims one row; every later claim is empty. Records any re-pend."""
+
+    def __init__(self, stage: str) -> None:
+        self.stage = stage
+        self.claims = 0
+        self.rescheduled: list[list[str]] = []
+
+    async def claim_next_fifo(self, *a: Any, **k: Any) -> OutboxItem | None:
+        self.claims += 1
+        return _row("row-1", self.stage) if self.claims == 1 else None
+
+    async def reschedule_claimed(self, ids: Any, next_attempt_at: float, now: Any = None) -> None:
+        self.rescheduled.append(list(ids))
+
+
+@pytest.mark.parametrize(
+    ("worker_attr", "body_attr", "stage"),
+    [
+        ("_router_worker", "_process_ingress_item", Stage.INGRESS.value),
+        ("_transform_worker", "_process_routed_batch", Stage.ROUTED.value),
+    ],
+)
+async def test_a_buildup_check_fault_after_a_good_pass_re_pends_nothing(
+    worker_attr: str,
+    body_attr: str,
+    stage: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    fast_worker: None,
+) -> None:
+    """The buildup check runs after the pass has handed its rows off, and its store reads can
+    raise. The rows are resolved by then, so that fault must re-pend nothing."""
+    caplog.set_level(logging.INFO, logger=_RUNNER_LOGGER)
+    monkeypatch.setattr(wiring_runner, "_BUILDUP_CHECK_INTERVAL", 0.0)
+    store = _OneRowThenIdleStore(stage)
+    runner = _runner(store)
+
+    async def body(*a: Any, **k: Any) -> Any:
+        if body_attr == "_process_routed_batch":
+            return False  # the batch body's "do not halt"
+        return (wiring_runner._ItemOutcome.PROCESSED, None)
+
+    buildup = {"n": 0}
+
+    async def failing_buildup(*a: Any, **k: Any) -> None:
+        buildup["n"] += 1
+        raise RuntimeError("simulated store outage in the buildup read")
+
+    monkeypatch.setattr(runner, body_attr, body)
+    monkeypatch.setattr(runner, "_maybe_alert_buildup", failing_buildup)
+    task = asyncio.ensure_future(getattr(runner, worker_attr)("IB"))
+    try:
+        await _until(lambda: buildup["n"] >= 1 and store.claims >= 3)
+    finally:
+        await _stop(runner, task)
+    assert _faults(caplog, _RUNNER_LOGGER, logging.ERROR)  # the fault was caught and logged
+    assert store.rescheduled == []
+
+
+class _BatchLaneStore:
+    """A FIFO delivery lane whose head is always due, and whose re-pend always fails."""
+
+    def __init__(self) -> None:
+        self.reschedules: list[list[str]] = []
+
+    async def claim_next_fifo(self, *a: Any, **k: Any) -> OutboxItem | None:
+        await asyncio.sleep(0)  # a real claim suspends; without this the loop starves the test
+        return _row("head")
+
+    async def reschedule_claimed(self, ids: Any, next_attempt_at: float, now: Any = None) -> None:
+        self.reschedules.append(list(ids))
+        raise RuntimeError("simulated store outage: database is locked")
+
+
+async def test_a_failed_batch_pass_records_its_re_pend_once(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, fast_worker: None
+) -> None:
+    """A batching outbound's failed pass holds the head AND the coalesced extras (#1579). Re-pended
+    in two writes, each failure recorded twice per pass: the count read double, and the extras'
+    line always fell on an odd position the schedule never emits. One write, one record."""
+    from messagefoundry.config.models import BatchConfig
+
+    caplog.set_level(logging.INFO, logger=_RUNNER_LOGGER)
+    store = _BatchLaneStore()
+    runner = _runner(store)
+    runner._batch["OB"] = BatchConfig(max_count=3, max_wait_ms=1)
+
+    async def coalesce_then_fail(name: str, cfg: Any, items: list[OutboxItem]) -> Any:
+        items.extend([_row("extra-1"), _row("extra-2")])
+        raise RuntimeError("simulated fault after coalescing")
+
+    monkeypatch.setattr(runner, "_deliver_coalesced_batch", coalesce_then_fail)
+    task = asyncio.ensure_future(runner._delivery_worker("OB"))
+    try:
+        await _until(lambda: len(store.reschedules) >= 9)
+    finally:
+        await _stop(runner, task)
+
+    # One re-pend per failed pass, naming every row the pass held.
+    assert all(ids == ["head", "extra-1", "extra-2"] for ids in store.reschedules)
+    repends = [
+        r
+        for r in _faults(caplog, _RUNNER_LOGGER, logging.WARNING)
+        if "reschedule_claimed failed" in r.getMessage()
+    ]
+    n = len(store.reschedules)
+    assert [_count(r) for r in repends] == [k for k in (1, 2, 4, 8, 16, 32, 64) if k <= n]
+    assert all("for 3 claimed row(s)" in r.getMessage() for r in repends)
+
+
 # --- the pooled dispatcher (the default claim mode) ------------------------------------------------
 
 
@@ -615,7 +726,7 @@ async def test_the_pooled_claimer_backs_off_its_traceback(
     faults = _faults(caplog, _DISPATCHER_LOGGER, logging.WARNING)
     assert [_count(f) for f in faults] == [1, 2, 4]
     assert _recoveries(caplog, _DISPATCHER_LOGGER) == [
-        "StageDispatcher ingress claim recovered after 5 consecutive failures"
+        "StageDispatcher ingress claimer-0 claim recovered after 5 failures in this run"
     ]
     assert claimer.faults == FailureRun()
 
@@ -649,7 +760,7 @@ async def test_a_claim_that_yields_on_a_lock_timeout_does_not_close_the_claimers
     assert claimer.faults.count == 2
     await d._claim_and_dispatch(claimer, [])
     assert _recoveries(caplog, _DISPATCHER_LOGGER) == [
-        "StageDispatcher ingress claim recovered after 2 consecutive failures"
+        "StageDispatcher ingress claimer-0 claim recovered after 2 failures in this run"
     ]
 
 
@@ -662,10 +773,16 @@ async def test_stopping_mid_outage_says_the_run_ended_without_a_recovery(
     claimer = d._claimers[0]
     for _ in range(3):
         await d._claim_and_dispatch(claimer, [])
-    assert d._close_run_on_stop(claimer.faults, "claim") == FailureRun()
+    assert (
+        d._close_run_on_stop(
+            claimer.faults, "claimer-0 claim", count_label=stage_dispatcher._CLAIM_RUN_COUNT
+        )
+        == FailureRun()
+    )
     assert d._close_run_on_stop(FailureRun(), "sweep") == FailureRun()  # a healthy run says nothing
     assert [r.getMessage() for r in caplog.records if "stopped with" in r.getMessage()] == [
-        "StageDispatcher ingress claim: stopped with 3 consecutive failures and no recovery"
+        "StageDispatcher ingress claimer-0 claim: stopped with 3 failures in this run and no "
+        "recovery"
     ]
 
 
@@ -748,7 +865,8 @@ async def test_a_real_stop_mid_outage_closes_every_open_run(
     stopped = [r.getMessage() for r in caplog.records if "stopped with" in r.getMessage()]
     assert len(stopped) == 3, stopped
     assert stopped[0] == (
-        "StageDispatcher ingress claim: stopped with 3 consecutive failures and no recovery"
+        "StageDispatcher ingress claimer-0 claim: stopped with 3 failures in this run and no "
+        "recovery"
     )
     assert stopped[1].startswith("StageDispatcher ingress claimer-0 release: stopped with ")
     assert stopped[2].startswith("StageDispatcher ingress sweep: stopped with ")

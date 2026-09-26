@@ -23,10 +23,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-__all__ = ["CONSECUTIVE", "FailureRun", "is_emission"]
+__all__ = ["CONSECUTIVE", "IN_THIS_RUN", "FailureRun", "is_emission"]
 
 #: The default name for what :attr:`FailureRun.count` counts, as it appears in every record.
 CONSECUTIVE = "consecutive failures"
+
+#: The name for a run that can span passes that did not fail, so its count is not consecutive.
+IN_THIS_RUN = "failures in this run"
 
 #: How much of an exception's message the cause signature keeps. A run holds its signature for as
 #: long as it lasts and compares it on every failure, and a message can carry a peer-sized payload.

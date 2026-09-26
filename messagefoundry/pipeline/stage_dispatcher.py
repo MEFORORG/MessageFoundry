@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Protocol
 
-from messagefoundry.log_backoff import FailureRun
+from messagefoundry.log_backoff import CONSECUTIVE, IN_THIS_RUN, FailureRun
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.phase_timing import (
     _DELIVERY_PHASE_EMIT_INTERVAL,  # the ONE definition of this package's log-throttle window
@@ -70,6 +70,9 @@ _LANE_ERROR_BACKOFF_SECONDS = 1.0
 # Claimer store-error backoff: the whole chunk's lanes return to READY and this claimer's partition
 # pauses ~this long (chunk-scoped; raise K to shrink the blast radius). ADR 0066 §11 item 1.
 _CLAIM_ERROR_BACKOFF_SECONDS = 1.0
+# BACKLOG #1844: what a claimer's claim run counts. Not "consecutive": a claim that returns on a lock
+# timeout (#1270) does not close the run, so the run can span claims that returned.
+_CLAIM_RUN_COUNT = IN_THIS_RUN
 # BACKLOG #1609: claimer/sweep respawn pacing. The FIRST respawn is immediate, matching the per_lane
 # worker supervisors (wiring_runner._on_worker_done). A replacement that dies again before it has run
 # cleanly (iterated, then kept running) for _RESPAWN_STABLE_SECONDS waits base * 2**(streak - 1),
@@ -194,6 +197,9 @@ class _Claimer:
     claimed for them (INFLIGHT). ``_claim_and_dispatch`` records both before it re-raises; the
     replacement releases the rows and only then re-readies the lanes (:meth:`_adopt_abandoned`)."""
 
+    # The partition's task name, ``claimer-<index>``: every log line about its runs carries it, so
+    # K>1 claimers' interleaved counts and closing lines can be told apart (#1844).
+    name: str
     ready: deque[str] = field(default_factory=deque)
     ready_set: set[str] = field(default_factory=set)
     event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -347,7 +353,9 @@ class StageDispatcher:
         self._infra_fault_backoff_cap = infra_fault_backoff_cap
 
         self._states: dict[str, _LaneState] = {}
-        self._claimers: list[_Claimer] = [_Claimer() for _ in range(claimers_per_stage)]
+        self._claimers: list[_Claimer] = [
+            _Claimer(name=self._task_name(i)) for i in range(claimers_per_stage)
+        ]
         # Bench-gated phase timing (default OFF, read ONCE here — never per claim / per episode). The ONE
         # Two SEPARATE bench levers, deliberately.
         # * claim (MEFOR_DELIVERY_PHASE_TIMING): a claimer's loop is serial, so this stage's lanes are
@@ -693,15 +701,17 @@ class StageDispatcher:
         self._timers.clear()
         self._timer_deadline.clear()
         self._lane_tasks.clear()
-        for i, claimer in enumerate(self._claimers):
+        for claimer in self._claimers:
             claimer.ready.clear()
             claimer.ready_set.clear()
             claimer.task = None
             claimer.abandoned.clear()
             claimer.orphan_ids.clear()
-            claimer.faults = self._close_run_on_stop(claimer.faults, "claim")
+            claimer.faults = self._close_run_on_stop(
+                claimer.faults, f"{claimer.name} claim", count_label=_CLAIM_RUN_COUNT
+            )
             claimer.release_faults = self._close_run_on_stop(
-                claimer.release_faults, f"{self._task_name(i)} release"
+                claimer.release_faults, f"{claimer.name} release"
             )
         self._sweep_faults = self._close_run_on_stop(self._sweep_faults, "sweep")
         self._slots_free = self._max_processing_lanes
@@ -709,7 +719,9 @@ class StageDispatcher:
         self._supervised.clear()
         self._running = False
 
-    def _close_run_on_stop(self, run: FailureRun, what: str) -> FailureRun:
+    def _close_run_on_stop(
+        self, run: FailureRun, what: str, *, count_label: str = CONSECUTIVE
+    ) -> FailureRun:
         """The clean run a restart-in-place begins with (#1844), saying so if one was open: without
         the line, the last word on a claimer or sweep stopped mid-outage is its last fault record,
         which reads the same as a fault that never ended.
@@ -719,10 +731,11 @@ class StageDispatcher:
         claimer continues its predecessor's runs, as the sweep's replacement does."""
         if run.count:
             log.warning(
-                "StageDispatcher %s %s: stopped with %d consecutive failures and no recovery",
+                "StageDispatcher %s %s: stopped with %d %s and no recovery",
                 self._stage.value,
                 what,
                 run.count,
+                count_label,
             )
         return FailureRun()
 
@@ -995,11 +1008,13 @@ class StageDispatcher:
             claimer.faults = claimer.faults.record(
                 log,
                 exc,
-                "StageDispatcher %s claim failed for %d lane(s); backing off %.1fs",
+                "StageDispatcher %s %s claim failed for %d lane(s); backing off %.1fs",
                 self._stage.value,
+                claimer.name,
                 len(lanes),
                 _CLAIM_ERROR_BACKOFF_SECONDS,
                 level=logging.WARNING,
+                count_label=_CLAIM_RUN_COUNT,
             )
             await self._sleep_or_stop(_CLAIM_ERROR_BACKOFF_SECONDS)
             return
@@ -1014,7 +1029,12 @@ class StageDispatcher:
                 # lock timeout (#1270), which is the store still in trouble, reported on its own line.
                 # Inside the try (#1609): the rows are INFLIGHT from here, so even this line is covered.
                 claimer.faults = claimer.faults.clear(
-                    log, "StageDispatcher %s claim", self._stage.value, level=logging.WARNING
+                    log,
+                    "StageDispatcher %s %s claim",
+                    self._stage.value,
+                    claimer.name,
+                    level=logging.WARNING,
+                    count_label=_CLAIM_RUN_COUNT,
                 )
             if self._claim_phase_timing:
                 # Recorded synchronously (no await between the read and the counter writes), so a sibling
