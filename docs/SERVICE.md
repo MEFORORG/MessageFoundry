@@ -512,7 +512,18 @@ moved the console/bind/origin switches into `[security]`.)
 Browse to this service's `/ui` (`https://127.0.0.1:8765/ui`) and sign in. The engine always serves
 HTTPS: with no `[api].tls_cert_file` it mints a self-signed certificate on first run, beside the
 store database as `api-generated-cert.pem`, so the browser warns until you import that file into the
-trust store or configure your own certificate. See
+trust store or configure your own certificate.
+
+**The engine renews that certificate early, and you must re-import it.** At startup, once less than
+a third of its lifetime is left (about 122 of its 365 days) or it has expired, the engine replaces
+it with a new key and certificate under the same file names. It never touches a certificate you
+configured in `[api].tls_cert_file`, and it never renews while running: the expiry monitor warns
+for an engine that is never restarted. Each renewal is logged at WARNING and written to the audit
+log as `api.tls_generated_pair_replaced`, with the old and new SHA-256 fingerprints. **After a
+renewal, import the new `api-generated-cert.pem` into the browser trust store again, and replace
+any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews once, before it
+starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
+See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)
 

@@ -240,6 +240,10 @@ diverge enough to warrant it; keep this root file general.
   library** (no engine state, I/O, or DB) — a client (e.g. the harness's rehomed Parse Tree view) **may**
   import it for client-side rendering. That is not "reaching into the engine"; importing any other engine
   package (`pipeline/`, `store/`, `transports/`, `config/`) from a client is still forbidden.
+  [`tests/test_dependency_boundaries.py`](tests/test_dependency_boundaries.py) enforces that ban
+  statically, for direct imports of those four packages, and the only exceptions are the paths its
+  `_CLIENT_ALLOWED` names, each for just the packages its entry lists; a client that needs MLLP
+  framing or `AckMode` imports the leaf `messagefoundry.mllpcodec`.
 - **Author config as modular Python.** Put shared helpers in `_`-prefixed files (the loader skips
   `_*`) and import them from siblings — don't copy-paste boilerplate. For a ported / non-trivial feed,
   split it by role — connections (`connections.toml`) / `@router` / `@handler` / `_<feed>_transforms.py`
