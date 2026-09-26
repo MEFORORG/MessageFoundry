@@ -214,7 +214,8 @@ _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
 #: consumers of it are a log line, a dead-letter row's ``last_error`` and an alert, each of which
 #: redacts and then truncates to :data:`~messagefoundry.redaction._DEFAULT_LIMIT` (200) anyway. Five
-#: times that is room for a peer to name the offending segment and then some.
+#: times that is room for a peer to name the offending segment and then some. MSA-1 and MSA-2 share
+#: the bound through :func:`_bounded_ack_field`; MSA-3 is the field it was sized for.
 #:
 #: **The bound belongs here rather than only downstream because the length is the PEER's to choose.**
 #: ``receive_max_bytes`` caps the ACK frame, not this field inside it, so MSA-3 arrives sized to the
@@ -226,10 +227,11 @@ _MAX_NAK_DETAIL_CHARS = 1024
 
 def _bounded_ack_field(value: str | None) -> str:
     """A peer-chosen ACK field, bounded for the exception message it is about to be written into
-    (BACKLOG #1576).
+    (BACKLOG #1576, #1847).
 
-    One helper for both fields that reach a raise, so the two cannot drift: adding the bound to MSA-3
-    and leaving MSA-2 beside it is the shape this fix arrived in, and the shape a review caught.
+    One helper for every peer-sized field that reaches a raise (MSA-1, MSA-2 and MSA-3 today), so
+    they cannot drift: adding the bound to MSA-3 and leaving MSA-2 beside it is the shape #1576
+    arrived in, and MSA-1 was the one left after that (#1847).
     ``clamp_untrusted`` and not a slice -- cutting at an arbitrary offset strands a fragment under the
     redactor's thresholds and walks the identifier into the log downstream."""
     return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)

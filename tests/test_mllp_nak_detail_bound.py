@@ -409,8 +409,8 @@ async def test_a_hostile_ack_code_is_bounded_too() -> None:
     """MSA-1 is the third peer-chosen field ``_check_ack`` writes into a raise (BACKLOG #1847).
 
     MSA-1 is the acknowledgment code, and a peer can send one of any length. Every code other than
-    AA/CA reaches the ``NegativeAckError`` message. Before #1847 it went in whole: a 2,097,152-character
-    MSA-1 gave a 2,097,173-character message.
+    AA/CA reaches the ``NegativeAckError`` message. Before #1847 it went in whole: this arm's
+    4,194,304-character MSA-1 gave a 4,194,325-character message, measured on ``633c303a2``.
 
     **The classification must not move.** The code is compared RAW, so an oversized MSA-1 is not AR
     or CR and lands on the transient AE branch. Bounding only the text keeps it there. The fixture is
