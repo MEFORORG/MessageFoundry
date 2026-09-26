@@ -712,8 +712,8 @@ def route(msg):
 |---------|-----|---------|---------|
 | `directory` | both | — (required) | folder to poll / write into |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
-| `poll_seconds` | in | `1.0` | poll interval |
-| `min_age_seconds` | in | `0` | skip files modified within this window (partial writes) |
+| `poll_seconds` | in | `1.0` | poll interval. It is also the **settle window**: a file is read only once two polls in a row see the same size and modification time (BACKLOG #1811), so every file waits at least one poll. The settle gate is always on and has no setting. |
+| `min_age_seconds` | in | `0` | skip files modified within this window. This is an extra wait on top of the settle gate, not the gate itself; set it for a partner that pauses between writes for longer than `poll_seconds`. |
 | `after_read` | in | `move` | `move` (→ `.processed`), `delete`, or `leave` (process **in place** — never move/delete the source file, for a read-only share / a directory another system owns; a hashed dedup ledger ensures a left file is ingested **once**, #142) |
 | `sort` | in | `name` | process order: `name` or `mtime` |
 | `recursive` | in | `false` | also scan subdirectories |
@@ -956,8 +956,13 @@ its own policy block below):
   the operator) and logged. A *textual-but-non-conformant* HL7 file still flows through and is recorded
   as an `ERROR`-status message by the parser (raw preserved in the store). A **transient** read failure
   (file locked / mid-write) or an **infrastructure** failure (store unavailable) **leaves the file in
-  place to retry** next scan — never an accept-and-drop. Use `min_age_seconds` to skip files still being
-  written. As a backstop, the source compares a file's size and modification time on each side of the
+  place to retry** next scan — never an accept-and-drop. A local File source reads a file only once
+  **two polls in a row** see the same size and modification time (the settle gate, BACKLOG #1811), so a
+  partner that pauses between writes for less than `poll_seconds` is waited out. It is always on; the
+  cost is one poll of latency per file. A partner that pauses for longer than `poll_seconds` can still
+  get past it, so for that partner use its write-then-rename, or a `min_age_seconds` longer than its
+  pause. The SFTP/FTP source has no settle gate yet. As a backstop, the source also compares a file's
+  size and modification time on each side of the
   read (BACKLOG #116). A file that changes **during** the read is not emitted that scan. One that
   changes **after** it is not moved or deleted, so the next scan reads it whole, and a WARNING says the
   message already handed off may be cut short. That message is **not a duplicate**: the pipeline treats
