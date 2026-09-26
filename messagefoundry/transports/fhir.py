@@ -874,6 +874,29 @@ def _resolve_read_url(
     return url
 
 
+def _mint_bearer(token: Any, prefix: str) -> str:
+    """Mint the SMART bearer for a lookup, raising :class:`FhirLookupError` if the mint fails.
+
+    The mint runs before the GET's own ``try``, and the provider raises ``DeliveryError`` (a refused
+    token reply is an ``EgressReplyError``, a subclass) or, for an over-length configured token URL,
+    ``ValueError``. A Handler and the sandbox worker catch only the lookup error types, so an escaped
+    mint failure read as a Handler crash (BACKLOG #1980). The ``DeliveryError`` text names only the
+    redacted token host and path plus a status or reason, never the assertion or the reply body, so
+    it is echoed like the sibling mappings; the ``ValueError`` is summarised, not echoed."""
+    from messagefoundry.config.fhir_lookup import FhirLookupError
+
+    try:
+        bearer: str = token.access_token()
+    except DeliveryError as exc:
+        raise FhirLookupError(f"{prefix}: {exc}") from exc
+    except ValueError as exc:
+        raise FhirLookupError(
+            f"{prefix}: the SMART token request could not be built (a configured SMART value was "
+            "refused)"
+        ) from exc
+    return bearer
+
+
 class FhirLookupExecutor:
     """GET-only executor for handler-callable **live** FHIR reads (``fhir_lookup``, ADR 0043).
 
@@ -1082,7 +1105,8 @@ class FhirLookupExecutor:
         headers = dict(self._headers[connection])
         token = self._token[connection]
         if token is not None:
-            headers["Authorization"] = f"Bearer {token.access_token()}"
+            bearer = _mint_bearer(token, f"fhir_lookup on {connection!r}")
+            headers["Authorization"] = f"Bearer {bearer}"
         # ASVS 4.2.5. ``url`` here is built per call, so it is the most message-derived URL in the
         # engine, and the minted bearer is added just above -- neither was ever measured. A
         # FhirLookupError (not a delivery error) because this read runs inside a Handler: there is no
@@ -1169,7 +1193,8 @@ class FhirLookupExecutor:
         headers = dict(self._headers[connection])
         token = self._token[connection]
         if token is not None:
-            headers["Authorization"] = f"Bearer {token.access_token()}"
+            bearer = _mint_bearer(token, f"FhirLookup {connection!r}")
+            headers["Authorization"] = f"Bearer {bearer}"
         # ASVS 4.2.5. ``url`` here is built per call, so it is the most message-derived URL in the
         # engine, and the minted bearer is added just above -- neither was ever measured. A
         # FhirLookupError (not a delivery error) because this read runs inside a Handler: there is no

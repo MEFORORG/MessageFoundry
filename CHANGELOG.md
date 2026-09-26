@@ -108,6 +108,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A failed SMART token mint in `fhir_lookup` now raises `FhirLookupError`, not a raw
+  `DeliveryError`.** A lookup mints its bearer before the GET, outside the handling that maps
+  every other lookup failure. So a token endpoint that was down, refused the client, sent a
+  garbled reply, or framed its reply ambiguously let the provider's `DeliveryError` escape. The
+  sandbox worker and a Handler catch only the lookup error types, so on a first deployment that
+  failure would have read as a Handler crash rather than a lookup failure. The mint now maps to
+  `FhirLookupError`, with the cause chained. The message names the redacted token host and the
+  status or reason, never the client assertion or the reply body. An over-length configured token
+  URL maps the same way, with a fixed message. The connection probe had the same gap and is fixed
+  too. (`BACKLOG #1980`)
 - **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
   it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
   `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals

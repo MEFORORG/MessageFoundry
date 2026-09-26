@@ -12,6 +12,7 @@ end-to-end dry-run-raises / router-raises behavior. Synthetic data only — neve
 from __future__ import annotations
 
 import email.message
+import http.client
 import io
 import json
 import threading
@@ -24,6 +25,7 @@ import pytest
 
 from messagefoundry import FhirRaw, FhirToken, fhir_lookup, fhirsearch
 from messagefoundry.config.fhir_lookup import FhirLookupError, activated
+from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
@@ -36,12 +38,18 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline import dryrun
 from messagefoundry.pipeline.wiring_runner import check_fhir_lookup_allowed
 from messagefoundry.store import MessageStatus
+from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.bounded_read import AmbiguousFramingError
 from messagefoundry.transports.fhir import (
     FhirLookupExecutor,
     _encode_search_params,
     _resolve_read_url,
 )
-from messagefoundry.transports.smart import SmartAuthError, with_smart_backend
+from messagefoundry.transports.smart import (
+    SmartAuthError,
+    SmartBackendTokenProvider,
+    with_smart_backend,
+)
 
 BASE = "https://fhir.example.org/fhir"
 _CONN = {"epic": {"url": BASE}}
@@ -646,6 +654,132 @@ async def test_smart_bearer_applied_and_reminted_on_401() -> None:  # AC-5
     with pytest.raises(FhirLookupError, match="401"):
         await ex2.read("epic", "Patient/123")
     assert prov2.invalidated == 1
+
+
+# --- a SMART token failure surfaces as FhirLookupError (BACKLOG #1980) -------
+#
+# The bearer is minted before the GET's own try, so a failed mint once escaped the lookup as the
+# provider's raw DeliveryError. The sandbox worker and a Handler both catch only the lookup error
+# types, so that escape read as a Handler crash. These drive a REAL provider against a faked token
+# endpoint, so each failure is the one the provider actually raises, not a stand-in.
+
+_TOKEN_URL = "https://auth.example.org/oauth2/token"
+
+
+def _wire(raw: bytes) -> http.client.HTTPResponse:
+    """A real parsed ``HTTPResponse`` over ``raw``, with no socket involved."""
+
+    class _Sock:
+        def makefile(self, *a: object, **k: object) -> io.BytesIO:
+            return io.BytesIO(raw)
+
+        def close(self) -> None:
+            pass
+
+    resp = http.client.HTTPResponse(_Sock(), method="POST")  # type: ignore[arg-type]
+    resp.begin()
+    return resp
+
+
+class _WireOpener:
+    """A token-endpoint opener that answers with a real parsed reply built from ``raw``."""
+
+    def __init__(self, raw: bytes) -> None:
+        self.raw = raw
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> Any:
+        return _wire(self.raw)
+
+
+# Transfer-Encoding beside Content-Length: reply_framing_fault refuses it (RFC 9112 section 6.1).
+_AMBIGUOUS_TOKEN_REPLY = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+    b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+)
+
+_TOKEN_FAILURES: dict[str, tuple[Any, type[BaseException]]] = {
+    # A 200 whose body is no token response: _parse_token_response raises DeliveryError.
+    "garbled": (_FakeOpener(body=b"<html>not a token</html>"), DeliveryError),
+    # A reply whose framing is ambiguous: the bounded read raises an EgressReplyError.
+    "ambiguous-framing": (_WireOpener(_AMBIGUOUS_TOKEN_REPLY), AmbiguousFramingError),
+    # The endpoint is down: DeliveryError.
+    "unreachable": (_FakeOpener(exc=urllib.error.URLError("connection refused")), DeliveryError),
+    # The endpoint refuses the client: DeliveryError naming the status.
+    "http-400": (_FakeOpener(exc=_http_error(400, b'{"error":"invalid_client"}')), DeliveryError),
+}
+
+
+@pytest.fixture(scope="module")
+def _ec_pem() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+
+
+def _smart_executor(pem: str, token_opener: Any) -> tuple[FhirLookupExecutor, _FakeOpener]:
+    """A lookup executor whose connection carries a real SMART provider on a faked token endpoint."""
+    ex, fhir_opener = _executor(body=PATIENT.encode())
+    provider = SmartBackendTokenProvider(
+        token_url=_TOKEN_URL,
+        client_id="cid",
+        private_key=pem,
+        algorithm=SignatureAlgorithm.ES256,
+        scope="system/Patient.rs",
+    )
+    provider._opener = token_opener  # type: ignore[assignment]
+    ex._token["epic"] = provider  # type: ignore[attr-defined]
+    return ex, fhir_opener
+
+
+def _assert_token_failure_is_a_lookup_error(
+    err: pytest.ExceptionInfo[FhirLookupError],
+    cause_type: type[BaseException],
+    fhir_opener: _FakeOpener,
+) -> None:
+    assert type(err.value) is FhirLookupError
+    assert isinstance(err.value.__cause__, cause_type)  # the cause stays chained
+    assert "epic" in str(err.value)
+    # Secret-safe: no reply body and no token-URL query reach the message. The redacted token
+    # host and path may, as they do in every sibling mapping.
+    for secret in ("invalid_client", "not a token", "hello", "aaaa"):
+        assert secret not in str(err.value)
+    # No FHIR request went out without its bearer.
+    assert fhir_opener.requests == []
+
+
+@pytest.mark.parametrize("failure", sorted(_TOKEN_FAILURES))
+async def test_smart_token_failure_on_read_is_a_lookup_error(_ec_pem: str, failure: str) -> None:
+    token_opener, cause_type = _TOKEN_FAILURES[failure]
+    ex, fhir_opener = _smart_executor(_ec_pem, token_opener)
+    with pytest.raises(FhirLookupError) as err:
+        await ex.read("epic", "Patient/123")
+    _assert_token_failure_is_a_lookup_error(err, cause_type, fhir_opener)
+
+
+@pytest.mark.parametrize("failure", sorted(_TOKEN_FAILURES))
+async def test_smart_token_failure_on_probe_is_a_lookup_error(_ec_pem: str, failure: str) -> None:
+    token_opener, cause_type = _TOKEN_FAILURES[failure]
+    ex, fhir_opener = _smart_executor(_ec_pem, token_opener)
+    with pytest.raises(FhirLookupError) as err:
+        await ex.test_connection("epic")
+    _assert_token_failure_is_a_lookup_error(err, cause_type, fhir_opener)
+
+
+async def test_smart_token_url_over_the_length_limit_is_a_lookup_error(_ec_pem: str) -> None:
+    # The mint measures the configured token URL and raises ValueError when it is over the limit.
+    # That is a config fault the Handler cannot fix, but it must still arrive as the lookup error.
+    ex, fhir_opener = _smart_executor(_ec_pem, _FakeOpener())
+    ex._token["epic"].token_url = _TOKEN_URL + "?" + "a" * 9000  # type: ignore[attr-defined]
+    for call in (lambda: ex.read("epic", "Patient/123"), lambda: ex.test_connection("epic")):
+        with pytest.raises(FhirLookupError) as err:
+            await call()
+        _assert_token_failure_is_a_lookup_error(err, ValueError, fhir_opener)
 
 
 # --- CapabilityStatement probe (AC-8) ----------------------------------------
