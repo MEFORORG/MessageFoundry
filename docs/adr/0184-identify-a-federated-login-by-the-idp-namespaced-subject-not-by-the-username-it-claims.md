@@ -65,7 +65,20 @@
   `directory_identity_conflict`. The bind refuses to move it to another pair, and the unbind still
   removes it. Section 0 of [CLAUDE.md](../../CLAUDE.md) (zero deployments) means no such binding
   exists outside a test.
-- **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25; slice C built 2026-09-25)
+- **Slice C remainder BUILT 2026-09-26 (BACKLOG #2027). The paragraph above, "What holds for a
+  binding made before slice C: nothing new", no longer describes the code; it is kept as the record
+  of slice C.** A binding on an id-less row is now never re-resolved by name. `authenticate_oidc`
+  refuses a pair that selects such a row as `directory_object_id_missing`, before the directory is
+  consulted, and leaves the binding in place. `reconcile_directory_sessions` skips the row, and
+  audits `auth.ad_reconcile_skipped` with that reason once per account per process. The lock-out
+  slice C avoided falls on nobody, under section 0. **The cost:** AC-5's second clause cannot hold
+  for such a row, since it has no id to probe by, so a directory disable or demotion reaches its
+  sessions only at their expiry. The remedy is the unbind, after which the row is an ordinary id-less
+  account. Pinned by `test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_name` in
+  `tests/test_auth_oidc_service.py` and `test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name`
+  in `tests/test_ad_session_reconcile.py`.
+- **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25; slice C built 2026-09-25;
+  its remainder built 2026-09-26)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session
   mechanism field serves) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)
@@ -248,7 +261,9 @@ part 4.)*
   *Built 2026-09-25 (slice C), by construction rather than by a check in the reconciler: the admin
   bind refuses a row with no `directory_object_id`, so a binding made since then never sits on a row
   the probe keys by name. A binding made before slice C on an id-less row is not covered; see the
-  slice C status line.*
+  slice C status line.* *Its first clause now holds for that row too (BACKLOG #2027): the pass skips
+  it rather than probe it by name. The second clause cannot hold there; see the slice C remainder
+  status line.*
 - **AC-6** — WHEN a federated login presents no `federated_subject` (the simple-bind and Kerberos
   callers), THE SYSTEM SHALL take no pair-keyed branch and SHALL emit the same audit row it emits today.
   → `tests/test_ad_login_pathway_split.py`

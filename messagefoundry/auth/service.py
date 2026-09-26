@@ -285,7 +285,9 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 
 #: The closed-set reason :meth:`AuthService.bind_federated_subject` refuses an account with when the
 #: account carries no ``directory_object_id`` (BACKLOG #1143 slice C, ADR 0184 AC-5). Written into the
-#: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`.
+#: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`. Also the
+#: reason a federated login refuses an already-bound id-less row, and a reconciliation pass skips one
+#: (BACKLOG #2027). Deliberately absent from the browser layer's code map, so it shows as generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
 #: The text ``POST /users`` answers a taken username with, from its pre-check and from
@@ -527,10 +529,12 @@ class DirectoryObjectIdMissing(ValueError):
 
     **WHAT THE REFUSAL MAKES HOLD, AND WHAT IT DOES NOT.** Every binding the administrative bind
     writes sits on a row carrying an id, and the id is written at the row's creation and never
-    cleared, so both re-resolves above ask by the id for it. It does not reach three things: a
-    binding written onto an id-less row before this refusal existed, which keeps its name-keyed
-    re-resolve (ADR 0184, slice C status line); a direct ``set_user_federated_subject`` call, which
-    checks no id, and whose one caller is the bind; and the step-up re-proof, which binds by name.
+    cleared, so both re-resolves above ask by the id for it. It does not reach two things: a direct
+    ``set_user_federated_subject`` call, which checks no id, and whose one caller is the bind; and
+    the step-up re-proof, which binds by name. A binding already on an id-less row, written before
+    this refusal existed or planted through that setter, is no longer re-resolved by name either
+    (BACKLOG #2027): the federated login refuses it with this same reason, and the reconciler
+    skips it (``_holds_unkeyed_federated_binding``).
     **The cost:** on a directory that returns no readable ``objectGUID``, no account can be bound.
     """
 
@@ -585,6 +589,17 @@ def _reproof_refusal_reason(proof: _Reproof) -> str:
 def _live_lock(user: UserRecord, now: float) -> bool:
     """Whether ``user`` is under a lockout that has not yet expired at ``now``."""
     return user.locked_until is not None and now < user.locked_until
+
+
+def _holds_unkeyed_federated_binding(user: UserRecord) -> bool:
+    """Whether ``user`` carries a federated binding but no ``directory_object_id`` (BACKLOG #2027).
+
+    Either half of the pair counts as a binding, matching the unbind's own predicate. Such a row's
+    only directory key is its username, and ADR 0184 AC-5 forbids re-resolving a bound row by that,
+    so the engine has no key it may ask the directory with.
+    """
+    has_binding = user.oidc_issuer is not None or user.oidc_subject is not None
+    return has_binding and not user.directory_object_id
 
 
 def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
@@ -932,6 +947,9 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
+        #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
+        #: #2027), so each is logged and audited once per process rather than once per pass.
+        self._reconcile_unkeyed_reported: set[str] = set()
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_secret: str | None = None
@@ -1900,13 +1918,33 @@ class AuthService:
             # through the directory path.
             await self._directory_reject_audit(username, "oidc", "local_account_conflict")
             return LoginOutcome(ok=False, error="account conflict", reason="local_account_conflict")
+        if not bound.directory_object_id:
+            # BACKLOG #2027 (ADR 0184 AC-5). A BOUND ROW WITH NO IMMUTABLE ID IS REFUSED, NOT
+            # RE-RESOLVED BY NAME. The bind refuses such a row since BACKLOG #1143 slice C, so this
+            # reaches only a binding written before that, or planted in the store. Its only
+            # directory key is its username, and a directory may reissue a freed name to another
+            # person; the re-resolve below would then hand the pair's holder that person's groups.
+            #
+            # Refused before the directory is consulted, and the binding is left in place rather
+            # than cleared. Clearing is the audited admin unbind's act, and a login that wrote it
+            # would sign the account out and notify its holder on the say-so of whoever presented
+            # the pair. Refusing writes nothing and leaves the remedy to an administrator: unbind,
+            # then follow DirectoryObjectIdMissing's steps to re-create the account with an id.
+            #
+            # The error is the generic one, and the web console collapses this slug to
+            # `oidc_failed`. The precise reason is on the audit row, for the operator.
+            await self._directory_reject_audit(username, "oidc", DIRECTORY_OBJECT_ID_MISSING)
+            return LoginOutcome(
+                ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
+            )
 
         # ADR 0184 part 2 and AC-2: RE-RESOLVE THE DIRECTORY PRINCIPAL FROM THE BOUND ROW, never from
         # the claim. Carrying on with a principal resolved from the claimed username is the half-done
         # re-ordering the ADR warns about: `_upsert_ad_user` would touch the claimed name's row and
         # `roles_for_ad_groups` would write that name's groups onto the bound account. The row's own
         # object id is handed over as the reconciler hands it, so a directory-side rename still
-        # resolves (BACKLOG #1532).
+        # resolves (BACKLOG #1532). The branch above guarantees the row carries one, so this
+        # re-resolve is never keyed on the name alone (BACKLOG #2027).
         try:
             principal = await asyncio.to_thread(
                 self._ldap.resolve_principal, bound.username, object_id=bound.directory_object_id
@@ -2545,7 +2583,9 @@ class AuthService:
         property rather than a choice here: one that returns no readable ``objectGUID`` leaves every
         row unbound, and the engine cannot key on an identifier it is never given. Such a site keeps
         the old behaviour, rename wart included; ``auth/ldap.py`` warns once per distinct shape so an
-        operator can find out.
+        operator can find out. **Except a row that carries a federated binding** (ADR 0184 AC-5,
+        BACKLOG #2027): :meth:`reconcile_directory_sessions` never hands one here, and
+        :meth:`_report_unkeyed_bindings` says why and what it costs.
 
         ``resolve_principal`` is the password-free service-account lookup the Kerberos path uses. It
         already rejects an account ``auth.ldap._account_enabled`` refuses by returning ``None`` on
@@ -2612,13 +2652,21 @@ class AuthService:
         # rather than a new store method, so this control needs no schema change on any backend.
         candidates: list[tuple[str, str]] = []
         users: dict[str, UserRecord] = {}
+        unkeyed: list[UserRecord] = []
         for user in await self._store.list_users():
             if user.auth_provider != AuthProvider.AD.value or user.disabled:
                 continue
             if not await self._store.list_sessions(user.id):
                 continue
+            if _holds_unkeyed_federated_binding(user):
+                # BACKLOG #2027 (ADR 0184 AC-5): never probed by name. Filtered HERE rather than
+                # answered as UNAVAILABLE by the probe, so it neither inflates the pass's
+                # "directory unreachable" count nor, as a pass's only candidate, reads as an outage.
+                unkeyed.append(user)
+                continue
             candidates.append((user.id, user.username))
             users[user.id] = user
+        await self._report_unkeyed_bindings(unkeyed)
         reconcile.prune_ledger(self._reconcile_strikes, users)
         reconcile.prune_ledger(self._reconcile_last_probed, users)
         if not candidates:
@@ -2872,6 +2920,46 @@ class AuthService:
             detail=_json({"user_id": user_id, "source": "directory"}),
             client=client,
         )
+
+    async def _report_unkeyed_bindings(self, unkeyed: Sequence[UserRecord]) -> None:
+        """Log and audit, once per account per process, each bound id-less row a pass skipped
+        (BACKLOG #2027).
+
+        **THE SKIP HAS A COST, AND THIS IS WHERE IT IS MADE VISIBLE.** ADR 0184 AC-5 forbids a name
+        probe of a bound row, and this row has no other key, so a directory disable or demotion no
+        longer ends its sessions within one interval; they end at their own expiry. That follows the pass's
+        convention for an account it cannot ask about, the fail-open UNAVAILABLE arm, rather than
+        revoking: revoking on every pass would sign a Windows SSO holder out each interval with no
+        end. The remedy is the audited admin unbind. The row is then an ordinary id-less account,
+        probed by name as any such row on that directory is.
+
+        The row is left bound on purpose. Clearing a binding is an administrator's audited act,
+        and this loop has no administrator behind it.
+        """
+        current = {user.id for user in unkeyed}
+        self._reconcile_unkeyed_reported &= current
+        for user in unkeyed:
+            if user.id in self._reconcile_unkeyed_reported:
+                continue
+            self._reconcile_unkeyed_reported.add(user.id)
+            _log.warning(
+                "directory reconcile: %s carries a federated binding but no directory object id, "
+                "so it is not probed by name and a directory disable will not end its sessions "
+                "before they expire. Unbind it (DELETE /users/{user_id}/federated-identity) to "
+                "return it to the reconciler.",
+                user.username,
+            )
+            await self._audit(
+                "auth.ad_reconcile_skipped",
+                actor="<reconciler>",
+                detail=_json(
+                    {
+                        "reason": DIRECTORY_OBJECT_ID_MISSING,
+                        "user_id": user.id,
+                        "username": user.username,
+                    }
+                ),
+            )
 
     async def _abort_reconcile_pass(self, plan: reconcile.ReconcilePlan) -> None:
         """Record an aborted pass. Applies NOTHING — the point of the abort."""

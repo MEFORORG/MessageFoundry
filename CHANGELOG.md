@@ -252,6 +252,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a federated link on an account with no directory id no longer signs anyone in.** The
+  link-time refusal further down this section (`BACKLOG #1143` slice C) stops new links on such an
+  account. This closes the ones made before it.
+  A federated sign-in whose `(issuer, sub)` selects an account with no `directory_object_id` is now
+  refused before the directory is asked. The login page shows the generic failure, and the
+  `auth.login_failed` audit row carries `directory_object_id_missing`. The directory recheck no
+  longer asks about such an account by its username either. It skips it and writes one
+  `auth.ad_reconcile_skipped` row with the same reason, once per account per process.
+  - **Why.** The username is the only key such an account has. A directory can give a freed
+    username to a new person, and the linked account would then take that person's groups (ADR
+    0184 AC-5).
+  - **The cost.** The recheck no longer ends that account's sessions when the directory disables
+    or demotes it; they end at their own expiry. The fix is to remove the link with
+    `DELETE /users/{user_id}/federated-identity`. The account is then an ordinary directory
+    account and the recheck covers it again. The link is never removed automatically.
+
+  Federation still ships off. (`BACKLOG #2027`, ADR 0184)
 - **A connection can now attest its hop secure, and the attestation is reported.** `inbound()`,
   `outbound()`, `FhirLookup()`, `DatabaseLookup()` and `DatabaseRef()` take `tls_hop_attested` with a
   mandatory `tls_hop_attested_reason`. So do `connections.toml` inbound and outbound tables, as
@@ -468,10 +485,11 @@ All notable changes to MessageFoundry are documented here. The format follows
     `objectGUID`, turn Windows SSO on if it is off, delete the account, and have the person sign in
     once with Windows SSO. Nothing else creates a directory account. The new account has a new
     `user_id`, so the old one's uploads, upload quota and saved searches do not follow.
-  - **A link made before this change on such an account is left in place.** This change adds no
-    sign-in refusal for it, and it can still be removed. It cannot be moved to another `sub`. On a
-    directory that now returns `objectGUID`, its sign-in is already refused as
-    `directory_identity_conflict`, as it was before this change.
+  - **A link made before this change on such an account is left in place.** It can still be
+    removed, and it cannot be moved to another `sub`. This change added no sign-in refusal for it;
+    the `BACKLOG #2027` entry at the top of this section does. On a directory that now
+    returns `objectGUID`, its sign-in is already refused as `directory_identity_conflict`, as it
+    was before this change.
 
   Federation still ships off. (`BACKLOG #1143`, slice C, ADR 0184)
 - **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
