@@ -252,9 +252,10 @@ class ApprovalGate:
 
         **The audit log must accept the release before the operation runs (BACKLOG #1940).** An
         ``approval.release_attempted`` row is written first; if that write fails the approve is
-        refused with 503 and the request stays pending. Once the operation has run, a failed
-        ``approval.approved`` AUDIT write is logged at ERROR and the release still reports success.
-        A failed ``executing`` to ``approved`` STATUS write still raises (BACKLOG #1562); see
+        refused with 503 and the request stays pending. Once the operation has run, neither
+        outcome write raises: a failed ``executing`` to ``approved`` status write, or a failed
+        ``approval.approved`` audit write, is logged at ERROR and the release still reports success.
+        A failed status write may leave the row ``executing``; see
         :meth:`_record_approved_execution`."""
         row = await self._require_pending(approval_id)
         requester_user_id = row["requester_user_id"]
@@ -508,13 +509,13 @@ class ApprovalGate:
     ) -> None:
         """Move a completed release from ``executing`` to ``approved`` and write ``approval.approved``.
 
-        The audit row is written even when the status write fails, because the operation ran either
-        way. The two writes fail differently. A failed STATUS write raises to a caller that is still
-        waiting (BACKLOG #1562), and the row may be left ``executing``. A failed AUDIT write is logged at
-        ERROR with the lost detail and does not raise (BACKLOG #1940): the operation has run, and the
+        The operation has run by the time this is called, so NEITHER write raises (BACKLOG #1940's
+        reasoning, applied to both). A 500 would tell the approver the release failed, and a new
+        request would then run the operation a second time. A failed STATUS write is logged at ERROR
+        with the approval id and the row may be left ``executing``. The audit
+        row is still attempted. A failed AUDIT write is logged at ERROR with the lost detail; the
         ``approval.release_attempted`` row written before the claim already records the release
-        against both identities. Once the caller is cancelled, :func:`_shielded` logs any error."""
-        settle_error: Exception | None = None
+        against both identities."""
         try:
             # Guarded on 'executing', so it can only move the row this call claimed.
             if not await self._store.decide_pending_approval(
@@ -529,13 +530,13 @@ class ApprovalGate:
                     "was not moved to 'approved'",
                     approval_id,
                 )
-        except Exception as exc:  # noqa: BLE001 - re-raised below, after the audit row is attempted
+        except Exception:  # noqa: BLE001 - the operation already ran; see the docstring
             log.exception(
-                "approval %s: the operation ran but moving the row to 'approved' failed; it may "
-                "still read 'executing'",
+                "approval %s: operation '%s' RAN, but moving the row to 'approved' failed; it may "
+                "still read 'executing'. The failure is not raised, because the operation ran",
                 approval_id,
+                operation,
             )
-            settle_error = exc
         # BACKLOG #1940: the operation HAS run by this point, so a failed audit write here must not
         # turn into an error. A 500 would tell the approver the release failed, and a re-request
         # would run a replay or a reload a second time. The approval.release_attempted row already
@@ -571,8 +572,6 @@ class ApprovalGate:
                 operation,
                 approved_detail,
             )
-        if settle_error is not None:
-            raise settle_error
 
     async def _settle_cancelled_claim(
         self,

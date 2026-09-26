@@ -887,9 +887,13 @@ async def test_cancel_during_the_claim_settles_to_failed_and_never_runs(engine: 
     assert await engine.store.list_audit(action="approval.approved") == []
 
 
-async def test_a_failed_approved_write_still_writes_the_audit_row(engine: Engine) -> None:
-    """The operation RAN. If moving the row to 'approved' fails, approval.approved is still written
-    and the error still reaches the caller; the row is left 'executing', never 'failed'."""
+async def test_a_failed_approved_write_still_writes_the_audit_row(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The operation RAN. If moving the row to 'approved' fails, approval.approved is still written,
+    the failure is logged at ERROR, and the approver still gets success: a 500 would invite a new
+    request that runs the operation twice (BACKLOG #1940's reasoning, applied to the status write).
+    The row is left 'executing', never 'failed'."""
     from tests._pending_approval_store_contract import _resolve, _StandingStore
 
     class _SettleFails(_StandingStore):
@@ -904,11 +908,18 @@ async def test_a_failed_approved_write_still_writes_the_audit_row(engine: Engine
         "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
     )
     assert approval_id is not None
-    with pytest.raises(OSError):
-        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        outcome = await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert outcome["result"] == {"ran": True}
     assert len(await engine.store.list_audit(action="approval.approved")) == 1
     assert await engine.store.list_audit(action="approval.failed") == []
     assert await _status_of(engine, approval_id) == "executing"
+    assert any(
+        r.levelno == logging.ERROR
+        and approval_id in r.getMessage()
+        and "moving the row to 'approved' failed" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # --- BACKLOG #1540: the self-approval refusal keys on users.id, not on the username --------

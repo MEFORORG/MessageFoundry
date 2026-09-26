@@ -164,7 +164,7 @@ The console is the **browser web console** served same-origin by the engine at `
 https://127.0.0.1:8765/ui
 ```
 
-The engine always serves HTTPS. With no `[api].tls_cert_file`, it mints a self-signed certificate on first run, beside the store database as `api-generated-cert.pem`, so the browser warns until you import that file into the trust store or configure your own certificate.
+The engine always serves HTTPS. With no `[api].tls_cert_file`, it mints a self-signed certificate on first run, beside the store database as `api-generated-cert.pem`, so the browser warns until you import that file into the trust store or configure your own certificate. The engine renews that certificate by itself at startup once less than a third of its lifetime is left (about 122 of its 365 days), and audits the renewal. The renewed certificate is a new one, so import it again, and replace any copy you pass to `--cacert`.
 
 The web console prompts for sign-in (authentication is on by default). Source: [packaging/messagefoundry-webconsole/](../packaging/messagefoundry-webconsole/). (The former PySide6 desktop console was retired — BACKLOG #103; PySide6 now backs only the standalone test harness.)
 

@@ -56,6 +56,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING — the `Http()` inbound listener answers 400 to a request with no `Host` or with two.**
+  RFC 9112 section 3.2 requires a server to refuse both shapes. In the shipped code an HTTP/1.1
+  request with no `Host` was accepted, and a second `Host` silently replaced the first. The listener
+  routes on no `Host` value, but a fronting proxy that honoured the first `Host` would have disagreed
+  with it about the second. Both shapes are now refused while the request head is read, before any
+  body byte is read or anything is dispatched. Each is a `framing_error` event with no ingress row,
+  and the refusal never echoes the header's value. An HTTP/1.0 request with no `Host` is still
+  accepted, because that version predates the field, and so is an empty `Host:` value. A `Host`
+  value's syntax is not checked. **A deploying sender or health probe that sends HTTP/1.1 with no
+  `Host` would be refused**, and must send one. (`BACKLOG #1972`)
 - **BREAKING: `serve` now refuses to start when the credential reminders have no `[alerts]`
   recipient.** The unclaimed-temporary-password and cert-expiry reminders go to the `[alerts]`
   notifier. That notifier needs `webhook_url`, or `email_to` beside `email_smtp_host` and
@@ -135,6 +145,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   `approval.approved` write is logged at ERROR and the release still succeeds. The replay and
   reload executors had the mirror defect: their own audit row failing after the action ran made
   the gate mark the request `failed`. They now log that failure at ERROR instead. (`BACKLOG #1940`)
+- **A dual-control release now records whether its operation finished, failed or was cut off.**
+  The gate used to mark a request `approved` before the operation ran, so a crash or a request
+  timeout mid-run left a row claiming an outcome nobody saw. The gate now claims the request as
+  `executing`, then settles it once the operation stops. `approved` means it ran and returned.
+  `failed` means it raised, or the release was cancelled before it started. `interrupted` means it
+  was cancelled while running, so it may have done none, some or all of its work; that writes a new
+  `approval.interrupted` audit row, and nothing retries it. Every outcome write is shielded, so a
+  second cancel cannot stop it. If the move to `approved` fails after the operation ran, the error
+  is logged and the release still succeeds, and the row may stay `executing`. A process that dies
+  mid-run also leaves its row at `executing`; nothing reconciles those rows yet.
+  (`BACKLOG #1562`)
 - **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
   stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
   stage stopped draining while intake kept acknowledging, and the engine still read healthy. The

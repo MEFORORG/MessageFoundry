@@ -1022,8 +1022,10 @@ worse than a stuck row, so an operator has to check the operation's own effects.
 route to settle an `interrupted` row yet. A process that dies mid-operation leaves its row at
 `executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
 share one store, and each would see the others' live releases as leftovers. If the operation ran but
-the move from `executing` to `approved` fails, the approve returns an error and the row may stay at
-`executing`; the gate still tries to write the `approval.approved` audit row.
+the move from `executing` to `approved` fails, the error is logged and the release still succeeds,
+because the operation has already run and an error would invite a new request that runs it twice.
+The row may stay at `executing`, and the gate still tries to write the `approval.approved` audit
+row.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

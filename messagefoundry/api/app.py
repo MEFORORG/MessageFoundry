@@ -203,6 +203,7 @@ from messagefoundry.api.security import (
     require_step_up,
     ws_token,
 )
+from messagefoundry.api.tls import GeneratedPairReplaced, record_generated_pair_replacements
 from messagefoundry.api.validation import (
     MAX_EVENT_KINDS,
     MAX_EXPORT_IDS,
@@ -7038,6 +7039,7 @@ def create_managed_app(
     backup_settings: BackupSettings | None = None,
     dr_settings: DrSettings | None = None,
     api_tls_cert_file: str | None = None,
+    api_tls_replacements: Sequence[GeneratedPairReplaced] = (),
     api_tls_client_cert_files: Sequence[str] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
@@ -7203,6 +7205,9 @@ def create_managed_app(
             # alert_instance.suspended_until so an operator suspend set before this process started is
             # honored from the first emit. Best-effort (a store error is swallowed; notify path unaffected).
             await notifier.prime_suspensions()
+        # ADR 0172 decision 6: a renewed or recovered generated API pair was replaced before the store
+        # existed, so its audit row is written here, the first moment it can be. Dormant when empty.
+        await record_generated_pair_replacements(store, api_tls_replacements)
         # Startup self-attestation of the installed engine wheel (ADR 0041 D3) — runs BEFORE the engine
         # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
         # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
