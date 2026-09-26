@@ -145,8 +145,8 @@ def test_every_writer_lock_block_is_guarded() -> None:
     method -- reds on its count. Add an INSERT to an allowlisted block -- reds as a writer."""
     blocks = _lock_blocks(STORE.read_text(encoding="utf-8"))
 
-    # Receipts: a walker that found nothing would pass vacuously. Measured on the #1803 branch:
-    # 75 guard blocks (70 with DML this reader can see), 24 _writer_txn blocks, 5 bare.
+    # Receipts: a walker that found nothing would pass vacuously. Measured 2026-09-26 on engine main
+    # plus #1803: 76 guard blocks (70 with DML this reader can see), 26 _writer_txn blocks, 5 bare.
     guards = [b for b in blocks if b.kind == "_writer_guard"]
     txns = [b for b in blocks if b.kind == "_writer_txn"]
     assert len(guards) > 60, f"liveness: only {len(guards)} _writer_guard blocks seen"

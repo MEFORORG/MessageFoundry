@@ -10834,7 +10834,7 @@ class MessageStore:
     ) -> bool:
         """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 WITHDRAW_AD_SCOPE_SQL,
                 (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
@@ -10993,12 +10993,12 @@ class MessageStore:
                 await self._db.execute(_SESSION_INSERT, params)
                 await self._commit()
             return True
-        # _writer_txn for the GUARDED path, not the bare lock the unguarded one keeps (BACKLOG
+        # _writer_txn for the GUARDED path, not the _writer_guard the unguarded one uses (BACKLOG
         # #1474). The lock alone is what makes the read and the INSERT atomic against
-        # clear_user_federated_subject, which takes the same lock — but this branch is now a
-        # MULTI-statement writer, and those go through the one helper that unwinds on BaseException,
-        # so a cancellation between the two cannot leave a transaction open for the next writer to
-        # inherit (ADR 0159). The refusal below rolls back itself, as that helper's contract requires.
+        # clear_user_federated_subject, which takes the same lock — but this branch is a
+        # MULTI-statement writer with an explicit transaction, so it goes through _writer_txn, which
+        # unwinds on BaseException (ADR 0159). The refusal below rolls back itself, as that helper's
+        # contract requires.
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT oidc_issuer, oidc_subject FROM users WHERE id=?", (user_id,)
