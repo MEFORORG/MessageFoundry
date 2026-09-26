@@ -23,13 +23,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import json
 import secrets
 import time
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+
+from messagefoundry.redaction import json_loads_or_refusal
 
 _VERIFIER_BYTES = 48  # 64 base64url chars — within RFC 7636's 43..128
 _STATE_BYTES = 32
@@ -346,10 +347,12 @@ def exchange_code(
         refusal = "token endpoint response could not be read"
     if refusal is not None:
         raise FlowError(refusal)
-    try:
-        payload = json.loads(body)
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise FlowError("token endpoint response is not valid JSON") from exc
+    # No handler here, for the same reason (BACKLOG #2048): the decode error holds the WHOLE reply,
+    # tokens included. The helper also catches json's depth-limit RecursionError, which used to
+    # escape this function as a non-FlowError.
+    payload, refusal = json_loads_or_refusal(body)
+    if refusal is not None:
+        raise FlowError(f"token endpoint response is not valid JSON ({refusal})")
     if not isinstance(payload, dict):
         raise FlowError("token endpoint response is not a JSON object")
     if "id_token" not in payload:

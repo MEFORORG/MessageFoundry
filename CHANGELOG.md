@@ -307,6 +307,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   got that answer. On those two backends the insert is refused by the foreign key to the account.
   The engine now re-reads the account to tell the two refusals apart. SQL Server has no such foreign
   key, so there the insert is not refused and this change does not apply. (`BACKLOG #1807`)
+- **The FHIR parsers and the OIDC token exchange no longer put their input on the exception
+  chain.** `FhirPeek.parse`, `FhirResource.parse` and `exchange_code` each raised a content-free
+  error `from exc`. The chained decode error holds the whole input: the FHIR body, or the token
+  endpoint's reply. The default traceback printer does not show it. Anything that reads the chain
+  by attribute would have written it to a log on first deployment. All three now decode
+  through `redaction.json_loads_or_refusal` and raise outside any handler, so `__cause__` and
+  `__context__` are both empty. The message keeps a content-free hint: the line and column, or the
+  error's class name. A token reply nested past json's depth limit now also fails as a login
+  error; it used to escape `exchange_code` as a `RecursionError`. At least four other JSON parse
+  sites still chain the decode error and are not covered here. (`BACKLOG #2048`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
