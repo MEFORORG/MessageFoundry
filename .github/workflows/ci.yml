@@ -121,7 +121,7 @@ jobs:
       # `push || workflow_dispatch` (NOT `!= 'pull_request'`) so the nightly `schedule` event does NOT
       # re-run this full functional matrix — the cron is reserved for the long load legs only.
 
-      # DELIBERATELY UNGATED — the one step in this job with no `code` condition.
+      # DELIBERATELY UNGATED — this step carries no `code` condition.
       #
       # The ledger gate polices the ADR number space, and an ADR-only PR is by definition DOCS-ONLY, so
       # `code == 'false'` and every gated step above is skipped. Gating this one the same way would
@@ -668,8 +668,8 @@ jobs:
       # non-step addends, setup 4:05 against 2:32). An earlier revision said "sized on windows-2025 as the
       # worse of the pair" without qualification -- that is FALSE for the job cap.
       #
-      # THE JOB CAP IS NOT A ROUNDING-UP OF THE STEP CAP, AND IT HAS FIRED. Two steps in this job carry
-      # a `timeout-minutes`, so the job must contain the SUM of two gated budgets plus setup -- a
+      # THE JOB CAP IS NOT A ROUNDING-UP OF THE STEP CAP, AND IT HAS FIRED. At least two steps in this
+      # job carry a `timeout-minutes`, so the job must contain the SUM of two gated budgets plus setup -- a
       # quantity neither step cap can bound on its own.
       #
       # UNTIL BACKLOG #344 PROPOSAL 5 THAT SUM WAS UNBOUNDABLE, because both steps drew on the SAME
@@ -949,6 +949,39 @@ jobs:
           name: connscale-readings-${{ matrix.os }}-py${{ matrix.python-version }}
           path: out/connscale/
           if-no-files-found: ignore
+
+      # BACKLOG #1775. A commit whose own SUBJECT refuses it (the vocabulary is in the script) must not
+      # merge, whoever opened the pull request -- a session by hand, or a mechanical pass over refs that
+      # treats a subject line as decoration. Nothing that opens pull requests reads subjects, so the
+      # refusal is enforced here, where every merge must pass.
+      #
+      # It rides inside this already-REQUIRED leg for the reason the ledger gate gives: a new required
+      # context wedges every pull request opened before it existed. Ungated on `code`, so a docs-only
+      # pull request is scanned too.
+      #
+      # LAST, AND ON `!cancelled()`, so a branch that carries a work-in-progress refusal still gets its
+      # lint, type and test results from this leg first. Placed early, its red would skip every later
+      # step and hide them. Being last also keeps its fetch, which can move the checkout's shallow
+      # boundary, clear of every step that reads history.
+      #
+      # 5 MINUTES, AND NO MORE. On `!cancelled()` this step also runs after a pytest step that used its
+      # whole `step_timeout`, so it must fit in what the ubuntu job cap leaves after setup plus that
+      # step (43 - 31 - about 5.5 minutes of setup). The script's own time budget sits inside it, so a
+      # slow fetch fails the script by name first.
+      #
+      # PULL REQUESTS ONLY. Why `merge_group` is skipped, and what the scan does not cover, is in the
+      # script's docstring and stated there once.
+      - name: Refused commit subjects (pull request range)
+        if: ${{ !cancelled() && runner.os == 'Linux' && github.event_name == 'pull_request' }}
+        timeout-minutes: 5
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+        run: >-
+          python scripts/ci/refused_subjects_check.py
+          --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
+          --expected-count "$PR_COMMITS" --fetch-remote origin
 
   # THE WEB CONSOLE SUITE, IN ITS OWN PARALLEL JOB (was a second step on every `test` leg).
   #

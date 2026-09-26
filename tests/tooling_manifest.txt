@@ -45,6 +45,7 @@ tests/test_ci_merge_group_gate.py
 tests/test_ci_odbc_installer_pipefail.py
 tests/test_ci_red_clearer.py
 tests/test_ci_red_reader.py
+tests/test_ci_refused_subjects.py
 tests/test_ci_retry_native_crash.py
 tests/test_ci_step_margin.py
 tests/test_ci_tooling_gate.py
