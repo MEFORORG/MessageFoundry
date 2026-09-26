@@ -262,13 +262,14 @@ async def test_preferred_delay0_wins_expired_lease_race_over_delayed_node(
     # predicate is false), so the preferred node then claims the same expired lease.
     await dr._maintain_leadership()
     assert dr.is_leader() is False  # expired 0.25s < 0.5s handicap: the real predicate rejects DR
-    owner, _expires = await dr.leadership_lease()
-    assert owner == "L"  # DR's rejected MERGE left the lease row untouched
+    owner, expires = await dr.leadership_lease()
+    assert (owner, expires) == ("L", _FROZEN_EPOCH + _TTL)  # DR's rejected MERGE left the row as-is
     await p._maintain_leadership()
     assert p.is_leader() is True  # delay=0: claims the instant the lease has expired
 
-    owner, _expires = await p.leadership_lease()
-    assert owner == "P"
+    owner, expires = await p.leadership_lease()
+    assert (owner, expires) == ("P", _FROZEN_EPOCH + _TTL + 0.25 + _TTL)
+    assert p.current_epoch() == 2  # a take-over of L's lease, not a renew, so the H1 epoch bumped
 
     # (4) Past the DR node's handicap window, the preferred node renews (owner=me carries NO delay) so
     # it holds a LIVE lease; the DR node runs again and STILL cannot take over. This proves P keeps
