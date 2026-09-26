@@ -106,6 +106,8 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _SESSION_LIVE_SQL,
+    _SESSION_NOT_AHEAD_SQL,
     AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
     MESSAGE_EVENT_KINDS,
@@ -154,6 +156,7 @@ from messagefoundry.store.store import (
     _append_channel_scope,
     _opt_float,
     _qmark_cutoff_case,
+    _session_live_params,
     audit_active_key_id,
     audit_append_secret,
     audit_rekey_when_keyed,
@@ -10918,19 +10921,22 @@ class SqlServerStore:
         return int(count) if count is not None else 0
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, now: float | None = None
+        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
     ) -> None:
-        """Revoke a user's active sessions beyond the ``keep`` most recently created (AUTH-SESS-CAP)."""
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
+        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+            f" AND {_SESSION_NOT_AHEAD_SQL}"
             " AND token_hash NOT IN ("
             "  SELECT TOP (?) token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+            f"  AND {_SESSION_LIVE_SQL}"
             "  ORDER BY created_at DESC, token_hash DESC"
             ")",
-            (now, user_id, keep, user_id),
+            (now, user_id, now, now, keep, user_id, *_session_live_params(now, idle_seconds)),
         )
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:

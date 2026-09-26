@@ -3118,8 +3118,16 @@ class AuthService:
             await self._supersede_session_hash(supersedes_hash, client=client)
         cap = self._settings.max_sessions_per_user
         if cap and cap > 0:
-            # Evict the oldest sessions beyond the cap (the just-created one is newest, so survives).
-            await self._store.enforce_session_cap(user_id, keep=cap)
+            # Keep the newest `cap` LIVE sessions and revoke the lapsed ones. The just-created row
+            # survives: it is the newest live row, or, if the clock stepped back since it was
+            # stamped, it is ahead of the cap's `now` and left alone. The idle timeout is the one
+            # identity_for_token validates against, so a row it would refuse never costs a live
+            # device its place (BACKLOG #1900).
+            await self._store.enforce_session_cap(
+                user_id,
+                keep=cap,
+                idle_seconds=self._settings.session_idle_timeout_minutes * 60,
+            )
         return token
 
     def _rekey_token_state(self, old_hash: str, new_hash: str) -> None:
@@ -3317,9 +3325,10 @@ class AuthService:
         in: ``/me/security-events`` selects rows by actor, so the event belongs in the feed of the
         user whose session ended, and must not put that user's ids in anyone else's.
 
-        An unrevoked row is ALWAYS revoked, even one already over by expiry or idle: the per-user
-        cap counts every unrevoked row, so leaving a lapsed one would let the cap evict a live
-        device in its place. Only a session that was still LIVE gets an audit row, so the trail does
+        An unrevoked row is ALWAYS revoked, even one already over by expiry or idle: ending the
+        presented token is the whole point, whatever its state. (The per-user cap no longer relies on
+        this. Since BACKLOG #1900 it counts only live rows and revokes lapsed ones itself.) Only a
+        session that was still LIVE gets an audit row, so the trail does
         not record the ending of something that had already ended. ``revoke_session`` reports no
         rowcount, so the row is read back: a rotation that re-keyed it between the read and the
         revoke leaves the old hash absent, and then no row claims a revoke that never happened.

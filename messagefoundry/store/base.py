@@ -2149,8 +2149,34 @@ class AuthStore(Protocol):
     ) -> int: ...
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, now: float | None = None
-    ) -> None: ...
+        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+    ) -> None:
+        """Keep a user's ``keep`` most recently created LIVE sessions and revoke the rest, lapsed
+        ones included (AUTH-SESS-CAP, BACKLOG #1900).
+
+        "Live" is exactly what ``AuthService.identity_for_token`` accepts: ``created_at <= now``,
+        ``last_used_at <= now``, ``expires_at >= now`` and ``now - last_used_at <= idle_seconds``,
+        each the negation of one of its rejections with the same comparison, so the two cannot
+        disagree at a boundary. Only live rows compete for the ``keep`` places. Counting every
+        unrevoked row, as this once did, would sign a live device out on first deployment to make
+        room for a newer row the validator already refuses.
+
+        Every other unrevoked row is revoked, with one exception below. A row past its idle or
+        absolute limit is REVOKED here, not skipped: that is what the validator does to it on
+        presentation, so nothing the validator would accept is lost. Skipped, it could come back
+        uncounted. Raising the idle setting would revive it, and the user would hold more than
+        ``keep`` sessions that validate.
+
+        The exception is a row stamped AHEAD of ``now``, which is neither ranked nor revoked. It is
+        usually not a clock step. It is a write that committed after this call read its clock: a
+        concurrent sign-in, a touch from a device in use, or a host whose clock leads. Revoking it
+        would sign that live device out. A genuine clock-step row is still refused by the validator,
+        and the next call ranks it once the clock passes it.
+
+        ``idle_seconds`` is required so the caller states the timeout it validates against; the store
+        never reads settings.
+        """
+        ...
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int: ...
 
