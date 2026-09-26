@@ -2674,13 +2674,13 @@ class AuthService:
                 continue
             candidates.append((user.id, user.username))
             users[user.id] = user
-        await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
         reconcile.prune_ledger(self._reconcile_strikes, users)
         reconcile.prune_ledger(self._reconcile_last_probed, users)
         if not candidates:
             # Nobody signed in: a no-op pass. A latched breaker alert is deliberately NOT cleared
             # here — this pass learned nothing about the directory, and clearing a standing alarm on
             # an absence of information would hide a misconfiguration that is still there.
+            await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             return reconcile.ReconcilePlan()
 
         selected = reconcile.select_candidates(
@@ -2723,6 +2723,7 @@ class AuthService:
         self._reconcile_strikes.update(plan.strikes)
         if plan.aborted is not None:
             await self._abort_reconcile_pass(plan)
+            await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             return plan
 
         self._reconcile_alert = None
@@ -2751,6 +2752,9 @@ class AuthService:
                 new_username=refresh.new_username,
                 held=await self._store.get_user_by_username(refresh.new_username),
             )
+        # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
+        # only this report and never stops the probes and revocations above from running.
+        await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
         return plan
 
     async def _refresh_cached_username(

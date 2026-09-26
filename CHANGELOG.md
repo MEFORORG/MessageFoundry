@@ -261,8 +261,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   longer asks about such an account by its username either. It skips it and writes one
   `auth.ad_reconcile_binding_unkeyed` row with the same reason, once per account per process. That
   is a new audit action, separate from the outage's `auth.ad_reconcile_skipped`, because it is not
-  benign. A Windows SSO sign-in still finds such an account by its username, as it finds any
-  account with no directory id.
+  benign. On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds
+  such an account by its username, as it finds any account with no directory id there.
   - **Why.** The username is the only key such an account has. A directory can give a freed
     username to a new person, and the linked account would then take that person's groups (ADR
     0184 AC-5).

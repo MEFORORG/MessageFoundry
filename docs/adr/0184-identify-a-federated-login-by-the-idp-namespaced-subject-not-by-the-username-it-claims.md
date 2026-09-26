@@ -74,8 +74,8 @@
   federated refusal is this one and no longer `directory_identity_conflict`; a Windows SSO sign-in
   there is still refused as `directory_identity_conflict`. `reconcile_directory_sessions` skips the
   row, and audits `auth.ad_reconcile_binding_unkeyed` with that reason once per account per process.
-  A Windows SSO sign-in still finds an id-less row by its name, bound or not, as BACKLOG #1471 leaves
-  every id-less row on such a directory. The lock-out
+  On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds an id-less
+  row by its name, bound or not, as BACKLOG #1471 leaves every id-less row there. The lock-out
   slice C avoided falls on nobody, under section 0. **The cost:** AC-5's second clause cannot hold
   for such a row, since it has no id to probe by, so a directory disable or demotion reaches its
   sessions only at their expiry. The remedy is the unbind, after which the row is an ordinary id-less
