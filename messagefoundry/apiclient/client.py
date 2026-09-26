@@ -20,7 +20,7 @@ from collections.abc import Callable, Sequence
 from json import JSONDecodeError
 from pathlib import Path
 from types import TracebackType
-from typing import TypeVar
+from typing import Literal, TypeVar
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -48,6 +48,8 @@ from messagefoundry.api.models import (
     AlertInstanceInfo,
     AlertInstanceList,
     AlertsConfig,
+    ApprovalList,
+    ApprovalResolveResult,
     ChannelInfo,
     ClusterNodeList,
     ClusterStatus,
@@ -1182,6 +1184,35 @@ class EngineClient:
         return _decode_approvable(
             self._request("POST", "/config/reload", json={"config_dir": config_dir}),
             ReloadResult,
+        )
+
+    # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
+
+    def list_approvals(self) -> ApprovalList:
+        """The open approval queue: ``pending`` requests awaiting a second approver, then
+        ``interrupted`` releases awaiting a resolve (BACKLOG #1562). Branch on each row's
+        ``status``. Gated by ``approvals:approve``."""
+        return _decode(self._get("/approvals"), ApprovalList)
+
+    def resolve_interrupted_approval(
+        self, approval_id: str, outcome: Literal["effects_applied", "effects_not_applied"]
+    ) -> ApprovalResolveResult:
+        """Record what an ``interrupted`` release did (BACKLOG #1562 part B). The engine never
+        re-runs the operation, whichever ``outcome`` is sent.
+
+        ``approvals:approve`` behind a fresh step-up, so the step-up/MFA handlers may prompt before
+        this returns; call it on the primary client, not a :meth:`for_polling` clone. Refusals are an
+        :class:`ApiError` carrying the engine's ``status``: ``403`` for the original requester, a
+        missing permission or a stale step-up, ``404`` for an unknown id, ``409`` for a row that is
+        not ``interrupted`` (including one another operator resolved first), and ``503`` when the
+        audit log refused the record, in which case the row is left ``interrupted``, or, in the rare
+        case the engine could not undo its status write, left resolved with no audit row (the
+        message says which)."""
+        return _decode(
+            self._request(
+                "POST", f"/approvals/{_seg(approval_id)}/resolve", json={"outcome": outcome}
+            ),
+            ApprovalResolveResult,
         )
 
     def stats(self) -> StatsResponse:

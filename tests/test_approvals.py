@@ -16,6 +16,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -1007,3 +1008,297 @@ async def test_a_request_with_no_requester_id_is_refused_fail_closed(engine: Eng
         assert row is not None and str(row["status"]) == "pending"
         # And the id is what the refusal turned on -- the requester's NAME is still present.
         assert str(row["requester"]) == "jdoe"
+
+
+# --- BACKLOG #1562 part B: resolving an interrupted release ----------------------------------------
+# Owner ruling 2026-09-26: any holder of approvals:approve, with a fresh step-up, never the requester,
+# records "effects applied" or "not applied". Audited, never re-runs, listed beside pending approvals.
+
+
+async def test_interrupted_resolution_store_contract(engine: Engine) -> None:
+    """The SQLite leg of the shared resolution contract; the server legs run the same body."""
+    from tests._pending_approval_store_contract import _assert_interrupted_resolution_contract
+
+    await _assert_interrupted_resolution_contract(engine.store)
+
+
+def _app_client(
+    engine: Engine, service: AuthService, runs: list[str]
+) -> tuple[ApprovalGate, httpx.AsyncClient]:
+    """A client over the real app, with the replay executor swapped for one that records each run,
+    so a test can prove a resolve never runs the operation."""
+    app = create_app(engine, auth=service, approvals=ON)
+    gate: ApprovalGate = app.state.approval_gate
+
+    async def _counts(_p: Mapping[str, Any]) -> dict[str, Any]:
+        runs.append("ran")
+        return {"requeued": 0}
+
+    gate.register("dead_letter_replay", "replay", _counts, permission=Permission.MESSAGES_REPLAY)
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    return gate, client
+
+
+async def _interrupted_row(engine: Engine, requester: str, requester_user_id: str) -> str:
+    """Forge the row an interrupted release leaves: claimed as 'executing' by 'releaser', then cut off.
+    Forged through the store's own transitions, so the row has exactly the shape the gate writes."""
+    approval_id = uuid4().hex
+    await engine.store.create_pending_approval(
+        approval_id=approval_id,
+        operation="dead_letter_replay",
+        params="{}",
+        requester=requester,
+        requester_user_id=requester_user_id,
+        requested_at=time.time() - 60.0,
+        expires_at=None,
+    )
+    assert await engine.store.decide_pending_approval(
+        approval_id, status="executing", approver="releaser", decided_at=time.time() - 30.0
+    )
+    assert await engine.store.decide_pending_approval(
+        approval_id,
+        status="interrupted",
+        approver="releaser",
+        decided_at=time.time() - 20.0,
+        from_status="executing",
+    )
+    return approval_id
+
+
+def _resolve_url(approval_id: str) -> str:
+    return f"/approvals/{approval_id}/resolve"
+
+
+async def test_get_approvals_lists_interrupted_beside_pending(engine: Engine) -> None:
+    """Pre-part-B an interrupted row was absent from GET /approvals, so nobody could find it."""
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    runs: list[str] = []
+    _gate, c = _app_client(engine, service, runs)
+    async with c:
+        pending_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        interrupted_id = await _interrupted_row(engine, "op", op_id)
+        listed = (await c.get("/approvals", headers=await _token(c, "approver"))).json()
+    by_id = {a["id"]: a for a in listed["approvals"]}
+    assert by_id[pending_id]["status"] == "pending"
+    assert by_id[interrupted_id]["status"] == "interrupted"
+    assert by_id[interrupted_id]["approver"] == "releaser"
+    assert by_id[interrupted_id]["decided_at"] is not None
+    assert by_id[interrupted_id]["requester"] == "op"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status"),
+    [("effects_applied", "resolved_applied"), ("effects_not_applied", "resolved_not_applied")],
+)
+async def test_resolve_records_the_outcome_audits_it_and_never_runs(
+    engine: Engine, outcome: str, status: str
+) -> None:
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    await _add(service, "resolver", Role.ADMINISTRATOR)
+    runs: list[str] = []
+    _gate, c = _app_client(engine, service, runs)
+    async with c:
+        approval_id = await _interrupted_row(engine, "op", op_id)
+        admin = await _token(c, "resolver")
+        r = await c.post(_resolve_url(approval_id), headers=admin, json={"outcome": outcome})
+        assert r.status_code == 200, r.text
+        assert r.json() == {
+            "operation": "dead_letter_replay",
+            "requested_by": "op",
+            "approved_by": "releaser",
+            "resolved_by": "resolver",
+            "outcome": outcome,
+            "status": status,
+        }
+        # Resolved rows leave the open queue.
+        listed = (await c.get("/approvals", headers=admin)).json()["approvals"]
+        assert all(a["id"] != approval_id for a in listed)
+        # A second resolve finds nothing interrupted to resolve.
+        again = await c.post(_resolve_url(approval_id), headers=admin, json={"outcome": outcome})
+        assert again.status_code == 409
+    assert await _status_of(engine, approval_id) == status
+    assert runs == [], "a resolve must never run the operation"
+    assert await engine.store.list_audit(action="approval.approved") == []
+    resolved = await engine.store.list_audit(action="approval.resolved")
+    assert len(resolved) == 1
+    assert str(resolved[0]["actor"]) == "resolver"
+    assert json.loads(str(resolved[0]["detail"])) == {
+        "approval_id": approval_id,
+        "operation": "dead_letter_replay",
+        "requester": "op",
+        "approver": "releaser",
+        "outcome": outcome,
+        "status": status,
+    }
+
+
+async def test_requester_cannot_resolve_their_own_interrupted_request(engine: Engine) -> None:
+    service = await _service(engine)
+    maker_id = await _add(service, "maker", Role.ADMINISTRATOR)  # holds approvals:approve itself
+    await _add(service, "other", Role.ADMINISTRATOR)
+    runs: list[str] = []
+    _gate, c = _app_client(engine, service, runs)
+    async with c:
+        approval_id = await _interrupted_row(engine, "maker", maker_id)
+        own = await c.post(
+            _resolve_url(approval_id),
+            headers=await _token(c, "maker"),
+            json={"outcome": "effects_applied"},
+        )
+        assert own.status_code == 403
+        assert "your own request" in own.json()["detail"]
+        assert await _status_of(engine, approval_id) == "interrupted"
+        # Positive control: the same request, the same body, a different approver.
+        ok = await c.post(
+            _resolve_url(approval_id),
+            headers=await _token(c, "other"),
+            json={"outcome": "effects_applied"},
+        )
+        assert ok.status_code == 200
+    assert [str(r["actor"]) for r in await engine.store.list_audit(action="approval.resolved")] == [
+        "other"
+    ]
+
+
+async def test_resolve_requires_a_fresh_step_up(engine: Engine) -> None:
+    """Approve and reject are require_paced; resolve is require_step_up, per the owner ruling."""
+    from messagefoundry.auth.tokens import hash_token
+
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    await _add(service, "resolver", Role.ADMINISTRATOR)
+    runs: list[str] = []
+    _gate, c = _app_client(engine, service, runs)
+    async with c:
+        approval_id = await _interrupted_row(engine, "op", op_id)
+        admin = await _token(c, "resolver")
+        token = admin["Authorization"].removeprefix("Bearer ")
+        await service.store.mark_session_reauthed(hash_token(token), now=0.0)  # window elapsed
+        stale = await c.post(
+            _resolve_url(approval_id), headers=admin, json={"outcome": "effects_applied"}
+        )
+        assert stale.status_code == 403
+        assert stale.headers.get("X-Step-Up-Required") == "1"
+        assert await _status_of(engine, approval_id) == "interrupted"
+        # Positive control: re-prove the password, and the same session may resolve.
+        reauth = await c.post("/me/reauth", headers=admin, json={"password": PW})
+        assert reauth.status_code == 200, reauth.text
+        # A successful elevation re-keys the session (ASVS 7.2.4); carry the new bearer.
+        rotated = {"Authorization": f"Bearer {reauth.json()['token']}"}
+        ok = await c.post(
+            _resolve_url(approval_id), headers=rotated, json={"outcome": "effects_applied"}
+        )
+        assert ok.status_code == 200, ok.text
+
+
+async def test_resolve_requires_the_approve_permission(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)  # fresh login, but no approvals:approve
+    runs: list[str] = []
+    _gate, c = _app_client(engine, service, runs)
+    async with c:
+        approval_id = await _interrupted_row(engine, "maker", "maker-id")
+        r = await c.post(
+            _resolve_url(approval_id),
+            headers=await _token(c, "op"),
+            json={"outcome": "effects_not_applied"},
+        )
+        assert r.status_code == 403
+        assert r.headers.get("X-Step-Up-Required") is None  # refused on permission, not step-up
+    assert await _status_of(engine, approval_id) == "interrupted"
+    assert await engine.store.list_audit(action="approval.resolved") == []
+
+
+async def test_resolve_refuses_a_row_that_is_not_interrupted(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "resolver", Role.ADMINISTRATOR)
+    runs: list[str] = []
+    _gate, c = _app_client(engine, service, runs)
+    async with c:
+        admin = await _token(c, "resolver")
+        pending_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        r = await c.post(
+            _resolve_url(pending_id), headers=admin, json={"outcome": "effects_applied"}
+        )
+        assert r.status_code == 409
+        assert "only an interrupted request can be resolved" in r.json()["detail"]
+        # An approved row is refused too, and resolving it did not run it a second time.
+        assert (await c.post(f"/approvals/{pending_id}/approve", headers=admin)).status_code == 200
+        assert runs == ["ran"]
+        r = await c.post(
+            _resolve_url(pending_id), headers=admin, json={"outcome": "effects_applied"}
+        )
+        assert r.status_code == 409
+        unknown = await c.post(
+            _resolve_url("0" * 32), headers=admin, json={"outcome": "effects_applied"}
+        )
+        assert unknown.status_code == 404
+        bad = await c.post(_resolve_url(pending_id), headers=admin, json={"outcome": "rerun"})
+        assert bad.status_code == 422
+    assert runs == ["ran"]
+    assert await _status_of(engine, pending_id) == "approved"
+    assert await engine.store.list_audit(action="approval.resolved") == []
+
+
+async def test_a_resolve_that_loses_the_race_answers_409(engine: Engine) -> None:
+    """Two resolvers read 'interrupted' at once; the store's guard lets only one record an outcome.
+    Driven by a stale read, so the second resolver passes the status check and meets the guard."""
+    from tests._pending_approval_store_contract import _resolve
+
+    approval_id = await _interrupted_row(engine, "maker", "maker-id")
+    stale = await engine.store.get_pending_approval(approval_id)
+
+    class _StaleRead:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(engine.store, name)
+
+        async def get_pending_approval(self, _approval_id: str) -> Any:
+            return stale
+
+    gate = ApprovalGate(_StaleRead(), ON, resolve_identity=_resolve)  # type: ignore[arg-type]
+    first = await gate.resolve_interrupted(
+        approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
+    )
+    assert first["status"] == "resolved_applied"
+    with pytest.raises(ApprovalError) as caught:
+        await gate.resolve_interrupted(
+            approval_id, outcome="effects_not_applied", resolver="b", resolver_user_id="b-id"
+        )
+    assert caught.value.status == 409 and "already resolved" in caught.value.detail
+    assert await _status_of(engine, approval_id) == "resolved_applied"
+    assert len(await engine.store.list_audit(action="approval.resolved")) == 1
+
+
+async def test_an_audit_refusal_puts_the_row_back_to_interrupted(engine: Engine) -> None:
+    """A resolution with no audit row would be an unattributed change to a dual-control record, so
+    a refused audit write undoes the status write and answers 503."""
+    from tests._pending_approval_store_contract import _resolve
+
+    approval_id = await _interrupted_row(engine, "maker", "maker-id")
+    before = await engine.store.get_pending_approval(approval_id)
+    assert before is not None
+
+    class _AuditRefuses:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(engine.store, name)
+
+        async def record_audit(self, action: str, **kw: Any) -> Any:
+            if action == "approval.resolved":
+                raise OSError("audit log unreachable")
+            return await engine.store.record_audit(action, **kw)
+
+    gate = ApprovalGate(_AuditRefuses(), ON, resolve_identity=_resolve)  # type: ignore[arg-type]
+    with pytest.raises(ApprovalError) as caught:
+        await gate.resolve_interrupted(
+            approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
+        )
+    assert caught.value.status == 503 and "still interrupted" in caught.value.detail
+    after = await engine.store.get_pending_approval(approval_id)
+    assert after is not None
+    assert str(after["status"]) == "interrupted"
+    assert str(after["approver"]) == "releaser"
+    assert float(after["decided_at"]) == float(before["decided_at"])

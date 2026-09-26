@@ -6471,6 +6471,17 @@ class PostgresStore:
             limit,
         )
 
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
+        """Released requests cut off mid-run, newest-first (BACKLOG #1562). No expiry filter: the
+        Store protocol says why."""
+        return await self._fetchall(
+            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
+            " expires_at FROM pending_approvals"
+            " WHERE status = 'interrupted'"
+            " ORDER BY requested_at DESC LIMIT $1",
+            limit,
+        )
+
     async def decide_pending_approval(
         self,
         approval_id: str,

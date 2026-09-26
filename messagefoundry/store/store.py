@@ -3934,7 +3934,8 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     requester_user_id TEXT,
     requested_at REAL NOT NULL,
     status       TEXT NOT NULL DEFAULT 'pending',  -- pending | executing | approved | rejected
-                                       -- | expired | failed | interrupted (BACKLOG #1562)
+                                       -- | expired | failed | interrupted | resolved_applied
+                                       -- | resolved_not_applied (BACKLOG #1562)
                                        -- 'executing': released and claimed, the executor is running;
                                        -- 'approved' is written only after the executor returns
                                        -- 'failed': the executor raised, or the release was cancelled
@@ -3942,6 +3943,9 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
                                        -- (ASVS 2.3.3 compensation)
                                        -- 'interrupted': cancelled mid-execution; the outcome is
                                        -- UNKNOWN, and nothing retries it
+                                       -- 'resolved_applied' | 'resolved_not_applied': an operator
+                                       -- recorded an interrupted row's effects as applied or
+                                       -- not; the operation is never re-run (BACKLOG #1562)
     approver     TEXT,                 -- the distinct second user who released/declined it
     decided_at   REAL,
     expires_at   REAL                  -- NULL = never; past this a pending request can't be approved
@@ -10008,6 +10012,19 @@ class MessageStore:
             )
             return list(await cur.fetchall())
 
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> list[aiosqlite.Row]:
+        """Released requests cut off mid-run, newest-first (BACKLOG #1562). No expiry filter: the
+        Store protocol says why. Same projection as :meth:`list_pending_approvals`."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
+                " expires_at FROM pending_approvals"
+                " WHERE status = 'interrupted'"
+                " ORDER BY requested_at DESC LIMIT ?",
+                (limit,),
+            )
+            return list(await cur.fetchall())
+
     async def decide_pending_approval(
         self,
         approval_id: str,
@@ -10024,7 +10041,8 @@ class MessageStore:
         The approval gate also uses it to settle a claimed row out of ``executing`` -- to
         ``approved``, to ``failed`` (the ASVS 2.3.3 compensation) or to ``interrupted`` (BACKLOG
         #1562) -- none of which may move a row some other caller already rejected or expired, hence
-        the guard is a parameter rather than a hardcoded literal."""
+        the guard is a parameter rather than a hardcoded literal. The resolve path moves a row out of
+        ``interrupted`` the same way, so two resolvers cannot both record an outcome."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
