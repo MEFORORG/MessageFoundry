@@ -26,8 +26,9 @@ decrypt/verify), **MDN** disposition notifications, **DNS CERT / LDAP** certific
 
 **Fail-loud at construction** (the ``RestDestination``/``EmailDestination`` pattern): a missing
 host/sender/recipient, an unreadable/malformed signing key, cert, recipient cert, or trust anchor, a
-signing key that does not match its cert, or a cleartext-credential misconfiguration **raises here**,
-so it fails at ``check``/dry-run/start — never as a wire-time surprise. The blocking crypto + SMTP
+signing key that does not match its cert, a recipient cert whose key is not RSA, a trial S/MIME build
+that fails, or a cleartext-credential misconfiguration **raises here**, so it fails at
+``check``/dry-run/start — never as a wire-time surprise. The blocking crypto + SMTP
 exchange runs off the event loop via ``asyncio.to_thread``.
 
 **STARTTLS posture is inherited from EMAIL.** The signed+encrypted S/MIME body already protects PHI at
@@ -54,7 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InternalError, InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
@@ -74,6 +75,8 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    NegativeAckError,
+    encode_wire_body,
     register_destination,
 )
 
@@ -92,6 +95,21 @@ logger = logging.getLogger(__name__)
 #: question in 11.3.1; the cell stays partial. And the message is no stronger than that RSA wrap: a
 #: 2048-bit recipient key bounds it near 112 bits of security.
 _CONTENT_CIPHER: pkcs7.ContentEncryptionAlgorithm = algorithms.AES256
+
+#: The fixed synthetic body :meth:`DirectDestination._probe_build` signs and encrypts at construction.
+#: ASCII, so every codec an operator could configure represents it.
+_PROBE_BODY = "MessageFoundry DIRECT construction probe"
+
+#: What a failed S/MIME build raises, named once so the construction probe and the send-time arm
+#: cannot drift apart. ``UnsupportedAlgorithm`` and ``InternalError`` subclass ``Exception`` rather
+#: than ``ValueError``; the first is the reported FIPS refusal (#1921), and the second is how
+#: ``cryptography`` surfaces an OpenSSL error it does not map. Neither is reproduced here.
+_BUILD_ERRORS: tuple[type[Exception], ...] = (
+    ValueError,
+    TypeError,
+    UnsupportedAlgorithm,
+    InternalError,
+)
 
 
 def _as_recipients(value: Any) -> list[str]:
@@ -177,7 +195,9 @@ def _require_key_strength(key: Any, setting: str) -> None:
 
     A key type this connector cannot classify passes rather than raises. The floor exists to catch a
     weak key of a KNOWN type; turning it into a second, silent type gate would refuse Ed25519 on a
-    day someone adds it, for a reason that has nothing to do with strength.
+    day someone adds it, for a reason that has nothing to do with strength. The one type gate this
+    connector does have is separate and names its reason: ``recipient_cert`` must be RSA because the
+    envelope builder supports nothing else (BACKLOG #1918).
     """
     if isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)) and key.key_size < _MIN_RSA_BITS:
         raise ValueError(
@@ -265,10 +285,23 @@ class DirectDestination(DestinationConnector):
         self._recipient_cert = _load_cert(
             "recipient_cert", _read_file("recipient_cert", s.get("recipient_cert"))
         )
-        _require_key_strength(self._recipient_cert.public_key(), "recipient_cert")
+        recipient_key = self._recipient_cert.public_key()
+        # RSA only, because the envelope is. The pinned cryptography's PKCS7EnvelopeBuilder raises
+        # `TypeError: Only RSA keys are supported at this time` for any other recipient key, so an EC
+        # cert would construct cleanly and then fail every send (BACKLOG #1918). The signer and the
+        # trust anchor are NOT restricted: add_signer and verify_directly_issued_by both take EC.
+        if not isinstance(recipient_key, rsa.RSAPublicKey):
+            kind = "EC" if isinstance(recipient_key, ec.EllipticCurvePublicKey) else "not RSA"
+            raise ValueError(
+                f"Direct destination 'recipient_cert' key type is {kind}; S/MIME encryption here "
+                "supports only RSA recipient keys, so every send would fail. Supply the partner's "
+                "RSA encryption certificate."
+            )
+        _require_key_strength(recipient_key, "recipient_cert")
         # Trust anchor — the CA(s) the recipient cert must chain to. Verified at construction so a cert
         # from an untrusted issuer is refused before we ever encrypt PHI to it.
         self._verify_recipient_trusted(_read_file("trust_anchor", s.get("trust_anchor")))
+        self._probe_build()
 
         # STARTTLS-by-default posture, identical to EmailDestination: the S/MIME body already protects
         # PHI, but the SMTP session still carries envelope metadata + any AUTH credentials, so cleartext
@@ -498,6 +531,27 @@ class DirectDestination(DestinationConnector):
             "refusing to encrypt PHI to an untrusted certificate"
         )
 
+    def _probe_build(self) -> None:
+        """Build one S/MIME message from a fixed synthetic body, so a build fault fails at
+        ``check``/dry-run/start and not on every message.
+
+        Every build input except the body is fixed by now: keys, certs, cipher, subject, addresses
+        and codec. A fault in any of them would repeat on every send, and the send-time arm maps a
+        build failure to a permanent per-message dead-letter, so without this a connection-wide fault
+        (a FIPS OpenSSL refusing the envelope builder, a library that stopped accepting a key, a
+        line break inside the subject) would quietly drain the whole queue into the dead-letter
+        store. The body is synthetic, so the library's own text is safe to show.
+
+        An unknown ``encoding`` never gets this far on a config path: ``build_check_registry``
+        refuses it first (``resolved_encoding_problems``)."""
+        try:
+            self._build_smime(_PROBE_BODY)
+        except _BUILD_ERRORS as exc:
+            raise ValueError(
+                "Direct destination could not build an S/MIME message from its settings: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
@@ -510,7 +564,9 @@ class DirectDestination(DestinationConnector):
     def _build_smime(self, payload: str) -> EmailMessage:
         """Build the outbound S/MIME message: SIGN the body with the sender key+cert, then ENCRYPT the
         signed blob to the recipient cert. Returns a fully-formed ``EmailMessage`` ready to submit."""
-        body = payload.encode(self.encoding)
+        # The shared helper, not a bare .encode(): a UnicodeEncodeError carries the WHOLE payload on
+        # `.object`, and the helper raises a content-free error with that chain severed (#1920).
+        body = encode_wire_body(payload, self.encoding, transport=f"Direct {self.host}:{self.port}")
         # SIGN — attach the signer cert so the recipient can verify without a side-channel. Options:
         #   * Binary       — keep the body byte-exact (no MIME/CRLF canonicalization that would corrupt
         #                    an HL7/binary payload).
@@ -582,14 +638,41 @@ class DirectDestination(DestinationConnector):
 
     def _send(self, payload: str) -> None:
         # PHI/secret-safe error text: the host + failure class only, never the body, the recipients'
-        # PHI, or the password. Crypto failures (a key/cert problem that slipped past construction) map
-        # to a non-transient DeliveryError so the message dead-letters rather than spinning on retry.
+        # PHI, or the password. A build failure here is a last resort: _probe_build already built one
+        # message from these exact settings at construction, so what reaches this arm changed since
+        # (the host's crypto policy, say). It is deterministic, so it is a PERMANENT NegativeAckError:
+        # the delivery worker dead-letters it on the first attempt. A plain DeliveryError is the
+        # transient class and would be retried to the attempt ceiling for a message that can never
+        # build (BACKLOG #1919). An un-encodable body is already permanent: encode_wire_body raises
+        # it, and this arm does not catch it.
+        #
+        # UnsupportedAlgorithm is caught too: it subclasses Exception, not ValueError, so it escaped
+        # this arm to the worker's "internal error" path. Reported for a FIPS-enabled OpenSSL, where
+        # the envelope builder refuses to construct; mapped defensively, NOT reproduced (#1921).
+        #
+        # The raise sits OUTSIDE the handler on purpose (BACKLOG #1920): `from exc` would chain the
+        # build error as `__cause__`, and `from None` would still leave it on `__context__`. Only the
+        # type NAME survives the handler. See `encode_wire_body` in transports/base.py.
+        msg: EmailMessage | None = None
+        failure = ""
         try:
             msg = self._build_smime(payload)
-        except (ValueError, TypeError) as exc:
-            raise DeliveryError(
-                f"Direct {self.host}:{self.port} S/MIME encode failed: {type(exc).__name__}"
-            ) from exc
+        except _BUILD_ERRORS as exc:
+            failure = type(exc).__name__
+        if msg is None:
+            # The worker's permanent path dead-letters without a log line, so say it here. Type name
+            # only, for the same reason as the error text.
+            logger.warning(
+                "Direct %s:%s: S/MIME build failed (%s); dead-lettering without retry",
+                self.host,
+                self.port,
+                failure,
+            )
+            raise NegativeAckError(
+                f"Direct {self.host}:{self.port} S/MIME build failed: {failure} (no retry)",
+                code="smime-build",
+                permanent=True,
+            )
         try:
             with self._connect() as smtp:
                 if self.username is not None:

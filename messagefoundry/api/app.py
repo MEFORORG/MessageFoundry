@@ -749,10 +749,10 @@ def _build_approval_gate(
 
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
         # Load-bearing dual-control guard (findings #1/#4/#11): ApprovalGate.approve runs THIS executor
-        # directly (purge_connection is NOT re-entered on the release path), and it flips the row to
-        # 'approved' BEFORE executing — so the require-quiesced precondition must be re-checked HERE, and
-        # a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise by rolling the row
-        # to 'failed' and auditing it, so a raise no longer strands it approved-but-unexecuted; skipping
+        # directly (purge_connection is NOT re-entered on the release path), and it claims the row
+        # ('executing', BACKLOG #1562) BEFORE executing — so the require-quiesced precondition must be
+        # re-checked HERE, and a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise
+        # by rolling the row to 'failed' and auditing it, so a raise no longer strands it; skipping
         # is still the better outcome HERE, because a non-quiesced outbound is a retryable precondition
         # miss the operator can clear, not a failed operation.) A non-quiesced
         # (running/stopping) outbound could have an INFLIGHT row cancel_queued cannot cancel, so purging
@@ -1289,19 +1289,24 @@ async def _guard_resubmission(
 
     The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
     of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal counts hl7apy's
-    errors rather than quoting them, since that text can echo a field value."""
+    errors rather than quoting them, since that text can echo a field value.
+
+    The 4xx is raised after the handler has ended, with only the phase and reason kept, so the caught
+    error is on neither of its chains (BACKLOG #1796). ``from None`` would leave it on
+    ``__context__``, and a guard error's own chain has held the whole body."""
     try:
         return await admit_resubmission(raw, inbound)
     except IngressGuardError as exc:
-        await engine.store.record_audit(
-            action,
-            actor=identity.username,
-            channel_id=channel_id,
-            detail=json.dumps({**detail, "phase": exc.phase, "reason": exc.reason}),
-            client=client_ip(request),
-        )
-        _log.warning("%s: refused by the ingress guards (phase=%s)", action, exc.phase)
-        raise HTTPException(_INGRESS_GUARD_STATUS[exc.phase], exc.reason) from None
+        phase, reason = exc.phase, exc.reason
+    await engine.store.record_audit(
+        action,
+        actor=identity.username,
+        channel_id=channel_id,
+        detail=json.dumps({**detail, "phase": phase, "reason": reason}),
+        client=client_ip(request),
+    )
+    _log.warning("%s: refused by the ingress guards (phase=%s)", action, phase)
+    raise HTTPException(_INGRESS_GUARD_STATUS[phase], reason)
 
 
 async def _audit_channel_denied(

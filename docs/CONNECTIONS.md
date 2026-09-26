@@ -1837,7 +1837,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `signing_cert` | — (required) | path to the sender's PEM/DER signing **certificate** |
 | `signing_key` | — (required) | path to the sender's PEM/DER signing **private key** |
 | `signing_key_password` | — | passphrase for an encrypted `signing_key` — a **secret**, via `env()` |
-| `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target) |
+| `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target). Must carry an **RSA** key: the S/MIME envelope supports RSA key transport only, so any other key type (EC included) is refused at construction |
 | `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to |
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
 | `subject` | `""` | static `Subject` |
@@ -1848,17 +1848,24 @@ these messages, and the SMTP relay accepts them before anyone tries.
 
 **Fail-loud at construction.** Every piece of crypto material is loaded and cross-checked when the connector
 is built — so `messagefoundry check` / dry-run / start catches it, never the first message: a malformed
-key/cert, a `signing_key` whose public half **does not match** `signing_cert`, and a `recipient_cert` **not
-issued by** any supplied `trust_anchor` (PHI is never encrypted to a certificate from an untrusted issuer).
+key/cert, a `signing_key` whose public half **does not match** `signing_cert`, a `recipient_cert` whose key
+is **not RSA**, and a `recipient_cert` **not issued by** any supplied `trust_anchor` (PHI is never encrypted
+to a certificate from an untrusted issuer). The connector then signs and encrypts one fixed synthetic body.
+So a fault that would fail every S/MIME build also fails here. That covers at least a crypto library or
+OpenSSL build that refuses the algorithms, and a line break inside `subject`. It does not cover the SMTP hop:
+the relay can still refuse a `sender` or recipient at send time.
 The trust check is deliberately **one level** (the recipient cert chains directly to a supplied anchor, or is
 a self-signed correspondent cert pinned as its own anchor) — full multi-level path building is deferred. No
 hostname/SAN match is done: a Direct address is an email, not a TLS SNI. Errors name the *setting* only,
 never the material or a cert subject (which can identify a patient's provider).
 
 **Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
-`allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. Both an SMTP
-failure and an S/MIME **encode** failure raise `DeliveryError`, so the lane **retries** per its
-`RetryPolicy`. Delivery is **at-least-once** and a Direct mailbox has no idempotency key, so a rare duplicate
+`allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. An SMTP
+failure raises `DeliveryError`, so the lane **retries** per its `RetryPolicy`. A message that cannot be
+**built** raises a **permanent** `NegativeAckError` and dead-letters on the first attempt, because a retry
+would fail the same way. That is a body the `encoding` cannot represent, or a crypto failure that began
+after construction. Its error names the failure class, or the codec and character position, and never the
+body. Delivery is **at-least-once** and a Direct mailbox has no idempotency key, so a rare duplicate
 is possible and **accepted by design** (a duplicate beats a drop), exactly as with `Email(...)`.
 `test_connection` does connect / STARTTLS / EHLO / optional login / NOOP — never `MAIL FROM` or `DATA`.
 
@@ -3070,7 +3077,7 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). Until the handshake completes, `max_connections`, `max_connections_per_host` and `source_ip_allowlist` do not apply to the socket, so the handshake bound limits how long such a socket lives, not how many a peer can open. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake, which never reached the handler. That last step needs the event loop's server to offer `close_clients()`, and uvloop's does not. The engine runs on uvloop wherever it is installed, which the `uvicorn[standard]` dependency does for CPython outside Windows. There, stop leaves a socket still in its handshake to the 10 s bound, and refuses it unread if it finishes the handshake after stop began. Stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound is aborted with no log line and no connection event; a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |
