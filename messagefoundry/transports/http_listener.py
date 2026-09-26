@@ -1079,19 +1079,22 @@ class HttpSource(SourceConnector):
             # message that never entered the pipeline. One branch answers both modes, so they cannot
             # drift (owner ruling 2026-09-26, BACKLOG #1960). Returns False: this is a post-record
             # refusal with no connection-event kind of its own, so the outer ``closed`` still fires.
-            await self._respond(writer, build_response(422, _NOT_ACCEPTED_BODY))
+            # The drain gets the receipt-sized budget in both modes: this is a fixed few dozen bytes,
+            # never the partner-sized body reply_write_timeout exists for.
+            await self._respond(
+                writer, build_response(422, _NOT_ACCEPTED_BODY), budget=_CLIENT_SHUTDOWN_GRACE
+            )
             return False
 
         if self.reply_from and self.sync_reply is not None:
-            return await self._respond_with_sync_reply(writer, message_id, peer_host=peer_host)
+            await self._respond_with_sync_reply(writer, message_id)
+            return False
 
         receipt = {"status": "accepted", "message_id": message_id}
         await self._respond(writer, build_response(202, json.dumps(receipt)))
         return False
 
-    async def _respond_with_sync_reply(
-        self, writer: asyncio.StreamWriter, message_id: str, *, peer_host: str | None
-    ) -> bool:
+    async def _respond_with_sync_reply(self, writer: asyncio.StreamWriter, message_id: str) -> None:
         """Block on the captured downstream reply and answer with it (ADR 0154 D5).
 
         Reached only when ``reply_from`` is set **and** the runner injected a resolver, so an inbound
@@ -1126,7 +1129,6 @@ class HttpSource(SourceConnector):
             # A partner Content-Type that fails the header guard must not take the turn down with
             # it: the body is still good, so fall back to our own type rather than 500 the caller.
             await self._respond(writer, build_response(status, body, extra_headers=extra))
-        return False
 
     def _reply_to_wire(
         self, reply: InboundReply, message_id: str
@@ -1167,8 +1169,13 @@ class HttpSource(SourceConnector):
         payload = json.dumps({"status": "delivery_failed", "message_id": message_id})
         return 502, payload, None
 
-    async def _respond(self, writer: asyncio.StreamWriter, data: bytes) -> None:
+    async def _respond(
+        self, writer: asyncio.StreamWriter, data: bytes, *, budget: float | None = None
+    ) -> None:
         """Write the success-path response, bounding the drain.
+
+        ``budget`` overrides :meth:`_drain_budget` for a response whose size does not depend on the
+        mode, such as the fixed ``422`` on a refused body.
 
         The drain was unbounded: a peer that stops reading held the connection — and its
         ``max_connections`` slot, since ``_active`` spans all of ``_serve_one`` — for as long as it
@@ -1186,7 +1193,7 @@ class HttpSource(SourceConnector):
         committed ingress row; for the ``422`` on a refused body it is the ``ERROR`` row.
         """
         writer.write(data)
-        await asyncio.wait_for(writer.drain(), self._drain_budget())
+        await asyncio.wait_for(writer.drain(), self._drain_budget() if budget is None else budget)
 
     def _drain_budget(self) -> float:
         """Seconds allowed to drain a response to the caller.

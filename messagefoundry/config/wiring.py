@@ -1954,8 +1954,8 @@ def Http(
     handed a ``408`` for a delay the engine imposed. The bucket is **listener-wide, not
     per-connection**: this connector answers one request per connection, so a per-connection bucket
     would pace nothing. A ``GET``/``HEAD`` health probe waits behind an outstanding debt but charges
-    nothing, and neither does a pre-ingress refusal — only a body the engine reads and records spends
-    the budget, including one it then refuses with a ``422``. Both
+    nothing. A request refused before its body reaches the engine charges nothing either. Only a body
+    the engine reads and records spends the budget, including one it then refuses with a ``422``. Both
     keys ship **off**, for the same reason as MLLP's: the number has to come from your feed profile.
 
     **TLS (WP-13b).** ``tls=True`` presents ``tls_cert_file``/``tls_key_file`` as the HTTPS server

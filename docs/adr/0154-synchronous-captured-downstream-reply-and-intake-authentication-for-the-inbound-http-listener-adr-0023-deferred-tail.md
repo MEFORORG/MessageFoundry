@@ -1268,7 +1268,8 @@ the mode is chosen, so the two paths cannot drift.
 
 That move changed one more thing on the sync path. Its `422` used to suppress the listener's closing
 `connection_event`, although the refusal emits no event kind of its own. So the connection log showed
-`established` with no end. Both paths now log `closed` after the `422`.
+`established` with no end. Both paths now log `closed` after the `422`. The `422` also drains under the
+receipt-sized budget in both modes, since `reply_write_timeout` exists for a partner-sized body.
 
 **Why the carve-out went.** D5 gave the reason itself: a `202` without a `message_id` is a lie to a proxy
 client. A plain receipt client is told the same lie. It reads `202` as "your body is stored and will flow",
@@ -1283,15 +1284,23 @@ nothing is deployed.
 - A committed body still gets the same `202` receipt carrying its `message_id`. AC-8 holds for it.
 - The pre-ingress refusals happen before the handler runs and are untouched. That covers at least the
   `400`, `401`, `403`, `408`, `411`, `413` and `503` answers.
-- The DICOM C-STORE SCP is the other receipt-handler consumer. It already answers a DIMSE failure on
-  `None` (BACKLOG #1910).
+- Other receipt-handler consumers keep their own answer. The DICOM C-STORE SCP, at least, already
+  answers a DIMSE failure on `None` (BACKLOG #1910).
 
-**A known limit, not settled by this amendment.** A `None` does not say why the handler refused. At
-least two causes are on the engine's side and may pass on a retry: the streaming detach's in-flight
-budget, and the strict-validation timeout. They now answer `422` like bad content, and a sender that
-treats every `4xx` as final gives up. Before this amendment they answered `202`, which told the sender
-the body was stored, so the `422` is still the more honest answer. Separating the two would widen the
-receipt-handler contract past `str | None`. That is unfiled, and it needs its own decision.
+**Known limits, not settled by this amendment.** A `None` says neither why the handler refused nor which
+`ERROR` row it wrote. Three consequences follow.
+
+- At least two causes are on the engine's side and may pass on a retry: the streaming detach's in-flight
+  budget, and the strict-validation timeout. They now answer `422` like bad content, and a sender that
+  treats every `4xx` as final gives up.
+- A body over the engine's ingress ceiling answers `422`, while one over the listener's `max_body_bytes`
+  answers `413`. The two differ only when an operator raises `max_body_bytes` past that ceiling.
+- The `422` carries no id, so an operator matches it to its `ERROR` row by time and peer only. The
+  refusal emits no `connection_event` kind of its own either.
+
+Before this amendment each of these answered `202`, which told the sender the body was stored, so the
+`422` is still the more honest answer. Fixing any of them widens the receipt-handler contract past
+`str | None`. That is unfiled, and it needs its own decision.
 
 **Where the original text stays.** D5's note and AC-8 keep their wording, each with a dated italic note in
 place. AC-8 now links a second test,
