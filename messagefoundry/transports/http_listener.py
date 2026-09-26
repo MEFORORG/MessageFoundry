@@ -9,7 +9,8 @@ to the pipeline's :class:`~messagefoundry.transports.base.InboundHandler` exactl
 ingress stage — mirroring MLLP's AA-on-receipt (ACK-on-receipt, ADR 0001). A post-ingress
 routing/transform/delivery failure happens *after* the ``202`` and is **not** reflected in the HTTP
 status — it surfaces only as the message's ``ERROR``/dead-letter disposition + the AlertSink, exactly
-as a post-ACK MLLP failure does.
+as a post-ACK MLLP failure does. A body the pipeline handler refuses at ingress (recorded ``ERROR``,
+no ingress row) is answered ``422``, never ``202`` (ADR 0154 amendment 2026-09-26).
 
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;
@@ -189,6 +190,12 @@ _HEALTH_PROBE_METHODS = frozenset({"GET", "HEAD"})
 #: and desyncs nothing, and it is the shape a health checker actually sends. A non-zero length is
 #: refused, because those are the declared bytes this listener would never read.
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+#: The answer when the receipt handler returns ``None``: it refused the body AFTER recording it with
+#: status ERROR (a decode, NUL, size, content-type, parse or strict-validation guard). Both the
+#: ``202`` receipt path and the sync-reply path answer this, so a caller is never told a refused body
+#: was accepted (owner ruling 2026-09-26, the ADR 0154 amendment of that date, BACKLOG #1960).
+_NOT_ACCEPTED_BODY = '{"error":"message was not accepted"}'
 
 #: A ``Content-Length`` with more significant digits than this is refused. It is far past any body
 #: cap, and ``int()`` raises past 4300 digits (CPython's ``sys.int_info.default_max_str_digits``),
@@ -1054,7 +1061,8 @@ class HttpSource(SourceConnector):
         # and returns the engine message_id. The 202 is the receipt-and-persistence signal (NOT a final
         # disposition) — a post-ingress routing/transform/delivery failure does NOT change this status
         # (it becomes the message's ERROR/dead-letter + AlertSink). count-and-log holds: the body is
-        # persisted before the response is written.
+        # persisted before the response is written — as a RECEIVED ingress row, or as an ERROR row when
+        # the handler refuses it and returns None.
         message_id = await self._handler(request.body)
         # Charge one token AFTER the body is committed, so the debt is settled by the NEXT request's
         # pre-read wait and never by withholding this partner's receipt. A GET/HEAD health probe and
@@ -1066,9 +1074,13 @@ class HttpSource(SourceConnector):
         if self.reply_from and self.sync_reply is not None:
             return await self._respond_with_sync_reply(writer, message_id, peer_host=peer_host)
 
-        receipt = {"status": "accepted"}
-        if message_id is not None:
-            receipt["message_id"] = message_id
+        if message_id is None:
+            # The handler refused the body AFTER recording it with status ERROR, so that row is the
+            # count-and-log record and only the answer changes here. A 202 would tell the caller its
+            # body was accepted when it was not (owner ruling 2026-09-26, BACKLOG #1960).
+            await self._respond(writer, build_response(422, _NOT_ACCEPTED_BODY))
+            return False
+        receipt = {"status": "accepted", "message_id": message_id}
         await self._respond(writer, build_response(202, json.dumps(receipt)))
         return False
 
@@ -1087,10 +1099,9 @@ class HttpSource(SourceConnector):
         """
         if message_id is None:
             # The handler declined AFTER recording the message with status ERROR — that write IS the
-            # count-and-log record, so nothing is dropped here. On the 202 path this answers
-            # "202 without a message_id", which is a lie to a proxy client; on the sync path a
-            # caller waiting for a reply deserves to be told the submission itself failed.
-            await self._respond(writer, build_response(422, '{"error":"message was not accepted"}'))
+            # count-and-log record, so nothing is dropped here. A caller waiting for a reply is told
+            # the submission itself failed, with the same 422 the receipt path answers.
+            await self._respond(writer, build_response(422, _NOT_ACCEPTED_BODY))
             return True
 
         resolver = self.sync_reply

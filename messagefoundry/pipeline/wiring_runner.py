@@ -2927,7 +2927,8 @@ class RegistryRunner:
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
         # A source that answers the sender with its own protocol status declares wants_receipt, and gets
         # the receipt handler: the committed message_id, or None when the body was refused and recorded
-        # ERROR. The HTTP listener (ADR 0023) maps that to its 202; the DICOM C-STORE SCP maps None to a
+        # ERROR. The HTTP listener (ADR 0023) maps an id to its 202 and None to a 422 (ADR 0154
+        # amendment 2026-09-26); the DICOM C-STORE SCP maps None to a
         # DIMSE failure (BACKLOG #1910). Every other source gets the standard handler, whose str return is
         # a wire reply/ACK and whose None means both "committed" and "refused". The transport declares the
         # contract rather than the runner keying on a connector type (CLAUDE.md sec. 4).
@@ -5252,9 +5253,10 @@ class RegistryRunner:
         """Commit a POSTed HTTP body to the ingress stage and return the engine ``message_id`` (the
         first-slice receipt, ADR 0023 D3). Returns ``None`` when the body was NOT committed — a
         decode/size-guard failure that recorded an ``ERROR`` (count-and-log: still persisted, never
-        accepted-and-dropped). The source maps a returned id to a ``202`` and a ``None`` here to a ``202``
-        without an id (the engine guard already recorded the disposition; a pre-ingress
-        oversize/malformed/allowlist refusal is the source's own synchronous ``4xx`` BEFORE this runs).
+        accepted-and-dropped). The HTTP source maps a returned id to a ``202`` and a ``None`` here to a
+        ``422`` (the engine guard already recorded the disposition; ADR 0154 amendment 2026-09-26). A
+        pre-ingress oversize/malformed/allowlist refusal is the source's own synchronous ``4xx`` BEFORE
+        this runs.
 
         Shares the SAME store calls, size ceiling, decode handling, and disposition machine as
         :meth:`_handle_inbound`; it differs only in returning the id instead of a wire ACK and in not
@@ -5401,8 +5403,8 @@ class RegistryRunner:
                 await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
                 return None
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
-        # failure records ERROR + returns None (HTTP maps None to a 202-without-id; the disposition is
-        # recorded) — never accepted-and-dropped.
+        # failure records ERROR + returns None (HTTP maps None to a 422; the disposition is recorded) —
+        # never accepted-and-dropped.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:

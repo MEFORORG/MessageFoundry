@@ -247,12 +247,21 @@ async def test_the_refusal_bodies_are_fixed_non_phi_json() -> None:
 
 
 async def test_a_declined_handler_is_422_on_the_sync_path() -> None:
-    # The shipped 202 path answers "202 without a message_id", which is a lie to a proxy client. A
-    # caller blocked on a reply deserves to be told the submission itself failed. Post-record, so
+    # A caller blocked on a reply deserves to be told the submission itself failed. Post-record, so
     # count-and-log holds: the handler already wrote the message with status ERROR.
     status, _, body = await _serve(InboundReply(ReplyOutcome.REPLY, body="x"), _decline=True)
     assert status == 422
     assert "not accepted" in body.decode()
+
+
+async def test_a_declined_handler_gets_the_same_422_on_both_paths() -> None:
+    # Owner ruling 2026-09-26 (BACKLOG #1960): the receipt path used to answer "202 without a
+    # message_id" here, which told the caller a refused body was accepted. Both paths now answer the
+    # same status and the same bytes, so a caller cannot tell which mode refused it.
+    sync = await _serve(InboundReply(ReplyOutcome.REPLY, body="x"), _decline=True)
+    receipt = await _serve(None, _decline=True)
+    assert receipt[0] == sync[0] == 422
+    assert receipt[2] == sync[2] == b'{"error":"message was not accepted"}'
 
 
 async def test_a_hostile_partner_content_type_cannot_take_the_turn_down() -> None:

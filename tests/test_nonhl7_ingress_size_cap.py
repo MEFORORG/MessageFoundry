@@ -300,7 +300,7 @@ async def test_http_decode_error_nul_dead_letters_mfb64_returns_none(store: Mess
 
     result = await runner._handle_inbound_http(reg.inbound["IB_HL7"], _HL7_DECODE_ERR_NUL)
 
-    assert result is None  # 202-without-id receipt
+    assert result is None  # the HTTP listener answers 422 (ADR 0154 amendment 2026-09-26)
     rows = await _rows(store)
     assert len(rows) == 1
     assert rows[0]["status"] == MessageStatus.ERROR.value
