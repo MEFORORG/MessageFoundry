@@ -27,6 +27,7 @@ import pytest
 
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Source
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+from messagefoundry.parsing.peek import Peek
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.transports import mllp as mllp_mod
@@ -238,7 +239,7 @@ async def test_a_header_that_faults_the_ack_builder_falls_back_to_defaults(
     real = mllp_mod.build_ack
 
     def faulting(inbound: Any, **kwargs: Any) -> str:
-        if isinstance(inbound, mllp_mod.Peek):
+        if isinstance(inbound, Peek):
             raise IndexError("string index out of range")
         return real(inbound, **kwargs)
 
