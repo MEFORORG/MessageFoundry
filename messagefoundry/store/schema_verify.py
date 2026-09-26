@@ -53,17 +53,22 @@ _REMEDY = (
     " then restart."
 )
 # A keyed store must not be recreated under the key it already uses. The per-key AES-GCM invocation
-# count (cipher_meta, ASVS 11.3.4) and the DEK's key-age clock (secret_rotation_meta) live in the store
-# file, so a fresh file under the same key starts both at zero: the reset gcm_bound.py refuses to offer.
-# A new key has no count by construction. `gen-key`, not `rotate-key`: rotate-key re-encrypts an
-# existing store under the active key, and a fresh store has nothing to re-encrypt.
+# count (cipher_meta, ASVS 11.3.4) lives in the store file, and so does the DEK's key-age stamp
+# (secret_rotation_meta), so a fresh file under the same key starts the count at zero: the reset
+# gcm_bound.py refuses to offer. A new key has no count by construction. The new-key instruction
+# leads, so a long store path cannot push it past the 200-character cut. The commands come next,
+# ahead of the differences: on a cut path the differences are the part to lose. `gen-key` and
+# `protect-key --generate` are the commands the serve no-key refusal names; `rotate-key` is not one,
+# because it re-encrypts an existing store and a fresh store has nothing to re-encrypt.
 _REMEDY_KEYED = (
-    "is from an incompatible version: move it and its -wal/-shm aside, then restart under a NEW store"
-    " key (`messagefoundry gen-key`)."
+    "is from an incompatible version: set a NEW store key, then move it and its -wal/-shm aside and"
+    " restart."
 )
-_KEYED_TAIL = (
-    " Keep the old key only to read the moved file: restarting under it would reset its AES-GCM"
-    " use count and key-age clock, which live in the store."
+_KEYED_DETAIL = (
+    " Make the key with `messagefoundry gen-key`, `messagefoundry protect-key --generate`, or your"
+    " key provider. Keep the old key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED: the moved file, uploads"
+    " and backups still need it. Restarting under the old key would zero its AES-GCM use count, which"
+    " lives in the store. If you set [secret_rotation].store_key_last_rotated, update it."
 )
 
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
@@ -267,7 +272,7 @@ async def verify_live_schema(
     schema: str,
     migrate: Migrate,
     path: object,
-    keyed: bool = False,
+    keyed: bool,
 ) -> None:
     """Refuse a live store whose schema lacks anything ``schema`` plus ``migrate`` would build.
 
@@ -276,14 +281,26 @@ async def verify_live_schema(
     migrations back and leaves the file as the old version wrote it, apart from the objects the
     schema script created, which are all new tables and indexes.
 
-    ``keyed`` picks the remedy: true when the store runs a local AES-GCM key, the only cipher whose
-    use the store counts, and then the operator is told to start the fresh store under a new key.
+    ``keyed`` picks the remedy: true when this process runs a local AES-GCM key, the only cipher
+    whose use the store counts. A store whose file already holds such a count is treated as keyed
+    too, so an operator shell without the service's key still gets the new-key remedy.
     """
     expected = await _expected_shape(schema, migrate)
     live = await read_schema_shape(db, sorted(expected.columns))
     problems = schema_differences(expected, live)
     if problems:
-        remedy, tail = (_REMEDY_KEYED, _KEYED_TAIL) if keyed else (_REMEDY, "")
+        keyed = keyed or await _holds_a_key_count(db)
+        remedy = _REMEDY_KEYED + _KEYED_DETAIL if keyed else _REMEDY
         raise SchemaMismatchError(
-            f"store {path} {remedy} Differences: " + "; ".join(problems) + "." + tail
+            f"store {path} {remedy} Differences: " + "; ".join(problems) + "."
         )
+
+
+async def _holds_a_key_count(db: aiosqlite.Connection) -> bool:
+    """Whether the live file records AES-GCM use for any key, so it was opened keyed at some point."""
+    try:
+        async with db.execute("SELECT EXISTS (SELECT 1 FROM cipher_meta)") as cur:
+            row = await cur.fetchone()
+    except sqlite3.OperationalError:  # an incompatible cipher_meta is reported as a difference
+        return False
+    return bool(row and row[0])

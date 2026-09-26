@@ -81,15 +81,36 @@ async def test_the_v032_search_presets_table_is_refused(tmp_path: Path) -> None:
     assert text.count("table '") == 1 and text.count("index '") == 1
 
 
-# A plausible Windows service data path, long enough that the 200-character cut in safe_exc bites.
-_SERVICE_PATH = r"C:\ProgramData\MessageFoundry\data\messagefoundry.db"
+# Plausible Windows service data paths. The 200-character cut in safe_exc bites on both, and the
+# longer one is where an instruction placed at the END of the lead used to be cut off.
+_SERVICE_PATHS = (
+    r"C:\ProgramData\MessageFoundry\data\messagefoundry.db",
+    r"C:\ProgramData\MessageFoundry\data\stores\production\instance-a\messagefoundry.db",
+)
+_KEYED_LEAD = (
+    "is from an incompatible version: set a NEW store key, then move it and its -wal/-shm aside and"
+    " restart."
+)
+_KEYED_DETAIL = (
+    " Make the key with `messagefoundry gen-key`, `messagefoundry protect-key --generate`, or your"
+    " key provider. Keep the old key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED: the moved file, uploads"
+    " and backups still need it. Restarting under the old key would zero its AES-GCM use count, which"
+    " lives in the store. If you set [secret_rotation].store_key_last_rotated, update it."
+)
+
+
+def _lead_survives_the_cut(text: str, db: Path, lead: str) -> None:
+    from messagefoundry.redaction import safe_exc
+
+    for service_path in _SERVICE_PATHS:
+        rendered = safe_exc(SchemaMismatchError(text.replace(str(db), service_path)))
+        assert f"store {service_path} {lead}" in rendered
 
 
 async def test_a_keyed_refusal_names_a_new_store_key(tmp_path: Path) -> None:
-    # The AES-GCM use count and the key-age clock live in the store file, so a fresh store under the
-    # SAME key starts both at zero -- the reset gcm_bound.py refuses to offer. The keyed remedy must
-    # send the operator to a new key instead.
-    from messagefoundry.redaction import safe_exc
+    # The AES-GCM use count lives in the store file (measured: a count of 2**31 in one store, 0 in a
+    # fresh store under the same key), so recreating under the SAME key is the reset gcm_bound.py
+    # refuses to offer. The keyed remedy must send the operator to a new key instead.
     from messagefoundry.store.crypto import generate_key, make_cipher
 
     db = tmp_path / "keyed.db"
@@ -97,32 +118,35 @@ async def test_a_keyed_refusal_names_a_new_store_key(tmp_path: Path) -> None:
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db, cipher=make_cipher(generate_key()))
     text = str(info.value)
-    lead = (
-        "is from an incompatible version: move it and its -wal/-shm aside, then restart under a NEW"
-        " store key (`messagefoundry gen-key`)."
-    )
-    assert text.startswith(f"store {db} {lead}")
-    assert text.endswith(
-        "Keep the old key only to read the moved file: restarting under it would reset its AES-GCM"
-        " use count and key-age clock, which live in the store."
-    )
-    # The whole lead survives the cut that an uncaught-error path applies, on a real service path.
-    rendered = safe_exc(SchemaMismatchError(text.replace(str(db), _SERVICE_PATH)))
-    assert f"store {_SERVICE_PATH} {lead}" in rendered
+    assert text.startswith(f"store {db} {_KEYED_LEAD}{_KEYED_DETAIL} Differences: ")
+    _lead_survives_the_cut(text, db, _KEYED_LEAD)
+
+
+async def test_a_keyed_store_opened_without_its_key_still_gets_the_new_key_remedy(
+    tmp_path: Path,
+) -> None:
+    # An operator shell without the service's key opens the store keyless. The file's own count row
+    # says it is keyed, and the same-key reset must not be what that operator is told to do.
+    from messagefoundry.store.crypto import generate_key, make_cipher
+
+    db = tmp_path / "keyed-then-keyless.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    await store.close()
+    _sql(db, "DROP TABLE search_presets;" + _V032_SEARCH_PRESETS)
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db)
+    assert str(info.value).startswith(f"store {db} {_KEYED_LEAD}")
 
 
 async def test_a_keyless_refusal_does_not_mention_a_key(tmp_path: Path) -> None:
-    from messagefoundry.redaction import safe_exc
-
-    db = tmp_path / "keyless.db"
+    db = tmp_path / "plain.db"
     _sql(db, _V032_SEARCH_PRESETS)
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     text = str(info.value)
-    assert "gen-key" not in text
-    assert "key" not in text.split(" Differences: ")[0].removeprefix(f"store {db} ")
-    lead = text.split(" Differences: ")[0].replace(str(db), _SERVICE_PATH)
-    assert lead in safe_exc(SchemaMismatchError(text.replace(str(db), _SERVICE_PATH)))
+    assert "key" not in text.removeprefix(f"store {db} ").split(" Differences: ")[0]
+    assert "gen-key" not in text and "RETIRED" not in text
+    _lead_survives_the_cut(text, db, text.removeprefix(f"store {db} ").split(" Differences: ")[0])
 
 
 async def test_the_refusal_releases_the_file_so_the_remedy_works(tmp_path: Path) -> None:
