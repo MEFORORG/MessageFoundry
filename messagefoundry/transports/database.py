@@ -63,7 +63,11 @@ from messagefoundry.config.settings import (
     hop_insecure_escape_downgrades,
     insecure_tls_allowed,
 )
-from messagefoundry.config.tls_policy import InsecureHopRefused, current_hop_posture
+from messagefoundry.config.tls_policy import (
+    HOP_ATTESTATION_LEVER,
+    InsecureHopRefused,
+    current_hop_posture,
+)
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -173,7 +177,7 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = F
         raise ValueError(
             "DATABASE connection TLS is weakened (trust_server_certificate=true or encrypt=false), "
             "which is MITM-able. Use a trusted server certificate with encrypt=true; set "
-            "tls_hop_attested=true with a tls_hop_attested_reason on the connection if the hop is "
+            f"{HOP_ATTESTATION_LEVER} on the connection if the hop is "
             "secure by other means (a proxy-terminated or isolated segment; reported as a loosening); "
             f"or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn to "
             "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "

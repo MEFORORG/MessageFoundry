@@ -74,6 +74,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.config.tls_policy import (
+    HOP_ATTESTATION_LEVER,
     HopPosture,
     TrustAnchorPolicy,
     active_hop_posture,
@@ -8315,22 +8316,17 @@ def check_fhir_lookup_allowed(
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
-#: How the four inbound bind refusals below describe ``--allow-insecure-bind``: an enforcing
-#: instance ignores it (:func:`_inbound_insecure_bind_permitted`).
-_INSECURE_BIND_FLAG_CLAMP = (
+#: How the four inbound bind refusals below end, after "... on a trusted, firewalled network ".
+#: The flag's caveat first: an enforcing instance ignores it (:func:`_inbound_insecure_bind_permitted`).
+#: Then the per-connection attestation, named with its reason and its supported surface (owner ruling
+#: 2026-09-24), never as a transport setting, which the loader refuses. Unlike the flag it crosses an
+#: enforcing instance, so it is reported as a loosening.
+_INSECURE_BIND_REFUSAL_TAIL = (
     "(an enforcing instance, which is the default, ignores the flag; "
-    "[security].enforcement = warn lets it apply)"
-)
-
-#: The per-connection lever the four inbound bind refusals offer beside the flag. It is named with its
-#: mandatory reason and its supported surface, the ``inbound()`` parameter or the ``connections.toml``
-#: key (owner ruling 2026-09-24), and never as a transport setting, which the loader refuses. Unlike
-#: the flag it crosses an enforcing instance, so it is reported as a loosening.
-_INSECURE_BIND_ATTESTATION = (
-    " If a TLS-terminating proxy or an isolated segment secures this hop by means the engine cannot "
-    "see, set tls_hop_attested=true with a tls_hop_attested_reason on the inbound connection (an "
-    "inbound() parameter or a connections.toml key); the attestation is reported as a security "
-    "loosening."
+    "[security].enforcement = warn lets it apply). If a TLS-terminating proxy or an isolated segment "
+    f"secures this hop by means the engine cannot see, set {HOP_ATTESTATION_LEVER} on the inbound "
+    "connection (an inbound() parameter or a connections.toml key); the attestation is reported as "
+    "a security loosening."
 )
 
 
@@ -8340,7 +8336,8 @@ def _insecure_bind_cause(source: Source) -> str:
     An attestation is named WITH its reason (owner ruling 2026-09-24), so the log line records why the
     operator vouched for the hop. Otherwise the cause is the flag."""
     if source.tls_hop_attested:
-        return f"tls_hop_attested; reason: {source.tls_hop_attested_reason}"
+        # Same shape and fallback as the MLLP guard's attestation line (transports/mllp.py).
+        return f"tls_hop_attested; reason: {source.tls_hop_attested_reason or '(none provided)'}"
     # serve folds [security].require_encryption_for_remote = false into the same flag (ADR 0118).
     return "--allow-insecure-bind / require_encryption_for_remote = false"
 
@@ -8508,7 +8505,7 @@ def check_mllp_tls_exposure(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; HL7 bodies would "
         "cross the network in cleartext. Set tls=true (+ tls_cert_file/tls_key_file) on the MLLP "
         "connection, or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
-        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "." + _INSECURE_BIND_ATTESTATION
+        "firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 
@@ -8544,10 +8541,7 @@ def check_http_tls_exposure(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; POSTed bodies "
         "(frequently PHI) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the Http connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network "
-        + _INSECURE_BIND_FLAG_CLAMP
-        + "."
-        + _INSECURE_BIND_ATTESTATION
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 
@@ -8780,10 +8774,7 @@ def check_dimse_tls_exposure(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; DICOM PHI (header "
         "+ pixel data) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the DICOM connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network "
-        + _INSECURE_BIND_FLAG_CLAMP
-        + "."
-        + _INSECURE_BIND_ATTESTATION
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 
@@ -8823,7 +8814,7 @@ def check_tcp_tls_exposure(
         f"{source.type.value.upper()} listener; raw-TCP/X12 payloads (frequently PHI) would cross the "
         "network in cleartext. TCP/X12 listeners are plaintext-only (no TLS option) — bind loopback, "
         "or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
-        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "." + _INSECURE_BIND_ATTESTATION
+        "firewalled network " + _INSECURE_BIND_REFUSAL_TAIL
     )
 
 

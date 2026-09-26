@@ -5369,8 +5369,9 @@ def security_loosenings(
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), four per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, a generic-ODBC ``DATABASE`` hop
-    with TLS unenforced (#333), and ``tls_hop_attested`` (owner ruling 2026-09-24) -- the store principal's OBSERVED privilege posture (#1008), and the
-    OBSERVED keying of the audit chain (#1905). It is NOT yet
+    with TLS unenforced (#333), and ``tls_hop_attested`` (owner ruling 2026-09-24) -- the store
+    principal's OBSERVED privilege posture (#1008), and the OBSERVED keying of the audit chain
+    (#1905). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -5420,7 +5421,8 @@ def security_loosenings(
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``; ``unverified_generic_db_hops``, which walks inbound as well as
-    outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads). A caller that genuinely has no graph — ``messagefoundry security show``, which reads a
+    outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads). A caller that
+    genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
 

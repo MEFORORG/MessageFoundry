@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.tls_policy import (
+    CREDENTIAL_HOP_WAYS_ACROSS,
     SYSTEM_TRUST_ANCHOR,
     InsecureHopRefused,
     TrustAnchor,
@@ -181,9 +182,7 @@ class SmartBackendTokenProvider:
         except InsecureHopRefused as exc:
             raise SmartAuthError(
                 "SMART token endpoint over cleartext http would expose the client_assertion; refused "
-                "by the instance security posture (use https, attest the hop as secure with "
-                "tls_hop_attested and a tls_hop_attested_reason, or declare cleartext_accepted with a "
-                "cleartext_reason)"
+                f"by the instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
             ) from exc
         if not client_id:
             raise SmartAuthError("SMART Backend Services requires a 'smart_client_id' setting")

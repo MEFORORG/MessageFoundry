@@ -2098,7 +2098,9 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
             f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
             "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
             "instance REFUSES these off-loopback at build-check unless the connection declares "
-            "tls_hop_attested with a tls_hop_attested_reason (the hop is secure by other means), "
+            # The spelling of config.tls_policy.HOP_ATTESTATION_LEVER, written out so this module
+            # does not import a crypto module for a string (the crypto-inventory gate).
+            "tls_hop_attested=true with a tls_hop_attested_reason (the hop is secure by other means), "
             "or, on an outbound only, cleartext_accepted with a cleartext_reason"
         ),
     )

@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
-from messagefoundry.config.wiring import WiringError
+from messagefoundry.config.wiring import HOP_ATTESTATION_KEYS, WiringError
 from messagefoundry.pipeline.wiring_runner import (
     check_dimse_tls_exposure,
     check_http_tls_exposure,
@@ -44,8 +44,8 @@ from messagefoundry.transports.http_auth import (
 )
 from messagefoundry.transports.smart import SmartAuthError, SmartBackendTokenProvider
 
-LEVER = "tls_hop_attested"
-REASON = "tls_hop_attested_reason"
+LEVER, REASON_KEY = HOP_ATTESTATION_KEYS
+SIDECAR_REASON = "TLS terminates at the site's stunnel sidecar"
 ENFORCING = HopPosture(enforcing=True)
 NOT_ENFORCING = HopPosture(enforcing=False)
 
@@ -68,7 +68,7 @@ def _no_blanket_escape(monkeypatch: pytest.MonkeyPatch) -> None:
 def _assert_offers_the_supported_lever(message: str) -> None:
     """The lever with its reason, and no route into the transport settings, which the loader refuses."""
     assert LEVER in message
-    assert REASON in message
+    assert REASON_KEY in message
     for settings_route in ("[settings]", "spec.settings", "settings["):
         assert settings_route not in message
 
@@ -78,9 +78,7 @@ def _listener(conn_type: ConnectorType, *, attested: bool = False) -> Source:
         type=conn_type,
         settings={"host": "0.0.0.0", "port": 9000},
         tls_hop_attested=attested,
-        tls_hop_attested_reason="TLS terminates at the site's stunnel sidecar"
-        if attested
-        else None,
+        tls_hop_attested_reason=SIDECAR_REASON if attested else None,
     )
 
 
@@ -128,7 +126,7 @@ def test_bind_warning_names_the_attestation_and_its_reason(
         )
     warned = " ".join(r.getMessage() for r in caplog.records)
     assert LEVER in warned
-    assert "TLS terminates at the site's stunnel sidecar" in warned
+    assert SIDECAR_REASON in warned
     assert "--allow-insecure-bind" not in warned
 
 
@@ -258,7 +256,7 @@ def test_the_declaration_surfaces_take_the_field_and_its_reason() -> None:
     }
     assert takers == _EXPECTED_TAKERS
     for name in takers:
-        assert REASON in inspect.signature(getattr(wiring, name)).parameters, name
+        assert REASON_KEY in inspect.signature(getattr(wiring, name)).parameters, name
     # No transport factory takes it: it is a declaration on the connection, not a transport setting.
     for factory in (wiring.MLLP, wiring.Http, wiring.Rest, wiring.Database, wiring.DatabasePoll):
         assert LEVER not in inspect.signature(factory).parameters, factory.__name__
@@ -272,7 +270,7 @@ _TOML_TABLES = {
     ),
     "inbound": ('[[inbound]]\nname = "IB"\ntransport = "mllp"\nrouter = "r"\n', "port = 1\n"),
 }
-_TOP_LEVEL_PAIR = f'{LEVER} = true\n{REASON} = "TLS terminates at the site\'s stunnel sidecar"\n'
+_TOP_LEVEL_PAIR = f'{LEVER} = true\n{REASON_KEY} = "{SIDECAR_REASON}"\n'
 
 
 @pytest.mark.parametrize("direction", sorted(_TOML_TABLES))
@@ -292,7 +290,7 @@ def test_connections_toml_takes_the_field_as_a_top_level_key(
     assert loaded.tls_hop_attested is True
     # The flag alone is refused: the reason is mandatory on this surface too.
     path.write_text(head + f"{LEVER} = true\n" + table + settings, encoding="utf-8")
-    with pytest.raises(WiringError, match=REASON):
+    with pytest.raises(WiringError, match=REASON_KEY):
         load_connections_file(path, Registry())
 
 

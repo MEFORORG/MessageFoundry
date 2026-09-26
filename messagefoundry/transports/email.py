@@ -55,6 +55,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
+    HOP_ATTESTATION_LEVER,
     InsecureHopRefused,
     RevocationHopGuard,
     build_smtp_tls_context,
@@ -153,8 +154,8 @@ class EmailDestination(DestinationConnector):
             ):
                 raise ValueError(
                     "Email destination use_tls=false sends the message (and any credentials) over "
-                    "cleartext SMTP; refused unless the connection sets tls_hop_attested=true with a "
-                    "tls_hop_attested_reason (the hop IS secure by other means), or "
+                    f"cleartext SMTP; refused unless the connection sets {HOP_ATTESTATION_LEVER} "
+                    "(the hop IS secure by other means), or "
                     "cleartext_accepted=true with a cleartext_reason (the hop is NOT secure and that "
                     "is accepted), or "
                     f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
