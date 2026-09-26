@@ -63,6 +63,7 @@ from messagefoundry.api.auth_models import (
     UserUpdateRequest,
 )
 from messagefoundry.api.security import (
+    alert_sink_for,
     bearer_token,
     client_ip,
     get_auth,
@@ -106,7 +107,6 @@ from messagefoundry.auth.service import (
     NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from messagefoundry.store.store import SessionRecord, UserRecord
 
@@ -114,22 +114,16 @@ _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
 
-# BACKLOG #315: the sink an Administrator grant reports to when no [alerts] notifier is wired, so the
-# grant still reaches the log at WARNING. Stateless, so one module-level instance serves every call.
-_FALLBACK_ALERT_SINK: AlertSink = LoggingAlertSink()
-
 
 def _alert_administrator_granted(app: FastAPI, username: str, *, via: str, granted_by: str) -> None:
     """Raise the ``administrator_granted`` alert (BACKLOG #315). Every dual-control approver is an
     Administrator and every Administrator can make another one, so this is the page for the step
     that mints a second approver. Raised here, in the API, never from ``auth/`` (CLAUDE.md section 4).
-
-    The key is ``user:<username>``, as the BACKLOG #1141 reminder's is. A colon is outside the
-    connection-name grammar, so an alert rule's ``control_action`` can never land on a real
-    connection through it (BACKLOG #1898). Best effort: the grant already happened and is audited."""
-    sink: AlertSink = getattr(app.state, "notifier", None) or _FALLBACK_ALERT_SINK
+    Best effort: the grant already happened and is audited."""
     try:
-        sink.administrator_granted(f"user:{username}", via=via, granted_by=granted_by)
+        alert_sink_for(app.state).administrator_granted(
+            f"user:{username}", via=via, granted_by=granted_by
+        )
     except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not 500 a
         # user-administration call whose write is already committed and audited.
         _log.exception("the administrator_granted alert for %r failed to emit", username)

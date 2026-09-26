@@ -27,7 +27,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.auth import Permission, Role
-from messagefoundry.auth.notifications import ACCOUNT_CREATED, SecurityEvent
+from messagefoundry.auth.notifications import ACCOUNT_CREATED
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings
@@ -38,14 +38,15 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _client_with_sink, _hold_replay
+from tests.test_approval_requester_recheck import _Sink as _RecheckSink
 from tests.test_approvals import ON, PW, _add, _service, _token
+from tests.test_auth_service import _FakeNotifier
 
 _FLAG = "approval.approver_provenance"
 
 
-class _Sink(LoggingAlertSink):
-    def __init__(self) -> None:
-        self.events: list[tuple[str, str, dict[str, Any]]] = []
+class _Sink(_RecheckSink):
+    """The recheck suite's recording sink, plus the two #315 events."""
 
     def approval_approver_provenance(
         self, name: str, *, operation: str, changed: tuple[str, ...]
@@ -63,14 +64,6 @@ class _RaisingSink(LoggingAlertSink):
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
         raise RuntimeError("sink broke its never-raise contract")
-
-
-class _Notifier:
-    def __init__(self) -> None:
-        self.events: list[SecurityEvent] = []
-
-    async def notify(self, event: SecurityEvent) -> None:
-        self.events.append(event)
 
 
 @pytest.fixture
@@ -237,7 +230,7 @@ async def test_the_flag_is_written_over_http_with_the_approvers_address(engine: 
     service = await _service(engine)
     await _add(service, "maker", Role.OPERATOR)
     sink = _Sink()
-    c, _ = _client_with_sink(engine, service, sink)  # type: ignore[arg-type]
+    c, _ = _client_with_sink(engine, service, sink)
     async with c:
         approval_id = await _hold_replay(c, await _token(c, "maker"))
         await _add(service, "checker", Role.ADMINISTRATOR)
@@ -307,7 +300,7 @@ async def test_promoting_to_administrator_raises_the_grant_alert(engine: Engine)
 
 
 async def test_account_created_notice_goes_to_the_new_accounts_address(engine: Engine) -> None:
-    notifier = _Notifier()
+    notifier = _FakeNotifier()
     service = AuthService(engine.store, AuthSettings(require_mfa=False), security_notifier=notifier)
     await service.initialize()
     await service.create_local_user(

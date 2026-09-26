@@ -197,7 +197,8 @@ class AlertSink(Protocol):
         request was made (BACKLOG #315). The release went ahead: this flags it and refuses nothing.
         One Administrator can mint or take over a second approver account, so this is the signal
         that the two identities on the release may be one person. ``name`` is
-        ``approval:<approval id>``, which no connection name can match. ``changed`` holds one or more
+        ``approval:<approval id>``; the colon is outside the connection-name grammar, so a rule's
+        ``control_action`` can never land on a real connection through it (BACKLOG #1898). ``changed`` holds one or more
         of ``account_created``, ``password_changed`` and ``totp_enrolled``. Carries the key, the
         operation key and the slugs only: no username, no params, no PHI. The
         ``approval.approver_provenance`` audit row is the durable record. Emitted by
@@ -207,8 +208,8 @@ class AlertSink(Protocol):
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
         """An account was given the built-in Administrator role, by creating it with the role or by a
         role change that adds it (BACKLOG #315). Every approver is an Administrator, so this is how a
-        second approver gets minted. ``name`` is ``user:<username>``, which no connection name can
-        match. ``via`` is ``account_created`` or ``roles_changed``; ``granted_by`` is the acting
+        second approver gets minted. ``name`` is ``user:<username>``, outside the connection-name
+        grammar for the same reason as :meth:`approval_approver_provenance`. ``via`` is ``account_created`` or ``roles_changed``; ``granted_by`` is the acting
         administrator's username. No PHI. Emitted by the API's user-administration routes, never from
         ``auth/``. A directory account that gains the role from the AD group map at sign-in is NOT
         this event."""

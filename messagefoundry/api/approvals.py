@@ -26,10 +26,8 @@ principal's sessions without disabling the row, and it re-diffs roles only for p
 live session. So a directory-side disable, delete or demotion is seen here only once it has reached
 the engine's row. Probing the directory at release is not built.
 
-The gate cannot prove the approver is a second person (BACKLOG #315). One Administrator can mint or
-take over another approver account. A release whose approver account was created, had its password
-changed, or enrolled TOTP after the request is flagged with an audit row and an alert, and is still
-released. See :meth:`ApprovalGate._flag_approver_provenance`.
+The gate cannot prove the approver is a second person (BACKLOG #315); what it flags instead is
+stated once, on :meth:`ApprovalGate._flag_approver_provenance`.
 
 The registry (op key -> executor) is populated by the API wiring, where the engine is in scope; this
 module owns only the generic hold/approve/reject mechanics over the ``pending_approvals`` store table.
@@ -299,7 +297,7 @@ class ApprovalGate:
         ):
             raise ApprovalError(409, "request was already decided")
         # BACKLOG #315 (b): after the transition, so only a release that really happened is flagged,
-        # and before the executor, so the flag lands even when the executor fails. It never refuses.
+        # and before the executor, so the flag lands even when the executor fails.
         await self._flag_approver_provenance(
             approval_id,
             operation=operation,
@@ -479,8 +477,6 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - see the docstring; the release continues
             log.exception("approval %s: the approver-provenance audit row failed", approval_id)
         try:
-            # `approval:` cannot appear in a connection name, so an alert rule's control_action can
-            # never be aimed at a real connection by this key (BACKLOG #1898).
             self._alert_sink.approval_approver_provenance(
                 f"approval:{approval_id}", operation=operation, changed=tuple(changed)
             )

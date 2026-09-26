@@ -948,9 +948,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
         # BACKLOG #315: a release went ahead with an approver account that changed after the request.
-        # `approval:<id>` stands in for "connection", so each flagged release is its own instance, and
-        # the colon keeps the key out of the connection-name grammar (BACKLOG #1898). The slugs land
-        # in the reason column. No username, no params, no PHI.
+        # `approval:<id>` stands in for "connection", so each flagged release is its own instance
+        # (the key's grammar is on AlertSink). The slugs land in the reason column. No PHI.
         self._emit(
             {
                 "type": "approval_approver_provenance",
@@ -964,8 +963,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
         # BACKLOG #315: an account gained the built-in Administrator role, which is what makes it a
         # dual-control approver. `user:<username>` stands in for "connection", as the #1141 reminder's
-        # key does, and the colon keeps it out of the connection-name grammar (BACKLOG #1898). The
-        # granting administrator is an operator account name, not message content.
+        # key does (the key's grammar is on AlertSink). The granting administrator is an operator
+        # account name, not message content.
         self._emit(
             {
                 "type": "administrator_granted",

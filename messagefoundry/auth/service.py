@@ -87,6 +87,7 @@ from messagefoundry.store.store import (
     UserRecord,
     WebAuthnCredential,
     require_notify_email,
+    seed_notify_email,
 )
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -4848,14 +4849,14 @@ class AuthService:
             detail=_json({"username": username, "roles": list(roles)}),
             client=client,
         )
-        created = await self._store.get_user(user_id)  # the address create_user seeded
-        # No address, no notice: the account has nobody to tell yet, and its holder is asked for one
+        # The address create_user seeded. None means nobody to tell yet: the holder is asked for one
         # at first sign-in (the NOTIFY_EMAIL_SET path) rather than told about this afterwards.
-        if created is not None and created.notify_email:
+        notify = seed_notify_email(email)
+        if notify:
             await self._notify_security(
                 ACCOUNT_CREATED,
                 username=username,
-                email=created.notify_email,
+                email=notify,
                 client=client,
                 detail={"roles": list(roles)},
             )
