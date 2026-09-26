@@ -72,9 +72,10 @@ from typing import Final
 _OUTCOMES: Final[frozenset[str]] = frozenset({"success", "failure", "cancelled", "skipped"})
 
 #: Below this ratio of cap-to-elapsed the step is reported LOW and the check exits non-zero. Not a
-#: round number chosen for looking safe: 1.30 sits under every leg's sized margin (the caps are set at
-#: ~1.35x a measured anchor and land at 1.54x-1.87x over the measured maxima), so it fires when a run
-#: has moved toward its cap rather than every time a runner has a slow morning.
+#: round number chosen for looking safe: 1.30 sits under every leg's sized margin (each cap is sized
+#: at about 1.35x a measured anchor or maximum, rounded up to the minute; ci.yml's sizing notes carry
+#: the per-leg ratios), so it fires when a run has moved toward its cap rather than every time a
+#: runner has a slow morning.
 DEFAULT_MIN_MARGIN: Final[float] = 1.30
 
 _BASELINE: Final[Path] = Path(__file__).resolve().parent / "step_margin_baseline.toml"
@@ -172,6 +173,13 @@ def load_baselines(path: Path = _BASELINE) -> list[Baseline]:
             raise MarginError(
                 f"baseline row {rows[-1].step!r} @ {rows[-1].leg!r} records a maximum of "
                 f"{entry['max_passing']!r}. A leg with no observation has no row, not a zero one."
+            )
+        if any((r.step, r.leg) == (rows[-1].step, rows[-1].leg) for r in rows[:-1]):
+            # `find_baseline` takes the FIRST match, so a re-measured row appended below the old one
+            # would leave the old maximum in force with nothing saying so (BACKLOG #1842).
+            raise MarginError(
+                f"baseline records {rows[-1].step!r} @ {rows[-1].leg!r} twice. Replace the old row "
+                "rather than adding a second one; only the first would ever be read."
             )
     if not rows:
         raise MarginError(f"baseline {path} records no rows -- refusing to check against nothing")

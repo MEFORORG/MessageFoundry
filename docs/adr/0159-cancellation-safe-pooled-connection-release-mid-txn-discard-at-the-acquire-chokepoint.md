@@ -386,6 +386,42 @@ the next reader does not re-derive the wrong precedent from the same comment.
 - **Private-attribute coupling.** `conn._conn` is aioodbc-internal. This is pre-existing — `_acquire`
   already reaches through it to apply the STORE-3 timeout — and aioodbc is hash-locked at 0.5.0, but a
   version bump must re-check `Pool.release`'s `if not conn.closed` rule.
+- **AMENDED 2026-09-26. A named residual: nobody has measured what `_acquire` costs per call on a
+  real SQL Server.** BACKLOG #351 raised the question. The fix to #351 removes the only thing that
+  kept raising it, so the question is recorded here rather than left in the ledger alone.
+
+  **Where it came from.** On 2026-08-02, CI for this ADR's change (BACKLOG #348) ran
+  `tests/test_cluster_failover_sqlserver.py`. On one commit, the SQL Server 2022 leg passed and the
+  2025 leg failed `test_preferred_delay0_wins_expired_lease_race_over_delayed_node`. That test then
+  needed less than 0.35 s of wall clock between a sleep and the lease claim, and every claim goes
+  through `_acquire`. So this change may have spent latency the test had no room for, without being
+  wrong. #351 makes the test deterministic: it now drives the clock that the lease predicate reads.
+  The test can no longer tip, so it can no longer ask the question. **What stays open is the cost,
+  not the test.**
+
+  **Re-specified, because "the ADR 0159 cost" is no longer one thing.** On the success path this ADR
+  adds one `try/except BaseException` frame and one `isinstance` that does not run. The `_acquire`
+  that ships now does at least three more things on every call, and none of them is this ADR's:
+
+  - **B11:** a `perf_counter` pair around the borrow, recorded into `_acquire_wait`
+    (`AcquireWaitHistogram`).
+  - **BACKLOG #1052:** the borrow goes through `acquire_pooled(...)` in `store/base.py`, which wraps
+    it in `ensure_future`, `shield` and `wait_for` to bound it at `[store].acquire_timeout`.
+  - **STORE-3:** `raw.timeout = self._settings.command_timeout`, assigned on every borrow.
+
+  A benchmark that times the whole of `_acquire` times all of these at once. To answer the #351
+  question it has to time this ADR's frame apart from them, one arm per addition.
+
+  **The pool metric does not answer it.** `messagefoundry_store_pool_acquire_wait_*_seconds` comes
+  from the B11 pair, and that pair closes before the `try` opens. It measures the WAIT for a free
+  pooled connection, not the cost of the frame. A green percentile there answers a different
+  question. The fake-pool unit tests cannot answer it either, because they never reach a real ODBC
+  stack.
+
+  **Where it can run.** The hosted `sqlserver-store` CI legs (2022 and 2025 containers) have a real
+  server, and so does the lab that BACKLOG #1003 tracks. The self-hosted Windows workflow,
+  `selfhosted-win2025-sql.yml`, leaves the failover test file out on purpose, because it hangs on
+  that VM.
 
 ## Acceptance Criteria
 

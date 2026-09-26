@@ -612,7 +612,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `phi_read_rate_limit_window_seconds` | float | 60 | sliding-window length |
 | `admin_write_rate_limit_enabled` | bool | `true` | per-actor anti-automation pacing on the **state-changing admin surface** (ASVS 2.4.2) — **NON-GET only**, charged from one per-actor bucket by both `require_step_up` and `require_paced`. Charged on the `/ui` surface too, by `require_ui` -- the console reaches the handlers in-process, so it re-applies the floor rather than inheriting it ([BACKLOG #287](BACKLOG.md)) |
 | `admin_write_rate_limit_per_actor` | int | 12 | max state-changing admin writes per actor per window (`0` disables this dimension); there is deliberately **no global arm** — one operator's bulk work must never throttle another's |
-| `admin_write_rate_limit_window_seconds` | float | 1.0 | sliding-window length; over budget → `429` + `Retry-After: 1`, refused before any further work |
+| `admin_write_rate_limit_window_seconds` | float | 1.0 | sliding-window length; over budget → `429` + `Retry-After: 1` on the JSON API and `Retry-After: 10` on the `/ui` console, refused before any further work |
 | `notify_security_events` | bool | `true` | email the affected user on lockout / first-success-after-failures / password-email-role-disable changes (ASVS 6.3.5/6.3.7). Reuses the `[alerts]` SMTP transport, sent to the user's own address; no SMTP configured → email skipped. The `GET /me/security-events` feed (over the audit log) is always available regardless of this toggle. On a **PHI production** instance this push must be *effective* — see `[alerts].security_notifications_required` (BACKLOG #188). |
 | `require_mfa` | | | **→ moved to `[security].require_mfa`** (ADR 0118) — set it there; no longer accepted in `[auth]`. |
 | `require_mfa_scope` | | | **→ set it as `[security].require_mfa_scope`** (ADR 0118) — like its `require_mfa` sibling it is rejected in `[auth]`. |
@@ -624,7 +624,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `ad_domain` | str | — | UPN suffix, e.g. `example.com` |
 | `ad_user_search_base` | str | — | required when `ad_enabled` |
 | `ad_group_search_base` | str | — | base for nested-group resolution |
-| `ad_bind_dn` | str | — | service-account DN used for lookups |
+| `ad_bind_dn` | str | — | service-account DN used for lookups. It must be able to read each user's `userAccountControl`: an account whose value it cannot read is refused at sign-in and read as absent by the session reconciler (BACKLOG #1639). |
 | `ad_bind_password` | secret | — | **env only** (`MEFOR_AUTH_AD_BIND_PASSWORD`), or use `ad_bind_password_secret` |
 | `ad_bind_password_secret` | str | — | connector `SecretProvider` reference (ADR 0019 §5) — when set and `[secrets].provider` is configured, the bind password is resolved from that backend (e.g. a Vault KV `path#field`) instead of `ad_bind_password`. A reference, not a secret. |
 | `ad_use_nested_groups` | bool | `true` | resolve nested groups (`LDAP_MATCHING_RULE_IN_CHAIN`) |

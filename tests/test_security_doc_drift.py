@@ -1255,6 +1255,13 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "test_the_console_dependency_of_the_browser_legs_is_stated",
     ): ("absence over text: a mention of serve_ui can only over-fire"),
     ("test_security_doc_rate_limits.py", "_config_section"): "slices CONFIGURATION.md prose",
+    ("test_security_doc_rate_limits.py", "test_ui_refusal_reader_can_fail"): (
+        "locates the anchor for a planted mutation, and fails loudly if it moves; the verdict is "
+        "_ui_refusal's AST read"
+    ),
+    ("test_security_doc_rate_limits.py", "test_ui_refusal_is_described_as_the_code_behaves"): (
+        "the text scan reads CONFIGURATION.md prose; the code half is _ui_refusal's AST read"
+    ),
     ("test_threat_model_doc_drift.py", "test_checks_py_only_names_os_system_as_a_lint_string"): (
         "the claim is about a string literal in checks.py"
     ),

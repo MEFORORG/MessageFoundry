@@ -135,8 +135,9 @@ audited (`auth.password_reset`). For the same reason, **admin-created accounts a
 
 **Anti-automation (ASVS 2.4.2).** A per-actor human-timing *pacing floor* on sensitive authenticated
 writes is **built** (BACKLOG #193). **Two** JSON-API gate families charge it, drawing **one bucket per
-actor** (`allow_admin_write`, keyed on the acting user, `_enforce_admin_write_pacing` in
-`api/security.py` is their only caller):
+actor** (`allow_admin_write`, keyed on the acting user). On the JSON API its only caller is
+`_enforce_admin_write_pacing` in `api/security.py`; the console charges it from `require_ui`, as the
+paragraph after this list describes:
 
 - **`require_step_up`** — the sensitive surface that also needs a fresh credential re-proof: purge,
   dead-letter and message replay/resend/edit-resend, `POST /config/reload`, **every** `users:manage`
@@ -158,8 +159,9 @@ it INSIDE the shared implementation that each GET and its needle-bearing POST bo
 budget charged is
 (`allow_phi_read`, ASVS 2.4.1) at admission, so bulk egress cannot outrun the same bucket that bounds
 `/messages`. Over the write floor the request is refused with `429 Too Many Requests` +
-`Retry-After: 1`; over the PHI-read budget with `429` + `Retry-After: 10`. Both are logged (never
-silent). The floor (`[auth].admin_write_rate_limit_per_actor` over
+`Retry-After: 1`; over the PHI-read budget with `429` + `Retry-After: 10`. On the JSON API both are
+logged at WARNING with the actor and path; the console's refusals are not, as the next paragraph
+says. The floor (`[auth].admin_write_rate_limit_per_actor` over
 `admin_write_rate_limit_window_seconds`, default **12 writes per 1.0 s**) sits an order of magnitude
 above human console interaction and above the worst-case `403 → POST /me/reauth → retry` burst, so an
 operator is never throttled while a machine-speed loop trips immediately.
@@ -169,6 +171,11 @@ JSON handler *functions* directly, so the JSON route's pacing `Depends` never ru
 therefore charges `allow_admin_write` in its own right rather than inheriting it, exactly as it
 already re-applies the per-actor **PHI-read** budget via `require_ui(..., phi=True)`. Provenance is
 asserted before the charge, so a cross-site write is refused without spending the victim's budget.
+
+**The console's refusal differs from the JSON floor's.** Over the write floor, `require_ui` answers
+`429` + `Retry-After: 10`, not `1`. It writes no WARNING line naming the actor, for the write floor
+or for the PHI-read budget it charges under `phi=True`; the JSON gates log both.
+
 The floor reaches every non-GET `/ui` route gated by `require_ui`; **seven are not so gated** (six
 with federation off). Five charge their own auth-surface budget instead: `POST /ui/login` and
 `POST /ui/oidc/start` the sign-in window, and `POST /ui/mfa`, `POST /ui/reauth` and
@@ -1013,6 +1020,53 @@ does not disable its row. It re-diffs roles only for principals that hold a live
 requester who was disabled, deleted or demoted in the directory after making a request can still pass
 this check. Probing the directory at release is not built.
 
+**One Administrator is enough to defeat dual control (BACKLOG #315).** The control cannot prove
+that two people concurred, and nothing in the engine can. Only an Administrator holds
+`approvals:approve`, and every Administrator also holds `users:manage`. So an Administrator can create
+a second Administrator account and choose its password. An Administrator can also take over an
+existing one: `POST /users/{id}/reset-password` returns the temporary password to the caller, and
+`POST /users/{id}/reset-mfa` removes the target's second factors. Either way, that one person can then
+request an action and approve it. Creating accounts and changing roles cannot be placed under
+approval, because `[approvals].operations` has no user-management key. The server does refuse
+self-approval by user id. A second account is a second user id, so that refusal does not stop this.
+
+An auditor would be wrong to read `approval.approved` as proof that two people agreed. Treat it as
+proof that two accounts did.
+
+What the engine does instead is make the cheap routes loud. It refuses none of them:
+
+| Signal | When | Where it goes |
+|---|---|---|
+| `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, or `PUT /ad-group-map` newly maps a group to it | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator |
+| `client` on the `user.created` audit row | An account created through `POST /users` | The creating administrator's address, like the approval rows |
+| `account_created` notice | An account created through `POST /users` with a notification address | The new account's own notification address |
+
+**These signals miss at least five routes.** Each ends in one person holding two approver accounts
+with no page.
+
+- **Takeover before the request.** An existing Administrator's password and second factor are reset
+  before the request is filed. All three timestamps predate the request, so the release is not
+  flagged. No role changed, so `administrator_granted` does not fire either. Only the audit rows for
+  the resets record it.
+- **Mint before the request.** A new Administrator created before the request is not flagged at
+  release. Its `administrator_granted` alert fired when it was created.
+- **Promotion after the request.** Promotion changes none of the three timestamps, so the release is
+  not flagged. Its `administrator_granted` alert is the only page.
+- **Re-enabling a disabled Administrator, or binding a directory Administrator's federated
+  identity.** Neither changes a timestamp or grants a role, so neither pages.
+- **A directory grant.** An account that gets Administrator because the *directory* added it to a
+  group already mapped to Administrator raises no alert. The engine never sees that grant.
+
+The check also flags some releases that changed nothing. A login that rehashes a password after an
+argon2 parameter change restamps `password_changed_at`, so each approver's first release after such a
+change is flagged. The comparison uses two clocks, the requester's and the store writer's, so the
+skew described under the dwell floor shifts it too.
+
+The provenance check flags rather than refuses on purpose. A refusal would stop only the careless
+route, and it would also refuse an honest directory approver whose engine row is created at first
+sign-in.
+
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
 sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
@@ -1090,7 +1144,8 @@ gate **also** requires the session's second factor: an MFA-required caller is re
 `X-MFA-Required` until `POST /auth/mfa-verify` succeeds (TOTP or a single-use recovery code), so these
 routes need both a fresh step-up window **and** the MFA factor. The window is not always a password:
 a code proved at the MFA gate stamps it too (see above). The step-up window composes with the
-dual-control approval above (the requester re-verifies; an independent approver still releases the action).
+dual-control approval above: the requester re-verifies, and a second account releases the action.
+That second account need not belong to a second person; see BACKLOG #315 under dual-control approval.
 
 ### Multi-factor authentication (TOTP, WP-14)
 
@@ -1511,8 +1566,8 @@ slack.
 | Live directory resolvability — probe strikes | a periodic AD probe of principals that still hold sessions | interval floored at 60 s; **2 consecutive** failed passes (`ad_session_recheck_strikes`); ≤ 200 users (`ad_session_recheck_max_users`) probed per pass, least-recently-probed first. Fail-**open** on DC unavailability (an unreachable DC revokes nothing) | **DENY** by revocation, `auth.ad_session_revoked` audited | **300 s** (the shipped default); `0` disables the loop entirely and is a named loosening | `[auth].ad_session_recheck_seconds`, `ad_session_recheck_strikes`, `ad_session_recheck_max_users` |
 | Live directory group membership vs. the session's granted roles | the AD groups returned by that same reconciliation probe, mapped through the AD-group→role map | on a **successful (PRESENT)** probe, the mapped role set differs from the account's current roles — a **single** pass, **no** strike accrual (unlike the row above) | **DENY** by revocation of every session for that account (the new roles are persisted first), `auth.ad_session_revoked` with `reason = roles_changed`; charged against the same mass-revoke breaker as an absence | **300 s** (same loop; `0` disables it) | `[auth].ad_session_recheck_seconds` |
 | Live directory mass-revoke breaker | the size of one pass's revocation set vs the probed population | the set exceeds **both** `ad_session_revoke_max` (**5**) **and** `ad_session_revoke_max_fraction` (**0.34**) — a second **binary** predicate layered on the row above, never a score (see "Directory session reconciliation") | **LOG** — the pass aborts revoking **nothing**, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row + loud alert | 5 / 0.34 | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
-| PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, WARNING-logged, charged at **admission** before any store work | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
-| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 1.0 s (`admin_write_rate_limit_window_seconds`); no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`, WARNING-logged. Charged on the JSON API and on `/ui`, which re-applies it | on, 12 writes / 1.0 s | `[auth].admin_write_rate_limit_enabled` |
+| PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, charged at **admission** before any store work. WARNING-logged on the JSON API; the `/ui` `phi=True` arm is not (see *The console's refusal differs from the JSON floor's*) | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
+| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 1.0 s (`admin_write_rate_limit_window_seconds`); no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 1.0 s | `[auth].admin_write_rate_limit_enabled` |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
 | Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | auth off on an exposed instance — a non-loopback bind **or** a declared terminator (`instance_exposed`); `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off, `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_sign_in`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind **or** a declared TLS terminator — never the console flag, BACKLOG #326) × `[approvals].enabled` | `admin_exposed` **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
@@ -2295,7 +2350,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 
 ### Route → limiter map
 
-**Scope, because its absence has been misread.** This map enumerates the **auth-surface** limiters only — the sign-in window (control 2) and the per-actor ceremony budget (control 3). It is **not** an inventory of everything that paces a route. Every non-GET `/ui` route additionally charges the per-actor **admin-write floor** in `require_ui`, and every non-GET route behind `require_paced`, `require_step_up` or `require_step_up_action` charges it in `_enforce_admin_write_pacing`; that limiter is documented in the ASVS 2.1.3 table below, not here. So a route absent from this map is not thereby unpaced. Five `/ui/account` writes — `mfa/enroll`, `mfa/disable`, `sessions/{session_id}/revoke`, `sessions/revoke-others` and `webauthn/{credential_id_hash}/delete` — charge that floor and no auth-surface limiter, which is why they appear in neither column.
+**Scope, because its absence has been misread.** This map enumerates the **auth-surface** limiters only — the sign-in window (control 2) and the per-actor ceremony budget (control 3). It is **not** an inventory of everything that paces a route. Every non-GET `/ui` route gated by `require_ui` additionally charges the per-actor **admin-write floor** there, and every non-GET route behind `require_paced`, `require_step_up` or `require_step_up_action` charges it in `_enforce_admin_write_pacing`; that limiter is documented in the ASVS 2.1.3 table below, not here. So a route absent from this map is not thereby unpaced. Five `/ui/account` writes — `mfa/enroll`, `mfa/disable`, `sessions/{session_id}/revoke`, `sessions/revoke-others` and `webauthn/{credential_id_hash}/delete` — charge that floor and no auth-surface limiter, which is why they appear in neither column.
 
 | Route | Limiter | Notes |
 |---|---|---|
@@ -2343,8 +2398,8 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Sign-in attempts | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | on / 10 / 60 / 60.0 s | 60 s | no | **yes** (60) | **yes** (10) | **in-process** — 3 JSON + 4 console entry routes (`POST /ui/login`, `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`), plus `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) | logged, **not** audited. **429 + `Retry-After: 30` on `POST /ui/login`** — the only *sign-in-window* route that sends the header (three **ceremony** routes, `POST /ui/reauth`, `POST /ui/reauth/webauthn` and `POST /ui/mfa`, send it too, see the row below); a **303 redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`)** on the other console entry routes — `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when it charges at all — because a browser navigation cannot render a 429 usefully; **429 with no `Retry-After`** on the three JSON routes |
 | Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 4 console ceremony routes (`POST /ui/mfa`, `POST /ui/reauth`, `POST /ui/reauth/webauthn`, `POST /ui/account/mfa/verify`), plus `POST /ui/account/password`, which inherits the JSON handler's single charge | 429; `Retry-After: 30` on `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn`, none on the three JSON routes, `POST /ui/account/mfa/verify` or `POST /ui/account/password`; logged |
 | Account lockout | `[auth].lockout_threshold`, `lockout_minutes` | 5 / 15 min | — | **yes** | no | no | **store-backed** — the local password leg + the TOTP/recovery leg of any account with TOTP enrolled, directory ones included, and the step-up re-auth re-proof (AD re-binds included) + the password-change re-proof (local accounts only), counted by one atomic `increment_login_failure` per attempt (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — `auth.login_locked` on the password leg, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs, `auth.login_failed` with `reason=locked` on the Kerberos and OIDC sign-ins (which do not feed it), the re-proofs are not refused by it, and the failure that spends a session's cap revokes that session: `auth.reauth` (`session_revoked=true`) / `auth.password_change_failed` (`reason=session_revoked`) |
-| PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 7 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 5 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`, logged |
-| Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds` | on / 12 / 1.0 s | 1.0 s | **yes** (12) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | 429 + `Retry-After: 1`, logged |
+| PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 7 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 5 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`; logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
+| Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds` | on / 12 / 1.0 s | 1.0 s | **yes** (12) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + `Retry-After: 1`, logged. `/ui`: 429 + `Retry-After: 10`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login | the user's oldest session is revoked |
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
@@ -2375,7 +2430,9 @@ trail is the per-account `auth.login_failed` / `auth.login_locked` rows, plus `a
 is audited under those names, not `auth.login_locked`), `auth.reauth` and `auth.password_change_failed`
 for the post-session re-proofs, and the two 6.3.5 events, `auth.account_locked` and
 `auth.login_after_failures`. PHI-read and admin-write
-throttles log at WARNING with actor + path.
+throttles on the JSON API log at WARNING with actor + path; the console's `require_ui` refusals do
+not (see *The console's refusal differs from the JSON floor's* under
+[Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
 
 **Per-IP limiter caveat (SEC-024).** The per-client-IP sign-in window is in-process and keyed on the
 caller's source address, so an attacker who can rotate source addresses creates a fresh empty per-IP
