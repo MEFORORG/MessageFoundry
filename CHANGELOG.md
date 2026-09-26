@@ -127,9 +127,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   The SMART provider also raised errors outside its own `DeliveryError` contract: for a malformed
   status line, a deeply nested reply, and an `expires_in` too large for a float. It now raises
   `DeliveryError` for each. So a FHIR or REST destination using SMART would retry them as transient
-  failures rather than treat them as internal errors. The provider now also refuses an `expires_in`
-  that is infinite or not a number, which it would have cached forever. It caps any other lifetime at
-  one hour. The lookup executor's probe method has no caller yet and gets the same mappings.
+  failures rather than treat them as internal errors. An `expires_in` of `1e999` parses as infinity,
+  and the provider would have cached that token forever. It now caches a token for at most one hour
+  after the expiry skew, and treats a `NaN` lifetime as a missing one. A deeply nested FHIR reply to
+  a lookup now maps to `FhirLookupError` too. The lookup executor's probe method has no caller yet and
+  gets the same mappings.
   (`BACKLOG #1980`)
 - **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
   it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.

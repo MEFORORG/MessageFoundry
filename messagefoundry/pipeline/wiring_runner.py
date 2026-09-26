@@ -1852,10 +1852,14 @@ class RegistryRunner:
             # each leg has its own 30 s default. No per-leg timeout can keep their sum under this
             # wait, so a hang in either leg lands here. Mapped so a Handler that catches
             # FhirLookupError sees it; the orphaned read still finishes on the loop, as before.
-            raise FhirLookupError(
-                f"fhir_lookup on {connection!r}: no result within "
-                f"{_LOOKUP_RESULT_TIMEOUT_SECONDS:g}s"
-            ) from exc
+            # On 3.11+ a TimeoutError the read itself raised arrives here too, so the future's
+            # state decides the wording: done means the read raised it, not the wait.
+            reason = (
+                "the read timed out"
+                if future.done()
+                else f"no result within {_LOOKUP_RESULT_TIMEOUT_SECONDS:g}s"
+            )
+            raise FhirLookupError(f"fhir_lookup on {connection!r}: {reason}") from exc
 
     # --- per-connection control (console operations) -------------------------
 

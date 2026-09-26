@@ -291,28 +291,42 @@ def test_token_mint_failures_keep_the_delivery_error_contract(
 
 
 @pytest.mark.parametrize(
-    "expires_in", [b"1e999", b"-1e999", b"NaN", b"Infinity"], ids=["1e999", "-1e999", "nan", "inf"]
+    ("expires_in", "cached_for"),
+    [
+        # json.loads reads 1e999 as inf. Before BACKLOG #1980 that cached the token forever.
+        (b"1e999", 3600.0),
+        (b"Infinity", 3600.0),
+        # A finite but absurd lifetime is clamped the same way.
+        (b"1e300", 3600.0),
+        # NaN is treated as a missing expires_in: 300 s less the 60 s skew.
+        (b"NaN", 240.0),
+        # A negative lifetime caches nothing, as it always did.
+        (b"-1e999", 0.0),
+    ],
+    ids=["1e999", "inf", "1e300", "nan", "-1e999"],
 )
-def test_a_non_finite_expires_in_is_refused(rsa_pem: str, expires_in: bytes) -> None:
-    # BACKLOG #1980: json.loads reads 1e999 as inf and accepts the NaN and Infinity literals. An
-    # infinite ttl would cache the token forever, so the provider refuses the reply instead.
+def test_the_token_cache_is_bounded_whatever_expires_in_says(
+    rsa_pem: str, expires_in: bytes, cached_for: float
+) -> None:
     provider = _provider(rsa_pem)
     body = b'{"access_token":"TOK","expires_in":' + expires_in + b"}"
     provider._opener = _FakeOpener(body=body)  # type: ignore[assignment]
-    with pytest.raises(DeliveryError, match="unparseable"):
-        provider.access_token()
-    assert provider._cached_token is None
-
-
-def test_an_absurd_expires_in_is_clamped(rsa_pem: str) -> None:
-    # A finite but absurd lifetime is clamped to the ceiling, so the token still re-mints.
-    provider = _provider(rsa_pem)
-    provider._opener = _FakeOpener(  # type: ignore[assignment]
-        body=b'{"access_token":"TOK","expires_in":1e300}'
-    )
     before = time.monotonic()
     assert provider.access_token() == "TOK"
-    assert provider._cached_expiry_monotonic <= before + 3600.0 + 1.0
+    after = time.monotonic()
+    # Both bounds, so a clamp that caches for zero seconds fails as surely as one that never clamps.
+    assert before + cached_for <= provider._cached_expiry_monotonic <= after + cached_for
+
+
+def test_the_cache_ceiling_applies_after_the_skew(rsa_pem: str) -> None:
+    # A skew as large as the ceiling still caches a long-lived token for the full ceiling.
+    provider = _provider(rsa_pem, expiry_skew_seconds=3600.0)
+    provider._opener = _FakeOpener(  # type: ignore[assignment]
+        body=b'{"access_token":"TOK","expires_in":86400}'
+    )
+    before = time.monotonic()
+    provider.access_token()
+    assert provider._cached_expiry_monotonic >= before + 3600.0
 
 
 def test_asvs_191_smart_oauth_controls_exercised(rsa_pem: str) -> None:

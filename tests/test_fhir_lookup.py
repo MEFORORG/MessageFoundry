@@ -863,6 +863,36 @@ async def test_a_malformed_fhir_reply_is_a_lookup_error(exc: Exception) -> None:
         assert "hello" not in str(err.value)
 
 
+async def test_a_deeply_nested_fhir_reply_is_a_lookup_error() -> None:
+    # BACKLOG #1980: json.loads raises RecursionError on a deeply nested body, which the FHIR codec
+    # does not map. 200 KB is far under the read bound.
+    ex, _ = _executor(body=b"[" * 200_000)
+    with pytest.raises(FhirLookupError, match="unparseable") as err:
+        await ex.read("epic", "Patient/123")
+    assert isinstance(err.value.__cause__, RecursionError)
+
+
+async def test_a_timeout_the_read_raised_is_not_called_a_bridge_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On 3.11+ the bridge's wait and a read's own TimeoutError are one class. A read that raised
+    # at once must not be reported as a wait that ran out.
+    class _TimesOut:
+        async def read(self, *a: object) -> dict[str, Any]:
+            raise TimeoutError("inner")
+
+    runner = types.SimpleNamespace(
+        _fhir_lookup_executor=_TimesOut(), _loop=asyncio.get_running_loop()
+    )
+    with pytest.raises(FhirLookupError, match="the read timed out"):
+        await asyncio.to_thread(
+            RegistryRunner._run_fhir_lookup,
+            runner,  # type: ignore[arg-type]
+            "epic",
+            "Patient/123",
+        )
+
+
 async def test_remote_disconnected_keeps_the_os_error_wording() -> None:
     # RemoteDisconnected is both an OSError and an HTTPException. The HTTPException arm sits after
     # the OSError arm, so this reply keeps the wording it had.
