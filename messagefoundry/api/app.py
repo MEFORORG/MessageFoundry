@@ -1289,19 +1289,24 @@ async def _guard_resubmission(
 
     The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
     of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal counts hl7apy's
-    errors rather than quoting them, since that text can echo a field value."""
+    errors rather than quoting them, since that text can echo a field value.
+
+    The 4xx is raised after the handler has ended, with only the phase and reason kept, so the caught
+    error is on neither of its chains (BACKLOG #1796). ``from None`` would leave it on
+    ``__context__``, and a guard error's own chain has held the whole body."""
     try:
         return await admit_resubmission(raw, inbound)
     except IngressGuardError as exc:
-        await engine.store.record_audit(
-            action,
-            actor=identity.username,
-            channel_id=channel_id,
-            detail=json.dumps({**detail, "phase": exc.phase, "reason": exc.reason}),
-            client=client_ip(request),
-        )
-        _log.warning("%s: refused by the ingress guards (phase=%s)", action, exc.phase)
-        raise HTTPException(_INGRESS_GUARD_STATUS[exc.phase], exc.reason) from None
+        phase, reason = exc.phase, exc.reason
+    await engine.store.record_audit(
+        action,
+        actor=identity.username,
+        channel_id=channel_id,
+        detail=json.dumps({**detail, "phase": phase, "reason": reason}),
+        client=client_ip(request),
+    )
+    _log.warning("%s: refused by the ingress guards (phase=%s)", action, phase)
+    raise HTTPException(_INGRESS_GUARD_STATUS[phase], reason)
 
 
 async def _audit_channel_denied(
