@@ -802,24 +802,32 @@ async def test_file_destination_created_directory_is_logged(
     assert "CREATED missing directory" not in caplog.text  # only a real creation is loud
 
 
-def _fail_part_unlink(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make ``os.unlink`` raise ``PermissionError`` for a ``.part`` temp only; the rest is real."""
+def _fail_part_unlink(
+    monkeypatch: pytest.MonkeyPatch, exc_type: type[OSError] = PermissionError
+) -> None:
+    """Make ``os.unlink`` raise ``exc_type`` for a ``.part`` temp only; the rest is real."""
     real_unlink = os.unlink
 
     def unlink(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
         if os.fspath(path).endswith(".part"):
-            raise PermissionError(errno.EACCES, "Access is denied", os.fspath(path))
+            code = errno.ENOENT if exc_type is FileNotFoundError else errno.EACCES
+            raise exc_type(code, os.strerror(code), os.fspath(path))
         real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "unlink", unlink)
 
 
+@pytest.mark.parametrize("exc_type", [PermissionError, FileNotFoundError])
 async def test_file_destination_failed_temp_unlink_warns_and_still_delivers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc_type: type[OSError],
 ) -> None:
-    # BACKLOG #1862. A failed temp unlink on the default hard-link path orphans the .part. The
-    # delivery was already published, so it must still succeed; only the silence changes.
-    _fail_part_unlink(monkeypatch)
+    # BACKLOG #1862. A failed temp unlink on the default claim path leaves the .part behind. The
+    # delivery was already published, so it must still succeed; only the silence changes. The
+    # FileNotFoundError case stands in for a dropped Windows UNC share, which raises that type too.
+    _fail_part_unlink(monkeypatch, exc_type)
     dest = _file_dest(tmp_path)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         await dest.send(ADT)  # the arm that must not regress: no DeliveryError
@@ -828,14 +836,34 @@ async def test_file_destination_failed_temp_unlink_warns_and_still_delivers(
     assert len(orphans) == 1
     assert "could not remove its temp file" in caplog.text
     assert str(orphans[0]) in caplog.text  # names the path an operator has to clean up
-    assert f"errno {errno.EACCES}" in caplog.text
+    assert exc_type.__name__ in caplog.text
+
+
+async def test_file_destination_failed_temp_unlink_keeps_the_real_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # When the publish itself fails AND the temp cannot be removed, the send must report the
+    # publish failure, not the cleanup one, and still log the leftover temp.
+    _fail_part_unlink(monkeypatch)
+
+    def full_disk(src: object, dst: object) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", full_disk)
+    dest = _file_dest(tmp_path, overwrite=True)
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"),
+        pytest.raises(DeliveryError, match="No space left on device"),
+    ):
+        await dest.send(ADT)
+    assert "could not remove its temp file" in caplog.text
 
 
 async def test_file_destination_consumed_temp_on_overwrite_is_silent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # os.replace consumes the temp, so every overwrite delivery finds it gone. That must not warn, or
-    # the #1862 warning would fire on every message and train operators to ignore it.
+    # os.replace consumes the temp, so there is nothing to remove. That must not warn, or the #1862
+    # warning would fire on every message and train operators to ignore it.
     dest = _file_dest(tmp_path, overwrite=True)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         await dest.send(ADT)

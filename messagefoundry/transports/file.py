@@ -339,28 +339,38 @@ class FileDestination(DestinationConnector):
         # deliveries can't clobber each other (FILE-5: replaces the TOCTOU exists()-then-rename).
         fd, tmp_name = tempfile.mkstemp(dir=self.directory, suffix=".part")
         tmp = Path(tmp_name)
+        consumed = False
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
             if self._overwrite:
                 os.replace(tmp, target)  # atomic overwrite; consumes tmp
+                consumed = True
             else:
-                _claim_unique(tmp, target)  # hard-links tmp → a free name
+                _claim_unique(tmp, target)  # hard-links (or copies) tmp to a free name
         finally:
-            # os.replace consumes the temp, so a missing file is expected. On the hard-link path this
-            # unlink is the only cleanup, and a failure orphans the .part for good (BACKLOG #1862):
-            # never raise (the target is published, or a real error is in flight), but never silent.
-            # The name is mkstemp's random one, not partner-chosen, so it needs no safe_name.
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning(
-                    "file destination could not remove its temp file %s (errno %s: %s); an orphaned "
-                    ".part file is left in the destination directory",
-                    tmp,
-                    exc.errno,
-                    exc.strerror,
-                )
+            if not consumed:
+                self._remove_temp(tmp)
+
+    @staticmethod
+    def _remove_temp(tmp: Path) -> None:
+        """Remove the ``.part`` temp, best-effort, and log a WARNING if it stays (BACKLOG #1862).
+
+        Only called while the temp should still exist, so ``FileNotFoundError`` is not treated as
+        success: on Windows a dropped UNC share also surfaces as ``FileNotFoundError``, and the
+        orphan is still there when the share returns. This never raises. After a claim the target
+        is already published, so the delivery must not fail. After a failure, the real error must
+        not be replaced by a cleanup error. The temp's name is random from ``mkstemp``, not chosen
+        by a partner, so it needs no ``safe_name``."""
+        try:
+            tmp.unlink()
+        except OSError as exc:
+            logger.warning(
+                "file destination could not remove its temp file %s: %s; a .part file may be left "
+                "in the destination directory",
+                tmp,
+                safe_exc(exc),
+            )
 
 
 class FileSource(SourceConnector):

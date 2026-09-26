@@ -88,11 +88,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
 - **A file destination now logs a WARNING when it cannot remove its `.part` temp file.** Each
-  delivery writes a temp file inside the destination directory, then hard-links it to the target
-  name. The temp removal after that ignored every error, so a failed removal left an orphaned
-  `.part` file there for good, with nothing in the log. The delivery itself was never affected and
-  still succeeds. The warning names the temp path and the OS error. The `overwrite` mode's rename
-  already consumes the temp, so a missing temp stays silent. (`BACKLOG #1862`)
+  delivery writes a temp file inside the destination directory, then hard-links or copies it to the
+  target name. The temp removal after that ignored every error. A failed removal left a full copy
+  of the message in a `.part` file there permanently, with nothing in the log. The delivery still
+  succeeds. The warning names the temp path and the OS error. The `overwrite` mode renames the temp
+  into place, so it has no temp left to remove and logs nothing. (`BACKLOG #1862`)
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
   `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other
