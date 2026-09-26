@@ -123,6 +123,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   of the message in a `.part` file there permanently, with nothing in the log. The delivery still
   succeeds. The warning names the temp path and the OS error. The `overwrite` mode renames the temp
   into place, so it has no temp left to remove and logs nothing. (`BACKLOG #1862`)
+- **An MLLP listener now answers a store outage at intake with a NAK before it closes the
+  connection.** When the inbound handler faulted, for example because the store could not commit
+  the message, the listener closed the socket with no reply and logged the event as
+  `framing_error`. It now sends an `AE` (a `CE` in enhanced mode) with fixed text, then closes,
+  and records a new `handler_error` connection event. An inbound that sends no replies keeps its
+  socket, so frames already sent behind the failed one are still handled. The message is still
+  not accepted, and the sender resends it. The NAK has no message row, so it is not in the ACK
+  capture stream. ([BACKLOG #1619](docs/BACKLOG.md))
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
   `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other
