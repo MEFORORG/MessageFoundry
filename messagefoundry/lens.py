@@ -76,6 +76,28 @@ CONTRACT_LATEST = CONTRACT_V2
 
 _CONTRACTS = frozenset({CONTRACT_V1, CONTRACT_V2})
 
+# What ``ast.parse`` raises, besides ``SyntaxError``, on source it cannot turn into a tree (BACKLOG
+# #1858). Each lens site converts these to its own error type, so the CLI's ``except`` sees a clean
+# refusal instead of an uncaught traceback. At least these are reachable, each measured by
+# tests/test_parser_refusal_guards.py; the classes mirror ``corepoint_import._verify_compilable``.
+#
+# * ``MemoryError`` -- the parser's width wall ("Parser stack overflowed"), a bounded parser limit
+#   rather than heap exhaustion, so the interpreter is fully usable afterwards.
+# * ``RecursionError`` -- the depth wall, raised while the parse builds a deeply nested tree.
+# * ``ValueError`` -- covers ``UnicodeEncodeError``, which a lone surrogate raises. One reaches these
+#   sites through the edit JSON, whose ``\ud800`` escape decodes to exactly that. A base class rather
+#   than a leaf, because enumerating leaves is how this defect was written.
+#
+# ``SyntaxError`` stays its own ``except`` at each site, because only it carries ``msg`` and ``lineno``.
+_PARSER_REFUSALS = (MemoryError, RecursionError, ValueError)
+
+
+def _refusal_reason(exc: Exception) -> str:
+    """Say why the parser refused, naming the class, since none of these carries a line number."""
+    if isinstance(exc, MemoryError | RecursionError):
+        return f"source too complex for the Python parser: {type(exc).__name__}: {exc}"
+    return f"{type(exc).__name__}: {exc}"
+
 
 class LensParseError(ValueError):
     """The module file could not be parsed (a syntax error) — a whole-file lens refusal (ADR 0076 §4).
@@ -320,7 +342,7 @@ def parse_module(path: str | Path, *, contract: int = CONTRACT_V1) -> list[dict[
     p = Path(path)
     try:
         source = p.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise LensParseError(f"{p}: cannot read ({exc})") from exc
     # posix slashes keep the emitted contract (and the committed L3 fixtures) OS-neutral.
     return parse_source(source, module=p.as_posix(), contract=contract)
@@ -334,7 +356,8 @@ def parse_source(
     The file-free entry point (used by tests). ``module`` is echoed into each contract's ``module``
     field. ``contract`` selects the emitted grammar — :data:`CONTRACT_V1` (the default) is the shipped
     handler-only contract, :data:`CONTRACT_V2` adds ``note`` + ``route`` rows and ``@router``
-    projection. Raises :class:`LensParseError` on a syntax error or an unknown ``contract``."""
+    projection. Raises :class:`LensParseError` on source the parser refuses (a syntax error, or one of
+    ``_PARSER_REFUSALS``) or an unknown ``contract``."""
     if contract not in _CONTRACTS:
         raise LensParseError(
             f"unknown contract version {contract!r} (supported: {sorted(_CONTRACTS)})"
@@ -346,6 +369,8 @@ def parse_source(
         tree = ast.parse(source)
     except SyntaxError as exc:
         raise LensParseError(f"{module}: cannot parse ({exc.msg} at line {exc.lineno})") from exc
+    except _PARSER_REFUSALS as exc:
+        raise LensParseError(f"{module}: cannot parse ({_refusal_reason(exc)})") from exc
     # Split on \r\n / \r / \n only (the tokenizer's line model) so a form-feed / NEL / U+2028 never
     # desyncs an AST line number from its text (F2); everything mapping a line number to text uses this.
     lines = _physical_lines(source)
@@ -1918,6 +1943,8 @@ def rewrite_source(
         tree = ast.parse(src)
     except SyntaxError as exc:
         raise LensRewriteError(f"{module}: cannot parse ({exc.msg} at line {exc.lineno})") from exc
+    except _PARSER_REFUSALS as exc:
+        raise LensRewriteError(f"{module}: cannot parse ({_refusal_reason(exc)})") from exc
 
     # Stale-coordinate guard (F7): the row coords came from a prior *disk*-based ``lens parse``, but the
     # edit runs on the *live* buffer. When the caller carries the projected row's source text, verify it
@@ -2079,6 +2106,11 @@ def _assert_reparses(result: str, module: str) -> None:
         raise LensRewriteError(
             f"{module}: the rewrite would produce invalid Python ({exc.msg} at line {exc.lineno}) - "
             "refused (no change made)"
+        ) from exc
+    except _PARSER_REFUSALS as exc:
+        raise LensRewriteError(
+            f"{module}: the rewrite would produce source the parser refuses "
+            f"({_refusal_reason(exc)}) - refused (no change made)"
         ) from exc
 
 
@@ -2515,10 +2547,23 @@ def _validated_expr(expr: str, pname: str) -> str:
         raise LensRewriteError(
             f"parameter {pname!r}: expression {expr!r} is not a valid Python expression ({exc.msg})"
         ) from exc
+    except _PARSER_REFUSALS as exc:
+        # The expression is left out: only very long source reaches the parser walls.
+        raise LensRewriteError(
+            f"parameter {pname!r}: the expression is not a valid Python expression "
+            f"({_refusal_reason(exc)})"
+        ) from exc
     try:
         probe: ast.expr | None = ast.parse(f"_f({expr})", mode="eval").body
     except SyntaxError:
         probe = None
+    except _PARSER_REFUSALS as exc:
+        # One call deeper than the parse above, so it can trip the wall that parse cleared. Refuse for
+        # that reason, not as the extra-argument refusal below, which would name the wrong cause.
+        raise LensRewriteError(
+            f"parameter {pname!r}: the expression is not a valid call argument "
+            f"({_refusal_reason(exc)})"
+        ) from exc
     if (
         not isinstance(probe, ast.Call)
         or len(probe.args) != 1
@@ -3365,7 +3410,7 @@ def _parse_pasted_block(block: str) -> ast.stmt:
     for header in ("def _f():\n", "async def _f():\n"):
         try:
             wrapped = ast.parse(header + block)
-        except SyntaxError:
+        except (SyntaxError, *_PARSER_REFUSALS):
             continue
         func = wrapped.body[0]
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):

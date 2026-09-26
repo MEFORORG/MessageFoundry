@@ -5965,11 +5965,11 @@ def create_app(
         Statuses: ``400`` not clustered (refused BEFORE the coordinator is touched — there is no lease
         and no standby, and ``force`` does not change that); ``412`` no other promotable node has a
         fresh heartbeat, so nothing could take the lease (BACKLOG #1509) — the ONLY refusal ``force``
-        overrides; ``409`` this node is not the leader — the caller resolves the leader from
-        ``GET /cluster/nodes`` first, and see the note below on the one case where a ``409`` IS the
-        successful answer; ``403`` missing permission / step-up / MFA; ``503`` engine not started,
-        authentication not configured, a membership read that raised, or one of the two drain
-        conditions below.
+        overrides; ``409`` this node neither held leadership nor owned a lease row to release — the
+        caller resolves the leader from ``GET /cluster/nodes`` first, and see the note below on the
+        one case where a ``409`` IS the successful answer; ``403`` missing permission / step-up /
+        MFA; ``503`` engine not started, authentication not configured, a membership read that
+        raised, or one of the two drain conditions below.
 
         **Why ``412`` and not a second ``409``.** ``409`` already says "you addressed the wrong node",
         and after a ``release-unconfirmed`` it can even be the failover succeeding. A no-sibling refusal
@@ -6017,60 +6017,48 @@ def create_app(
           leads nothing — this branch asserts nothing about who the leader is.
         * ``StepdownReleaseUnconfirmed`` → reason ``release-unconfirmed``. This node **has** demoted
           itself and **this call armed its claim pause** — both hold on every branch that reaches the
-          raise, because the pause is armed on ``self._is_leader or owed`` and the write is only
-          attempted under the same condition. What it could not confirm is whether the write expiring
-          its lease row committed. A lost response to a committed ``UPDATE`` is indistinguishable from
-          an ``UPDATE`` that never ran, so the body is conditional: saying "it is still the leader" is
-          right on one branch and, on the other, sends an operator to fix a cluster that is already
-          failing over correctly.
+          raise, because the pause is armed on the coordinator's ``_may_own_lease_row()`` and the
+          write is only attempted under the same condition. What it could not confirm is whether the
+          write expiring its lease row committed. A lost response to a committed ``UPDATE`` is
+          indistinguishable from an ``UPDATE`` that never ran, so the body is conditional: saying "it
+          is still the leader" is right on one branch and, on the other, sends an operator to fix a
+          cluster that is already failing over correctly.
 
           **What this branch must NOT say is that a teardown just started.** The demotion edge fires
-          under ``if was_leader`` — in ``DbCoordinator.step_down_leadership`` and identically in its
-          SQL Server twin, the only two that reach this raise — which a RETRY has already cleared, so
-          a repeat refusal signals nothing new and an earlier body claiming otherwise was false on
-          exactly that branch. The body therefore describes the demotion teardown as a mechanism — it
+          under ``was_leader or lease_released`` — in ``DbCoordinator.step_down_leadership`` and
+          identically in its SQL Server twin, the only two that reach this raise. On this branch the
+          write did not return, so ``lease_released`` is false, and ``was_leader`` a RETRY has already
+          cleared, so a repeat refusal signals nothing new and an earlier body claiming otherwise was
+          false on exactly that branch. The body therefore describes the demotion teardown as a mechanism — it
           runs on the graph supervisor, not in this call — rather than asserting one began here.
 
         Both map to ``503`` because both are environment conditions, which is what the neighbouring DR
         endpoints and the ADR's own contract give that status.
 
-        **A ``409`` after a ``release-unconfirmed`` ``503`` is the retry SUCCEEDING**, not a wrong-node
-        answer — *while the claim pause holds*. The coordinator re-sends the owed write on the next
-        stepdown; by then this node has already demoted, so it truthfully reports ``was_leader=false``.
-        That pause is two ``heartbeat_seconds``, 20s at the shipped default, and it is the whole scope
-        of that sentence. A retry reaches that write only once the membership read and the ``412``
-        check above let it through, so while the store is still failing it answers
-        ``members-unreadable`` and re-sends nothing.
+        **A retry after a ``release-unconfirmed`` ``503`` is answered by the lease ROW, not the flag
+        (BACKLOG #1508).** The first call already cleared the in-memory flag, so the retry reports
+        ``was_leader=false`` and re-sends the owed owner-scoped write. If the row still names this node,
+        the write matches it and the retry answers ``200`` with ``lease_released=true``: the drain is
+        done. If a standby acquired first, the row names the standby, the write matches nothing and
+        the retry answers ``409``. **That ``409`` is the failover having worked.** Do not take the
+        ``409``'s generic remedy here and step down whichever node ``GET /cluster/nodes`` now names as
+        leader: that is the healthy successor, and draining it undoes the failover. A retry reaches
+        the write only once the membership read and the ``412`` check above let it through, so while
+        the store is still failing it answers ``members-unreadable`` and re-sends nothing.
 
-        **Retrying promptly is the slow path, and can be an indefinite one.** The pause is armed on
-        ``self._is_leader or owed``, so a retry that re-sends an owed write RE-ARMS it for another two
-        ``heartbeat_seconds``. Nothing promotes this node except ``_maintain_leadership`` setting the
-        flag when its claim succeeds, and that claim returns not-held at the pause gate before it
-        touches the database. So an operator who retries faster than the pause expires never lets a
-        tick through and holds themselves in ``409``. The remedy for a ``release-unconfirmed`` ``503``
-        is to WAIT and read ``GET /cluster/nodes``, not to retry in a loop.
-
-        **Past the pause the answer is ``200`` OR ``409``, decided by who the lease row names by then
-        — an earlier revision promised ``200`` flatly and was false on one of the two branches.** The
-        claim statement has exactly two arms: renew, gated on this node still OWNING the row
-        (``WHERE leader_lease.owner = $2`` on Postgres, ``t.owner = ?`` in the SQL Server ``MERGE``),
-        which carries no expiry term; and take-over, which requires the lease to have expired. Nothing
-        below turns on which backend it is — both spell the same two arms. If the row still names
-        this node when the pause ends — the release write never committed, or it committed and no
-        standby took the lease — the renew arm matches on the next tick, this node leads again, and a
-        retry answers ``200``. If a standby acquired instead, the row names the standby and its lease
-        is live, so NEITHER arm matches, ``_claim_or_renew_lease`` reports not-held, this node stays a
-        follower, and a retry answers ``409``. **That ``409`` is the failover having worked.** Do not
-        take the ``409``'s generic remedy here and step down whichever node ``GET /cluster/nodes`` now
-        names as leader: that is the healthy successor, and draining it undoes the failover. Either
-        way the confirmation is the lease moving in ``GET /cluster/nodes``, not the status code.
+        **Each retry that releases the row re-arms the claim pause** for another two
+        ``heartbeat_seconds``, so a node an operator keeps retrying stays drained. That is the intent
+        of the call, and it does not slow a standby: the pause gates only this node's own claim.
+        Either way the confirmation is the lease moving in ``GET /cluster/nodes``, not the status
+        code.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
         already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
         never runs on those, so a second denied row there would double-count. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
-        ``was_leader: false``, which IS the refusal. That leaves the not-clustered ``400``, the
-        no-sibling ``412`` and the three ``503``s, which nothing else would record.
+        ``was_leader: false, lease_released: false``, which IS the refusal. That leaves the
+        not-clustered ``400``, the no-sibling ``412`` and the three ``503``s, which nothing else would
+        record.
         """
         c = engine.coordinator
 
@@ -6161,7 +6149,7 @@ def create_app(
         # lost-lease tick between a pre-read and the release would otherwise record was_leader=true for
         # an action that released nothing (ADR 0056, "Audit the return value, not a pre-read").
         try:
-            was_leader, released_at = await c.step_down_leadership()
+            outcome = await c.step_down_leadership()
         except StepdownLockTimeout as exc:
             # NOTHING RAN. No lease row was read or written, nothing was demoted, and — because the
             # handler takes no is_leader() pre-read — this node may lead nothing at all. So this arm
@@ -6199,7 +6187,8 @@ def create_app(
             # is still not quiescent — for different reasons than the sentence gave.
             #
             # And the body must not claim a teardown started ON THIS CALL: _fire_on_demote runs only
-            # under `if was_leader`, which a retry of an owed write has already cleared.
+            # when the outcome drained something, and on this arm the write did not return, so only
+            # `was_leader` could be true, and a retry of an owed write has already cleared it.
             await _denied("release-unconfirmed", exc)
             raise HTTPException(
                 503,
@@ -6216,8 +6205,9 @@ def create_app(
             ) from exc
         result = ClusterStepdownResult(
             node_id=c.node_id,
-            was_leader=was_leader,
-            released_at=released_at,
+            was_leader=outcome.was_leader,
+            released_at=outcome.released_at,
+            lease_released=outcome.lease_released,
             new_leader_eligible=new_leader_eligible,
             force=force,
         )
@@ -6229,8 +6219,12 @@ def create_app(
             detail=json.dumps(result.model_dump()),
             client=client_ip(request),
         )
-        if not was_leader:
-            raise HTTPException(409, f"node {c.node_id} is not the current leader")
+        # 200 when EITHER fact holds (BACKLOG #1508): a self-fenced node no longer holds the gate but
+        # did own a live row, and releasing that row IS the drain the caller asked for.
+        if not outcome.drained:
+            raise HTTPException(
+                409, f"node {c.node_id} is not the current leader and owns no lease row to release"
+            )
         return result
 
     # --- third-tier DR standby (#61, ADR 0048) -------------------------------

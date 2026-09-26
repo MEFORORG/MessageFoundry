@@ -625,7 +625,7 @@ class StoreSettings(_Section):
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
     ssl_root_cert: str | None = None
-    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the DB SERVER's certificate.
+    # BACKLOG #299: optional PEM file of CRLs checked against the DB SERVER's certificate.
     # The store hop builds its own context and resolves no trust anchor, so [tls].crl_file never reaches
     # it -- this is its own knob rather than a silent inheritance, the per-hop scoping error that item
     # warns about. POSTGRES ONLY, and only on the `ssl_root_cert` (pinned-CA) branch: that is the one
@@ -954,9 +954,11 @@ class ApiSettings(_Section):
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
     #: Opt-in CRL for the mTLS client certificates `tls_client_ca_file` verifies (BACKLOG #1005).
-    #: A PEM carrying the CA **and** its CRL. Absent, client certificates are verified for chain
-    #: and RFC 5280 conformance but NOT for revocation -- measured, a revoked-but-chain-valid
-    #: client is ACCEPTED. Set it and a revoked partner certificate is refused at the handshake.
+    #: A PEM file holding the client CA's CRL. Put the CA itself in `tls_client_ca_file`, where the
+    #: #285 pin covers it: a certificate in this file the store lacks refuses start (BACKLOG #1890).
+    #: Absent, client certificates are verified for chain and RFC 5280 conformance but NOT for
+    #: revocation -- measured, a revoked-but-chain-valid client is ACCEPTED. Set it and a revoked
+    #: partner certificate is refused at the handshake.
     #:
     #: **An expired CRL refuses EVERY client, not only revoked ones**, so this is read at startup
     #: and refused loudly there rather than at the first partner handshake. See
@@ -1234,7 +1236,7 @@ class TlsSettings(_Section):
     #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
-    # PEM path to a CRL (or a CA+CRL bundle) for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
+    # PEM path to a file of CRLs for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
     # the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
     # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
     # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
@@ -1792,7 +1794,7 @@ class LoggingSettings(_Section):
     forward_tls_verify: bool = True
     # Optional client cert (PEM cert+key chain) for mutual TLS to the collector. None = no client auth.
     forward_tls_client_cert: str | None = None
-    # Optional CRL (PEM, or a CA+CRL bundle) checked against the COLLECTOR's certificate (BACKLOG
+    # Optional PEM file of CRLs checked against the COLLECTOR's certificate (BACKLOG
     # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
     # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
     # would be the per-hop scoping error that item warns about. Applies only with
@@ -2400,7 +2402,7 @@ class AuthSettings(_Section):
     # REFUSES — always, independent of [security].enforcement (a substituted OIDC anchor permits JWKS
     # substitution + forged id_tokens). Dormant when None. Block-scoped (direct-read, not desugared).
     oidc_tls_ca_cert_pin: str | None = None
-    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the IdP's certificate. The
+    # BACKLOG #299: optional PEM file of CRLs checked against the IdP's certificate. The
     # IdP opener resolves no trust anchor, so [tls].crl_file cannot reach it -- this is its own knob
     # rather than a silent inheritance. A revoked IdP cert matters more than on a data hop: this is the
     # leg carrying the client secret, the authorization code and the identity assertion. Same
@@ -5463,8 +5465,9 @@ def security_loosenings(
         out.append(
             (
                 "require_encryption_for_remote",
-                "off-machine access is permitted WITHOUT TLS — bearer tokens and PHI would cross the network "
-                "in cleartext (still refused on a production-PHI bind)",
+                "off-machine access is permitted with no operator certificate — the API serves "
+                "on its self-signed placeholder, which no trust store vouches for, and inbound "
+                "listeners without tls bind in cleartext (still refused under enforcement=enforce)",
             )
         )
     if not sec.external_link_interstitial:

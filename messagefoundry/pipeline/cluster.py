@@ -66,7 +66,7 @@ import socket
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 from uuid import uuid4
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -81,6 +81,7 @@ __all__ = [
     "DbCoordinator",
     "StepdownUnavailable",
     "StepdownLockTimeout",
+    "StepdownOutcome",
     "StepdownReleaseUnconfirmed",
     "build_coordinator",
     "default_node_id",
@@ -224,9 +225,10 @@ def has_promotable_sibling(members: Iterable[ClusterMember], node_id: str) -> bo
     clean-shutdown ``left`` tombstone), ``promotable`` (ADR 0096) and ``fresh``. No window is chosen
     here: ``fresh`` is the rule :meth:`ClusterCoordinator.cluster_members` already applied.
 
-    **A point-in-time read, not a promise.** A sibling that dies after the read still counted, and
-    ``acquire_delay_seconds`` is not weighed, so a sibling handicapped past the stepdown pause counts
-    too and the drained node can win its own lease back (BACKLOG #1507)."""
+    **A point-in-time read, not a promise.** A sibling that dies after the read still counted.
+    ``acquire_delay_seconds`` is not weighed, and does not need to be: the release zeroes the lease
+    expiry, which cancels the handicap against a released lease (see :func:`stepdown_pause_seconds`,
+    BACKLOG #1507)."""
     return any(
         m.node_id != node_id and m.status == "active" and m.promotable and m.fresh for m in members
     )
@@ -235,6 +237,44 @@ def has_promotable_sibling(members: Iterable[ClusterMember], node_id: str) -> bo
 _DEMOTE_BUDGET_FRACTION = 0.5
 _DEMOTE_BUDGET_FLOOR = 1.0
 _DEMOTE_BUDGET_CEILING = 10.0
+
+
+class StepdownOutcome(NamedTuple):
+    """What :meth:`ClusterCoordinator.step_down_leadership` did, as two separate facts (BACKLOG #1508).
+
+    ``was_leader`` is whether this node held the IN-MEMORY gate when the release ran, and
+    ``released_at`` the epoch-seconds instant it cleared that gate (``None`` when it held none).
+    ``lease_released`` is whether the owner-scoped write matched a lease row naming this node, so that
+    row now reads expired. The two diverge in the self-fence window: the watchdog has cleared the gate
+    on the node's own clock while the row is still live on the DB clock. One boolean used to answer
+    both questions, and that is how a self-fenced node answered "not the leader" over a row it owned.
+    """
+
+    was_leader: bool
+    released_at: float | None
+    lease_released: bool
+
+    @property
+    def drained(self) -> bool:
+        """Whether the call drained anything: the rule behind the endpoint's ``200`` versus ``409``,
+        and behind the demotion edge a stepdown fires."""
+        return self.was_leader or self.lease_released
+
+
+def rows_affected(status: object) -> int:
+    """The row count a release write reported, for BOTH coordinators: an ``int`` from
+    ``SqlServerStore._execute``, or asyncpg's command tag (``"UPDATE 1"``). ``-1`` when there is none
+    to read, the DB-API spelling of "unknown". Callers test ``!= 0``, so an unknown count reads as
+    RELEASED: that keeps the stepdown's claim pause armed, which is the safe direction, at the cost of
+    a ``200`` that could over-report a drain. Both drivers report a count for a direct ``UPDATE``, so
+    this is a guard, not a path. Only a node that may own the row sends the write at all."""
+    if isinstance(status, int):
+        return status
+    if isinstance(status, str):
+        tail = status.rpartition(" ")[2]
+        if tail.isdigit():
+            return int(tail)
+    return -1
 
 
 class StepdownUnavailable(RuntimeError):
@@ -352,11 +392,18 @@ def stepdown_pause_seconds(heartbeat_seconds: float) -> float:
 
     Two heartbeats, and read that as a floor rather than a guarantee. A sibling's acquire runs once per
     ``heartbeat_seconds`` at an unrelated phase, so a full interval can elapse before it even looks at
-    the expired lease and a second gives it one whole interval in which to look. **That holds only for
-    a sibling carrying no ADR 0096 ``acquire_delay_seconds``.** A sibling handicapped by more than this
-    pause is still refused when the pause ends, and the drained node then wins its own lease back. This
-    function reads ``heartbeat_seconds`` alone, so it cannot see the handicap it is being compared
-    against; the gap is real, unfixed, and recorded on the stepdown's backlog item.
+    the expired lease and a second gives it one whole interval in which to look.
+
+    **A sibling's ADR 0096 ``acquire_delay_seconds`` does not lengthen that wait, so this function
+    does not need to read it (BACKLOG #1507).** The release writes ``lease_expires_at = 0``, the
+    epoch, not "now". The take-over predicate adds the delay to that stored expiry, so it asks whether
+    ``0 + delay`` is before the DB clock, an epoch count in the billions. That holds for any delay a
+    setting could carry, so a handicapped sibling takes a RELEASED lease on its first tick, exactly as
+    an unhandicapped one does. The handicap still weighs against a lease that expired on its own,
+    which is the case it exists for. Two limits remain, and neither is the handicap. The pause is
+    measured in THIS node's heartbeat, so a sibling configured with a longer one can miss the window.
+    And if the release write did not commit, the row keeps its real expiry and the handicap applies;
+    that path answers ``503 release-unconfirmed``, not ``200``.
 
     **This pause covers the ticks that come AFTER the release. It does not order the release against a
     tick already in flight** — :attr:`DbCoordinator._leadership_lock` does that, and the two are not
@@ -520,22 +567,26 @@ class ClusterCoordinator(Protocol):
         leader with no lease/expiry."""
         ...
 
-    async def step_down_leadership(self) -> tuple[bool, float | None]:
+    async def step_down_leadership(self) -> StepdownOutcome:
         """Voluntarily release this node's leadership lease and **keep running** as a standby — the
         planned-failover / maintenance-drain control plane behind ``POST /cluster/stepdown``
         (ADR 0056, slice 1).
 
-        Returns ``(was_leader, released_at)``: whether this node actually held leadership at the moment
-        the release ran, and the epoch-seconds instant it was demoted (``None`` when it held none). **The
-        caller audits this return value, never a prior** :meth:`is_leader` **read** — a fence or a
-        lost-lease tick can flip leadership between the read and the release, and auditing the pre-read
-        would record ``was_leader=true`` for an action that released nothing.
+        Returns a :class:`StepdownOutcome` ``(was_leader, released_at, lease_released)``: whether this
+        node held the in-memory leadership gate at the moment the release ran, the epoch-seconds instant
+        it was demoted (``None`` when it held none), and whether the release expired a lease row naming
+        this node. **The caller audits this return value, never a prior** :meth:`is_leader` **read** — a
+        fence or a lost-lease tick can flip leadership between the read and the release, and auditing
+        the pre-read would record ``was_leader=true`` for an action that released nothing.
+
+        The two booleans are separate on purpose; :class:`StepdownOutcome` says why (BACKLOG #1508).
+        The endpoint answers ``200`` when :attr:`StepdownOutcome.drained` and ``409`` otherwise.
 
         This is a **visibility lift** of the release the coordinators already run on a clean
         :meth:`stop`, not a new election mechanism: the lease, the self-fence and the epoch token are
         unchanged. The one difference from :meth:`stop` is that the node stays up and keeps
         heartbeating, so it reports itself a standby rather than leaving. :class:`NullCoordinator`
-        returns ``(False, None)`` — single-node has no lease to release (and the endpoint refuses a
+        releases nothing — single-node has no lease to release (and the endpoint refuses a
         single-node caller before reaching here).
 
         **Raises one of two** :class:`StepdownUnavailable` **subclasses**, which say different things:
@@ -544,17 +595,23 @@ class ClusterCoordinator(Protocol):
         itself but the write expiring its lease row did not return. The DB coordinators raise them;
         :class:`NullCoordinator` never does.
 
-        **A returned tuple does NOT mean a release wrote to the lease row**, and an earlier version of
-        this line said it did. ``(False, None)`` is the ordinary answer from a node that holds no
-        leadership and owes no write — nothing is sent to the DB, and :class:`NullCoordinator` returns
-        it with no DB at all. What a returned tuple does mean is that nothing is left unresolved:
+        **A returned outcome does NOT mean a release wrote to the lease row**, and an earlier version of
+        this line said it did. All-false is the ordinary answer from a node that has never held the
+        lease and owes no write — nothing is sent to the DB, and :class:`NullCoordinator` returns it
+        with no DB at all. What a returned outcome does mean is that nothing is left unresolved:
         either a write ran and returned, or there was none to run.
+
+        **The write is sent whenever this node MAY own a lease row**, not only when the gate reads
+        True: when it leads, when an earlier write is owed, or when it has confirmed a hold that no
+        release has cleared since, which is the self-fence window and the lost-lease case. The
+        write is owner-scoped, so on a node whose row a sibling has already taken it matches nothing
+        and reports ``lease_released=False`` truthfully.
 
         **A retry re-attempts a write left unconfirmed**, so re-calling this is the remedy for
         :class:`StepdownReleaseUnconfirmed`. The DB coordinators remember that a release is owed, and
         the next stepdown re-sends the owner-scoped ``UPDATE`` even though the in-memory gate already
         reads False — without that, the retry took an early return, sent nothing, and answered
-        ``(False, None)`` while the lease row was still live and still owned by this node.
+        "not the leader" while the lease row was still live and still owned by this node.
         """
         ...
 
@@ -630,12 +687,12 @@ class NullCoordinator:
         # expiry so /cluster/nodes is byte-identical in shape to a real cluster's.
         return (self.node_id, None)
 
-    async def step_down_leadership(self) -> tuple[bool, float | None]:
+    async def step_down_leadership(self) -> StepdownOutcome:
         # Single-node: there is no lease to release and no standby to promote, so this releases
         # nothing and reports so. Unreachable through the API — POST /cluster/stepdown refuses a
         # single-node caller with 400 before it touches the coordinator (ADR 0056) — but a truthful
         # answer here keeps the Protocol honest for any direct caller.
-        return (False, None)
+        return StepdownOutcome(was_leader=False, released_at=None, lease_released=False)
 
 
 # One-time-per-process info guard: the active-passive HA feature set is COMPLETE — election (Step 4),
@@ -1274,6 +1331,12 @@ class DbCoordinator:
             timeout=self._renew_timeout,
         )
         if row is None or row["owner"] != self.node_id:
+            # The DB answered, and another node holds a live lease: this node owns no row, so drop both
+            # things _may_own_lease_row reads (BACKLOG #1508). An owed release is moot too: its
+            # owner-scoped write can no longer match. Only here, where the row was actually read; the
+            # short-circuits above return not-held without looking at it.
+            self._last_renew_ok = None
+            self._lease_release_owed = False
             return False
         # Cache the epoch we now hold (fresh-acquire bump or renew's unchanged value). The engine reads it
         # on promotion and pushes it into the store; a renew leaves it identical so no push churn.
@@ -1326,7 +1389,7 @@ class DbCoordinator:
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
 
-    async def step_down_leadership(self) -> tuple[bool, float | None]:
+    async def step_down_leadership(self) -> StepdownOutcome:
         """Release leadership and stay up as a standby (ADR 0056 slice 1). See the Protocol method.
 
         It calls the same :meth:`_release_leadership` ``stop()`` does, but **the ordering inside that
@@ -1388,6 +1451,12 @@ class DbCoordinator:
         so this method can force it past that early return. "Did not return" covers a CANCELLED write
         as well as a raised one — the request deadline can cancel this call mid-write — which is why
         :meth:`_release_leadership` arms that flag *before* the write rather than in its ``except``.
+
+        **A self-fenced node is drained too (BACKLOG #1508).** The fence clears the gate on the node's
+        own clock while the row stays live on the DB clock, so gating the write on the gate refused
+        exactly the drain an operator reaches for after a fence. The write is now gated on
+        :meth:`_may_own_lease_row`, and the pause and the demotion edge follow the row as well as the
+        gate. A node that has seen a sibling take its lease sends nothing and answers ``409``.
         """
         await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
         try:
@@ -1395,16 +1464,17 @@ class DbCoordinator:
             # while the release is suspended in the pool write unwinds this method correctly but would
             # skip an assignment placed after the await, leaving _no_claim_until at 0.0 on a node whose
             # lease row may already be expired — the very re-arm the pause exists to prevent. Reading
-            # _is_leader here is exact rather than a "pre-read" of the kind the endpoint refuses to
-            # make: nothing suspends between this read and _release_leadership's own read of the same
-            # attribute (awaiting a coroutine does not yield to the loop), and the only other writers
-            # are _maintain_leadership, which is holding-lock-excluded, and _check_fence, which is
+            # the leadership state here is exact rather than a "pre-read" of the kind the endpoint
+            # refuses to make: nothing suspends between this read and _release_leadership's own read
+            # (awaiting a coroutine does not yield to the loop), and the only other writers are
+            # _maintain_leadership, which is holding-lock-excluded, and _check_fence, which is
             # synchronous and therefore cannot run in that gap.
-            owed = self._lease_release_owed
+            #
             # Held across the await because the second arm below needs the SAME predicate, and
             # `self._is_leader` is already False by then — _release_leadership clears it on its first
             # line, so re-reading it there would silently arm nothing.
-            arming = self._is_leader or owed
+            arming = self._may_own_lease_row()
+            prior_pause = self._no_claim_until
             if arming:
                 # Stand down long enough that every sibling has had a full tick at the expired lease.
                 # The retry needs this as much as the first call does: the release expires
@@ -1413,8 +1483,16 @@ class DbCoordinator:
                 self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
                     self._heartbeat_seconds
                 )
-            was_leader, released_at, wrote = await self._release_leadership(force_write=owed)
-            if arming:
+            was_leader, released_at, wrote, lease_released = await self._release_leadership(
+                force_write=arming
+            )
+            outcome = StepdownOutcome(was_leader, released_at, lease_released)
+            if arming and wrote and not outcome.drained:
+                # NOTHING TO DRAIN: the write returned and matched no row, so the row names another
+                # node. Undo this call's arm, so a 409 leaves a follower that once led exactly as it
+                # found it; a pause here would only delay the follower's claim if the leader failed.
+                self._no_claim_until = prior_pause
+            elif arming:
                 # ARMED A SECOND TIME, from the instant the write RETURNED, taking whichever expiry is
                 # LATER. The arm above is measured from before the write, so the write's own duration
                 # comes out of the pause — and nothing bounds that duration from here: the pool
@@ -1434,7 +1512,9 @@ class DbCoordinator:
                     self._no_claim_until,
                     self._monotonic() + stepdown_pause_seconds(self._heartbeat_seconds),
                 )
-            if was_leader:
+            # A row release counts as a demotion edge too (BACKLOG #1508). In the self-fence window
+            # the watchdog already fired it; firing again only re-sets the engine's wake event.
+            if outcome.drained:
                 self._fire_on_demote()
             # NOT nested under `was_leader`. A retry re-sending an owed write has already demoted, so it
             # reports was_leader=False and would otherwise swallow a second failure into a 409.
@@ -1442,20 +1522,38 @@ class DbCoordinator:
                 raise StepdownReleaseUnconfirmed(lease_release_unconfirmed(self.node_id))
         finally:
             self._leadership_lock.release()
-        return (was_leader, released_at)
+        return outcome
+
+    def _may_own_lease_row(self) -> bool:
+        """Whether this node may own a lease row, so a stepdown must send the expiring write
+        (BACKLOG #1508). Pure in-memory, so it adds no round trip to the stepdown's critical section.
+
+        Three disjuncts. The gate reads True. An earlier write is owed
+        (:attr:`_lease_release_owed`). Or ``_last_renew_ok`` is set: a hold was confirmed and nothing
+        has cleared it since. Two things clear the baseline: a release, and a claim the DB answered
+        with another owner's live lease (:meth:`_claim_or_renew_lease`), which clears the owed flag
+        too. So the last disjunct is the self-fence
+        window, where :meth:`_check_fence` clears the gate but not the baseline and the row stays live
+        on the DB clock for up to ``ttl - fence`` more. **Do not clear the baseline in**
+        :meth:`_check_fence`: that would bring BACKLOG #1508 back, and the self-fence stepdown tests
+        would fail. If a sibling took the row without this node's DB seeing it, the owner-scoped write
+        matches nothing, the stepdown answers 409, which is true, and the pause it armed is taken
+        back."""
+        return self._is_leader or self._lease_release_owed or self._last_renew_ok is not None
 
     async def _release_leadership(
         self, *, force_write: bool = False
-    ) -> tuple[bool, float | None, bool]:
+    ) -> tuple[bool, float | None, bool, bool]:
         """Clean release: demote the cached gate first (so a concurrent is_leader() reader never sees a
         stale True), then expire our lease row so a standby can acquire immediately. Safe to call when
         never elected (the UPDATE simply matches no owned row).
 
-        Returns ``(was_leader, released_at, wrote)`` — whether this node held leadership when the
-        release ran, the epoch-seconds instant it was demoted, and whether the lease row's ``UPDATE``
-        returned. ``released_at`` is stamped at the in-memory demotion, not after the DB round trip:
-        that instant is when this node stopped answering :meth:`is_leader` ``True``, which is the fact
-        the audit trail is recording.
+        Returns ``(was_leader, released_at, wrote, lease_released)`` — whether this node held
+        leadership when the release ran, the epoch-seconds instant it was demoted, whether the lease
+        row's ``UPDATE`` returned, and whether it matched a row naming this node (BACKLOG #1508).
+        ``released_at`` is stamped at the in-memory demotion, not after the DB round trip: that instant
+        is when this node stopped answering :meth:`is_leader` ``True``, which is the fact the audit
+        trail is recording.
 
         **``wrote`` exists because the two callers want opposite things from a failed write.**
         :meth:`stop` is best-effort — the node is leaving, so a lease that ages out at its TTL costs
@@ -1471,15 +1569,16 @@ class DbCoordinator:
         count at all — see :class:`StepdownReleaseUnconfirmed`.
 
         ``force_write`` sends the ``UPDATE`` even when this node's in-memory gate already reads False.
-        Only :meth:`step_down_leadership` passes it, and only when :attr:`_lease_release_owed` says an
-        earlier write did not return. :meth:`stop` never does: it is best-effort by design, and a
-        no-op ``UPDATE`` from every departing follower would log a warning on a pool that is closing."""
+        Only :meth:`step_down_leadership` passes it, on :meth:`_may_own_lease_row`. :meth:`stop` never
+        does: it is best-effort by design, and a self-fenced node's pool is the one most likely to
+        hang a shutdown on a write with no per-call bound. So a self-fenced node that is STOPPED still
+        leaves its row to age out; that gap is outside BACKLOG #1508, which is the stepdown."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
         self._leader_epoch = None  # released: no longer a fenced leader
         if not was_leader and not force_write:
-            return (False, None, True)
+            return (False, None, True, False)
         released_at = time.time() if was_leader else None
         # #145: clean step-down (inverse -> auto-resolves). Guarded, because a forced retry alerted on
         # its first pass: it is re-sending a write, not demoting a second time.
@@ -1501,7 +1600,7 @@ class DbCoordinator:
         try:
             # Expire the lease (set it to the epoch) only if we still own it, so a standby's next
             # acquire tick takes over at once instead of waiting out the full TTL.
-            await self._pool.execute(
+            status = await self._pool.execute(
                 "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = $1 AND owner = $2",
                 self._lease_key,
                 self.node_id,
@@ -1513,9 +1612,9 @@ class DbCoordinator:
                 self.node_id,
                 safe_exc(exc),
             )
-            return (was_leader, released_at, False)
+            return (was_leader, released_at, False, False)
         self._lease_release_owed = False
-        return (was_leader, released_at, True)
+        return (was_leader, released_at, True, rows_affected(status) != 0)
 
     # --- #145 leadership-transition alerts (never-raise) ---------------------
 

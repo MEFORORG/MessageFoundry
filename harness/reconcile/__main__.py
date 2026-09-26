@@ -27,10 +27,12 @@ import json
 import sys
 from pathlib import Path
 
+from harness.frame_cap import max_frame_bytes_arg
 from harness.reconcile.compare import DEFAULT_KEY, ReconcileResult, load_messages, reconcile
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
 from messagefoundry.config.models import AckMode
+from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES
 
 
 def _parse_field(spec: str) -> tuple[str, int]:
@@ -58,6 +60,7 @@ async def _run_capture(args: argparse.Namespace) -> int:
         host=args.host,
         ports=tuple(args.port),
         ack_mode=AckMode(args.ack_mode),
+        max_frame_bytes=args.max_frame_bytes,
     )
     await sink.start()
     print(
@@ -72,7 +75,9 @@ async def _run_capture(args: argparse.Namespace) -> int:
     finally:
         await sink.stop()
         print(
-            f"captured {sink.captured} message(s) ({sink.unparseable} unparseable)", file=sys.stderr
+            f"captured {sink.captured} message(s) ({sink.unparseable} unparseable, "
+            f"{sink.refused} refused over the frame cap)",
+            file=sys.stderr,
         )
     return 0
 
@@ -109,6 +114,14 @@ def main(argv: list[str] | None = None) -> int:
         default="original",
         choices=[m.value for m in AckMode],
         help="ACK mode to send",
+    )
+    cap.add_argument(
+        "--max-frame-bytes",
+        type=max_frame_bytes_arg,
+        default=DEFAULT_MAX_FRAME_BYTES,
+        help="largest MLLP frame accepted; a bigger one drops its connection. 0 turns the cap off, "
+        "as on the engine's MLLP source; a negative value is refused "
+        "(default: %(default)s, the engine's MLLP default)",
     )
 
     cmp = sub.add_parser(

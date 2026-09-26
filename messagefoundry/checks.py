@@ -99,6 +99,37 @@ from typing import Any
 
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
 
+# What ``_parse_config_module`` raises on a config module it cannot turn into a tree (BACKLOG #1858).
+# The advisory legs skip such a file, because ``validate`` runs first and names it: the loader's broad
+# catch reports each of these as ``error loading config module <file>``. Catching ``SyntaxError`` alone
+# let the rest escape as an uncaught traceback. At least these are reachable, each measured by
+# tests/test_parser_refusal_guards.py.
+#
+# * ``SyntaxError`` -- the ordinary broken module, and every encoding failure (see below).
+# * ``MemoryError`` -- the parser's width wall ("Parser stack overflowed"), a bounded parser limit
+#   rather than heap exhaustion, so the interpreter is fully usable afterwards.
+# * ``RecursionError`` -- the depth wall, raised while the parse builds a deeply nested tree.
+# * ``OSError`` -- the file could not be read at all.
+#
+# ``ValueError`` is deliberately absent. ``corepoint_import._verify_compilable`` names it because it
+# compiles a ``str``; these legs parse BYTES, where no ``ValueError`` is reachable. Naming it would turn
+# an unforeseen failure in a security leg into a silent skip rather than a loud one.
+#
+# Never widen this to ``Exception``: the point is to name the failure, and a broad catch would hide a
+# defect in the analysis itself.
+_UNPARSEABLE_MODULE = (SyntaxError, MemoryError, RecursionError, OSError)
+
+
+def _parse_config_module(path: Path) -> ast.Module:
+    """Parse a config module from its BYTES, so its encoding is read the way the loader reads it.
+
+    ``ast.parse`` on bytes honours a PEP 263 coding cookie and a UTF-8 BOM, exactly as the import system
+    does, and turns every decoding failure into a ``SyntaxError`` the loader reports too. Decoding with
+    ``read_text(encoding="utf-8")`` instead diverged from the loader on a module declaring
+    ``# coding: latin-1``: it loads and runs, but the text read fails, so a leg that skipped it would
+    pass the handler-security gate over code nobody scanned, strict mode included (BACKLOG #1858)."""
+    return ast.parse(path.read_bytes())
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -403,8 +434,8 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
       so the wrapped f-string flags — pinned by ``test_raise_fstring_flags_call_wrapped_interpolation``.
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
-    A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
-    already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
+    A malformed module never crashes the gate (anything in ``_UNPARSEABLE_MODULE`` → skip that file;
+    ``validate`` already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
     """
     base = Path(config_dir)
     if not base.is_dir():
@@ -414,8 +445,8 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         for node in ast.walk(tree):
@@ -544,8 +575,8 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         for node in ast.walk(tree):
@@ -1213,8 +1244,8 @@ def _check_handler_security(
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         imported = _imported_modules(tree)
@@ -1328,20 +1359,26 @@ _DISPOSITION_ALIASES = {
 }
 
 
-def _expected_disposition(fixture_path: str | Path) -> str | None:
+def _expected_disposition(fixture_path: str | Path, *, cap: int) -> str | None:
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
     Returns the normalized disposition name (one of :data:`_DRYRUN_DISPOSITIONS`), or
     ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
-    Raises ``ValueError`` for an unreadable or unrecognized declaration (a fixture-authoring mistake).
+    Raises ``ValueError`` for an unreadable, over-cap or unrecognized declaration (a fixture-authoring
+    mistake). The sidecar is read under its fixture's ``cap``, so it never lands in memory whole
+    (ASVS 5.1.1, BACKLOG #1127).
     """
+    from messagefoundry.pipeline.dryrun import read_fixture
+
     sidecar = Path(f"{fixture_path}.expect")
     if not sidecar.is_file():
         return None
-    try:
-        raw = sidecar.read_text(encoding="utf-8").strip().upper()
-    except OSError as exc:
-        raise ValueError(f"cannot read {sidecar.name}: {exc}") from exc
+    data = read_fixture(
+        sidecar,
+        cap,
+        advice="an .expect sidecar holds one disposition name",
+    )
+    raw = data.decode("utf-8").strip().upper()
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:
         valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
@@ -1452,7 +1489,8 @@ def _check_dryrun(
         n for n, ic in reg.inbound.items() if ic.deployed and not ic.content_type.is_binary
     ]
     try:
-        message_sets = read_message_sets(mpath, inbound_names, cap=fixture_cap(reg))
+        cap = fixture_cap(reg)
+        message_sets = read_message_sets(mpath, inbound_names, cap=cap)
     except ValueError as exc:
         # An over-cap or unreadable fixture file (BACKLOG #1127) fails the gate with the reader's own
         # message rather than escaping as a traceback.
@@ -1470,7 +1508,7 @@ def _check_dryrun(
     )
     for label, path, raw, target in message_sets:
         try:
-            expected = _expected_disposition(path)
+            expected = _expected_disposition(path, cap=cap)
         except ValueError as exc:
             errors.append(f"{label}: {exc}")
             continue
@@ -2018,8 +2056,8 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
             "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
-            "instance REFUSES these off-loopback at build-check unless the connection declares "
-            "tls_hop_attested or cleartext_accepted"
+            "instance REFUSES these off-loopback at build-check unless that outbound connection "
+            "declares cleartext_accepted with a cleartext_reason (an inbound DatabasePoll cannot)"
         ),
     )
 
