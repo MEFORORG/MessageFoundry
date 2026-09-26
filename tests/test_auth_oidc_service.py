@@ -35,12 +35,21 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND, FEDERATED_IDENTITY_UNBOUND
+from messagefoundry.auth.notifications import (
+    ACCOUNT_CREATED,
+    FEDERATED_IDENTITY_BOUND,
+    FEDERATED_IDENTITY_UNBOUND,
+)
 from messagefoundry.auth.service import (
     FEDERATED_SUBJECT_NOT_BOUND,
     AuthService,
+    DirectoryAccountNotFound,
+    DirectoryAccountRefused,
+    DirectoryObjectIdMissing,
     FederatedSubjectHeld,
+    InvalidNotifyEmail,
     LoginOutcome,
+    UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import SignatureAlgorithm
@@ -829,6 +838,148 @@ async def test_the_admin_bind_audits_and_notifies_and_a_login_never_does(
             assert (await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")).ok
         assert len(await _audit_rows(store, "auth.federated_subject_bound")) == 1
         assert len([e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_BOUND]) == 1
+    finally:
+        await store.close()
+
+
+async def test_an_administrator_created_directory_account_binds_and_signs_in_with_kerberos_off(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2021. On a site with no Windows SSO, nothing used to create the directory mirror row
+    the admin bind needs, so nobody could sign in through the IdP. The administrator's create makes
+    it from a service-account lookup, and the row then binds and signs in like a Kerberos-born one.
+
+    The row's objectGUID is the one the directory answered with; the create takes no id of its own.
+    Its ``mail`` is adopted under #2014's rule, and that address is told the account was created."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _CapturingNotifier()
+        ldap = _FakeLdap()
+        service = await _service(store, rsa_key, ldap=ldap, notifier=notifier, bind=None)
+        assert service._settings.kerberos_enabled is False
+        assert await store.get_user_by_username("jdoe") is None
+
+        user_id = await service.create_directory_account("jdoe", actor="admin", client="10.0.0.9")
+        assert ldap.resolved == ["jdoe"]
+        user = await store.get_user(user_id)
+        assert user is not None
+        assert user.auth_provider == AuthProvider.AD.value
+        assert user.directory_object_id == PRINCIPAL.directory_object_id
+        assert user.notify_email == PRINCIPAL.email
+        assert await store.get_user_role_ids(user_id) == []
+        [row] = await _audit_rows(store, "user.created")
+        assert row["actor"] == "admin" and row["client"] == "10.0.0.9"
+        assert json.loads(row["detail"]) == {
+            "username": "jdoe",
+            "roles": [],
+            "provider": "ad",
+            "notify_email_source": "directory",
+        }
+        created = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
+        assert [e.email for e in created] == [PRINCIPAL.email]
+
+        await service.bind_federated_subject(user_id, "S-1-alice", actor="admin")
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+        assert out.ok and out.identity is not None, out.error
+        assert out.identity.user_id == user_id
+    finally:
+        await store.close()
+
+
+async def test_the_directory_create_refuses_before_any_write(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Each refusal leaves the users table as it was: no match (or a disabled account, which the
+    lookup reports the same way), an entry with no readable objectGUID, and a name or an id a row
+    already holds. A directory ``mail`` #2014 would not adopt is still kept out of ``notify_email``,
+    because the admin create uses the sign-in's own birth."""
+    store = await MessageStore.open(":memory:")
+    try:
+        no_id = AdPrincipal(
+            username="noid", display_name=None, email=None, dn="CN=noid", groups=frozenset()
+        )
+        renamed = AdPrincipal(
+            username="jdoe2",
+            display_name=None,
+            email=None,
+            dn="CN=jdoe2",
+            groups=frozenset(),
+            directory_object_id=PRINCIPAL.directory_object_id,
+        )
+        lookalike = AdPrincipal(
+            username="lookalike",
+            display_name=None,
+            email="аdmin@example.org",
+            dn="CN=lookalike",
+            groups=frozenset(),
+            directory_object_id="guid-lookalike",
+        )
+        fresh = AdPrincipal(
+            username="fresh",
+            display_name=None,
+            email="fresh@example.org",
+            dn="CN=fresh",
+            groups=frozenset(),
+            directory_object_id="guid-fresh",
+        )
+        ldap = _FakeLdap(
+            by_username={
+                "ghost": None,
+                "noid": no_id,
+                "jdoe": PRINCIPAL,
+                "jdoe2": renamed,
+                "lookalike": lookalike,
+                "fresh": fresh,
+            }
+        )
+        notifier = _CapturingNotifier()
+        service = await _service(store, rsa_key, ldap=ldap, notifier=notifier, bind=None)
+        with pytest.raises(DirectoryAccountNotFound):
+            await service.create_directory_account("ghost", actor="admin")
+        with pytest.raises(DirectoryObjectIdMissing):
+            await service.create_directory_account("noid", actor="admin")
+        asked = len(ldap.resolved)
+        with pytest.raises(DirectoryAccountRefused, match="name is required"):
+            await service.create_directory_account("   ", actor="admin")
+        assert len(ldap.resolved) == asked  # refused before the lookup
+        assert await store.list_users() == []
+
+        await service.create_directory_account("jdoe", actor="admin")
+        with pytest.raises(UsernameTaken):
+            await service.create_directory_account("jdoe", actor="admin")
+        # The same directory object under a new name: the existing row is its mirror.
+        with pytest.raises(UsernameTaken):
+            await service.create_directory_account("jdoe2", actor="admin")
+        assert [u.username for u in await store.list_users()] == ["jdoe"]
+
+        # No usable directory `mail`: the administrator must give the address, checked as
+        # POST /users checks it, or nothing is written.
+        for bad in (None, "  ", "a@b.org, c@d.org"):
+            with pytest.raises(InvalidNotifyEmail):
+                await service.create_directory_account("lookalike", actor="admin", notify_email=bad)
+        assert await store.get_user_by_username("lookalike") is None
+        # A usable one: the administrator may not point the holder's notices elsewhere.
+        with pytest.raises(InvalidNotifyEmail):
+            await service.create_directory_account(
+                "fresh", actor="admin", notify_email="elsewhere@example.org"
+            )
+        assert await store.get_user_by_username("fresh") is None
+        user_id = await service.create_directory_account(
+            "lookalike", actor="admin", notify_email="holder@example.org"
+        )
+        user = await store.get_user(user_id)
+        assert user is not None and user.notify_email == "holder@example.org"
+        # The lookalike stays in the profile mirror only, and the refusal names the administrator.
+        assert user.email == lookalike.email
+        [refused] = await _audit_rows(store, "auth.ad_notify_email_not_adopted")
+        assert refused["actor"] == "admin"
+        # The typed address is the one told, and the audit row says who chose it.
+        created = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
+        assert [(e.username, e.email) for e in created][-1] == ("lookalike", "holder@example.org")
+        rows = [r for r in await _audit_rows(store, "user.created") if "lookalike" in r["detail"]]
+        assert json.loads(rows[0]["detail"])["notify_email_source"] == "administrator"
+
+        no_directory = AuthService(store, AuthSettings(require_mfa=False))
+        with pytest.raises(DirectoryAccountRefused, match="no directory"):
+            await no_directory.create_directory_account("jdoe", actor="admin")
     finally:
         await store.close()
 
