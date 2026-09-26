@@ -1847,7 +1847,11 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
         "DRIVER={ODBC Driver 18 for SQL Server}",
         f"SERVER={settings.server},{settings.port}",  # server validated; port is an int
         f"DATABASE={_odbc_brace(settings.database or '')}",
-        f"Connection Timeout={settings.connect_timeout}",
+        # No login-timeout keyword here, on purpose (BACKLOG #1626). `Connection Timeout=` is an
+        # ADO.NET keyword that ODBC Driver 18 silently ignores: measured against a black-hole address,
+        # a DSN carrying `Connection Timeout=2` still waited 15.1 s, the same as no timeout at all.
+        # The driver's login timeout is SQL_ATTR_LOGIN_TIMEOUT, which pyodbc sets from its `timeout=`
+        # argument, so every connect site passes `timeout=settings.connect_timeout` instead.
         f"APP={_odbc_brace(settings.application_name)}",
     ]
     if settings.auth is SqlAuth.SQL:
@@ -2454,7 +2458,9 @@ class SqlServerStore:
         import aioodbc
 
         return await aioodbc.connect(
-            dsn=connection_string(self._settings, posture=self._posture), autocommit=False
+            dsn=connection_string(self._settings, posture=self._posture),
+            autocommit=False,
+            timeout=self._settings.connect_timeout,  # the LOGIN timeout (#1626), not a DSN keyword
         )
 
     @asynccontextmanager
@@ -2657,6 +2663,9 @@ class SqlServerStore:
                 maxsize=max(1, settings.pool_size),
                 autocommit=False,
                 executor=executor,
+                # aioodbc hands this through to every pyodbc.connect the pool makes, where it is the
+                # LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT). The DSN cannot carry it (#1626).
+                timeout=settings.connect_timeout,
             )
         except Exception:
             # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
@@ -3049,7 +3058,9 @@ class SqlServerStore:
         db = settings.database
         try:
             conn = await aioodbc.connect(
-                dsn=connection_string(settings, posture=posture), autocommit=True
+                dsn=connection_string(settings, posture=posture),
+                autocommit=True,
+                timeout=settings.connect_timeout,  # the LOGIN timeout (#1626)
             )
         except Exception as exc:  # noqa: BLE001 - the pool open below surfaces a real connect failure
             log.warning("skipping the RCSI check on %r (could not connect): %s", db, exc)
@@ -3369,9 +3380,12 @@ class SqlServerStore:
         import pyodbc
 
         dsn = connection_string(self._settings, posture=self._posture)
+        login_timeout = self._settings.connect_timeout
 
         def _factory() -> Any:
-            conn = pyodbc.connect(dsn, autocommit=False)
+            # `timeout=` is pyodbc's LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT, #1626); `conn.timeout`
+            # below is the separate per-statement bound.
+            conn = pyodbc.connect(dsn, autocommit=False, timeout=login_timeout)
             conn.timeout = ct  # seconds; finite (ct==0 refused above) — per-statement bound
             return conn
 
@@ -3418,7 +3432,9 @@ class SqlServerStore:
     async def _acquire(self) -> AsyncIterator[Any]:
         """Acquire a pooled connection with the configured command (statement) timeout applied.
 
-        ``Connection Timeout`` in the DSN is only the *login* timeout; the per-statement timeout is a
+        ``[store].connect_timeout`` is only the *login* timeout, and it reaches the driver as
+        pyodbc's ``timeout=`` argument at pool creation, never as a DSN keyword: ODBC Driver 18
+        ignores ``Connection Timeout`` (BACKLOG #1626). The per-statement timeout is a separate
         pyodbc **connection** attribute (STORE-3). aioodbc's wrapper exposes ``timeout`` read-only, so
         we set it on the underlying ``pyodbc.Connection`` (``_conn``); aioodbc 0.5.0 has no creation
         hook (``after_created``), so we apply it per-acquire (an idempotent int assignment). The prior
@@ -3431,7 +3447,7 @@ class SqlServerStore:
         pooled connection as the pool saturates. Read-only/additive — the timing never changes the
         acquired connection or its release.
 
-        BACKLOG #1052: that same chokepoint is where the borrow is BOUNDED. ``Connection Timeout``
+        BACKLOG #1052: that same chokepoint is where the borrow is BOUNDED. ``connect_timeout``
         bounds the login and ``command_timeout`` the statement; neither bounds the wait for a free
         pooled connection, so a wedged pool blocked the acquiring task forever. ``acquire_pooled``
         raises :class:`~messagefoundry.store.base.StoreAcquireTimeout` at
