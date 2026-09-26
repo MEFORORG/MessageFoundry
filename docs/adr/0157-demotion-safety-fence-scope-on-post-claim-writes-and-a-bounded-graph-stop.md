@@ -420,7 +420,7 @@ coroutine cancelled mid-`execute` leaves an aioodbc transaction committed or rol
 (`except Exception: await conn.rollback()` does **not** catch `CancelledError`). If it commits, say so
 rather than claiming a proof.
 
-> ⚠️ **Inc 2 is MIS-SPECIFIED above; do not build it as written.** It proposes an owner-blind, age-based
+> **WARNING: Inc 2 is MIS-SPECIFIED above; do not build it as written.** It proposes an owner-blind, age-based
 > periodic sweep. The verified defect is narrower — there is no recovery at **graph re-start**, because
 > `RegistryRunner.reload()` is a quiesce-and-swap that calls no recovery — and the right fix is a scoped
 > reset there. An age sweep on SQL Server has **no populated `owner` column** to discriminate with, so it

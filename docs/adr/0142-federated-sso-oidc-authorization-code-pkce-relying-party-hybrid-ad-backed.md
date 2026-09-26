@@ -367,7 +367,7 @@ after an out-of-band identity check, so a genuine reassignment is an admin opera
 *[Both halves of this residual are stale since 2026-09-25 (BACKLOG #1143): the refusal is now
 `federated_subject_not_bound`, and the recommended rebind exists as `PUT /users/{user_id}/federated-identity`.]*
 
-**⚠️ SECOND RESIDUAL, added 2026-08-09 — the guard is trust-on-first-use, so A.1's attack still succeeds
+**SECOND RESIDUAL, added 2026-08-09 — the guard is trust-on-first-use, so A.1's attack still succeeds
 against an UNBOUND account.** This section previously stated only the availability edge above, which read as
 though the takeover half were fully closed. It is not, and the omission is the more consequential half.
 
