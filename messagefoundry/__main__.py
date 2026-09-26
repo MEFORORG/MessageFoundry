@@ -3228,8 +3228,8 @@ def _serve(args: argparse.Namespace) -> int:
                         "action) would have no push channel. The pull-only /me/security-events feed "
                         "carries the user's own events but not an administrator's change to their "
                         "account (ASVS 6.3.5/6.3.7). Configure the [alerts] SMTP transport (email_smtp_host + "
-                        'email_from; add email_to as well if any [[alerts.rules]] routes to "email" — '
-                        "the alert email transport requires all three) and keep "
+                        "email_from; add email_to as well — the credential reminders and the alert "
+                        "email transport need a recipient) and keep "
                         "[auth].notify_security_events on; or, to rely on the "
                         "pull-only feed, set [alerts].security_notifications_required=false (audited).",
                         file=sys.stderr,
@@ -3260,6 +3260,59 @@ def _serve(args: argparse.Namespace) -> int:
                     f"instance ({env_name!r}) has no out-of-band security-event push (only the "
                     "pull-only /me/security-events feed). Configure [alerts] SMTP + "
                     "[auth].notify_security_events to enable it.",
+                    file=sys.stderr,
+                )
+
+        # --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need a RECIPIENT, not just a relay ---
+        # The unclaimed-temporary-password reminder and the cert-expiry reminder go to the [alerts]
+        # notifier, and notifier_from_settings builds one only from a webhook_url, or from SMTP host +
+        # sender + at least one email_to. The per-user channel above needs no email_to (each notice is
+        # addressed to its account), so a config that passes it can still send every reminder to the log
+        # alone. Same refuse/warn split and the same audited waiver as the channel gate, so an instance
+        # that waived out-of-band notices in writing is not refused twice. The recipient test IS
+        # configured_alert_transport_names, the no-build mirror of notifier_from_settings, so the two
+        # cannot drift. Scoped to sign-in on, like the channel gate: the cert monitor also runs with
+        # sign-in off, and that loopback-only case is not gated here.
+        from messagefoundry.pipeline.alert_sinks import configured_alert_transport_names
+
+        reminder_can_fire = (
+            settings.auth.initial_password_expiry_hours > 0 or settings.cert_monitor.warn_days > 0
+        )
+        if reminder_can_fire and not configured_alert_transport_names(settings.alerts):
+            if settings.alerts.security_notifications_required:
+                if enforcing:
+                    print(
+                        "error: no [alerts] recipient is configured on a "
+                        f"{'production ' if production else ''}PHI instance ({env_name!r}); "
+                        "refusing to start — the credential reminders (an unclaimed temporary "
+                        "password nearing its deadline, a certificate nearing expiry) would reach "
+                        "only the log (ASVS 6.4.5). Set [alerts].webhook_url, or email_to alongside "
+                        "email_smtp_host + email_from; or, to accept reminders in the log only, set "
+                        "[alerts].security_notifications_required=false (audited).",
+                        file=sys.stderr,
+                    )
+                    return 2
+                print(
+                    "warning: no [alerts] recipient is configured in a PHI-carrying environment "
+                    f"({env_name!r}) — the credential reminders (an unclaimed temporary password, an "
+                    "expiring certificate) reach only the log. Set [alerts].webhook_url, or email_to "
+                    "alongside email_smtp_host + email_from (ASVS 6.4.5).",
+                    file=sys.stderr,
+                )
+            elif enforcing and security_channel_ready:
+                # With no channel either, the waiver's AUDIT line above already fired; one per waiver.
+                logging.getLogger(__name__).warning(
+                    "AUDIT: starting a %sPHI instance (environment %r) with no [alerts] recipient "
+                    "([alerts].security_notifications_required=false) — the credential reminders "
+                    "reach only the log (ASVS 6.4.5 waiver).",
+                    "production " if production else "",
+                    env_name,
+                )
+                print(
+                    "warning: [alerts].security_notifications_required=false — no [alerts] "
+                    f"recipient on a {'production ' if production else ''}PHI instance "
+                    f"({env_name!r}); the credential reminders reach only the log. Set "
+                    "[alerts].webhook_url, or email_to alongside email_smtp_host + email_from.",
                     file=sys.stderr,
                 )
 

@@ -123,7 +123,7 @@ precisely what 15.1.3 does today and why a green CI proves nothing about these d
 
 That last row is the fix for **15.1.3**: the guards stop being inspection-only theatre.
 
-> ### ⚠️ Amendment at ratification (2026-08-01) — §7's original placement was WRONG
+> ### Amendment at ratification (2026-08-01) — §7's original placement was WRONG
 >
 > This ADR was drafted proposing *"a vault CI job runs the verifier against the real data"*, reasoning
 > from the fact that the vault has `ci.yml`, `tests/` and `pyproject.toml`. **Open question 1 asked

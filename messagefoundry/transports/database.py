@@ -1253,7 +1253,7 @@ class DatabaseSource(SourceConnector):
         # Per-tick row ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
         # poll source may default this on are stated once, in transports/base.py). Caps how many rows
         # ONE poll takes from poll_statement's result set; the rest stay in the table and the next poll
-        # takes them. A falsy value (None/0) disables the cap, matching the file sources' knobs.
+        # takes them. None/0 (in any spelling) disables the cap, matching the file sources' knobs.
         self._poll_max_rows: int | None = resolve_poll_ceiling(
             s.get("poll_max_rows", DEFAULT_MAX_ITEMS_PER_POLL),
             knob="poll_max_rows",

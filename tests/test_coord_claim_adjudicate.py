@@ -478,3 +478,45 @@ def test_a_squash_merge_suffix_is_not_collected_as_a_citation(repo: Path, tmp_pa
         "the squash-merge pull-request suffix was collected as a delivery citation for item 47. "
         f"citations={r['citations']}"
     )
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        # A labelled pull request inside the group is not an item.
+        "fix(hooks): the deny text (BACKLOG #40, PR #47)",
+        # A conventional-commit scope is the WORD, not the `BACKLOG #` token.
+        "docs(backlog): file #47 and #48",
+        # A closed group ends what its token governs.
+        "fix(hooks): the deny text (BACKLOG #40) closes #47",
+    ],
+)
+def test_a_number_the_claim_gate_does_not_count_is_not_collected_either(
+    repo: Path, tmp_path: Path, subject: str
+) -> None:
+    """PARITY WITH scripts/hooks/claim_check.py (BACKLOG #1347). The gate counts a subject's items by
+    this tool's rule and refuses every other `#N`. Where the gate reads a number as NOT an item, this
+    tool must not collect it as a delivery of one, or the two disagree about the same subject."""
+    backlog(repo, f"## 47. Not delivered here\n\n> {PRIORITIZED} open\n\nbody\n")
+    (repo / "other.txt").write_text("y", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", subject)
+    git(repo, "push", "-q", "origin", "main")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "47", tmp_path / "gone", "seat")
+    r = rows(repo)["47"]
+    assert not r["citations"], f"{subject!r} was collected for item 47: {r['citations']}"
+
+
+def test_a_sibling_after_a_bare_token_is_still_collected(repo: Path, tmp_path: Path) -> None:
+    """The positive arm for the negatives above: narrowing the token must not lose the bare-token
+    form, which the gate counts as an item and therefore accepts."""
+    backlog(repo, f"## 47. Delivered as a sibling\n\n> {PRIORITIZED} open\n\nbody\n")
+    (repo / "other.txt").write_text("y", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "fix(hooks): BACKLOG #40, #47 deny text")
+    git(repo, "push", "-q", "origin", "main")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "47", tmp_path / "gone", "seat")
+    r = rows(repo)["47"]
+    assert any("#47" in c["subject"] for c in r["citations"]), r["citations"]

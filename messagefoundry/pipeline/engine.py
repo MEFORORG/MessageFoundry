@@ -1573,19 +1573,18 @@ class Engine:
         # exactly the moment a superseded ex-leader may still be mid-teardown and mid-write. A RETAINED
         # stale epoch is what fails closed on every claim and rejects every terminal resolve.
         #
-        # Safe because _start_graph pushes current_epoch() unconditionally on promotion (:1178) AND
+        # Safe because _start_graph pushes current_epoch() unconditionally on promotion AND
         # _reconcile_graph re-stamps it on every leader+running pass (below), and no non-graph path
         # resolves a CLAIMED row — the operator paths are PENDING/DEAD/DONE-scoped.
         #
-        # Cross-backend, stated precisely because the obvious stronger claim is false: on Postgres every
-        # claim path and every terminal resolve is now fenced. On SQL Server only the three FIFO claim
-        # paths carry a guard — `claim_ready` and every terminal resolve are still UNFENCED there until
-        # ADR 0157 Inc 3 — so retaining the epoch stops a demoted SQL Server node claiming FIFO lanes and
-        # nothing more. That is still strictly better than today (where the clear disarmed even those),
-        # but it is NOT "a demoted SS node claims nothing".
+        # Cross-backend: on Postgres (ADR 0157 Inc 1) and on SQL Server (Inc 3) every claim path and
+        # every terminal resolve is fenced, so a retained stale epoch stops a demoted node claiming any
+        # lane, FIFO or UNORDERED. The residual that passes on both is the same-process re-promotion the
+        # ADR's Consequences name: only a per-claim token closes that.
         #
         # PINNED INVARIANT, not tidiness: restoring the clear looks like cleanup and silently disarms the
-        # fence. See test_stop_graph_retains_the_leader_epoch.
+        # fence. Pinned by test_engine_pushes_leader_epoch_into_store_on_promotion in
+        # tests/test_cluster_graph_gating.py, which asserts no (None, None) push ever happens.
         log.info("engine graph stopped — this node is now standby")
 
     async def _reconcile_graph(self) -> None:

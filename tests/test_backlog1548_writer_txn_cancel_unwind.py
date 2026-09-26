@@ -17,9 +17,10 @@ same things:
 
 1. the failure propagates;
 2. NO transaction is left open;
-3. an UNRELATED writer can still use the connection afterwards -- that writer deliberately issues no
-   ``BEGIN``, so it is the probe that would carry the abandoned work if one were still open;
-4. it did NOT carry that work: the ingress row is still there, still ``inflight``, and nothing the
+3. an UNRELATED writer can still use the connection afterwards. That writer issues no ``BEGIN``,
+   and since BACKLOG #1803 it runs under ``_writer_guard``, which rolls an abandoned transaction back
+   on entry. So point 2 is what detects a failed unwind, and this point shows the connection works;
+4. the abandoned work is gone: the ingress row is still there, still ``inflight``, and nothing the
    failed handoff would have produced leaked;
 5. the handoff RE-RUNS to success, which is the at-least-once contract the unwind exists to keep.
 
@@ -166,12 +167,10 @@ async def _assert_connection_clean(store: MessageStore, *, probe: str) -> None:
     Order matters. `in_transaction` is asserted FIRST because the probe below closes whatever is
     open, which would mask the failure at the `begin` cancel point.
 
-    The probe is load-bearing for a specific reason: `record_connection_event` takes the write lock
-    and issues its INSERT with NO `BEGIN` of its own. If the failed writer's transaction were still
-    open, this INSERT would join it and its commit would make the abandoned work durable -- which is
-    exactly the inheritance this unwind exists to prevent. Should that method ever grow a
-    transaction of its own, this stops proving anything and needs replacing with another short
-    writer."""
+    The probe is `record_connection_event`, a short writer with NO `BEGIN` of its own. It runs under
+    `_writer_guard` (BACKLOG #1803), which rolls an inherited transaction back on entry and logs at
+    ERROR rather than joining it. So the `in_transaction` assertion is what detects a failed unwind,
+    and the probe shows the connection is usable afterwards."""
     assert not store._db.in_transaction, "the failed writer left its transaction open"
     await store.record_connection_event(
         connection=probe, transport="mllp", direction="inbound", kind="probe"
