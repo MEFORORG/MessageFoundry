@@ -1683,7 +1683,15 @@ class AuthStore(Protocol):
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
-    ) -> None: ...
+        adopt_notify_email: bool = True,
+    ) -> None:
+        """Insert one account row.
+
+        ``notify_email`` is seeded from ``email`` through ``seed_notify_email`` unless
+        ``adopt_notify_email`` is ``False``, which binds NULL and keeps ``email`` as the profile
+        mirror. The directory birth passes ``False`` for a ``mail`` the address form would not
+        suggest (BACKLOG #2014); every other caller keeps the default."""
+        ...
 
     async def get_user(self, user_id: str) -> UserRecord | None: ...
 

@@ -10199,6 +10199,7 @@ class MessageStore:
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
+        adopt_notify_email: bool = True,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
@@ -10213,7 +10214,7 @@ class MessageStore:
                     auth_provider,
                     display_name,
                     email,
-                    seed_notify_email(email),
+                    seed_notify_email(email) if adopt_notify_email else None,
                     now,
                     now,
                     password_hash,
