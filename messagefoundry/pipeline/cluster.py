@@ -469,7 +469,7 @@ class ClusterCoordinator(Protocol):
         The epoch is bumped **only on a fresh acquire** (a node taking the lease — not a renew), so a
         superseded ex-leader holds a strictly *older* epoch than the live leader. The engine reads this
         synchronously on promotion and pushes it into the store (:meth:`Store.set_leader_epoch`), where
-        the FIFO claim validates ``held_epoch >= leader_lease.leader_epoch`` inside the single claim
+        every claim path validates ``held_epoch >= leader_lease.leader_epoch`` inside its own claim
         transaction so a paused/superseded ex-leader **claims 0 rows** (Kleppmann fencing token; store ↔
         coordinator import direction is one-way — the engine pushes, the store never
         imports the coordinator, ARCH-6). Cheap + synchronous (cached state). :class:`NullCoordinator`

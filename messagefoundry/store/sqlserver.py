@@ -3723,7 +3723,7 @@ class SqlServerStore:
         )
         try:
             await self.release_claimed(list(exc.outbox_ids))
-        except Exception:  # noqa: BLE001 — promotion recovery still covers the row; never mask it
+        except Exception:  # noqa: BLE001 - promotion recovery still covers the row; never mask it
             log.warning(
                 "fenced %s: re-pend failed; row(s) left INFLIGHT for promotion recovery",
                 exc.method,
@@ -4965,7 +4965,7 @@ class SqlServerStore:
         row (which holds the origin non-terminal until ``ingress_handoff`` consumes it). body + detail
         are ciphertext; outcome is plaintext."""
         now = time.time() if now is None else now
-        guard, guard_params = self._resolve_guard()  # ADR 0157 C1 — TERMINAL
+        guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # Leading SELECT (also opens the txn so _maybe_finalize's applock is never first).
@@ -4983,7 +4983,7 @@ class SqlServerStore:
                     row[2],
                     row[3],
                 )
-                # ADR 0157 C1 — the guard rides THIS, the first write, so a rejection discards the
+                # ADR 0157 C1: the guard rides THIS, the first write, so a rejection discards the
                 # response artifact, the re-ingress work-row, the ledger row and the finalize together.
                 # An artifact with no resolved queue row is the half-applied state C3 rejects.
                 await self._exec_terminal(
@@ -5749,7 +5749,7 @@ class SqlServerStore:
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child."""
         now = time.time() if now is None else now
-        # ADR 0157 C1 — both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND
+        # ADR 0157 C1: both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND
         # finalize the origin, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
         # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
         guard, guard_params = self._resolve_guard()
@@ -7015,7 +7015,7 @@ class SqlServerStore:
         if destination_name is not None:
             where.append("destination_name=?")
             filters.append(destination_name)
-        # H1 FENCING TOKEN (ADR 0157 C5, Inc 3) — the UNORDERED claim is fenced exactly like the three
+        # H1 FENCING TOKEN (ADR 0157 C5, Inc 3): the UNORDERED claim is fenced exactly like the three
         # FIFO claims: a superseded ex-leader's UPDATE matches 0 rows and it claims nothing. The guard
         # rides the UPDATE, not the CTE, which is placement parity with the FIFO claims and the Postgres
         # twin. The honest cost is the same as there: a fenced claim's CTE still briefly READPAST-hides
@@ -7074,7 +7074,7 @@ class SqlServerStore:
         # H1: the engine pushes the held leader epoch + lease key here on promotion (read from the
         # coordinator — the store never imports it, ARCH-6). Stamps cached state only; the next claim or
         # terminal resolve validates it inside that statement's own txn (ADR 0157 Inc 3).
-        # epoch=None OMITS BOTH GUARDS ENTIRELY — None means NO FENCE, not a safe null token. That is why
+        # epoch=None OMITS BOTH GUARDS ENTIRELY. None means NO FENCE, not a safe null token. That is why
         # _stop_graph deliberately does NOT clear it on demotion (ADR 0157 C4).
         self._leader_epoch = epoch
         self._lease_key = lease_key
@@ -7976,7 +7976,7 @@ class SqlServerStore:
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        guard, guard_params = self._resolve_guard()  # ADR 0157 C1 — TERMINAL
+        guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
@@ -8026,7 +8026,7 @@ class SqlServerStore:
         distinct ``message_id``. Sequential single-row statements on one cursor (EF-6 no-MARS). A
         vanished member is skipped; a crash before commit rolls all N back to ``INFLIGHT``."""
         now = time.time() if now is None else now
-        # ADR 0157 C1 — TERMINAL. Rendered ONCE for the loop: a fence on ANY member raises out and rolls
+        # ADR 0157 C1: TERMINAL. Rendered ONCE for the loop: a fence on ANY member raises out and rolls
         # all N back, which is the all-or-nothing contract the docstring already promises.
         guard, guard_params = self._resolve_guard()
         # ALL N, not the prefix walked so far: the rollback undoes every member, and all N are still
@@ -8036,7 +8036,7 @@ class SqlServerStore:
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 finalize: dict[str, None] = {}
-                for outbox_id in outbox_ids:
+                for outbox_id in all_ids:
                     await cur.execute(
                         "SELECT message_id, destination_name, handler_name, attempts"
                         " FROM queue WHERE id=?",
@@ -8107,7 +8107,7 @@ class SqlServerStore:
                         retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                # ADR 0157 C1 — guard the DEAD branch ONLY. The retry branch returns the row to
+                # ADR 0157 C1: guard the DEAD branch ONLY. The retry branch returns the row to
                 # PENDING; fencing THAT would leave it INFLIGHT, turning a permitted duplicate into a
                 # forbidden strand. On the retry branch the suffix is "", so the statement and params
                 # are byte-identical to pre-Inc-3, and checked=False means the rowcount is never read.
@@ -8183,7 +8183,7 @@ class SqlServerStore:
                         retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                # ADR 0157 C1 — the same DEAD-branch-only split as mark_failed, decided ONCE from
+                # ADR 0157 C1: the same DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the loop: a fence on any member raises out and
                 # rolls all N back, matching the all-or-nothing contract the docstring promises.
                 guard, guard_params = (
@@ -8235,12 +8235,12 @@ class SqlServerStore:
         :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        guard, guard_params = self._resolve_guard()  # ADR 0157 C1 — TERMINAL, once for the loop
+        guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL, once for the loop
         all_ids = tuple(outbox_ids)  # a rejection re-pends ALL N, as in mark_batch_done
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 finalize: dict[str, None] = {}
-                for outbox_id in outbox_ids:
+                for outbox_id in all_ids:
                     await cur.execute(
                         "SELECT message_id, destination_name FROM queue WHERE id=?",
                         (outbox_id,),
@@ -8594,7 +8594,7 @@ class SqlServerStore:
             error
         )  # PHI chokepoint (#120) — incl. f"undecryptable payload: {exc}" callers; ciphered below (H4)
         now = time.time() if now is None else now
-        # ADR 0157 C1 — TERMINAL, and the sharpest of the set: a DEAD row is never re-claimed, so H2's
+        # ADR 0157 C1: TERMINAL, and the sharpest of the set: a DEAD row is never re-claimed, so H2's
         # skip-and-complete cannot heal a false dead-letter the way it heals a false DONE.
         guard, guard_params = self._resolve_guard()
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:

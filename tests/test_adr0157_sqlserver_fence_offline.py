@@ -397,6 +397,17 @@ async def test_a_rejected_batch_repends_every_member_including_those_never_walke
         assert len(_updates(cur)) == 1 and conn.commits == 0, method
 
 
+async def test_a_one_shot_iterable_still_resolves_every_member() -> None:
+    """The batch methods materialise their ids once for D1. Looping over the original iterable after
+    that would walk an exhausted generator, commit an empty transaction and strand all N INFLIGHT.
+    Mutation: loop ``for outbox_id in outbox_ids`` again and this fails."""
+    for method, args in (("mark_batch_done", ()), ("dead_letter_batch", ("boom",))):
+        cur, conn = _Cursor(), _Conn()
+        store, _ = _store(cur, conn, epoch=None)
+        await getattr(store, method)((i for i in ("a", "b", "c")), *args, now=1.0)
+        assert [p[-1] for _s, p in _updates(cur)] == ["a", "b", "c"], method
+
+
 async def test_every_single_row_resolve_is_fenced_and_returns_its_no_op_value() -> None:
     expected: dict[str, tuple[tuple[Any, ...], dict[str, Any], Any]] = {
         "dead_letter_now": (("row-1", "boom"), {}, None),

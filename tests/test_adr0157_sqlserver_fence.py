@@ -165,10 +165,15 @@ async def test_resolve_guard_is_fail_open_on_a_missing_lease_row(store: Any) -> 
 
 
 async def test_lease_key_none_with_an_armed_epoch_disagrees_by_design(store: Any) -> None:
-    """``ISNULL(NULL, 5) <= 5`` lets the resolve land; ``NULL <= 5`` declines the claim."""
+    """``ISNULL(NULL, 5) <= 5`` lets the resolve land; ``NULL <= 5`` declines the claim.
+
+    A lease row at epoch 6 is present on purpose. With the real key the resolve would be FENCED
+    (6 > 5), so a landing write proves the None key was bound as None and matched no row, rather
+    than proving only that the table was empty."""
     await _enqueue(store)
     claimed = await store.claim_next_fifo("OB1", now=200.0)
     assert claimed is not None
+    await _seed_epoch(store, 6)
 
     store.set_leader_epoch(5, lease_key=None)
     await store.mark_done(claimed.id)

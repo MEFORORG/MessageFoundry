@@ -1573,7 +1573,7 @@ class Engine:
         # exactly the moment a superseded ex-leader may still be mid-teardown and mid-write. A RETAINED
         # stale epoch is what fails closed on every claim and rejects every terminal resolve.
         #
-        # Safe because _start_graph pushes current_epoch() unconditionally on promotion (:1178) AND
+        # Safe because _start_graph pushes current_epoch() unconditionally on promotion AND
         # _reconcile_graph re-stamps it on every leader+running pass (below), and no non-graph path
         # resolves a CLAIMED row — the operator paths are PENDING/DEAD/DONE-scoped.
         #
@@ -1583,7 +1583,8 @@ class Engine:
         # ADR's Consequences name: only a per-claim token closes that.
         #
         # PINNED INVARIANT, not tidiness: restoring the clear looks like cleanup and silently disarms the
-        # fence. See test_stop_graph_retains_the_leader_epoch.
+        # fence. Pinned by test_engine_pushes_leader_epoch_into_store_on_promotion in
+        # tests/test_cluster_graph_gating.py, which asserts no (None, None) push ever happens.
         log.info("engine graph stopped — this node is now standby")
 
     async def _reconcile_graph(self) -> None:

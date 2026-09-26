@@ -8,8 +8,10 @@
 >
 > **Inc 3 is BUILT (2026-09-26, BACKLOG #1497), on a measured premise.** Its gate asked whether a
 > coroutine cancelled mid-`execute` leaves an aioodbc transaction committed or rolled back. Hosted CI
-> answered it in runs 36219288548 and 36223227696: rolled back, never committed, on SQL Server 2022 and
-> 2025. `claim_fifo_heads` is the one exception by reading, and it needs no further fence. SQL Server
+> answered it in runs 36219288548 and 36223227696: rolled back, never committed, in every case that
+> gave a reading. That is three cases on SQL Server 2022 and two on 2025; the third 2025 case,
+> `claim_ready`, crashed natively and gave no reading. `claim_fifo_heads` is the one exception by
+> reading, and it needs no further fence. SQL Server
 > now fences `claim_ready` and the same eight terminal resolves as Postgres. It needed nothing from
 > Inc 2: D1's re-pend and the successor's promotion reset close recovery. The measurement and the
 > as-built note are at the increment.
@@ -562,7 +564,8 @@ path exists. Re-scoping narrows what Inc 2 builds; it does not make Inc 3 indepe
 
 ### Inc 3, as built — SQL Server fences on a measured cancel premise (2026-09-26, BACKLOG #1497)
 
-**The gate's answer: a cancelled coroutine's transaction rolls back, and never commits.** Hosted CI
+**The gate's answer: a cancelled coroutine's transaction rolls back, and never commits, in every case
+that gave a reading.** One case gave none, and the table says which. Hosted CI
 measured it on a branch that exists only for the measurement and is never merged
 (`b137-1497-inc3-probe`, file `tests/test_adr0157_inc3_cancel_probe_sqlserver.py`). The runs are
 36219288548 (round 1) and 36223227696 (round 2). Round 2's jobs are 108352322839 (SQL Server 2025) and
@@ -636,10 +639,11 @@ corrected it. Two paths now resolve a fenced row in bounded time on SQL Server:
 Neither uses Inc 2's layers. Inc 2 as built still earns its place, but for a different strand: the
 rows a stopped worker leaves behind.
 
-**Tests.** `tests/test_adr0157_sqlserver_fence_offline.py` has 16 tests and is not gated, so it runs
+**Tests.** `tests/test_adr0157_sqlserver_fence_offline.py` has 17 tests and is not gated, so it runs
 on every leg. It holds the structural gate over every `queue` status write in `store/sqlserver.py`,
-the twin of `tests/test_adr0157_fence_scope.py`, and behaviour tests against fake cursors. Ten
-mutations were each confirmed red against it, one per guard, check, sentinel catch and D1 call.
+the twin of `tests/test_adr0157_fence_scope.py`, and behaviour tests against fake cursors. Eleven
+mutations were each confirmed red against it, one per guard, check, sentinel catch, D1 call and
+batch loop.
 `tests/test_adr0157_sqlserver_fence.py` has 15 tests and needs a real server. It runs only on the
 hosted `sqlserver-store` legs, in the catch-all step of `.github/workflows/ci.yml`. It mirrors the
 Postgres runtime tests and adds the row-count pin and both recovery-closure paths above.
@@ -654,6 +658,12 @@ Postgres runtime tests and adds the row-count pin and both recovery-closure path
 - A cancel that commits a `claim_fifo_heads` claim leaves the row for the next start or promotion, as
   above.
 - A laptop run proves nothing about the T-SQL. The runtime tests skip without a server.
+- **Flagged for a decision, not built.** C1 leaves `mark_failed`'s retry branch unguarded, and on SQL
+  Server it has no `status='inflight'` conjunct either. So a stalled ex-leader whose send then fails
+  can re-pend a row the successor already finished as DONE, and the row is sent again. That is a
+  duplicate, which the invariant permits, but it also writes a `failed` event on a PROCESSED message.
+  A status conjunct on the retry branch would stop it without risking a strand, because SQL Server
+  has no owner-blind lease sweep for such a conjunct to fight. This ADR does not decide that.
 
 **Inc 4 — `TeardownReason` + bounded, concurrent source stop (DEMOTE only). BUILT.** The enum lands
 **here**: `_teardown_unsafe` is the single shutdown path, so bounding it unguarded would change
