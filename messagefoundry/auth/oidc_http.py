@@ -51,7 +51,12 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
     narrow_to_approved_suites,
 )
-from messagefoundry.transports.bounded_read import reply_framing_fault
+from messagefoundry.transports.bounded_read import (
+    AmbiguousFramingError,
+    EgressReplyError,
+    read_reply_body,
+    reply_framing_fault,
+)
 
 __all__ = ["build_idp_opener", "jwks_fetcher"]
 
@@ -115,7 +120,7 @@ def build_idp_opener(
         # trusted unchecked. A non-empty cadata= makes create_default_context skip the OS store, as
         # cafile= does. An EMPTY one would load the whole OS store, because it tests cadata for
         # truth, so anchor_cadata refuses an anchor with no PEM block before it gets here. A
-        # certificate inside crl_file still joins the store, by path: see verified_anchor_cadata.
+        # certificate inside crl_file that this store lacks refuses the build (harden_crl_check, #1890).
         cadata = verified_anchor_cadata(oidc_anchor_spec(ca_cert_file, pin), enforcing=enforcing)
         ctx = ssl.create_default_context(cadata=cadata)
     else:
@@ -167,6 +172,24 @@ def jwks_fetcher(
             # floor after this see the cache's throttle, as after any failed fetch.
             if reply_framing_fault(resp) is not None:
                 raise http.client.HTTPException("JWKS response framed its body length ambiguously")
-            return bytes(resp.read(_MAX_JWKS_BYTES + 1))
+            # BACKLOG #1979: the strict reader under read_bounded. Not read_bounded itself, because
+            # JwksCache judges the length and expects the extra byte. Refusals are retyped to
+            # HTTPException for the reason above, outside the handler so nothing chains to them.
+            try:
+                body = read_reply_body(resp, _MAX_JWKS_BYTES + 1, connector="OIDC JWKS endpoint")
+            except AmbiguousFramingError:
+                failure = "JWKS response framed its body length ambiguously"
+            except EgressReplyError:  # the family, so a later sibling is retyped too
+                failure = "JWKS response could not be read whole"
+            else:
+                # The declared-length check read_bounded makes, which read_reply_body leaves to its
+                # caller. Skipped past the bound, where JwksCache refuses the size itself.
+                remaining = getattr(resp, "length", None)
+                if len(body) > _MAX_JWKS_BYTES or not (
+                    isinstance(remaining, int) and remaining > 0
+                ):
+                    return body
+                failure = "JWKS response ended before its declared length"
+            raise http.client.HTTPException(failure)
 
     return fetch

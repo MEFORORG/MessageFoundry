@@ -23,6 +23,7 @@ from collections.abc import AsyncIterator, Callable
 
 import pytest
 
+from messagefoundry.pipeline import cluster_sqlserver
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 from messagefoundry.store import OutboxStatus
 
@@ -205,53 +206,91 @@ async def test_non_promotable_warm_dr_stays_passive_across_handover(coords) -> N
     assert members["ha2"].promotable is True
 
 
-# --- HA-8: leader-preference (acquire_delay_seconds) across a real expiry race ---
+# --- HA-8: leader-preference (acquire_delay_seconds) on a clock the test drives ---
+
+# An epoch far from the real one (about 1.8e9 today). A lease stamped on the real clock would read
+# back near 1.8e9, so a patch that silently stopped reaching the MERGE fails the control below
+# instead of passing. Every offset used with it is a multiple of 0.25, so the FLOAT sums are exact.
+_FROZEN_EPOCH = 1000.0
 
 
-async def test_preferred_delay0_wins_expired_lease_race_over_delayed_node(coords) -> None:
-    # HA-8: the acquire_delay handicap (the T-SQL sibling of Postgres's `$4` term — the take-over-of-an-
-    # EXPIRED-lease predicate is compared against SYSUTCDATETIME() offset by the delay) resolved against the
-    # REAL SQL Server clock. The fake-pool unit tests (tests/test_cluster_lease.py) re-implement this
+def _set_db_clock(monkeypatch: pytest.MonkeyPatch, at: float) -> None:
+    """Point the lease MERGE's ``@now`` at a literal instead of ``SYSUTCDATETIME()``.
+
+    ``_claim_or_renew_lease`` reads the module-level ``_DB_NOW`` expression each time it builds the
+    batch, so this swaps only the clock. The MERGE, its delay predicate and the real server that
+    evaluates them are all unchanged."""
+    monkeypatch.setattr(cluster_sqlserver, "_DB_NOW", repr(float(at)))
+
+
+async def test_preferred_delay0_wins_expired_lease_race_over_delayed_node(
+    coords, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # HA-8: the acquire_delay handicap (the T-SQL sibling of Postgres's `$4` term: the take-over-of-an-
+    # EXPIRED-lease predicate `t.lease_expires_at + @delay < @now`) evaluated by the REAL MERGE on a
+    # real SQL Server. The fake-pool unit tests (tests/test_cluster_lease.py) re-implement this
     # arithmetic in Python and never run the MERGE. A preferred node (delay=0) and a warm-DR node
-    # (delay=0.5) both race a lease that has been expired for only ~0.15s: the DR node is handicapped OUT
-    # (0.15s < 0.5s → its stricter predicate is false), while the preferred node takes over at once — and
+    # (delay=0.5) both race a lease that has been expired for 0.25s: the DR node is handicapped OUT
+    # (0.25 < 0.5, so its stricter predicate is false), while the preferred node takes over at once and
     # then KEEPS it (the DR node still can't take a live, renewed lease).
+    #
+    # BACKLOG #351: this test used to sleep `_TTL + 0.15` on the real clock and then needed the DR
+    # node's claim to land within 0.35s of wall clock, across a real DB round trip on a shared runner.
+    # It went red on one SQL Server leg and green on the other on the same commit. The test now sets
+    # the `@now` the predicate reads, so every comparison below is exact and no margin is involved.
+    # Real-clock expiry is still covered by test_standby_takes_over_after_lease_expires and the HA-9
+    # test above, which only need MORE than the TTL to pass and so have no upper margin to miss.
     make, _ = coords
     ll = make("L")
 
-    # (1) L acquires; its lease expires at DB_now + _TTL (1.0s) on the real clock.
+    # (1) L acquires; its lease expires at epoch + _TTL on the driven clock.
+    _set_db_clock(monkeypatch, _FROZEN_EPOCH)
     await ll._maintain_leadership()
     assert ll.is_leader() is True
+    owner, expires = await ll.leadership_lease()
+    # Positive control: the MERGE stamped the DRIVEN clock, not SYSUTCDATETIME().
+    assert (owner, expires) == ("L", _FROZEN_EPOCH + _TTL)
 
-    # (2) L "crashes" (stops renewing); sleep just past the TTL so the lease is expired by only ~0.15s —
-    # inside the DR node's 0.5s handicap window but past the preferred node's 0s window.
-    await asyncio.sleep(_TTL + 0.15)
+    # (2) L "crashes" (stops renewing). Move the clock so the lease has been expired for 0.25s: inside
+    # the DR node's 0.5s handicap window, past the preferred node's 0s window.
+    _set_db_clock(monkeypatch, _FROZEN_EPOCH + _TTL + 0.25)
 
     p = make("P", acquire_delay_seconds=0.0)
     dr = make("DR", acquire_delay_seconds=0.5)
 
-    # (3) The DR node races the ~0.15s-expired lease FIRST and is handicapped out (its delayed take-over
+    # (3) The DR node races the expired lease FIRST and is handicapped out (its delayed take-over
     # predicate is false), so the preferred node then claims the same expired lease.
     await dr._maintain_leadership()
-    assert (
-        dr.is_leader() is False
-    )  # 0.15s expired < 0.5s handicap → the real delay predicate rejects DR
+    assert dr.is_leader() is False  # expired 0.25s < 0.5s handicap: the real predicate rejects DR
+    owner, expires = await dr.leadership_lease()
+    assert (owner, expires) == ("L", _FROZEN_EPOCH + _TTL)  # DR's rejected MERGE left the row as-is
     await p._maintain_leadership()
-    assert p.is_leader() is True  # delay=0 → claims the instant the lease has expired
+    assert p.is_leader() is True  # delay=0: claims the instant the lease has expired
 
-    owner, _expires = await p.leadership_lease()
-    assert owner == "P"
+    owner, expires = await p.leadership_lease()
+    assert (owner, expires) == ("P", _FROZEN_EPOCH + _TTL + 0.25 + _TTL)
+    assert p.current_epoch() == 2  # a take-over of L's lease, not a renew, so the H1 epoch bumped
 
-    # (4) Well past the DR node's handicap window, the preferred node renews (owner=me carries NO delay) so
-    # it holds a LIVE lease; the DR node runs again and STILL cannot take over — proving P keeps it, not
-    # merely wins the first tick.
-    await asyncio.sleep(0.5 + 0.15)
-    await p._maintain_leadership()  # renew → fresh live lease, unhandicapped
+    # (4) Past the DR node's handicap window, the preferred node renews (owner=me carries NO delay) so
+    # it holds a LIVE lease; the DR node runs again and STILL cannot take over. This proves P keeps
+    # it, not merely wins the first tick.
+    renew_at = _FROZEN_EPOCH + _TTL + 1.0
+    _set_db_clock(monkeypatch, renew_at)
+    await p._maintain_leadership()  # renew: fresh live lease, unhandicapped
     assert p.is_leader() is True
     await dr._maintain_leadership()
-    assert dr.is_leader() is False  # P holds a live renewed lease → DR never wins
-    owner, _expires = await p.leadership_lease()
-    assert owner == "P"  # the preferred node kept leadership across the whole race
+    assert dr.is_leader() is False  # P holds a live renewed lease, so DR never wins
+    owner, expires = await p.leadership_lease()
+    assert (owner, expires) == ("P", renew_at + _TTL)  # kept, and renewed on the driven clock
+
+    # (5) Control for step (3): the handicap DELAYS the DR node, it does not bar it. P now "crashes"
+    # too; once its lease has been expired for longer than 0.5s, the same DR node takes it. Without
+    # this arm, step (3) would also pass if the DR node could never claim at all.
+    _set_db_clock(monkeypatch, renew_at + _TTL + 0.75)
+    await dr._maintain_leadership()
+    assert dr.is_leader() is True
+    owner, _expires = await dr.leadership_lease()
+    assert owner == "DR"
 
 
 # --- full start()/stop() lifecycle electing exactly one leader --------------

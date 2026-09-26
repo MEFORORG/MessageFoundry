@@ -438,7 +438,7 @@ def test_cli_upsert_reports_connection_json_nested_past_the_decoder(
 
 
 def test_cli_upsert_does_not_report_a_downstream_recursion_error_as_bad_input(
-    cfg: Path, monkeypatch: pytest.MonkeyPatch
+    cfg: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The converse of the test above, and the property that lets ONE arm serve a wide `try`: the
     conversion is scoped by TYPE, so a `RecursionError` raised downstream of the decode is still not
@@ -448,7 +448,9 @@ def test_cli_upsert_does_not_report_a_downstream_recursion_error_as_bad_input(
     `upsert_connection` and the build-check callback. It is safe there only because
     `_load_operator_json` wraps `json.loads` ALONE -- nothing else in the block can produce an
     `_OperatorJsonError`. So drive `upsert_connection` itself into a `RecursionError` on input that
-    decoded fine: it must escape uncaught rather than be blamed on the operator's `--data`.
+    decoded fine: it must reach `main`'s dispatch-level floor rather than be blamed on the operator's
+    `--data`. Since BACKLOG #1863 that floor returns 1 with a JSON error naming the exception type,
+    so the discriminator is the error TEXT, not whether `main` raises.
 
     RED when: the conversion moves out to the subcommand's wide `try` (an `except RecursionError`
     there), or `_load_operator_json` grows to wrap more than the decode. Either turns this into an
@@ -466,5 +468,9 @@ def test_cli_upsert_does_not_report_a_downstream_recursion_error_as_bad_input(
         "router": "r",
         "settings": {"port": 2600},
     }
-    with pytest.raises(RecursionError, match="raised by upsert_connection"):
-        main(["connection", "upsert", "--config", str(cfg), "--data", json.dumps(obj), "--json"])
+    rc = main(["connection", "upsert", "--config", str(cfg), "--data", json.dumps(obj), "--json"])
+    error = json.loads(capsys.readouterr().out)["error"]
+
+    assert rc == 1
+    assert error.startswith("RecursionError: raised by upsert_connection"), error
+    assert "nested too deeply" not in error, "a downstream fault was blamed on the operator's input"

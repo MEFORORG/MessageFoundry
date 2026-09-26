@@ -1355,6 +1355,8 @@ def _crl_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
 
     put("ca_only.pem", ca_pem)
     put("ca_and_fresh.pem", ca_pem + crl(now + 30 * day))
+    # BARE, for a context that does not already trust the CA: BACKLOG #1890 refuses the bundle there.
+    put("fresh_only.pem", crl(now + 30 * day))
     put("ca_and_expired.pem", ca_pem + crl(now - day))
     for cn, serial, is_server, stem in (
         ("localhost", 2000, True, "server"),
@@ -1377,7 +1379,7 @@ def test_harden_crl_check_loads_the_crl_and_sets_the_flag(_crl_material: dict[st
     # POSITIVE CONTROL for the two refusals below: the helper CAN succeed, so those tests are not
     # green merely because it rejects everything handed to it.
     ctx = _verifying_ctx()
-    harden_crl_check(ctx, _crl_material["ca_and_fresh"])
+    harden_crl_check(ctx, _crl_material["fresh_only"])
     assert ctx.cert_store_stats()["crl"] >= 1
     assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
@@ -1508,7 +1510,7 @@ def _crl_policy(crl: str, ca: str | None = None, mode: str = "system") -> TrustA
 def test_resolve_trust_anchor_carries_the_crl_onto_every_non_loopback_arm(
     _crl_material: dict[str, str],
 ) -> None:
-    crl = _crl_material["ca_and_fresh"]
+    crl = _crl_material["fresh_only"]
     ca = _crl_material["ca_only"]
     # system mode, no internal CA: the anchor names no CA at all and still carries the CRL. This is the
     # arm that matters most -- it is the shipped default, so most hops reach revocation through it.
@@ -1536,7 +1538,7 @@ def test_a_loopback_hop_is_exempt_from_the_crl(_crl_material: dict[str, str]) ->
     # on-box traffic to close a gap the gate does not consider open.
     for host in ("127.0.0.1", "localhost", "::1"):
         anchor = resolve_trust_anchor(
-            connection_ca_file=None, host=host, policy=_crl_policy(_crl_material["ca_and_fresh"])
+            connection_ca_file=None, host=host, policy=_crl_policy(_crl_material["fresh_only"])
         )
         assert anchor.crl_file is None, host
         assert anchor.narrows is False, host
@@ -1557,18 +1559,18 @@ def test_a_crl_alone_makes_the_anchor_narrow(_crl_material: dict[str, str]) -> N
     # answered False here would leave the hop on that unrevoked shared opener while its guard was told
     # revocation was checked -- the exact per-hop scoping failure this item warns about.
     anchor = resolve_trust_anchor(
-        connection_ca_file=None, host="10.0.0.5", policy=_crl_policy(_crl_material["ca_and_fresh"])
+        connection_ca_file=None, host="10.0.0.5", policy=_crl_policy(_crl_material["fresh_only"])
     )
     assert anchor.cafile is None
     assert anchor.narrows is True
 
 
 def test_build_verifying_client_context_sets_the_crl_flag(_crl_material: dict[str, str]) -> None:
-    crl = _crl_material["ca_and_fresh"]
+    crl, ca = _crl_material["fresh_only"], _crl_material["ca_only"]
     for anchor in (
         TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl),  # system + CRL
-        TrustAnchor(cafile=crl, load_system_roots=True, crl_file=crl),  # augment + CRL
-        TrustAnchor(cafile=crl, load_system_roots=False, crl_file=crl),  # pinned + CRL
+        TrustAnchor(cafile=ca, load_system_roots=True, crl_file=crl),  # augment + CRL
+        TrustAnchor(cafile=ca, load_system_roots=False, crl_file=crl),  # pinned + CRL
     ):
         ctx = build_verifying_client_context(anchor)
         assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF, anchor
@@ -1584,7 +1586,7 @@ def test_build_verifying_client_context_sets_the_crl_flag(_crl_material: dict[st
 def test_build_anchored_https_handler_sets_the_crl_flag_on_its_own_context(
     _crl_material: dict[str, str],
 ) -> None:
-    crl = _crl_material["ca_and_fresh"]
+    crl = _crl_material["fresh_only"]
     # The system-plus-CRL arm keeps urllib's OWN context and loads the CRL onto it. `cafile` is None
     # here, so this also pins the guard added around load_verify_locations, which rejects an all-None
     # call.
@@ -1594,7 +1596,8 @@ def test_build_anchored_https_handler_sets_the_crl_flag_on_its_own_context(
     assert context_checks_revocation(urllib_handler_context(handler, connector="probe")) is True
     # The pinned arm substitutes a context and must carry the CRL through that substitution.
     pinned = build_anchored_https_handler(
-        anchor=TrustAnchor(cafile=crl, load_system_roots=False, crl_file=crl), connector="probe"
+        anchor=TrustAnchor(cafile=_crl_material["ca_only"], load_system_roots=False, crl_file=crl),
+        connector="probe",
     )
     assert context_checks_revocation(urllib_handler_context(pinned, connector="probe")) is True
     # NEGATIVE CONTROL.
@@ -1630,7 +1633,7 @@ def test_requests_verify_refuses_a_crl_it_cannot_express(_crl_material: dict[str
     anchor = TrustAnchor(
         cafile=_crl_material["ca_only"],
         load_system_roots=False,
-        crl_file=_crl_material["ca_and_fresh"],
+        crl_file=_crl_material["fresh_only"],
     )
     with pytest.raises(ValueError, match="crl_file"):
         requests_verify_from_anchor(anchor, cell="probe")

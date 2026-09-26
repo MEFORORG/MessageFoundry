@@ -7,6 +7,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Dual control now flags a release whose approver account is new or was just taken over, and an
+  Administrator grant pages.** One Administrator can create or take over a second approver account,
+  so dual control cannot prove two people agreed; `docs/SECURITY.md` now says so, and ADR 0041's
+  "two colluding insiders" residual is corrected to one. A release whose approver account was
+  created, had its password changed, or enrolled TOTP after the request writes an
+  `approval.approver_provenance` audit row and raises the `approval_approver_provenance` alert. The
+  release still goes ahead. Creating an Administrator, promoting to it, or newly mapping a directory
+  group to it raises the `administrator_granted` alert. The `user.created` audit row now records the
+  creating administrator's address, and an account created with a notification address gets an
+  `account_created` notice. Both alert types can be targeted by `[[alerts.rules]]`.
+  (`BACKLOG #315`)
 - **`credential_expires_at` tells a client when an admin-issued temporary password stops working.**
   `POST /auth/login` returns it in `LoginResponse` when `must_change_password` is set. `POST /users`
   returns it in `UserSummary` for the account it creates. It is a Unix timestamp, read from the same
@@ -112,6 +123,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   failure status where it used to get Success. A `max_object_bytes` above 16 MiB no longer raises
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
+- **`POST /users` answers `409 username already exists` when two creates race for one name.** The
+  route checks the name before it creates the account, but two requests can both pass that check.
+  The second insert then met the store's UNIQUE index, and that error reached the API's catch-all
+  handler as a `500`. The engine now catches it and answers `409` with the same text the check
+  gives. The web console's create-user form shows that text too. (`BACKLOG #1808`)
+- **On SQLite and PostgreSQL, adding a passkey to an account deleted mid-enrolment now says `no
+  such user`.** It used to say `label already in use`, because every store refusal of the insert
+  got that answer. On those two backends the insert is refused by the foreign key to the account.
+  The engine now re-reads the account to tell the two refusals apart. SQL Server has no such foreign
+  key, so there the insert is not refused and this change does not apply. (`BACKLOG #1807`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
@@ -130,6 +151,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a CRL file can no longer add trust anchors.** Each CRL setting loaded its file as
+  a CA file, so any certificate in it became a trusted CA for the hop. That CA skipped the hop's
+  pin and permission checks. It covers at least `[api].tls_client_crl_file`, an inbound
+  connection's `tls_crl_file`, `[tls].crl_file`, `[logging].forward_tls_crl_file`,
+  `[auth].oidc_tls_crl_file` and `[store].ssl_crl_file`. The engine now refuses to build the hop
+  when its CRL file carries a certificate not already in the hop's trust store. A file holding a
+  CA already loaded for that hop, plus that CA's CRL, still loads. A bare CRL always does, so
+  give each CRL setting a bare CRL. The inbound revocation refusal no longer tells an operator to
+  put the CA in the CRL file. ([BACKLOG #1890](docs/BACKLOG.md))
 - **BREAKING: under `enforce`, a trust anchor whose permissions or path the engine cannot read now
   refuses to start, unless its SHA-256 pin matches.** This covers `[auth].oidc_tls_ca_cert_file`,
   `[auth].ad_tls_ca_cert_file`, `[api].tls_client_ca_file` and, new in this release, the mTLS CA
@@ -183,7 +213,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   cleartext guards as the live build, so a hop the live build refuses now fails the test too. A
   refused CA answers the test with `trust anchor refused; see the server log`. The path and
   SHA-256 go to the log, not to the caller or the audit row. Not covered: the CAs of outbound connections, and an inbound `tls_crl_file`, which is still
-  read by path, so a certificate inside it is trusted unchecked.
+  read by path. A certificate inside it was trusted unchecked until BACKLOG #1890, later in this release.
   ([BACKLOG #1142](docs/BACKLOG.md))
 - **A config reload now refuses a trust anchor that the next start would refuse.** The reload
   check ran the pin, ACL and path checks, but not the check that the file holds a loadable PEM
@@ -473,6 +503,39 @@ All notable changes to MessageFoundry are documented here. The format follows
   Docker Desktop bind mount does not, so there it answers indeterminate, and under `enforce` it
   refuses unless the pin matches.
   ([BACKLOG #1142](docs/BACKLOG.md))
+- **BREAKING: an HTTP-family reply is now refused when its header block or its chunked body breaks
+  the HTTP/1.1 grammar.** 0.4.0 read most of these as the partner's answer. A REST, SOAP, FHIR or DICOMweb delivery,
+  and an OAuth2 or SMART token request, now raises `AmbiguousFramingError`, a transient delivery
+  error that is retried and then dead-lettered. A `fhir_lookup` reply raises inside the Handler. The
+  OIDC token and JWKS reads refuse the same replies, and that sign-in fails as an unavailable IdP.
+  The OIDC token read now also refuses a body shorter than its `Content-Length`, as the connectors
+  already did. Newly refused, at least:
+  - a header line that is not a field line, such as a line with no colon or a space before the
+    colon. 0.4.0 dropped every header after that line. It then framed the body without them. So it
+    could return three bytes of raw chunk framing as the answer. Or it could read to close and take
+    in a second response as part of the body. This holds under any `Content-Type`. Under
+    `multipart/*` or `message/*`, 0.4.0 built the lost lines into MIME parts and read the body
+    without them all the same;
+  - a header line with no name, a first line that is a continuation, a `From ` line, a field
+    name that is not an RFC 9110 token, or a field value holding a control character such as NUL;
+  - a chunk-size line that is not plain hex digits, such as `-5`, `1_0`, `+5`, `0x5` or ` 5`
+    (whitespace before the size). Whitespace after the size, as in `5 `, is refused too, unless a
+    chunk extension follows it. `5 ;ext` still reads, because RFC 9112 allows whitespace before the
+    `;`. 0.4.0 parsed these with `int()`. On a negative size it read to the end of the stream, past
+    the reply's byte bound, and only then failed;
+  - a chunk line ended by a bare LF, or holding a bare CR, and chunk data not followed by CRLF;
+  - a trailer line that is not a field line, or more than 100 trailer lines, counting folded
+    continuations.
+
+  Chunk extensions, trailer fields (folded or not), upper-case hex and leading zeros still read.
+  So does a `multipart/*` reply, such as SOAP with MTOM. A chunked body still reads when its stream
+  ends cleanly after the last chunk, or between trailer lines, with no final CRLF. 0.4.0 read that
+  too. Still missed, at least: a bare CR followed by text that reads as a field line. The engine
+  sees only the header block the HTTP reader parsed, so any lost line that leaves no trace there
+  is missed the same way. Connection probes and the alert webhook discard the body and are not refused. They stop reading at the first bad
+  chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
+  send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
+  [BACKLOG #1979](docs/BACKLOG.md))
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
@@ -753,8 +816,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `messagefoundry verify` reports it ahead of time. ADR 0173 section 4.3 called for this guard,
   and ADR 0173 AC-4 records these limits. **Migration:** with OIDC on, set
   `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the token and
-  JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file becomes a
-  trusted root for this hop. `[security].enforcement = "warn"` also lets `serve` start, but it
+  JWKS endpoint certificates. Put only CRLs in it. A certificate in that file became a trusted
+  root for this hop until BACKLOG #1890, later in this release, made it refuse instead. `[security].enforcement = "warn"` also lets `serve` start, but it
   turns every enforce-only refusal in the instance into a warning, not this one alone.
   (`BACKLOG #1887`)
 - **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine

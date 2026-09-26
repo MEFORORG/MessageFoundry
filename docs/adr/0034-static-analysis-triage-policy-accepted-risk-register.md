@@ -474,6 +474,8 @@ one is an accepted residual.
 > all** — grep for `node20`/`node24` across `tests/`, `scripts/`, `.github/workflows/` and
 > `pyproject.toml` returns prose only. The deadline below rests on a person reading this page. Building
 > that check is unfiled work (the Node20 deadline probe, no number allocated).
+> **BUILT 2026-09-25 (BACKLOG #1868).** `scripts/quality/workflow_local_action_check.py` now reads
+> `runs.using` from every local action. See the amendment of that date at the foot of this ADR.
 >
 > It also carried one judgment the Contingency bullet does not: on a step holding a write token that
 > any GitHub user can trigger by comment, **trading a frozen vendored bundle for a less-reviewed fork
@@ -486,6 +488,12 @@ one is an accepted residual.
 > the last word rather than the archived upstream's — this workflow holds no reference to that action's
 > upstream at all, so no release could re-declare node24 even in principle. The risk is live and the
 > revisit bullet stands.
+>
+> **DISCHARGED 2026-09-25 (BACKLOG #1868). The paragraph above is no longer true of the tree.** No
+> upstream release could change the line, but this repository could, because the copy is ours:
+> `action.yml` now declares `node24`. Of the three bullets called standing, the revisit bullet is now
+> discharged and the contingency retired; *Why not replaced now* still stands. See the amendment of
+> 2026-09-25 at the foot of this ADR.
 
 * **Finding. RETRACTED 2026-09-21 — the anchor is gone.** As written: `warning[archived-uses]`,
   `.github/workflows/cla.yml:44` —
@@ -514,14 +522,20 @@ one is an accepted residual.
   this, it demonstrated it: PR #621 rewrote the `uses:` without adding the checkout a local action
   needs, every run died in about three seconds, and 7 of 21 open pull requests were blocked at once
   until an administrator cleared it.
-* **Hard revisit: before Node20 removal. STANDS — this is the live half of this amendment.**
+* **DISCHARGED 2026-09-25 (BACKLOG #1868) — read the amendment of that date at the foot of this ADR.**
+  Node 20 left the runners on 2026-09-23 with no wedge, because the runner forced this action onto
+  Node 24. `action.yml` now declares `node24`, and a probe refuses a retired runtime. The bullet is
+  kept as written below.
+  **Hard revisit: before Node20 removal. STANDS — this is the live half of this amendment.**
   `action.yml` declares `runs.using: node20` at the pin, at the archived HEAD, and in the vendored copy
   (`.github/actions/cla-assistant-lite/action.yml:45`, re-verified 2026-09-21). An archived repo can
   never re-declare node24, so GitHub's fall-2026 Node20 removal — not this lint — forces fork-or-
   replace. No firm date is published. **The planning date this bullet set has now passed:** it named
   mid-September 2026, and this note is dated 2026-09-21. The re-check it asked for is due rather than
   upcoming, and the contingency below is 2026-08-01 vintage and has not been re-verified since.
-* **Contingency, verified 2026-08-01.** There is no canonical successor — the archived README directs
+* **RETIRED UNUSED 2026-09-25 (BACKLOG #1868).** The deadline it planned for passed without it; see
+  the amendment of that date. Its gates still apply if the action is ever replaced for another reason.
+  **Contingency, verified 2026-08-01.** There is no canonical successor — the archived README directs
   users to fork. The best candidate found is `iainmcgin/cla-github-action`, Apache-2.0, not archived,
   last pushed 2026-06-17, 4 stars, single personal maintainer. Note v3.2.0 is an **annotated** tag whose
   ref resolves to tag object `07f1588b0cee15f89a489a77704c9d45d39ec0a1`; the commit `uses:` must pin is
@@ -739,3 +753,78 @@ Line numbers in this section are navigation aids, not evidence: locate `_enforce
 The dismissal comments cite `http_auth.py:337` for the secret read, which is that expression's line on
 `main` and not on the scanned merge ref, where the same expression sits further down — a small instance
 of the same point.
+
+## Amendment — 2026-09-25: the Node 20 deadline passed without a wedge, and the vendored action now declares `node24` (BACKLOG #1868)
+
+The 2026-08-01 amendment's **Hard revisit** bullet is discharged, and its **Contingency** is retired
+unused. Both are marked in place above. This does not supersede the ADR: the triage policy and the
+register are unchanged, and this closes one register entry's deadline.
+
+### Node 20 left the runners on 2026-09-23, and this action was already running on Node 24
+
+| Reading | Source, and when it was read |
+|---|---|
+| GitHub switched runners to Node 24 by default on **2026-06-16** and removed Node 20 on **2026-09-23**. The plan moved three times, and the post's editor's notes of 2026-02-25, 2026-05-19 and 2026-08-25 record each change. | GitHub changelog, *Deprecation of Node 20 on GitHub Actions runners* (2025-09-19, with editor's notes), read 2026-09-25. |
+| Node 20 is gone, runners use Node 24 for JavaScript actions, and the `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` opt-out no longer works. | GitHub changelog, *Node 20 is no longer available in GitHub Actions* (2026-09-23), read 2026-09-25. |
+| `runs.using` for a JavaScript action accepts `node20` and `node24`. | GitHub docs, *Metadata syntax reference*, read 2026-09-25. |
+| Node.js 24 reaches end of life on **2028-04-30**. | `nodejs/Release` `schedule.json`, read 2026-09-25. |
+| **The runner already ran this bundle on Node 24, and `cla` stayed green through the removal.** Run 35669923620 (2026-09-21, before the removal) and run 36211163685 (2026-09-26T02:16Z, after it) both ran the `CLA Assistant` step to success on runner `2.337.0`. Both carry the annotation *"The following actions target Node.js 20 but are being forced to run on Node.js 24: ./.github/actions/cla-assistant-lite"*. Both logs also show the `DEP0040` (`punycode`) and `DEP0169` (`url.parse()`) warnings Node 24 prints. | `gh run view --log` on those two `pull_request_target` runs, read 2026-09-25 US Central time, which was already 2026-09-26 in UTC. The twelve most recent `pull_request_target` runs of `cla.yml` all concluded `success`. |
+
+**So the premise of the revisit bullet did not hold.** It said the removal *"forces fork-or-replace"*,
+and #1868 feared a wedge on every pull request. The removal came and went, and nothing wedged,
+because the runner forces a `node20` action onto Node 24 rather than refusing it. That shim is
+GitHub's choice, with no promise attached. Relying on it would move the deadline onto a behaviour
+nobody here controls.
+
+### The vendored action now declares the runtime it already ran on
+
+* **`action.yml` declares `using: "node24"`,** with a comment above it saying why. The provenance
+  record says what was diffed against upstream. The runner was already doing this, so the runtime
+  that executes the bundle does not change. The bundle bytes do not change either.
+* **The provenance pin moved with it.** `scripts/security/build_cla_action_provenance.py` (BACKLOG
+  #1578) pins `action.yml` to reviewed bytes, not to upstream. The new pin says why it moved.
+
+### A probe now reads `runs.using`, so the next deadline does not rest on a reader
+
+* **What it refuses.** `scripts/quality/workflow_local_action_check.py` reads `runs.using` from every
+  local action a workflow calls directly. It refuses `node12`, `node16` and `node20`. It refuses a
+  missing value and any runtime it does not list.
+* **When it refuses `node24`.** From a revisit date in the script's `_NODE_RUNTIME_REVISIT`, which
+  holds the date and its reasoning. It warns in the 90 days before. The CI step runs on the real
+  clock, so on that date it fails every pull request and names its own fix.
+* **Why the step's trigger matters.** It already runs in `ci.yml` on `pull_request`, against the
+  branch's own files. `cla.yml` runs on `pull_request_target`, so a pull request that edits the
+  action is tested with main's copy.
+* **Its controls.** The probe prints each runtime it read beside its verdict. The live tree reports
+  `./.github/actions/cla-assistant-lite=node24`. A copy of the tree set back to `node20` exits 1.
+  `tests/test_workflow_local_action_check.py` pins exit 1 on a tree whose only problem is the
+  runtime, and exit 0 on a fully clean tree. The script's `--self-test` covers the retired, current
+  and revisit-date arms; the test file covers the rest.
+
+### A pattern scan of the bundle found nothing Node 24 removed
+
+The scan of `dist/index.js` looked for Node APIs removed at end of life in Node 22 to 24. It found no
+`util.is*` calls, `util._extend`, `util.log`, `SlowBuffer`, `createSecurePair`,
+`crypto.createCipher` or `_stream_*` internals. It found `new Buffer(` (6), `url.parse(` (6), a
+`require("punycode")` and one guarded `process.binding` fallback. All four still exist in Node 24
+and only warn.
+
+A pattern scan is weaker than an audit. The runs above are the stronger evidence. Both took the path
+where every author is allowlisted or signed. The unsigned-contributor path has not been seen on
+Node 24 here. That path posts a comment and commits to `cla-signatures`.
+
+### Only a hosted run can prove the new line starts
+
+`cla.yml` loads the action from the base checkout. So the pull request carrying this change runs
+main's `action.yml`, and its own `cla` green proves nothing about the new line. The first run that
+reads it is the first `pull_request_target` run after the merge. If the runner refused `node24`,
+`cla` would stop reporting on every pull request. The revert would be gated by the same context, as
+PR #621 showed. The risk is small: `node24` is documented, and this runner already runs the bundle on
+Node 24. Read the first post-merge `cla` run, and keep a revert ready.
+
+### The fork contingency is retired unused
+
+This deadline no longer needs the fork named in the 2026-08-01 Contingency. Vendoring made the
+runtime line ours to change. GitHub's own shim showed the bundle runs on Node 24. The Contingency's
+gates still apply if the action is ever replaced for another reason. The judgment recorded above
+also stands: a less-reviewed fork is not a security win over a frozen bundle.

@@ -1073,7 +1073,7 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 - When asked for tabular results, provide the final table directly — not code that generates it.
 - **Review security prose by asking what a reader would DO with it, not whether it is accurate**
   (**SDS-3.4**). The rules below are instances of it. Reasoning, evidence and dates:
-  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.8**,
+  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.10**,
   under *"Reviewing security prose"* — the source of record.
 - **State a load-bearing fact ONCE and link to it; never restate it** (**SDS-3.5**).
 - **A completeness claim is a liability — prefer "at least" to an enumeration** (**SDS-3.6**).
@@ -1082,6 +1082,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   `git diff` on a staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job*
   conclusion for a *step* question. Name the question and what the tool returns; check they are the
   same sentence.
+- **Before clearing a suspect from what a record says, ask whether that record could hold the state
+  at all** (**SDS-3.10**). Then name the suspects that step leaves open.
 
 ---
 

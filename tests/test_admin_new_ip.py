@@ -76,6 +76,7 @@ async def test_disabled_by_default_is_a_noop() -> None:
         service = AuthService(store, AuthSettings(), security_notifier=notifier)  # default off
         await service.initialize()
         token, _ = await _enabled_admin(service, client="10.1.1.1")
+        notifier.events.clear()  # setup's ACCOUNT_CREATED notice (BACKLOG #315), not under test
         # Even a wildly different address is a no-op while the feature is off.
         assert await service.flag_new_client_ip(token, "10.9.9.9", path="/users") is False
         assert notifier.events == []
@@ -92,6 +93,7 @@ async def test_new_ip_flags_audits_and_notifies() -> None:
         )
         await service.initialize()
         token, _ = await _enabled_admin(service, client="10.1.1.1")
+        notifier.events.clear()  # setup's ACCOUNT_CREATED notice (BACKLOG #315), not under test
         # Same address → not new; no side effects.
         assert await service.flag_new_client_ip(token, "10.1.1.1", path="/users") is False
         assert notifier.events == []

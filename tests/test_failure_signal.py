@@ -264,10 +264,10 @@ def test_the_signal_job_declares_no_scope_nobody_decided_to_grant() -> None:
     """
     job_perms = _doc()["jobs"]["signal"].get("permissions")
     assert job_perms == {"actions": "read", "pull-requests": "write", "issues": "write"}, (
-        f"the signal job's permissions are {job_perms!r}. `actions: read` backs the jobs fetch that "
-        "names the ejecting job -- the permissions block's own comment carries the measurement for "
-        "why it is declared on a public repo that answers without it. Adding another scope means "
-        "writing down what needs it."
+        f"the signal job's permissions are {job_perms!r}. `actions: read` backs the `blame` step's "
+        "jobs fetch, which both comments read -- the permissions block's own comment carries the "
+        "measurement for why it is declared on a public repo that answers without it. Adding "
+        "another scope means writing down what needs it."
     )
 
 
@@ -518,12 +518,15 @@ def test_the_ejection_step_reads_its_run_values_from_the_environment() -> None:
 # repository out (`test_it_pulls_in_no_third_party_actions`), so it cannot import the identical rule
 # from `scripts/ci/report_ci_red.py`. Held in `env:` it is a string these tests can RUN, which is the
 # only way to test the bytes that ship rather than a copy of them beside the file.
+#
+# Since #1786 the rule and the jobs fetch live in one `blame` step, and both comments read its
+# answer: the ejection comment here, and the standing-tracker comment for a red with no pull request.
 # ---------------------------------------------------------------------------------------------------
 
 
 def _blame(jobs: list[dict[str, object]]) -> str:
     """Run the SHIPPED attribution rule, read out of the workflow, over a jobs payload."""
-    program = str(_step("attribute-ejection")["env"]["BLAME_PY"])
+    program = str(_step("blame")["env"]["BLAME_PY"])
     out = subprocess.run(  # noqa: S603 - fixed argv, no shell
         [sys.executable, "-c", program],
         input=json.dumps({"jobs": jobs}),
@@ -575,7 +578,9 @@ def test_a_cancelled_sibling_is_never_named_as_the_cause() -> None:
     assert _blame([cancelled]) == ""
 
 
-def test_the_roll_up_the_workflow_refuses_is_the_one_the_reader_refuses() -> None:
+def test_the_roll_up_the_workflow_refuses_is_the_one_the_reader_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Two copies of one rule, so they are compared rather than trusted.
 
     `scripts/ci/report_ci_red.py` refuses the same job by name. If either moves alone, an ejection
@@ -587,12 +592,17 @@ def test_the_roll_up_the_workflow_refuses_is_the_one_the_reader_refuses() -> Non
     )
     assert spec is not None and spec.loader is not None
     reader = importlib.util.module_from_spec(spec)
+    # Registered BEFORE it runs, as `tests/test_ci_red_reader.py` does. The script defines a
+    # dataclass, and `dataclasses` looks its module up in `sys.modules`; unregistered, this test
+    # passed only when the reader's suite happened to import the script first, and failed alone.
+    # Through monkeypatch, so the module another suite registered is put back afterwards.
+    monkeypatch.setitem(sys.modules, spec.name, reader)
     spec.loader.exec_module(reader)
 
-    program = str(_step("attribute-ejection")["env"]["BLAME_PY"])
+    program = str(_step("blame")["env"]["BLAME_PY"])
     for name in reader._ROLLUP_JOBS:
         assert f'"{name}"' in program or f"'{name}'" in program, (
-            f"report_ci_red.py refuses to name {name!r} as a cause, and the ejection comment's rule "
+            f"report_ci_red.py refuses to name {name!r} as a cause, and the blame step's rule "
             "does not mention it. A roll-up named as the cause tells the reader nothing, and the two "
             "readers of the same red must not disagree about which job that is."
         )
@@ -604,30 +614,189 @@ def test_the_attribution_reads_the_jobs_of_the_run_it_is_commenting_on() -> None
     The rule above is only reached if something supplies it a payload. Asserting the rule without
     asserting the call would pass for a step that computes the right answer from nothing.
     """
-    env = _step("attribute-ejection").get("env", {})
+    env = _step("blame").get("env", {})
     assert "github.event.workflow_run.id" in str(env.get("RUN_ID", "")), (
-        "the attribution step no longer takes the failing run's id from the event, so it cannot ask "
-        "which of that run's jobs failed"
+        "the blame step no longer takes the failing run's id from the event, so it cannot ask which "
+        "of that run's jobs failed"
     )
-    body = _run_block("attribute-ejection")
-    assert "/jobs" in body and "$RUN_ID" in body, (
-        "the attribution step no longer fetches the run's jobs. Without that call the comment is back "
-        "to naming the WORKFLOW, which is the defect #1403 left open."
+    assert "github.event.workflow_run.run_attempt" in str(env.get("RUN_ATTEMPT", "")), (
+        "the blame step no longer takes the failing ATTEMPT from the event. The plain jobs endpoint "
+        "answers for the latest attempt, so a re-run clicked before this step ran would be read instead"
+    )
+    body = _run_block("blame")
+    assert "/attempts/$RUN_ATTEMPT/jobs" in body and "$RUN_ID" in body, (
+        "the blame step no longer fetches the jobs of the attempt that failed. Without that call both "
+        "comments are back to naming the WORKFLOW, which is the defect #1403 and #1786 left open."
+    )
+    assert "where=" in body and "GITHUB_OUTPUT" in body, (
+        "the blame step no longer publishes its answer as a step output, so neither comment can "
+        "read it"
     )
 
 
 def test_a_jobs_fetch_that_fails_still_posts_a_comment_and_says_what_is_missing() -> None:
-    """FAIL SOFT, AND SAY SO. An ejection comment is the only record there is, so losing it to a 403
-    or an aged-out run would be worse than the defect being fixed. Degrading to the old
-    workflow-only text is acceptable; degrading SILENTLY is not -- a reader cannot tell "no job
-    failed" from "I could not look".
+    """FAIL SOFT, AND SAY SO. An ejection comment and a tracker comment are each the only record
+    there is, so losing either to a 403 or an aged-out run would be worse than the defect being
+    fixed. Degrading to the old workflow-only text is acceptable; degrading SILENTLY is not -- a
+    reader cannot tell "no job failed" from "I could not look".
     """
-    body = _run_block("attribute-ejection")
+    blame = _step("blame")
+    job_timeout = int(_doc()["jobs"]["signal"]["timeout-minutes"])
+    assert blame.get("continue-on-error") is True and 0 < int(blame.get("timeout-minutes", 0)) < (
+        job_timeout
+    ), (
+        "the blame step can now stop the job. Without `continue-on-error` and a timeout SHORTER than "
+        "the job's, a failed or hung jobs fetch skips every comment after it -- including the "
+        "tracker comment for a trunk red, which nothing else reports"
+    )
+    body = _run_block("blame")
     assert "if gh api" in body, (
-        "the jobs fetch is no longer guarded, so a non-zero exit trips `set -e` and the comment is "
-        "never posted at all"
+        "the jobs fetch is no longer guarded, so a non-zero exit trips `set -e`, the job stops, and "
+        "no comment is posted at all"
     )
-    assert "names the workflow only" in body, (
-        "the degraded path no longer tells the reader the job could not be read, so a comment naming "
-        "only the workflow is indistinguishable from a run in which nothing failed"
+    assert "::notice::" in body, (
+        "an empty answer from a fetch and a rule that both succeeded no longer leaves a log line, so "
+        "a comment saying the job could not be read points at a log that does not say why"
     )
+    caveat = str(_doc()["jobs"]["signal"].get("env", {}).get("NO_JOB_CAVEAT", ""))
+    assert "names the workflow only" in caveat, (
+        "the shared caveat no longer says the comment names the workflow only"
+    )
+    for consumer in _BLAME_CONSUMERS:
+        assert "$NO_JOB_CAVEAT" in _run_block(consumer), (
+            f"the {consumer!r} step's degraded path no longer tells the reader the job could not be "
+            "read, so a comment naming only the workflow is indistinguishable from a run in which "
+            "nothing failed"
+        )
+
+
+# ---------------------------------------------------------------------------------------------------
+# ONE RULE FOR BOTH COMMENTS (BACKLOG #1786).
+#
+# The standing-tracker comment -- a red with no pull request behind it -- named only the workflow; the
+# workflow's header carries the measurement. The fix is not a second copy of the rule in the tracker
+# step: it is one `blame` step whose answer both comments read.
+# ---------------------------------------------------------------------------------------------------
+
+#: The steps that print the blame step's answer, by `id:`.
+_BLAME_CONSUMERS = ("attribute-ejection", "tracker")
+
+
+def test_the_tracker_comment_names_the_failing_job_and_step() -> None:
+    """The row's measured defect: the tracker comment named the WORKFLOW and nothing else."""
+    assert "steps.blame.outputs.where" in str(_step("tracker").get("env", {}).get("WHERE", "")), (
+        "the tracker step no longer reads the blame step's answer, so a red with no pull request is "
+        "back to a comment naming only the workflow -- the form nobody could triage (#1786)"
+    )
+    assert '"$WHERE"' in _run_block("tracker"), (
+        "the tracker comment no longer prints the failing job and step"
+    )
+
+
+def test_both_comments_print_the_answer_inside_a_code_span() -> None:
+    """The rule's clean-up -- one line, no backtick -- is only safe inside a code span, where a
+    mention or a link in a fork's job name stays inert. Pinned for BOTH comments: dropping the span
+    from either one makes a fork's job name live Markdown in a comment posted under this token."""
+    # The format AND the argument order, because the span only protects the value that fills it:
+    # swapping two arguments would move a fork's job name outside the span and keep the format.
+    expected = {
+        "attribute-ejection": r'''printf '%s failed in `%s`' "$RUN_NAME" "$WHERE"''',
+        "tracker": r'''printf '%s failed in `%s` on a %s run.' "$RUN_NAME" "$WHERE" "$RUN_EVENT"''',
+    }
+    for consumer in _BLAME_CONSUMERS:
+        assert expected[consumer] in _run_block(consumer), (
+            f"the {consumer!r} comment no longer prints the blame step's answer, and only that, "
+            "inside a code span"
+        )
+
+
+def test_both_comments_read_one_rule_and_neither_keeps_a_copy() -> None:
+    """Two copies of the fetch and the rule would drift apart, and the two kinds of comment would then
+    name causes by different rules.
+
+    The blame step must run before both consumers, must run whenever the job does (a condition would
+    have to mirror both consumers', and would print "could not read" over a run nobody read), and
+    must be the only step that holds a rule or reads the run's jobs.
+    """
+    steps = _steps()
+    assert "if" not in _step("blame"), (
+        "the blame step gained an `if:`. Every comment reads its answer, so a condition that does not "
+        "cover a consumer makes that consumer print the degraded caveat over a run it never read."
+    )
+    order = [s.get("id") for s in steps]
+    for consumer in _BLAME_CONSUMERS:
+        assert order.index("blame") < order.index(consumer), (
+            f"the blame step runs after {consumer!r}, so that step reads an output not yet written"
+        )
+        assert "steps.blame.outputs.where" in str(
+            _step(consumer).get("env", {}).get("WHERE", "")
+        ), f"the {consumer!r} step no longer reads the blame step's answer through `env:`"
+    # A copy need not reuse the names. Any step other than `blame` that runs Python, calls the
+    # Actions API, or asks `gh run` about a run is a second reader of the run's jobs.
+    copies = [
+        s.get("id") or s.get("name")
+        for s in steps
+        if s.get("id") != "blame"
+        and any(
+            marker in str(s.get("run", "")) + json.dumps(s.get("env") or {})
+            for marker in ("python", "gh api", "gh run", "/actions/", "import json", "jobs.json")
+        )
+    ]
+    assert copies == [], (
+        f"steps {copies} read the run's jobs or hold a rule of their own; only `blame` may, so the two "
+        "comments cannot name causes by different rules"
+    )
+    # Positive control for the scan: it must see the one step that does do all of this.
+    blame_text = str(_step("blame").get("run", "")) + json.dumps(_step("blame").get("env") or {})
+    assert all(
+        m in blame_text for m in ("python", "gh api", "/actions/", "import json", "jobs.json")
+    ), (
+        "the copy scan's markers no longer match the blame step itself, so a zero above proves nothing"
+    )
+
+
+def test_a_job_name_cannot_break_out_of_its_code_span() -> None:
+    """A fork's red reaches the tracker, and a fork chooses its own job and step names. A newline
+    would start a new Markdown block and a backtick would close the code span early."""
+    hostile = {
+        "name": "leg `x`\n\n@someone",
+        "conclusion": "failure",
+        "steps": [{"name": "step\r\n`y`", "conclusion": "failure"}],
+    }
+    answer = _blame([hostile])
+    assert "`" not in answer and "\n" not in answer and "\r" not in answer, answer
+    assert answer == "leg 'x' @someone / step 'y'"
+
+
+def test_a_very_long_job_name_cannot_push_a_comment_past_its_size_limit() -> None:
+    """GitHub refuses a comment over its size limit, and then the red is recorded nowhere."""
+    answer = _blame([{"name": "x" * 70_000, "conclusion": "failure", "steps": []}])
+    assert len(answer) == 200 and answer.endswith("..."), len(answer)
+
+
+def test_a_control_or_format_character_is_not_passed_through() -> None:
+    """A right-to-left override is a format character, not whitespace, so `str.split()` keeps it,
+    and it would reorder the comment text that follows it."""
+    answer = _blame([{"name": "lint\u202eevil\u200b", "conclusion": "failure", "steps": []}])
+    assert answer == "lint evil", repr(answer)
+
+
+def test_a_failing_job_with_no_name_is_still_named() -> None:
+    """An empty answer would read as "no job failed", which is the false negative this rule refuses."""
+    assert _blame([{"name": " ", "conclusion": "failure", "steps": []}]) == "unnamed job"
+
+
+def test_other_failing_legs_are_counted_so_one_cannot_hide_another() -> None:
+    """Only the first leg is named. A flaky leg named first must not make a real failure beside it
+    look like the same old flake, so the count of the others follows."""
+    second = {"name": "test (ubuntu-latest, py3.14)", "conclusion": "failure", "steps": []}
+    answer = _blame([_REAL_TIMING_GATE_JOB, _REAL_ROLLUP_JOB, second])
+    assert answer.endswith(" (and 1 more failing job)"), answer
+
+
+def test_the_rule_parses_as_an_older_python() -> None:
+    """The tests run the rule under this interpreter; the runner runs it under its own `python3`,
+    which is older. Syntax only the newer one accepts would fail there, and only softly."""
+    import ast
+
+    ast.parse(str(_step("blame")["env"]["BLAME_PY"]), feature_version=(3, 10))

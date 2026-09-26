@@ -99,6 +99,37 @@ from typing import Any
 
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
 
+# What ``_parse_config_module`` raises on a config module it cannot turn into a tree (BACKLOG #1858).
+# The advisory legs skip such a file, because ``validate`` runs first and names it: the loader's broad
+# catch reports each of these as ``error loading config module <file>``. Catching ``SyntaxError`` alone
+# let the rest escape as an uncaught traceback. At least these are reachable, each measured by
+# tests/test_parser_refusal_guards.py.
+#
+# * ``SyntaxError`` -- the ordinary broken module, and every encoding failure (see below).
+# * ``MemoryError`` -- the parser's width wall ("Parser stack overflowed"), a bounded parser limit
+#   rather than heap exhaustion, so the interpreter is fully usable afterwards.
+# * ``RecursionError`` -- the depth wall, raised while the parse builds a deeply nested tree.
+# * ``OSError`` -- the file could not be read at all.
+#
+# ``ValueError`` is deliberately absent. ``corepoint_import._verify_compilable`` names it because it
+# compiles a ``str``; these legs parse BYTES, where no ``ValueError`` is reachable. Naming it would turn
+# an unforeseen failure in a security leg into a silent skip rather than a loud one.
+#
+# Never widen this to ``Exception``: the point is to name the failure, and a broad catch would hide a
+# defect in the analysis itself.
+_UNPARSEABLE_MODULE = (SyntaxError, MemoryError, RecursionError, OSError)
+
+
+def _parse_config_module(path: Path) -> ast.Module:
+    """Parse a config module from its BYTES, so its encoding is read the way the loader reads it.
+
+    ``ast.parse`` on bytes honours a PEP 263 coding cookie and a UTF-8 BOM, exactly as the import system
+    does, and turns every decoding failure into a ``SyntaxError`` the loader reports too. Decoding with
+    ``read_text(encoding="utf-8")`` instead diverged from the loader on a module declaring
+    ``# coding: latin-1``: it loads and runs, but the text read fails, so a leg that skipped it would
+    pass the handler-security gate over code nobody scanned, strict mode included (BACKLOG #1858)."""
+    return ast.parse(path.read_bytes())
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -403,8 +434,8 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
       so the wrapped f-string flags — pinned by ``test_raise_fstring_flags_call_wrapped_interpolation``.
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
-    A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
-    already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
+    A malformed module never crashes the gate (anything in ``_UNPARSEABLE_MODULE`` → skip that file;
+    ``validate`` already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
     """
     base = Path(config_dir)
     if not base.is_dir():
@@ -414,8 +445,8 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         for node in ast.walk(tree):
@@ -544,8 +575,8 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         for node in ast.walk(tree):
@@ -1213,8 +1244,8 @@ def _check_handler_security(
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         imported = _imported_modules(tree)

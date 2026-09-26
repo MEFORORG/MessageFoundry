@@ -827,9 +827,10 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     repeats the handshakes over memory BIOs. :func:`anchor_cadata` covers the inputs where the two
     differ.
 
-    ``cadata=`` loads no CRL from the anchor file. **A CRL file is still loaded by path**
-    (:func:`~messagefoundry.config.tls_policy.harden_crl_check`, ``cafile=``), and any certificate in
-    it enters the trust store unchecked. That residual is not closed here."""
+    ``cadata=`` loads no CRL from the anchor file. A CRL file is loaded separately, by
+    :func:`~messagefoundry.config.tls_policy.harden_crl_check`, which refuses a load that would add a
+    certificate to the trust store (BACKLOG #1890). The CRL file carries no pin or ACL check:
+    whoever can write it can change what is revoked, but not what is trusted."""
     verdict = evaluate_anchor(spec)
     _enforce_verdict(spec, verdict, enforcing=enforcing)
     return anchor_cadata(verdict.data, spec)

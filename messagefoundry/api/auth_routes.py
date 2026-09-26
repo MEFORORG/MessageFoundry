@@ -63,6 +63,7 @@ from messagefoundry.api.auth_models import (
     UserUpdateRequest,
 )
 from messagefoundry.api.security import (
+    alert_sink_for,
     bearer_token,
     client_ip,
     get_auth,
@@ -99,11 +100,13 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
     STEP_UP_ACTION_SESSION_TERMINATE,
+    USERNAME_TAKEN,
     AuthService,
     CurrentPasswordCheck,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
     NotifyEmailAlreadySet,
+    UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
@@ -112,6 +115,17 @@ from messagefoundry.store.store import SessionRecord, UserRecord
 _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
+
+
+def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
+    """Raise the ``administrator_granted`` alert (BACKLOG #315; why, and the key grammar, are on
+    ``AlertSink.administrator_granted``). Raised here, in the API, never from ``auth/`` (CLAUDE.md
+    section 4). Best effort: the grant already happened and is audited."""
+    try:
+        alert_sink_for(app.state).administrator_granted(key, via=via, granted_by=granted_by)
+    except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not 500 a
+        # user-administration call whose write is already committed and audited.
+        _log.exception("the administrator_granted alert for %r failed to emit", key)
 
 
 # CSV formula injection (CWE-1236 / ASVS 1.2.10). The audit export is the ONE attacker-influenced
@@ -822,25 +836,35 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post("/users", response_model=UserSummary, status_code=status.HTTP_201_CREATED)
     async def create_user(
         body: UserCreateRequest,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> UserSummary:
         await _validate_roles(service, body.roles)
         if await service.store.get_user_by_username(body.username) is not None:
-            raise HTTPException(status.HTTP_409_CONFLICT, "username already exists")
+            raise HTTPException(status.HTTP_409_CONFLICT, USERNAME_TAKEN)
         violations = service.password_violations(body.password, username=body.username)
         if violations:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
             )
-        user_id = await service.create_local_user(
-            username=body.username,
-            password=body.password,
-            display_name=body.display_name,
-            email=body.email,
-            roles=body.roles,
-            actor=identity.username,
-        )
+        try:
+            user_id = await service.create_local_user(
+                username=body.username,
+                password=body.password,
+                display_name=body.display_name,
+                email=body.email,
+                roles=body.roles,
+                actor=identity.username,
+                client=_client(request),  # ADR 0150, BACKLOG #315: attribute the user.created row
+            )
+        except UsernameTaken as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        # Only after the create succeeded: a lost username race (409 above) granted nobody anything.
+        if Role.ADMINISTRATOR.value in body.roles:
+            _alert_administrator_granted(
+                app, f"user:{body.username}", via="account_created", granted_by=identity.username
+            )
         user = await service.store.get_user(user_id)
         assert user is not None
         # BACKLOG #1141 (ASVS 6.4.5): the initial password is a must-change credential the login gate
@@ -958,7 +982,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             user_id
         ):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot remove the last administrator")
+        # BACKLOG #315: promotion mints an approver exactly as creation does, so it pages too. Only a
+        # GRANT pages: re-saving an existing Administrator's roles changes nothing.
+        granted = (
+            Role.ADMINISTRATOR.value in body.roles
+            and Role.ADMINISTRATOR.value not in await service.store.get_user_role_ids(user_id)
+        )
         await service.set_roles(user_id, body.roles, actor=identity.username)
+        if granted:
+            _alert_administrator_granted(
+                app, f"user:{user.username}", via="roles_changed", granted_by=identity.username
+            )
         return SimpleMessage(detail="roles updated")
 
     @app.post("/users/{user_id}/reset-password", response_model=PasswordResetResponse)
@@ -1170,9 +1204,25 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         await _validate_roles(service, [e.role for e in body.entries])
+
+        # BACKLOG #315: mapping a group to Administrator makes every member who signs in an approver,
+        # so each group that newly maps to it pages, as a promotion does. Read back from the store on
+        # both sides, because the store normalises group names and a re-save must not page.
+        async def admin_groups() -> set[str]:
+            rows = await service.store.list_ad_group_role_map()
+            return {
+                str(r["ad_group"]) for r in rows if str(r["role_id"]) == Role.ADMINISTRATOR.value
+            }
+
+        grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
+        before = await admin_groups() if grants else set()
         await service.set_ad_group_map(
             [(e.ad_group, e.role) for e in body.entries], actor=identity.username
         )
+        for group in sorted((await admin_groups() - before) if grants else set()):
+            _alert_administrator_granted(
+                app, f"ad-group:{group}", via="ad_group_map", granted_by=identity.username
+            )
         return SimpleMessage(detail="ad-group map updated")
 
     @app.get("/ad-group-scope-map", response_model=AdGroupScopeMap)
