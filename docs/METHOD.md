@@ -30,8 +30,9 @@ dissolves the cross-account coordination problem rather than solving it. Several
 once, usually one per account, and what binds them is the repository they share.
 
 **The case spawning exists for is a PR that needs a fix with no Manager alive**, which nothing else
-resolves: no workflow reads a red PR back. `CLAUDE.md` section 5 carries the reasoning and the two
-spelling hazards. This replaced a rule reading *"NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE"*,
+resolves: workflows label and report a red PR, but none sends it to a seat (see "Nothing tells
+anyone your PR is waiting" below). `CLAUDE.md` section 5 carries the reasoning and the two spelling
+hazards. This replaced a rule reading *"NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE"*,
 true when written and false by 2026-09-16.
 
 **The grant below is LIVE again, and the measurements are kept because they still apply.** It gated
@@ -398,9 +399,22 @@ no commit and no PR the worktree is the only record of what you saw.
 ## Nothing tells anyone your PR is waiting
 
 No workflow reports that a PR is finished and unread. `stalled-prs.yml` comes closest, and it reports
-green-but-unmergeable PRs on a daily cron. `failure-signal.yml` labels a red PR `ci-red`. No workflow
-reads that label back, though `scripts/ci/report_ci_red.py` does when a seat runs it by hand, and it
-names the run that reddened each labelled PR. Nothing delivers that to you; you have to ask.
+green-but-unmergeable PRs on a daily cron.
+
+`failure-signal.yml` labels a PR `ci-red` when at least some workflows go red on it. Its header says
+which ones it watches and where a red with no PR goes instead.
+
+It also comments on a PR the merge queue ejected, meaning a queued PR the queue dropped after a red
+run on the merged result. That PR's own head can still be green.
+
+`ci-red-report.yml` reads the label back on a schedule, through `scripts/ci/report_ci_red.py`. The
+script names the run, job and step behind each label it can attribute, and it sees queue runs.
+
+That report lands only in its own run summary, so nothing delivers it to you. A seat that wants a
+fresh answer runs the script, whose docstring gives the flags and exit codes.
+
+Nothing removes the label on its own. A seat can run `scripts/ci/clear_stale_ci_red.py`; its
+docstring says when it clears and when it keeps.
 
 `unread-signal.yml` used to report unread PRs. It outlived the review gate by a week: the owner ruled
 it off on 2026-09-08, the workflow was disabled on the server that day, and it was deleted on
