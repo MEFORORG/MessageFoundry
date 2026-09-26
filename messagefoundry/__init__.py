@@ -40,7 +40,6 @@ if TYPE_CHECKING:
     from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
     from messagefoundry.config.ingest_time import current_ingest_time
     from messagefoundry.config.models import (
-        AckMode,
         BatchConfig,
         BuildupThreshold,
         InternalErrorPolicy,
@@ -94,6 +93,7 @@ if TYPE_CHECKING:
     from messagefoundry.content_type import ContentType
     from messagefoundry.diagnostics import checkpoint, log_note
     from messagefoundry.fhirsearch import FhirRaw, FhirToken
+    from messagefoundry.mllpcodec import AckMode
     from messagefoundry.parsing.compression import (
         CompressionError,
         deflate_compress,
@@ -147,7 +147,6 @@ _LAZY_EXPORTS: dict[str, str] = {
     "FhirLookupError": "messagefoundry.config.fhir_lookup",
     "fhir_lookup": "messagefoundry.config.fhir_lookup",
     "current_ingest_time": "messagefoundry.config.ingest_time",
-    "AckMode": "messagefoundry.config.models",
     "BatchConfig": "messagefoundry.config.models",
     "BuildupThreshold": "messagefoundry.config.models",
     "ContentType": "messagefoundry.content_type",
@@ -200,6 +199,7 @@ _LAZY_EXPORTS: dict[str, str] = {
     "log_note": "messagefoundry.diagnostics",
     "FhirRaw": "messagefoundry.fhirsearch",
     "FhirToken": "messagefoundry.fhirsearch",
+    "AckMode": "messagefoundry.mllpcodec",
     "CompressionError": "messagefoundry.parsing.compression",
     "deflate_compress": "messagefoundry.parsing.compression",
     "deflate_decompress": "messagefoundry.parsing.compression",

@@ -31,9 +31,8 @@ from harness.frame_cap import max_frame_bytes_arg
 from harness.reconcile.compare import DEFAULT_KEY, ReconcileResult, load_messages, reconcile
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
-from messagefoundry.config.models import AckMode
 from messagefoundry.console_streams import harden_console_streams
-from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES
+from messagefoundry.mllpcodec import DEFAULT_MAX_FRAME_BYTES, AckMode
 
 
 def _parse_field(spec: str) -> tuple[str, int]:

@@ -2371,12 +2371,13 @@ jobs:
             echo "ide=false" >> "$GITHUB_OUTPUT"
           fi
           # `tooling`: the harness tier's SUBJECT is scripts/, the workflows, and the ledger, so those are
-          # what can change its result on a PR. Plus the two files that define the partition itself: edit
-          # the manifest or the conftest hook that reads it and the tier must re-run to prove the new
-          # split still holds.
+          # what can change its result on a PR. Plus the files that define the partition itself: edit
+          # the manifest, the conftest hook that applies it, or tests/_tooling_manifest.py (the one
+          # parser that hook reads it through, BACKLOG #1434) and the tier must re-run to prove the
+          # new split still holds.
           #
-          # THE SECOND ARM MATCHES THE MANIFEST AGAINST ITSELF, and that is the point. Editing one of the
-          # 94 listed tests has to run them, and the obvious spelling -- an alternation of test-name
+          # THE SECOND ARM MATCHES THE MANIFEST AGAINST ITSELF, and that is the point. Editing a listed
+          # test has to run the tier, and the obvious spelling -- an alternation of test-name
           # prefixes -- is a SECOND definition of the tier that drifts from the first silently, in the
           # direction where an edited test simply stops being covered. `grep -xF -f` reads the one
           # definition there is. Comments and blanks are stripped first: a blank pattern under -F -x
@@ -2416,7 +2417,7 @@ jobs:
           # asserts while matching no other arm here. This lock is listed rather than its siblings
           # because it is the file the test READS -- uv.lock and requirements.lock move with it in one
           # re-export, but a uv.lock edit that was never exported has not changed the guard's subject.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else

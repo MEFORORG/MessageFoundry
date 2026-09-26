@@ -1120,12 +1120,19 @@ def ensure_logger_sink(logger: logging.Logger) -> None:
     """Guarantee the next record on ``logger`` reaches a handler, in a process that configured none
     (BACKLOG #1199). Idempotent, and self-removing once the process configures a real sink.
 
-    **The defect this closes.** Only two call sites in the package install a root handler — the
-    ``serve`` and ``supervise`` subcommands, both in :mod:`messagefoundry.__main__`. Every other
-    subcommand runs with an EMPTY root handler list, and ``logging.lastResort`` is WARNING-only, so
-    an INFO record is dropped outright rather than degraded. The measured instance is the off-box
-    audit tee (:mod:`messagefoundry.store.audit_tee`), whose whole purpose is that a copy of every
-    audit record leaves the box.
+    **The defect this closes.** A process with an EMPTY root handler list sends every record to
+    ``logging.lastResort``, which is WARNING-only, so an INFO record is dropped outright rather than
+    degraded. The measured instance is the off-box audit tee
+    (:mod:`messagefoundry.store.audit_tee`), whose whole purpose is that a copy of every audit record
+    leaves the box.
+
+    **Which processes still reach that shape.** When #1199 landed, every CLI subcommand but ``serve``
+    and ``supervise`` did. Since BACKLOG #1441, ``__main__.main`` gives most subcommands a filtered
+    stderr root handler before dispatch (``__main__._CONFIGURES_OWN_LOGGING`` names the exceptions
+    and their residual), so they normally find a handler and do not build one here. Any process that
+    logs without going through ``main()`` still can. This used to say "only two call sites in the
+    package install a root handler", which was an enumeration over a search that could not see a
+    bare ``root.addHandler`` (the tray entrypoint has one). Read the install sites from the tree.
 
     **What it does.** Takes our own handler off ``logger``, then asks ``logging.Logger.hasHandlers``
     whether anything else would receive the record. That predicate is not an approximation of the
@@ -1170,8 +1177,8 @@ def ensure_logger_sink(logger: logging.Logger) -> None:
         return
     # Unsynchronized on purpose. Two threads racing here both install, and the loser's handler is
     # dropped on the next call — so the worst case is ONE duplicated line, never a dropped one, and it
-    # self-heals. A lock on every call would buy nothing against that, and the shipped processes that
-    # reach this branch (the CLI subcommands) are single-threaded anyway.
+    # self-heals. A lock on every call would buy nothing against that. Since #1441 main() installs a
+    # root handler for most subcommands first, so the callers left are the ones the docstring names.
     handler = build_stderr_handler()
     handler.set_name(name)
     logger.addHandler(handler)
@@ -1181,12 +1188,13 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     """Install a **stderr-only** root handler carrying the same PHI-redaction + control-char-scrub
     filter chain :func:`configure_logging` puts on stdout, and return it.
 
-    For a MessageFoundry process whose **stdout is not a log channel**. Two shapes reach here, and the
-    second is why this is not sandbox-specific machinery. (1) A child whose stdout is a **binary
+    For a MessageFoundry process whose **stdout is not a log channel**. At least three shapes reach
+    here, which is why this is not sandbox-specific machinery. (1) A child whose stdout is a **binary
     channel**: the ADR 0087 sandbox worker, whose stdout carries the MFW2 IPC frames, so a stray log
     byte written there would corrupt a frame. (2) A **CLI subcommand invoked with ``--json``**, whose
     stdout carries one machine-parsed document; ``__main__.main`` calls this before dispatch and
-    carries the measurement (BACKLOG #1489). The obvious way to express either,
+    carries the measurement (BACKLOG #1489). (3) **Most other CLI subcommands**, when the root has no
+    handler yet (BACKLOG #1441); ``__main__.main`` carries the reasoning. The obvious way to express any,
     ``logging.basicConfig(stream=sys.stderr)``, gets the stream right and the *filters* wrong: it
     installs a handler with **no filters at all**, so a child's records would reach the stderr the
     parent captures and relays (ADR 0176) with neither PHI redaction nor CR/LF neutralization

@@ -28,6 +28,10 @@ from messagefoundry.config.tls_policy import TrustAnchorPolicy
 # package (BACKLOG #1596). Every `from messagefoundry.config.models import ContentType` still works.
 from messagefoundry.content_type import ContentType as ContentType
 
+# AckMode is defined in the client-importable MLLP leaf (BACKLOG #1697) so a client can name it
+# without importing this package; it is re-exported here, where the engine has always found it.
+from messagefoundry.mllpcodec import AckMode as AckMode
+
 
 class ConnectorType(str, Enum):  # noqa: UP042
     """Built-in transport connectors. A closed set: a new transport is a new member here, and no
@@ -64,14 +68,6 @@ class ConnectorType(str, Enum):  # noqa: UP042
     # DIMSE is the C-STORE SCP source (gated by the TCP egress arm as a raw socket) AND the C-STORE SCU
     # destination; DICOMWEB is the STOW-RS destination (gated by the HTTP egress arm, like REST/SOAP/FHIR).
     # An inbound DICOMweb (STOW-RS) receiver is destination-only here — it awaits the HTTP listener (ADR 0023).
-
-
-class AckMode(str, Enum):  # noqa: UP042
-    """HL7 acknowledgement mode for MLLP/TCP sources."""
-
-    ORIGINAL = "original"  # MSA generated from the inbound message
-    ENHANCED = "enhanced"  # application + commit acks (MSH-15/16)
-    NONE = "none"
 
 
 class AckAfter(str, Enum):  # noqa: UP042
