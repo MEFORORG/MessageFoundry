@@ -85,6 +85,13 @@ param(
     # ONE VALUE, AND THAT IS THE HARD STOP (BACKLOG #1754). `-Kind backlog` is refused by parameter
     # binding, before the script body runs, so there is no path through this file that can issue a
     # backlog number. Widening this set is how that guarantee would be lost.
+    #
+    # THAT GUARANTEE COVERS THIS FILE ONLY (BACKLOG #1829). A worktree whose tree predates the
+    # retirement still carries the old script, and it still runs: on 2026-09-19 one issued #1770 and
+    # #1771, which the vault ledger already held. Nothing here can change an old copy, so the defence
+    # lives in what every copy shares, the registry. scripts/coord/tombstone-retired-backlog-allocator.ps1
+    # writes alloc/backlog/1000000.json, and every pre-retirement floor takes a maximum over that
+    # directory, so a stale copy issues #1000001 -- harmless and wrong on sight. Do not delete it.
     [ValidateSet("adr")]
     [string]$Kind = "adr",
     [string]$Title,

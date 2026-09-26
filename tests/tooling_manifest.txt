@@ -57,6 +57,7 @@ tests/test_codex_bridge.py
 tests/test_connscale_harvest.py
 tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_reentrancy.py
+tests/test_coord_alloc_retired_tombstone.py
 tests/test_coord_fleet_fetch_clock.py
 # The four below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
 # real post-commit hook. They are listed rather than left off because the diff that can break them is
