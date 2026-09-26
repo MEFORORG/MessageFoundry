@@ -133,10 +133,10 @@ def split_by_obr(message: Message | str | bytes) -> list[str]:
     to split, so it is returned **as-is** in a single-element list with its control id **unchanged**
     (no suffix) — the natural no-op for a non-order message.
 
-    **Blank segments.** An empty segment line (a ``\r\r`` in the source) still counts as a segment
-    when the groups are found, so every order keeps its own observations; it is then left out of the
-    parts, since it carries nothing (BACKLOG #1597). A zero-OBR message is returned verbatim, blank
-    line and all.
+    **Blank segments.** :meth:`Message.parse` drops empty segment lines, so text input never
+    carries one here. A :class:`Message` built straight from a parse tree still can. Such a segment
+    counts as a segment when the groups are found, so every order keeps its own observations, and it
+    is then left out of the parts, since it carries nothing (BACKLOG #1597).
 
     Accepts a :class:`Message`, or a raw ``str``/``bytes`` (parsed here), matching how the other
     parsing helpers take input. Returns re-encoded ``\r``-delimited HL7 strings.

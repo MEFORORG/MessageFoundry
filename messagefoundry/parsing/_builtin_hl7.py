@@ -378,9 +378,9 @@ def extract_field(
     Raises ``IndexError`` for the invalid-depth case (surfaced as None at the Peek layer); returns None
     for absent/empty. Also raises ``IndexError`` when the message carries a blank segment — python-hl7's
     ``extract_field`` resolves the segment through the raising ``segments()`` scan
-    (:func:`raise_if_blank_segment_scan`), so byte-parity requires the same blow-up here. The Peek layer
-    runs that scan *before* its invalid-depth ``IndexError``→None catch, so a blank-segment error
-    propagates while an over-index still maps to None (matching the legacy path's two separate catches).
+    (:func:`raise_if_blank_segment_scan`), so byte-parity requires the same blow-up here. The Peek and
+    Message layers never hand this function a blank segment: both drop empty lines before parsing
+    (BACKLOG #1594), so the scan here is parity with the library, not a path the engine reaches.
     """
     raise_if_blank_segment_scan(msg)
     # python-hl7's ``extract_field`` resolves the segment through ``segments()``, which skips a

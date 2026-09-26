@@ -8,9 +8,10 @@ are normalised. Before the fix, ``Peek.parse`` accepted that, then ``peek.contro
 listener caught only ``HL7PeekError``, so the message got no row, no ACK and no NAK, and the MLLP
 server dropped the connection. That broke the count-and-log invariant (CLAUDE.md section 2).
 
-**The fix is tolerant, as the ledger row asks.** The peek drops empty lines before either backend
-parses, so the message is ACKed ``AA`` and committed ``RECEIVED`` with its routing fields. The stored
-raw keeps the blank line: the engine records what the sender sent. A runner guard and a ``build_ack``
+**The fix is tolerant, as the ledger row asks.** ``Peek.parse`` and ``Message.parse`` drop empty
+lines before either backend parses, so the message is ACKed ``AA`` and committed ``RECEIVED`` with its
+routing fields, and a Handler can still edit it. The stored raw keeps the blank line: the engine
+records what the sender sent. A runner guard and a ``build_ack``
 guard back that up, so a field read that faults for any other reason still records ``ERROR`` and
 NAKs ``AR``. Those two are driven here by injecting the fault, because no wire input reaches them
 once the parser is fixed.
@@ -20,6 +21,7 @@ Synthetic HL7 only (CLAUDE.md section 9).
 
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import NoReturn
@@ -31,6 +33,7 @@ import messagefoundry.pipeline.wiring_runner as wiring_runner
 from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing._backend import backend
+from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import Peek, normalize
 from messagefoundry.parsing.summary import summarize
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -168,6 +171,59 @@ async def test_the_http_listener_commits_a_message_with_a_blank_segment(
     rows = await _rows(store)
     assert len(rows) == 1 and rows[0]["status"] == MessageStatus.RECEIVED.value
     assert rows[0]["control_id"] == "CTRL1594"
+
+
+@_BACKENDS
+async def test_a_streaming_inbound_detaches_a_document_from_a_message_with_a_blank_segment(
+    builtin: bool, store: MessageStore
+) -> None:
+    # The detach re-parses the body with Message and writes OBX-5.5 through a whole-field set. Had
+    # only the peek dropped the empty line, that set would raise IndexError and escape the listener
+    # exactly as the peek did: no row, no NAK. A code-review subagent found this path.
+    b64 = base64.b64encode(b"P" * 2048).decode("ascii")
+    body = (
+        f"{_HEADER.replace('ADT^A01', 'MDM^T02')}\r\r{_PID}\r"
+        f"OBX|1|ED|PDF^Report||^Application^PDF^Base64^{b64}||||||F\r"
+    )
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            name="IB_STREAM",
+            spec=ConnectionSpec(ConnectorType.MLLP, {"port": 0}),
+            router="r",
+            content_type=ContentType.HL7V2,
+            stream_threshold_bytes=500,
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    rr = RegistryRunner(reg, store)
+    with backend(builtin=builtin):
+        ack = await rr._handle_inbound(reg.inbound["IB_STREAM"], body.encode())
+
+    assert ack is not None and "MSA|AA|CTRL1594" in ack
+    rows = await _rows(store)
+    assert len(rows) == 1 and rows[0]["status"] == MessageStatus.RECEIVED.value
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM attachment")
+    row = await cur.fetchone()
+    assert row is not None and row["n"] == 1
+
+
+# --- the Message surface agrees with the peek -----------------------------------------------------
+
+
+@_BACKENDS
+def test_a_handler_can_edit_a_message_that_arrived_with_a_blank_segment(builtin: bool) -> None:
+    # Message.parse drops the empty line too. Kept, it would make every whole-field set raise on
+    # both backends, so a message the listener ACKed would then fail in every Handler that edits it.
+    with backend(builtin=builtin):
+        msg = Message.parse(_SHAPES["crlf-crlf"])
+        assert msg.segments() == Peek.parse(_SHAPES["crlf-crlf"]).segments() == ["MSH", "PID"]
+        msg.set("MSH-10", "EDITED")
+        msg.set("PID-3.1", "200")
+        assert (
+            msg.encode()
+            == f"{_HEADER.replace('CTRL1594', 'EDITED')}\r{_PID.replace('100', '200')}\r"
+        )
 
 
 # --- defence in depth: a faulting field read on an accepted peek ----------------------------------

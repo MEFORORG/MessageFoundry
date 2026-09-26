@@ -183,19 +183,21 @@ def parse_path(path: str) -> tuple[str, int, int | None, int | None]:
 _BLANK_SEGMENT_RUN = re.compile("\r{2,}")
 
 
-def _drop_blank_segments(norm: str) -> str:
-    """``norm`` with every empty segment line removed, for the peek parse only (BACKLOG #1594).
+def drop_blank_segments(norm: str) -> str:
+    """``norm`` with every empty segment line removed, before a tolerant parse (BACKLOG #1594).
 
     A sender that ends segments with ``CRLF`` and adds a blank line produces ``\\r\\r`` once
     :func:`normalize` has run. Both backends parse that into a segment with no id. python-hl7 then
-    raises ``IndexError`` from its by-id segment scan on **any** field read, and the built-ins replicate
-    that for byte parity. On the pre-ACK path that error is not an :class:`HL7PeekError`, so it escaped
-    the listener: no disposition, no NAK, and a dropped connection.
+    raises ``IndexError`` from its by-id segment scan on **any** field read or whole-field set, and
+    the built-ins replicate that for byte parity. On the pre-ACK path that error is not an
+    :class:`HL7PeekError`, so it escaped the listener: no disposition, no NAK, and a dropped
+    connection.
 
-    An empty line carries nothing a router reads, so the peek treats it as absent. That is the tolerant
-    answer, on both backends alike. :attr:`Peek.raw` keeps the text as received, so the stored message
-    is still byte-for-byte what the sender sent. Only exactly empty lines go; a whitespace-only line is
-    a segment with an odd id, which already parses and reads cleanly.
+    An empty line carries nothing, so :meth:`Peek.parse` and :meth:`Message.parse
+    <messagefoundry.parsing.message.Message.parse>` both drop it, on both backends alike, and the two
+    surfaces agree about a body. :attr:`Peek.raw` and the stored message keep the text as received.
+    A parsed ``Message`` does not, so its ``encode()`` carries no blank line. Only exactly empty
+    lines go; a whitespace-only line is a segment with an odd id, which already parses and reads.
     """
     if "\r\r" not in norm:
         return norm
@@ -223,8 +225,9 @@ class Peek:
     Construct via :meth:`parse`. ``message`` is the underlying parse — either a built-ins
     :data:`~messagefoundry.parsing._builtin_hl7.ParsedMessage` (ADR 0054, the default backend) or a
     legacy ``python-hl7`` :class:`hl7.Message` (when ``_backend.USE_BUILTIN`` is off or the built-ins
-    path fell back). ``raw`` is the normalized (``\\r``-delimited) text it was parsed from. Field
-    access dispatches on the backing type, so the public surface is identical either way.
+    path fell back). ``raw`` is the normalized (``\\r``-delimited) text as received; the parse ran
+    over that text less its empty segment lines (:func:`drop_blank_segments`). Field access
+    dispatches on the backing type, so the public surface is identical either way.
     """
 
     message: _builtin_hl7.ParsedMessage | hl7.Message
@@ -245,7 +248,7 @@ class Peek:
         if not norm.lstrip().startswith("MSH"):
             raise HL7PeekError("message does not start with an MSH segment")
         enforce_expansion_budget(norm)
-        text = _drop_blank_segments(norm)
+        text = drop_blank_segments(norm)
         if _backend.use_builtin():
             try:
                 return cls(message=_builtin_hl7.parse(text), raw=norm)

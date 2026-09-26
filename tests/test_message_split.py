@@ -15,8 +15,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import hl7
 import pytest
 
+import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.parsing import Message, split_batch, split_by_obr
 from messagefoundry.parsing._backend import backend
@@ -194,6 +196,19 @@ _BLANK_BEFORE_ORDERS = "MSH|^~\\&|LAB|FAC|EHR|HOSP|20260101||ORU^R01|B1|P|2.5.1\
 _TWO_ORDERS = "OBR|1|O1\rOBX|1|ST|T||v1\rOBR|2|O2\rOBX|1|ST|T||v2\r"
 
 
+def _holding_blank_segments(text: str, *, builtin: bool) -> Message:
+    """A Message built straight from a backend parse, so it keeps its empty segments.
+
+    ``Message.parse`` drops empty lines (BACKLOG #1594), so since that fix a ``str`` or ``bytes``
+    input never reaches ``split_by_obr`` with one. A Message constructed from a parse tree still can,
+    and that is the shape #1597 lives in; asserting the blank is really there keeps this honest.
+    """
+    msg = Message(_builtin_hl7.parse(text) if builtin else hl7.parse(text))
+    assert "\r\r" not in text or "" in msg.segments(), "the fixture lost its blank segment"
+    return msg
+
+
+@pytest.mark.parametrize("via", ["tree", "text"])
 @pytest.mark.parametrize("builtin", [True, False], ids=["builtins", "python-hl7"])
 @pytest.mark.parametrize(
     "oru",
@@ -205,17 +220,21 @@ _TWO_ORDERS = "OBR|1|O1\rOBX|1|ST|T||v1\rOBR|2|O2\rOBX|1|ST|T||v2\r"
     ],
     ids=["blank-in-header", "control", "blank-in-group"],
 )
-def test_split_by_obr_keeps_each_observation_with_its_own_order(oru: str, builtin: bool) -> None:
+def test_split_by_obr_keeps_each_observation_with_its_own_order(
+    oru: str, builtin: bool, via: str
+) -> None:
     with backend(builtin=builtin):
-        parts = [Message.parse(p) for p in split_by_obr(oru)]
+        source = _holding_blank_segments(oru, builtin=builtin) if via == "tree" else oru
+        parts = [Message.parse(p) for p in split_by_obr(source)]
         assert [p.segments() for p in parts] == [["MSH", "PID", "OBR", "OBX"]] * 2
         assert [(p.field("OBR-2"), p.field("OBX-5")) for p in parts] == [("O1", "v1"), ("O2", "v2")]
         assert [p.control_id for p in parts] == ["B1-1", "B1-2"]
 
 
-def test_split_by_obr_returns_a_zero_obr_message_verbatim_with_its_blank_line() -> None:
+def test_split_by_obr_returns_a_zero_obr_message_unsplit_without_its_blank_line() -> None:
+    # Message.parse drops the empty line (BACKLOG #1594); nothing else about the message changes.
     adt = ADT_A01.replace("EVN", "\rEVN", 1)  # MSH, blank, EVN, PID
-    assert split_by_obr(adt) == [adt]
+    assert split_by_obr(adt) == [ADT_A01]
 
 
 # --- File source: batch split at ingress -------------------------------------

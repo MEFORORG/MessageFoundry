@@ -1034,8 +1034,17 @@ class MLLPDestination(DestinationConnector):
             if self.verify_ack_control_id:
                 try:
                     sent_control_id = Peek.parse(payload).control_id
-                except PEEK_READ_FAULTS:  # HL7PeekError is a ValueError, so it lands here too
-                    # A faulting MSH-10 read is "unreadable" too (BACKLOG #1594): skip correlation.
+                except HL7PeekError:
+                    sent_control_id = None
+                except PEEK_READ_FAULTS as exc:
+                    # A faulting MSH-10 read is unreadable too (BACKLOG #1594), so correlation is
+                    # skipped; say so, because this silently switches off a delivery check.
+                    logger.warning(
+                        "MLLP send to %s:%s: MSH-10 read raised %s; ACK correlation skipped",
+                        self.host,
+                        self.port,
+                        type(exc).__name__,
+                    )
                     sent_control_id = None
             if not self.persistent:
                 return await self._send_once(payload, sent_control_id)
