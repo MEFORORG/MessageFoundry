@@ -31,7 +31,6 @@ import contextlib
 import json
 import logging
 import logging.handlers
-import os
 import queue
 import re
 import socket
@@ -62,6 +61,10 @@ from messagefoundry.logging_guard import (
     LogWriteGuard,
     set_active_guard,
 )
+
+# Re-exported from a stdlib-only leaf so `parsing/` can call it without loading this module and the
+# config layer behind it (BACKLOG #1596). `configure_logging()` below still calls it.
+from messagefoundry.phi_log_silencer import silence_phi_prone_dependency_loggers
 from messagefoundry.redaction import redact_untrusted
 
 # THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
@@ -1230,33 +1233,6 @@ def current_log_level() -> str:
     """The root logger's current effective level name (``"DEBUG"``…``"CRITICAL"``) — reflects the startup
     ``configure_logging`` baseline or a later :func:`set_runtime_level` override (BACKLOG #171)."""
     return logging.getLevelName(logging.getLogger().level)
-
-
-def silence_phi_prone_dependency_loggers() -> None:
-    """Silence third-party loggers that emit raw HL7 field values (PHI) into the general log.
-
-    ``python-hl7`` (0.4.5) logs the **whole field** at ERROR on benign-but-unmapped escape sequences
-    (``hl7/util.py`` ``unescape``: ``"Error decoding value [%s], field [%s]…"``; also a full segment
-    line at ``util.py:64``) — a PHI leak hit on every message via :func:`~messagefoundry.parsing.summary.summarize`,
-    landing in NSSM's captured stdout/stderr and violating the "never log full bodies at INFO+" rule
-    (review finding C-1). Those loggers are named by module ``__file__`` (``getLogger(__file__)``), so
-    ``logging.getLogger("hl7")`` does **not** reach them — we match by the package directory instead.
-
-    We drop these records entirely (level ``CRITICAL``): they carry no operational signal the engine
-    doesn't already record as an ``ERROR`` disposition with non-PHI text, and they are PHI by
-    construction. Idempotent and best-effort (a missing/renamed dependency must never break logging).
-    """
-    try:
-        import hl7
-        import hl7.containers  # noqa: F401  (registers its __file__-named logger)
-        import hl7.util  # noqa: F401
-    except ImportError:
-        return
-    pkg_dir = os.path.normcase(os.path.dirname(os.path.abspath(hl7.__file__)))
-    for name in list(logging.Logger.manager.loggerDict):
-        # hl7 names its loggers getLogger(__file__) → an absolute path inside the hl7 package dir.
-        if os.path.normcase(name).startswith(pkg_dir):
-            logging.getLogger(name).setLevel(logging.CRITICAL)
 
 
 #: Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01) — RFC 4330.
