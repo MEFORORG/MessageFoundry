@@ -474,7 +474,12 @@ extend-exclude = ["docs/benchmarks/results"]
 # (SIM), pyupgrade (UP), and import sorting (I). Adopted as a one-shot sweep: the safe backlog is
 # auto-fixed and the rest grandfathered with per-line `# noqa` so the required gate is green from a
 # clean baseline and NEW code must comply (the rubric's "blocking from a clean baseline" intent).
-extend-select = ["B", "C4", "SIM", "UP", "I"]
+#
+# RUF006 (BACKLOG #1093, CWE-772/404): a task created and not referenced can be garbage-collected
+# mid-flight, because the event loop holds tasks weakly. It is at least one resource-release rule
+# ruff already ships that the families above do not select. Adopted with its single finding fixed
+# (store/base.py `_salvage_late_borrow`), so it gates from a clean baseline.
+extend-select = ["B", "C4", "SIM", "UP", "I", "RUF006"]
 
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's dependency-injection idiom calls Depends()/Query()/etc. in argument defaults -- the
