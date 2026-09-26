@@ -657,8 +657,8 @@ def _scan_sql_tokens(statement: str) -> list[tuple[str, str]]:
 
 
 def _require_read_only(statement: str) -> None:
-    """Enforce the ADR 0010 db_lookup read-only carve-out at the statement layer (defense-in-depth with
-    ``ApplicationIntent=ReadOnly`` + a recommended ``db_datareader``-only login).
+    """Test a db_lookup statement's shape for the ADR 0010 read-only carve-out. Defence in depth only,
+    like ``ApplicationIntent=ReadOnly``. A read-only login is the control (``docs/CONNECTIONS.md``).
 
     The statement is tokenized (:func:`_scan_sql_tokens`), so comments, string literals and quoted
     identifiers are skipped, and then three rules apply:
@@ -1560,7 +1560,7 @@ class DatabaseLookupExecutor:
 
     Built by the :class:`~messagefoundry.pipeline.wiring_runner.RegistryRunner` from the graph's
     ``DatabaseLookup`` specs (``env()``-resolved + ``[egress].allowed_db``-checked by the runner). Lazily
-    opens one read-only ``aioodbc`` pool per named connection; :meth:`query` runs on the engine loop,
+    opens one autocommit ``aioodbc`` pool per named connection; :meth:`query` runs on the engine loop,
     while ``db_lookup`` bridges to it from the handler's worker thread via ``run_coroutine_threadsafe``.
     Reuses the DATABASE connector's DSN build / named-parameter translation / SQLSTATE extraction.
 
@@ -1572,8 +1572,8 @@ class DatabaseLookupExecutor:
     (:func:`_build_dsn`), and pools here are opened **autocommit**, so a write that got past the
     statement test would commit rather than be rolled back. What actually bounds this connection is the
     privilege of the account it dials, which only the operator can set — see ``docs/CONNECTIONS.md``
-    (BACKLOG #1574). ADR 0010 states the same shape as a read-only *convention*: "the executor neither
-    commits nor exposes a write path."
+    (BACKLOG #1574). ADR 0010's *Scope* consequence says this executor never commits; a dated
+    correction beneath it (BACKLOG #1791) records why that is false and supersedes it.
 
     Pools are autocommit because each lookup is a single self-contained read; T-SQL has no
     ``SET TRANSACTION READ ONLY``, so there is no read-only transaction to open in its place.
@@ -1643,9 +1643,10 @@ class DatabaseLookupExecutor:
             raise DbLookupError(
                 f"db_lookup: no DatabaseLookup connection named {connection!r} (declared: {known})"
             )
-        # ADR 0010: enforce the read-only carve-out at the statement layer before anything executes, so a
-        # write/EXEC never reaches the autocommit pool (which would silently commit and re-apply on a
-        # crash-replay of the transform). PHI-free — never echoes the statement.
+        # ADR 0010: run the statement-layer read-only test before anything executes. A write/EXEC
+        # the test recognises then never reaches the autocommit pool. That pool would silently
+        # commit it and re-apply it on a crash-replay of the transform. PHI-free — never echoes the
+        # statement.
         _require_read_only(statement)
         sql, names = _parse_named_params(statement)
         bound = _bind_lookup_params(params or {}, names, connection)
