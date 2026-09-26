@@ -91,17 +91,14 @@ _needs_default_aes128 = pytest.mark.skipif(
     reason="this build's default does not offer the AES-128-GCM suite",
 )
 
-#: Whether this build's interpreter default offers anything beyond the approved list. The controls
-#: below need it to: on a build whose default is ALREADY the approved list, a stock context cannot
-#: talk to a CBC-only peer either, and "the narrowing did it" cannot be shown. They SKIP there rather
-#: than fail, because the product is still correct on such a build; only the control is unavailable.
-_DEFAULT_OFFERS_MORE = bool(
-    _DEFAULT_SUITE_NAMES
-    - set(APPROVED_TLS12_SUITES)
-    - {"TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256", "TLS_AES_128_GCM_SHA256"}
-)
+#: Whether this build's interpreter default offers the CBC-only peer's suite. The CBC controls below
+#: need it: on a build whose default lacks it, a stock context cannot talk to a CBC-only peer either,
+#: and "the narrowing did it" cannot be shown. They SKIP there rather than fail, because the product
+#: is still correct on such a build; only the control is unavailable. This read "anything beyond the
+#: approved list" until ruling R4, when the three AES-128-GCM suites began to count as "beyond".
+_DEFAULT_OFFERS_MORE = CBC_ONLY in _DEFAULT_SUITE_NAMES
 _needs_wider_default = pytest.mark.skipif(
-    not _DEFAULT_OFFERS_MORE, reason="this build's default offers only the approved suites"
+    not _DEFAULT_OFFERS_MORE, reason="this build's default does not offer the CBC-SHA2 suite"
 )
 
 _NB = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)

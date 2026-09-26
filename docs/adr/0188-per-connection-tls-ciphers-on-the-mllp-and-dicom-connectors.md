@@ -288,8 +288,8 @@ TLS 1.3 is out of reach of `set_ciphers`. A new `tls_policy.narrow_tls13_suites(
 `SSLContext.set_ciphersuites` with `APPROVED_TLS13_SUITES` where the method exists, and returns
 whether it did. `narrow_to_approved_suites` calls it. So does the new `apply_operator_tls_ciphers`,
 the one function both seams now use to apply an operator `tls_ciphers` string. The apiclient keeps
-its own copy, which reaches the inner context of a `truststore` wrapper; the wrapper does not
-forward `set_ciphersuites`.
+its own copy. Both reach the inner context of a `truststore` wrapper, which does not forward
+`set_ciphersuites`; the apiclient's default branch builds one.
 
 | Where | TLS 1.2 | TLS 1.3 |
 |---|---|---|
@@ -327,7 +327,7 @@ In `tests/test_tls_default_suites.py`:
   -> `test_narrow_tls13_suites_applies_the_approved_tls13_list_where_the_method_exists`,
   `test_narrow_tls13_suites_reports_nothing_done_without_the_method`,
   `test_the_tls13_aes128_residual_is_measured_as_the_recorded_gap` (the tripwire),
-  `test_the_apiclient_narrows_the_inner_truststore_context`
+  `test_both_tls13_narrowings_reach_the_inner_truststore_context`
 - **AC-12** -- An operator `tls_ciphers` string SHALL reach a context only through
   `apply_operator_tls_ciphers`, which also narrows TLS 1.3.
   -> `test_every_operator_cipher_branch_narrows_tls13_too`,

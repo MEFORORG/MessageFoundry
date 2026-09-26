@@ -13,8 +13,11 @@ validator) without crossing the engine's one-way dependency boundaries. The cont
   (BACKLOG #300); set, it applies the operator's string after the allow-list accepts it. It narrows
   only: each seam calls :func:`harden_cipher_suites` after it, where the 12.1.2 call-site guard can
   see the assertion.
-* :func:`narrow_to_approved_suites` — the DEFAULT TLS 1.2 suite list on every context the engine
-  builds (BACKLOG #300, the ADR 0188 amendment): the approved names, in order.
+* :func:`narrow_to_approved_suites` -- the DEFAULT suite list on every context the engine builds
+  (BACKLOG #300, the ADR 0188 amendments): the approved TLS 1.2 names, in order, and the TLS 1.3
+  names through :func:`narrow_tls13_suites` where the interpreter allows it (BACKLOG #2042).
+* :func:`apply_operator_tls_ciphers` -- the ONE way an operator ``tls_ciphers`` string reaches a
+  context, so the TLS 1.3 half is never forgotten; ``tests/test_tls_default_suites.py`` pins it.
 * :func:`harden_kex_groups` — *attempt* to pin the approved ECDHE groups on a built context, and
   **report whether it managed to**. ``SSLContext.set_groups`` is a **Python 3.15** API (this said
   "3.13+" and was wrong), so today it pins nothing on every supported runtime and the contexts inherit

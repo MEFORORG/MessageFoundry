@@ -2855,7 +2855,8 @@ def DICOM(
     default) the SCP and the SCU offer the approved AEAD suites, the default on every hop the engine
     builds (BACKLOG #300). An older modality or PACS that speaks only CBC cannot negotiate TLS 1.2 with
     them, nor, since BACKLOG #2042, one that speaks only AES-128-GCM. This setting cannot reopen
-    either: the fix is a reviewed change to ``_APPROVED_TLS_SUITES``. Set, the string is validated by the **same** strict allow-list that guards
+    either: the fix is a reviewed change to ``_APPROVED_TLS_SUITES``. Set, the string is validated
+    by the **same** strict allow-list that guards
     ``[api].tls_ciphers`` (AEAD-only, forward-secret, encrypting, peer-authenticating, 128-bit floor)
     and then applied, so opting in NARROWS this one hop. A rejected string fails loud at construction,
     surfaced by ``messagefoundry check`` / dry-run."""
