@@ -4344,7 +4344,7 @@ class ApprovalsSettings(_Section):
 #: The two snapshot mechanisms for the SQLite store backup (ADR 0049). ``vacuum_into`` (default) writes
 #: a fresh, fully-checkpointed, defragmented single-file copy. ``online_backup`` uses SQLite's Online
 #: Backup API for a page-for-page copy. Neither holds the store write lock for the copy (BACKLOG #1937);
-#: both run on a dedicated read-only connection, so store writes proceed during either.
+#: what the copy still costs is stated once, on ``MessageStore.snapshot_to``.
 _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 
 #: Cloud-URL schemes the destination must NEVER be (ADR 0049 — local/UNC only, no new egress surface).

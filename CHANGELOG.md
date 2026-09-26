@@ -177,8 +177,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   deploying site every store write, logins included, would have waited for the whole copy. On a
   synthetic 201 MB store, one write issued during a snapshot waited 0.72 to 2.68 s under either
   method. Only the WAL checkpoint now holds the lock. The copy runs on its own read-only connection
-  in one read transaction, so it is still point-in-time, and the same write took 3 to 7 ms.
-  `online_backup` was also documented as copying in yielding batches; it copied in one step under the
+  in one read transaction, so it is still point-in-time, and the same write took 3 to 7 ms. A
+  retention WAL checkpoint that lands during a copy runs PASSIVE, since the copy keeps a TRUNCATE from
+  finishing. `online_backup` was also documented as copying in yielding batches; it copied in one step under the
   lock. The default stays `vacuum_into`, which writes a defragmented copy. ADR 0049 carries the
   correction. (`BACKLOG #1937`)
 - **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup

@@ -157,7 +157,8 @@ class StoreLifecycle(Protocol):
         (postgres/sqlserver) this raises :class:`DbaDelegatedError` (DB-tier backup is DBA-delegated,
         #52). ``method`` is ``"vacuum_into"`` (default — ``VACUUM INTO``, a defragmented copy) or
         ``"online_backup"`` (the SQLite Online Backup API, a page-for-page copy). Neither holds the store
-        write lock for the copy (BACKLOG #1937): only the WAL checkpoint does.
+        write lock for the copy (BACKLOG #1937); the SQLite ``MessageStore.snapshot_to`` docstring says
+        what the copy still costs.
 
         The snapshot is **point-in-time consistent and non-mutating**: it first checkpoints the WAL, then
         copies the DB **as it is** — it never claims, mutates, resets, completes, or dead-letters a
