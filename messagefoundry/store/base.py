@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -109,9 +110,14 @@ __all__ = [
     "StoreLifecycle",
     "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
+    "PROVISION_SCHEMA_COMMAND",
+    "SchemaNotProvisionedError",
+    "SchemaProvisionResult",
+    "StoreGrantsMissingError",
     "backend_supports_reference_sets",
     "make_spec",
     "open_store",
+    "provision_store_schema",
     "sqlite_settings",
     "warm_pool_connections",
     "warm_pool_target",
@@ -2248,6 +2254,74 @@ class StoreNotFoundError(RuntimeError):
         )
 
 
+#: The operator command that provisions a server-DB schema (#305). Named in one place because every
+#: refusal under ``[store].schema_management = external`` must tell the operator how to clear it.
+PROVISION_SCHEMA_COMMAND = "messagefoundry store provision-schema"
+
+
+class SchemaNotProvisionedError(RuntimeError):
+    """A server-DB store opened under ``[store].schema_management = external`` found no usable
+    ``schema_meta`` marker for this build's DDL batch (BACKLOG #305, ASVS 13.2.2).
+
+    External mode never runs schema DDL at open, so a fresh database, or the first start of a build
+    whose schema moved, refuses here until a DDL-capable principal runs
+    :data:`PROVISION_SCHEMA_COMMAND`. ``schema`` is this login's default schema, and ``hint`` names a
+    cause re-running that command would not fix, so a refusal does not send an operator round a loop
+    of "already current" for the causes the backend can see."""
+
+    def __init__(
+        self,
+        backend: StoreBackend,
+        database: str | None,
+        expected: str,
+        *,
+        schema: str | None = None,
+        hint: str | None = None,
+    ) -> None:
+        self.backend = backend
+        self.database = database
+        self.expected = expected
+        self.schema = schema
+        self.hint = hint
+        where = f" (this login's default schema is {schema!r})" if schema else ""
+        super().__init__(
+            f"the {backend.value} store schema in database {database!r} is not provisioned for this "
+            f"build{where}: schema_meta is absent, not visible to this login, or records a different "
+            f"DDL batch (this build expects {expected[:12]}...). [store].schema_management is "
+            "'external', so the engine runs no schema DDL at open and is refusing to start. Have a "
+            f"DBA run `{PROVISION_SCHEMA_COMMAND}` against this database as a principal that may "
+            "create objects (docs/DEPLOY-SERVER-DB.md section 2), then start again."
+            + (f" If it reports the schema already current: {hint}." if hint else "")
+            + " Set [store].schema_management = 'auto' only if the runtime principal is meant to "
+            "hold standing DDL rights"
+        )
+
+
+class StoreGrantsMissingError(RuntimeError):
+    """The provisioned schema is current, but the runtime login cannot use all of it (BACKLOG #305).
+
+    Raised at open under ``[store].schema_management = external`` so a missing row grant refuses the
+    start instead of failing the first pipeline path that touches the object. ``provision-schema``
+    cannot fix it: the grant is the DBA's."""
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaProvisionResult:
+    """What ``provision-schema`` did (BACKLOG #305).
+
+    ``applied`` is whether the DDL batch ran (``False``: the marker was already current). ``schema``
+    is where the batch's unqualified objects live for the provisioning principal, printed so an
+    operator can match it against the schema a refused runtime login names. ``options_off`` names any
+    SQL Server database option that is OFF after the run, read back rather than inferred, with
+    ``remedy`` the statements that turn them on. ``READ_COMMITTED_SNAPSHOT`` among them makes the run
+    PARTIAL, because the pooled claim mode refuses to start while it is off."""
+
+    applied: bool
+    schema: str | None = None
+    options_off: tuple[str, ...] = ()
+    remedy: str | None = None
+
+
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     """The configured SQLite path when nothing is there, else ``None``.
 
@@ -2282,8 +2356,10 @@ async def open_store(
     first run and the ``provision-admin`` bootstrap. Otherwise an absent SQLite file raises
     :class:`StoreNotFoundError` before anything connects, because SQLite's connect would create it and
     the schema ensure would fill it. It governs creation only: an existing file is still migrated, and
-    the server backends ignore it (they never ``CREATE DATABASE``, but do build the schema into any
-    database that exists).
+    the server backends ignore it (they never ``CREATE DATABASE``). Whether they build the schema is
+    ``[store].schema_management`` (#305): under the server-DB default ``external`` open only reads the
+    ``schema_meta`` marker and raises :class:`SchemaNotProvisionedError` without running any DDL;
+    ``auto`` builds or upgrades the schema in whatever database it reaches.
 
     ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
     (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is a production server-DB backend,
@@ -2361,6 +2437,36 @@ async def open_store(
             message_events=message_events,
             posture=posture,
         )
+    raise NotImplementedError(f"store backend {settings.backend.value!r} is not implemented yet")
+
+
+async def provision_store_schema(
+    settings: StoreSettings, *, posture: HopPosture | None = None
+) -> SchemaProvisionResult:
+    """Run the server-DB schema DDL batch as the CURRENT principal — the provisioning half of the
+    BACKLOG #305 split (``messagefoundry store provision-schema``). See :class:`SchemaProvisionResult`
+    for what it reports.
+
+    It does DDL and nothing else: no cipher, no at-rest migration, no audit-chain watermark, no caches.
+    Those need the store key, and a DBA who provisions the schema should not have to hold it. It runs
+    the batch whatever ``[store].schema_management`` says, because provisioning is the one caller
+    external mode exists to route DDL to.
+
+    SQLite is refused: the file store builds its own schema at open and has no principal to split, and
+    refusing keeps this command from creating a file at a path it was merely pointed at (#1780)."""
+    if settings.backend is StoreBackend.SQLITE:
+        raise ValueError(
+            "the sqlite store builds its own schema when `messagefoundry serve` first opens it; "
+            f"`{PROVISION_SCHEMA_COMMAND}` applies to the sqlserver and postgres backends only"
+        )
+    if settings.backend is StoreBackend.SQLSERVER:
+        from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep
+
+        return await SqlServerStore.provision_schema(settings, posture=posture)
+    if settings.backend is StoreBackend.POSTGRES:
+        from messagefoundry.store.postgres import PostgresStore  # lazy: optional asyncpg dep
+
+        return await PostgresStore.provision_schema(settings, posture=posture)
     raise NotImplementedError(f"store backend {settings.backend.value!r} is not implemented yet")
 
 

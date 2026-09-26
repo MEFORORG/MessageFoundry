@@ -2242,7 +2242,9 @@ jobs:
           # are declared there (ADR 0013), and SQL Server / Postgres both declare supports_response_capture
           # + supports_pt_reingress True — so a regression in that surface is a SERVER-DB regression and must
           # pull these legs, not just the SQLite suite.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege)|\.github/workflows/ci\.yml)'; then
+          # tests/_live_scratch.py builds and drops the store_privilege live legs' principals (#305),
+          # so an edit to it alone must pull the legs that exercise it.
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege)|tests/_live_scratch\.py|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -2528,6 +2530,7 @@ jobs:
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry
@@ -2550,6 +2553,7 @@ jobs:
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry
@@ -2574,6 +2578,7 @@ jobs:
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry
@@ -2614,6 +2619,7 @@ jobs:
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry
@@ -2639,6 +2645,7 @@ jobs:
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry
@@ -2690,6 +2697,7 @@ jobs:
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry
@@ -2713,6 +2721,7 @@ jobs:
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry
@@ -2745,6 +2754,7 @@ jobs:
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry
@@ -2770,6 +2780,7 @@ jobs:
         env:
           MEFOR_TEST_SQLSERVER: "1"
           MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry
@@ -2793,6 +2804,7 @@ jobs:
           bash scripts/ci/retry-native-crash.sh
           pytest -v
           tests/test_store_privilege_preflight.py
+          tests/test_store_privilege_schema_split.py
 
   # Postgres store backend (Track B): run the gated store suite against a real PostgreSQL service
   # container (Linux, so 1x minutes). Runs NIGHTLY + on-demand (workflow_dispatch — use
@@ -2844,6 +2856,7 @@ jobs:
         env:
           MEFOR_TEST_POSTGRES: "1"
           MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "5432"
           MEFOR_STORE_DATABASE: messagefoundry
@@ -2860,6 +2873,7 @@ jobs:
         env:
           MEFOR_TEST_POSTGRES: "1"
           MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "5432"
           MEFOR_STORE_DATABASE: messagefoundry
@@ -2878,6 +2892,7 @@ jobs:
         env:
           MEFOR_TEST_POSTGRES: "1"
           MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "5432"
           MEFOR_STORE_DATABASE: messagefoundry
@@ -2905,6 +2920,7 @@ jobs:
         env:
           MEFOR_TEST_POSTGRES: "1"
           MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "5432"
           MEFOR_STORE_DATABASE: messagefoundry
@@ -2928,6 +2944,7 @@ jobs:
         env:
           MEFOR_TEST_POSTGRES: "1"
           MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "5432"
           MEFOR_STORE_DATABASE: messagefoundry
@@ -2944,6 +2961,7 @@ jobs:
         env:
           MEFOR_TEST_POSTGRES: "1"
           MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "5432"
           MEFOR_STORE_DATABASE: messagefoundry
@@ -2966,6 +2984,7 @@ jobs:
         env:
           MEFOR_TEST_POSTGRES: "1"
           MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "5432"
           MEFOR_STORE_DATABASE: messagefoundry
@@ -2987,6 +3006,7 @@ jobs:
         env:
           MEFOR_TEST_POSTGRES: "1"
           MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "5432"
           MEFOR_STORE_DATABASE: messagefoundry
@@ -3003,6 +3023,7 @@ jobs:
         run: >-
           pytest -v
           tests/test_store_privilege_preflight.py
+          tests/test_store_privilege_schema_split.py
 
   # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (auth
   # off, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
@@ -3239,6 +3260,7 @@ jobs:
           MEFOR_LOAD_TRANSFORM: edit
           MEFOR_LOAD_SINK_PORT: "2700"  # matches --sink-port below
           MEFOR_STORE_BACKEND: sqlserver  # no --db: the backend + connection come from MEFOR_STORE_*
+          MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
           MEFOR_STORE_SERVER: localhost
           MEFOR_STORE_PORT: "1433"
           MEFOR_STORE_DATABASE: MessageFoundry

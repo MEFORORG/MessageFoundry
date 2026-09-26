@@ -5,8 +5,10 @@
 ASVS 13.2.2 scores least-privilege backend-component accounts, and ``docs/AOAG-DEPLOYMENT.md``
 shipped a "grant the engine login ``db_owner`` on the ``mefor`` database" instruction on the premise
 that the real set was an open *filled-by-staging* question. It is not open — it is derivable from the
-store: ``db_datareader`` + ``db_datawriter`` + ``db_ddladmin``, with ``EXECUTE`` needed only under
-``[store].fifo_claim_proc`` (SQL Server only, default off). There is no engine code path here, so the
+store: ``db_datareader`` + ``db_datawriter`` for the runtime login, ``db_ddladmin`` for the
+principal that runs the schema DDL, with ``EXECUTE`` needed only under ``[store].fifo_claim_proc``
+(SQL Server only, default off). Since BACKLOG #305 those are two principals by default:
+``[store].schema_management = "external"`` moves the DDL to ``messagefoundry store provision-schema``. There is no engine code path here, so the
 guard is a structural assertion over the two Markdown runbooks.
 
 The mutation this must catch: re-adding an over-grant instruction — e.g. "use this known-good interim
@@ -36,6 +38,8 @@ _RUNBOOKS = (_ROOT / "docs" / "AOAG-DEPLOYMENT.md", _ROOT / "docs" / "DEPLOY-SER
 _OVER_GRANTS = ("db_owner", "sysadmin")
 # The derived least-privilege set both runbooks must keep agreeing on (see the module docstring).
 _LEAST_PRIVILEGE = ("db_datareader", "db_datawriter", "db_ddladmin")
+# #305: what both runbooks must name so the DDL grant reads as the provisioning principal's.
+_PROVISIONING_SPLIT = ("provision-schema", "schema_management")
 
 
 def test_runbooks_never_prescribe_an_over_grant() -> None:
@@ -74,3 +78,14 @@ def test_execute_grant_is_documented_as_conditional_not_baseline() -> None:
     assert "fifo_claim_proc" in joined, (
         "the EXECUTE grant must be tied to [store].fifo_claim_proc, never listed as baseline"
     )
+
+
+def test_both_runbooks_name_the_provisioning_split() -> None:
+    """#305: ``db_ddladmin`` belongs to the provisioning principal by default. A runbook that names the
+    three roles without the command and the setting reads as the old single-login grant."""
+    for path in _RUNBOOKS:
+        text = path.read_text(encoding="utf-8")
+        missing = [token for token in _PROVISIONING_SPLIT if token not in text]
+        assert not missing, (
+            f"{path.name} omits {missing}, so its db_ddladmin grant reads as runtime"
+        )

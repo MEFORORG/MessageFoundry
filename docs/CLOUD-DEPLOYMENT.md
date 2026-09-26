@@ -281,8 +281,11 @@ TLS-terminating collector).
 ## 7. Quick start (managed Postgres, k8s)
 
 1. **Provision a managed Postgres** (RDS / Cloud SQL / Azure DB) in a **private subnet**, Multi-AZ, with
-   KMS at-rest encryption and a CA-trusted server cert. Create the `messagefoundry` database + a `mefor`
-   login that may create objects on first open (the store bootstraps its schema on `open()`).
+   KMS at-rest encryption and a CA-trusted server cert. Create the `messagefoundry` database, a
+   provisioning role that owns the store's schema, and a row-only `mefor` runtime role
+   ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.2, posture B). Run
+   `messagefoundry store provision-schema` as the provisioning role before the first start. The
+   engine runs no schema DDL and refuses to start until it has (BACKLOG #305).
 2. **Build a config-baked image** (`FROM messagefoundry:<version>; COPY --chown=10001:10001 config /config`)
    and push it to your private registry.
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with

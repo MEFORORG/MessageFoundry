@@ -88,7 +88,8 @@ class SqlServerCoordinator:
 
     Mirrors :class:`~messagefoundry.pipeline.cluster.DbCoordinator`.
     On :meth:`start` it idempotently creates the ``nodes`` / ``leader_lease`` / ``cluster_config`` tables
-    (under the store's ``sp_getapplock`` DDL guard), upserts this node, and spawns a **maintenance** task
+    (under the store's ``sp_getapplock`` DDL guard, and under ``[store].schema_management = auto`` only;
+    under ``external`` the store batch created them, #305), upserts this node, and spawns a **maintenance** task
     (heartbeat + lease acquire/renew + config-version refresh each tick) and a DB-free **fence watchdog**
     that demotes this node if it cannot renew within ``leader_fence_timeout`` (< the lease TTL) — so a
     partitioned old leader stops reporting :meth:`is_leader` ``True`` before any standby can acquire the
@@ -108,9 +109,13 @@ class SqlServerCoordinator:
         promotable: bool = True,
         monotonic: Callable[[], float] = time.monotonic,
         alert_sink: AlertSink | None = None,
+        run_schema_ddl: bool = True,
     ) -> None:
         self._store = store
         self.node_id = node_id
+        # #305: False under [store].schema_management = external; see DbCoordinator._run_schema_ddl.
+        # The tables are in store.sqlserver.CLUSTER_SCHEMA, which the store's own batch runs.
+        self._run_schema_ddl = run_schema_ddl
         # #145: leadership-transition alerts, IN LOCKSTEP with DbCoordinator (same events, same fire
         # points). None → the default LoggingAlertSink. See cluster.py DbCoordinator._alert_sink.
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
@@ -173,7 +178,8 @@ class SqlServerCoordinator:
         if self._heartbeat_task is not None:
             return
         self._log_cluster_enabled_once()
-        await self._ensure_tables()
+        if self._run_schema_ddl:
+            await self._ensure_tables()
         await self._register()
         self._stop.clear()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -303,6 +309,10 @@ class SqlServerCoordinator:
     async def _ensure_tables(self) -> None:
         """Create the nodes / leader_lease / cluster_config tables under the store's transaction-scoped
         applock (serializes concurrent first-opens so two nodes can't race the CREATE TABLEs)."""
+        # Lazy, like the store's own driver import: a module-level import would tie this module to the
+        # store package at import time for no benefit.
+        from messagefoundry.store.sqlserver import CLUSTER_SCHEMA
+
         async with self._store._acquire() as conn:
             cur = await conn.cursor()
             try:
@@ -311,55 +321,10 @@ class SqlServerCoordinator:
                 await cur.execute("SELECT 1")
                 await cur.fetchone()
                 await self._store._applock(cur, self._lock_key)
-                await cur.execute(
-                    "IF OBJECT_ID(N'nodes', N'U') IS NULL"
-                    " CREATE TABLE nodes ("
-                    " node_id NVARCHAR(256) NOT NULL PRIMARY KEY, host NVARCHAR(256) NULL,"
-                    " pid INT NULL, started_at FLOAT NULL, last_seen FLOAT NULL,"
-                    " status NVARCHAR(32) NULL,"
-                    " is_leader BIT NOT NULL CONSTRAINT DF_nodes_is_leader DEFAULT 0,"
-                    # ADR 0096 leader-preference config, mirrored per-node for the /cluster/nodes API.
-                    " acquire_delay_seconds FLOAT NOT NULL"
-                    " CONSTRAINT DF_nodes_acquire_delay DEFAULT 0,"
-                    " promotable BIT NOT NULL CONSTRAINT DF_nodes_promotable DEFAULT 1);"
-                )
-                # ADR 0096: additively migrate a pre-existing nodes table (cluster upgraded in place). No
-                # ADD COLUMN IF NOT EXISTS in T-SQL, so guard on COL_LENGTH; idempotent and under the same
-                # sp_getapplock DDL guard so two nodes opening at once can't race it (REL-1).
-                await cur.execute(
-                    "IF COL_LENGTH(N'nodes', N'acquire_delay_seconds') IS NULL"
-                    " ALTER TABLE nodes ADD acquire_delay_seconds FLOAT NOT NULL"
-                    " CONSTRAINT DF_nodes_acquire_delay DEFAULT 0;"
-                )
-                await cur.execute(
-                    "IF COL_LENGTH(N'nodes', N'promotable') IS NULL"
-                    " ALTER TABLE nodes ADD promotable BIT NOT NULL"
-                    " CONSTRAINT DF_nodes_promotable DEFAULT 1;"
-                )
-                await cur.execute(
-                    "IF OBJECT_ID(N'leader_lease', N'U') IS NULL"
-                    " CREATE TABLE leader_lease ("
-                    " lease_key NVARCHAR(256) NOT NULL PRIMARY KEY, owner NVARCHAR(256) NULL,"
-                    " lease_expires_at FLOAT NOT NULL,"
-                    " leader_epoch BIGINT NOT NULL"  # H1: monotonic fencing token
-                    " CONSTRAINT DF_leader_lease_epoch DEFAULT 0);"
-                )
-                # H1 (owner-gated live ALTER): additively add leader_epoch to a pre-existing leader_lease
-                # (a cluster upgraded in place). SQL Server has no ADD COLUMN IF NOT EXISTS, so guard on
-                # COL_LENGTH; idempotent (a no-op once present / on the fresh CREATE above) and under the
-                # same sp_getapplock DDL guard so two nodes can't race it (REL-1). The DEFAULT 0 backfills
-                # the existing single row, so the first fresh acquire after the upgrade bumps it to 1.
-                await cur.execute(
-                    "IF COL_LENGTH(N'leader_lease', N'leader_epoch') IS NULL"
-                    " ALTER TABLE leader_lease ADD leader_epoch BIGINT NOT NULL"
-                    " CONSTRAINT DF_leader_lease_epoch DEFAULT 0;"
-                )
-                await cur.execute(
-                    "IF OBJECT_ID(N'cluster_config', N'U') IS NULL"
-                    " CREATE TABLE cluster_config ("
-                    " id INT NOT NULL PRIMARY KEY, config_version INT NOT NULL,"
-                    " updated_at FLOAT NOT NULL);"
-                )
+                # Stated once in CLUSTER_SCHEMA (#305), which the store's own batch also runs; the
+                # comments that explain each statement live there.
+                for statement in CLUSTER_SCHEMA:
+                    await cur.execute(statement)
                 await conn.commit()
             except Exception:
                 await conn.rollback()

@@ -129,6 +129,7 @@ jobs:
           --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
     env:
       MEFOR_STORE_BACKEND: postgres
+      MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
       MEFOR_STORE_SERVER: localhost
       MEFOR_STORE_PORT: "5432"
       MEFOR_STORE_DATABASE: messagefoundry
@@ -277,6 +278,7 @@ jobs:
           - 1433:1433
     env:
       MEFOR_STORE_BACKEND: sqlserver
+      MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
       MEFOR_STORE_SERVER: localhost
       MEFOR_STORE_PORT: "1433"
       MEFOR_STORE_DATABASE: MessageFoundry

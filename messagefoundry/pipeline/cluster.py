@@ -654,8 +654,9 @@ _logged_cluster_enabled = False
 class DbCoordinator:
     """Postgres-backed cluster membership + **leader election** (Track B Steps 3-7).
 
-    On :meth:`start` it idempotently creates the ``nodes`` + ``leader_lease`` tables, upserts this
-    node's row, and spawns two cooperatively-cancellable tasks: a **maintenance** task that each tick
+    On :meth:`start` it idempotently creates the ``nodes`` + ``leader_lease`` tables (under
+    ``[store].schema_management = auto`` only; under ``external`` the store batch that
+    ``provision-schema`` ran created them, #305), upserts this node's row, and spawns two cooperatively-cancellable tasks: a **maintenance** task that each tick
     (a) refreshes ``last_seen`` and (b) maintains leadership via a **self-fencing lease** (the single
     ``leader_lease`` row, renewed to ``DB_now + leader_lease_ttl``; a standby acquires only once that
     lease has expired per the DB clock), and a **fence watchdog** task that does NO DB I/O and demotes
@@ -698,9 +699,14 @@ class DbCoordinator:
         db_schema: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         alert_sink: AlertSink | None = None,
+        run_schema_ddl: bool = True,
     ) -> None:
         self._pool = pool
         self.node_id = node_id
+        # #305: False under [store].schema_management = external. The store open has already verified
+        # the schema_meta marker, and the batch that marker records includes this coordinator's tables
+        # (store.postgres.CLUSTER_SCHEMA), so the runtime role need not, and must not, run DDL here.
+        self._run_schema_ddl = run_schema_ddl
         # #145: emit an alert on every leadership transition (acquire / lose / self-fence / release) so a
         # failover is never silent. None → the default LoggingAlertSink (logs the transition). Threaded in
         # lockstep with SqlServerCoordinator; NullCoordinator (single node) never transitions, so byte-identical.
@@ -818,7 +824,8 @@ class DbCoordinator:
         if self._heartbeat_task is not None:
             return  # already started — don't spawn a second heartbeat
         self._log_cluster_enabled_once()
-        await self._ensure_nodes_table()
+        if self._run_schema_ddl:
+            await self._ensure_nodes_table()
         await self._register()
         self._stop.clear()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -991,6 +998,10 @@ class DbCoordinator:
         uses for its own schema DDL, so two nodes opening at once can't race the CREATE. The lock key is
         schema-namespaced (see :attr:`_lock_key`), matching :meth:`PostgresStore._lock_key`, so two
         deployments sharing one database via different schemas don't contend on it."""
+        # Lazy: the store module defers its driver import, but a module-level import here would tie
+        # this module's import to the store package for no benefit.
+        from messagefoundry.store.postgres import CLUSTER_SCHEMA
+
         async with self._pool.acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 await conn.execute(
@@ -998,59 +1009,10 @@ class DbCoordinator:
                     _LOCK_CLASS_CLUSTER,
                     self._lock_key,
                 )
-                await conn.execute(
-                    "CREATE TABLE IF NOT EXISTS nodes ("
-                    " node_id    TEXT PRIMARY KEY,"
-                    " host       TEXT,"
-                    " pid        INTEGER,"
-                    " started_at DOUBLE PRECISION,"
-                    " last_seen  DOUBLE PRECISION,"
-                    " status     TEXT,"
-                    " is_leader  BOOLEAN NOT NULL DEFAULT FALSE,"  # Step 7: derived-leader observability
-                    # ADR 0096 leader-preference config, mirrored per-node for the /cluster/nodes API.
-                    " acquire_delay_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,"
-                    " promotable BOOLEAN NOT NULL DEFAULT TRUE"
-                    ")"
-                )
-                # Idempotent migration for a pre-Step-7 nodes table created without is_leader (a cluster
-                # upgraded in place): add the column if it is absent. Still under the DDL advisory lock,
-                # so two nodes opening at once can't race it. ADD COLUMN IF NOT EXISTS is a no-op on the
-                # fresh CREATE above and on any node that already migrated.
-                await conn.execute(
-                    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS is_leader BOOLEAN NOT NULL DEFAULT FALSE"
-                )
-                # ADR 0096: additively migrate a pre-existing nodes table (cluster upgraded in place) to
-                # carry the leader-preference config columns. Same DDL advisory lock; ADD COLUMN IF NOT
-                # EXISTS is a no-op on the fresh CREATE above and on any already-migrated node.
-                await conn.execute(
-                    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS acquire_delay_seconds "
-                    "DOUBLE PRECISION NOT NULL DEFAULT 0"
-                )
-                await conn.execute(
-                    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS promotable BOOLEAN NOT NULL DEFAULT TRUE"
-                )
-                # The self-fencing leadership lease (Workstream A2): a single row per cluster (keyed by
-                # the schema-namespaced lease_key) holding the current leader + its DB-clock expiry. The
-                # leader renews lease_expires_at every heartbeat; a standby acquires only once it has
-                # expired. Created under the same DDL lock so concurrent opens can't race it.
-                await conn.execute(
-                    "CREATE TABLE IF NOT EXISTS leader_lease ("
-                    " lease_key        TEXT PRIMARY KEY,"
-                    " owner            TEXT,"
-                    " lease_expires_at DOUBLE PRECISION NOT NULL,"
-                    " leader_epoch     BIGINT NOT NULL DEFAULT 0"  # H1: monotonic fencing token
-                    ")"
-                )
-                # H1 (owner-gated live ALTER): additively add leader_epoch to a pre-existing
-                # leader_lease (a cluster upgraded in place). ADD COLUMN IF NOT EXISTS is a no-op on the
-                # fresh CREATE above and on any node that already migrated, and runs under the same DDL
-                # advisory lock so two nodes opening at once can't race it (REL-1 additive migration).
-                # DEFAULT 0 backfills the existing single row, so the first fresh acquire after the
-                # upgrade bumps it to 1 — a strictly-increasing epoch from the legacy baseline.
-                await conn.execute(
-                    "ALTER TABLE leader_lease ADD COLUMN IF NOT EXISTS leader_epoch BIGINT NOT NULL "
-                    "DEFAULT 0"
-                )
+                # The statements are stated once in CLUSTER_SCHEMA (#305), which the store's own batch
+                # also runs; the comments that explain each one live there.
+                for statement in CLUSTER_SCHEMA:
+                    await conn.execute(statement)
 
     async def _register(self) -> None:
         """Upsert this node's row as ``active`` (a restart re-activates a prior 'left' tombstone). The
@@ -1617,6 +1579,12 @@ def build_coordinator(
     # the settings enum's value (no StoreBackend import → no config dependency here); the import is local
     # to avoid a cluster.py <-> cluster_sqlserver.py cycle (cluster_sqlserver imports this module).
     backend = getattr(settings, "backend", None)
+    # #305: under [store].schema_management = external the runtime login runs no DDL, and the store
+    # open has already verified the batch that creates this coordinator's tables. Duck-typed like the
+    # backend above; a settings stand-in without the method keeps the coordinator's own DDL (auto).
+    resolve = getattr(settings, "resolved_schema_management", None)
+    mode = resolve() if callable(resolve) else None
+    run_schema_ddl = getattr(mode, "value", mode) != "external"
     if getattr(backend, "value", backend) == "sqlserver":
         from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
@@ -1632,6 +1600,7 @@ def build_coordinator(
             acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
             promotable=getattr(cluster_settings, "promotable", True),
             alert_sink=alert_sink,  # #145: failover-transition alerts (lockstep with DbCoordinator)
+            run_schema_ddl=run_schema_ddl,
         )
     return DbCoordinator(
         pool,
@@ -1661,4 +1630,5 @@ def build_coordinator(
         # the SQL Server store ignores db_schema (StoreSettings._db_schema_backend).
         db_schema=getattr(settings, "db_schema", None),
         alert_sink=alert_sink,  # #145: failover-transition alerts
+        run_schema_ddl=run_schema_ddl,
     )

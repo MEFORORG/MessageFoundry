@@ -34,22 +34,29 @@ against the unedited workflow before it was trusted.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
 import re
-import secrets
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from _live_scratch import (
+    SqlServerAdmin,
+    postgres_teardown,
+    scratch_name,
+    sqlserver_admin,
+    throwaway_password,
+)
 
 from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
+    SchemaManagement,
     SecretRotationSettings,
     SecuritySettings,
     SqlAuth,
@@ -65,6 +72,7 @@ from messagefoundry.store.privilege import (
     SQLSERVER_DOCUMENTED_DATABASE_ROLES,
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
+    SQLSERVER_RUNTIME_DATABASE_ROLES,
     PostgresRoleFacts,
     StorePrivilegeError,
     StorePrivilegeReport,
@@ -82,16 +90,6 @@ _THIS_FILE = "tests/test_store_privilege_preflight.py"
 # The exact grant docs/DEPLOY-SERVER-DB.md §1.1 prescribes, restated here so a change to either side
 # has to be a deliberate two-file edit rather than a silent drift in one.
 _DOCUMENTED_SQLSERVER = ("db_datareader", "db_datawriter", "db_ddladmin")
-
-
-def _throwaway_password() -> str:
-    """A per-run password for the purpose-made live-leg principal, GENERATED rather than written down.
-
-    Not a literal, on purpose. A hardcoded one would be a credential-shaped string in a public repo —
-    it would need a `.gitleaks.toml` allowlist entry, and every allowlist entry is a rule the scanner
-    stops applying. `token_urlsafe` is `[A-Za-z0-9_-]` only, so it never needs quoting inside the
-    fixture's SQL string literals, and the prefix keeps it complex enough for a password policy."""
-    return "Px9_" + secrets.token_urlsafe(24)
 
 
 # --- direction 2 first: the correctly-granted principal must be SILENT ------------------------
@@ -513,6 +511,10 @@ def _probe_row(
         "db_name": "MessageFoundry",
         "control_server": control_server,
         "control_db": control_db,
+        # #305: the directly-granted schema-DDL rights, read in both modes, counted under external.
+        "create_table": 0,
+        "default_schema": "dbo",
+        "alter_schema": 0,
     }
     for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
         row[f"srv_{i}"] = None if name in unread else int(name in server_roles)
@@ -526,6 +528,7 @@ def _sqlserver_probe(
     row: dict[str, Any] | None,
     *,
     user_defined: tuple[str, ...] = (),
+    schema_management: SchemaManagement | None = None,
 ) -> Any:
     """A real :class:`SqlServerStore` whose two read helpers are stubbed. No driver, no connection.
 
@@ -542,6 +545,7 @@ def _sqlserver_probe(
             auth=SqlAuth.INTEGRATED,
             server="db.invalid",
             database="MessageFoundry",
+            schema_management=schema_management,
         ),
     )
 
@@ -657,6 +661,8 @@ async def test_a_genuine_least_privilege_row_still_observes_clean(
         monkeypatch,
         _probe_row(database_roles=_DOCUMENTED_SQLSERVER),
         user_defined=("db_datareader", "mefor_app"),
+        # The three-role set is the AUTO-mode grant (#305); the external default is covered below.
+        schema_management=SchemaManagement.AUTO,
     )
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.OBSERVED
@@ -665,6 +671,30 @@ async def test_a_genuine_least_privilege_row_still_observes_clean(
     assert set(_DOCUMENTED_SQLSERVER) <= set(report.database_roles)
     assert report.principal == "CORP\\mefor-svc$"
     assert report.database == "MessageFoundry"
+
+
+async def test_external_mode_counts_db_ddladmin_as_excess_on_the_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#305: under the server-DB default (external) the runtime login holds row CRUD only, so the
+    same three-role login that is clean under auto carries ONE finding, and it is db_ddladmin."""
+    store = _sqlserver_probe(monkeypatch, _probe_row(database_roles=_DOCUMENTED_SQLSERVER))
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == ("database role db_ddladmin",)
+    assert "schema_management=external" in report.detail
+
+
+async def test_external_mode_runtime_grant_observes_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other direction for external mode: the runtime grant alone is silent."""
+    store = _sqlserver_probe(
+        monkeypatch, _probe_row(database_roles=tuple(sorted(SQLSERVER_RUNTIME_DATABASE_ROLES)))
+    )
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == ()
 
 
 async def test_a_zero_read_is_a_real_negative_and_is_not_confused_with_a_null(
@@ -1060,62 +1090,73 @@ async def test_live_sqlserver_probe_observes_the_configured_principal() -> None:
         )
 
 
-@pytest.mark.skipif(not _SQLSERVER_ON, reason="set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* env)")
-async def test_live_sqlserver_probe_sees_both_directions_on_a_purpose_made_principal() -> None:
-    """Create a least-privilege login, connect AS it, assert an EMPTY excess list — then add
-    ``db_owner`` and assert the probe names it. Both directions against a real server, or neither.
+@pytest.fixture
+async def sqlserver_privprobe_login() -> AsyncIterator[tuple[SqlServerAdmin, StoreSettings]]:
+    """A login and database user made for ONE test, granted the documented three roles, and dropped
+    afterwards even when the test fails. Yields the admin connection and the login's store settings.
 
-    Skips (never fails) when the configured principal cannot create logins: the assertion is about the
-    probe, and a store credential without ``ALTER ANY LOGIN`` cannot set the fixture up. CI connects as
-    ``sa``, so the leg that matters always runs it."""
+    The name is unique per call (``_live_scratch``): this was a fixed ``mefor_privprobe_test`` behind an
+    ``IF SUSER_ID(...) IS NULL`` guard, and a leftover from an earlier attempt then failed the login
+    with 18456 on the next one. Skips (never fails) when the configured principal cannot create
+    logins: that is a limit of the fixture's credential, not a fact about the probe."""
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.sqlserver import SqlServerStore
 
     base = load_settings(environ=os.environ).store
-    login = "mefor_privprobe_test"
-    password = _throwaway_password()
-    admin = await SqlServerStore.open(base)
+    login = scratch_name("mefor_privprobe")
+    password = throwaway_password()
+    # Open and close the store as the configured principal first, as the old in-test admin did: under
+    # the CI leg's schema_management=auto that brings this database's schema current, so the
+    # least-privilege open never depends on an earlier test having built it.
+    await (await SqlServerStore.open(base)).close()
+    async with sqlserver_admin(base) as admin:
+        try:
+            try:
+                await admin.run(
+                    f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF"
+                )
+                await admin.run(f"CREATE USER [{login}] FOR LOGIN [{login}]")
+                for role in _DOCUMENTED_SQLSERVER:
+                    await admin.run(f"ALTER ROLE {role} ADD MEMBER [{login}]")
+            except Exception as exc:  # noqa: BLE001 — a fixture-setup limit, not a probe failure
+                pytest.skip(f"cannot create a test login with this store principal: {exc}")
+            yield (
+                admin,
+                base.model_copy(
+                    update={"auth": SqlAuth.SQL, "username": login, "password": password}
+                ),
+            )
+        finally:
+            await admin.teardown(users=[login], logins=[login])
+
+
+@pytest.mark.skipif(not _SQLSERVER_ON, reason="set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* env)")
+async def test_live_sqlserver_probe_sees_both_directions_on_a_purpose_made_principal(
+    sqlserver_privprobe_login: tuple[SqlServerAdmin, StoreSettings],
+) -> None:
+    """Connect AS a least-privilege login, assert an EMPTY excess list — then add ``db_owner`` and
+    assert the probe names it. Both directions against a real server, or neither. CI connects as
+    ``sa``, so the leg that matters always runs it."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    admin, least = sqlserver_privprobe_login
+    login = least.username
+    store = await SqlServerStore.open(least)
     try:
-        try:
-            await admin._execute(
-                f"IF SUSER_ID('{login}') IS NULL CREATE LOGIN {login} WITH PASSWORD='{password}',"
-                " CHECK_POLICY=OFF"
-            )
-            await admin._execute(
-                f"IF USER_ID('{login}') IS NULL CREATE USER {login} FOR LOGIN {login}"
-            )
-            for role in _DOCUMENTED_SQLSERVER:
-                await admin._execute(f"ALTER ROLE {role} ADD MEMBER {login}")
-        except Exception as exc:  # noqa: BLE001 — a fixture-setup limit, not a probe failure
-            pytest.skip(f"cannot create a test login with this store principal: {exc}")
-
-        least = base.model_copy(
-            update={"auth": SqlAuth.SQL, "username": login, "password": password}
-        )
-        store = await SqlServerStore.open(least)
-        try:
-            clean = await store.probe_principal_privileges()
-        finally:
-            await store.close()
-        assert clean.status is StorePrivilegeStatus.OBSERVED
-        assert clean.excess == (), f"a correctly-granted login must be silent, got {clean.excess}"
-        assert set(_DOCUMENTED_SQLSERVER) <= set(clean.database_roles)
-
-        await admin._execute(f"ALTER ROLE db_owner ADD MEMBER {login}")
-        store = await SqlServerStore.open(least)
-        try:
-            over = await store.probe_principal_privileges()
-        finally:
-            await store.close()
-        assert "database role db_owner" in over.excess
+        clean = await store.probe_principal_privileges()
     finally:
-        for stmt in (
-            f"IF USER_ID('{login}') IS NOT NULL DROP USER {login}",
-            f"IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN {login}",
-        ):
-            with contextlib.suppress(Exception):  # teardown is best-effort
-                await admin._execute(stmt)
-        await admin.close()
+        await store.close()
+    assert clean.status is StorePrivilegeStatus.OBSERVED
+    assert clean.excess == (), f"a correctly-granted login must be silent, got {clean.excess}"
+    assert set(_DOCUMENTED_SQLSERVER) <= set(clean.database_roles)
+
+    await admin.run(f"ALTER ROLE db_owner ADD MEMBER [{login}]")
+    store = await SqlServerStore.open(least)
+    try:
+        over = await store.probe_principal_privileges()
+    finally:
+        await store.close()
+    assert "database role db_owner" in over.excess
 
 
 @pytest.mark.skipif(not _POSTGRES_ON, reason="set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env)")
@@ -1165,9 +1206,10 @@ async def test_live_postgres_probe_sees_both_directions_on_a_purpose_made_role()
     from messagefoundry.store.postgres import PostgresStore
 
     base = load_settings(environ=os.environ).store
-    role = "mefor_privprobe_test"
-    schema = "mefor_privprobe_test"
-    password = _throwaway_password()
+    # Unique per call, so a leftover from a crashed attempt can never be the role this run logs in as.
+    role = scratch_name("mefor_privprobe")
+    schema = role
+    password = throwaway_password()
     admin = await PostgresStore.open(base)
     try:
         try:
@@ -1213,12 +1255,7 @@ async def test_live_postgres_probe_sees_both_directions_on_a_purpose_made_role()
             await store.close()
         assert f"CREATEROLE via role {role}_wrap" in wrapped.excess
     finally:
-        for stmt in (
-            f"DROP SCHEMA IF EXISTS {schema} CASCADE",
-            f"REVOKE ALL ON DATABASE {base.database} FROM {role}",
-            f"DROP ROLE IF EXISTS {role}",
-            f"DROP ROLE IF EXISTS {role}_wrap",
-        ):
-            with contextlib.suppress(Exception):  # teardown is best-effort
-                await admin._execute(stmt)
+        await postgres_teardown(
+            admin, database=base.database, schemas=[schema], roles=[role, f"{role}_wrap"]
+        )
         await admin.close()

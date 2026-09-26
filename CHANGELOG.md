@@ -32,6 +32,24 @@ All notable changes to MessageFoundry are documented here. The format follows
   audit row before it writes the address, so the address never lands unaudited. If that write then
   fails, it does not report success. The warning `provision-admin` prints for a missing `--email`
   now names this command. (`BACKLOG #1136`)
+- **On SQL Server and PostgreSQL the engine's runtime login no longer runs schema DDL, and
+  `messagefoundry store provision-schema` does it instead.** New `[store].schema_management`
+  takes `auto` or `external`; **`external` is the server-DB default**, and SQLite is always
+  `auto`. Under `external`, `serve` reads the `schema_meta` marker and **refuses to start** when it
+  does not match this build, naming the database, the login's default schema, and the command. It runs
+  no schema DDL and, on SQL Server, no `ALTER DATABASE`, so a refused start leaves the database as it
+  found it. A clustered node's coordinator tables now ride the same batch. A DBA runs
+  `provision-schema` as a DDL-capable principal, with the engines stopped, before the first start and
+  before the first start of any upgrade whose schema moved. It needs no store key, a re-run on a
+  current schema is a no-op, and it exits 3 when `READ_COMMITTED_SNAPSHOT` is still off. On
+  PostgreSQL an external-mode start also refuses when the runtime role lacks row access to a store
+  object, instead of failing mid-pipeline. The runtime login then
+  needs row access only: `db_datareader` + `db_datawriter` on SQL Server, `USAGE` plus row grants on
+  PostgreSQL ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.1, §1.2, §2). The startup
+  privilege probe follows the mode: under `external` it names `db_ddladmin`, or `CREATE` on the store
+  schema, as excess. Set `schema_management = "auto"` to keep the engine building its own schema;
+  on a server DB that is reported by `security_loosenings()` as `schema_management`.
+  ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
 - **BREAKING — the engine no longer creates an account on its own.** A `serve` on a store with no

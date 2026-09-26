@@ -44,6 +44,7 @@ if (-not (Test-Path $py)) {
 
 $env:MEFOR_TEST_POSTGRES = "1"
 $env:MEFOR_STORE_BACKEND = "postgres"
+$env:MEFOR_STORE_SCHEMA_MANAGEMENT = "auto"   # #305: the test suites build their own schema
 $env:MEFOR_STORE_SERVER = $DbServer
 $env:MEFOR_STORE_PORT = "$Port"
 $env:MEFOR_STORE_DATABASE = $Database
