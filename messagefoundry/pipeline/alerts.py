@@ -224,7 +224,9 @@ class AlertSink(Protocol):
     def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
         """Startup self-attestation found loaded engine module(s) that do not match the installed
         wheel ``RECORD`` baseline — a runtime in-place tamper tripwire (ADR 0041 D3, #54). ``name``
-        labels the source (``"engine-integrity"``); ``reason`` is a PHI-free summary string;
+        labels the source: ``"engine-integrity"``/``"engine-unattested"`` for the engine wheel, and
+        ``"webconsole-integrity"``/``"webconsole-unattested"`` for the loaded web console's own wheel
+        (BACKLOG #1802). ``reason`` is a PHI-free summary string;
         ``drift_count`` is how many module files drifted. Carries no file content (no PHI, nothing
         sensitive). Emitted by :func:`~messagefoundry.integrity.run_startup_attestation`. Dedicated
         rather than reusing :meth:`connection_stopped` so an operator can route/triage a tamper signal

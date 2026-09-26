@@ -299,6 +299,36 @@ fingerprint+git-HEAD covers more cheaply for now.
 > no hole, because an adversary with venv-write plants the editable marker or rewrites the check in the
 > same single write.
 
+- **AC-15** — WHERE the web console package is loaded in the engine process, WHEN the engine starts,
+  THE SYSTEM SHALL apply AC-9 to AC-14 to the loaded console files (`.py`, `.js`, `.css`) against the
+  `messagefoundry-webconsole` distribution's own `RECORD`, recording and alerting under console
+  subjects, and SHALL record and alert for every failed arm before refusing. WHERE the console is not
+  loaded, THE SYSTEM SHALL NOT attest it.
+  → `tests/test_startup_attestation.py::test_console_tamper_is_detected_recorded_and_fails_closed`
+  → `tests/test_startup_attestation.py::test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine`
+  → `tests/test_startup_attestation.py::test_console_absent_changes_nothing_even_under_fail_closed`
+  → `tests/test_startup_attestation.py::test_the_engine_arm_text_is_unchanged`
+
+> **Amendment 2026-09-25 (BACKLOG #1802) — D3 attested only the engine wheel, and the console is a
+> second wheel running in the same process.** `messagefoundry-webconsole` is versioned apart from the
+> engine, and the engine wheel does not contain it, so an in-place edit to a console file matched no
+> `RECORD` the check read. AC-15 adds a console arm rather than widening the engine's distribution name.
+> Three choices in it are worth knowing.
+>
+> 1. **It keys on the console being LOADED, not on it being installed.** A console that is absent, or
+>    installed on a JSON-only engine, never ran in the process, and importing it to find its files
+>    would run it. `create_app` imports the console before the lifespan attests, so a console that
+>    serves is one that is attested.
+> 2. **Loaded but unattestable fails the same way the engine does (AC-13).** A console with no
+>    distribution metadata, a stripped `RECORD`, or files outside its install root is attested-nothing.
+>    A console that declares itself editable keeps the AC-12 no-op, so a dev checkout is never bricked.
+> 3. **It walks by suffix instead of keeping a file list.** A list would ship in the engine wheel and
+>    be compared against the console's `RECORD`, which is versioned apart, so it would go stale.
+>
+> The engine arm's log lines, alert subjects, audit detail and refusal text are unchanged, and a test
+> pins them word for word. The trust-domain residual in D3 applies to the console unchanged: this
+> detects an inconsistent in-place edit, not one that also re-seals the console's `RECORD`.
+
 ## Options considered
 
 1. **Attribution + runtime-integrity layer on top of ADR 0036 (this) — CHOSEN.** Fills exactly the gaps

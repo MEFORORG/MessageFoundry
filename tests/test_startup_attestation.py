@@ -12,6 +12,9 @@ The engine hashes its loaded ``messagefoundry`` module files against the install
 - AC-13 — a pass that compared NOTHING (no baseline, a stripped baseline, a shadowed package) warns,
   records and alerts, and fails closed when opted in (BACKLOG #1679).
 
+The same rules also cover the web console's own distribution when the process has loaded it (BACKLOG
+#1802); that arm's tests are the last block in this file.
+
 The attestation logic is exercised against a fabricated install root (a fake ``mfengine`` package +
 its ``*.dist-info/RECORD``) so the test never depends on how *this* repo happens to be installed.
 ``messagefoundry.integrity`` is parameterized only by the dist name + the loaded-files lookup, both
@@ -22,8 +25,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import logging
+import sys
+import types
 from collections.abc import Sequence
-from importlib.metadata import PathDistribution
+from importlib.metadata import PackageNotFoundError, PathDistribution
 from pathlib import Path
 
 import pytest
@@ -117,6 +124,10 @@ def _patch(
     monkeypatch.setattr(integ.metadata, "distribution", _fake_distribution)
     monkeypatch.setattr(integ, "_loaded_module_files", lambda: sorted(loaded))
     monkeypatch.setattr(integ, "_attested_asset_files", lambda: list(assets))
+    # The web console arm (BACKLOG #1802) reads `sys.modules`, and whether the real console is imported
+    # depends on which tests ran first in this process. Every engine-arm test says "not loaded", so it
+    # attests exactly the fabricated engine and nothing else. The console block below opts back in.
+    monkeypatch.setattr(integ, "_console_loaded_files", lambda: None)
 
 
 class _RecordingSink(AlertSink):
@@ -857,5 +868,352 @@ async def test_declared_editable_under_the_default_posture_stays_silent(
         assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
         assert [a for a in await store.list_audit() if a["action"] == "startup_integrity"] == []
         assert sink.events == []
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1802: the web console arm -----------------------------------------------------------
+#
+# The console is its own distribution, so the engine's RECORD never listed its files. These tests
+# fabricate a clean engine install beside a console install and point both arms at them. The console
+# uses its REAL import name, because the arm keys on it.
+
+_REAL_CONSOLE_LOADED_FILES = integ._console_loaded_files
+_CONSOLE_PKG = integ._CONSOLE_PACKAGE
+_CONSOLE_FILES = {
+    f"{_CONSOLE_PKG}/__init__.py": b"__version__ = '1.0'\n",
+    f"{_CONSOLE_PKG}/mount.py": b"def mount_ui(app, deps):\n    return None\n",
+    f"{_CONSOLE_PKG}/static/app.js": b"'use strict';\n",
+    f"{_CONSOLE_PKG}/static/app.css": b"body { margin: 0; }\n",
+}
+
+
+def _install_engine_and_console(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    console_installed: bool = True,
+    console_editable: bool = False,
+    console_loaded: bool = True,
+) -> Path:
+    """A clean fabricated engine plus a fabricated console, both wired in. Returns the console root.
+
+    ``console_installed=False`` leaves the console importable but with no distribution metadata, the
+    shape of a source tree on ``sys.path``. ``console_loaded=False`` is the JSON-only engine.
+    """
+    engine_pkg = "mfengine"
+    engine_dist, engine_loaded = _build_wheel_install(
+        tmp_path / "engine",
+        pkg=engine_pkg,
+        files={
+            f"{engine_pkg}/__init__.py": b"VERSION = '1.0'\n",
+            f"{engine_pkg}/core.py": b"SAFE = True\n",
+        },
+    )
+    _patch(monkeypatch, engine_dist, engine_loaded, engine_pkg)
+
+    console_root = tmp_path / "console"
+    console_dist, console_files = _build_wheel_install(
+        console_root, pkg=_CONSOLE_PKG, files=_CONSOLE_FILES, editable=console_editable
+    )
+
+    def _distribution(name: str) -> PathDistribution:
+        if name == engine_pkg:
+            return engine_dist
+        assert name == "messagefoundry-webconsole", name
+        if not console_installed:
+            raise PackageNotFoundError(name)
+        return console_dist
+
+    monkeypatch.setattr(integ.metadata, "distribution", _distribution)
+    if console_loaded:
+        monkeypatch.setattr(integ, "_console_loaded_files", lambda: sorted(console_files))
+    return console_root
+
+
+def _startup_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [r for r in rows if r["action"] == "startup_integrity"]
+
+
+def test_console_not_loaded_is_not_attested(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The REAL lookup, not a stub: with the console absent from ``sys.modules`` there is nothing
+    loaded to attest, and the arm must say so rather than import the console to look."""
+    monkeypatch.delitem(sys.modules, _CONSOLE_PKG, raising=False)
+    monkeypatch.setattr(integ, "_console_loaded_files", _REAL_CONSOLE_LOADED_FILES)
+    assert integ._console_loaded_files() is None
+    assert integ.attest_console() is None
+    assert _CONSOLE_PKG not in sys.modules, "the arm must never import the console to attest it"
+
+
+async def test_console_absent_changes_nothing_even_under_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Not installed, or installed and never imported: the console arm stays out of the way. No
+    refusal, no audit row, no alert and no warning, with the opt-in set."""
+    _install_engine_and_console(tmp_path, monkeypatch, console_loaded=False)
+
+    store = await open_store(sqlite_settings(str(tmp_path / "absent.db")), create=True)
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+            result = await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        assert result.ok is True and result.checked == 2
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert _startup_rows(await store.list_audit()) == []
+        assert sink.events == []
+    finally:
+        await store.close()
+
+
+async def test_console_loaded_and_clean_is_attested_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control for the refusals below: a clean console install compares every file,
+    source AND static, and starts silently under fail-closed."""
+    _install_engine_and_console(tmp_path, monkeypatch)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert console.ok is True and console.attested is True
+    assert console.checked == len(_CONSOLE_FILES)
+
+    store = await open_store(sqlite_settings(str(tmp_path / "clean.db")), create=True)
+    sink = _RecordingSink()
+    try:
+        await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        assert _startup_rows(await store.list_audit()) == []
+        assert sink.events == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("tampered", [f"{_CONSOLE_PKG}/mount.py", f"{_CONSOLE_PKG}/static/app.js"])
+async def test_console_tamper_is_detected_recorded_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tampered: str
+) -> None:
+    """The limb BACKLOG #1802 filed: a console file edited in place after install. Source and the
+    browser code it serves are both covered. Alert-only records and alerts; fail-closed also refuses."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    (console_root / tampered).write_bytes(b"// neutered\n")
+
+    console = integ.attest_console()
+    assert console is not None
+    assert [(d.path, d.reason) for d in console.drift] == [(tampered, "hash_mismatch")]
+
+    store = await open_store(sqlite_settings(str(tmp_path / "tamper.db")), create=True)
+    sink = _RecordingSink()
+    try:
+        result = await run_startup_attestation(store, sink, fail_closed_on_drift=False)
+        assert result.ok is True, "the engine's own result is returned, and the engine is clean"
+        rows = _startup_rows(await store.list_audit())
+        assert len(rows) == 1
+        detail = json.loads(str(rows[0]["detail"]))
+        assert detail["distribution"] == "messagefoundry-webconsole"
+        assert detail["drift"] == [tampered] and detail["fail_closed"] is False
+        assert sink.events == [
+            (
+                "webconsole-integrity",
+                "1 web console file(s) drifted from the installed messagefoundry-webconsole "
+                "wheel RECORD",
+                1,
+            )
+        ]
+
+        with pytest.raises(IntegrityError, match=r"^web console integrity attestation failed: 1 "):
+            await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        assert len(_startup_rows(await store.list_audit())) == 2, "recorded BEFORE refusing"
+    finally:
+        await store.close()
+
+
+def test_a_file_planted_in_the_loaded_console_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The REAL walk over the loaded package's ``__path__``: a script dropped beside the shipped ones
+    has no RECORD row, so it is drift. A file of a suffix the arm does not attest is ignored."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    (package_dir / "static" / "extra.js").write_bytes(b"fetch('/steal');\n")
+    (package_dir / "static" / "notes.txt").write_bytes(b"not attested\n")
+    fake = types.ModuleType(_CONSOLE_PKG)
+    fake.__path__ = [str(package_dir)]
+    monkeypatch.setitem(sys.modules, _CONSOLE_PKG, fake)
+    monkeypatch.setattr(integ, "_console_loaded_files", _REAL_CONSOLE_LOADED_FILES)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert [(d.path, d.reason) for d in console.drift] == [
+        (f"{_CONSOLE_PKG}/static/extra.js", "missing")
+    ]
+    assert console.checked == len(_CONSOLE_FILES)
+
+
+def test_a_single_file_module_shadowing_the_console_is_unattestable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A module with no ``__path__`` under the console's name, outside the install root: nothing is
+    compared, and that is attested-nothing, never clean."""
+    _install_engine_and_console(tmp_path, monkeypatch)
+    shadow = tmp_path / "elsewhere" / f"{_CONSOLE_PKG}.py"
+    shadow.parent.mkdir(parents=True)
+    shadow.write_bytes(b"def mount_ui(app, deps):\n    return None\n")
+    fake = types.ModuleType(_CONSOLE_PKG)
+    fake.__file__ = str(shadow)
+    monkeypatch.setitem(sys.modules, _CONSOLE_PKG, fake)
+    monkeypatch.setattr(integ, "_console_loaded_files", _REAL_CONSOLE_LOADED_FILES)
+
+    assert integ._console_loaded_files() == [shadow.resolve()]
+    console = integ.attest_console()
+    assert console is not None
+    assert console.ok is False and console.attested_nothing is True
+    assert console.unattested_reason == "no_attested_file_under_install_root"
+
+
+@pytest.mark.parametrize("shape", ["not_installed", "record_rowless"])
+async def test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Loaded but unattestable is the engine's AC-13, applied to the console: warn, record, alert under
+    its own subject, and refuse under fail-closed. Absent is the only shape the arm skips."""
+    console_root = _install_engine_and_console(
+        tmp_path, monkeypatch, console_installed=shape != "not_installed"
+    )
+    if shape == "record_rowless":
+        record = console_root / f"{_CONSOLE_PKG}-1.0.dist-info" / "RECORD"
+        record.write_text(f"{_CONSOLE_PKG}-1.0.dist-info/RECORD,,\n", encoding="utf-8")
+    expected_reason = {
+        "not_installed": "not_an_installed_distribution",
+        "record_rowless": "record_has_no_package_rows",
+    }[shape]
+
+    store = await open_store(sqlite_settings(str(tmp_path / f"{shape}.db")), create=True)
+    sink = _RecordingSink()
+    try:
+        with pytest.raises(IntegrityError) as refused:
+            await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        assert str(refused.value).startswith(
+            f"web console integrity attestation verified nothing ({expected_reason})"
+        )
+        rows = _startup_rows(await store.list_audit())
+        assert len(rows) == 1
+        detail = json.loads(str(rows[0]["detail"]))
+        assert detail["distribution"] == "messagefoundry-webconsole"
+        assert detail["unattested_reason"] == expected_reason and detail["checked"] == 0
+        assert [event[0] for event in sink.events] == ["webconsole-unattested"]
+    finally:
+        await store.close()
+
+
+async def test_a_console_that_declares_itself_editable_is_the_ac12_no_op(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dev checkout's console is never bricked, never audited and never alerted. Under the opt-in it
+    warns, naming the console as the install that disarmed it."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch, console_editable=True)
+    (console_root / f"{_CONSOLE_PKG}/mount.py").write_bytes(b"# dev edit\n")
+
+    store = await open_store(sqlite_settings(str(tmp_path / "editable.db")), create=True)
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+            await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "the messagefoundry-webconsole install DECLARES itself editable" in warnings[0]
+        assert _startup_rows(await store.list_audit()) == []
+        assert sink.events == []
+    finally:
+        await store.close()
+
+
+async def test_both_arms_record_before_either_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Engine drift and console drift at once: two audit rows, two alerts under their own subjects, and
+    one refusal naming both. The engine's refusal text stays first and unchanged."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    (tmp_path / "engine" / "mfengine" / "core.py").write_bytes(b"SAFE = False\n")
+    (console_root / f"{_CONSOLE_PKG}/mount.py").write_bytes(b"# neutered\n")
+
+    store = await open_store(sqlite_settings(str(tmp_path / "both.db")), create=True)
+    sink = _RecordingSink()
+    try:
+        with pytest.raises(IntegrityError) as refused:
+            await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        message = str(refused.value)
+        assert message.startswith("engine integrity attestation failed: 1 attested file(s)")
+        assert "; web console integrity attestation failed: 1 attested file(s)" in message
+        assert len(_startup_rows(await store.list_audit())) == 2
+        assert [event[0] for event in sink.events] == ["engine-integrity", "webconsole-integrity"]
+    finally:
+        await store.close()
+
+
+# The engine arm's operator-facing text, pinned WORD FOR WORD. The console arm reuses the handler that
+# emits it, so this is the proof that extending the check changed nothing an engine operator reads.
+# These strings were the module's output before BACKLOG #1802; edit them only on purpose.
+_ENGINE_TEXT = {
+    "drift_log": (
+        "startup integrity DRIFT: 1 engine file(s) do not match the installed wheel RECORD "
+        "(fail_closed=True) — possible in-place engine tampering"
+    ),
+    "drift_reason": "1 engine file(s) drifted from the installed wheel RECORD",
+    "drift_refusal": (
+        "engine integrity attestation failed: 1 attested file(s) do not match the installed wheel "
+        "RECORD ([integrity].fail_closed_on_drift=true; refusing to start)"
+    ),
+    "nothing_log": (
+        "startup integrity: attestation verified NOTHING (record_absent_or_empty) — no engine file "
+        "was compared against a RECORD baseline (fail_closed=True), so an in-place edit would go "
+        "undetected"
+    ),
+    "nothing_reason": (
+        "startup attestation compared no engine file against a baseline (record_absent_or_empty)"
+    ),
+    "nothing_refusal": (
+        "engine integrity attestation verified nothing (record_absent_or_empty): no engine file was "
+        "compared against the installed wheel RECORD ([integrity].fail_closed_on_drift=true; refusing "
+        "to start on an unattested install)"
+    ),
+    "editable_log": (
+        "startup integrity: [integrity].fail_closed_on_drift is set, but this install DECLARES itself "
+        "editable (declared_editable), so attestation compared no file and the tripwire is DISARMED — "
+        "the hard enforcement you opted into is NOT in effect. Install the non-editable wheel to get "
+        "it. This reports a misconfiguration, not a tamper: an actor who can write the venv can plant "
+        "the editable marker itself."
+    ),
+    "clean_log": "startup integrity: 2 engine file(s) attested clean",
+}
+
+
+@pytest.mark.parametrize("shape", ["drift", "nothing", "editable", "clean"])
+async def test_the_engine_arm_text_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, shape: str
+) -> None:
+    pkg = "mfengine"
+    files = {f"{pkg}/__init__.py": b"VERSION = '1.0'\n", f"{pkg}/core.py": b"SAFE = True\n"}
+    dist, loaded = _build_wheel_install(
+        tmp_path, pkg=pkg, files=files, editable=shape == "editable"
+    )
+    _patch(monkeypatch, dist, loaded, pkg)
+    if shape == "drift":
+        (tmp_path / f"{pkg}/core.py").write_bytes(b"SAFE = False\n")
+    elif shape == "nothing":
+        (tmp_path / f"{pkg}-1.0.dist-info" / "RECORD").unlink()
+
+    store = await open_store(sqlite_settings(str(tmp_path / f"{shape}.db")), create=True)
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.INFO, logger="messagefoundry.integrity"):
+            if shape in {"drift", "nothing"}:
+                with pytest.raises(IntegrityError) as refused:
+                    await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+                assert str(refused.value) == _ENGINE_TEXT[f"{shape}_refusal"]
+                assert [event[1] for event in sink.events] == [_ENGINE_TEXT[f"{shape}_reason"]]
+                detail = json.loads(str(_startup_rows(await store.list_audit())[0]["detail"]))
+                assert "distribution" not in detail, "the engine's audit detail keeps its old keys"
+            else:
+                await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        assert _ENGINE_TEXT[f"{shape}_log"] in caplog.messages, caplog.messages
     finally:
         await store.close()

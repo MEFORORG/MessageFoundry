@@ -140,6 +140,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **Startup attestation now checks the web console, not just the engine.** The console ships as its
+  own wheel, `messagefoundry-webconsole`, and runs inside the engine process. Attestation compared
+  only the engine wheel's files, so a console file edited in place went unseen. When the engine has
+  loaded the console, it now hashes the console's `.py`, `.js` and `.css` files against the console
+  wheel's own `RECORD`. The same `[integrity]` rules apply. Drift and a console that cannot be
+  attested both record a `startup_integrity` row and raise an alert, under the subjects
+  `webconsole-integrity` and `webconsole-unattested`. With `fail_closed_on_drift` on, either one
+  refuses the start. A console that is not installed, or not served, is skipped, and a console that
+  declares itself editable is exempt. The engine's own messages are unchanged. (`BACKLOG #1802`)
 - **BREAKING: a CRL file can no longer add trust anchors.** Each CRL setting loaded its file as
   a CA file, so any certificate in it became a trusted CA for the hop. That CA skipped the hop's
   pin and permission checks. It covers at least `[api].tls_client_crl_file`, an inbound
