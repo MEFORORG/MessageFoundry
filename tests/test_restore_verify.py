@@ -439,6 +439,78 @@ async def test_full_verify_passes_on_a_snapshot_holding_state_and_reference_rows
     assert res.decrypted_cells >= 1
 
 
+def test_full_verify_passes_on_an_archive_written_under_a_since_retired_key(tmp_path) -> None:
+    """AC-5 "incl. retired keys", under ``full``. Rows are sealed under key A and backed up. A routine
+    rotation then makes B active and moves A to ``encryption_keys_retired``. The full verify must still
+    PASS. Every sealed cell in this snapshot was written under A, so the decrypt pass can count a cell
+    only by using A from the keyring the full open inherits.
+
+    The light-verify twin above proves the archive-key precheck finds A. The full verify needs A in a
+    second place: the store it opens over the snapshot. The contrast arm shows that second place on its
+    own. It hands the verify the archive key, so the precheck passes, but leaves A out of the store
+    settings. The store's eager ``state`` warm-up then cannot open its cell, and the verdict turns.
+
+    The settings name a live path that does not exist, and the test checks it still does not exist
+    afterwards. A full verify that opened the configured path instead of the snapshot would create it.
+
+    Synchronous for the same reason as the keyless test above: ``_verify_archive_blocking`` runs its own
+    loop for the full open."""
+    import asyncio
+
+    key_a = generate_key()
+    db = tmp_path / "msg.db"
+
+    async def _setup() -> str:
+        store = await _state_and_reference_store(db, key_a)
+        try:
+            runner = BackupRunner(
+                store,
+                BackupSettings(enabled=True, destination=str(tmp_path / "b")),
+                store_settings=StoreSettings(path=str(db), encryption_key=key_a),
+                config_dir=None,
+            )
+            result = await runner.run_once(now=1.0)
+        finally:
+            await store.close()
+        assert result is not None
+        return result.archive_path
+
+    archive = asyncio.run(_setup())
+
+    live = tmp_path / "live-after-rotation.db"  # never created; the verify must not create it
+    key_b = generate_key()
+    rotated = StoreSettings(
+        path=str(live),
+        encryption_key=key_b,  # B is now active
+        encryption_keys_retired=key_a,  # A is retired but still decrypt-capable
+    )
+    res = asyncio.run(run_restore_verify(archive, store_settings=rotated, full=True))
+    assert res.status == "PASS", res.reason
+    assert res.integrity_ok is True
+    assert res.row_counts == res.manifest_counts
+    assert res.decrypted_cells >= 1, "a full verify that decrypted nothing proves nothing"
+    assert not live.exists(), "the full verify opened the configured path, not the snapshot"
+
+    # Contrast arm. This split (archive key in hand, store settings without it) is the shipped defect's
+    # shape, reached through the blocking call as in the keyless test above.
+    without_a = _verify_archive_blocking(
+        archive_path=archive,
+        keys=[base64.b64decode(key_a)],
+        full=True,
+        store_settings=StoreSettings(path=str(live), encryption_key=key_b),
+    )
+    # FAIL rather than KEY_MISMATCH: the keyring holds a key, so a cell it cannot open is
+    # indistinguishable from corruption (see _full_open_check).
+    assert without_a.status == "FAIL", without_a.reason
+    # The precheck, the archive decrypt, the integrity check and the row counts all passed, so the full
+    # leg alone turned the verdict.
+    assert without_a.integrity_ok is True
+    assert without_a.row_counts == without_a.manifest_counts
+    reason = without_a.reason or ""
+    assert reason.startswith("full restore-verify:") and "CipherError" in reason, reason
+    assert not live.exists()
+
+
 def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error(tmp_path) -> None:
     """A full open that FAILS must report why it failed. The snapshot lives in a temp directory the
     verify unwinds on the way out, and ``MessageStore.open`` used to leave its aiosqlite handle open

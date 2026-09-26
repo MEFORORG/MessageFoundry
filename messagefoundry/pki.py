@@ -20,6 +20,7 @@ import ipaddress
 from dataclasses import dataclass
 
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
@@ -34,6 +35,8 @@ __all__ = [
     "load_pkcs12",
     "make_self_signed",
     "read_cert_facts",
+    "read_self_signed_facts",
+    "SelfSignedFacts",
 ]
 
 # Day math shared with pipeline/cert_expiry.py's expiry monitor — keep the convention identical.
@@ -194,6 +197,55 @@ def read_cert_facts(pem: bytes, *, now: float) -> CertFacts:
         sans=sans,
         days_remaining=days_remaining,
         expired=days_remaining < 0,
+    )
+
+
+@dataclass(frozen=True)
+class SelfSignedFacts:
+    """The public facts that decide whether an engine-generated certificate is due for renewal, and
+    that identify it in the audit record of a replacement (BACKLOG #1276). Never any private material.
+
+    ``engine_shaped`` is the shape :func:`make_self_signed` produces: subject equal to issuer, a
+    signature that verifies under the certificate's OWN key, and basic constraints present with
+    ``CA=false``. A certificate that fails any of those was not minted by the engine, so the engine
+    has no business replacing it, whatever file it sits in."""
+
+    #: SHA-256 over the DER certificate, lowercase hex: the fingerprint a client pins.
+    sha256: str
+    not_before: float  # epoch seconds
+    not_after: float  # epoch seconds
+    not_after_iso: str
+    engine_shaped: bool
+
+
+def read_self_signed_facts(pem: bytes) -> SelfSignedFacts:
+    """Parse a PEM certificate into :class:`SelfSignedFacts`. Raises ``ValueError`` when ``pem`` is
+    not a parseable certificate. Reads only the public certificate, never a key."""
+    cert = x509.load_pem_x509_certificate(pem)
+    try:
+        constraints = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        engine_shaped = not constraints.ca and cert.subject == cert.issuer
+        if engine_shaped:
+            # Raises unless the certificate's own key signed it: a certificate merely NAMING itself
+            # as issuer is not self-signed, and is not the engine's.
+            cert.verify_directly_issued_by(cert)
+    except (
+        x509.ExtensionNotFound,
+        x509.DuplicateExtension,
+        InvalidSignature,
+        UnsupportedAlgorithm,
+        ValueError,
+        TypeError,
+    ):
+        # No or a duplicated basic-constraints extension, a signature the key does not verify, or
+        # a key or algorithm the verifier does not support. Each means "not the engine's shape".
+        engine_shaped = False
+    return SelfSignedFacts(
+        sha256=cert.fingerprint(hashes.SHA256()).hex(),
+        not_before=cert.not_valid_before_utc.timestamp(),
+        not_after=cert.not_valid_after_utc.timestamp(),
+        not_after_iso=cert.not_valid_after_utc.isoformat(),
+        engine_shaped=engine_shaped,
     )
 
 

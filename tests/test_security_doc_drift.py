@@ -1858,13 +1858,25 @@ def _mount_installs_ui_ws_hook(tree: ast.Module) -> bool:
 def _ui_ws_audit_shape(tree: ast.Module) -> tuple[bool, bool]:
     """``(writes a grant row, passes a client address)`` for ``authorize_ui_ws``, read by AST.
 
-    The WebSocket note says the cookie gate writes no grant row and its denial rows carry no client
-    address. Both are facts about code that BACKLOG #1197 may change, so they are read, not assumed.
+    The WebSocket note says the cookie gate writes no grant row and its denial rows carry the client
+    address (BACKLOG #1644). Both are facts about code that BACKLOG #1197 may change, so they are
+    read, not assumed. ``with_client`` is true only when EVERY denial call passes
+    ``client=client_ip(...)``. The note names that extractor, so a call that drops the keyword, passes
+    ``None`` or reads the address inline makes the note false and turns this guard red.
     """
     gate = named_func(tree, "authorize_ui_ws")
     grants = bool(call_sites(gate, "audit_permission_granted"))
     denials = call_sites(gate, "audit_mfa_denied") + call_sites(gate, "audit_permission_denied")
-    with_client = any(kw.arg == "client" for call in denials for kw in call.keywords)
+
+    def _via_client_ip(call: ast.Call) -> bool:
+        return any(
+            kw.arg == "client"
+            and isinstance(kw.value, ast.Call)
+            and ast.unparse(kw.value.func) == "client_ip"
+            for kw in call.keywords
+        )
+
+    with_client = bool(denials) and all(_via_client_ip(call) for call in denials)
     return grants, with_client
 
 
@@ -1906,10 +1918,11 @@ def test_ws_stats_gate_order_is_derived_and_documented() -> None:
     grants, with_client = _ui_ws_audit_shape(
         _parse((console / "_auth.py").read_text(encoding="utf-8"))
     )
-    assert not grants and not with_client, (
-        f"authorize_ui_ws now writes a grant row ({grants}) or passes a client address "
-        f"({with_client}). The WebSocket note and the 16.3.2 paragraph say it does neither; "
-        "rewrite both."
+    assert not grants and with_client, (
+        f"authorize_ui_ws now writes a grant row ({grants}), or a denial call no longer passes "
+        f"client=client_ip(...) (every call does: {with_client}). The WebSocket note says it writes "
+        "no grant row and its denial rows carry the client, and the 16.3.2 paragraph says the "
+        "console writes no grant row; rewrite whichever is now false."
     )
 
     rows = [
@@ -1936,6 +1949,9 @@ def test_ws_stats_gate_order_is_derived_and_documented() -> None:
     )
     assert "`authorize_ui_ws` writes no grant row" in design, (
         "the WebSocket note must say the cookie gate writes no grant row"
+    )
+    assert "Its denial rows carry the client address" in design, (
+        "the WebSocket note must say the cookie gate's denial rows carry the client (BACKLOG #1644)"
     )
     plane_item = design[design.find("2. **Authentication plane selection**") :][:900]
     assert "cookie first and header token second" in plane_item, (
@@ -2043,12 +2059,21 @@ def test_ws_stats_gate_order_reader_detects_a_planted_reorder() -> None:
     )
     assert not _mount_installs_ui_ws_hook(helper_only), "only mount_ui's own body counts"
 
-    audit = _parse(
-        "async def authorize_ui_ws(websocket):\n"
-        "    await auth.audit_permission_granted(identity, p, path)\n"
-        "    await auth.audit_permission_denied(identity, p, path, client=ip)\n"
+    def shape(*denials: str) -> tuple[bool, bool]:
+        body = "    pass\n" + "".join(f"    await auth.{d}\n" for d in denials)
+        return _ui_ws_audit_shape(_parse(f"async def authorize_ui_ws(websocket):\n{body}"))
+
+    mfa_via = "audit_mfa_denied(i, path, client=client_ip(websocket))"
+    both = shape("audit_permission_granted(identity, p, path)", mfa_via)
+    assert both == (True, True)
+    # BACKLOG #1644: the note names client_ip, so each of these makes it false and must read False.
+    one_short = shape(mfa_via, "audit_permission_denied(i, p, path)")
+    assert one_short == (False, False), "one call without client= must fail the every-call rule"
+    assert shape("audit_permission_denied(i, p, path, client=ip)") == (False, False), (
+        "an inline address, not client_ip, must not count"
     )
-    assert _ui_ws_audit_shape(audit) == (True, True)
+    assert shape("audit_permission_denied(i, p, path, client=None)") == (False, False)
+    assert shape() == (False, False), "no denial call at all must not read as every call passing"
 
 
 # =====================================================================================================
