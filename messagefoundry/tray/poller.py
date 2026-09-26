@@ -37,7 +37,14 @@ from dataclasses import dataclass
 import httpx
 
 from messagefoundry.tray.config import TrayConfig
-from messagefoundry.tray.probe import make_probe_client, pin_loads, probe_health, probe_ui
+from messagefoundry.tray.probe import (
+    LoadedPin,
+    load_pin,
+    make_probe_client,
+    probe_health,
+    probe_ui,
+    read_pin,
+)
 from messagefoundry.tray.state import (
     HealthProbe,
     ProbeInputs,
@@ -232,13 +239,14 @@ class StatusPoller:
         self._ui_probe = ui_probe
         # The default factory carries the config's certificate pin, so a caller that injects its
         # own factory owns the trust decision too.
-        #: The pin the default factory uses. See :meth:`_rebuild_once_the_pin_loads`.
+        #: The pin the default client trusts. See :meth:`_follow_the_pin`.
         self._pin: str | None = None
         if client_factory is None:
             self._pin = config.engine_cacert
             client_factory = functools.partial(make_probe_client, cacert=config.engine_cacert)
         self._client_factory = client_factory
-        self._pin_pending = False
+        #: The pin bytes the current client was built from, or None when it was not built from them.
+        self._pin_pem: bytes | None = None
         self._clock = clock
         self._toast_min_interval_s = toast_min_interval_s
         self._client: httpx.Client | None = None
@@ -326,7 +334,7 @@ class StatusPoller:
 
     def poll_once(self, now: float) -> PollResult:
         """Read all probes once and produce a :class:`PollResult`. Does I/O via the injected deps."""
-        self._rebuild_once_the_pin_loads()
+        self._follow_the_pin()
         reading = self._scm_reader(self._config.service_name)
         client = self._client
         health = self._health_probe(client) if client is not None else HealthProbe.DOWN
@@ -335,31 +343,60 @@ class StatusPoller:
         return self._build_result(inputs, reading, now)
 
     def _open_client(self) -> None:
-        # Checked BEFORE the build, so a pin that appears in between costs one spare rebuild
-        # rather than leaving the client unpinned.
-        self._pin_pending = self._pin is not None and not pin_loads(self._pin)
-        self._client = self._client_factory(self._config.engine_url)
+        loaded = load_pin(self._pin) if self._pin is not None else None
+        if loaded is None:
+            # No pin configured, or not loadable yet: the factory decides, and a pin that loads
+            # later is picked up by `_follow_the_pin` because nothing has been recorded.
+            self._client = self._client_factory(self._config.engine_url)
+            return
+        self._adopt_pin(loaded)
 
-    def _rebuild_once_the_pin_loads(self) -> None:
-        """Pick up the engine's certificate once it loads, without a tray restart.
+    def _follow_the_pin(self) -> None:
+        """Rebuild the client when the pinned certificate changes, without a tray restart.
 
-        The engine mints its pair on its first run, so a tray started before then builds its client
-        with no pin, and the probe falls back to the OS trust store and reads the engine as down.
-        The client is otherwise built once, so this retries the load on each tick and rebuilds the
-        client once it succeeds. It keys on LOADING, not on the file existing: the engine writes
-        the file non-atomically, so an empty or half-written file exists too. The pending flag
-        clears only after the rebuild, so a factory that raises is retried on the next tick.
+        Two events change it. The engine mints its pair on its first run, so a tray started before
+        then has no pin to load and reads the engine as down. And the engine renews its certificate
+        early, at startup (BACKLOG #1276), so a tray pinned to the old one would fail verification
+        against a running engine and show it DOWN until restarted. A context reads its file once,
+        when it is built, so neither reaches a client already open.
+
+        **The trigger is a read of the file on every tick, compared byte for byte with what the
+        client was built from.** Waiting for a verification failure was the alternative, and it
+        cannot be seen from here: the probes fold every transport error, a refused connection and a
+        failed handshake alike, into ``DOWN``. The steady-state cost is one read of a small local
+        file beside two HTTP round trips, and bytes are compared rather than hashed because the
+        comparison is exact and needs no digest.
+
+        **The pin is never dropped.** Only bytes that LOAD replace the client: a missing,
+        unreadable, empty or half-written file keeps the current one, so a renewal caught mid-write
+        costs nothing. The new client pins the new file alone. A certificate that is not the
+        engine's therefore fails verification exactly as before, and nothing here reaches for the
+        OS trust store or turns verification off. The record moves only after the new client
+        exists, so a build that raises is retried on the next tick.
         """
-        if not self._pin_pending or self._pin is None or self._stop.is_set():
+        if self._pin is None or self._stop.is_set():
             return
-        if not pin_loads(self._pin):
-            return
-        log.info("engine certificate %s now loads; rebuilding the probe client", self._pin)
+        current = read_pin(self._pin)
+        if current is None or current == self._pin_pem:
+            return  # unreadable (keep the current client) or unchanged (nothing to do)
+        loaded = load_pin(self._pin)
+        if loaded is None:
+            return  # present but not loadable yet: empty, half-written, or rewritten mid-load
+        log.info(
+            "engine certificate %s %s; rebuilding the probe client",
+            self._pin,
+            "now loads" if self._pin_pem is None else "has changed",
+        )
         old = self._client
-        self._client = self._client_factory(self._config.engine_url)
-        self._pin_pending = False
+        self._adopt_pin(loaded)
         if old is not None:
             old.close()
+
+    def _adopt_pin(self, loaded: LoadedPin) -> None:
+        """Open a client trusting exactly the loaded context, and record the bytes it came from."""
+        pem, context = loaded
+        self._client = make_probe_client(self._config.engine_url, cacert=self._pin, pinned=context)
+        self._pin_pem = pem
 
     def _unknown_result(self) -> PollResult:
         """The stand-in :class:`PollResult` for a tick that raised.
