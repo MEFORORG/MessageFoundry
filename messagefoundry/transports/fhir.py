@@ -1165,6 +1165,14 @@ class FhirLookupExecutor:
             raise FhirLookupError(
                 f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} failed: {exc}"
             ) from exc
+        except http.client.HTTPException as exc:
+            # A malformed status or header line (BadStatusLine, LineTooLong) is neither an OSError
+            # nor a URLError (BACKLOG #1980). Named by class only: its text can echo reply bytes.
+            # After the OSError arm, so RemoteDisconnected (both kinds) keeps the OSError wording.
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} sent a malformed HTTP "
+                f"reply ({type(exc).__name__})"
+            ) from exc
 
     def _parse(self, connection: str, body: str, status: int) -> dict[str, Any]:
         """Parse a 2xx reply body into a resource / searchset ``Bundle`` dict via the pure codec. PHI-safe:
@@ -1238,4 +1246,10 @@ class FhirLookupExecutor:
         except (TimeoutError, OSError) as exc:
             raise FhirLookupError(
                 f"FhirLookup {connection!r}: FHIR {_redact_url(base)} failed: {exc}"
+            ) from exc
+        except http.client.HTTPException as exc:
+            # As in _get: named by class only, and after the OSError arm (BACKLOG #1980).
+            raise FhirLookupError(
+                f"FhirLookup {connection!r}: FHIR {_redact_url(base)} sent a malformed HTTP reply "
+                f"({type(exc).__name__})"
             ) from exc

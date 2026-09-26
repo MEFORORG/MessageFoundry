@@ -1845,7 +1845,17 @@ class RegistryRunner:
                 "fhir_lookup is unavailable — no FhirLookup connections are configured"
             )
         future = asyncio.run_coroutine_threadsafe(executor.read(connection, query, params), loop)
-        return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
+        try:
+            return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            # BACKLOG #1980: the wait bounds the WHOLE read, the SMART token mint plus the GET, and
+            # each leg has its own 30 s default. No per-leg timeout can keep their sum under this
+            # wait, so a hang in either leg lands here. Mapped so a Handler that catches
+            # FhirLookupError sees it; the orphaned read still finishes on the loop, as before.
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: no result within "
+                f"{_LOOKUP_RESULT_TIMEOUT_SECONDS:g}s"
+            ) from exc
 
     # --- per-connection control (console operations) -------------------------
 

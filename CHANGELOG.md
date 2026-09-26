@@ -115,11 +115,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   contract says to, would have missed it. The mint now maps to `FhirLookupError`, with the cause
   chained. The message names the redacted token URL and a status or reason. It never carries the
   client assertion or the reply body. An over-length configured token URL maps the same way, with
-  a fixed message. The SMART provider also raised three errors outside its own `DeliveryError`
-  contract: a malformed status line, a deeply nested reply, and an `expires_in` too large for a
-  float. It now raises `DeliveryError` for each. So a FHIR or REST destination using SMART
-  would retry them as transient failures rather than treat them as internal errors. The lookup
-  executor's probe method has no caller yet and gets the same mapping. (`BACKLOG #1980`)
+  a fixed message. Three more raw errors reached a Handler from `fhir_lookup` and now map the same
+  way:
+  - A read that gets no result within the Handler's 30-second wait. That wait covers the token mint
+    and the GET together, and each has its own 30-second default. So a token endpoint that never
+    answers used to surface as a bare `TimeoutError`.
+  - A malformed status or header line from the FHIR server itself. The message names the error
+    class only.
+  - The same malformed reply from the token endpoint.
+
+  The SMART provider also raised errors outside its own `DeliveryError` contract: for a malformed
+  status line, a deeply nested reply, and an `expires_in` too large for a float. It now raises
+  `DeliveryError` for each. So a FHIR or REST destination using SMART would retry them as transient
+  failures rather than treat them as internal errors. The provider now also refuses an `expires_in`
+  that is infinite or not a number, which it would have cached forever. It caps any other lifetime at
+  one hour. The lookup executor's probe method has no caller yet and gets the same mappings.
+  (`BACKLOG #1980`)
 - **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
   it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
   `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import re
 import secrets
 import threading
@@ -94,6 +95,10 @@ _DEFAULT_EXPIRY_SKEW = 60.0
 _DEFAULT_TOKEN_TIMEOUT = 30.0
 # If the token response omits expires_in, assume a short, conservative lifetime and re-mint soon.
 _FALLBACK_TOKEN_TTL = 300.0
+# The longest lifetime this provider will cache a token for, whatever expires_in claims. SMART Backend
+# Services expects tokens of about five minutes, so an hour is generous. Clamping only makes the next
+# mint come sooner; without it a reply claiming 1e300 seconds would be cached for good (BACKLOG #1980).
+_MAX_TOKEN_TTL = 3600.0
 
 
 class SmartAuthError(ValueError):
@@ -384,6 +389,12 @@ class SmartBackendTokenProvider:
                 raise ValueError("missing access_token")
             expires_in = payload.get("expires_in", _FALLBACK_TOKEN_TTL)
             ttl = float(expires_in) if isinstance(expires_in, (int, float)) else _FALLBACK_TOKEN_TTL
+            # json.loads reads 1e999 as inf and accepts the NaN and Infinity literals. An infinite
+            # ttl would cache the token forever, so a non-finite one is refused. A finite one past
+            # the ceiling is clamped. A negative one already re-mints on the next call.
+            if not math.isfinite(ttl):
+                raise ValueError("non-finite expires_in")
+            ttl = min(ttl, _MAX_TOKEN_TTL)
         # RecursionError (a deeply nested body) and OverflowError (an integer expires_in too large
         # for a float) are neither ValueError nor TypeError, and once escaped the provider's
         # DeliveryError contract (BACKLOG #1980).

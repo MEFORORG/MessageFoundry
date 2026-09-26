@@ -290,6 +290,31 @@ def test_token_mint_failures_keep_the_delivery_error_contract(
     assert "garbage" not in str(err.value)
 
 
+@pytest.mark.parametrize(
+    "expires_in", [b"1e999", b"-1e999", b"NaN", b"Infinity"], ids=["1e999", "-1e999", "nan", "inf"]
+)
+def test_a_non_finite_expires_in_is_refused(rsa_pem: str, expires_in: bytes) -> None:
+    # BACKLOG #1980: json.loads reads 1e999 as inf and accepts the NaN and Infinity literals. An
+    # infinite ttl would cache the token forever, so the provider refuses the reply instead.
+    provider = _provider(rsa_pem)
+    body = b'{"access_token":"TOK","expires_in":' + expires_in + b"}"
+    provider._opener = _FakeOpener(body=body)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError, match="unparseable"):
+        provider.access_token()
+    assert provider._cached_token is None
+
+
+def test_an_absurd_expires_in_is_clamped(rsa_pem: str) -> None:
+    # A finite but absurd lifetime is clamped to the ceiling, so the token still re-mints.
+    provider = _provider(rsa_pem)
+    provider._opener = _FakeOpener(  # type: ignore[assignment]
+        body=b'{"access_token":"TOK","expires_in":1e300}'
+    )
+    before = time.monotonic()
+    assert provider.access_token() == "TOK"
+    assert provider._cached_expiry_monotonic <= before + 3600.0 + 1.0
+
+
 def test_asvs_191_smart_oauth_controls_exercised(rsa_pem: str) -> None:
     """BACKLOG #191 — drive the built SMART Backend Services outbound so the five ASVS L3 OAuth/JWS
     controls are demonstrably *effective*, not merely present: 9.1.2 (alg allowlist, no 'None'),

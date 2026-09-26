@@ -11,11 +11,13 @@ end-to-end dry-run-raises / router-raises behavior. Synthetic data only — neve
 
 from __future__ import annotations
 
+import asyncio
 import email.message
 import http.client
 import io
 import json
 import threading
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,8 +37,8 @@ from messagefoundry.config.wiring import (
     WiringError,
     build_inbound_connection,
 )
-from messagefoundry.pipeline import dryrun
-from messagefoundry.pipeline.wiring_runner import check_fhir_lookup_allowed
+from messagefoundry.pipeline import dryrun, wiring_runner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, check_fhir_lookup_allowed
 from messagefoundry.store import MessageStatus
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.bounded_read import AmbiguousFramingError
@@ -790,6 +792,83 @@ async def test_smart_token_url_over_the_length_limit_is_a_lookup_error(_ec_pem: 
         with pytest.raises(FhirLookupError) as err:
             await call()
         _assert_token_failure_is_a_lookup_error(err, ValueError, fhir_opener)
+
+
+class _HungTokenOpener:
+    """A token endpoint that does not answer until ``release`` is set, then answers with a token."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.answered = threading.Event()
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> _FakeResp:
+        self.release.wait(10)
+        self.answered.set()
+        return _FakeResp(json.dumps({"access_token": "tok", "expires_in": 300}).encode())
+
+
+async def test_a_hung_token_mint_reaches_the_handler_as_a_lookup_error(
+    _ec_pem: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #1980: the Handler bridge waits a bounded time for the whole read, and a mint that
+    # never answers once reached the Handler as the bridge's builtin TimeoutError. The bridge runs
+    # here exactly as a Handler's worker thread runs it, against a live loop, with the wait shrunk.
+    monkeypatch.setattr(wiring_runner, "_LOOKUP_RESULT_TIMEOUT_SECONDS", 0.2)
+    token_opener = _HungTokenOpener()
+    ex, fhir_opener = _smart_executor(_ec_pem, token_opener)
+    runner = types.SimpleNamespace(_fhir_lookup_executor=ex, _loop=asyncio.get_running_loop())
+    try:
+        with pytest.raises(FhirLookupError) as err:
+            await asyncio.to_thread(
+                RegistryRunner._run_fhir_lookup,
+                runner,  # type: ignore[arg-type]
+                "epic",
+                "Patient/123",
+            )
+    finally:
+        token_opener.release.set()
+    assert type(err.value) is FhirLookupError
+    assert isinstance(err.value.__cause__, TimeoutError)
+    assert "epic" in str(err.value) and "0.2s" in str(err.value)
+    # The orphaned read still finishes on the loop, as it did before the mapping.
+    assert await asyncio.to_thread(token_opener.answered.wait, 5)
+    for _ in range(100):
+        if fhir_opener.requests:
+            break
+        await asyncio.sleep(0.01)
+    assert len(fhir_opener.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        http.client.BadStatusLine("hello"),
+        http.client.LineTooLong("header line"),
+    ],
+    ids=["bad-status-line", "line-too-long"],
+)
+async def test_a_malformed_fhir_reply_is_a_lookup_error(exc: Exception) -> None:
+    # BACKLOG #1980: http.client raises these from the FHIR server's own reply, and neither is an
+    # OSError or a URLError, so both once escaped read and probe raw. Named by class only.
+    for call in ("read", "probe"):
+        ex, _ = _executor(exc=exc)
+        with pytest.raises(FhirLookupError) as err:
+            if call == "read":
+                await ex.read("epic", "Patient/123")
+            else:
+                await ex.test_connection("epic")
+        assert type(err.value) is FhirLookupError
+        assert err.value.__cause__ is exc
+        assert f"malformed HTTP reply ({type(exc).__name__})" in str(err.value)
+        assert "hello" not in str(err.value)
+
+
+async def test_remote_disconnected_keeps_the_os_error_wording() -> None:
+    # RemoteDisconnected is both an OSError and an HTTPException. The HTTPException arm sits after
+    # the OSError arm, so this reply keeps the wording it had.
+    ex, _ = _executor(exc=http.client.RemoteDisconnected("closed"))
+    with pytest.raises(FhirLookupError, match="failed: closed"):
+        await ex.read("epic", "Patient/123")
 
 
 # --- CapabilityStatement probe (AC-8) ----------------------------------------
