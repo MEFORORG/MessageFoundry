@@ -671,3 +671,157 @@ def test_an_existing_store_with_no_administrator_still_prompts_and_provisions(
     assert db.exists()
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+
+
+# --- BACKLOG #2034: the trust-anchor enforcement dial reaches this command -----------------------
+
+
+def _anchored_service_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hop: str, enforcement: str
+) -> Path:
+    """A service config whose AD (over LDAPS) or OIDC block names a real CA file.
+
+    ``AuthService`` checks that anchor when it is built, and this command builds one. The CA comes
+    from the byte-binding module's tiny PKI rather than a second copy of it here. Imported here, not
+    at module scope, so a collection error in that module does not take this whole file down.
+    """
+    from tests.test_trust_anchor_byte_binding import _make_ca
+
+    anchor = tmp_path / f"{hop}-ca.pem"
+    anchor.write_bytes(_make_ca(tmp_path, f"{hop}-ca").pem)
+    # A TOML literal string, so a Windows path needs no escaping. The secrets go in the environment,
+    # where the settings loader wants them. OIDC needs AD enabled too; there the AD block names no CA,
+    # so the OIDC anchor is the only one checked.
+    monkeypatch.setenv("MEFOR_AUTH_AD_BIND_PASSWORD", "not-a-real-password")
+    security = ""
+    auth = (
+        "ad_enabled = true\n"
+        'ad_server = "ldaps://dc1.example.test:636"\n'
+        'ad_user_search_base = "DC=example,DC=test"\n'
+        'ad_bind_dn = "CN=svc,DC=example,DC=test"\n'
+        'ad_domain = "example.test"\n'
+    )
+    if hop == "ad":
+        auth += f"ad_tls_ca_cert_file = '{anchor.as_posix()}'\n"
+    else:
+        monkeypatch.setenv("MEFOR_AUTH_OIDC_CLIENT_SECRET", "not-a-real-secret")
+        security = 'web_console_public_address = "https://ops.example"\n'
+        auth += (
+            "oidc_enabled = true\n"
+            'oidc_issuer = "https://idp.example"\n'
+            'oidc_client_id = "mefor-console"\n'
+            'oidc_authorization_endpoint = "https://idp.example/authorize"\n'
+            'oidc_token_endpoint = "https://idp.example/token"\n'
+            'oidc_jwks_uri = "https://idp.example/jwks"\n'
+            'oidc_allowed_endpoints = ["idp.example"]\n'
+            f"oidc_tls_ca_cert_file = '{anchor.as_posix()}'\n"
+        )
+    cfg = tmp_path / "service.toml"
+    cfg.write_text(
+        f'[security]\nenforcement = "{enforcement}"\n{security}[auth]\n{auth}', encoding="utf-8"
+    )
+    return cfg
+
+
+def _pin_verdict(monkeypatch: pytest.MonkeyPatch, *, owner_only: bool) -> None:
+    """Pin the anchor's ACL verdict with the byte-binding module's helper, so the result does not
+    depend on this machine's ACLs. Imported lazily for the reason given above."""
+    from tests.test_trust_anchor_byte_binding import _verdicts
+
+    _verdicts(monkeypatch, acl=owner_only, path=True)
+
+
+def _existing_empty_store(db: Path, key: str) -> None:
+    """A keyed store holding no Administrator: the state a refused start leaves behind. The command
+    then builds ``AuthService`` early, to ask whether an Administrator exists, before any prompt."""
+
+    async def create_empty() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        await store.close()
+
+    asyncio.run(create_empty())
+
+
+_HOPS = [pytest.param("ad", id="ad-ldaps"), pytest.param("oidc", id="oidc")]
+_STORES = ["fresh", "existing"]
+
+
+@pytest.mark.parametrize("hop", _HOPS)
+@pytest.mark.parametrize("store", _STORES)
+@pytest.mark.parametrize(
+    ("enforcement", "owner_only"),
+    [
+        pytest.param("warn", False, id="weak-anchor-at-warn"),
+        pytest.param("enforce", True, id="control-clean-anchor-at-enforce"),
+    ],
+)
+def test_the_command_provisions_where_serve_would_start(
+    hop: str,
+    store: str,
+    enforcement: str,
+    owner_only: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """At ``warn``, ``serve`` warns about an anchor others can write and starts. So must this.
+
+    The command built ``AuthService`` with no dial, which enforces, so it refused where ``serve``
+    only warned. The control is a clean anchor at ``enforce``: it provisions with no anchor warning,
+    so the refusal below comes from the verdict and not from the config. Text mode, not ``--json``:
+    ``--json`` replaces the root handler caplog reads. Both stores, because each builds
+    ``AuthService`` at a different point and each build must carry the dial.
+    """
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    _pin_verdict(monkeypatch, owner_only=owner_only)
+    cfg = _anchored_service_config(tmp_path, monkeypatch, hop, enforcement)
+    db = tmp_path / "p.db"
+    if store == "existing":
+        _existing_empty_store(db, key)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    assert main([*argv, "--db", str(db)]) == 0
+    assert "OK: created Administrator" in capsys.readouterr().out
+    warned = [r.getMessage() for r in caplog.records if "writable by a non-owner" in r.getMessage()]
+    if owner_only:
+        assert warned == []
+    else:
+        assert warned and all("enforcement=warn, starting anyway" in m for m in warned)
+
+
+@pytest.mark.parametrize("hop", _HOPS)
+@pytest.mark.parametrize("store", _STORES)
+def test_a_weak_anchor_is_refused_cleanly_at_enforce(
+    hop: str,
+    store: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """At ``enforce`` the command refuses, in words and with exit 1, never as a traceback.
+
+    Both arms that build ``AuthService`` are covered. On an existing store the early "is there an
+    Administrator" answer builds it, before the prompt. On a fresh one nothing is built until the
+    write, after the prompt.
+    """
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    _pin_verdict(monkeypatch, owner_only=False)
+    cfg = _anchored_service_config(tmp_path, monkeypatch, hop, "enforce")
+    db = tmp_path / "p.db"
+    if store == "existing":
+        _existing_empty_store(db, key)
+        _no_prompt(monkeypatch)
+    else:
+        _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    assert main([*argv, "--db", str(db), "--json"]) == 1
+    captured = capsys.readouterr()
+    error = json.loads(captured.out)["error"]
+    # The anchor's own refusal, and this command's line after it: not the dispatch floor's report.
+    assert "writable by a non-owner" in error and "enforcement=enforce refuses" in error
+    assert "provisioned nothing" in error
+    assert "Traceback" not in captured.out + captured.err

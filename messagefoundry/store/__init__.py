@@ -22,6 +22,7 @@ from messagefoundry.store.base import (
     sqlite_settings,
 )
 from messagefoundry.store.document_strip import StripResult
+from messagefoundry.store.schema_verify import SchemaMismatchError
 from messagefoundry.store.store import (
     ClaimAbortPhase,
     ClaimedHeads,
@@ -49,6 +50,7 @@ __all__ = [
     "OutboxStatus",
     "QueueStore",
     "Row",
+    "SchemaMismatchError",
     "SecretRotationMetaRow",
     "SecretRotationMetaStore",
     "Stage",

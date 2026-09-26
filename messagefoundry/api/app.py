@@ -230,6 +230,7 @@ from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
     make_registry_anchor_preflight,
+    make_settings_anchor_preflight,
     run_anchor_preflight,
 )
 from messagefoundry.config.ai_policy import (
@@ -749,10 +750,10 @@ def _build_approval_gate(
 
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
         # Load-bearing dual-control guard (findings #1/#4/#11): ApprovalGate.approve runs THIS executor
-        # directly (purge_connection is NOT re-entered on the release path), and it flips the row to
-        # 'approved' BEFORE executing — so the require-quiesced precondition must be re-checked HERE, and
-        # a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise by rolling the row
-        # to 'failed' and auditing it, so a raise no longer strands it approved-but-unexecuted; skipping
+        # directly (purge_connection is NOT re-entered on the release path), and it claims the row
+        # ('executing', BACKLOG #1562) BEFORE executing — so the require-quiesced precondition must be
+        # re-checked HERE, and a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise
+        # by rolling the row to 'failed' and auditing it, so a raise no longer strands it; skipping
         # is still the better outcome HERE, because a non-quiesced outbound is a retryable precondition
         # miss the operator can clear, not a failed operation.) A non-quiesced
         # (running/stopping) outbound could have an INFLIGHT row cancel_queued cannot cancel, so purging
@@ -786,7 +787,26 @@ def _build_approval_gate(
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
-        outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+        try:
+            outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+        except WiringError as exc:
+            # BACKLOG #2034: a release the engine refuses (a settings or inbound trust anchor, or a
+            # bad config) answers 422 and records the row the inline route records, rather than
+            # escaping the approve route as a 500. The gate still marks the approval failed.
+            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+            _log.warning("released config reload refused: %s", exc)
+            await engine.store.record_audit(
+                "config_reload_failed",
+                actor=actor,
+                detail=json.dumps(
+                    {
+                        "requested": config_dir,
+                        "dry_run": False,
+                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
+                    }
+                ),
+            )
+            raise ApprovalError(422, "invalid configuration") from exc
         registry = outcome.registry
         # BACKLOG #1940: the graph has swapped. A raise here would be compensated into 'failed' for
         # a reload that ran, so log instead; approval.approved still records the release.
@@ -1289,19 +1309,24 @@ async def _guard_resubmission(
 
     The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
     of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal counts hl7apy's
-    errors rather than quoting them, since that text can echo a field value."""
+    errors rather than quoting them, since that text can echo a field value.
+
+    The 4xx is raised after the handler has ended, with only the phase and reason kept, so the caught
+    error is on neither of its chains (BACKLOG #1796). ``from None`` would leave it on
+    ``__context__``, and a guard error's own chain has held the whole body."""
     try:
         return await admit_resubmission(raw, inbound)
     except IngressGuardError as exc:
-        await engine.store.record_audit(
-            action,
-            actor=identity.username,
-            channel_id=channel_id,
-            detail=json.dumps({**detail, "phase": exc.phase, "reason": exc.reason}),
-            client=client_ip(request),
-        )
-        _log.warning("%s: refused by the ingress guards (phase=%s)", action, exc.phase)
-        raise HTTPException(_INGRESS_GUARD_STATUS[exc.phase], exc.reason) from None
+        phase, reason = exc.phase, exc.reason
+    await engine.store.record_audit(
+        action,
+        actor=identity.username,
+        channel_id=channel_id,
+        detail=json.dumps({**detail, "phase": phase, "reason": reason}),
+        client=client_ip(request),
+    )
+    _log.warning("%s: refused by the ingress guards (phase=%s)", action, phase)
+    raise HTTPException(_INGRESS_GUARD_STATUS[phase], reason)
 
 
 async def _audit_channel_denied(
@@ -3556,29 +3581,10 @@ def create_app(
                     operation="config_reload",
                     detail="held for a second approver (dual-control)",
                 )
-        # #285 (ASVS 6.7.1): re-verify the operator-supplied trust anchors on every real deploy, BEFORE
-        # the graph swap — the on-disk PEMs are re-read, so a swapped anchor is audited (auth.trust_anchor)
-        # and a pinned-but-substituted / (under enforce) newly group-writable anchor REFUSES the deploy
-        # (422) rather than converging onto a tampered CA. Dormant (no-op) when no anchor is configured.
-        anchor_specs = getattr(request.app.state, "trust_anchor_specs", ())
-        if anchor_specs and not req.dry_run:
-            try:
-                await run_anchor_preflight(
-                    anchor_specs,
-                    engine.store,
-                    enforcing=getattr(request.app.state, "trust_anchors_enforcing", True),
-                )
-            except (TrustAnchorError, OSError) as exc:
-                _log.warning("config reload refused (trust anchor): %s", exc)
-                await engine.store.record_audit(
-                    "config_reload_failed",
-                    actor=user.username,
-                    detail=json.dumps(
-                        {"requested": req.config_dir, "dry_run": False, "reason": "trust_anchor"}
-                    ),
-                    client=client_ip(request),
-                )
-                raise HTTPException(422, "invalid configuration") from exc
+        # #285 (ASVS 6.7.1): the engine re-verifies the settings trust anchors first on every real
+        # reload, so a swapped or newly exposed anchor refuses the deploy (422, audited as
+        # reason="trust_anchor" below). It moved there from this route in BACKLOG #2034, so a held,
+        # convergence or DR reload runs it too.
         try:
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
@@ -3611,11 +3617,15 @@ def create_app(
             )
             raise HTTPException(404, "config directory not found") from exc
         except WiringError as exc:
-            _log.warning("config reload failed (invalid config): %s", exc)
-            # An inbound connection's trust anchor (BACKLOG #1142, slice 3) is refused inside the
-            # engine and arrives wrapped. It keeps the reason the settings anchors' refusal above
-            # records, so one filter on reason="trust_anchor" sees both.
+            # A trust anchor refused inside the engine arrives wrapped: an inbound connection's CA
+            # (BACKLOG #1142, slice 3) or a settings anchor (BACKLOG #2034). Both record
+            # reason="trust_anchor", so one audit filter sees both.
             anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+            _log.warning(
+                "config reload %s: %s",
+                "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
+                exc,
+            )
             await engine.store.record_audit(
                 "config_reload_failed",
                 actor=user.username,
@@ -7370,6 +7380,12 @@ def create_managed_app(
             registry_preflight=make_registry_anchor_preflight(
                 store, enforcing=trust_anchors_enforcing
             ),
+            # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA), re-verified by
+            # the engine on EVERY real reload, not only the direct /config/reload route. None when
+            # no settings anchor is configured.
+            settings_preflight=make_settings_anchor_preflight(
+                trust_anchor_specs, store, enforcing=trust_anchors_enforcing
+            ),
         )
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
@@ -7430,10 +7446,6 @@ def create_managed_app(
 
                 notifier.set_control_callback(_alert_control)
             app.state.engine = engine
-            # #285: stash the trust anchors so /config/reload re-verifies the on-disk PEMs (a swapped anchor
-            # is caught + audited, a pinned-but-substituted anchor refuses the deploy) — the reload seam.
-            app.state.trust_anchor_specs = tuple(trust_anchor_specs)
-            app.state.trust_anchors_enforcing = trust_anchors_enforcing
             app.state.store_settings = resolved  # back GET /security/posture (M5)
             # BACKLOG #1182: the settings half of the static-credential inventory, for the same route.
             app.state.static_credential_settings = static_credential_settings

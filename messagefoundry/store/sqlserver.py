@@ -106,6 +106,8 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _SESSION_LIVE_SQL,
+    _SESSION_NOT_AHEAD_SQL,
     AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
     MESSAGE_EVENT_KINDS,
@@ -154,6 +156,7 @@ from messagefoundry.store.store import (
     _append_channel_scope,
     _opt_float,
     _qmark_cutoff_case,
+    _session_live_params,
     audit_active_key_id,
     audit_append_secret,
     audit_rekey_when_keyed,
@@ -432,6 +435,24 @@ _SQL_STATE_MERGE: Final[str] = (
     " WHEN NOT MATCHED THEN INSERT (namespace, [key], value, set_at, message_id)"
     " VALUES (?,?,?,?,?);"
 )
+
+
+# BACKLOG #1628: how many times, and how far apart, the open-time RCSI check re-reads the state after
+# its own ALTER failed. Engine shards and cluster nodes open concurrently, so on a greenfield database
+# a peer's ALTER ... WITH ROLLBACK IMMEDIATE can kill ours or hold the lock ours needs, while RCSI ends
+# up ON all the same. A few spaced re-reads on a fresh connection tell that race from a real denial.
+_RCSI_REREADS: Final[int] = 3
+_RCSI_REREAD_DELAY_S: Final[float] = 1.0
+
+
+def _rcsi_remedy(database: str | None) -> str:
+    """The one statement a DBA runs to enable RCSI, with the name bracket-escaped (``]`` doubled) so
+    a database name containing ``]`` still yields a statement that runs."""
+    name = (database or "").replace("]", "]]")
+    return (
+        f"a DBA must run once: ALTER DATABASE [{name}] SET READ_COMMITTED_SNAPSHOT ON"
+        " WITH ROLLBACK IMMEDIATE"
+    )
 
 
 def _applock_timeout_ms(command_timeout: int) -> int:
@@ -1844,7 +1865,11 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
         "DRIVER={ODBC Driver 18 for SQL Server}",
         f"SERVER={settings.server},{settings.port}",  # server validated; port is an int
         f"DATABASE={_odbc_brace(settings.database or '')}",
-        f"Connection Timeout={settings.connect_timeout}",
+        # No login-timeout keyword here, on purpose (BACKLOG #1626). `Connection Timeout=` is an
+        # ADO.NET keyword that ODBC Driver 18 silently ignores: measured against a black-hole address,
+        # a DSN carrying `Connection Timeout=2` still waited 15.1 s, the same as no timeout at all.
+        # The driver's login timeout is SQL_ATTR_LOGIN_TIMEOUT, which pyodbc sets from its `timeout=`
+        # argument, so every connect site passes `timeout=settings.connect_timeout` instead.
         f"APP={_odbc_brace(settings.application_name)}",
     ]
     if settings.auth is SqlAuth.SQL:
@@ -2451,7 +2476,9 @@ class SqlServerStore:
         import aioodbc
 
         return await aioodbc.connect(
-            dsn=connection_string(self._settings, posture=self._posture), autocommit=False
+            dsn=connection_string(self._settings, posture=self._posture),
+            autocommit=False,
+            timeout=self._settings.connect_timeout,  # the LOGIN timeout (#1626), not a DSN keyword
         )
 
     @asynccontextmanager
@@ -2654,6 +2681,9 @@ class SqlServerStore:
                 maxsize=max(1, settings.pool_size),
                 autocommit=False,
                 executor=executor,
+                # aioodbc hands this through to every pyodbc.connect the pool makes, where it is the
+                # LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT). The DSN cannot carry it (#1626).
+                timeout=settings.connect_timeout,
             )
         except Exception:
             # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
@@ -3038,19 +3068,71 @@ class SqlServerStore:
         load (concurrency_fixes (a)). Runs on its OWN autocommit connection BEFORE the pool is
         created, so the momentary exclusivity of ``WITH ROLLBACK IMMEDIATE`` has no sibling MEFOR
         session to terminate; IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
-        (greenfield first boot) and every later open()/failover is a detect-and-skip no-op. Degrades
-        to a warning (never fails open()) when the principal lacks ALTER DATABASE or the lock cannot
-        be taken — emitting the exact statement for a DBA to run out-of-band."""
+        (greenfield first boot) and every later open()/failover is a detect-and-skip no-op.
+
+        **FAILS CLOSED when RCSI is off and cannot be turned on (BACKLOG #1628).** This used to degrade
+        to a warning when the principal lacked ``ALTER DATABASE``, which is exactly the least-privilege
+        login ``docs/DEPLOY-SERVER-DB.md`` §1.1 prescribes. Under locking READ COMMITTED the finalizer
+        deadlocks, whatever the claim mode: a caller UPDATEs its own queue row, then
+        :meth:`_maybe_finalize` takes the per-message applock and scans the message's rows, and that
+        scan waits for a SHARED lock on a sibling's row the sibling holds EXCLUSIVELY while it waits on
+        the same applock. Fable packet 4 (P4-05 / H-8) measured 29 of 30 concurrent fan-out finalizes
+        fail that way, the message left unfinalized. The fix it named first, taking the applock before
+        each caller's own row write, would move the lock in every finalizing primitive (about twenty,
+        with async, batched and sync twins); refusing the mode instead keeps one invariant in one place,
+        and every other correctness argument in this file already assumes RCSI on. So the open refuses,
+        naming the statement a DBA runs once. It also refuses when the probe cannot connect or cannot
+        read the state, since either way RCSI is unverified, and a pool opened after a transient probe
+        failure would run in exactly the mode this check exists to exclude.
+        ``ALLOW_SNAPSHOT_ISOLATION`` still only warns: no store path depends on it.
+
+        Concurrent opens (engine shards, cluster nodes) are handled only where our own ALTER fails:
+        the state is re-read on fresh connections and a peer's successful ALTER lets the open go on.
+        A narrower window stays: a peer's ``ROLLBACK IMMEDIATE`` landing on our initial connect or
+        state read still fails this open, and a restart recovers it. Pre-enabling RCSI, as the deploy
+        docs require for a least-privilege login, closes it entirely."""
         import aioodbc
 
         db = settings.database
+        remedy = _rcsi_remedy(db)
+        dsn = connection_string(settings, posture=posture)
+
+        async def _rcsi_on_after_a_peer() -> bool:
+            """Re-read RCSI on FRESH connections after our ALTER failed: a concurrent opener's ALTER
+            may have killed our session yet turned RCSI on. Any failure to read counts as OFF."""
+            for attempt in range(_RCSI_REREADS):
+                if attempt:
+                    await asyncio.sleep(_RCSI_REREAD_DELAY_S)
+                try:
+                    probe = await aioodbc.connect(
+                        dsn=dsn, autocommit=True, timeout=settings.connect_timeout
+                    )
+                    try:
+                        pcur = await probe.cursor()
+                        await pcur.execute(
+                            "SELECT is_read_committed_snapshot_on FROM sys.databases"
+                            " WHERE name = DB_NAME()"
+                        )
+                        prow = await pcur.fetchone()
+                    finally:
+                        await probe.close()
+                except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
+                    log.debug("RCSI re-read on %r failed", db, exc_info=True)
+                    continue
+                if prow is not None and prow[0]:
+                    return True
+            return False
+
         try:
             conn = await aioodbc.connect(
-                dsn=connection_string(settings, posture=posture), autocommit=True
+                dsn=connection_string(settings, posture=posture),
+                autocommit=True,
+                timeout=settings.connect_timeout,  # the LOGIN timeout (#1626)
             )
-        except Exception as exc:  # noqa: BLE001 - the pool open below surfaces a real connect failure
-            log.warning("skipping the RCSI check on %r (could not connect): %s", db, exc)
-            return
+        except Exception as exc:
+            raise RuntimeError(
+                f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
+            ) from exc
         try:
             # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
             # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
@@ -3061,24 +3143,36 @@ class SqlServerStore:
                 "FROM sys.databases WHERE name = DB_NAME()"
             )
             row = await cur.fetchone()
-            # If we cannot read the state, do NOT attempt a disruptive ALTER.
-            rcsi_on = bool(row[0]) if row else True
-            snapshot_on = (row[1] in (1, 2)) if row else True
-            if not rcsi_on:
+            if row is None:
+                # The connected database is always visible to its own login in sys.databases, so a
+                # missing row is not a state to guess at. Do NOT attempt a disruptive ALTER; refuse.
+                raise RuntimeError(
+                    f"could not read the READ_COMMITTED_SNAPSHOT state of database {db!r}, so it is"
+                    f" unverified; {remedy}, and the login must be able to read its own"
+                    " sys.databases row -- refusing to open the store (fail closed)"
+                )
+            snapshot_on = row[1] in (1, 2)
+            if not row[0]:
                 try:
                     await cur.execute(
                         "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
-                except Exception as exc:  # noqa: BLE001 - permission/lock: degrade to a DBA pointer
-                    log.warning(
-                        "could not enable READ_COMMITTED_SNAPSHOT on %r (%s); a DBA should run once: "
-                        "ALTER DATABASE [%s] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE — "
-                        "without it the staged claim/finalize paths are more deadlock-prone under load",
+                except Exception as exc:
+                    if not await _rcsi_on_after_a_peer():
+                        raise RuntimeError(
+                            f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
+                            f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
+                            " under locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
+                        ) from exc
+                    log.info(
+                        "READ_COMMITTED_SNAPSHOT on %r was enabled by a concurrent opener (%s)",
                         db,
                         exc,
-                        db,
                     )
+                    # Our connection may be dead, and the peer's open runs the same snapshot step,
+                    # so a warning from a doomed ALTER here would only mislead.
+                    snapshot_on = True
             if not snapshot_on:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
@@ -3086,16 +3180,21 @@ class SqlServerStore:
                 except Exception as exc:  # noqa: BLE001 - non-fatal
                     log.warning("could not enable ALLOW_SNAPSHOT_ISOLATION on %r: %s", db, exc)
         finally:
-            await conn.close()
+            try:
+                await conn.close()
+            except Exception:  # noqa: BLE001 - a peer's ROLLBACK IMMEDIATE may have killed it
+                log.debug("RCSI probe connection close failed", exc_info=True)
 
     async def require_rcsi_for_pooled(self) -> None:
         """Hard-verify READ_COMMITTED_SNAPSHOT is ON — the pooled claim mode's startup gate (ADR 0066
         §3.3). :meth:`claim_fifo_heads`' STEP-1 discovery is a plain committed-snapshot read whose
         non-blocking guarantee (EMPTY-on-locked-head; a shared claimer connection never pinned in a
-        lock-wait) DEPENDS on RCSI. :meth:`_ensure_database_options` force-enables it at open but
-        deliberately degrades to a warning on a locked-down DB — acceptable for the per-lane claims
-        (they block by design), NOT for pooled mode, which must **fail closed** here rather than
-        silently claim with blocking discovery reads. Same state query as the open-time check. The
+        lock-wait) DEPENDS on RCSI. :meth:`_ensure_database_options` now fails the open itself when
+        RCSI is off and cannot be enabled (BACKLOG #1628: the finalizer deadlocks under locking READ
+        COMMITTED in EVERY claim mode, so the old per-lane warning fallback was not safe either). So
+        this gate can only fire when RCSI was switched off after this store opened, and
+        ``[pipeline].require_rcsi_for_pooled=false`` no longer lets a store open with RCSI off. Same
+        state query as the open-time check. The
         runner awaits this at pooled ``start()`` (ADR 0066 §5): under
         ``[pipeline].require_rcsi_for_pooled`` a raise unwinds the start; false downgrades it to a
         loud warning + a ``/stats`` degraded gauge. Raises with the exact DBA remediation statement."""
@@ -3106,8 +3205,7 @@ class SqlServerStore:
             db = self._settings.database
             raise RuntimeError(
                 f"pooled claim mode requires READ_COMMITTED_SNAPSHOT on database {db!r} and it is"
-                f" OFF; a DBA must run once: ALTER DATABASE [{db}] SET READ_COMMITTED_SNAPSHOT ON"
-                " WITH ROLLBACK IMMEDIATE — refusing to start pooled claimers (fail closed)"
+                f" OFF; {_rcsi_remedy(db)} — refusing to start pooled claimers (fail closed)"
             )
 
     async def probe_principal_privileges(self) -> StorePrivilegeReport:
@@ -3366,9 +3464,12 @@ class SqlServerStore:
         import pyodbc
 
         dsn = connection_string(self._settings, posture=self._posture)
+        login_timeout = self._settings.connect_timeout
 
         def _factory() -> Any:
-            conn = pyodbc.connect(dsn, autocommit=False)
+            # `timeout=` is pyodbc's LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT, #1626); `conn.timeout`
+            # below is the separate per-statement bound.
+            conn = pyodbc.connect(dsn, autocommit=False, timeout=login_timeout)
             conn.timeout = ct  # seconds; finite (ct==0 refused above) — per-statement bound
             return conn
 
@@ -3415,7 +3516,9 @@ class SqlServerStore:
     async def _acquire(self) -> AsyncIterator[Any]:
         """Acquire a pooled connection with the configured command (statement) timeout applied.
 
-        ``Connection Timeout`` in the DSN is only the *login* timeout; the per-statement timeout is a
+        ``[store].connect_timeout`` is only the *login* timeout, and it reaches the driver as
+        pyodbc's ``timeout=`` argument at pool creation, never as a DSN keyword: ODBC Driver 18
+        ignores ``Connection Timeout`` (BACKLOG #1626). The per-statement timeout is a separate
         pyodbc **connection** attribute (STORE-3). aioodbc's wrapper exposes ``timeout`` read-only, so
         we set it on the underlying ``pyodbc.Connection`` (``_conn``); aioodbc 0.5.0 has no creation
         hook (``after_created``), so we apply it per-acquire (an idempotent int assignment). The prior
@@ -3428,7 +3531,7 @@ class SqlServerStore:
         pooled connection as the pool saturates. Read-only/additive — the timing never changes the
         acquired connection or its release.
 
-        BACKLOG #1052: that same chokepoint is where the borrow is BOUNDED. ``Connection Timeout``
+        BACKLOG #1052: that same chokepoint is where the borrow is BOUNDED. ``connect_timeout``
         bounds the login and ``command_timeout`` the statement; neither bounds the wait for a free
         pooled connection, so a wedged pool blocked the acquiring task forever. ``acquire_pooled``
         raises :class:`~messagefoundry.store.base.StoreAcquireTimeout` at
@@ -10046,6 +10149,7 @@ class SqlServerStore:
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
+        adopt_notify_email: bool = True,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -10059,7 +10163,7 @@ class SqlServerStore:
                 auth_provider,
                 display_name,
                 email,
-                seed_notify_email(email),
+                seed_notify_email(email) if adopt_notify_email else None,
                 now,
                 now,
                 password_hash,
@@ -10918,19 +11022,22 @@ class SqlServerStore:
         return int(count) if count is not None else 0
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, now: float | None = None
+        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
     ) -> None:
-        """Revoke a user's active sessions beyond the ``keep`` most recently created (AUTH-SESS-CAP)."""
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
+        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+            f" AND {_SESSION_NOT_AHEAD_SQL}"
             " AND token_hash NOT IN ("
             "  SELECT TOP (?) token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+            f"  AND {_SESSION_LIVE_SQL}"
             "  ORDER BY created_at DESC, token_hash DESC"
             ")",
-            (now, user_id, keep, user_id),
+            (now, user_id, now, now, keep, user_id, *_session_live_params(now, idle_seconds)),
         )
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:
