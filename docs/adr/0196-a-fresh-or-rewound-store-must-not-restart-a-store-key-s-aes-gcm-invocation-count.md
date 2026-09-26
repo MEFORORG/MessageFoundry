@@ -1,8 +1,14 @@
 # 0196 — A fresh or rewound store must not restart a store key's AES-GCM invocation count
 
-- **Status:** Proposed (2026-09-26). An options memo with the drafter's recommendation. The owner
-  accepts or rejects it, and no code may follow until it is Accepted. BACKLOG #2070 stays open until
-  then; its closing step 1 asks for exactly this record before any build.
+- **Status:** **Accepted -- 2026-09-26, by an owner ruling given to a Manager seat.** The owner
+  accepted the drafter's recommendation, choosing the option labelled "C+ per-store sub-key
+  (Recommended)". The ruling is posted on engine PR 1655. The build may start. The chosen option
+  settles one item under *To resolve on acceptance*, and one more is a build list rather than a
+  choice. Five stay open, and the build brief must settle each; that section says which.
+  > **Superseded status text, kept as a record.** Until 2026-09-26 this line read: *"Proposed
+  > (2026-09-26). An options memo with the drafter's recommendation. The owner accepts or rejects it,
+  > and no code may follow until it is Accepted. BACKLOG #2070 stays open until then; its closing step
+  > 1 asks for exactly this record before any build."*
 - **Date:** 2026-09-26
 - **Related:** BACKLOG #2070 (the row this answers) ·
   [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md), amendment 2026-07-22 (the persisted
@@ -135,8 +141,14 @@ state, not an act.
 
 ## Decision
 
-**None. This memo does not choose.** It lays out the options with their costs and gives one drafter's
-recommendation, which the owner may take or reject.
+**Owner ruling, 2026-09-26: option C+.** The owner accepted the drafter's recommendation, choosing the
+option labelled "C+ per-store sub-key (Recommended)". The label names the option. It does not name
+where the salt lives or how the residual routes are handled, which the drafter's recommendation also
+covered. *To resolve on acceptance* keeps both open for the build brief.
+
+> **Superseded decision text, kept as a record.** Until 2026-09-26 this section read: *"**None. This
+> memo does not choose.** It lays out the options with their costs and gives one drafter's
+> recommendation, which the owner may take or reject."*
 
 ## Options considered
 
@@ -405,22 +417,30 @@ Manager-dispatched vault Builder once something is built.
 
 ## To resolve on acceptance
 
-- [ ] **The shape.** C+, A with D, B as an opt-in, or something else. This is the owner's ruling and
-      the reason the status is Proposed.
-- [ ] **Where the salt lives**, if C or C+: one row, or each value's marker.
-- [ ] **The residual routes.** Accept a copy or rewind the engine never sees as a documented limit,
-      or ask for B as an opt-in for sites that run Vault or a KMS.
+- [x] **The shape.** C+, A with D, B as an opt-in, or something else. This is the owner's ruling and the
+      reason the status is Proposed. **Settled 2026-09-26:** C+, by the owner ruling.
+- [ ] **Where the salt lives**, if C or C+: one row, or each value's marker. **Open for the build.** The
+      owner ruling does not settle this, so the build brief must. The drafter recommended each value's
+      marker (sub-choice 2); the ruling's label does not name it.
+- [ ] **The residual routes.** Accept a copy or rewind the engine never sees as a documented limit, or
+      ask for B as an opt-in for sites that run Vault or a KMS. **Open for the build.** The owner ruling
+      does not settle this, so the build brief must.
 - [ ] **The key-age half.** Accept the floor with the #1004 consequence recorded, or add an ENFORCE
-      refusal for a fresh keyed store with no stamp.
+      refusal for a fresh keyed store with no stamp. **Open for the build.** The owner ruling does not
+      settle this, so the build brief must.
 - [ ] **How the salt reaches the cipher.** `open_store` builds every store's cipher with
-      `build_store_cipher` before the backend opens, and so does `dr_backup._decrypt_check`. Under C
-      the salt lives in the store, so the cipher must learn it after open, or the order must change.
-- [ ] **The four gaps found in review.** The backup run that fails mid-build, the quiet fallback on
-      a failing counter write, the full restore-verify's scratch open, and the DR codec that never
+      `build_store_cipher` before the backend opens, and so does `dr_backup._decrypt_check`. Under C the
+      salt lives in the store, so the cipher must learn it after open, or the order must change. **Open
+      for the build.** The owner ruling does not settle this, so the build brief must.
+- [ ] **The four gaps found in review.** The backup run that fails mid-build, the quiet fallback on a
+      failing counter write, the full restore-verify's scratch open, and the DR codec that never
       consults the ceiling. Say whether AC-6 and AC-8 stay in this build or move to their own ledger
-      items, and what handles the other two.
-- [ ] **Text to update in the same build**, at least: PR 1629's keyed remedy ("would zero its AES-GCM
-      use count") and the comment above it in `schema_verify.py`; the "Rotation semantics" paragraph
-      in `gcm_bound.py`; the `cipher_meta` DDL comment in `store.py`; the invocation-bound comment in
-      `crypto.py` and the `_count_invocation` error text; the `_rotate_key` docstring; and the
-      "Rotation semantics" paragraph of ADR 0019's 2026-07-22 amendment.
+      items, and what handles the other two. **Open for the build.** The owner ruling does not settle
+      this, so the build brief must.
+- [x] **Not a choice; carried to the build.** The accepted option makes these corrections part of the
+      build, and the build brief must list them. **Text to update in the same build**, at least: PR
+      1629's keyed remedy ("would zero its AES-GCM use count") and the comment above it in
+      `schema_verify.py`; the "Rotation semantics" paragraph in `gcm_bound.py`; the `cipher_meta` DDL
+      comment in `store.py`; the invocation-bound comment in `crypto.py` and the `_count_invocation`
+      error text; the `_rotate_key` docstring; and the "Rotation semantics" paragraph of ADR 0019's
+      2026-07-22 amendment.

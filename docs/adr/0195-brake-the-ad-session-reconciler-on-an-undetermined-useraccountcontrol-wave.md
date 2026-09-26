@@ -1,6 +1,12 @@
 # ADR 0195 — Brake the AD session reconciler on an undetermined userAccountControl wave
 
-- **Status:** Proposed -- for the owner to accept. No code until Accepted.
+- **Status:** **Accepted -- 2026-09-26, by an owner ruling given to a Manager seat.** The owner
+  accepted the drafter's recommendation, choosing the option labelled "Accept option 5 (Recommended)".
+  The ruling is posted on engine PR 1655. The build may start. The chosen option settles one item under
+  *To resolve on acceptance*, and one more is a build list rather than a choice. Four stay open, and
+  the build brief must settle each; that section says which.
+  > **Superseded status text, kept as a record.** Until 2026-09-26 this line read: *"Proposed -- for
+  > the owner to accept. No code until Accepted."*
   <!-- Proposed (no code yet) -> Accepted (build may start) -> Superseded by NNNN / Rejected -->
 - **Date:** 2026-09-26
 - **Related:** [ADR 0079](0079-kerberos-idp-session-coordination.md) (mechanism 2, the directory
@@ -120,6 +126,10 @@ one organizational unit (OU) holding 40 signed-in users, out of 200 probed.
   `tests/test_ad_user_account_control.py` says the same about its own doubles.
 
 ## Decision
+
+**Owner ruling, 2026-09-26: accepted.** The owner chose the option labelled "Accept option 5
+(Recommended)", which accepts the drafter's recommendation below. The text that follows is kept as it
+was written when this ADR was Proposed.
 
 **Proposed, the drafter's recommendation: option 5, holding only the undetermined accounts, with the
 count taken across the probe rotation.** Confidence: **medium-high** on a distinct outcome plus a
@@ -275,18 +285,25 @@ reopen it.
 
 ## To resolve on acceptance
 
-- [ ] Hold only the undetermined accounts (recommended), or abort the whole pass through the
-      existing `plan.aborted` path.
+- [x] Hold only the undetermined accounts (recommended), or abort the whole pass through the existing
+      `plan.aborted` path. **Settled 2026-09-26 by the chosen option itself.** Option 5, as defined
+      under *Options considered*, holds every undetermined account and reconciles the rest of the estate
+      as today. The whole-pass abort is not taken.
 - [ ] Is the count of one a fixed rule (recommended; there is no deploying site to tune for) or a new
-      `[auth]` setting?
-- [ ] Names: the held audit action, the alert type, and the reason slug.
+      `[auth]` setting? **Open for the build.** The owner ruling does not settle this, so the build
+      brief must. Option 5 fixes the count at one; the ruling does not say whether that one is fixed or
+      configurable.
+- [ ] Names: the held audit action, the alert type, and the reason slug. **Open for the build.** The
+      owner ruling does not settle this, so the build brief must.
 - [ ] The revocation `reason` for `DISABLED` and a single `UNDETERMINED`. Keeping `directory_absent`
-      leaves audit readers and the AC-3 test unchanged. A new reason tells an operator more.
+      leaves audit readers and the AC-3 test unchanged. A new reason tells an operator more. **Open for
+      the build.** The owner ruling does not settle this, so the build brief must.
 - [ ] Whether ADR 0079's "Acknowledged floor" paragraph and its Consequences residual get a dated
-      pointer amendment to this ADR. The drafter's lean is yes, since both argue the opposite for
-      this case.
-- [ ] Prose the build must correct, at least: the comment above `ad_session_revoke_max` in
-      `config/settings.py` (BACKLOG #2039 closing item 5); the `_account_enabled` warning text, which
-      says the reconciler reads these accounts as absent; the `reconcile.py` module docstring and the
-      `ProbeOutcome.ABSENT` docstring; the `_search_user` comment and the `_probe_principal`
-      docstring; and both tests AC-1 and AC-2 replace.
+      pointer amendment to this ADR. The drafter's lean is yes, since both argue the opposite for this
+      case. **Open for the build.** The owner ruling does not settle this, so the build brief must.
+- [x] **Not a choice; carried to the build.** The accepted option makes these corrections part of the
+      build, and the build brief must list them. Prose the build must correct, at least: the comment
+      above `ad_session_revoke_max` in `config/settings.py` (BACKLOG #2039 closing item 5); the
+      `_account_enabled` warning text, which says the reconciler reads these accounts as absent; the
+      `reconcile.py` module docstring and the `ProbeOutcome.ABSENT` docstring; the `_search_user`
+      comment and the `_probe_principal` docstring; and both tests AC-1 and AC-2 replace.
