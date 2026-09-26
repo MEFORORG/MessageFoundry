@@ -1004,7 +1004,7 @@ the row to one of three outcomes:
 | Status | Meaning | Audit row (against the approver) |
 |---|---|---|
 | `approved` | The operation ran and returned | `approval.approved` |
-| `failed` | The operation raised, so it did not complete | `approval.failed` |
+| `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
 | `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be

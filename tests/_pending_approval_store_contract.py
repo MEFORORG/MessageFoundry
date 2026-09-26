@@ -148,15 +148,19 @@ async def _status(store: Any, approval_id: str) -> str:
     return str(row["status"])
 
 
+_OUTCOME_ACTIONS = ("approval.approved", "approval.failed", "approval.interrupted")
+
+
 async def _audit_actions(store: Any, approval_id: str) -> list[str]:
-    """This request's audit actions. Filtered on the id, because the server legs share one log."""
-    rows = await store.list_audit(limit=500)
-    return [
-        str(r["action"])
-        for r in rows
-        if str(r["action"]).startswith("approval.")
-        and json.loads(str(r["detail"])).get("approval_id") == approval_id
-    ]
+    """This request's outcome audit actions. Read per action and filtered on the id, because the
+    server legs share one log: a plain newest-N read could miss this request's row under load and
+    turn an absence assertion vacuous."""
+    found: list[str] = []
+    for action in _OUTCOME_ACTIONS:
+        for r in await store.list_audit(action=action, limit=500):
+            if json.loads(str(r["detail"])).get("approval_id") == approval_id:
+                found.append(action)
+    return found
 
 
 async def _assert_release_success_contract(store: Any) -> None:

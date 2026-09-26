@@ -3832,8 +3832,9 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
                                        -- | expired | failed | interrupted (BACKLOG #1562)
                                        -- 'executing': released and claimed, the executor is running;
                                        -- 'approved' is written only after the executor returns
-                                       -- 'failed': the executor raised, so the operation did NOT
-                                       -- complete (ASVS 2.3.3 compensation)
+                                       -- 'failed': the executor raised, or the release was cancelled
+                                       -- before it started, so the operation did NOT complete
+                                       -- (ASVS 2.3.3 compensation)
                                        -- 'interrupted': cancelled mid-execution; the outcome is
                                        -- UNKNOWN, and nothing retries it
     approver     TEXT,                 -- the distinct second user who released/declined it

@@ -212,8 +212,8 @@ async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_pat
     # Findings #1/#4/#11 — the LOAD-BEARING dual-control guard. A purge held while the outbound was
     # stopped, then RELEASED after the operator re-started the outbound, must cancel NOTHING: the
     # require-quiesced re-check lives inside the `_purge` approval executor (ApprovalGate.approve runs it
-    # directly and has already flipped the row to 'approved', so it returns a fail-closed SKIP rather
-    # than raising, which would strand the row approved-but-unexecuted).
+    # directly and has already claimed the row as 'executing', so it returns a fail-closed SKIP rather
+    # than raising, which would record a retryable precondition miss as a failed operation).
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     await _add(service, "approver", Role.ADMINISTRATOR)
@@ -385,10 +385,10 @@ async def test_a_pending_replay_with_no_captured_requester_still_releases(engine
 
 # --- ASVS 2.3.3: the released-but-unexecuted compensating transition ---------------------------
 #
-# approve() moves the row to 'approved' BEFORE running the executor, and that ordering is
-# load-bearing (it guards the double-approve race). The gap this closes is what happens when the
-# executor then raises: without compensation the row is left asserting an operation that never
-# happened, AND no approval.approved row is written either, so the store carries a released
+# approve() claims the row ('executing' since BACKLOG #1562) BEFORE running the executor, and that
+# ordering is load-bearing (it guards the double-approve race). The gap this closes is what happens
+# when the executor then raises: without compensation the row is left claimed for an operation that
+# never happened, AND no approval.approved row is written either, so the store carries a released
 # approval with no recorded outcome at all.
 
 
@@ -412,8 +412,8 @@ async def _gate_with_failing_op(engine: Engine) -> tuple[ApprovalGate, RuntimeEr
     return gate, boom, maker_id
 
 
-async def test_raising_executor_rolls_the_row_out_of_approved(engine: Engine) -> None:
-    """The row must NOT be left at 'approved' for an operation that did not run."""
+async def test_raising_executor_rolls_the_row_to_failed(engine: Engine) -> None:
+    """The row must NOT be left claimed for an operation that did not run."""
     gate, boom, maker_id = await _gate_with_failing_op(engine)
     approval_id = await gate.guard(
         "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
@@ -515,28 +515,67 @@ async def test_cancelled_release_ends_interrupted_with_its_own_audit_row(engine:
     await _assert_release_cancel_contract(engine.store)
 
 
-async def test_cancel_while_recording_success_still_records_approved(engine: Engine) -> None:
-    """The executor RETURNED, so the operation ran; a cancel that lands while that outcome is being
-    written must not strand the row in 'executing'. The caller still sees the cancellation."""
-    from tests._pending_approval_store_contract import _resolve, _StandingStore
+# The cancel WINDOWS. Each test below holds one store write open, cancels the approve inside it, then
+# lets the write finish. The row must still end in the outcome that actually happened.
 
-    entered = asyncio.Event()
-    release = asyncio.Event()
+_WAIT_S = 10.0
 
-    class _SlowSettle(_StandingStore):
+
+async def _eventually(check: Any) -> None:
+    """Wait, bounded, for a shielded write that finishes after its caller was cancelled."""
+    deadline = time.monotonic() + _WAIT_S
+    while not await check():
+        assert time.monotonic() < deadline, "the shielded write never finished"
+        await asyncio.sleep(0.01)
+
+
+def _held_store(engine: Engine, action: str, *, approver_changed: bool = False) -> Any:
+    """The real store, with the FIRST call matching ``action`` held open until ``release`` is set.
+
+    ``action`` is an audit action name, or ``decide:<status>`` for a status write. With
+    ``approver_changed`` the approver account reads as created after the request, so the release
+    is flagged (BACKLOG #315) and the provenance write runs in approve()'s ``finally``."""
+    from tests._pending_approval_store_contract import _StandingStore
+
+    class _Held(_StandingStore):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _hold(self, name: str) -> None:
+            if name == action and not self.entered.is_set():
+                self.entered.set()
+                await self.release.wait()
+
         async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-            # Only the SETTLE out of 'executing', never the claim, is held open.
-            if kw.get("status") == "approved" and kw.get("from_status") == "executing":
-                entered.set()
-                await release.wait()
+            await self._hold(f"decide:{kw['status']}")
             return bool(await self._store.decide_pending_approval(approval_id, **kw))
 
-    gate = ApprovalGate(_SlowSettle(engine.store), ON, resolve_identity=_resolve)
+        async def record_audit(self, audit_action: str, **kw: Any) -> Any:
+            await self._hold(audit_action)
+            return await self._store.record_audit(audit_action, **kw)
 
-    async def _runs(_p: Mapping[str, Any]) -> dict[str, Any]:
-        return {"ran": True}
+        async def get_user(self, _user_id: str) -> Any:
+            user = await super().get_user(_user_id)
+            if approver_changed:
+                user.created_at = time.time() + 3600.0
+            return user
 
-    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    return _Held(engine.store)
+
+
+async def _cancel_inside(store: Any, execute: Any) -> tuple[str, list[str]]:
+    """Run approve() over ``store``, cancel it once the held write is entered, release the write,
+    and return the approval id plus whether the executor started."""
+    from tests._pending_approval_store_contract import _resolve
+
+    ran: list[str] = []
+
+    async def _wrapped(p: Mapping[str, Any]) -> dict[str, Any]:
+        ran.append("started")
+        return dict(await execute(p))
+
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
+    gate.register("dead_letter_replay", "op", _wrapped, permission=Permission.MESSAGES_REPLAY)
     approval_id = await gate.guard(
         "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
     )
@@ -544,20 +583,113 @@ async def test_cancel_while_recording_success_still_records_approved(engine: Eng
     task = asyncio.create_task(
         gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     )
-    await asyncio.wait_for(entered.wait(), 10)
+    await asyncio.wait_for(store.entered.wait(), _WAIT_S)
+    # cancel() cancels the shield the task is parked on at once, so releasing the held write straight
+    # after still lands the cancellation inside it. Released BEFORE awaiting the task, because a
+    # cancel during the claim makes approve() wait for the claim to land before it re-raises.
     task.cancel()
+    store.release.set()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 10)
-    release.set()
-    # The shielded record finishes after the caller's cancellation; wait for it, bounded.
-    for _ in range(200):
-        if await engine.store.list_audit(action="approval.approved"):
-            break
-        await asyncio.sleep(0.01)
+        await asyncio.wait_for(task, _WAIT_S)
+    return approval_id, ran
+
+
+async def _status_of(engine: Engine, approval_id: str) -> str:
     row = await engine.store.get_pending_approval(approval_id)
-    assert row is not None and str(row["status"]) == "approved"
+    assert row is not None
+    return str(row["status"])
+
+
+async def _runs(_p: Mapping[str, Any]) -> dict[str, Any]:
+    return {"ran": True}
+
+
+async def test_cancel_while_recording_success_still_records_approved(engine: Engine) -> None:
+    """The executor RETURNED, so the operation ran; a cancel that lands while that outcome is being
+    written must not strand the row in 'executing'. The caller still sees the cancellation."""
+    store = _held_store(engine, "decide:approved")
+    approval_id, _ = await _cancel_inside(store, _runs)
+
+    async def _settled() -> bool:
+        return bool(await engine.store.list_audit(action="approval.approved"))
+
+    await _eventually(_settled)
+    assert await _status_of(engine, approval_id) == "approved"
     assert len(await engine.store.list_audit(action="approval.approved")) == 1
     assert await engine.store.list_audit(action="approval.interrupted") == []
+
+
+async def test_cancel_in_the_provenance_write_still_records_approved(engine: Engine) -> None:
+    """A FLAGGED release (BACKLOG #315) writes its provenance row in approve()'s ``finally``. A
+    cancel landing there must not skip the settle: the operation ran, so the row ends 'approved'."""
+    store = _held_store(engine, "approval.approver_provenance", approver_changed=True)
+    approval_id, ran = await _cancel_inside(store, _runs)
+    assert ran == ["started"]
+
+    async def _flagged() -> bool:
+        return bool(await engine.store.list_audit(action="approval.approver_provenance"))
+
+    await _eventually(_flagged)
+    assert await _status_of(engine, approval_id) == "approved"
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+
+
+async def test_a_second_cancel_cannot_cancel_the_interrupted_record(engine: Engine) -> None:
+    """A cancellation re-delivered while 'interrupted' is being written (a request timeout inside a
+    middleware task group can do this) must not cancel the record of the first one."""
+    store = _held_store(engine, "decide:interrupted")
+    never = asyncio.Event()
+
+    async def _hangs(_p: Mapping[str, Any]) -> dict[str, Any]:
+        await never.wait()
+        return {"ran": True}
+
+    # The first cancel lands in the executor; the second while the interrupted write is held.
+    from tests._pending_approval_store_contract import _resolve
+
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
+    gate.register("dead_letter_replay", "op", _hangs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    task = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+
+    async def _executing() -> bool:
+        return await _status_of(engine, approval_id) == "executing"
+
+    await _eventually(_executing)
+    task.cancel()
+    await asyncio.wait_for(store.entered.wait(), _WAIT_S)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _WAIT_S)
+    store.release.set()
+
+    async def _recorded() -> bool:
+        return bool(await engine.store.list_audit(action="approval.interrupted"))
+
+    await _eventually(_recorded)
+    assert await _status_of(engine, approval_id) == "interrupted"
+
+
+async def test_cancel_during_the_claim_settles_to_failed_and_never_runs(engine: Engine) -> None:
+    """Cancelled while claiming. The claim still commits, and nothing ran, so the known outcome is
+    'failed' -- not a row stranded in 'executing' that nobody can reject or release."""
+    store = _held_store(engine, "decide:executing")
+    approval_id, ran = await _cancel_inside(store, _runs)
+
+    async def _failed() -> bool:
+        return bool(await engine.store.list_audit(action="approval.failed"))
+
+    await _eventually(_failed)
+    assert ran == []  # the executor never started
+    assert await _status_of(engine, approval_id) == "failed"
+    failed = (await engine.store.list_audit(action="approval.failed"))[0]
+    assert json.loads(str(failed["detail"]))["error"] == "CancelledError"
+    assert await engine.store.list_audit(action="approval.approved") == []
 
 
 # --- BACKLOG #1540: the self-approval refusal keys on users.id, not on the username --------
