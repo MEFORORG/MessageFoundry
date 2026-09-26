@@ -2970,14 +2970,17 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 
 The three **poll** sources — `File(...)`, `Sftp(...)`/`Ftp(...)` and `DatabasePoll(...)` — each take at
 most **500 items per tick** (`poll_max_files`, `poll_max_rows`). The ceiling **ships on**, and `None` or `0`
-(in any spelling, including the text `"0"`) turns it off. A negative or non-numeric value is refused when
-the connection is built, before it starts, rather than leaving a source that reports running and takes
-nothing.
+(in any spelling, including the text `"0"`) turns it off. At least a negative value, a fraction below one and
+text that is not a number are refused when the connection is built, before it starts. A larger fraction
+is cut down to a whole number.
 
 **It is a deferral, not a drop.** A file the scan does not reach is still in the drop directory; a row
 the poll does not fetch is still in the table, unmarked. The next tick takes it. On `DatabasePoll(...)`
-that needs a `mark_statement` that takes each handled row out of what `poll_statement` selects; without
-one, a poll can select the same rows every time and never reach the rest. Nothing is quarantined,
+a later tick reaches the rest only if `mark_statement` takes each handled row out of what
+`poll_statement` selects; without that, a poll can select the same rows every time. Even with it, at
+least one case would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
+the rest, end every poll at the skip cap described below, so the rows behind them would never be
+reached. Nothing is quarantined,
 errored, or accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never
 read was never received, and there is no disposition to record.
 
@@ -3010,8 +3013,10 @@ step over, capped at 64 of those.
 pre-ingest scan hook, a handler failure, and a listing entry refused as an unsafe name all leave the
 item where it is. Charging those would let one permanently stuck item consume the whole ceiling on every
 tick and starve the healthy items behind it. Only an item the tick finished with — handed off, or
-quarantined to the error directory — charges. A quarantine whose move to the error directory fails
-still charges, although the file then stays where it was.
+quarantined to the error directory — charges. **One gap in that rule:** a quarantine whose move to
+the error directory fails still charges, although the file stays where it was. A file that can never
+be quarantined would therefore spend the budget on every tick, which is the starvation this rule exists
+to prevent.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it

@@ -825,8 +825,10 @@ async def test_a_negative_ceiling_is_refused_at_build_on_every_poll_source(
     tick: the source would report running and take nothing, for ever. That is the worst outcome this
     control can produce, so a typo is refused where a bad ``after_read`` is — at wiring, before start.
 
-    Red mutation: replace ``resolve_poll_ceiling`` with ``int(value) if value else None`` — no build
-    raises, and this test reds three times."""
+    Text that is not a number is refused on every source too, with a message naming the setting.
+
+    Red mutation: replace ``resolve_poll_ceiling`` with ``int(value) if value else None`` — no negative
+    build raises, and this test reds at the first one."""
     inbox = tmp_path / "in"
     inbox.mkdir()
     with pytest.raises(ValueError, match="positive number of items per poll"):
@@ -835,9 +837,12 @@ async def test_a_negative_ceiling_is_refused_at_build_on_every_poll_source(
         _remote_source(monkeypatch, _FakeRemoteClient({}), poll_max_files=-1)
     with pytest.raises(ValueError, match="positive number of items per poll"):
         _db_source(poll_max_rows=-1)
-    # Text that is not a number is refused at build too, naming the setting.
     with pytest.raises(ValueError, match="poll_max_files='many' is not a valid int value"):
         _file_source(inbox, poll_max_files="many")
+    with pytest.raises(ValueError, match="poll_max_files='many' is not a valid int value"):
+        _remote_source(monkeypatch, _FakeRemoteClient({}), poll_max_files="many")
+    with pytest.raises(ValueError, match="poll_max_rows='many' is not a valid int value"):
+        _db_source(poll_max_rows="many")
 
 
 # === the security record ======================================================
@@ -846,9 +851,12 @@ async def test_a_negative_ceiling_is_refused_at_build_on_every_poll_source(
 # 948 renamed the knob, that row still named ``max_files_per_poll`` at 1000 and called the Database
 # poll uncovered (BACKLOG #1518). The guard lives HERE, beside the tests that measure the ceiling, so
 # a rename of the knob or a new default reds the doc check in the same module. It reads what it
-# compares against from the code: knob names from the factory signatures, the default from
-# ``DEFAULT_MAX_ITEMS_PER_POLL``. It checks names and numbers, plus two phrases; the mechanics are
-# stated once, in ``docs/CONNECTIONS.md``, and the row links there rather than repeating them.
+# compares against from the code: knob names and their sources from the factory signatures, the
+# default from ``DEFAULT_MAX_ITEMS_PER_POLL``. The conditions and the charging mechanics are stated
+# once, in ``docs/CONNECTIONS.md``; the row must link there, and this guard checks that it does.
+#
+# It is a prose screen, so it catches the shapes it was cut from and a set of near misses, not every
+# possible wrong sentence. The control at the end of this section lists the shapes it is known to see.
 
 _SECURITY_DOC = Path(__file__).resolve().parent.parent / "docs" / "SECURITY.md"
 
@@ -856,9 +864,9 @@ _SECURITY_DOC = Path(__file__).resolve().parent.parent / "docs" / "SECURITY.md"
 #: the KNOB each one takes is derived below rather than listed.
 _POLL_FACTORIES: tuple[Callable[..., Any], ...] = (File, Sftp, Ftp, DatabasePoll)
 
-#: A backticked name shaped like a poll-ceiling knob in either word order (``poll_max_files``,
-#: ``max_files_per_poll``). Every one the row names must be a knob a factory really takes.
-_KNOB_SHAPED = re.compile(r"`([a-z_]*(?:max[a-z_]*poll|poll[a-z_]*max)[a-z_]*)`")
+#: A name shaped like a poll-ceiling knob in either word order (``poll_max_files``,
+#: ``max_files_per_poll``), backticked or not. Every one the row names must be a knob a factory takes.
+_KNOB_SHAPED = re.compile(r"\b([a-z_]*(?:max[a-z_]*poll|poll[a-z_]*max)[a-z_]*)\b")
 
 #: A whole number, thousands separators allowed, so "1,000" reads as 1000 rather than as 1 and 0.
 _NUMBER = re.compile(r"\d+(?:,\d{3})*")
@@ -866,9 +874,13 @@ _NUMBER = re.compile(r"\d+(?:,\d{3})*")
 _ITEM_2 = "(2) "
 _NOT_COVERED = "**Still not covered even when set:**"
 _SHIPS_ON = "**Resource bounds that DO ship on**"
+_LINK = "CONNECTIONS.md#per-tick-poll-ceilings"
 
 
 def _ingest_row() -> str:
+    # A copy of the helper in test_dicom_association_intake_bound.py, kept rather than imported:
+    # that module skips itself at import when the [dicom] extra is absent, which would take this
+    # guard down with it.
     doc = _SECURITY_DOC.read_text(encoding="utf-8")
     return next(line for line in doc.splitlines() if line.startswith("| **Ingest plane**"))
 
@@ -902,58 +914,78 @@ def _poll_row_complaints(row: str, knobs: dict[str, str], default: int) -> list[
     if missing:
         return [f"the row has lost the landmark(s) {missing} this guard reads it by; re-derive it"]
     complaints: list[str] = []
-    live_knobs = set(knobs.values())
-    for name in sorted(set(_KNOB_SHAPED.findall(row)) - live_knobs):
+    for name in sorted(set(_KNOB_SHAPED.findall(row)) - set(knobs.values())):
         complaints.append(f"the row names `{name}`, which no poll factory takes")
+    if re.search(r"no row ceiling", row, re.IGNORECASE):
+        complaints.append("the row says a source has no row ceiling; DatabasePoll() takes one")
 
     # Item (2) is the ceiling's own statement. It may state no number but the default, so a wrong
     # default is caught wherever in the item it is written, before or after the knob.
     item = row[row.index(_ITEM_2) + len(_ITEM_2) : row.index(_NOT_COVERED)]
-    for factory, knob in sorted(knobs.items()):
-        if f"`{knob}`" not in item:
-            complaints.append(f"item (2) does not name `{knob}`, the ceiling {factory}() takes")
+    by_knob: dict[str, set[str]] = {}
+    for factory, knob in knobs.items():
+        by_knob.setdefault(knob, set()).add(factory)
+    for knob, factories in sorted(by_knob.items()):
+        # The parenthesis after the knob's first mention names the sources that take it, exactly.
+        scope = re.search(rf"`{re.escape(knob)}` \(([^)]*)\)", item)
+        named = set(re.findall(r"`([A-Za-z]+)`", scope.group(1))) if scope else set()
+        if named != factories:
+            complaints.append(
+                f"item (2) does not tie `{knob}` to exactly {sorted(factories)}; it names "
+                f"{sorted(named)}"
+            )
     if (stated := _numbers(item)) != {default}:
         complaints.append(
             f"item (2) states the number(s) {sorted(stated)}; the only number it may state is the "
             f"shipped default, {default}"
         )
-    for phrase in ("deferred, not refused", "refused when the connection is built"):
+    for phrase in (
+        f"ship ON at {default}",
+        "not how many it lists",
+        "deferred, not refused",
+        "on the Database source only under conditions",
+        "refused when the connection is built",
+        _LINK,
+    ):
         if phrase not in item:
             complaints.append(f"item (2) no longer says {phrase!r}")
 
-    # The "not covered" sentence must not list the Database poll, which now has a ceiling.
-    clause = re.split(r"\.\s", row.split(_NOT_COVERED, 1)[1], maxsplit=1)[0]
-    if "database" in clause.lower():
+    # The "not covered" sentence must not list the Database poll, which now has a ceiling. The
+    # sentence runs to the next bold landmark, so an "e.g." inside it does not cut it short.
+    clause = re.split(r"\.\s+\*\*", row.split(_NOT_COVERED, 1)[1], maxsplit=1)[0]
+    if re.search(r"database|\bDB\b", clause, re.IGNORECASE):
         complaints.append(
             "the row lists the Database poll as uncovered; DatabasePoll() takes a ceiling"
         )
 
-    # The ship-on list names each knob with the default in the parenthesis that follows it.
+    # The ship-on list names each knob, and every number in the parenthesis after them is the default.
     ships_on = row.split(_SHIPS_ON, 1)[1]
-    listed = re.search(
-        r"((?:`[a-z_]+`(?:,? and |, ))*`poll_max_[a-z_]+`) \((\d+(?:,\d{3})*)", ships_on
-    )
+    listed = re.search(r"((?:`[a-z_]+`(?:,? and |, ))*`poll_max_[a-z_]+`) \(([^)]*)\)", ships_on)
     if listed is None:
         complaints.append("the ship-on list no longer names the poll ceiling with its default")
     else:
-        for knob in sorted(live_knobs - set(_KNOB_SHAPED.findall(listed.group(1)))):
+        for knob in sorted(set(knobs.values()) - set(_KNOB_SHAPED.findall(listed.group(1)))):
             complaints.append(f"the ship-on list does not name `{knob}`")
-        if _numbers(listed.group(2)) != {default}:
+        if (in_list := _numbers(listed.group(2))) != {default}:
             complaints.append(
-                f"the ship-on list states {listed.group(2)}; the code ships {default}"
+                f"the ship-on list states {sorted(in_list)}; the code ships {default}"
             )
     return complaints
 
 
 def test_the_security_ingest_row_agrees_with_the_shipped_poll_ceiling() -> None:
-    """The SECURITY.md Ingest plane row names the real knobs and the real default, covers the
-    Database source, and keeps two statements an operator relies on: the excess waits for a later
-    tick, and a bad value is refused before the connection starts.
+    """The SECURITY.md Ingest plane row names the real knobs with the sources that take them, states
+    the real default as shipped ON, covers the Database source, links the conditions it does not
+    restate, and keeps two statements an operator relies on: the excess waits for a later tick, and a
+    bad value is refused before the connection starts.
 
-    Those behaviours are measured earlier in this module, by the ``*_second_*_drains_*`` tests and
+    Those behaviours are measured earlier in this module, by the ``*_second_*_drains_*`` tests,
+    ``test_file_leave_mode_files_already_taken_do_not_charge_the_ceiling`` and
     ``test_a_negative_ceiling_is_refused_at_build_on_every_poll_source``. This test holds the prose
     to them. It restores the guard withdrawn from ``tests/test_dicom_association_intake_bound.py``
-    when PR 948 renamed the knob (BACKLOG #1518)."""
+    when PR 948 renamed the knob (BACKLOG #1518). The factory-default loop repeats the per-source
+    default pins above on purpose: a factory default that split from the constant would leave the
+    doc no single number to state."""
     knobs = _poll_ceiling_knobs()
     for factory in _POLL_FACTORIES:
         knob = knobs[factory.__name__]
@@ -966,8 +998,9 @@ def test_the_security_ingest_row_agrees_with_the_shipped_poll_ceiling() -> None:
 
 
 def test_the_poll_row_guard_fires_on_the_wording_it_replaced() -> None:
-    """Proves the guard above can fail. It feeds the guard the wording #1518 replaced, then a set of
-    rewordings of the live row that each state a wrong fact in a new place."""
+    """Proves the guard above can fail. It feeds the guard the wording #1518 replaced, then plants a
+    set of wrong facts into the live row, and each plant must draw the complaint aimed at it rather
+    than any complaint at all."""
     knobs = _poll_ceiling_knobs()
     default = DEFAULT_MAX_ITEMS_PER_POLL
 
@@ -987,9 +1020,10 @@ def test_the_poll_row_guard_fires_on_the_wording_it_replaced() -> None:
     got = complaints(retired)
     for expected in (
         "`max_files_per_poll`, which no poll factory takes",
-        "does not name `poll_max_files`",
-        "does not name `poll_max_rows`",
+        "does not tie `poll_max_files`",
+        "does not tie `poll_max_rows`",
         "states the number(s) [1000]",
+        "no row ceiling",
         "Database poll as uncovered",
         "ship-on list no longer names the poll ceiling",
     ):
@@ -997,20 +1031,67 @@ def test_the_poll_row_guard_fires_on_the_wording_it_replaced() -> None:
 
     live = _ingest_row()
     assert not _poll_row_complaints(live, knobs, default), "the live row must pass, or this is moot"
-    plants = {
-        "a wrong default in its own sentence": live.replace(
-            "with why 500", "with why 500 (it used to be 1,000)"
+    sources = "(the `File`, `Sftp` and `Ftp` sources)"
+    plants: dict[str, tuple[str, str]] = {
+        "the ceiling shipped off": (
+            live.replace("ship ON at 500", "ship OFF (500 when set)"),
+            "'ship ON at 500'",
         ),
-        "a wrong default before the knob": live.replace(
-            _ITEM_2 + "`poll_max_files`", _ITEM_2 + "At 1000 per tick, `poll_max_files`"
+        "a wrong default in its own sentence": (
+            live.replace("why 500", "why 500 (it used to be 1,000)"),
+            "states the number(s) [500, 1000]",
         ),
-        "the Database poll in lower case": live.replace(
-            _NOT_COVERED, _NOT_COVERED + " the database poll source (no row ceiling),"
+        "a wrong default before the knob": (
+            live.replace(
+                _ITEM_2 + "`poll_max_files`", _ITEM_2 + "At 1000 per tick, `poll_max_files`"
+            ),
+            "states the number(s) [500, 1000]",
         ),
-        "a retired knob anywhere": live + " `max_files_per_poll`",
-        "a reworded landmark": live.replace(_NOT_COVERED, "**Not covered even when set:**"),
-        "a wrong ship-on default": live.replace("`poll_max_rows` (500", "`poll_max_rows` (1000"),
+        "the knobs swapped between sources": (
+            live.replace(
+                "`poll_max_files` " + sources, "`poll_max_files` (the `DatabasePoll` source)"
+            ),
+            "does not tie `poll_max_files`",
+        ),
+        "a source dropped": (
+            live.replace(sources, "(the `File` and `Sftp` sources)"),
+            "does not tie `poll_max_files`",
+        ),
+        "the retired no-ceiling sentence in item (2)": (
+            live.replace(
+                "before it starts. ", "before it starts. Its `fetchall` has no row ceiling. ", 1
+            ),
+            "no row ceiling",
+        ),
+        "the Database poll uncovered after an e.g.": (
+            live.replace(_NOT_COVERED, _NOT_COVERED + " (e.g. the Database poll source)"),
+            "Database poll as uncovered",
+        ),
+        "the Database poll uncovered in lower case": (
+            live.replace(_NOT_COVERED, _NOT_COVERED + " the database poll source,"),
+            "Database poll as uncovered",
+        ),
+        "the Database poll uncovered as DB": (
+            live.replace(_NOT_COVERED, _NOT_COVERED + " the DB poll source,"),
+            "Database poll as uncovered",
+        ),
+        "the conditions link removed": (live.replace(_LINK, "CONNECTIONS.md"), repr(_LINK)),
+        "an unbackticked retired knob": (
+            live.replace(
+                ", `source_ip_allowlist`", ", max_files_per_poll (1000), `source_ip_allowlist`"
+            ),
+            "`max_files_per_poll`, which no poll factory takes",
+        ),
+        "a second default in the ship-on list": (
+            live.replace("(500, on the poll sources)", "(500 on files, 1000 on the database)"),
+            "the ship-on list states [500, 1000]",
+        ),
+        "a reworded landmark": (
+            live.replace(_NOT_COVERED, "**Not covered even when set:**"),
+            "lost the landmark",
+        ),
     }
-    for what, row in plants.items():
+    for what, (row, expected) in plants.items():
         assert row != live, f"the plant for {what} did not apply; its anchor text has moved"
-        assert _poll_row_complaints(row, knobs, default), f"the guard missed {what}"
+        got = complaints(row)
+        assert expected in got, f"the guard missed {what}: expected {expected!r}, got {got!r}"

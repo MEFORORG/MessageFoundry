@@ -76,7 +76,9 @@ def test_the_ingest_row_agrees_with_the_dicom_signature() -> None:
         assert "max_associations_per_second" in row, (
             "DICOM() now takes an association-rate bound, so the ingest row must name it"
         )
-        assert "Not covered even when set:** the DICOM C-STORE SCP" not in row, (
+        # Lower-cased: the row's landmark is "**Still not covered even when set:**", which a
+        # capitalised "Not covered" never matched, so this check could not fire (BACKLOG #1518 review).
+        assert "not covered even when set:** the dicom c-store scp" not in row.lower(), (
             "DICOM() now takes an association-rate bound; the row may no longer call the SCP "
             "uncovered"
         )
