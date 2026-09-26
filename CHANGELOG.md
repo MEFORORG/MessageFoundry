@@ -119,6 +119,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A dual-control release can no longer run without an audit row, or be recorded as failed after
+  it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
+  that refused writes would have let a replay or a reload complete with no record of the release,
+  and handed the approver a 500. The gate now writes a new `approval.release_attempted` row, naming
+  both identities, before it moves the request. If that write fails, the approve returns 503, the
+  operation does not run, and the request stays pending. After the operation has run, a failed
+  `approval.approved` write is logged at ERROR and the release still succeeds. The replay and
+  reload executors had the mirror defect: their own audit row failing after the action ran made
+  the gate mark the request `failed`. They now log that failure at ERROR instead. (`BACKLOG #1940`)
 - **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
   stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
   stage stopped draining while intake kept acknowledging, and the engine still read healthy. The

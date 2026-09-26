@@ -711,12 +711,22 @@ def _build_approval_gate(
             # The actor is the REQUESTER, matching the inline row; no `client` accompanies it, per
             # _record_reload_audit's docstring (ADR 0150).
             requester = p.get("requester")
-            await engine.store.record_audit(
-                "dead_letter_replay",
-                actor=str(requester) if requester else None,
-                channel_id=channel_id,
-                detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
-            )
+            # BACKLOG #1940: the deliveries are already re-queued. A raise here would reach the
+            # gate's ASVS 2.3.3 compensation and record a replay that ran as 'failed'. Log instead:
+            # approval.approved still carries this executor's {"requeued": N} result.
+            try:
+                await engine.store.record_audit(
+                    "dead_letter_replay",
+                    actor=str(requester) if requester else None,
+                    channel_id=channel_id,
+                    detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
+                )
+            except Exception:  # noqa: BLE001 - every store backend raises its own type
+                _log.exception(
+                    "released replay re-queued %d deliveries, but its dead_letter_replay audit "
+                    "row failed",
+                    requeued,
+                )
         return {"requeued": requeued}
 
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
@@ -752,17 +762,25 @@ def _build_approval_gate(
         # gate surfaces it). The same fingerprint-bearing config_reload audit row is written so the
         # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
         config_dir = p.get("config_dir")
+        # Read BEFORE the reload (BACKLOG #1940): a KeyError raised after the swap would reach the
+        # gate's compensation and record a reload that ran as 'failed'.
+        actor = str(p["requester"])
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
         outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
         registry = outcome.registry
-        await _record_reload_audit(
-            engine,
-            actor=str(p["requester"]),
-            dir_arg=config_dir,
-            failed_steps=[f.step for f in outcome.failures],
-        )
+        # BACKLOG #1940: the graph has swapped. A raise here would be compensated into 'failed' for
+        # a reload that ran, so log instead; approval.approved still records the release.
+        try:
+            await _record_reload_audit(
+                engine,
+                actor=actor,
+                dir_arg=config_dir,
+                failed_steps=[f.step for f in outcome.failures],
+            )
+        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            _log.exception("released config reload swapped the graph, but its audit row failed")
         return {
             "inbound": len(registry.inbound),
             "outbound": len(registry.outbound),
