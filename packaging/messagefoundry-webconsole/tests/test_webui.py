@@ -6637,7 +6637,7 @@ async def test_oidc_login_link_tracks_availability(engine: Engine) -> None:
         assert r.headers["location"].startswith("https://idp.example/authorize?")
 
 
-@pytest.mark.parametrize(("status", "link_stays"), [(400, True), (503, False)])
+@pytest.mark.parametrize(("status", "link_stays"), [(400, True), (401, True), (503, False)])
 async def test_a_bad_authorization_code_cannot_hide_the_oidc_link(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, status: int, link_stays: bool
 ) -> None:
@@ -6645,9 +6645,11 @@ async def test_a_bad_authorization_code_cannot_hide_the_oidc_link(
     the token endpoint refuses. The real ``exchange_code`` runs against an opener that answers
     ``status``, so the sequence reaches the service the way it would live.
 
-    A 400 is RFC 6749's ``invalid_grant``, the caller's own doing: the link and ``/auth/providers``
-    must survive it, or any visitor could switch federated sign-in off. The 503 arm is the control:
-    an IdP that is down must still hide the link, so this test can fail."""
+    Any 4xx is the endpoint answering. A 400 is RFC 6749's ``invalid_grant``, the caller's own doing,
+    and the link and ``/auth/providers`` must survive it, or any visitor could switch federated
+    sign-in off. A 401 is the engine's own secret, and it is audited rather than hidden, so that no
+    body has to be read to tell the two apart. The 503 arm is the control: an IdP that is down must
+    still hide the link, so this test can fail."""
     import io
     import urllib.error
 

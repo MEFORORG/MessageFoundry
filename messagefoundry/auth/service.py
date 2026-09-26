@@ -1399,6 +1399,10 @@ class AuthService:
         fixed before dispatch, so the latency is a function of ``started`` and nothing else — not of
         which branch ran, and so not of anything about the username.
 
+        ``started`` is the call's start on the ``login`` and ``kerberos`` seams. On the ``oidc`` seam
+        it is the end of the IdP round trip for a refusal after it (see :class:`_PadClock`): still
+        fixed before any account-dependent work, but not before dispatch.
+
         **Successes return unpadded, deliberately.** A valid credential has already told the caller
         the account exists; enumeration is about telling two FAILURES apart, and padding the success
         path would only make every real sign-in slower.
@@ -1937,25 +1941,33 @@ class AuthService:
             # exc.reason is closed-set, so nothing IdP-influenced reaches the audit row.
             await self._directory_reject_audit("<oidc>", "oidc", exc.reason)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=exc.reason)
-        except oidc.TokenRefusedError:
-            # BACKLOG #1948. The token endpoint ANSWERED and refused this grant, which a signed-out
-            # caller causes by presenting a bad code. It must not mark the IdP unavailable: that flag
+        except oidc.TokenRefusedError as exc:
+            # BACKLOG #1948. The token endpoint ANSWERED with a 4xx, which a signed-out caller
+            # causes by presenting a bad code. It must not mark the IdP unavailable: that flag
             # hides the federated link on /ui/login and in /auth/providers for everyone, so marking
             # here would let any caller switch federated sign-in off. Nor does it clear the flag, as
             # no sign-in succeeded. It is a FlowError, so this arm must stay above the outage arm.
             # Audited with the client address, as the outage arm is: a spray of junk codes is the
-            # abuse this arm exists for, and the operator needs to see where it comes from.
+            # abuse this arm exists for, and the operator needs to see where it comes from. The
+            # status is the only other thing recorded, and it is what tells a spray (400) from the
+            # engine's own misconfiguration (a 401 on every sign-in). Never the IdP's body.
             await self._audit(
                 "auth.login_failed",
                 actor="<oidc>",
-                detail=_json({"provider": "ad", "mech": "oidc", "reason": "token_refused"}),
+                detail=_json(
+                    {
+                        "provider": "ad",
+                        "mech": "oidc",
+                        "reason": "token_refused",
+                        "status": exc.status,
+                    }
+                ),
                 client=client,
             )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="token_refused")
         except (OSError, ValueError, http.client.HTTPException) as exc:
-            # IdP unreachable / a non-2xx that is not a grant refusal / malformed response.
-            # JwksCache's injected fetch raises RAW urllib errors (not wrapped in JwksError), so a
-            # narrow `except JwksError` here
+            # IdP unreachable / a 3xx or 5xx / malformed response. JwksCache's injected fetch raises
+            # RAW urllib errors (not wrapped in JwksError), so a narrow `except JwksError` here
             # would let an IdP outage escape as an unhandled 500 instead of a degraded login.
             # http.client.HTTPException is neither an OSError nor a ValueError: a proxy answering the
             # token POST with a non-HTTP status line raises BadStatusLine, which would otherwise

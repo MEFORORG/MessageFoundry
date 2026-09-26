@@ -1591,7 +1591,7 @@ async def test_authenticate_oidc_pads_its_own_refusals(
 
 def _refuse_the_grant(monkeypatch: pytest.MonkeyPatch) -> None:
     def refuse(**_kwargs: Any) -> Mapping[str, object]:
-        raise oidc.TokenRefusedError("token endpoint returned HTTP 400")
+        raise oidc.TokenRefusedError("token endpoint returned HTTP 400", status=400)
 
     monkeypatch.setattr(oidc, "exchange_code", refuse)
 
@@ -1609,15 +1609,25 @@ async def test_a_refused_code_leaves_the_idp_flag_as_it_was(
             service.mark_oidc_unavailable("URLError")
         _refuse_the_grant(monkeypatch)
         out = await service.authenticate_oidc(
-            AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+            AUTH_CODE,
+            _flow(),
+            redirect_uri="https://ops.example/ui/oidc/callback",
+            client="192.0.2.7",
         )
         assert not out.ok and out.token is None and out.reason == "token_refused"
         assert service.oidc_available is was_available
         # A refusal of the caller's grant, audited as a failed sign-in under a closed-set slug and
-        # NOT as an IdP error: the operator reading the log must not chase an outage.
+        # NOT as an IdP error: the operator reading the log must not chase an outage. The row
+        # carries where the code came from and the status, which is what tells a junk-code spray
+        # from the engine's own misconfiguration.
         assert await _audit_rows(store, "auth.login_error") == []
-        failed = await _audit_rows(store, "auth.login_failed")
-        assert any('"reason": "token_refused"' in (r["detail"] or "") for r in failed)
+        [row] = [
+            r
+            for r in await _audit_rows(store, "auth.login_failed")
+            if '"reason": "token_refused"' in (r["detail"] or "")
+        ]
+        assert row["client"] == "192.0.2.7"
+        assert json.loads(row["detail"])["status"] == 400
     finally:
         await store.close()
 

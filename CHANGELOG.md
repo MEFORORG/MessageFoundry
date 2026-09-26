@@ -157,14 +157,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   provider's latency cannot split refusals across it. A success is not delayed.
   (`BACKLOG #1947`)
 - **A bad authorization code no longer hides the federated sign-in link.** A token endpoint that
-  refuses the code a caller presents answers with an `invalid_grant` error, and the engine used to
-  read that as an identity provider outage. That set `oidc_available` to false, which hides the link on
+  refuses the code a caller presents answers with an HTTP 4xx, and the engine used to read that as
+  an identity provider outage. That set `oidc_available` to false, which hides the link on
   `/ui/login` and reports `oidc: false` from `/auth/providers`. So any signed-out visitor who
   started a flow could turn federated sign-in off for everyone by calling back with a junk code.
-  The token exchange now raises `TokenRefusedError` for a 4xx whose RFC 6749 `error` is
-  `invalid_grant`, and nothing else is read from the body. The engine audits it as a failed sign-in
-  with reason `token_refused` and the client address, and leaves the flag alone. Any other refusal,
-  including a 400 `invalid_client` from a wrong client secret, is still an outage.
+  The token exchange now raises `TokenRefusedError` for any 4xx, since the endpoint answered. The
+  engine audits it as a failed sign-in with reason `token_refused`, the HTTP status and the client
+  address, and leaves the flag alone. The engine's own faults, such as a wrong client secret, are
+  4xx too: they are told apart by the status on the audit row, not by the flag, so no error body is
+  read. A transport failure, 3xx or 5xx is still an outage.
   (`BACKLOG #1948`)
 - **The Python engine client now ends the session a new sign-in replaces.** `EngineClient.login`
   used to overwrite the bearer token it held and never revoke it, so the old session would have
