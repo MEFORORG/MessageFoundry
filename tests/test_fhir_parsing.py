@@ -8,8 +8,12 @@ FhirPeek.evaluate, which need the extra) lives in tests/test_fhir_resource.py be
 
 from __future__ import annotations
 
+import importlib
+import json
 import subprocess
 import sys
+from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 from _fhir_fixtures import (
@@ -20,7 +24,7 @@ from _fhir_fixtures import (
     as_json,
 )
 
-from messagefoundry.parsing import FhirPeek, FhirPeekError
+from messagefoundry.parsing import FhirPeek, FhirPeekError, FhirResource
 from messagefoundry.parsing.fhir import FhirError, FhirValidationError
 
 # --- FhirPeek: the tolerant routing tier (no [fhir] extra needed) ------------
@@ -64,6 +68,35 @@ def test_peek_operation_outcome_resource_type() -> None:
 def test_peek_rejects_unparseable_or_non_object(body: str) -> None:
     with pytest.raises(FhirPeekError):
         FhirPeek.parse(body)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "parse", "wrapper"),
+    [
+        pytest.param("peek", FhirPeek.parse, FhirPeekError, id="FhirPeek"),
+        # The JSON decode runs before FhirResource loads the [fhir] extra, so this needs no extra.
+        pytest.param("resource", FhirResource.parse, FhirValidationError, id="FhirResource"),
+    ],
+)
+def test_too_deep_json_is_the_typed_error(
+    monkeypatch: pytest.MonkeyPatch,
+    module_name: str,
+    parse: Callable[[str], object],
+    wrapper: type[FhirError],
+) -> None:
+    """json's depth limit is a ``RecursionError``, a ``RuntimeError`` the ``ValueError`` arm does not
+    reach (BACKLOG #1600). The trigger is a raised ``RecursionError``, not a deep body, because the
+    depth where json's C decoder gives out is a property of the runner (BACKLOG #1222)."""
+    module = importlib.import_module(f"messagefoundry.parsing.fhir.{module_name}")
+
+    def _recursing_loads(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    stand_in = SimpleNamespace(loads=_recursing_loads, JSONDecodeError=json.JSONDecodeError)
+    monkeypatch.setattr(module, "json", stand_in)
+    with pytest.raises(wrapper, match="not parseable FHIR JSON") as excinfo:
+        parse(as_json(PATIENT_R4B))
+    assert isinstance(excinfo.value.__cause__, RecursionError)
 
 
 def test_peek_xml_is_deferred() -> None:

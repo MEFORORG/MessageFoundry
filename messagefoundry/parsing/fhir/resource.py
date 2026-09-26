@@ -75,7 +75,9 @@ class FhirResource:
         raw = raw.lstrip("﻿")  # tolerate a leading UTF-8 BOM (json.loads would otherwise choke)
         try:
             data = json.loads(raw)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+            # RecursionError is json's depth limit, a RuntimeError the ValueError does not reach
+            # (BACKLOG #1600).
             raise FhirValidationError("body is not parseable FHIR JSON") from exc
         if not isinstance(data, dict):
             raise FhirValidationError(

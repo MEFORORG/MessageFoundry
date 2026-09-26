@@ -224,6 +224,39 @@ def zip_compress(entries: Mapping[str, bytes], *, level: int | None = None) -> b
     return buf.getvalue()
 
 
+def _member_codec_errors() -> tuple[type[Exception], ...]:
+    # zipfile reads LZMA and Zstandard members through modules a Python build may omit, and neither
+    # module's error is an OSError, so each is named when its module is present.
+    errors: list[type[Exception]] = []
+    try:
+        import lzma
+
+        errors.append(lzma.LZMAError)
+    except ImportError:
+        pass
+    try:
+        from compression import zstd
+
+        errors.append(zstd.ZstdError)
+    except ImportError:
+        pass
+    return tuple(errors)
+
+
+# What a corrupt archive or member raises. ValueError covers a member name flagged UTF-8 that is not
+# (UnicodeDecodeError) and a corrupt offset that makes zipfile seek to a negative position.
+# CompressionError is a ValueError too, so zip_decompress re-raises it in an arm AHEAD of this one;
+# without that arm the refusals its loop raises would be caught here and relabelled.
+_ZIP_CORRUPT_ERRORS: tuple[type[Exception], ...] = (
+    zipfile.BadZipFile,
+    OSError,
+    EOFError,
+    zlib.error,
+    ValueError,
+    *_member_codec_errors(),
+)
+
+
 def zip_decompress(
     data: bytes, *, max_output_bytes: int | None, max_entries: int = 1024
 ) -> dict[str, bytes]:
@@ -236,8 +269,10 @@ def zip_decompress(
 
     ``max_entries`` caps the member count (a many-entry archive is a bomb axis too). ``max_output_bytes``
     caps the **total** decompressed size across all members, enforced with per-member bounded reads so a
-    lying central-directory size cannot force full expansion. A corrupt archive, too many members, or an
-    over-ceiling total raises :class:`CompressionError`. Duplicate file member names also refuse the whole
+    lying central-directory size cannot force full expansion. A corrupt archive, too many members, an
+    over-ceiling total, or a member that uses a zip feature ``zipfile`` cannot read (encryption, a
+    compression method, a format version) raises :class:`CompressionError`, which names a member by
+    its position and never by its filename. Duplicate file member names also refuse the whole
     archive, since the returned mapping cannot preserve repeated names.
 
     Each member is also **admitted or refused** (ASVS 5.2.2 / 5.3.2, BACKLOG #1128) — its name must be a
@@ -253,6 +288,8 @@ def zip_decompress(
         raise CompressionError(f"max_entries must be a non-negative int, got {max_entries!r}")
     result: dict[str, bytes] = {}
     total = 0
+    position = 0
+    failure: str | None = None
     try:
         with zipfile.ZipFile(io.BytesIO(data), mode="r") as zf:
             names = zf.namelist()
@@ -291,6 +328,25 @@ def zip_decompress(
                         f"zip archive member {position} refused: {content_reason}"
                     )
                 result[info.filename] = body
-    except (zipfile.BadZipFile, OSError, EOFError, zlib.error) as exc:
-        raise CompressionError(f"corrupt or truncated zip archive: {exc}") from exc
+    except CompressionError:
+        raise  # a refusal from the loop is already the verdict; the ValueError arm must not relabel it
+    except _ZIP_CORRUPT_ERRORS as exc:
+        # The class name is a diagnostic that carries no member name; the message may carry one.
+        failure = f"is corrupt or truncated ({type(exc).__name__})"
+    except RuntimeError:
+        # NotImplementedError is a RuntimeError. zipfile raises RuntimeError for a member flagged as
+        # encrypted and NotImplementedError for a compression method, a flag or a format version it
+        # lacks (BACKLOG #1598).
+        failure = (
+            "uses a zip feature this reader does not support "
+            "(encryption, a compression method, or a format version)"
+        )
+    # zipfile's messages embed the archive-chosen member filename, which can be PHI: the encrypted
+    # RuntimeError carries the ZipInfo repr, and BadZipFile says "Bad CRC-32 for file '<name>'". So
+    # the typed error names the member position only, and it is raised OUTSIDE the handler, with no
+    # chain: `from None` clears __cause__ but leaves __context__, where a chain-walking handler
+    # would still find the filename (BACKLOG #1598).
+    if failure is not None:
+        where = f"zip archive member {position}" if position else "zip archive"
+        raise CompressionError(f"{where} {failure}")
     return result
