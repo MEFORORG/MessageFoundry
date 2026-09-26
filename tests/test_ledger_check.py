@@ -770,6 +770,32 @@ def test_a_row_split_across_a_newline_after_the_pipe_is_not_a_row(repo: Path) ->
     assert "ADR 0002 (0002-new.md) has no row" in out
 
 
+def test_a_companion_declared_only_in_a_row_HIDDEN_after_a_line_separator_is_refused(
+    repo: Path,
+) -> None:
+    """BACKLOG #2003, through the gate. str.splitlines() breaks on U+2028 and INDEX_ROW's `^` does not.
+
+    A row finder that split lines itself found the hidden row, which names 0001-evil.md, while the
+    row count saw only the real 0001 row. index_rows is the one enumeration, so the gate sees the real
+    row, which does not name the file, and refuses the reuse.
+    """
+    write(repo, "docs/adr/0001-evil.md", "# 0001 -- Evil\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + "prose\u2028| [0001](0001-first.md) | x [c](0001-evil.md) |\n"
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n",
+    )
+    allocate(repo, "adr", "0001")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 already exists" in out
+
+
 # ----------------------------------------------------------------- BACKLOG numbers
 
 
