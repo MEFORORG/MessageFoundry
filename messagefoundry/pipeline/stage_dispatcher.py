@@ -434,7 +434,8 @@ class StageDispatcher:
         rows PENDING (no drop / no reorder) and halts delivery; only :meth:`resume_lane` re-arms it.
 
         COOPERATIVE — NEVER ``task.cancel`` a serializer: a cancelled mid-delivery row strands its
-        claimed row INFLIGHT forever (``reset_stale_inflight`` is startup/DR-only), which purge's
+        claimed row INFLIGHT until the next start or promotion (``reset_stale_inflight``; a reload's
+        ADR 0157 Inc 2 recovery covers only a per-lane worker that returned), which purge's
         PENDING-only ``cancel_queued`` could never clear. So a lane mid-episode (CLAIMING/PROCESSING) is
         marked ``pause_pending`` and reaches PAUSED at the terminal transition / next empty claim, after
         its <=1 in-flight OUTBOUND head finishes (delivered, or re-pended PENDING by a FIFO RETRY) —

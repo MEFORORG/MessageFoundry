@@ -162,7 +162,7 @@ from messagefoundry.store import (
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
-from messagefoundry.store.store import ConnectionEventWrite
+from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -2256,7 +2256,8 @@ class RegistryRunner:
         """stop_outbound body without the reload lock (callers hold it). Sync + returns fast: it flags
         the pause and requests it in whichever claim mode is active, but NEVER awaits the in-flight
         drain (cooperative). NEVER ``task.cancel`` a worker/serializer — a cancelled mid-delivery row
-        strands INFLIGHT forever (``reset_stale_inflight`` is startup/DR-only), defeating require-stopped."""
+        strands INFLIGHT until the next start or promotion (a reload recovers only a worker that
+        RETURNED, never a cancelled one -- ADR 0157 Inc 2), defeating require-stopped."""
         self._validate_outbound(name)
         self._outbound_paused.add(name)
         # The OPERATOR now owns this lane's down state — a reload must not resume it (#115/#233): drop any
@@ -2930,7 +2931,8 @@ class RegistryRunner:
         it was never delivered, which makes the gap quiet rather than harmless.
 
         **Cooperative in both claim modes, and NEVER a ``task.cancel``** — a cancelled mid-item worker
-        strands its claimed row INFLIGHT and ``reset_stale_inflight`` is startup/DR-only:
+        strands its claimed row INFLIGHT until the next start or promotion (a reload recovers only
+        a worker that RETURNED, never a cancelled one -- ADR 0157 Inc 2):
 
         * **pooled** (the default): ``pause_lane`` per stage, the same primitive
           :meth:`_stop_outbound_unsafe` uses. A lane mid-episode reaches PAUSED at its quiesce point,
@@ -4659,13 +4661,68 @@ class RegistryRunner:
 
     # --- atomic reload (quiesce-and-swap) ------------------------------------
 
+    async def _recover_stopped_worker_residue(self) -> int:
+        """Reload-time BACKSTOP: re-pend the rows a RETURNED per-lane worker left INFLIGHT (ADR
+        0157 Inc 2, BACKLOG #1497). A stopping worker releases its own tail
+        (:meth:`_release_tail_on_stop`); this catches a release that failed, and anything else a
+        worker left behind when it returned.
+
+        The scope is a worker that returned normally, and nothing wider. A returned worker holds
+        nothing, and each lane has one consumer (ADR 0059), so its INFLIGHT rows are residue. A LIVE
+        worker's lane is never touched: ``reload`` stops no worker, so those rows may be mid-send.
+        A worker that RAISED is skipped because its done-callback respawns it. A cancelled one is
+        skipped because only teardown cancels. The worker state is the discriminator; there is no
+        age and no cutoff.
+
+        It uses the ownership-scoped ``reset_stale_inflight`` (ADR 0073), which every backend
+        implements, and never probes ``reclaim_expired_leases``, so the promotion path's
+        ``hasattr`` gate cannot move. Best effort: a failure logs and leaves the rows for the next
+        start, and never rolls a reload back. Returns the number of rows re-pended."""
+
+        def returned(task: asyncio.Task[None]) -> bool:
+            return task.done() and not task.cancelled() and task.exception() is None
+
+        scopes: list[tuple[Stage, OwnedLanes]] = []
+        for kind, stage in (
+            ("router", Stage.INGRESS),
+            ("transform", Stage.ROUTED),
+            ("response", Stage.RESPONSE),
+        ):
+            names = frozenset(n for n, t in self._inbound_worker_dict(kind).items() if returned(t))
+            if names:
+                scopes.append((stage, OwnedLanes(channels=names, destinations=frozenset())))
+        # A lane the OUTBOUND dispatcher holds is skipped: its rows may be the dispatcher's.
+        out = self._dispatchers.get(Stage.OUTBOUND)
+        dests = frozenset(
+            n
+            for n, t in self._workers.items()
+            if returned(t) and (out is None or out.phase(n) is None)
+        )
+        if dests:
+            scopes.append((Stage.OUTBOUND, OwnedLanes(channels=frozenset(), destinations=dests)))
+        recovered = 0
+        try:
+            for stage, owned in scopes:
+                recovered += await self.store.reset_stale_inflight(stage=stage.value, owned=owned)
+        except Exception:  # noqa: BLE001 — best effort; see the docstring
+            log.warning(
+                "reload: could not recover rows a stopped worker left in flight; they stay "
+                "INFLIGHT for reset_stale_inflight at the next start",
+                exc_info=True,
+            )
+        if recovered:
+            log.info("reload: re-pended %d row(s) a stopped worker left in flight", recovered)
+        return recovered
+
     async def reload(self, new_registry: Registry) -> None:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
 
         Quiesce-and-swap, in this order: (0) build-check every new connector — a bad spec raises
         here, before anything is touched, so the running graph is left intact; (1) stop accepting new
-        inbound messages; (2) swap the registry + restart the inbound listeners from it (Router/
-        Handler changes take effect immediately — the inbound path reads ``self.registry`` live);
+        inbound messages; (1a) re-pend rows a RETURNED worker left in flight
+        (:meth:`_recover_stopped_worker_residue`); (2) swap the registry + restart the inbound
+        listeners from it (Router/Handler changes take effect immediately — the inbound path reads
+        ``self.registry`` live);
         (2a) decide the OUTBOUND lane partition for the lanes this reload ADDS — it MUST sit between
         the swap and the listener restart, because step 2's listeners and step 2b's dispatcher nudge
         both READ that decision and would otherwise take the unknown-lane default (ADR 0066 D4, and
@@ -4691,6 +4748,13 @@ class RegistryRunner:
                 await self._stop_inbound_unsafe(
                     name
                 )  # we hold _reload_lock — use the unsafe variant
+
+            # 1a. ADR 0157 Inc 2: re-pend what a RETURNED worker left in flight. HERE, and no later:
+            #     step 2's listener restart re-arms inbound workers (_start_inbound_unsafe ->
+            #     _ensure_inbound_workers) and step 3 respawns delivery workers, and a re-armed
+            #     worker may claim on the lane before the reset lands. The helper says why it is
+            #     safe.
+            await self._recover_stopped_worker_residue()
 
             try:
                 # 2. Swap the registry and restart inbound listeners from it (intake back up first).
@@ -5517,8 +5581,9 @@ class RegistryRunner:
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
         claimed row INFLIGHT. Every claim path selects ``status='pending'``, so the surviving worker
-        never reconsiders it, and ``reset_stale_inflight`` runs from ``Engine.start()`` and the
-        cluster promotion path only — **not** from ``reload()``. Without this the row waits for a
+        never reconsiders it, and ``reset_stale_inflight`` runs from ``Engine.start()``, the
+        cluster promotion path, and a ``reload()`` for a worker that has RETURNED (ADR 0157 Inc 2)
+        -- which this surviving worker has not. Without this the row waits for a
         service restart, overtaken by its successors, while ``pending_depth`` (pending rows only)
         reports the lane healthy to the buildup and stall alerts.
 
@@ -5543,6 +5608,35 @@ class RegistryRunner:
             log.warning(
                 "%s worker %r: reschedule_claimed failed for %d claimed row(s); they stay INFLIGHT "
                 "for reset_stale_inflight at the next start",
+                worker,
+                name,
+                len(ids),
+                exc_info=True,
+            )
+
+    async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> None:
+        """Best-effort release of the batch tail a per-lane worker still holds when it RETURNS on a
+        STOPPED outcome (ADR 0157 Inc 2, BACKLOG #1497) -- the per-lane twin of the pooled
+        ``_run_lane`` tail release, so one ``internal_error`` STOP leaves the same queue state in both
+        claim modes.
+
+        Every STOPPED path resolves its own head row first, and ``release_claimed`` touches only rows
+        still ``inflight``, so the caller passes its whole claimed batch. The tail was never
+        dispatched, so ``release_claimed`` (which undoes the claim's ``attempts`` increment) is the
+        right re-pend rather than ``reschedule_claimed``: a stopped lane has no worker to spin.
+
+        Without this the tail stayed INFLIGHT, invisible to every claim, and a worker re-armed by an
+        operator ``start_*`` / ``restart_*`` (or an alert rule's auto-restart) drained newer rows past
+        it until the next start. A failure here logs and leaves the rows for the reload-time backstop
+        (:meth:`_recover_stopped_worker_residue`) or the next start."""
+        if not ids:
+            return
+        try:
+            await self.store.release_claimed(list(ids))
+        except Exception:  # noqa: BLE001 — a stopping worker must not raise out of its return
+            log.warning(
+                "%s worker %r: release_claimed failed for %d claimed row(s) on stop; they stay "
+                "INFLIGHT for the reload-time backstop or the next start",
                 worker,
                 name,
                 len(ids),
@@ -5655,6 +5749,7 @@ class RegistryRunner:
                     else:
                         outcome = await self._process_delivery_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
+                        await self._release_tail_on_stop("delivery", name, claimed)
                         return
             except asyncio.CancelledError:
                 raise
@@ -6240,6 +6335,7 @@ class RegistryRunner:
                 for item in items:
                     outcome = await self._process_ingress_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
+                        await self._release_tail_on_stop("router", name, claimed)
                         return
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # ingress backlog is building (a slow/hung router). Uses the global buildup threshold.
@@ -6350,10 +6446,9 @@ class RegistryRunner:
             # drains the backlog). Reschedule with a retry-FOREVER policy (NOT the outbound
             # delivery defaults, whose finite max_attempts would dead-letter an ACKed-but-
             # never-attempted message purely for being removed) so the message is never
-            # dropped. The unprocessed batch tail stays INFLIGHT and is recovered in order by
-            # reset_stale_inflight on the next START (ADR 0058 INV-3) — #1611: NOT on a reload.
-            # reload_detail never calls it, so a reload restoring the inbound re-arms this worker
-            # and drains the PENDING backlog while the tail stays in flight until a restart.
+            # dropped. The worker releases the unprocessed batch tail as it returns
+            # (_release_tail_on_stop, ADR 0157 Inc 2), so the tail keeps its FIFO position and
+            # the reload that restores the inbound drains it with the rest of the backlog.
             # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
             # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
             # purely for outliving a reload — the one thing these three sites exist to prevent.
@@ -6673,6 +6768,7 @@ class RegistryRunner:
                 # sequential per-item loop. Returns True iff the lane must halt (STOP policy / missing
                 # inbound), matching the old `for item in items` early return.
                 if await self._process_routed_batch(name, items):
+                    await self._release_tail_on_stop("transform", name, claimed)
                     return
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # routed (transform) backlog is building behind a slow/hung handler — reported separately
@@ -6789,10 +6885,9 @@ class RegistryRunner:
             # Inbound removed; nothing to transform with until a reload restores it (which
             # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
             # router worker), so the ACKed-but-unprocessed message is never dropped. The
-            # unprocessed batch tail stays INFLIGHT and is recovered in order by
-            # reset_stale_inflight on the next START (ADR 0058 INV-3) — #1611: NOT on a reload.
-            # reload_detail never calls it, so a reload restoring the inbound re-arms this worker
-            # and drains the PENDING backlog while the tail stays in flight until a restart.
+            # worker releases the unprocessed batch tail as it returns (_release_tail_on_stop,
+            # ADR 0157 Inc 2), so the tail keeps its FIFO position and the reload that
+            # restores the inbound drains it with the rest of the backlog.
             # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
             # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
             # purely for outliving a reload — the one thing these three sites exist to prevent.
