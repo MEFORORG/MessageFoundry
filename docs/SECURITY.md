@@ -998,13 +998,35 @@ server-side, not a client confirmation). On release the captured operation is **
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`.
 
-**The audit log must accept a release before the operation runs.** Just before it releases a
-request, the gate writes an `approval.release_attempted` row against the approver, naming the
-requester. If the audit log refuses that write, the approve returns **503**, nothing runs, and the
-request stays pending. `approval.approved` is written after the operation, with its result. If only
-that later write fails, the error is logged and the release still succeeds, because the operation
-has already run. A release that loses a race with another approve or a reject leaves an
-`approval.release_attempted` row with no outcome row after it; the request's status says what won.
+**The audit log must accept a release before the operation runs.** Before it claims a request, the
+gate writes an `approval.release_attempted` row against the approver, naming the requester. If the
+audit log refuses that write, the approve returns **503**, nothing runs, and the request stays
+pending. `approval.approved` is written after the operation, with its result. If only that later
+audit write fails, the error is logged and the release still succeeds, because the operation has
+already run. At least a release that loses a race with another approve or a reject, or is
+cancelled before its claim lands, leaves an `approval.release_attempted` row with no outcome row
+after it; the request's status says what won.
+
+**A release records what happened to it (BACKLOG #1562).** The gate claims the request as
+`executing` before it runs the operation, so two approvers cannot both release it. It then settles
+the row to one of three outcomes, each with its own audit row after the `approval.release_attempted`
+row:
+
+| Status | Meaning | Audit row (against the approver) |
+|---|---|---|
+| `approved` | The operation ran and returned | `approval.approved` |
+| `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
+| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
+
+Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
+worse than a stuck row, so an operator has to check the operation's own effects. The engine has no
+route to settle an `interrupted` row yet. A process that dies mid-operation leaves its row at
+`executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
+share one store, and each would see the others' live releases as leftovers. If the operation ran but
+the move from `executing` to `approved` fails, the error is logged and the release still succeeds,
+because the operation has already run and an error would invite a new request that runs it twice.
+The row may stay at `executing`, and the gate still tries to write the `approval.approved` audit
+row.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

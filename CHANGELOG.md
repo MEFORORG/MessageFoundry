@@ -156,6 +156,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   `approval.approved` write is logged at ERROR and the release still succeeds. The replay and
   reload executors had the mirror defect: their own audit row failing after the action ran made
   the gate mark the request `failed`. They now log that failure at ERROR instead. (`BACKLOG #1940`)
+- **A dual-control release now records whether its operation finished, failed or was cut off.**
+  The gate used to mark a request `approved` before the operation ran, so a crash or a request
+  timeout mid-run left a row claiming an outcome nobody saw. The gate now claims the request as
+  `executing`, then settles it once the operation stops. `approved` means it ran and returned.
+  `failed` means it raised, or the release was cancelled before it started. `interrupted` means it
+  was cancelled while running, so it may have done none, some or all of its work; that writes a new
+  `approval.interrupted` audit row, and nothing retries it. Every outcome write is shielded, so a
+  second cancel cannot stop it. If the move to `approved` fails after the operation ran, the error
+  is logged and the release still succeeds, and the row may stay `executing`. A process that dies
+  mid-run also leaves its row at `executing`; nothing reconciles those rows yet.
+  (`BACKLOG #1562`)
 - **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
   stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
   stage stopped draining while intake kept acknowledging, and the engine still read healthy. The
