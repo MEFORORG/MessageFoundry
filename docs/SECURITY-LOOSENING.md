@@ -159,13 +159,20 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   restart ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)).
 - **Still refused:** nothing — this is advisory only. An exposed bind with an empty list starts normally.
 
-### `require_encryption_for_remote = false` — accept cleartext for off-machine access
-- **What you lose:** bearer tokens and PHI cross the network **in cleartext**. This is the config-file twin
-  of the `--allow-insecure-bind` dev escape.
+### `require_encryption_for_remote = false` — accept off-machine access without an operator certificate
+- **What you lose:** it differs by surface. This is the config-file twin of the `--allow-insecure-bind`
+  dev escape.
+  - **The API** still serves TLS, on the engine's generated self-signed placeholder
+    ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+    No trust store vouches for it, so a remote client can authenticate the engine only by pinning that
+    exact certificate. Any other client cannot tell the engine from an on-path attacker.
+  - **An inbound MLLP, HTTP, DICOM SCP, raw-TCP or X12 listener** without `tls` binds in cleartext, so
+    PHI crosses the network unencrypted.
 - **When acceptable:** a lab/loopback-adjacent trusted, firewalled segment; never for real remote PHI.
 - **Compensating controls:** network isolation; prefer in-process TLS (`[api].tls_cert_file`) or a
   TLS-terminating proxy instead.
-- **Still refused:** a **production-PHI** cleartext bind — the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
+- **Still refused:** either bind under `[security].enforcement = enforce`, the shipped default — the
+  [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
   clamp cannot be relaxed by this switch or by `--allow-insecure-bind`.
 
 ### `serve_web_console = false` — do **not** mount the browser ops console at `/ui` (surface-reducing opt-out)

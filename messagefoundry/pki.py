@@ -119,9 +119,9 @@ class CrlFacts:
 def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
     """Parse a PEM CRL into its public inventory facts, evaluated at ``now`` (epoch seconds).
 
-    Accepts a bundle: a file may concatenate the issuing CA and its CRL, which is exactly the shape
-    ``harden_crl_check`` loads through ``cafile=``. The FIRST ``X509 CRL`` block is read and any
-    certificate blocks are skipped, so the same path serves a bare ``.crl`` and a CA+CRL bundle.
+    Tolerates certificate blocks in the same file: the FIRST ``X509 CRL`` block is read and any
+    certificate blocks are skipped. ``harden_crl_check`` is stricter, and refuses a file whose
+    certificates the hop does not already trust (BACKLOG #1890).
 
     Raises ``ValueError`` when the bytes carry no CRL at all -- a configured-but-CRL-less file must
     never degrade to "revocation checking silently off"."""

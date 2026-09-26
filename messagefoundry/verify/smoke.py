@@ -403,7 +403,7 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     The gate covers SQLite only, and :func:`missing_sqlite_store` says what that leaves open on the
     server backends.
     """
-    import asyncio
+    from messagefoundry.last_resort import run_guarded
 
     rid, title = "store.connect", "Store connectivity"
     absent = missing_sqlite_store(store)
@@ -426,7 +426,7 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
         await handle.close()
 
     try:
-        asyncio.run(_open_close())
+        run_guarded(_open_close())
     except Exception as exc:  # any driver/connection/auth failure
         return CheckResult(
             rid,
@@ -450,7 +450,7 @@ def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
 
     An absent SQLite store holds no prior message, so it yields ``None`` without opening — and so
     without creating — one (BACKLOG #1708; see :func:`missing_sqlite_store`)."""
-    import asyncio
+    from messagefoundry.last_resort import run_guarded
 
     if missing_sqlite_store(store) is not None:
         return None
@@ -467,7 +467,7 @@ def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
         finally:
             await handle.close()
 
-    return asyncio.run(_newest())
+    return run_guarded(_newest())
 
 
 def _classify_disposition(status: str | None, *, control_id: str, timeout: float) -> CheckResult:
@@ -520,6 +520,8 @@ def check_smoke_disposition(
     """
     import asyncio
 
+    from messagefoundry.last_resort import run_guarded
+
     rid, title = "smoke.disposition", "Live smoke disposition"
     absent = missing_sqlite_store(store)
     if absent is not None:
@@ -562,7 +564,7 @@ def check_smoke_disposition(
             await handle.close()
 
     try:
-        status = asyncio.run(_poll())
+        status = run_guarded(_poll())
     except Exception as exc:  # any driver/connection failure — surface, never crash the verify run
         return CheckResult(rid, title, Status.ERROR, f"could not read the store disposition: {exc}")
     return _classify_disposition(status, control_id=control_id, timeout=timeout)
