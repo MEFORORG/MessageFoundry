@@ -4,8 +4,9 @@
 # installed whatever `hatchling` PyPI served at build time, including inside release.yml's build jobs,
 # which hold `id-token: write` and publish what the backend emits. The pin picks one immutable release.
 # It does NOT stop the fetch, check a hash, or pin hatchling's own dependencies; BACKLOG #1546 records
-# that residual and the `--no-isolation` form that would close it. Nothing is known to bump this table
-# automatically, so bump it by hand.
+# that residual and the `--no-isolation` form that would close it. Dependabot's uv updater bumps THIS
+# table and neither of the two under packaging/, so a Dependabot hatchling bump reds the lockstep test
+# until those two are moved by hand in the same PR.
 requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
