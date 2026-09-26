@@ -70,12 +70,13 @@ section reference.
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
+| | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 
-**Seven of these do not live in `[security]`.** `[store].aad_bind`,
+**Eight of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds` and
 `[secret_rotation].enforce_store_key_expiry` sit in their own
-sections for cohesion, and the last three are per-**connection** facts, not service
+sections for cohesion, and the last four are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 first four are named by `security_loosenings()` from the loaded
@@ -159,13 +160,20 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   restart ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)).
 - **Still refused:** nothing — this is advisory only. An exposed bind with an empty list starts normally.
 
-### `require_encryption_for_remote = false` — accept cleartext for off-machine access
-- **What you lose:** bearer tokens and PHI cross the network **in cleartext**. This is the config-file twin
-  of the `--allow-insecure-bind` dev escape.
+### `require_encryption_for_remote = false` — accept off-machine access without an operator certificate
+- **What you lose:** it differs by surface. This is the config-file twin of the `--allow-insecure-bind`
+  dev escape.
+  - **The API** still serves TLS, on the engine's generated self-signed placeholder
+    ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+    No trust store vouches for it, so a remote client can authenticate the engine only by pinning that
+    exact certificate. Any other client cannot tell the engine from an on-path attacker.
+  - **An inbound MLLP, HTTP, DICOM SCP, raw-TCP or X12 listener** without `tls` binds in cleartext, so
+    PHI crosses the network unencrypted.
 - **When acceptable:** a lab/loopback-adjacent trusted, firewalled segment; never for real remote PHI.
 - **Compensating controls:** network isolation; prefer in-process TLS (`[api].tls_cert_file`) or a
   TLS-terminating proxy instead.
-- **Still refused:** a **production-PHI** cleartext bind — the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
+- **Still refused:** either bind under `[security].enforcement = enforce`, the shipped default — the
+  [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
   clamp cannot be relaxed by this switch or by `--allow-insecure-bind`.
 
 ### `serve_web_console = false` — do **not** mount the browser ops console at `/ui` (surface-reducing opt-out)
@@ -387,12 +395,10 @@ This section is kept rather than deleted, because the claim it used to make is t
   lever reached nineteen gates and this page does not carry a heading for each of them. Two it reached
   are named here because they have no heading of their own —
   `[alerts].security_notifications_required` accepts the pull-only security-event feed instead of a
-  configured channel, and revocation is attested **process-wide** with the environment variable
-  `MEFOR_TLS_REVOCATION_ATTESTED`. **There is no per-connection revocation lever.**
-  `tls_revocation_attested` exists on the outbound model and the connectors read it, but it has no
-  factory parameter and no `connections.toml` key, so nothing can author it — and
-  [DEPLOYMENT.md](DEPLOYMENT.md)'s own maintenance rule names that field and forbids offering it as an
-  operator lever. This page offered it until [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) prompted a re-read.
+  configured channel, and revocation is attested either **per connection** with
+  [`tls_revocation_attested`](#tls_revocation_attested--true-on-a-connection--revocation-checked-outside-the-engine)
+  or **process-wide** with the environment variable `MEFOR_TLS_REVOCATION_ATTESTED`, which no longer
+  crosses an enforcing outbound hop.
 - **Setting it now fails the start**, with a message naming those switches. See [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
 
 ### `[store].aad_bind = false` — at-rest values are no longer bound to their cell
@@ -588,6 +594,33 @@ This section is kept rather than deleted, because the claim it used to make is t
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
 
+### `tls_revocation_attested = true` on a connection — revocation checked outside the engine
+> **Connection-scoped**, both directions: an `inbound()`/`outbound()` keyword, or a **top-level**
+> `connections.toml` key (not under `[settings]`), always paired with a mandatory
+> `tls_revocation_attested_reason`.
+> [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
+> §1.5 item 4. It is **not** in the switch table above, because that table lists what
+> `security_loosenings()` reports, and this does not reach it yet; see the last bullet.
+- **What you lose:** the engine's refusal of a *verifying* TLS hop that checks no certificate
+  revocation. On an outbound hop that is the `RevocationHopGuard` refusal (stdlib `ssl` fetches no
+  OCSP or CRL). On an mTLS listener it is the `check_inbound_revocation` refusal of a listener with
+  `tls_ca_file` and no `tls_crl_file`. With the attestation set, a revoked but unexpired certificate on
+  that hop is accepted **unless your PKI or terminator stops it**, because the engine will not.
+- **When acceptable:** a revocation-checking PKI or terminator really does cover this hop, and you can
+  name it. That name belongs in the reason. On a listener, prefer `tls_crl_file`, which checks
+  revocation in the engine and needs no attestation.
+- **What it cannot do:** it never reaches a cleartext or verify-off hop, which keep their own
+  refusals. It is a claim about one named hop, which is why it crosses an enforcing instance where the
+  process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299).
+- **How it is recorded:** a flag without a reason, a blank reason, or a reason without the flag fails
+  at load, on both authoring surfaces. Each time the attestation lets a hop through that an enforcing
+  instance would otherwise refuse, the engine logs a WARNING naming the hop and your reason, at every
+  construction. That record is a log line, not an `audit` table row, for the reason given under
+  `cleartext_accepted` above.
+- **Where it is NOT reported yet:** `messagefoundry check`, `security_loosenings()` and
+  `GET /security/posture` do not list the attested set, as they do for `cleartext_accepted` and
+  `tls_allow_expired`. Until they do, find it by searching your config for `tls_revocation_attested`.
+
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
 > **Connection-scoped**, and unlike the two above it is not a flag anyone sets — it is the *absence* of a
 > verifying keyword. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
@@ -713,6 +746,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
+| `tls_hop_attested` (per-connection hop attested secure) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |

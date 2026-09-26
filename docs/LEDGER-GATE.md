@@ -183,8 +183,10 @@ It blocks a commit that:
 
 It reads the **staged** tree (`git show :path`), never the working tree — otherwise an untracked
 work-in-progress ADR sitting in your checkout would block every unrelated commit. It checks the index row
-only for **newly added** ADRs, so old debt cannot fail every future commit; that is how a gate gets
-uninstalled. It does **not** assert sort order (the index is legitimately unsorted).
+only for **newly added** ADRs, which is the right scope for a commit-time gate. The whole corpus is checked
+elsewhere: `tests/test_adr_index_coverage.py` asserts that every existing ADR file, companions included, is
+named by its number's row (BACKLOG #1516). It needs no legacy exemption, because 0077, 0079 and 0080 have
+rows. The gate does **not** assert sort order (the index is legitimately unsorted).
 
 Stdlib only, no `messagefoundry` import: most worktrees have no `.venv`, and a gate that silently skips is
 worse than no gate.

@@ -52,7 +52,7 @@ def _free_port() -> int:
         s.close()
 
 
-async def _wait_until(predicate, timeout: float = 2.0) -> None:  # type: ignore[no-untyped-def]
+async def _wait_until(predicate, timeout: float = 2.0) -> None:
     async def _poll() -> None:
         while not predicate():
             await asyncio.sleep(0.01)
@@ -61,13 +61,13 @@ async def _wait_until(predicate, timeout: float = 2.0) -> None:  # type: ignore[
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "autostart.db")
     yield s
     await s.close()
 
 
-def _file_out(name: str, tmp_path: Path, *, auto_start: bool = True):  # type: ignore[no-untyped-def]
+def _file_out(name: str, tmp_path: Path, *, auto_start: bool = True):
     return build_outbound_connection(
         name,
         ConnectionSpec(

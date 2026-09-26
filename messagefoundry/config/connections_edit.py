@@ -97,6 +97,10 @@ _SCALAR_FIELDS = (
     # it on a save would turn an attested hop into a REFUSED one at the next reload, as above.
     "tls_hop_attested",
     "tls_hop_attested_reason",
+    # ADR 0173: the per-connection revocation attestation (both directions). Dropping it on a save
+    # would turn an attested hop into a REFUSED one at the next reload, the same failure as above.
+    "tls_revocation_attested",
+    "tls_revocation_attested_reason",
 )
 # Sub-tables follow the scalars. ``schedule`` is deliberately LAST — it nests ``windows`` as an array
 # of inline tables, visually the heaviest entry, so the simple knobs stay greppable above it.

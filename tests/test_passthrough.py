@@ -415,8 +415,8 @@ async def _engine_on_backend(
     """A SQLite-backed Engine whose store is monkeypatched to *report* ``backend`` + the PT capability,
     so the start-time allow-list can be exercised without a real Postgres/SQL Server."""
     s = await MessageStore.open(tmp_path / "pt_backend.db")
-    s.backend = backend  # type: ignore[assignment]  # fake the reported backend for the guard
-    s.supports_pt_reingress = supports_pt  # type: ignore[assignment]
+    s.backend = backend  # fake the reported backend for the guard
+    s.supports_pt_reingress = supports_pt
     engine = Engine(s)
     engine.add_registry(registry)
     return engine, s
@@ -455,7 +455,7 @@ async def test_engine_rejects_pt_on_unknown_future_backend(tmp_path: Any) -> Non
     s = await MessageStore.open(tmp_path / "pt_future.db")
     # Simulate a backend that left the base default (False) and exposes no StoreBackend value (so the
     # guard falls back to naming the store class) — yet PT is still rejected (allow-list, not block-list).
-    s.supports_pt_reingress = False  # type: ignore[assignment]
+    s.supports_pt_reingress = False
     s.backend = None  # type: ignore[assignment]  # not a StoreBackend → class-name fallback
     engine = Engine(s)
     engine.add_registry(_pt_graph())
@@ -553,8 +553,8 @@ async def test_reload_live_rejects_introduced_pt_inbound(
     inbox.mkdir()
     outdir.mkdir()
     s = await MessageStore.open(tmp_path / "reload_pt.db")
-    s.backend = backend  # type: ignore[assignment]
-    s.supports_pt_reingress = False  # type: ignore[assignment]
+    s.backend = backend
+    s.supports_pt_reingress = False
     engine = Engine(s)
     engine.add_registry(_file_graph(inbox, outdir, with_pt=False))
     try:
@@ -586,8 +586,8 @@ async def test_reload_bringup_rejects_pt_graph_when_started_graphless(
     inbox.mkdir()
     outdir.mkdir()
     s = await MessageStore.open(tmp_path / "bringup_pt.db")
-    s.backend = backend  # type: ignore[assignment]
-    s.supports_pt_reingress = False  # type: ignore[assignment]
+    s.backend = backend
+    s.supports_pt_reingress = False
     engine = Engine(s)  # no add_registry → runner is None
     try:
         await engine.start()  # graphless start
@@ -614,8 +614,8 @@ async def test_reload_dry_run_rejects_pt_graph(
     inbox.mkdir()
     outdir.mkdir()
     s = await MessageStore.open(tmp_path / "dryrun_pt.db")
-    s.backend = backend  # type: ignore[assignment]
-    s.supports_pt_reingress = False  # type: ignore[assignment]
+    s.backend = backend
+    s.supports_pt_reingress = False
     engine = Engine(s)  # runner is None → dry_run builds a throwaway checker carrying this store
     try:
         _patch_load_config(monkeypatch, _file_graph(inbox, outdir, with_pt=True))
@@ -669,8 +669,8 @@ async def test_reload_non_pt_graph_unaffected_on_non_sqlite(
     inbox.mkdir()
     outdir.mkdir()
     s = await MessageStore.open(tmp_path / "nonpt_reload.db")
-    s.backend = backend  # type: ignore[assignment]
-    s.supports_pt_reingress = False  # type: ignore[assignment]
+    s.backend = backend
+    s.supports_pt_reingress = False
     engine = Engine(s)
     engine.add_registry(_file_graph(inbox, outdir, with_pt=False))
     try:

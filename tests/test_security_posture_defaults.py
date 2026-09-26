@@ -357,6 +357,10 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     "tls_key_file": "material/path, not a posture switch",
     "tls_key_password": "material/path, not a posture switch",
     "tls_ca_file": "material/path, not a posture switch",
+    # BACKLOG #1142, slice 3. A TIGHTENING, like tls_ciphers below: a set pin refuses any other
+    # bytes, and the one thing it relaxes (an unreadable ACL or path loads, with a warning and a
+    # pinned=true audit row) is reported by that row rather than by a posture reader.
+    "tls_ca_pin": "SHA-256 of tls_ca_file: a tightening; its escape writes an audit row",
     # BACKLOG #1005 added this one. It is exempt for BOTH of the reasons already used above, and
     # stating only the first would be the weaker half: it is a material PATH like tls_ca_file
     # beside it, AND its ABSENCE is GATED rather than reported -- check_inbound_revocation refuses
@@ -381,6 +385,12 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     "verify_tls": "same as tls_verify",
     "tls_check_hostname": "gated by the same ADR 0092 hop cell",
     "encrypt": "SQL Server preset only — _build_dsn's posture-keyed weakened-TLS refusal gates it",
+    # ADR 0173 made this pair authorable (owner ruling 2026-09-24). The attestation is audited with its
+    # reason at each construction where it suppresses a revocation refusal, but no connection-scoped
+    # reader lists the attested set yet. That reader is owed, as for tls_verify above, and
+    # docs/SECURITY-LOOSENING.md says so in the attestation's own entry.
+    "tls_revocation_attested": "audited per construction; a connection-scoped reader is owed",
+    "tls_revocation_attested_reason": "the reason text for tls_revocation_attested, not a switch",
 }
 
 

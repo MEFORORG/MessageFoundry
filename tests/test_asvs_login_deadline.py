@@ -256,7 +256,8 @@ async def test_every_login_failure_branch_answers_at_one_deadline(
 ) -> None:
     """THE INVARIANCE ASSERTION for the sign-in seam.
 
-    Five failure branches whose real costs differ by 75x at the parent commit. Each is driven from a
+    Four failure branches whose real costs differed by up to 75x before the pad. A fifth, the
+    first-run account's spelling, went with that account (ADR 0183). Each is driven from a
     call start captured in :func:`_least_deadline_offsets`, and the assertion is that
     ``deadline - start`` is the same for all of them — not that it equals any particular number, and
     not that it equals a constant the production code also reads.
@@ -273,12 +274,6 @@ async def test_every_login_failure_branch_answers_at_one_deadline(
             "invalid credentials",
         ),
         "locked_account": (lambda: service.login("locky", "definitely-not-it"), "account locked"),
-        # The bootstrap spelling takes an extra store lookup plus the supersession check (#1268), and
-        # measured 3.6 ms slower than every other local branch before the pad.
-        "bootstrap_username": (
-            lambda: service.login("admin", "definitely-not-it"),
-            "invalid credentials",
-        ),
         # BACKLOG #1137 retired directory password sign-in on 2026-08-22, AFTER this item's research
         # was written. It refuses before any store lookup, so it was by far the loudest branch here —
         # and, measured 2026-09-16, by far the CHEAPEST, which is why a stall reaches it first.
@@ -448,7 +443,7 @@ async def test_the_ui_sso_route_inherits_the_deadline(
     service = _sso_service(engine)
     await service.initialize()
     monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "stranger")
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))  # type: ignore[arg-type]
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.get(
             "/ui/sso",
@@ -473,7 +468,7 @@ async def test_route_local_rejects_are_deliberately_not_padded(
     """
     service = _sso_service(engine)
     await service.initialize()
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))  # type: ignore[arg-type]
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.get("/ui/sso", headers={"Authorization": "Negotiate !!!not-base64!!!"})
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=sso_failed"

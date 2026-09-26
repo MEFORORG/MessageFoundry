@@ -50,7 +50,7 @@ def _rsa_pem() -> str:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
 
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
     return key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
@@ -101,6 +101,7 @@ def _build(
                 cleartext_accepted=accepted,
                 cleartext_reason="on-prem proxy listener has no TLS" if accepted else None,
                 tls_revocation_attested=True,  # isolate the proxy behaviour from the #201 revocation gate
+                tls_revocation_attested_reason="revocation-checking PKI at the partner edge",
             )
         )
 

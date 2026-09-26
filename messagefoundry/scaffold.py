@@ -239,8 +239,11 @@ _GITIGNORE = """\
 *.db-shm
 *.db-wal
 *.log
-# the one-time bootstrap admin credential the engine writes next to the store
+# the one-time bootstrap admin credential engines before ADR 0183 Wave 2 wrote beside the store
 bootstrap-admin.txt
+# the API TLS pair the engine mints next to the store when no [api].tls_cert_file is set (ADR 0172)
+api-generated-key.pem
+api-generated-cert.pem
 .env
 .env.*
 /out/

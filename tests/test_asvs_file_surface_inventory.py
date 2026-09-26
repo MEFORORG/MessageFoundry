@@ -14,7 +14,7 @@ new surface on a derived axis fails the build until it has a row. Modelled on
 A row's KEY is the first backticked token in its first cell. Keys are what the axes compare, so a
 passing mention of ``file`` or ``database`` elsewhere in a row cannot stand in for a missing row.
 
-Three derived axes, and the hand-kept parts the doc discloses:
+Four derived axes, and the hand-kept parts the doc discloses:
 
 1. **Receivers.** Importing ``messagefoundry.transports`` runs every ``register_source(...)``. Each
    registered source type's ``.value`` must key an upload row, or be named in the exclusion bullet
@@ -22,7 +22,13 @@ Three derived axes, and the hand-kept parts the doc discloses:
    ``_UPLOAD_BODY_PATHS`` or :data:`CONTENT_ROUTES`, or a hand-kept key in :data:`HAND_KEPT_UPLOAD_KEYS`
    whose factory parameter still exists. Anything else is a stale row.
 2. **Upload routes.** Every path in ``api/app.py``'s ``_UPLOAD_BODY_PATHS`` must key an upload row.
-3. **Downloads.** An AST walk over ``messagefoundry/`` and ``messagefoundry_webconsole/`` finds every
+3. **IDE pickers and harness receivers.** Every ``showOpenDialog`` call in ``ide/src/``, plus the
+   pinned pick lists in :data:`IDE_PICK_LISTS`, must be named in the IDE picker row. Every code unit
+   in ``harness/`` that starts a server and builds an ``MLLPDecoder`` must be named in the harness row,
+   and must bound each decoder at the engine's ``DEFAULT_MAX_FRAME_BYTES``. Every code unit there that
+   builds a ``QFileSystemWatcher`` reads files another party writes, so it must be named in the same
+   row, must cap its reads at ``DEFAULT_MAX_MESSAGE_BYTES``, and must not read a file whole.
+4. **Downloads.** An AST walk over ``messagefoundry/`` and ``messagefoundry_webconsole/`` finds every
    code site that writes a ``Content-Disposition`` header (``str`` or ``bytes``) or builds a
    ``FileResponse``, and names its file and enclosing function. That set must equal
    :data:`DOWNLOAD_EMITTERS` exactly, and each emitter's route must key a download row.
@@ -113,15 +119,140 @@ _PICKER_CALL = re.compile(r"\.showOpenDialog\s*\(")
 _TS_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 
 
+def _ts_code(path: Path) -> str:
+    return _TS_COMMENT.sub("", path.read_text(encoding="utf-8"))
+
+
 def ide_pickers(src: Path, root: Path) -> set[str]:
     """Repo-relative paths of the shipped ``.ts`` files that call ``showOpenDialog(``. Comments and
     the extension's own tests (``src/test/``) are skipped: neither is a surface a user reaches."""
     return {
         f.relative_to(root).as_posix()
         for f in sorted(src.rglob("*.ts"))
-        if "test" not in f.relative_to(src).parts[:-1]
-        and _PICKER_CALL.search(_TS_COMMENT.sub("", f.read_text(encoding="utf-8")))
+        if "test" not in f.relative_to(src).parts[:-1] and _PICKER_CALL.search(_ts_code(f))
     }
+
+
+#: IDE sample choices that are a pick list rather than a ``showOpenDialog``: file -> the calls that make
+#: the choice. A pick list over a directory listing cannot be told from a menu by a call name alone
+#: (``statusBar.ts`` also lists a directory and shows a pick list), so these are pinned, and each must
+#: still make every call named here.
+IDE_PICK_LISTS: dict[str, tuple[str, ...]] = {
+    "ide/src/liveDebug.ts": ("readdirSync(", ".hl7", "showQuickPick("),
+}
+
+#: The Steps view's own capped read of its picked sample (the IDE row says why it exists).
+_IDE_SAMPLE_CAP = _IDE_SRC / "sampleFile.ts"
+_TS_SIZE = re.compile(r"export const MAX_SAMPLE_FILE_BYTES = ([\d\s*]+);")
+
+
+def ts_sample_cap(path: Path) -> int:
+    """``MAX_SAMPLE_FILE_BYTES`` in ``sampleFile.ts``: a product of integer literals, evaluated here."""
+    m = _TS_SIZE.search(_ts_code(path))
+    assert m, f"MAX_SAMPLE_FILE_BYTES is not a product of integer literals in {path.name}"
+    value = 1
+    for factor in m.group(1).split("*"):
+        value *= int(factor)
+    return value
+
+
+#: Where the test harness lives; its MLLP receivers are an upload row by Manager decision.
+_HARNESS = _ROOT / "harness"
+_SERVER_CALLS = frozenset({"QTcpServer", "start_server"})
+
+
+def harness_receivers(src: Path, root: Path) -> dict[str, list[ast.Call]]:
+    """``<file>::<unit>`` -> its ``MLLPDecoder(...)`` calls, for every top-level class or function in
+    ``src`` that both starts a server and builds an ``MLLPDecoder``. A client that only reads ACKs
+    starts no server, so it is not a receiver."""
+    found: dict[str, list[ast.Call]] = {}
+    for path in sorted(src.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "MLLPDecoder" not in text:
+            continue  # most harness files never parse: no decoder, no receiver
+        for node in ast.parse(text).body:
+            if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            calls = [c for c in ast.walk(node) if isinstance(c, ast.Call)]
+            decoders = [c for c in calls if _call_name(c) == "MLLPDecoder"]
+            if decoders and any(_call_name(c) in _SERVER_CALLS for c in calls):
+                found[f"{path.relative_to(root).as_posix()}::{node.name}"] = decoders
+    return found
+
+
+def unbounded_decoders(
+    receivers: dict[str, list[ast.Call]], root: Path, cap_name: str = "DEFAULT_MAX_FRAME_BYTES"
+) -> list[str]:
+    """Receivers with an ``MLLPDecoder`` built without ``max_frame_bytes=`` (or with it ``None``),
+    or whose file does not import ``cap_name`` from ``messagefoundry.transports.mllp`` and use it in
+    that unit. A cap read from a setting that defaults to ``cap_name`` passes: the check is on the
+    default, and a site may raise it as the engine's own setting may."""
+    bad: list[str] = []
+    for key, decoders in receivers.items():
+        file, unit = key.split("::")
+        if not _imports_and_uses(root / file, unit, "messagefoundry.transports.mllp", cap_name):
+            bad.append(f"{key} (does not bound at {cap_name})")
+        for call in decoders:
+            cap = next((k.value for k in call.keywords if k.arg == "max_frame_bytes"), None)
+            if cap is None or (isinstance(cap, ast.Constant) and cap.value is None):
+                bad.append(f"{key}:{call.lineno} (MLLPDecoder without max_frame_bytes)")
+    return bad
+
+
+def _imports_and_uses(path: Path, unit: str, module: str, cap_name: str) -> bool:
+    """``path`` imports ``cap_name`` from ``module`` at top level, and top-level ``unit`` uses it."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported = any(
+        isinstance(n, ast.ImportFrom)
+        and n.module == module
+        and any(a.name == cap_name for a in n.names)
+        for n in tree.body
+    )
+    node = next(n for n in tree.body if getattr(n, "name", None) == unit)
+    return imported and any(isinstance(n, ast.Name) and n.id == cap_name for n in ast.walk(node))
+
+
+_WATCHER_CALLS = frozenset({"QFileSystemWatcher"})
+_WHOLE_FILE_READS = frozenset({"read_text", "read_bytes"})
+
+
+def harness_file_watchers(src: Path, root: Path) -> list[str]:
+    """``<file>::<unit>`` for every top-level class or function in ``src`` that builds a
+    ``QFileSystemWatcher``: it reads files another party writes into a directory it watches."""
+    found: list[str] = []
+    for path in sorted(src.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "QFileSystemWatcher" not in text:
+            continue
+        for node in ast.parse(text).body:
+            if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if any(
+                isinstance(c, ast.Call) and _call_name(c) in _WATCHER_CALLS for c in ast.walk(node)
+            ):
+                found.append(f"{path.relative_to(root).as_posix()}::{node.name}")
+    return found
+
+
+def uncapped_watchers(
+    watchers: Iterable[str], root: Path, cap_name: str = "DEFAULT_MAX_MESSAGE_BYTES"
+) -> list[str]:
+    """Watchers that do not cap at ``cap_name`` (imported from ``messagefoundry.parsing.peek`` and
+    used in the unit), or that read a file whole: ``read_text``, ``read_bytes``, or a ``read()`` with
+    no size."""
+    bad: list[str] = []
+    for key in watchers:
+        file, unit = key.split("::")
+        path = root / file
+        if not _imports_and_uses(path, unit, "messagefoundry.parsing.peek", cap_name):
+            bad.append(f"{key} (does not cap at {cap_name})")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        node = next(n for n in tree.body if getattr(n, "name", None) == unit)
+        for call in (c for c in ast.walk(node) if isinstance(c, ast.Call)):
+            name = _call_name(call)
+            if name in _WHOLE_FILE_READS or (name == "read" and not call.args):
+                bad.append(f"{key}:{call.lineno} (reads a file whole: {name})")
+    return bad
 
 
 #: The registered sources the doc excludes as reading nothing from outside. Pinned here so a NEW
@@ -216,7 +347,7 @@ def _walk(
     node: ast.AST, stack: list[str], where: str, file_responses: set[str], out: set[str]
 ) -> None:
     is_fn = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    if is_fn:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):  # narrows; `is_fn` cannot
         stack.append(node.name)
     if _is_emitter(node, file_responses):
         out.add(f"{where}::{stack[-1] if stack else '<module>'}")
@@ -304,6 +435,9 @@ def test_no_upload_row_or_source_exclusion_names_a_surface_the_code_lacks() -> N
         | set(CONTENT_ROUTES)
         | set(HAND_KEPT_UPLOAD_KEYS)
         | ide_pickers(_IDE_SRC, _ROOT)
+        | set(IDE_PICK_LISTS)
+        | {key.split("::")[0] for key in harness_receivers(_HARNESS, _ROOT)}
+        | {key.split("::")[0] for key in harness_file_watchers(_HARNESS, _ROOT)}
     )
     stale = stale_keys(set(_UPLOAD_ROWS), allowed) | stale_keys(_EXCLUDED_SOURCES, _SOURCE_VALUES)
     assert not stale, f"5.1.1 rows or exclusions naming nothing the code registers: {sorted(stale)}"
@@ -332,8 +466,13 @@ def test_every_capturing_outbound_is_named_in_the_reply_row() -> None:
 
 
 def test_every_ide_file_picker_is_named_in_the_picker_row() -> None:
-    pickers = ide_pickers(_IDE_SRC, _ROOT)
-    assert pickers, "instrument found no showOpenDialog call in ide/src at all"
+    dialogs = ide_pickers(_IDE_SRC, _ROOT)
+    assert dialogs, "instrument found no showOpenDialog call in ide/src at all"
+    for file, calls in IDE_PICK_LISTS.items():
+        code = _ts_code(_ROOT / file)
+        missing = [c for c in calls if c not in code]
+        assert not missing, f"pinned pick list {file} no longer makes {missing}"
+    pickers = dialogs | set(IDE_PICK_LISTS)
     first_cells = {
         token
         for row in _UPLOAD_ROWS.values()
@@ -346,6 +485,55 @@ def test_every_ide_file_picker_is_named_in_the_picker_row() -> None:
     row = next((r for key, r in _UPLOAD_ROWS.items() if key in pickers), None)
     assert row is not None, "no upload row is KEYED by an IDE picker path"
     assert has_figure(row, f"MAX_FIXTURE_FILE_BYTES` = {_size(dryrun.MAX_FIXTURE_FILE_BYTES)}")
+    assert has_figure(row, f"MAX_SAMPLE_FILE_BYTES` = {_size(ts_sample_cap(_IDE_SAMPLE_CAP))}")
+
+
+def test_the_steps_view_reads_its_sample_only_through_the_cap() -> None:
+    """The Steps view read its picked sample whole before ``dryrun`` saw it (BACKLOG #1127). Its cap
+    must equal ``dryrun``'s default, and ``stepsView.ts`` must check at pick time and read capped."""
+    assert ts_sample_cap(_IDE_SAMPLE_CAP) == dryrun.MAX_FIXTURE_FILE_BYTES
+    code = _ts_code(_IDE_SRC / "stepsView.ts")
+    assert "checkSampleSize(" in code and "readSampleCapped(" in code
+    assert "readFileSync(" not in code, "stepsView.ts reads a file outside the sample cap"
+
+
+# --- the harness's MLLP receivers -----------------------------------------------------------------
+
+
+def test_every_harness_receiver_is_named_in_the_harness_row_and_bounded() -> None:
+    receivers = harness_receivers(_HARNESS, _ROOT)
+    assert receivers, "instrument found no server-side MLLPDecoder in harness/ at all"
+    files = {key.split("::")[0] for key in receivers}
+    named = {
+        token
+        for row in _UPLOAD_ROWS.values()
+        for token in re.findall(r"`([^`]+)`", row.split("|")[1])
+        if token.startswith("harness/")
+    }
+    watcher_files = {key.split("::")[0] for key in harness_file_watchers(_HARNESS, _ROOT)}
+    assert named == files | watcher_files, (
+        f"harness row differs from the code: {sorted(named ^ (files | watcher_files))}"
+    )
+    bad = unbounded_decoders(receivers, _ROOT)
+    assert not bad, bad
+    row = next((r for key, r in _UPLOAD_ROWS.items() if key in files), None)
+    assert row is not None, "no upload row is KEYED by a harness receiver path"
+    assert has_figure(row, f"DEFAULT_MAX_FRAME_BYTES` = {_size(DEFAULT_MAX_FRAME_BYTES)}")
+
+
+def test_every_harness_file_watcher_is_named_in_the_harness_row_and_capped() -> None:
+    """The File tab's watch pane read each new file whole with no cap (BACKLOG #1127 follow-up). A
+    unit that watches a directory another party writes to must cap its reads like the engine."""
+    watchers = harness_file_watchers(_HARNESS, _ROOT)
+    assert watchers, "instrument found no QFileSystemWatcher in harness/ at all"
+    bad = uncapped_watchers(watchers, _ROOT)
+    assert not bad, bad
+    row = next((r for key, r in _UPLOAD_ROWS.items() if key.startswith("harness/")), None)
+    assert row is not None, "no upload row is KEYED by a harness path"
+    first_cell = row.split("|")[1]
+    for key in watchers:
+        assert f"`{key.split('::')[0]}`" in first_cell, f"{key} is not named in the harness row"
+    assert has_figure(row, f"DEFAULT_MAX_MESSAGE_BYTES` = {_size(DEFAULT_MAX_MESSAGE_BYTES)}")
 
 
 # --- axis 2: upload routes ------------------------------------------------------------------------
@@ -564,6 +752,7 @@ QUOTED_CONSTANTS: dict[str, int] = {
     "_MAX_CONFIG_MEMBERS": dr_backup._MAX_CONFIG_MEMBERS,
     "_MAX_CONFIG_BYTES": dr_backup._MAX_CONFIG_BYTES,
     "MAX_FIXTURE_FILE_BYTES": dryrun.MAX_FIXTURE_FILE_BYTES,
+    "MAX_SAMPLE_FILE_BYTES": ts_sample_cap(_IDE_SAMPLE_CAP),
 }
 
 _QUOTED = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)` = (\d+(?:,\d{3})*(?: [KMG]iB)?)")
@@ -730,3 +919,75 @@ def test_self_test_figure_match_respects_number_boundaries() -> None:
     assert not has_figure(row, "6,000,000 characters")
     assert not has_figure("ceiling 1,000,000", "ceiling 1,000")
     assert not has_figure("MAX_EXPORT_IDS` = 100,000", "MAX_EXPORT_IDS` = 100")
+
+
+def test_self_test_a_harness_receiver_is_found_and_an_unbounded_one_flagged(tmp_path: Path) -> None:
+    src = tmp_path / "harness"
+    src.mkdir()
+    (src / "rx.py").write_text(
+        "from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder\n"
+        "class Bounded:\n"
+        "    async def start(self):\n        await asyncio.start_server(self.on, 'h', 0)\n"
+        "    def on(self):\n        return MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)\n"
+        "class Unbounded:\n"
+        "    def __init__(self):\n        self.s = QTcpServer(self)\n"
+        "    def on(self):\n        return MLLPDecoder()\n"
+        "class ExplicitNone:\n"
+        "    def run(self):\n        start_server(DEFAULT_MAX_FRAME_BYTES)\n"
+        "        return MLLPDecoder(max_frame_bytes=None)\n"
+        "class ClientOnly:\n"
+        "    def read_ack(self):\n        return MLLPDecoder()\n",
+        encoding="utf-8",
+    )
+    receivers = harness_receivers(src, tmp_path)
+    assert set(receivers) == {
+        "harness/rx.py::Bounded",
+        "harness/rx.py::Unbounded",
+        "harness/rx.py::ExplicitNone",
+    }
+    assert unbounded_decoders(receivers, tmp_path) == [
+        "harness/rx.py::Unbounded (does not bound at DEFAULT_MAX_FRAME_BYTES)",
+        "harness/rx.py::Unbounded:11 (MLLPDecoder without max_frame_bytes)",
+        "harness/rx.py::ExplicitNone:15 (MLLPDecoder without max_frame_bytes)",
+    ]
+
+
+def test_self_test_the_ts_sample_cap_is_evaluated(tmp_path: Path) -> None:
+    ts = tmp_path / "sampleFile.ts"
+    ts.write_text(
+        "// export const MAX_SAMPLE_FILE_BYTES = 1;\nexport const MAX_SAMPLE_FILE_BYTES = 4 * 1024;\n",
+        encoding="utf-8",
+    )
+    assert ts_sample_cap(ts) == 4096
+
+
+def test_self_test_a_harness_file_watcher_is_found_and_an_uncapped_one_flagged(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "harness"
+    src.mkdir()
+    (src / "fw.py").write_text(
+        "from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES\n"
+        "class Capped:\n"
+        "    def __init__(self):\n        self.w = QFileSystemWatcher(self)\n"
+        "    def scan(self, p):\n"
+        "        with p.open('rb') as fh:\n            return fh.read(DEFAULT_MAX_MESSAGE_BYTES + 1)\n"
+        "class Whole:\n"
+        "    def __init__(self):\n        self.w = QFileSystemWatcher(self)\n"
+        "    def scan(self, p):\n        return p.read_text()\n"
+        "class BareRead:\n"
+        "    def __init__(self):\n        self.w = QFileSystemWatcher(self)\n"
+        "    def scan(self, p):\n"
+        "        DEFAULT_MAX_MESSAGE_BYTES\n        with p.open('rb') as fh:\n"
+        "            return fh.read()\n"
+        "class NotAWatcher:\n"
+        "    def scan(self, p):\n        return p.read_text()\n",
+        encoding="utf-8",
+    )
+    watchers = harness_file_watchers(src, tmp_path)
+    assert watchers == ["harness/fw.py::Capped", "harness/fw.py::Whole", "harness/fw.py::BareRead"]
+    assert uncapped_watchers(watchers, tmp_path) == [
+        "harness/fw.py::Whole (does not cap at DEFAULT_MAX_MESSAGE_BYTES)",
+        "harness/fw.py::Whole:12 (reads a file whole: read_text)",
+        "harness/fw.py::BareRead:19 (reads a file whole: read)",
+    ]

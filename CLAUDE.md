@@ -843,8 +843,8 @@ gates a merge**, and no seat has to clear one.
 
 ### A Builder runs the checks before it commits, because nobody downstream can ask it to
 
-- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict),
-  `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
+- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict,
+  over `messagefoundry` and, with `--explicit-package-bases`, `tests`), `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
 - **Then review your own diff with the `code-review` SUBAGENT, at effort `xhigh`, named explicitly.**
   Ruff is style, mypy is types, pytest is regression, and `/simplify` above is a quality pass that
   points at `code-review` for bugs -- none of them looks for a NEW correctness defect. **Say
@@ -915,11 +915,12 @@ QT_QPA_PLATFORM=offscreen pytest -q          # PowerShell: $env:QT_QPA_PLATFORM=
 ruff format .
 ruff check .
 mypy messagefoundry
+mypy --explicit-package-bases tests   # BACKLOG #1799; the profile and its exemptions: pyproject.toml
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
 python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 
-# open the web console (operator UI) — browse to the engine's /ui (e.g. http://127.0.0.1:8765/ui)
+# open the web console (operator UI) — browse to the engine's /ui (e.g. https://127.0.0.1:8765/ui)
 
 # launch the standalone PySide6 test harness (separate process; attaches to the API)
 python -m harness
@@ -1072,7 +1073,7 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 - When asked for tabular results, provide the final table directly — not code that generates it.
 - **Review security prose by asking what a reader would DO with it, not whether it is accurate**
   (**SDS-3.4**). The rules below are instances of it. Reasoning, evidence and dates:
-  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.8**,
+  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.10**,
   under *"Reviewing security prose"* — the source of record.
 - **State a load-bearing fact ONCE and link to it; never restate it** (**SDS-3.5**).
 - **A completeness claim is a liability — prefer "at least" to an enumeration** (**SDS-3.6**).
@@ -1081,6 +1082,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   `git diff` on a staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job*
   conclusion for a *step* question. Name the question and what the tool returns; check they are the
   same sentence.
+- **Before clearing a suspect from what a record says, ask whether that record could hold the state
+  at all** (**SDS-3.10**). Then name the suspects that step leaves open.
 
 ---
 

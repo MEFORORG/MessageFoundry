@@ -270,6 +270,7 @@ jobs:
             tests/test_claude_section_citations.py tests/test_write_share_denominator.py
             tests/test_cutover_slug_rot.py
             tests/test_docs_cite_no_refused_config_keys.py
+            tests/test_install_docs_pin_the_current_version.py
             tests/test_operator_docs_no_warning_sign.py
             tests/test_docs_upstream_hop_ack.py"
           # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
@@ -328,7 +329,7 @@ jobs:
       # narrow set stays narrow; the docker-smoke job builds from docker/locks/* and installs nothing).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -422,6 +423,10 @@ jobs:
       # checkout, its own `cla` check went green three times on the remote action it was deleting,
       # and on landing it blocked 7 of 21 open pull requests behind a required context whose repair
       # was itself gated by the broken check. This step runs on the branch's own file.
+      #
+      # IT ALSO FAILS ON A RUNTIME AND ON A DATE (BACKLOG #1868). It refuses a local action whose
+      # `runs.using` GitHub has retired, and a current one past its revisit date in the script. Read
+      # the step's own output; a red here on a pull request that touched no workflow is the date.
       - name: Workflow local-action references resolve
         if: runner.os == 'Linux'
         run: python scripts/quality/workflow_local_action_check.py
@@ -466,6 +471,28 @@ jobs:
       - name: Type-check (mypy, strict — linux platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: mypy messagefoundry messagefoundry_webconsole --exclude 'messagefoundry/tray/'
+
+      # BACKLOG #1799: tests/ is type-checked. WHY THE SCOPE IS WHAT IT IS, so the next gap is not
+      # found by accident. This is the THIRD directory to fall outside a gate that reads as
+      # repo-wide: #327 fixed .gitignore, then docs/**/*.py sat exempt from lint, mypy and pytest
+      # directly below the note explaining the first (see the `changes` job, and its verdict "the
+      # instance was fixed and the class left open"). tests/ was the third: the engine steps name
+      # their packages and pre-commit runs no mypy, so nothing type-checked a test file.
+      #   * The scope is the DIRECTORY, not a file list, so a new test file is checked on arrival.
+      #     The exemptions, the profile it runs under and the reason for `--explicit-package-bases`
+      #     are stated once, in pyproject.toml's [tool.mypy] comments. tests/test_mypy_tests_scope.py
+      #     pins this step, the profile's key set and the exemption list's hygiene and ceiling.
+      #   * Linux platform only. The win32 pass below exists for SHIPPED win32 code; a test's win32
+      #     branch runs on the Windows pytest legs, where a defect in it fails the run.
+      #   * Placed straight after the linux engine pass so it reuses that pass's mypy cache; after
+      #     the win32 pass it re-analyses the engine modules the tests import.
+      #   * NOT REPO-WIDE. At least harness/, tee/, scripts/, samples/, docker/, fuzz/, docs/**/*.py
+      #     and packaging/messagefoundry-webconsole/tests/ are outside every mypy step. mypy follows a
+      #     test's import into harness/ or scripts/, but the editable install reports those modules
+      #     as silenced site-packages, so a green step says nothing about them.
+      - name: Type-check (mypy, tests — linux platform)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
+        run: mypy --explicit-package-bases tests
 
       # The win32 pass types messagefoundry/tray (now inside the messagefoundry package, so no separate
       # path argument) plus every other sys.platform=='win32' branch.
@@ -1066,7 +1093,7 @@ jobs:
 
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1122,7 +1149,7 @@ jobs:
       # Each leg's 66 splits 61 success / 5 not, and every red above came from the 61: `decide()`
       # returns LOW only for a step that concluded SUCCESS, so a red here is always a green suite.
       #
-      # At the margin caps in force -- 5 / 6 / 9 -- the observed maxima sit at 1.345x, 1.229x and
+      # At the margin caps then in force -- 5 / 6 / 9 -- the observed maxima sit at 1.345x, 1.229x and
       # 1.179x. Two legs are under the gate's 1.30x floor AT THEIR OWN WORST RUN. Seven ejections in
       # twelve hours is what that looks like from the inside. ubuntu clears at 1.345x and is next.
       #
@@ -1213,10 +1240,13 @@ jobs:
       # still names the test, so a hang is attributable; the stack is not. Re-run that node id serially
       # to get the dump back -- do not read the missing dump as the timeout having failed to fire.
       #
-      # WINDOWS-2025's MARGIN CAP IS 9, NOT 6, AND THE CAUSE IS RUNNER VARIANCE RATHER THAN SUITE
-      # GROWTH. Every "cap" in this note means `webconsole_margin_cap`, which is what these four runs
-      # were measured against; it was spelled `webconsole_step_timeout` when the note was written,
-      # because that one variable was then both the ruler and the wall. The numbers are untouched.
+      # WINDOWS-2025's MARGIN CAP WENT FROM 6 TO 9, AND THE CAUSE WAS RUNNER VARIANCE RATHER THAN SUITE
+      # GROWTH. It is 8 now: the BACKLOG #1842 re-derivation under "THE MARGIN CAPS ARE RE-DERIVED"
+      # below re-sized it on a post-xdist pool. This paragraph is the 2026-09-13 reasoning for 9, kept
+      # as a record. Every "cap" in this note means `webconsole_margin_cap`, which is what these four
+      # runs were measured against; it was spelled `webconsole_step_timeout` when the note was
+      # written, because that one variable was then both the ruler and the wall. The numbers are
+      # untouched.
       # Re-derived 2026-09-13, after the margin gate EVICTED PR 1097 from the merge queue. Four
       # windows-2025 runs of the SAME 497-test suite, inside one hour:
       #
@@ -1279,17 +1309,18 @@ jobs:
       # BEFORE the kill. Splitting the two makes that true with room: the gate still reds at
       # margin_cap / 1.30, which now sits well under the wall instead of on it.
       #
-      # THE MARGIN CAPS ARE UNCHANGED AND ARE NOT SIZED BY *THIS* CHANGE -- the DECOUPLING -- at 5 / 6
-      # / 9, exactly the values that were in force as `webconsole_step_timeout`. Sizing them honestly
+      # THE MARGIN CAPS WERE LEFT UNCHANGED BY *THAT* CHANGE -- the DECOUPLING -- at 5 / 6 / 9,
+      # exactly the values then in force as `webconsole_step_timeout`. Sizing them honestly
       # needs a sample collected under a kill that does not truncate it. Shipping a decoupling and a
       # re-size together would bury the one change that can be reasoned about, so the re-size is
       # deliberately a later, separate change with its own measurement.
       #
-      # THE CAPS ARE STILL 5 / 6 / 9 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
-      # "THE MARGIN CAPS ARE RE-DERIVED". BACKLOG #1879 did the re-derivation this paragraph defers and
-      # came back "unchanged", so the two notes agree; they are 50 lines apart and could be read as
-      # contradicting, which is the only reason this pointer exists. Do not restate the arithmetic
-      # here -- one copy, per SDS-3.5.
+      # THE CAPS ARE NOW 5 / 6 / 8 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
+      # "THE MARGIN CAPS ARE RE-DERIVED". BACKLOG #1879 did the first re-derivation this paragraph
+      # defers and came back "unchanged". BACKLOG #1842 did the second, on the first hosted pool taken
+      # under xdist, and moved windows-2025 from 9 to 8. The notes are 50 lines apart and could be
+      # read as contradicting, which is the only reason this pointer exists. Do not restate the
+      # arithmetic here -- one copy, per SDS-3.5.
       #
       # THAT SAMPLE NOW EXISTS, and this paragraph's next clause used to deny it: it said such a sample
       # "does not exist yet and cannot exist until this arrangement has been live for a while". The
@@ -1317,7 +1348,8 @@ jobs:
       # number until a warning stops. What it asks for is a cap derived from what the work takes. This cap
       # is derived from four measured runs and set so the OBSERVED WORST clears the floor, so it is the
       # second. The detector is not disarmed either: at 9:00 it warns again above 6:55, which is outside
-      # the entire observed range.
+      # the entire observed range. That 9 is 8 now, re-sized by BACKLOG #1842 below; at 8:00 the gate
+      # warns above 6:09.
       #
       # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 a green suite came within 35 seconds of being
       # KILLED, because the 6:00 that was then the margin cap was also the `timeout-minutes` -- the
@@ -1340,17 +1372,18 @@ jobs:
       # 7:38 on 2026-09-22, nine days later. Not necessarily its FIRST: the pool above is twelve hours
       # wide, so it can date a breach and cannot date the earliest one.
       #
-      # THE MARGIN CAPS ARE RE-DERIVED AND THE RE-DERIVATION CAME BACK "UNCHANGED" -- 5 / 6 / 9, and
-      # saying that out loud is the point of this paragraph. A cap that nobody moved and a cap that was
-      # checked and found right look identical in a diff, so here is the arithmetic. Each cap divided by
-      # the 1.30x floor gives the longest the step may take on that leg, set beside the WORST SERIAL run
-      # in the 66-observation pool above:
+      # THE MARGIN CAPS ARE RE-DERIVED, TWICE. The first re-derivation came back "UNCHANGED" -- 5 / 6 /
+      # 9 -- and saying so out loud is the point of the next few paragraphs. The second, BACKLOG #1842,
+      # moved windows-2025 to 8; it is the group headed "THE SECOND RE-DERIVATION" below. A cap that
+      # nobody moved and a cap that was checked and found right look identical in a diff, so here is
+      # the first one's arithmetic. Each cap divided by the 1.30x floor gives the longest the step may
+      # take on that leg, set beside the WORST SERIAL run in the 66-observation pool above:
       #
       #   ubuntu-latest   5:00 / 1.30 = 3:51   worst serial 3:43   already clears with no speedup
       #   windows-2022    6:00 / 1.30 = 4:37   worst serial 4:53   needs 1.058x
       #   windows-2025    9:00 / 1.30 = 6:55   worst serial 7:38   needs 1.103x
       #
-      # So the caps as they stand bet that xdist delivers 1.06x and 1.10x on the two breaching legs.
+      # So the caps as they then stood bet that xdist delivers 1.06x and 1.10x on the two breaching legs.
       # Measured locally at 1.563x under this step's own flags. A bet that small against a margin that
       # large is the whole argument for leaving the numbers alone, and it is falsifiable: if either leg
       # still reds after this lands, the bet was wrong and the number, not the reasoning, is the fix.
@@ -1361,17 +1394,75 @@ jobs:
       # are not evidence; a hosted leg landing materially above them means the contention penalty is
       # real and the re-derivation below matters sooner.
       #
-      # WHY THE CAPS ARE NOT LOWERED, WHICH IS THE OTHER HALF OF "RE-DERIVED". Sizing them at 1.30x a
-      # PROJECTED post-xdist time would need a hosted post-xdist sample, and none exists -- this change
-      # creates the first one. Projecting the local 1.861x onto a 4-vCPU runner and sizing from it is
-      # precisely the move that reds the gate on the first merge group if the hosted ratio comes in at
-      # 1.15x, which is the harm being fixed rather than a cost of fixing it. The honest cost of waiting
-      # is named instead of hidden: until the caps come down, the gate tolerates roughly another
-      # doubling before it speaks, and at the growth rate above that is about a quarter of cover.
+      # WHY THE CAPS WERE NOT LOWERED THEN, WHICH IS THE OTHER HALF OF "RE-DERIVED". Written before any
+      # hosted post-xdist sample existed; that sample is the second re-derivation below. Sizing them at
+      # 1.30x a PROJECTED post-xdist time would need a hosted post-xdist sample, and none existed --
+      # that change created the first one. Projecting the local 1.861x onto a 4-vCPU runner and sizing
+      # from it is precisely the move that reds the gate on the first merge group if the hosted ratio
+      # comes in at 1.15x, which is the harm being fixed rather than a cost of fixing it.
       #
       # RE-DERIVING THEM LATER NEEDS NO NEW INSTRUMENT. The pool above was collected from the jobs API
       # by keying on this step's name and its OWN conclusion, per leg; repeat that once a few dozen
       # post-xdist merge_group runs exist, take each leg's worst PASSING run, and size at 1.30x it.
+      # CORRECTED 2026-09-26: read literally, "1.30x it" puts the worst run ON the gate's floor. The
+      # rule the second re-derivation used is ceil_minute(1.35x the worst passing run). The 1.35
+      # multiple is #131's, per the engine sizing note above `step_timeout`; the BACKLOG #1842 row
+      # credits the rule to #344 and adds a 5:00 floor, which binds on no leg here.
+      #
+      # THE SECOND RE-DERIVATION, BACKLOG #1842, ON THE FIRST HOSTED POST-xdist POOL. It moved
+      # windows-2025 from 9 to 8 and left the other two alone. The pool's definition, n, min and median
+      # live ONCE, in the three web console rows of scripts/ci/step_margin_baseline.toml. The pool
+      # opens at the first run after PR 1415, which added `-n`. This note carries the sizing input and
+      # the evidence those rows do not:
+      #
+      #   leg             worst passing   x 1.35   cap
+      #   ubuntu-latest   3:13            4:21     5   unchanged
+      #   windows-2022    4:11            5:39     6   unchanged
+      #   windows-2025    5:24            7:17     8   was 9
+      #
+      # tests/test_ci_step_margin.py reads each cap and each recorded maximum, and fails unless the cap
+      # is exactly what this rule gives. So a re-measured row moves its cap in the same change, or CI
+      # says so. The same table at 1.30x rounds up to the same three caps.
+      #
+      # The pool is merge_group plus pull_request. merge_group alone has maxima 2:54 / 4:09 / 5:06,
+      # which would size windows-2025 at 7; the wider pool is used because its maximum is higher. push
+      # and workflow_dispatch runs in the same window executed this step only 7 times per leg, all
+      # under the rows, because a push that changes no code leaves the job unexpanded. The kills stay
+      # 9 / 10 / 12. Each is still at least 1.30x its cap, and the nesting table above sums the kills,
+      # so that table does not move.
+      #
+      # LOWERING windows-2025 TO 8 HAS A COST, AND IT IS TAKEN ON PURPOSE. At 9 the gate reds above
+      # 6:55; at 8 it reds above 6:09, 14 percent over the worst pooled run of 5:24. The rule leaves
+      # windows-2022 10 percent (4:37 over 4:11) and ubuntu 20 percent (3:51 over 3:13), so 8 puts
+      # windows-2025 between them. The rule keeps the ruler close to the work, so the gate speaks when
+      # the suite grows. Holding 9 would keep a cap that no run in this pool supports, which is the
+      # "bound derived from another bound" #344 closed. If windows-2025 starts ejecting merge groups
+      # at 8, re-measure; do not restore 9 by hand.
+      #
+      # THE POOL IS UNCENSORED ON EVIDENCE. No step in it concluded failure. Two were cancelled, and
+      # each for a cause unrelated to its duration. The ubuntu step stopped at 1:09 when its whole run
+      # was cancelled. The windows-2025 step stopped at 4:11 in run 35748255462, cancelled once a newer
+      # run on the same branch started four minutes after it. The other exclusions were skipped.
+      #
+      # THE GATE'S OWN STEP IS THE READING, AND IT HAS A CONTROL. The census also read each job's
+      # `Step margin -- web console suite` conclusion. Across every success row in the pool, at 5 / 6 /
+      # 9, it concluded failure zero times. The control is the same census before PR 1415, from PR
+      # 1398's merge: there that step failed 12 times on windows-2022 and 3 times on windows-2025, over
+      # about 140 rows per leg. So the zero is a reading, not a matcher that finds nothing.
+      #
+      # THE API DURATION AND THE GATE'S OWN CLOCK AGREE TO ABOUT A SECOND. The gate divides a
+      # mark-to-mark elapsed, which includes step transitions. In the pre-xdist half, windows-2022's
+      # slowest green was 4:36 and its fastest red 4:38, straddling the 4:37 red line.
+      #
+      # WHAT THIS MEANS FOR BACKLOG #1842. It was filed against windows-2022 at 5 of 30 merge_group
+      # runs red, and it proposed raising that cap to 7. xdist fixed the red first: that leg's worst
+      # run is now 4:11, 1.434x under 6:00. No run in the pool supports the raise.
+      #
+      # THE HOSTED RUNS CAME IN SLOWER THAN THE PROJECTION, AS IT WARNED THEY MIGHT. Medians, both
+      # sides from the one census, moved 3:20 -> 2:35, 4:20 -> 3:17 and 4:50 -> 3:35. That is 1.29x,
+      # 1.32x and 1.35x against the projected 1.563x, so the contention penalty on a 4-vCPU runner is
+      # real. Worst runs are not compared here: the projection's inputs came from a 66-row pool and
+      # this one holds about 300 rows per leg, and a maximum grows with the size of its sample.
       #
       # `matrix.pytest_workers` NOW FEEDS TWO SUITES, AND ITS OWN NOTE STILL CALLS IT THE ENGINE'S.
       # That note offers 2 as "the conservative rung" if engine timing tests start flaking. Taking that
@@ -1637,7 +1728,7 @@ jobs:
           exit 1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1827,6 +1918,38 @@ jobs:
         if: runner.os == 'Windows'
         run: npm test
 
+  # BACKLOG #1164, owner decision 2026-09-24: the TypeScript/JavaScript and PowerShell crypto
+  # OPERATION arms of the ASVS 11.1.3 gate run in their OWN small job so they can gate a merge.
+  # They used to be the last step of `ide` above, and that job is path-gated on a pull request, so a
+  # PR touching only the console's JS, a .ps1 or the gate script was not scanned until push-to-main.
+  # THAT GAP IS CLOSED: this job has no `needs:`, no job-level `if:` and no path gate, so it runs on
+  # every event this workflow triggers on -- pull_request, push-to-main and merge_group, and also the
+  # nightly cron and a manual dispatch, where it costs seconds. The merge_group arm is load-bearing:
+  # a required context with no queue leg never reports on a queued entry and wedges it. Do not add a
+  # job-level `if:` to trim the cron run; a skipped job is the context not reporting.
+  #
+  # Stdlib-only Python, no npm build, one Linux leg: the scan reads source text and is not
+  # platform-dependent. Deliberately NOT in ci-gate's `needs:`. It is a context of its own, like the
+  # `test` legs, rather than a leg of the roll-up.
+  #
+  # The job `name:` below IS the status-check context string, so renaming it is a branch-protection
+  # change. It blocks a merge only while branch protection requires that context, a server setting
+  # nothing here can see; `.github/required-contexts.txt` is the checked-in record of that set.
+  crypto-operations:
+    name: crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Crypto operation inventory (TypeScript/JavaScript + PowerShell arms)
+        # Stdlib-only (no install). Exits non-zero, failing the job, on any drift.
+        run: python scripts/security/crypto_inventory_check.py --non-python-operations
+
   # Path filter for the container-pulling server-DB leg(s). A docs/unrelated PR shouldn't pull the SQL
   # Server image (mcr.microsoft.com anonymous pulls are rate-limited — repeated PRs flake on
   # "toomanyrequests"). This job decides whether the SQL Server leg needs to run: ALWAYS true on
@@ -1923,8 +2046,9 @@ jobs:
           # THE TWO MUST MOVE TOGETHER AND A TEST SAYS SO. Two copies of a coupled number is the drift
           # this repository has been bitten by repeatedly, so the coupling is asserted mechanically
           # rather than documented: tests/test_ci_step_margin.py reads BOTH out of these literals and
-          # requires kill >= 1.30x margin cap on every named leg, plus the nesting invariant, plus the
-          # leg names and their count. Raise one of the pair and that test names the other.
+          # requires, at least, kill >= 1.30x margin cap on every named leg, the nesting invariant, the
+          # leg names and their count, and each margin cap equal to ceil_minute(1.35x) its leg's row in
+          # scripts/ci/step_margin_baseline.toml. Move one number and that test names the others.
           # `pytest_workers` is the xdist worker count for the engine suite. It is a MATRIX knob rather
           # than a literal in the run body for the same reason every other per-leg number here is one:
           # the trial dispatches that size it are then a one-line edit, and a leg can differ from its
@@ -1991,7 +2115,7 @@ jobs:
           # they were split.
           U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":5,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":6,"webconsole_step_timeout":10,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":8,"webconsole_step_timeout":12,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
@@ -2095,12 +2219,13 @@ jobs:
           # packaging-build, via `docker`, `ide`, `tooling` and `packaging` below.
           #
           # BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING, because dropping either changes the
-          # answer. "Names merge_group nowhere" ALONE is true of SIX of this file's 13 jobs -- it also
-          # takes in `changes`, which has no `if:` at all, and `ci-gate`, which is `always()` and
-          # reads no output of this step. Neither is decided by anything emitted here. Scanned over
-          # all 13 job blocks rather than sampled, and tests/test_ci_merge_group_gate.py pins the
-          # sides of that scan BY MEMBERSHIP, not by count: the SEVEN jobs whose own job-level or
-          # step-level `if:` names merge_group, the SIX of this paragraph, and the FOUR named above.
+          # answer. "Names merge_group nowhere" ALONE is true of SEVEN of this file's 14 jobs -- it
+          # also takes in `changes` and `crypto-operations`, which have no `if:` at all, and
+          # `ci-gate`, which is `always()` and reads no output of this step. None of the three is
+          # decided by anything emitted here. Scanned over all 14 job blocks rather than sampled, and
+          # tests/test_ci_merge_group_gate.py pins the sides of that scan BY MEMBERSHIP, not by count:
+          # the SEVEN jobs whose own job-level or step-level `if:` names merge_group, the SEVEN of
+          # this paragraph, and the FOUR named above.
           # THE COUNTS IN THIS PARAGRAPH ARE NOT WHAT IS PINNED -- that module held a count until
           # 2026-09-22 and a count sits at six while a job key is renamed underneath it. It also
           # fails outright if either half of this predicate stops removing anything, which is the
@@ -2482,7 +2607,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2798,7 +2923,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2996,7 +3121,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3189,7 +3314,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3342,7 +3467,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3572,6 +3697,65 @@ jobs:
         if: always()
         shell: powershell
         run: .\scripts\service\uninstall-service.ps1
+
+      # --- ADR 0183 Amendment A, Wave 0 (BACKLOG #1136): the AUTH-ON arm ------------------------------
+      # Everything above runs with sign-in OFF, so it cannot see the question these two steps ask:
+      # can the NSSM service account and the operator who runs `provision-admin` both open ONE SQLite
+      # store, in either order? ADR 0163 reads MessageStore.open as re-securing the store trio to the
+      # current user alone on every open, which would make whichever identity opens a fresh store
+      # first its only principal. These steps MEASURE that; they fix nothing, and a red here is the
+      # reading Wave 0 exists to produce -- do not weaken the check to turn it green. The fix is 0b.
+      #
+      # Each arm installs the service under the DEFAULT virtual account (NT SERVICE\MessageFoundry),
+      # with sign-in required, on its own fresh data directory, and uninstalls it afterwards. The helper
+      # asserts the SCM run-as account and the owner of each sampled service process, so an arm that
+      # silently ran as some other account goes red instead of measuring the wrong thing. Every red
+      # names the identity and the trio file(s) granting it no read+write, and is tagged [STORE ACCESS]
+      # only when a log shows an open failure -- [NOT SHOWN TO BE STORE ACCESS] otherwise, so a refused
+      # start gate or a held port is not read as the lockout. After every open each trio file may grant only
+      # SYSTEM, Administrators, the service account and the operator, or the arm goes red. A restriction
+      # the engine logged as failed prints GREEN (CONDITIONAL). The helper's header says how each arm reds.
+      #
+      # `!cancelled()` rather than the default `success()`: both readings are wanted on every run, so
+      # the start-first arm still runs when the provision-first arm or the auth-off smoke went red.
+      # Windows PowerShell 5.1, matching the install step above. timeout-minutes bounds a hung arm.
+      - name: Store access, auth on -- provision first, then the service (ADR 0183 Wave 0)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: powershell
+        run: .\scripts\service\measure-store-access.ps1 -Order ProvisionFirst -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
+
+      - name: Store access, auth on -- the service first, then the operator (ADR 0183 Wave 0)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: powershell
+        run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -DataDir C:\ProgramData\MessageFoundry-w0-start-first
+
+      # ADR 0183 Amendment A, Wave 2: the engine creates no account on its own now, so the start-first
+      # order is the one an operator who starts the service before provisioning meets. This third arm
+      # runs it end to end across the two identities with no outcome left open: the first start MUST be
+      # refused for want of an Administrator and name provision-admin (AC-11), with no
+      # bootstrap-admin.txt written (AC-13); the operator's provision-admin --email MUST succeed; the
+      # restart MUST serve and sign the new administrator in. A refusal for a missing address, or a
+      # provision-admin that finds an Administrator already there, means a start created an account
+      # nobody named -- the retired default coming back -- and reds the arm. It reds the way the two
+      # arms above do: an ::error annotation per failure, then RED lines and a throw.
+      - name: Store access, auth on -- start first, then provision, end to end (ADR 0183 Wave 2)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: powershell
+        run: .\scripts\service\measure-store-access.ps1 -Order StartFirstEndToEnd -DataDir C:\ProgramData\MessageFoundry-w2-start-first-e2e
+
+      - name: Upload store-access logs (ADR 0183 Wave 0)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: store-access-logs-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            C:\ProgramData\MessageFoundry-w0-provision-first\logs\
+            C:\ProgramData\MessageFoundry-w0-start-first\logs\
+            C:\ProgramData\MessageFoundry-w2-start-first-e2e\logs\
+          if-no-files-found: ignore
 
       - name: Upload service logs
         if: always()
@@ -3896,8 +4080,56 @@ jobs:
           # Pass the needs context via env, not inline ${{ }} in the run block (defense-in-depth against
           # template injection — a job output could in theory carry a quote that breaks out of echo).
           NEEDS_JSON: ${{ toJSON(needs) }}
+          GATE_ARM: failure
+        # THE ANNOTATION NAMES THE LEG, and the check list is why (BACKLOG #1776). A reader classifying
+        # the check rows against the required set sees `CI gate` red beside a leg that is not required,
+        # and cannot join the two: the needs dump uses job ids, the check list uses display names. So
+        # both arms print the culprit's id AND its check-list name. The Python is byte-identical in the
+        # two steps -- only GATE_ARM differs -- and a crash in it cannot turn the step green: the
+        # `|| echo` keeps the dump and the unconditional `exit 1` below it.
         run: |
-          echo "::error::A gated CI leg FAILED. This is a real break -- see the needs dump below."
+          python3 - <<'PY' || echo "::error::CI gate could not name the leg; read the needs dump below."
+          import json
+          import os
+
+          # Job id -> the name the check list shows, `*` standing for a matrix value. The two differ,
+          # and `tooling` showing as `repo harness tests (...)` is the gap BACKLOG #1776 records.
+          # tests/test_ci_gate_annotation.py pins this against every need's own `name:`.
+          CHECK_NAMES = {
+              "changes": "detect server-DB + docker changes",
+              "sqlserver-store": "sql server (store + connector) *",
+              "postgres-store": "postgres store",
+              "load-test": "load test (smoke, sqlite)",
+              "load-test-sqlserver": "load test (smoke, sqlserver) *",
+              "windows-service-smoke": "windows service smoke (*, py*)",
+              "webconsole": "web console tests (*, py*)",
+              "tooling": "repo harness tests (*)",
+              "packaging-build": "packaging-build",
+          }
+
+
+          def label(job_id):
+              shown = CHECK_NAMES.get(job_id, job_id)
+              return job_id if shown == job_id else f'{job_id} (check list: "{shown}")'
+
+
+          def legs(result):
+              ids = sorted(k for k, v in NEEDS.items() if (v or {}).get("result") == result)
+              return ", ".join(label(k) for k in ids) or "none"
+
+
+          NEEDS = json.loads(os.environ["NEEDS_JSON"])
+          if os.environ["GATE_ARM"] == "failure":
+              print(f"::error::CI gate failed: {legs('failure')} FAILED. This is a real break; open that leg's log.")
+              cancelled = legs("cancelled")
+              if cancelled != "none":
+                  print(f"::error::Also CANCELLED, so untested: {cancelled}.")
+          else:
+              print(f"::error::CI gate failed: {legs('cancelled')} CANCELLED. A cancelled leg tested nothing.")
+              print("::error::Superseded if a newer run on the same ref exists: that NEWER run gates the merge.")
+              print("::error::Timed out if the leg's own log says it hit its job timeout-minutes cap: a real problem.")
+              print("::error::Otherwise some other cause, for example a hand cancellation to free runners: re-run it.")
+          PY
           echo "$NEEDS_JSON"
           exit 1
 
@@ -3907,10 +4139,57 @@ jobs:
           contains(needs.*.result, 'cancelled')
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          GATE_ARM: cancelled
+        # AT LEAST THREE CAUSES END A LEG `cancelled`, and this message used to name one. Supersession
+        # by `cancel-in-progress` is the common one (the census above). A job that runs past its own
+        # JOB-level `timeout-minutes` also lands as `cancelled` -- measured from the `toJSON(needs)`
+        # dump under BACKLOG #1410, see tests/test_gate_liveness.py; how a STEP-level cap kill reports
+        # is not measured here. And an operator cancelling a run by hand, for example to free starved
+        # runners, does too; a reader told only "check the newer run" finds none and no explanation
+        # (BACKLOG #1776). The list is not closed, so the last line says "some other cause".
         run: |
-          echo "::error::A gated CI leg was CANCELLED, so it tested nothing and cannot read as a pass."
-          echo "::error::If this run was superseded by a newer push to the same ref, the NEWER run is"
-          echo "::error::what gates the merge and this red is expected. Check the newer run first."
+          python3 - <<'PY' || echo "::error::CI gate could not name the leg; read the needs dump below."
+          import json
+          import os
+
+          # Job id -> the name the check list shows, `*` standing for a matrix value. The two differ,
+          # and `tooling` showing as `repo harness tests (...)` is the gap BACKLOG #1776 records.
+          # tests/test_ci_gate_annotation.py pins this against every need's own `name:`.
+          CHECK_NAMES = {
+              "changes": "detect server-DB + docker changes",
+              "sqlserver-store": "sql server (store + connector) *",
+              "postgres-store": "postgres store",
+              "load-test": "load test (smoke, sqlite)",
+              "load-test-sqlserver": "load test (smoke, sqlserver) *",
+              "windows-service-smoke": "windows service smoke (*, py*)",
+              "webconsole": "web console tests (*, py*)",
+              "tooling": "repo harness tests (*)",
+              "packaging-build": "packaging-build",
+          }
+
+
+          def label(job_id):
+              shown = CHECK_NAMES.get(job_id, job_id)
+              return job_id if shown == job_id else f'{job_id} (check list: "{shown}")'
+
+
+          def legs(result):
+              ids = sorted(k for k, v in NEEDS.items() if (v or {}).get("result") == result)
+              return ", ".join(label(k) for k in ids) or "none"
+
+
+          NEEDS = json.loads(os.environ["NEEDS_JSON"])
+          if os.environ["GATE_ARM"] == "failure":
+              print(f"::error::CI gate failed: {legs('failure')} FAILED. This is a real break; open that leg's log.")
+              cancelled = legs("cancelled")
+              if cancelled != "none":
+                  print(f"::error::Also CANCELLED, so untested: {cancelled}.")
+          else:
+              print(f"::error::CI gate failed: {legs('cancelled')} CANCELLED. A cancelled leg tested nothing.")
+              print("::error::Superseded if a newer run on the same ref exists: that NEWER run gates the merge.")
+              print("::error::Timed out if the leg's own log says it hit its job timeout-minutes cap: a real problem.")
+              print("::error::Otherwise some other cause, for example a hand cancellation to free runners: re-run it.")
+          PY
           echo "$NEEDS_JSON"
           exit 1
 

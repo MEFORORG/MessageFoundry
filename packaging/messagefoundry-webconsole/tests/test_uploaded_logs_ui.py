@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, hash_token
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
@@ -1082,6 +1084,65 @@ async def test_resend_confirm_does_not_reflect_hostile_markup(
         assert "&lt;script&gt;" in r.text
 
 
+async def test_resend_confirm_is_step_up_gated_and_reauth_returns_to_it_once(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #1822 -- the resend CONFIRM page takes the step-up its JSON equivalent carries.
+
+    It used to be plain ``require_ui`` on the claim that it IS the re-auth continuation, so a step-up
+    there would bounce the operator back to /ui/reauth forever. This test is the measurement that
+    claim never had. ONE session, whose window is aged in the store rather than configured stale:
+    with ``step_up_max_age=-1`` re-auth could never make any window fresh, so every gated
+    continuation would "loop" and the test would prove nothing about this route.
+
+    The sequence is the one a browser follows: stale GET, the re-auth form, the re-auth POST, then
+    the Location it answers. The last hop is the assertion that carries the item -- a 200, not a
+    second 303 to /ui/reauth -- and the fresh arm before the ageing is its control.
+    """
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+        confirm = f"/ui/uploaded-logs/file/{fid}/resend-confirm?index=1&to=in1"
+
+        # CONTROL: inside a fresh window the page renders, so the refusal below is the window's doing.
+        fresh = await c.get(confirm, follow_redirects=False)
+        assert fresh.status_code == 200, fresh.headers.get("location")
+        assert "Resend this message?" in fresh.text
+
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        await service.store.mark_session_reauthed(hash_token(tok), now=0.0)
+        assert await service.has_recent_step_up(tok) is False
+
+        # The un-stepped session is sent to re-auth, and the continuation keeps BOTH parameters: a
+        # path-only `next` would come back as a 422 with the operator's selection gone.
+        stale = await c.get(confirm, follow_redirects=False)
+        assert stale.status_code == 303, stale.text
+        assert stale.headers["location"] == f"/ui/reauth?next={quote(confirm, safe='/')}"
+
+        # The re-auth page ACCEPTS that continuation. A rejected one 303s to /ui instead.
+        form = await c.get(stale.headers["location"], follow_redirects=False)
+        assert form.status_code == 200, form.headers.get("location")
+
+        r = await c.post(
+            "/ui/reauth",
+            data={"next": confirm, "password": PW},
+            headers={"Sec-Fetch-Site": "same-origin"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303, r.text
+        assert r.headers["location"] == confirm, r.headers["location"]
+
+        # NO LOOP. Re-auth refreshed the window before redirecting, so the gated page renders.
+        back = await c.get(r.headers["location"], follow_redirects=False)
+        assert back.status_code == 200, back.headers.get("location")
+        # The rendered sentence, not a bare "in1": the form's action URL also carries `to=in1`.
+        assert "message #1 from" in back.text
+        assert "inbound connection “in1”" in back.text
+
+
 async def test_resend_refused_by_the_target_inbounds_guards_names_its_own_cause(
     engine: Engine, tmp_path: Path
 ) -> None:
@@ -1130,3 +1191,163 @@ async def test_resend_refused_by_the_target_inbounds_guards_names_its_own_cause(
         landed = await c.get(refused.headers["location"], follow_redirects=False)
         assert landed.status_code == 200 and "declared content type" in landed.text
     assert await engine.store.list_messages(channel_id="in1") == []
+
+
+async def test_a_refused_upload_is_explained_rather_than_answered_as_json(
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1169: a keyed store refuses a plaintext upload until ``rotate-key`` seals it, and the
+    engine answers that refusal 423. The console's browse, resend and delete routes did not map it,
+    so the HTTPException escaped as application/json inside the HTML console.
+
+    Two refused shapes, the same two the engine's own test builds. ``refused`` is a plaintext upload
+    whose SIDECAR is refused: its owner cannot be read, so the engine answers 404 to everyone but a
+    files:access_any holder, and 423 to that holder. ``half`` has a sealed sidecar over a plaintext
+    body, so its owner reaches the body and gets 423. Neither ``save`` nor an interrupted reseal
+    leaves that shape (a reseal seals the body first); it stands in for a body swapped in behind a
+    real sidecar, which is why the notice keeps its fix conditional.
+
+    Each 423 must land on the list page as an allow-listed code whose notice names the fix, and never
+    suggest the ciphertext opt-out. The 404 answers stay exactly as they were: the refusal must not
+    become an existence oracle through the console either."""
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.uploads import UploadStore
+    from messagefoundry_webconsole.routes import uploaded_logs as ul_routes
+
+    for d in ("in", "o1"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB1", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o1")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB1", m))
+    engine.add_registry(reg)
+    await engine.start()  # a running target, so resend gets past its 404/409 target checks
+
+    service = await _service(engine, ("op", Role.OPERATOR), ("root", Role.ADMINISTRATOR))
+    app: Any = _app(engine, service, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        await _upload(c, "acme.hl7")
+        await _upload(c, "half.hl7")
+    plain = app.state.upload_store
+    by_name = {m.filename: m.file_id for m in await plain.list_files()}
+    refused, half = by_name["acme.hl7"], by_name["half.hl7"]
+    # The test engine is keyless, so both were stored as plaintext. Enable a key, and seal only the
+    # second file's sidecar.
+    keyed = UploadStore(
+        tmp_path / "uploads", make_cipher(generate_key(), write_v2=True), max_bytes=10**6
+    )
+    _, half_meta = keyed._paths(half)  # noqa: SLF001
+    half_meta.write_text(
+        keyed._encrypt_meta(await plain.get_meta(half)),  # noqa: SLF001
+        encoding="utf-8",
+    )
+    app.state.upload_store = keyed
+
+    async def _landed(c: httpx.AsyncClient, r: httpx.Response, code: str, lead: str) -> None:
+        assert r.status_code == 303, r.text
+        assert "application/json" not in r.headers.get("content-type", "")
+        assert r.headers["location"] == f"/ui/uploaded-logs?e={code}"
+        page = await c.get(r.headers["location"], follow_redirects=False)
+        assert page.status_code == 200, page.text
+        assert lead in page.text
+        assert "messagefoundry rotate-key" in page.text
+        assert "allow_unmarked_ciphertext" not in page.text
+
+    with caplog.at_level(logging.WARNING, logger=_ROUTE_LOGGER):
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            await _login(c, "op")
+            # The owner reaches the half-sealed file's body: browse, filter and resend all refuse.
+            for r in (
+                await c.get(f"/ui/uploaded-logs/file/{half}", follow_redirects=False),
+                await c.post(
+                    f"/ui/uploaded-logs/file/{half}/filter",
+                    data={"message_type": "ADT"},
+                    follow_redirects=False,
+                ),
+                # Bad criteria 400 first; the route's retry without them then meets the 423.
+                await c.get(
+                    f"/ui/uploaded-logs/file/{half}?field_path=not+a+path",
+                    follow_redirects=False,
+                ),
+                # An over-long criterion fails the console's own model, so the page browses
+                # metadata-only and meets the 423 on that path instead.
+                await c.post(
+                    f"/ui/uploaded-logs/file/{half}/filter",
+                    data={"field_path": "P" * 40},
+                    follow_redirects=False,
+                ),
+            ):
+                await _landed(c, r, "browse_locked", "That file could not be opened")
+            resend = await c.post(
+                f"/ui/uploaded-logs/file/{half}/resend",
+                params={"index": "0", "to": "in1"},
+                follow_redirects=False,
+            )
+            await _landed(c, resend, "resend_locked", "That resend did not run")
+
+            # Controls: the refused sidecar hides its owner, so the owner gets the engine's 404, and
+            # the console keeps answering that 404 exactly as before.
+            gone = await c.get(f"/ui/uploaded-logs/file/{refused}", follow_redirects=False)
+            assert gone.status_code == 303
+            assert gone.headers["location"] == "/ui/uploaded-logs"
+            not_found = await c.post(
+                f"/ui/uploaded-logs/file/{refused}/delete", follow_redirects=False
+            )
+            assert not_found.headers["location"] == "/ui/uploaded-logs?e=delete_failed"
+            hidden = await c.post(
+                f"/ui/uploaded-logs/file/{refused}/resend",
+                params={"index": "0", "to": "in1"},
+                follow_redirects=False,
+            )
+            assert hidden.headers["location"] == "/ui/uploaded-logs?e=resend_failed"
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as a:
+            await _login(a, "root")
+            # The override holder is told the file exists and why it is refused.
+            browse = await a.get(f"/ui/uploaded-logs/file/{refused}", follow_redirects=False)
+            await _landed(a, browse, "browse_locked", "That file could not be opened")
+            resend = await a.post(
+                f"/ui/uploaded-logs/file/{refused}/resend",
+                params={"index": "0", "to": "in1"},
+                follow_redirects=False,
+            )
+            await _landed(a, resend, "resend_locked", "That resend did not run")
+            delete = await a.post(
+                f"/ui/uploaded-logs/file/{refused}/delete", follow_redirects=False
+            )
+            await _landed(a, delete, "delete_locked", "That delete did not run")
+
+    # The refused delete removed nothing.
+    assert all(p.exists() for p in keyed._paths(refused))  # noqa: SLF001
+    lines = [r.getMessage() for r in caplog.records if r.name == _ROUTE_LOGGER]
+    assert f"uploaded-log delete refused: file_id={refused} status=423" in lines
+    assert f"uploaded-log resend refused: file_id={half} status=423" in lines
+    assert f"uploaded-log browse refused: file_id={half} status=423" in lines
+    assert f"uploaded-log browse refused: file_id={refused} status=423" in lines
+    # No log line names a file.
+    assert not any("acme" in line or "half.hl7" in line for line in lines)
+    # No notice points at the store's opt-out for unmarked values, by name or by paraphrase.
+    for notice in (
+        ul_routes.BROWSE_LOCKED_NOTICE,
+        ul_routes.RESEND_LOCKED_NOTICE,
+        ul_routes.DELETE_LOCKED_NOTICE,
+    ):
+        assert "rotate-key" in notice
+        assert not any(w in notice.lower() for w in ("unmarked", "allow_", "opt-out", "opt out"))

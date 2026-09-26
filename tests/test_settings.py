@@ -230,6 +230,20 @@ def test_unknown_key_refusal_reports_every_offender_at_once(tmp_path: Path) -> N
     assert "[api].prot" in str(excinfo.value)
 
 
+@pytest.mark.parametrize("key", ["bootstrap_expiry_hours", "bootstrap_warn_hours"])
+def test_the_retired_bootstrap_timers_are_refused_as_unknown_keys(tmp_path: Path, key: str) -> None:
+    # ADR 0183 Amendment A, Wave 3 (BACKLOG #1136): the engine creates no default account, so the two
+    # timers that retired it are gone. They are refused by the GENERIC unknown-key path, not by a
+    # named entry in _REMOVED_KEYS -- the ADR keeps them out of that table on purpose.
+    cfg = _write(tmp_path / "messagefoundry.toml", f"[auth]\n{key} = 72\n")
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    message = str(excinfo.value)
+    assert message.startswith("unrecognized config key(s): ")
+    assert f"[auth].{key}" in message
+    assert key not in AuthSettings.model_fields
+
+
 def test_a_relocated_key_keeps_its_specific_message(tmp_path: Path) -> None:
     # [auth].enabled IS a real field, so it is refused by _reject_relocated_keys with the message that
     # names its new home — the generic unknown-key refusal must not shadow it.
@@ -384,7 +398,6 @@ def test_auth_password_policy_defaults_are_asvs_aligned() -> None:
     assert a.password_check_breached and a.password_check_context
     assert a.password_check_username  # v2: own-username rejection on by default (6.2.11)
     assert a.password_breach_corpus_file is None  # opt-in larger offline corpus (6.2.12)
-    assert a.bootstrap_expiry_hours == 72
 
 
 def test_auth_breach_corpus_and_username_check_from_env() -> None:

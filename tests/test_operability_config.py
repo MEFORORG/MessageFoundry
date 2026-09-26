@@ -122,7 +122,12 @@ def test_source_ip_allowlist_empty_is_no_restriction() -> None:
 
 def test_metadata_non_table_rejected() -> None:
     with pytest.raises(WiringError, match="metadata must be a table"):
-        build_inbound_connection("IB", MLLP(port=2575), router="r", metadata=["not", "a", "table"])
+        build_inbound_connection(
+            "IB",
+            MLLP(port=2575),
+            router="r",
+            metadata=["not", "a", "table"],  # type: ignore[arg-type]  # the wrong type IS the test
+        )
 
 
 def test_metadata_stored_on_inbound_and_outbound() -> None:

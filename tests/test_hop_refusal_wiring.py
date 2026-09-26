@@ -445,10 +445,14 @@ def _mtls(**overrides: object) -> Source:
     """An MLLP listener with mTLS ON. Paths are never opened by the gate -- it reads settings only."""
     settings: dict[str, object] = {"tls": True, "tls_cert_file": "c.pem", "tls_ca_file": "ca.pem"}
     settings.update({k: v for k, v in overrides.items() if k != "attested"})
+    attested = bool(overrides.get("attested", False))
     return Source(
         type=ConnectorType.MLLP,
         settings=settings,
-        tls_revocation_attested=bool(overrides.get("attested", False)),
+        tls_revocation_attested=attested,
+        tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
+        if attested
+        else None,
     )
 
 
@@ -460,6 +464,35 @@ def test_mtls_without_a_crl_is_refused_on_an_enforcing_phi_instance() -> None:
     # or none of them mean anything.
     with pytest.raises(WiringError, match="no revocation"):
         check_inbound_revocation(_mtls(), "IB_PARTNER", posture=_PHI_ENFORCING)
+
+
+def test_the_refusal_and_warning_name_only_a_lever_an_operator_can_set(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # SDS-3.7 on the TEXT: every lever named must be settable. PR 1502 dropped
+    # `tls_revocation_attested` from both because nothing could author it; the owner ruled on
+    # 2026-09-24 to build the surface instead (ADR 0173), so the lever is back and this test proves the
+    # flag and its mandatory reason are real inbound() parameters AND connections.toml keys, and that
+    # _source_config carries them onto the Source (test_revocation_attestation_authoring.py).
+    import inspect
+
+    from messagefoundry.config.connections_file import _INBOUND_KEYS
+    from messagefoundry.config.wiring import inbound
+
+    with pytest.raises(WiringError) as exc:
+        check_inbound_revocation(_mtls(), "IB_PARTNER", posture=_PHI_ENFORCING)
+    with caplog.at_level("WARNING"):
+        check_inbound_revocation(_mtls(), "IB", posture=HopPosture(enforcing=False))
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    params = inspect.signature(inbound).parameters
+    for text in (str(exc.value), warned):
+        assert "tls_crl_file" in text  # also proves the warning fired at all
+        assert "tls_revocation_attested=true" in text and "tls_revocation_attested_reason" in text
+    for key in ("tls_revocation_attested", "tls_revocation_attested_reason"):
+        assert key in params, f"{key} is named in the refusal but inbound() cannot set it"
+        assert key in _INBOUND_KEYS, (
+            f"{key} is named in the refusal but connections.toml rejects it"
+        )
 
 
 def test_a_configured_crl_passes() -> None:

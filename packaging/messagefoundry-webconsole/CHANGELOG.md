@@ -25,6 +25,34 @@ that value. Console 0.3.0 does not work with that engine, so upgrade the two tog
 under Changed says why engine 0.4.0 does not work with this console.
 
 ### Added
+- **An administrator can link, relink and unlink a user's federated (OIDC) identity** (`BACKLOG
+  #1143`, `BACKLOG #295`, ADR 0184 slice B).
+  - The user page gains a Federated sign-in card. It shows the issuer and `sub` the account is
+    linked to, or says it is not linked.
+  - `/ui/users/{user_id}/federated-identity` shows the link and offers Link, or Relink when one
+    exists. `/ui/users/{user_id}/federated-identity/unlink-confirm` states what an unlink does
+    before the one button that does it.
+  - Both changes call the engine's own `PUT` and `DELETE /users/{user_id}/federated-identity`
+    handlers. Each POST needs a fresh re-authentication for the action
+    `admin_federated_identity`. A recent sign-in does not count, unless the site set
+    `[auth].require_action_step_up = false`. A POST without one goes through `/ui/reauth` and
+    comes back to the page, so the operator submits again.
+  - Each attempt uses up its re-authentication, including one the engine refuses. The refusal
+    page shows the reason in words and keeps the typed `sub`, and trying again asks for the
+    password first.
+  - Each form posts back the link it showed. If another administrator changed the link since
+    the page opened, the POST is refused and the page shows the current link. The check runs
+    before the engine's handler and does not serialise against a concurrent write. So a stale
+    page can still replace or remove a link another administrator set at the same moment. A
+    later slice would move the check into the service's bind and unbind.
+  - An administrator's own account shows no form, and the engine refuses a POST on it. A local
+    account, or an engine with no `[auth].oidc_issuer`, shows no Link form.
+  - **A directory account with no immutable directory id (`objectGUID`) shows no Link form**
+    (`BACKLOG #1143`, slice C). The engine refuses to link it with `directory_object_id_missing`,
+    and a hand-made POST shows that refusal in words. Needs the new engine seam:
+    `FederatedIdentityView` gained `has_directory_object_id`, which the screen reads.
+  - Needs the new engine seam: `AdminHandlers` gained the two handlers and the
+    `federated_identity_view` projection, which returns the new `FederatedIdentityView`.
 - **Pages that issue or enforce an admin-set temporary password now say when it stops working**
   (`BACKLOG #1141`, PR 1456). The engine refuses such a password once
   `[auth].initial_password_expiry_hours` have passed since it was set.
@@ -51,6 +79,11 @@ under Changed says why engine 0.4.0 does not work with this console.
   `UiSeamMismatch`. Same one-value `SUPPORTED_ENGINE_SEAMS` rule as 0.2.15 (`BACKLOG #279`).
   **Migration:** upgrade the engine and the console together. Or set
   `[security].serve_web_console = false` on the engine to run its JSON API alone.
+- **`GET /ui/sso` no longer passes `seed_reauth=False` to the engine** (`BACKLOG #1144`, step 5).
+  The engine's `authenticate_kerberos` dropped the argument: it now withholds the step-up window
+  on every directory sign-in itself, the JSON `POST /auth/negotiate` included. What a user sees on
+  `/ui/sso` is unchanged. The engine UI seam moved with the signature, so `SUPPORTED_ENGINE_SEAMS`
+  holds the new value and the one-value rule above still applies.
 
 ### Fixed
 - **The reset-password page no longer fails with a `500` when the temporary password's deadline is
@@ -59,8 +92,45 @@ under Changed says why engine 0.4.0 does not work with this console.
   `[auth].initial_password_expiry_hours` can reach. By then the reset had already replaced the
   password, so the administrator never saw the new one. The page now drops the deadline sentence
   instead, and so do the new deadline sentences under Added.
+- **The uploaded-file browse, resend and delete pages now explain a file the engine refuses under
+  the store key** (`BACKLOG #1169`). Engine PR 1500 made the engine answer `423 Locked` for an
+  uploaded file its store cipher cannot read. These three routes did not handle that status, so the
+  console showed the engine's raw JSON error. Each now returns to the uploaded-files list with a
+  plain notice. The notice says the engine cannot read the file under the store's encryption key.
+  It adds that a file stored as plaintext before the key was turned on stays refused until an
+  administrator runs `messagefoundry rotate-key` with the engine stopped. It never points at the
+  `[store].allow_unmarked_ciphertext` opt-out. Each refusal logs a WARNING with the file id and
+  status only, never the filename. The `404` answers are unchanged, so a refused owner check still
+  reads as a missing file.
 
 ### Security
+- **The user page sets the notification address in its own field** (`BACKLOG #1139`, ADR 0182
+  Amendment A). The page's Email field is pre-filled with the stored profile address and posted
+  back on every save, and the engine copied it into the notification address. So saving a display
+  name or a disable moved where security notices go, or filled a missing address from the
+  directory. The engine no longer does that. The page now shows a Notification address field,
+  pre-filled with the stored value, and a hidden copy of that value. The route sends the address
+  only when the administrator changed it from what the page showed, so an unrelated save moves
+  nothing, and a page left open cannot undo another administrator's change. Emptying the field is
+  refused with an error, because the address cannot be cleared. A new value moves it and notifies
+  the old address. **Requires an engine whose `UserUpdateRequest` carries `notify_email`**, which
+  moved the engine UI seam. An older engine's model refuses the key, so every address change would
+  fail as "invalid input". This console refuses that engine at startup with `UiSeamMismatch`
+  instead.
+- **The notification-address page suggests the address already on the account** (`BACKLOG #1139`).
+  Engine PR 1522 added `/ui/account/notify-address`, where an account with no notification address
+  is confined while the engine sends security notices. Its input now starts with the account's
+  profile address, `users.email`, when that passes the same checks as a submitted address. On a
+  directory account that is the last `mail` the directory supplied. A line under the input names
+  the source and asks the holder to change it if it is not theirs. A pre-filled input is not
+  focused on load. Opening the page writes nothing; the address is set only when the holder
+  submits the form. Only a pure-ASCII address with no Punycode (`xn--`) domain label is suggested.
+  So a directory writer cannot pre-fill a lookalike built from non-ASCII letters, such as a Cyrillic
+  `a`. An all-ASCII lookalike such as `examp1e.org` is still offered, and the line under the input
+  is what asks the holder to check it. The submit still accepts what it did.
+  **Requires an engine with `AuthService.suggested_notify_email`**, which moved the engine UI seam
+  again. An engine at PR 1522 lacks that method and ships the older seam, so this console refuses
+  it at startup with `UiSeamMismatch` rather than failing on the page.
 - **Ending a session or enrolling a factor from an MFA-pending session now needs the existing
   factor first, on an account that has one** (`BACKLOG #1951`, PR 1469).
   `require_ui_reauth_only_action` skips the MFA check, so that an account with no factor can still

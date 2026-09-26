@@ -36,6 +36,8 @@ from messagefoundry.api.auth_models import (
     CustomRoleInfo,
     CustomRoleRequest,
     ElevatedResponse,
+    FederatedIdentityRequest,
+    FederatedIdentityView,
     LoginRequest,
     LoginResponse,
     MfaConfirmRequest,
@@ -43,6 +45,7 @@ from messagefoundry.api.auth_models import (
     MfaEnrollResponse,
     MfaStatusResponse,
     MfaVerifyRequest,
+    NotifyEmailRequest,
     PasswordChangeRequest,
     PasswordResetResponse,
     ProvidersInfo,
@@ -60,6 +63,7 @@ from messagefoundry.api.auth_models import (
     UserUpdateRequest,
 )
 from messagefoundry.api.security import (
+    alert_sink_for,
     bearer_token,
     client_ip,
     get_auth,
@@ -88,6 +92,7 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
+    STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
@@ -95,7 +100,13 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
     STEP_UP_ACTION_SESSION_TERMINATE,
+    USERNAME_TAKEN,
     AuthService,
+    CurrentPasswordCheck,
+    FederatedSubjectHeld,
+    InvalidNotifyEmail,
+    NotifyEmailAlreadySet,
+    UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
@@ -104,6 +115,17 @@ from messagefoundry.store.store import SessionRecord, UserRecord
 _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
+
+
+def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
+    """Raise the ``administrator_granted`` alert (BACKLOG #315; why, and the key grammar, are on
+    ``AlertSink.administrator_granted``). Raised here, in the API, never from ``auth/`` (CLAUDE.md
+    section 4). Best effort: the grant already happened and is audited."""
+    try:
+        alert_sink_for(app.state).administrator_granted(key, via=via, granted_by=granted_by)
+    except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not 500 a
+        # user-administration call whose write is already committed and audited.
+        _log.exception("the administrator_granted alert for %r failed to emit", key)
 
 
 # CSV formula injection (CWE-1236 / ASVS 1.2.10). The audit export is the ONE attacker-influenced
@@ -223,6 +245,23 @@ def _parse_channel_scope(raw: str | None) -> list[str] | None:
     return [str(c) for c in value] if isinstance(value, list) else []
 
 
+def _federated_identity_view(user: UserRecord, service: AuthService) -> FederatedIdentityView:
+    """Project one account's federated binding for the console (BACKLOG #1143, ADR 0184 slice B).
+
+    Sync, like :func:`_user_summary`, so the console never reads a ``UserRecord`` attribute itself.
+    Only the console's users:manage pages call it; no JSON route returns this view."""
+    return FederatedIdentityView(
+        user_id=user.id,
+        username=user.username,
+        auth_provider=user.auth_provider,
+        issuer=user.oidc_issuer,
+        subject=user.oidc_subject,
+        bind_issuer=service.oidc_issuer,
+        # The same truthiness test AuthService.bind_federated_subject refuses on.
+        has_directory_object_id=bool(user.directory_object_id),
+    )
+
+
 def _user_summary(
     user: UserRecord, role_ids: list[str], *, credential_expires_at: float | None = None
 ) -> UserSummary:
@@ -297,6 +336,15 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         )
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
+        # ASVS 7.2.4: WHY NO PRIOR TOKEN IS REVOKED HERE, when the three console sign-in legs do
+        # revoke one. There, the server's own Set-Cookie replaces the browser's session cookie, so
+        # the server is what strands the old session. Here the response only RETURNS a token. A
+        # bearer token is not ambient: the client still holds its old one, and whether it discards
+        # it is the client's own act. So the client is the one that must end it, with POST
+        # /auth/logout, as the IDE's signIn does. This route reads the credential from the body and
+        # never reads the Authorization header, so it acts on no presented session. Revoking the
+        # user's other sessions is not the answer: a bearer caller may run several at once, one
+        # per tool, and a sign-in must not sign out every other device.
         return _login_response(
             outcome.token,
             outcome.identity,
@@ -323,9 +371,19 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             token_bytes = base64.b64decode(header[len("Negotiate ") :], validate=True)
         except (binascii.Error, ValueError):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid SPNEGO token") from None
+        # BACKLOG #1144 step 5: the session is born with NO step-up window, exactly as GET /ui/sso's
+        # is. This route used to take the seeding default while the console passed False, so a
+        # bearer client got up to `step_up_max_age_seconds` of step-up-gated access on the login
+        # stamp alone. A session that owes a factor still meets X-MFA-Required first, and the code
+        # it proves opens the window (verify_mfa). One that owes none meets 403 +
+        # X-Step-Up-Required on its first gated action and answers with POST /me/reauth, a live
+        # directory re-bind.
         outcome = await service.authenticate_kerberos(token_bytes, client=_client(request))
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "SSO authentication failed")
+        # ASVS 7.2.4: no prior token is revoked here, for the reason /auth/login gives above. This
+        # route DOES read the Authorization header, but RFC 4559 fills it with the SPNEGO token, so a
+        # prior bearer token cannot even be presented on this request.
         # mfa_required is FORWARDED here, not defaulted (BACKLOG #1144). This route used to omit it
         # because a directory session was minted MFA-satisfied and the answer was always False; the
         # Kerberos leg now mints at the minimum, so omitting it would tell the client no second factor
@@ -356,7 +414,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
+        session: str | None = Depends(bearer_token),
     ) -> SimpleMessage:
+        """``session`` is the caller's session token, which a wrong current password is charged to
+        (BACKLOG #1138). The JSON plane resolves it from the bearer header; the web console, which
+        delegates here with a cookie session, passes it explicitly."""
         # Post-session ceremony: per-ACTOR budget, not the shared unauthenticated sign-in one.
         if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "password-change")
@@ -364,7 +426,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD passwords are managed in Active Directory"
             )
-        if not await service.verify_current_password(identity, body.current_password):
+        # Counts toward the account lockout and against this session's re-proof budget; the failure
+        # that exhausts the budget revokes the session (BACKLOG #1138).
+        check = await service.verify_current_password(
+            identity,
+            body.current_password,
+            token=session if isinstance(session, str) else None,
+            client=_client(request),
+        )
+        if check is CurrentPasswordCheck.SESSION_ENDED:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
+        if check is not CurrentPasswordCheck.OK:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "current password is incorrect")
         # ASVS 6.4.1: a "change" that reuses the current password is not a change — it would leave an
         # expired/temp credential in place (and defeats the must_change_password claim step).
@@ -381,6 +453,27 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         return SimpleMessage(detail="password changed; please sign in again")
 
+    @app.post("/me/notify-email", response_model=SimpleMessage)
+    async def fill_notify_email(
+        body: NotifyEmailRequest,
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require()),
+    ) -> SimpleMessage:
+        """Set the caller's own notification address where it has none (BACKLOG #1139, ASVS 6.3.7).
+
+        The way out of the confinement ``require()`` applies to ``must_set_notify_email``. It fills a
+        missing address only: an account that has one gets 409, and an administrator changes it,
+        which notifies the old address. ``require()`` leaves this route under the factor gate, so a
+        session still owing its second factor cannot reach it."""
+        try:
+            await service.fill_own_notify_email(identity, body.email, client=_client(request))
+        except NotifyEmailAlreadySet as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return SimpleMessage(detail="notification address set")
+
     @app.post("/me/reauth", response_model=ElevatedResponse)
     async def reauth(
         body: ReauthRequest,
@@ -391,7 +484,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> ElevatedResponse:
         """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
         session's step-up window so it may perform highly sensitive operations for the configured
-        period. Rate-limited like the password change; a failure is a 403 and performs nothing.
+        period. Rate-limited like the password change; a failure is a 403 that counts against this
+        session's re-proof budget, and toward the account lockout unless a lock is already live. The
+        failure that exhausts the budget ends the session with a 401 (BACKLOG #1138). The account lock
+        does not refuse it.
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""
@@ -412,9 +508,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             purpose=body.purpose,
         )
         if elevation.token is None:
-            # session_lost is a good password on a session revoked mid-ceremony: 401, not the 403 a
-            # wrong password gets, so the client re-authenticates instead of re-prompting for a
-            # password that was already correct.
+            # session_lost: the session is gone -- revoked mid-ceremony under a good password, or
+            # revoked for spending its re-proof budget (BACKLOG #1138). 401, not the 403 a wrong
+            # password gets, so the client signs in again instead of re-prompting.
             if elevation.session_lost:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
@@ -740,25 +836,35 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post("/users", response_model=UserSummary, status_code=status.HTTP_201_CREATED)
     async def create_user(
         body: UserCreateRequest,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> UserSummary:
         await _validate_roles(service, body.roles)
         if await service.store.get_user_by_username(body.username) is not None:
-            raise HTTPException(status.HTTP_409_CONFLICT, "username already exists")
+            raise HTTPException(status.HTTP_409_CONFLICT, USERNAME_TAKEN)
         violations = service.password_violations(body.password, username=body.username)
         if violations:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
             )
-        user_id = await service.create_local_user(
-            username=body.username,
-            password=body.password,
-            display_name=body.display_name,
-            email=body.email,
-            roles=body.roles,
-            actor=identity.username,
-        )
+        try:
+            user_id = await service.create_local_user(
+                username=body.username,
+                password=body.password,
+                display_name=body.display_name,
+                email=body.email,
+                roles=body.roles,
+                actor=identity.username,
+                client=_client(request),  # ADR 0150, BACKLOG #315: attribute the user.created row
+            )
+        except UsernameTaken as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        # Only after the create succeeded: a lost username race (409 above) granted nobody anything.
+        if Role.ADMINISTRATOR.value in body.roles:
+            _alert_administrator_granted(
+                app, f"user:{body.username}", via="account_created", granted_by=identity.username
+            )
         user = await service.store.get_user(user_id)
         assert user is not None
         # BACKLOG #1141 (ASVS 6.4.5): the initial password is a must-change credential the login gate
@@ -803,13 +909,29 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
         supplied = body.model_fields_set
-        await service.update_user(
-            user_id,
-            display_name=body.display_name if "display_name" in supplied else current.display_name,
-            email=body.email if "email" in supplied else current.email,
-            disabled=body.disabled if "disabled" in supplied else None,
-            actor=identity.username,
-        )
+        # BACKLOG #1139, ADR 0182 Amendment A (the rule is on AuthService.update_user): notify_email
+        # is NOT filled from the stored row when omitted, and an explicit null is refused, because a
+        # client sending it asked for a clear the address does not allow.
+        if "notify_email" in supplied and body.notify_email is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "the notification address can be changed but not cleared",
+            )
+        try:
+            await service.update_user(
+                user_id,
+                display_name=(
+                    body.display_name if "display_name" in supplied else current.display_name
+                ),
+                email=body.email if "email" in supplied else current.email,
+                disabled=body.disabled if "disabled" in supplied else None,
+                notify_email=body.notify_email,
+                actor=identity.username,
+            )
+        except InvalidNotifyEmail as exc:
+            # Raised before any write, so this refuses the whole save. The message names the rule
+            # and never echoes the value.
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="updated")
 
     @app.delete("/users/{user_id}", response_model=SimpleMessage)
@@ -860,7 +982,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             user_id
         ):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot remove the last administrator")
+        # BACKLOG #315: promotion mints an approver exactly as creation does, so it pages too. Only a
+        # GRANT pages: re-saving an existing Administrator's roles changes nothing.
+        granted = (
+            Role.ADMINISTRATOR.value in body.roles
+            and Role.ADMINISTRATOR.value not in await service.store.get_user_role_ids(user_id)
+        )
         await service.set_roles(user_id, body.roles, actor=identity.username)
+        if granted:
+            _alert_administrator_granted(
+                app, f"user:{user.username}", via="roles_changed", granted_by=identity.username
+            )
         return SimpleMessage(detail="roles updated")
 
     @app.post("/users/{user_id}/reset-password", response_model=PasswordResetResponse)
@@ -949,6 +1081,83 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(code, detail) from exc
         return SimpleMessage(detail="MFA reset")
 
+    # --- federated identity binding (BACKLOG #1143 / #295, ADR 0184) ---------------------------------
+    #
+    # THE ONLY PATH THAT CREATES A FEDERATED BINDING. Owner ruling 2026-09-06: a federated login never
+    # binds, and an unbound one is refused (ADR 0184 AC-4). Both routes ship in the same change as
+    # that refusal, never before it: while login still bound on first presentation, an unbind here
+    # would have let the next login bind whatever subject then presented.
+    #
+    # Action-bound, single-use and MFA-gated, like the password reset: which IdP identity may sign in
+    # as an account is an attribute that affects authentication (ASVS 7.5.1). The console leg (ADR
+    # 0184 slice B, /ui/users/{id}/federated-identity) calls both handlers BY REFERENCE through
+    # AdminHandlers, which skips the Depends below, so it re-asserts the same action-bound gate.
+
+    @app.put("/users/{user_id}/federated-identity", response_model=SimpleMessage)
+    async def bind_user_federated_identity(
+        user_id: ResourceId,
+        body: FederatedIdentityRequest,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
+        ),
+    ) -> SimpleMessage:
+        """Bind the account to an IdP ``sub`` under the configured issuer, or rebind it. A rebind
+        revokes the account's sessions with the old binding. 404 for an unknown user, 409 on a
+        conflict, 400 for every other refusal, including the caller's own account."""
+        # SELF-EXCLUSION, as the two reset routes above do. Re-pointing or removing your own
+        # federated identity ends every session you hold, the calling one included, and on a site
+        # where you sign in only through the IdP it can leave the last administrator locked out.
+        if user_id == identity.user_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
+            )
+        try:
+            bound = await service.bind_federated_subject(
+                user_id, body.subject, actor=identity.username
+            )
+        except FederatedSubjectHeld as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            detail = str(exc)
+            code = (
+                status.HTTP_404_NOT_FOUND
+                if detail == "no such user"
+                else status.HTTP_400_BAD_REQUEST
+            )
+            raise HTTPException(code, detail) from exc
+        if bound.previous_subject is None and bound.previous_issuer is None:
+            return SimpleMessage(detail="federated identity bound")
+        return SimpleMessage(
+            detail=f"federated identity rebound; revoked {bound.sessions_revoked} session(s)"
+        )
+
+    @app.delete("/users/{user_id}/federated-identity", response_model=SimpleMessage)
+    async def unbind_user_federated_identity(
+        user_id: ResourceId,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
+        ),
+    ) -> SimpleMessage:
+        """Remove the account's federated binding and revoke its sessions (BACKLOG #1474's service
+        method). Its next federated login is refused until it is bound again."""
+        if user_id == identity.user_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
+            )
+        try:
+            revoked = await service.unbind_federated_subject(user_id, actor=identity.username)
+        except ValueError as exc:
+            detail = str(exc)
+            code = (
+                status.HTTP_404_NOT_FOUND
+                if detail == "no such user"
+                else status.HTTP_400_BAD_REQUEST
+            )
+            raise HTTPException(code, detail) from exc
+        return SimpleMessage(detail=f"federated identity unbound; revoked {revoked} session(s)")
+
     @app.get("/users/{user_id}/channel-scope", response_model=ChannelScope)
     async def get_channel_scope(
         user_id: ResourceId,
@@ -995,9 +1204,25 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         await _validate_roles(service, [e.role for e in body.entries])
+
+        # BACKLOG #315: mapping a group to Administrator makes every member who signs in an approver,
+        # so each group that newly maps to it pages, as a promotion does. Read back from the store on
+        # both sides, because the store normalises group names and a re-save must not page.
+        async def admin_groups() -> set[str]:
+            rows = await service.store.list_ad_group_role_map()
+            return {
+                str(r["ad_group"]) for r in rows if str(r["role_id"]) == Role.ADMINISTRATOR.value
+            }
+
+        grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
+        before = await admin_groups() if grants else set()
         await service.set_ad_group_map(
             [(e.ad_group, e.role) for e in body.entries], actor=identity.username
         )
+        for group in sorted((await admin_groups() - before) if grants else set()):
+            _alert_administrator_granted(
+                app, f"ad-group:{group}", via="ad_group_map", granted_by=identity.username
+            )
         return SimpleMessage(detail="ad-group map updated")
 
     @app.get("/ad-group-scope-map", response_model=AdGroupScopeMap)
@@ -1173,6 +1398,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         set_channel_scope=set_channel_scope,
         reset_user_password=reset_user_password,
         reset_user_mfa=reset_user_mfa,
+        bind_user_federated_identity=bind_user_federated_identity,
+        unbind_user_federated_identity=unbind_user_federated_identity,
         admin_revoke_user_sessions=admin_revoke_user_sessions,
         delete_user=delete_user,
         create_custom_role=create_custom_role,
@@ -1189,5 +1416,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         list_audit=_audit_ui_list,
         my_security_events=my_security_events,
         user_summary=_user_summary,
+        federated_identity_view=_federated_identity_view,
         current_user=_current_user,
     )

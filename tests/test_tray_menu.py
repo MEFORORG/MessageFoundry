@@ -25,7 +25,7 @@ def _snap(
     )
 
 
-def _by_action(items: list, action: Action):  # type: ignore[no-untyped-def]
+def _by_action(items: list, action: Action):
     return next((it for it in items if it.action is action), None)
 
 
@@ -70,9 +70,9 @@ def test_service_action_enablement(
     items = build_menu(
         _snap(state), autostart_enabled=False, repo_open_available=True, log_available=True
     )
-    assert _by_action(items, Action.START).enabled is can_start  # type: ignore[union-attr]
-    assert _by_action(items, Action.STOP).enabled is can_stop  # type: ignore[union-attr]
-    assert _by_action(items, Action.RESTART).enabled is can_restart  # type: ignore[union-attr]
+    assert _by_action(items, Action.START).enabled is can_start
+    assert _by_action(items, Action.STOP).enabled is can_stop
+    assert _by_action(items, Action.RESTART).enabled is can_restart
 
 
 def test_monitor_only_disables_all_control_and_repo() -> None:
@@ -86,7 +86,7 @@ def test_monitor_only_disables_all_control_and_repo() -> None:
         item = _by_action(items, act)
         assert item is not None and item.enabled is False
     # Console still opens for a remote engine.
-    assert _by_action(items, Action.OPEN_CONSOLE).enabled is True  # type: ignore[union-attr]
+    assert _by_action(items, Action.OPEN_CONSOLE).enabled is True
 
 
 def test_not_installed_shows_install_hint_and_no_service_actions() -> None:
@@ -122,14 +122,14 @@ def test_autostart_checkbox_reflects_state() -> None:
         repo_open_available=True,
         log_available=True,
     )
-    assert _by_action(on, Action.TOGGLE_AUTOSTART).checked is True  # type: ignore[union-attr]
+    assert _by_action(on, Action.TOGGLE_AUTOSTART).checked is True
     off = build_menu(
         _snap(TrayState.RUNNING),
         autostart_enabled=False,
         repo_open_available=True,
         log_available=True,
     )
-    assert _by_action(off, Action.TOGGLE_AUTOSTART).checked is False  # type: ignore[union-attr]
+    assert _by_action(off, Action.TOGGLE_AUTOSTART).checked is False
 
 
 def test_exit_never_maps_to_a_control_action() -> None:

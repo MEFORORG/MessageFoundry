@@ -30,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import datetime
 import json
 import logging
 import os
@@ -192,9 +191,11 @@ from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     authorize_ws,
     client_ip,
+    deadline_utc,
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
     optional_identity,
+    pending_credential_deadline,
     require,
     require_paced,
     require_phi_read,
@@ -223,10 +224,11 @@ from messagefoundry.api.validation import (
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.reconcile import ReconcilePlan
-from messagefoundry.auth.service import AuthService, BootstrapAdmin
+from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
+    make_registry_anchor_preflight,
     run_anchor_preflight,
 )
 from messagefoundry.config.ai_policy import (
@@ -322,7 +324,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
+from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
     NotDeployedError,
@@ -347,7 +349,6 @@ from messagefoundry.store.content_search import (
 )
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.store import _secure_file
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -1217,8 +1218,15 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 #: The status a refused operator resubmission answers with, by the ingress guard that refused it
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
 #: the same status the upload route gives a non-text file. A body the listener could not have decoded,
-#: or an HL7 body ``Peek.parse`` refuses, is 422.
-_INGRESS_GUARD_STATUS: dict[str, int] = {"size": 413, "type": 415, "decode": 422, "parse": 422}
+#: an HL7 body ``Peek.parse`` refuses, or one a ``validation.strict`` inbound's strict hl7apy validation
+#: refuses or times out on, is 422.
+_INGRESS_GUARD_STATUS: dict[str, int] = {
+    "size": 413,
+    "type": 415,
+    "decode": 422,
+    "parse": 422,
+    "strict": 422,
+}
 
 
 async def _guard_resubmission(
@@ -1235,17 +1243,18 @@ async def _guard_resubmission(
     """Admit a resubmitted body as the target inbound's listener would, or refuse it (BACKLOG #1911).
 
     The upload resend and the edit-resend paths write the stage row directly, so the listener's size
-    ceiling and declared-type checks never ran on them. This runs the same guards
-    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmitted_body`) before anything is written
+    ceiling, declared-type checks and strict validation never ran on them. This runs the same guards
+    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmission`) before anything is written
     and returns the form to commit, which the caller writes instead of the body it was handed. A
     refusal is an HTTP 4xx, an ``action`` audit row and a log line, and no message row is written, so
     count-and-log holds: no body is accepted and then dropped. Off the event loop, because the body can
     be as large as an upload.
 
     The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
-    of the body, so neither the row nor the 4xx detail echoes PHI."""
+    of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal counts hl7apy's
+    errors rather than quoting them, since that text can echo a field value."""
     try:
-        return await asyncio.to_thread(admit_resubmitted_body, raw, inbound)
+        return await admit_resubmission(raw, inbound)
     except IngressGuardError as exc:
         await engine.store.record_audit(
             action,
@@ -1312,6 +1321,26 @@ async def _record_control_audit(
     )
 
 
+#: What the connection-test routes return for a refused trust anchor, in place of its text.
+_ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
+
+
+def _caused_by_trust_anchor(exc: BaseException) -> bool:
+    """Whether ``exc`` wraps a :class:`TrustAnchorError` through its explicit ``__cause__`` chain.
+
+    Only ``raise ... from``, the way ``build_test_connector`` wraps a build failure. An implicit
+    ``__context__`` is not followed: an unrelated error raised while handling an anchor refusal
+    would then be hidden as one."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, TrustAnchorError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return False
+
+
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
@@ -1359,6 +1388,12 @@ async def _run_connection_test(
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
+        if _caused_by_trust_anchor(exc):
+            # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
+            # full text goes to the operator log, as the reload route's does; the caller and the
+            # audit row get a fixed line (BACKLOG #1142).
+            _log.warning("connection test refused %r (trust anchor): %s", name, exc)
+            return _result(supported=True, success=False, ms=0.0, detail=_ANCHOR_REFUSED_DETAIL)
         return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
     start = time.monotonic()
     supported, success, detail = True, False, None
@@ -2276,7 +2311,9 @@ def create_app(
             emitted_dests: set[str] = set()
             for (cid, dname), dm in metrics.destinations.items():
                 if cid not in reg.inbound:
-                    continue  # a declarative-channel edge, already emitted above
+                    # An inbound this node does not run (another engine shard's, or one no longer in
+                    # the config): no row here. Its outbound's standalone row reads null (#1817).
+                    continue
                 if scoped:
                     # A channel-scoped user must not see shared-outbound topology (peer IP/port/state) —
                     # the same denial connection_metadata/test/purge apply to a shared outbound.
@@ -2402,6 +2439,23 @@ def create_app(
                     else (rr.outbound_status(oname) if rr.running else "stopped")
                 )
                 standalone[oname] = (status, None)
+            # BACKLOG #1817: `null` on a count means "not measured" and `0` means "measured as zero", and
+            # a standalone row can be either. The metrics above group EVERY outbound-stage queue row, and
+            # a standalone outbound's edges (if any) are all skipped ones, from inbounds this node does
+            # not run. If each of those reads zero now (nothing queued, nothing written or dead since the
+            # engine started), the row's counters are a measured zero. If any reads non-zero, the row
+            # keeps null rather than fold it in: folding would count a sibling engine shard's live
+            # traffic on every shard, and a per-row stats reset keys on this row's name, so it could
+            # never zero what the row showed.
+            busy_unshown = (
+                set()
+                if scoped
+                else {
+                    ename
+                    for (_cid, ename), dm in metrics.destinations.items()
+                    if dm.queue_depth or dm.written or dm.dead
+                }
+            )
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:
                     continue  # channel-scoped users never see shared-outbound topology (see above)
@@ -2410,6 +2464,7 @@ def create_app(
                     continue  # a removed/draining outbound has no spec to render; shown dests are covered
                 dmethod = _method_label(oc.spec.type.value)
                 dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
+                measured_zero: int | None = None if dname in busy_unshown else 0
                 rows.append(
                     ConnectionRow(
                         role="destination",
@@ -2422,13 +2477,15 @@ def create_app(
                         method=dmethod,
                         peer=dpeer,
                         port=dport,
-                        queue_depth=None,
+                        # This row does not report the ages. With a measured zero nothing is queued,
+                        # so there is no queued item to age and no queue to clear.
+                        queue_depth=measured_zero,
                         idle_seconds=None,
                         alerts_active=open_alerts.get(dname, 0),
-                        errored=None,
+                        errored=measured_zero,
                         read=None,
-                        written=None,
-                        backlog_seconds=None,
+                        written=measured_zero,
+                        backlog_seconds=None if measured_zero is None else 0.0,
                         delivered_age_seconds=None,
                         simulated=rr.outbound_simulated(dname),
                         paused=rr.outbound_quiesced(dname),
@@ -3517,6 +3574,10 @@ def create_app(
             raise HTTPException(404, "config directory not found") from exc
         except WiringError as exc:
             _log.warning("config reload failed (invalid config): %s", exc)
+            # An inbound connection's trust anchor (BACKLOG #1142, slice 3) is refused inside the
+            # engine and arrives wrapped. It keeps the reason the settings anchors' refusal above
+            # records, so one filter on reason="trust_anchor" sees both.
+            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
             await engine.store.record_audit(
                 "config_reload_failed",
                 actor=user.username,
@@ -3524,7 +3585,7 @@ def create_app(
                     {
                         "requested": req.config_dir,
                         "dry_run": req.dry_run,
-                        "reason": "invalid_config",
+                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
                     }
                 ),
                 client=client_ip(request),
@@ -5930,11 +5991,11 @@ def create_app(
         Statuses: ``400`` not clustered (refused BEFORE the coordinator is touched — there is no lease
         and no standby, and ``force`` does not change that); ``412`` no other promotable node has a
         fresh heartbeat, so nothing could take the lease (BACKLOG #1509) — the ONLY refusal ``force``
-        overrides; ``409`` this node is not the leader — the caller resolves the leader from
-        ``GET /cluster/nodes`` first, and see the note below on the one case where a ``409`` IS the
-        successful answer; ``403`` missing permission / step-up / MFA; ``503`` engine not started,
-        authentication not configured, a membership read that raised, or one of the two drain
-        conditions below.
+        overrides; ``409`` this node neither held leadership nor owned a lease row to release — the
+        caller resolves the leader from ``GET /cluster/nodes`` first, and see the note below on the
+        one case where a ``409`` IS the successful answer; ``403`` missing permission / step-up /
+        MFA; ``503`` engine not started, authentication not configured, a membership read that
+        raised, or one of the two drain conditions below.
 
         **Why ``412`` and not a second ``409``.** ``409`` already says "you addressed the wrong node",
         and after a ``release-unconfirmed`` it can even be the failover succeeding. A no-sibling refusal
@@ -5982,60 +6043,48 @@ def create_app(
           leads nothing — this branch asserts nothing about who the leader is.
         * ``StepdownReleaseUnconfirmed`` → reason ``release-unconfirmed``. This node **has** demoted
           itself and **this call armed its claim pause** — both hold on every branch that reaches the
-          raise, because the pause is armed on ``self._is_leader or owed`` and the write is only
-          attempted under the same condition. What it could not confirm is whether the write expiring
-          its lease row committed. A lost response to a committed ``UPDATE`` is indistinguishable from
-          an ``UPDATE`` that never ran, so the body is conditional: saying "it is still the leader" is
-          right on one branch and, on the other, sends an operator to fix a cluster that is already
-          failing over correctly.
+          raise, because the pause is armed on the coordinator's ``_may_own_lease_row()`` and the
+          write is only attempted under the same condition. What it could not confirm is whether the
+          write expiring its lease row committed. A lost response to a committed ``UPDATE`` is
+          indistinguishable from an ``UPDATE`` that never ran, so the body is conditional: saying "it
+          is still the leader" is right on one branch and, on the other, sends an operator to fix a
+          cluster that is already failing over correctly.
 
           **What this branch must NOT say is that a teardown just started.** The demotion edge fires
-          under ``if was_leader`` — in ``DbCoordinator.step_down_leadership`` and identically in its
-          SQL Server twin, the only two that reach this raise — which a RETRY has already cleared, so
-          a repeat refusal signals nothing new and an earlier body claiming otherwise was false on
-          exactly that branch. The body therefore describes the demotion teardown as a mechanism — it
+          under ``was_leader or lease_released`` — in ``DbCoordinator.step_down_leadership`` and
+          identically in its SQL Server twin, the only two that reach this raise. On this branch the
+          write did not return, so ``lease_released`` is false, and ``was_leader`` a RETRY has already
+          cleared, so a repeat refusal signals nothing new and an earlier body claiming otherwise was
+          false on exactly that branch. The body therefore describes the demotion teardown as a mechanism — it
           runs on the graph supervisor, not in this call — rather than asserting one began here.
 
         Both map to ``503`` because both are environment conditions, which is what the neighbouring DR
         endpoints and the ADR's own contract give that status.
 
-        **A ``409`` after a ``release-unconfirmed`` ``503`` is the retry SUCCEEDING**, not a wrong-node
-        answer — *while the claim pause holds*. The coordinator re-sends the owed write on the next
-        stepdown; by then this node has already demoted, so it truthfully reports ``was_leader=false``.
-        That pause is two ``heartbeat_seconds``, 20s at the shipped default, and it is the whole scope
-        of that sentence. A retry reaches that write only once the membership read and the ``412``
-        check above let it through, so while the store is still failing it answers
-        ``members-unreadable`` and re-sends nothing.
+        **A retry after a ``release-unconfirmed`` ``503`` is answered by the lease ROW, not the flag
+        (BACKLOG #1508).** The first call already cleared the in-memory flag, so the retry reports
+        ``was_leader=false`` and re-sends the owed owner-scoped write. If the row still names this node,
+        the write matches it and the retry answers ``200`` with ``lease_released=true``: the drain is
+        done. If a standby acquired first, the row names the standby, the write matches nothing and
+        the retry answers ``409``. **That ``409`` is the failover having worked.** Do not take the
+        ``409``'s generic remedy here and step down whichever node ``GET /cluster/nodes`` now names as
+        leader: that is the healthy successor, and draining it undoes the failover. A retry reaches
+        the write only once the membership read and the ``412`` check above let it through, so while
+        the store is still failing it answers ``members-unreadable`` and re-sends nothing.
 
-        **Retrying promptly is the slow path, and can be an indefinite one.** The pause is armed on
-        ``self._is_leader or owed``, so a retry that re-sends an owed write RE-ARMS it for another two
-        ``heartbeat_seconds``. Nothing promotes this node except ``_maintain_leadership`` setting the
-        flag when its claim succeeds, and that claim returns not-held at the pause gate before it
-        touches the database. So an operator who retries faster than the pause expires never lets a
-        tick through and holds themselves in ``409``. The remedy for a ``release-unconfirmed`` ``503``
-        is to WAIT and read ``GET /cluster/nodes``, not to retry in a loop.
-
-        **Past the pause the answer is ``200`` OR ``409``, decided by who the lease row names by then
-        — an earlier revision promised ``200`` flatly and was false on one of the two branches.** The
-        claim statement has exactly two arms: renew, gated on this node still OWNING the row
-        (``WHERE leader_lease.owner = $2`` on Postgres, ``t.owner = ?`` in the SQL Server ``MERGE``),
-        which carries no expiry term; and take-over, which requires the lease to have expired. Nothing
-        below turns on which backend it is — both spell the same two arms. If the row still names
-        this node when the pause ends — the release write never committed, or it committed and no
-        standby took the lease — the renew arm matches on the next tick, this node leads again, and a
-        retry answers ``200``. If a standby acquired instead, the row names the standby and its lease
-        is live, so NEITHER arm matches, ``_claim_or_renew_lease`` reports not-held, this node stays a
-        follower, and a retry answers ``409``. **That ``409`` is the failover having worked.** Do not
-        take the ``409``'s generic remedy here and step down whichever node ``GET /cluster/nodes`` now
-        names as leader: that is the healthy successor, and draining it undoes the failover. Either
-        way the confirmation is the lease moving in ``GET /cluster/nodes``, not the status code.
+        **Each retry that releases the row re-arms the claim pause** for another two
+        ``heartbeat_seconds``, so a node an operator keeps retrying stays drained. That is the intent
+        of the call, and it does not slow a standby: the pause gates only this node's own claim.
+        Either way the confirmation is the lease moving in ``GET /cluster/nodes``, not the status
+        code.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
         already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
         never runs on those, so a second denied row there would double-count. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
-        ``was_leader: false``, which IS the refusal. That leaves the not-clustered ``400``, the
-        no-sibling ``412`` and the three ``503``s, which nothing else would record.
+        ``was_leader: false, lease_released: false``, which IS the refusal. That leaves the
+        not-clustered ``400``, the no-sibling ``412`` and the three ``503``s, which nothing else would
+        record.
         """
         c = engine.coordinator
 
@@ -6126,7 +6175,7 @@ def create_app(
         # lost-lease tick between a pre-read and the release would otherwise record was_leader=true for
         # an action that released nothing (ADR 0056, "Audit the return value, not a pre-read").
         try:
-            was_leader, released_at = await c.step_down_leadership()
+            outcome = await c.step_down_leadership()
         except StepdownLockTimeout as exc:
             # NOTHING RAN. No lease row was read or written, nothing was demoted, and — because the
             # handler takes no is_leader() pre-read — this node may lead nothing at all. So this arm
@@ -6164,7 +6213,8 @@ def create_app(
             # is still not quiescent — for different reasons than the sentence gave.
             #
             # And the body must not claim a teardown started ON THIS CALL: _fire_on_demote runs only
-            # under `if was_leader`, which a retry of an owed write has already cleared.
+            # when the outcome drained something, and on this arm the write did not return, so only
+            # `was_leader` could be true, and a retry of an owed write has already cleared it.
             await _denied("release-unconfirmed", exc)
             raise HTTPException(
                 503,
@@ -6181,8 +6231,9 @@ def create_app(
             ) from exc
         result = ClusterStepdownResult(
             node_id=c.node_id,
-            was_leader=was_leader,
-            released_at=released_at,
+            was_leader=outcome.was_leader,
+            released_at=outcome.released_at,
+            lease_released=outcome.lease_released,
             new_leader_eligible=new_leader_eligible,
             force=force,
         )
@@ -6194,8 +6245,12 @@ def create_app(
             detail=json.dumps(result.model_dump()),
             client=client_ip(request),
         )
-        if not was_leader:
-            raise HTTPException(409, f"node {c.node_id} is not the current leader")
+        # 200 when EITHER fact holds (BACKLOG #1508): a self-fenced node no longer holds the gate but
+        # did own a live row, and releasing that row IS the drain the caller asked for.
+        if not outcome.drained:
+            raise HTTPException(
+                409, f"node {c.node_id} is not the current leader and owns no lease row to release"
+            )
         return result
 
     # --- third-tier DR standby (#61, ADR 0048) -------------------------------
@@ -6611,6 +6666,17 @@ def create_app(
     return app
 
 
+#: The one host command that creates the first Administrator. Named by every message below that
+#: tells an operator the store has none (ADR 0183 Amendment A, AC-11 and AC-12). ``{store}`` is the
+#: opened store's cross-backend ``path`` descriptor, so an operator whose service runs with a
+#: non-default config or store sees which one to point the command at: a provision into any other
+#: store reports OK and leaves this one refused.
+_PROVISION_ADMIN_HINT = (
+    "Create one at the host with `messagefoundry provision-admin --username <name> --email "
+    "<address>`, pointed at this store ({store}) and the service's own config, then start again"
+)
+
+
 async def _assert_security_notice_is_deliverable(
     store: Store,
     *,
@@ -6626,26 +6692,36 @@ async def _assert_security_notice_is_deliverable(
     The serve gate in ``messagefoundry/__main__.py`` already refuses without a notification channel,
     but it computes readiness from ``notify_security_events`` + ``email_smtp_host`` + ``email_from``
     -- **SMTP wiring alone**. That asks *"is a transport configured"* and never *"can the account
-    that matters actually receive"*: the instrument answering the adjacent question (SDS-3.8). On a
-    first run the only account that exists is the bootstrap administrator, created with no address,
-    so the gate passes green while every one of the ten notice types about the account holding
-    ``frozenset(Permission)`` silently no-ops -- including ``LOGIN_AFTER_FAILURES``, the classic
-    someone-guessed-it signal.
+    that matters actually receive"*: the instrument answering the adjacent question (SDS-3.8). An
+    Administrator with no address passes that gate green while every one of the ten notice types
+    about the account holding ``frozenset(Permission)`` silently no-ops -- including
+    ``LOGIN_AFTER_FAILURES``, the classic someone-guessed-it signal.
 
     **This check must live here and not beside the transport gate.** ``_serve`` is synchronous and
     opens no store, so at that point there is no user table to ask. The ASGI lifespan is the only
-    place the store and the freshly minted bootstrap admin are both in hand -- which is why the
-    owner's ruling (option (b), 2026-08-13) corrected the item's own stated fix location.
+    place the store is in hand -- which is why the owner's ruling (option (b), 2026-08-13) corrected
+    the item's own stated fix location.
+
+    **The refusal says which half failed, because the fix differs (ADR 0183 Amendment A).** The
+    engine creates no account on its own since Wave 2, so a store nobody has provisioned holds no
+    enabled Administrator at all. That half names ``provision-admin``, which succeeds against such a
+    store (AC-11). An Administrator with no address is the other half; ``provision-admin`` refuses
+    there, so it names the offline setter ``admin-set-notify-email`` and the audited waiver (AC-16).
+
+    **It is also where a skipped gate still says that nobody can sign in (AC-12).** With sign-in
+    required, notices off or waived in writing, and no enabled Administrator, the engine starts and
+    routes HL7 but no one can reach the console. That is logged as ONE WARNING naming
+    ``provision-admin``. Under ``warn`` the refusal's own WARNING already says it, so nothing more is
+    logged. With sign-in not required no Administrator is needed and nothing is logged. It stays a
+    warning rather than a refusal on purpose: NSSM restarts a service at boot with nobody present,
+    and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
 
     **Why deliverability rather than "require an email at creation".** A fix resting on an OPERATOR
     ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
-    table can. This paragraph used to justify that by saying an address a human sets on an AD or OIDC
-    account is overwritten at the holder's next sign-in, and **BACKLOG #1139 made that half false**:
-    ``update_user_profile`` still issues ``UPDATE users SET display_name=?, email=?`` unconditionally
-    on every directory login, but ``email`` is now the mirror only. The address this check reads --
-    ``notify_email`` -- is engine-owned and named by no directory-sync statement, so a directory login
-    no longer moves it. The conclusion stands on the narrower ground: an operator can still forget,
-    and a first-run bootstrap administrator is still minted with no address at all.
+    table can. BACKLOG #1139 narrowed that ground: the address this check reads -- ``notify_email``
+    -- is engine-owned and named by no directory-sync statement, so a directory login no longer
+    moves it. The conclusion stands on what is left: an operator can still forget, and
+    ``provision-admin`` without ``--email`` succeeds with a warning.
 
     **It reads ``notify_email`` and not ``email`` for the reason the split exists.** They are two
     columns now, and only one of them is where a notice is addressed. Asking about ``email`` would be
@@ -6656,80 +6732,55 @@ async def _assert_security_notice_is_deliverable(
     which is a different and much larger change.
     """
     auth_settings = auth_settings or AuthSettings()
-    if not auth_settings.enabled or not auth_settings.notify_security_events:
-        return  # no notices to deliver; the transport gate already governs whether that is allowed
+    if not auth_settings.enabled:
+        return  # sign-in is not required, so no Administrator is needed to reach the engine
     alerts = alerts_settings or AlertsSettings()
-    if not alerts.security_notifications_required:
-        return  # the audited, in-writing opt-out -- the pull-only feed is accepted
-    for user in await store.list_users():
-        if user.disabled or not user.notify_email:
-            continue
-        if Role.ADMINISTRATOR.value in await store.get_user_role_ids(user.id):
-            return
-    detail = (
-        "no enabled Administrator has a notification address, so every out-of-band security notice about "
-        "the most privileged accounts would be silently dropped (SecurityEventNotifier returns "
-        "early when the recipient has no address). The [alerts] SMTP transport being configured "
-        "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
-        "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
-        "/me/security-events feed in writing via [alerts].security_notifications_required=false. "
-        "(On a NEW install, `messagefoundry provision-admin --username <name> --email <address>` "
-        "before the first serve avoids this state entirely -- BACKLOG #1136. It is not a fix for "
-        "the instance that just refused: it declines once an enabled Administrator exists, which "
-        "by this point one does.)"
+    # The two preconditions of the deliverability question. Either one false skips the refusal: the
+    # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
+    gated = auth_settings.notify_security_events and alerts.security_notifications_required
+    # Addressed accounts first, so the common start stops at the first addressed Administrator and
+    # never reads the roles of the rest of the table. Once an Administrator WITHOUT an address is
+    # reached, every account after it lacks one too, so the question is settled there.
+    enabled = sorted(
+        (u for u in await store.list_users() if not u.disabled), key=lambda u: not u.notify_email
     )
+    administrator_exists = False
+    for user in enabled:
+        if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
+            continue
+        if user.notify_email or not gated:
+            return
+        administrator_exists = True
+        break
+    if not administrator_exists:
+        # A SQLite store file named absolutely, since the operator's shell may sit in another
+        # directory than the service; a server backend's descriptor is server/database, names no
+        # file, and is left as it is.
+        where = str(Path(store.path).resolve()) if Path(store.path).is_file() else store.path
+        detail = (
+            "no enabled Administrator exists in this store, so nobody can sign in, and every "
+            "out-of-band security notice about the most privileged accounts would reach nobody. The "
+            f"engine creates no account on its own. {_PROVISION_ADMIN_HINT.format(store=where)}."
+        )
+        if not gated:
+            # AC-12: the gate is skipped, so this is the one line that says the console is unreachable.
+            _log.warning("the engine is starting with no way to sign in: %s", detail)
+            return
+    else:
+        detail = (
+            "no enabled Administrator has a notification address, so every out-of-band security "
+            "notice about the most privileged accounts would be silently dropped "
+            "(SecurityEventNotifier returns early when the recipient has no address). The [alerts] "
+            "SMTP transport being configured does not make a notice deliverable. Set an address at "
+            "the host with `messagefoundry admin-set-notify-email --username <administrator> "
+            "--email <address>`, run against this store with the engine stopped, or accept the "
+            "pull-only /me/security-events feed in writing via "
+            "[alerts].security_notifications_required=false"
+        )
     enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
         raise RuntimeError(f"refusing to start a PHI instance: {detail}")
     _log.warning("PHI instance with no deliverable security-notice recipient: %s", detail)
-
-
-def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettings) -> None:
-    """Persist the one-time bootstrap password to a restricted file — never the rotating log.
-
-    Until rotated it is a standing Administrator credential, so it must not land in NSSM's broadly
-    readable stdout capture. Write it to an owner-only file the operator consumes and deletes; log
-    only the location. Paired with server-side must_change_password enforcement, it dies at first login.
-    """
-    base = Path(store_settings.path or ".").resolve()
-    secret_file = base.parent / "bootstrap-admin.txt"
-    body = f"username: {bootstrap.username}\npassword: {bootstrap.password}\n"
-    # ASVS 6.4.5: state the renewal deadline WITH the credential — an unclaimed bootstrap is
-    # auto-disabled at this instant, so the "sign in and change it before then" instruction ships
-    # alongside the secret rather than being an out-of-band assumption. None when expiry is off.
-    deadline = (
-        datetime.datetime.fromtimestamp(bootstrap.expires_at, tz=datetime.UTC).isoformat()
-        if bootstrap.expires_at is not None
-        else None
-    )
-    if deadline is not None:
-        body += (
-            f"expires: {deadline} — sign in and change this password before then, "
-            "or the unclaimed credential is disabled.\n"
-        )
-    # Create the file owner-only from the instant it exists, closing the POSIX create-then-chmod TOCTOU
-    # (SEC-020): O_EXCL + 0o600 means the secret is never group/world-readable even momentarily, and
-    # O_EXCL also refuses to follow a pre-planted symlink/file at that path. A second service start
-    # before the operator deletes the prior file would hit FileExistsError — remove the stale file we
-    # own, then re-create exclusively.
-    flags = os.O_CREAT | os.O_WRONLY | os.O_EXCL | os.O_TRUNC
-    try:
-        fd = os.open(str(secret_file), flags, 0o600)
-    except FileExistsError:
-        secret_file.unlink()  # the prior owner-only file we wrote; replace it under the same mode
-        fd = os.open(str(secret_file), flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(body)
-    # On Windows os.open's mode is minimal, so still apply the icacls owner-only DACL (the store's
-    # platform-correct primitive: chmod on POSIX is a no-op here since O_EXCL already set 0o600).
-    _secure_file(secret_file)
-    _log.warning(
-        "Created bootstrap admin %r; one-time password written to %s — sign in, change it, then "
-        "delete that file%s.",
-        bootstrap.username,
-        secret_file,
-        f" (expires {deadline} unless claimed)" if deadline is not None else "",
-    )
 
 
 _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound the sessions table
@@ -6803,32 +6854,89 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_session_revoked(revocation.username, reason=revocation.reason)
 
 
-_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL = 3600.0  # re-check the bootstrap warn window hourly
+_INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
 
 
-async def _bootstrap_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
-    """Remind an operator, ONCE, that an UNCLAIMED first-run bootstrap admin is nearing its auto-disable
-    deadline (ASVS 6.4.5 arm 2). API-lifespan-owned (like :func:`_session_reaper`), NOT engine-owned — it
-    reaches the :class:`AuthService` directly. ``auth.bootstrap_expiry_warning()`` evaluates the warn
-    window and latches once-per-process; a non-None result is the fresh reminder to emit as the PHI-free
-    ``bootstrap_admin_expiring`` alert (the ISO deadline + whole hours remaining — never the password).
+def _initial_credential_warn_lead(auth: AuthService) -> float | None:
+    """How long before an admin-issued credential's deadline to remind an operator, in seconds.
 
-    A transient store error must not kill the loop for the process lifetime (that would silently drop the
-    reminder) — log and retry next interval, the session-reaper precedent."""
+    BACKLOG #1141 (ASVS 6.4.5). The last third of the window, capped at 24 hours: 24 hours at the
+    shipped 72, and a holder never gets reminded about a credential it was handed moments ago on a
+    short window. No setting, deliberately: the reminder is advisory and a knob would be one more
+    loosening to inventory. ``None`` when ``[auth].initial_password_expiry_hours`` is 0, where
+    nothing expires and there is nothing to remind about."""
+    window = auth.initial_credential_deadline(
+        0.0
+    )  # the window in seconds, from the gate's arithmetic
+    if window is None:
+        return None
+    return min(_INITIAL_CREDENTIAL_MAX_LEAD, window / 3)
+
+
+async def _remind_expiring_initial_credentials(
+    auth: AuthService,
+    sink: AlertSink,
+    *,
+    lead: float,
+    warned: dict[str, float],
+    now: float | None = None,
+) -> None:
+    """One pass: alert once for each unclaimed admin-issued credential inside its warn window.
+
+    The deadline is :func:`pending_credential_deadline`, the route-layer function the refusal and the
+    console pages read. It returns :meth:`AuthService.initial_credential_deadline` under the gate's
+    own ``must_change_password`` condition, so the reminder names the instant the gate refuses on. A
+    disabled account is skipped: it cannot sign in whatever the credential does.
+
+    ``warned`` maps a user id to the deadline already reminded about. A new credential on the same
+    account has a new deadline, so it is reminded about again. An entry is dropped once its account
+    leaves every window (claimed, lapsed, disabled or deleted), so the map stays as small as the set
+    of live reminders."""
+    now = time.time() if now is None else now
+    live: set[str] = set()
+    for user in await auth.store.list_users():
+        if user.disabled:
+            continue
+        deadline = pending_credential_deadline(auth, user)
+        if deadline is None or not (deadline - lead <= now < deadline):
+            continue
+        live.add(user.id)
+        if warned.get(user.id) == deadline:
+            continue
+        expires = deadline_utc(deadline)
+        if expires is None:
+            continue
+        sink.initial_credential_expiring(
+            f"user:{user.username}",
+            expires_at=expires,
+            hours_remaining=max(0, int((deadline - now) // 3600)),
+        )
+        warned[user.id] = deadline
+    for user_id in warned.keys() - live:
+        del warned[user_id]
+
+
+async def _initial_credential_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
+    """Remind an operator before an admin-issued temporary password lapses unclaimed (ASVS 6.4.5,
+    BACKLOG #1141). The engine hands that credential to an ADMINISTRATOR and has no channel to its
+    holder, so the reminder goes to the ``[alerts]`` sink as ``initial_credential_expiring``.
+
+    The poll runs at half the warn lead, capped at an hour, so every window holds at least one pass.
+    The :func:`_session_reaper` shape: API-lifespan-owned, and a failed pass is logged and retried
+    rather than ending the loop."""
+    lead = _initial_credential_warn_lead(auth)
+    if lead is None:
+        return
+    interval = min(3600.0, lead / 2)
+    warned: dict[str, float] = {}
     while True:
         try:
-            warning = await auth.bootstrap_expiry_warning()
-            if warning is not None:
-                expires_at, hours_remaining = warning
-                iso = datetime.datetime.fromtimestamp(expires_at, tz=datetime.UTC).isoformat()
-                sink.bootstrap_admin_expiring(
-                    "bootstrap-admin", expires_at=iso, hours_remaining=hours_remaining
-                )
+            await _remind_expiring_initial_credentials(auth, sink, lead=lead, warned=warned)
         except asyncio.CancelledError:
             raise
         except Exception:
-            _log.exception("bootstrap expiry reminder: pass failed; will retry next interval")
-        await asyncio.sleep(_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL)
+            _log.exception("initial credential reminder: pass failed; will retry next interval")
+        await asyncio.sleep(interval)
 
 
 def create_managed_app(
@@ -6920,8 +7028,8 @@ def create_managed_app(
 
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
-    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService`, seeds the
-    built-in roles, and creates a bootstrap admin on first run. The store is opened via the
+    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService` and seeds the
+    built-in roles; it creates no account (ADR 0183). The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
     — the CLI server passes it; in-process/test callers omit it (no separate API socket is bound).
@@ -7059,6 +7167,8 @@ def create_managed_app(
         # or a package loaded from outside the install root (BACKLOG #1679): a pass that compared zero
         # files cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
         # (`pip install -e .`), so dev is never bricked. Off only if [integrity].enabled=false.
+        # It attests the web console too when create_app has imported it (serve_ui on), against the
+        # console wheel's own RECORD under the same rules (BACKLOG #1802).
         integ = integrity_settings or IntegritySettings()
         if integ.enabled:
             try:
@@ -7204,6 +7314,13 @@ def create_managed_app(
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
             registry_guard=registry_guard,
+            # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
+            # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
+            # every real reload. Each connector's own build then enforces again and loads the bytes
+            # it read. Dormant when no inbound names a CA: no store call, no audit row.
+            registry_preflight=make_registry_anchor_preflight(
+                store, enforcing=trust_anchors_enforcing
+            ),
         )
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
@@ -7220,6 +7337,8 @@ def create_managed_app(
                 # re-applied on every reload inside the engine). None = the whole graph.
                 if registry_filter is not None:
                     loaded = registry_filter(loaded)
+                # After the filter, as the reload path does: the anchors this process will load.
+                await engine.preflight_registry(loaded)
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()
@@ -7235,10 +7354,11 @@ def create_managed_app(
         upload_retention_runner: UploadRetentionRunner | None = None
         reaper: asyncio.Task[None] | None = None
         reconciler: asyncio.Task[None] | None = None
-        bootstrap_reminder: asyncio.Task[None] | None = None
+        # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
+        credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
-        # the engine, both notifiers, the retention runner, the three tasks -- was otherwise
+        # the engine, both notifiers, the retention runner, the tasks -- was otherwise
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
@@ -7375,10 +7495,8 @@ def create_managed_app(
                     # connector-construction gate, so the clamp is inert unless the posture arrives here).
                     hop_posture=_hop_posture,
                 )
-                bootstrap = await auth.initialize()
+                await auth.initialize()
                 app.state.auth = auth
-                if bootstrap is not None:
-                    _emit_bootstrap_admin(bootstrap, resolved)
                 await _assert_security_notice_is_deliverable(
                     store,
                     auth_settings=auth_settings,
@@ -7429,21 +7547,12 @@ def create_managed_app(
                         auth_settings.oidc_redirect_path,
                     )
                 reaper = asyncio.create_task(_session_reaper(store))
-                if auth.bootstrap_deadline_configured:
-                    # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
-                    # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
-                    # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
-                    # (LoggingAlertSink fallback) or notifies. No task when NEITHER bound is configured.
-                    #
-                    # BACKLOG #1141: this open-coded `auth_settings.bootstrap_expiry_hours > 0`, a THIRD copy
-                    # of a question `bootstrap_expiry_warning` answers over TWO bounds — WP-3 account
-                    # retirement AND the ASVS 6.4.1 credential expiry. At bootstrap_expiry_hours=0 with
-                    # initial_password_expiry_hours set, that method computed a correct deadline and this
-                    # task — ITS ONLY CONSUMER — was never created, so the warning arm was SILENTLY DEAD.
-                    # BACKLOG #1245 corrected the two computations in auth/service.py and never reached the
-                    # gate deciding whether they run. Ask the AuthService, which owns the predicate now.
-                    bootstrap_reminder = asyncio.create_task(
-                        _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
+                if _initial_credential_warn_lead(auth) is not None:
+                    # BACKLOG #1141 (ASVS 6.4.5): a nudge for every unclaimed temporary password an
+                    # administrator issued. Gated on the predicate the task itself reads, so the gate
+                    # cannot drift from the task.
+                    credential_reminder = asyncio.create_task(
+                        _initial_credential_expiry_reminder(auth, notifier or LoggingAlertSink())
                     )
                 if auth.directory_reconcile_enabled:
                     # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
@@ -7482,11 +7591,9 @@ def create_managed_app(
                 # previously-died reaper stored, so it can't propagate here and skip engine.stop()
                 # (review M-33).
                 await asyncio.gather(reaper, return_exceptions=True)
-            if bootstrap_reminder is not None:
-                bootstrap_reminder.cancel()
-                # gather(return_exceptions): absorb our cancellation + any stored exception so it can't
-                # propagate here and skip engine.stop() (the reaper precedent).
-                await asyncio.gather(bootstrap_reminder, return_exceptions=True)
+            if credential_reminder is not None:
+                credential_reminder.cancel()
+                await asyncio.gather(credential_reminder, return_exceptions=True)
             # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
             # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
             # called it, so every clean restart dropped the open hour's PHI-summary access audit --

@@ -150,17 +150,17 @@ version**, the same way you pin any other production dependency. Create a venv a
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install "messagefoundry==0.1.0"        # pin the exact engine version (core runtime only)
+pip install "messagefoundry==0.4.0"        # pin the exact engine version (core runtime only)
 ```
 
-`messagefoundry==0.1.0` pulls only the **core runtime** — what a headless engine needs. Add extras
+`messagefoundry==0.4.0` pulls only the **core runtime** — what a headless engine needs. Add extras
 (§4.2) for the PySide6 test harness, a server-DB backend, or SFTP; the browser web console installs
 as its own `messagefoundry-webconsole` wheel.
 
-> ⚠️ **Early access.** `0.1.0` is an **Early Access** release on public PyPI — feature-complete and
+> ⚠️ **Early access.** `0.4.0` is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
-> launch. The exact-pin command above (`==0.1.0`) resolves today; the earlier `0.1.0rc1` pre-release also
-> remains installable. You can equally install from the engine's **GitHub Release assets** or your
+> launch. The exact-pin command above (`==0.4.0`) resolves today; earlier releases, back to the `0.1.0rc1`
+> pre-release, remain installable. You can equally install from the engine's **GitHub Release assets** or your
 > organization's **private index**.
 
 **Verify the release before you install.** MessageFoundry ships one signed wheel to many PHI-bearing
@@ -170,7 +170,7 @@ provenance** and a **Sigstore signature**; check both with the **GitHub CLI** (`
 optionally `sigstore` (`pip install sigstore`). Install **only** the file that passes:
 
 ```powershell
-$V = "0.1.0"   # the exact version you intend to install
+$V = "0.4.0"   # the exact version you intend to install
 
 # Download the wheel + its Sigstore bundle from that release's assets
 gh release download "v$V" --repo MEFORORG/MessageFoundry `
@@ -218,10 +218,14 @@ host.
 | Extra | Pulls in | When |
 |---|---|---|
 | `postgres` | `asyncpg` (no OS dep; ships compiled wheels) | Using the PostgreSQL backend (recommended prod path) |
-| `console` | PySide6 + keyring | Running the desktop admin console |
+| `harness` | PySide6 | Running the standalone send/receive test harness (the operator console is the separate `messagefoundry-webconsole` wheel) |
 | `sftp` | paramiko | SFTP connectors |
 | `sqlserver` | `aioodbc` **+ OS-level Microsoft ODBC Driver 18** | The SQL Server *store* backend (`backend=sqlserver`, production) and the DATABASE connector family. |
-| `dev` | pytest/ruff/mypy/httpx | Development & CI |
+| `dev` | pytest/ruff/mypy | Development & CI |
+
+The table names the extras an operator reaches for first. The full list, including `fhir`, `dicom`,
+`x12`, `xml`, `webauthn`, `vault` and `otel`, is `[project.optional-dependencies]` in the engine's
+`pyproject.toml`.
 
 > ⚠️ There is **no friendly preflight** for the `postgres` extra: if you set `backend=postgres` but
 > forgot `pip install 'messagefoundry[postgres]'`, you get a raw `ImportError` at startup instead of a
@@ -327,7 +331,7 @@ creation.
 ### 4.6 Verify it runs
 
 ```powershell
-curl http://127.0.0.1:8765/health           # -> {"status":"ok"}
+curl.exe --cacert <DataDir>\api-generated-cert.pem https://127.0.0.1:8765/health   # -> {"status":"ok"}
 # tail <DataDir>\logs\service.out.log for the "wiring started" banner
 ```
 
@@ -759,7 +763,7 @@ lifespan to call `engine.stop()` for a clean drain. Always **drain → stop → 
   use **dead-letter replay** to recover messages that a bad transform stranded before the rollback.
 
 **Pre-1.0 cadence:** pin a released version (`messagefoundry==X.Y.Z`); the **latest release** is the
-supported target. Reproduce a problem against the latest release before filing an issue, and keep
+supported target. Reproduce a problem against the latest release first, and keep
 upgrades **small and frequent** rather than large and rare.
 
 ---
@@ -885,14 +889,15 @@ throughput — only the leader processes.
 
 ## 15. Getting help & reporting bugs
 
-- **Bugs & feature requests:** open a GitHub issue using the repository's issue templates
-  (`bug_report.md` / `feature_request.md`).
+- **Bugs, feature requests and questions:** not through GitHub Issues. `CONTRIBUTING.md`, section
+  "Finding something to work on", names the routes.
 - **Security vulnerabilities:** use the repository's **private security advisory** process per
   `.github/SECURITY.md` — do **not** open a public issue for a vulnerability.
-- **Before filing:** verify against current `main` (pre-1.0, latest-main-only support), and include the
-  engine version, config shape, and relevant **non-PHI** log excerpts.
-- 🔒 **Never attach real PHI** to an issue, log excerpt, or reproduction. Reproduce with a synthetic
-  corpus from `messagefoundry generate`.
+- **Before you share a problem:** verify it against current `main` (pre-1.0, latest-main-only
+  support). Include the engine version, config shape, and relevant **non-PHI** log excerpts.
+- **Never attach real PHI** to anything you share, including a log excerpt or a reproduction.
+  Redact hostnames, IP addresses and partner names. Reproduce with a synthetic corpus from
+  `messagefoundry generate`.
 
 ---
 

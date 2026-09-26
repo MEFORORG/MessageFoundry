@@ -105,7 +105,7 @@ switch, a merge), just **restart** it (elevated):
 
 ```powershell
 & C:\ProgramData\MessageFoundry\bin\nssm.exe restart MessageFoundry
-curl http://127.0.0.1:8765/health
+curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
 Because the install is editable, a restart runs **whatever branch is checked out** in the repo.
@@ -243,12 +243,23 @@ The key is a base64 32-byte secret. Two ways to supply it:
   relying on the directory. To rotate, `protect-key` a new key to the file and run `messagefoundry
   rotate-key` with the prior key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3).
 
-> **External vault / managed identity.** DPAPI is the built-in on-box option. To source the key (or
-> SQL/AD credentials) from an external secrets manager — Windows Credential Manager, HashiCorp Vault,
-> Azure Key Vault via a **managed identity**, or an AD **gMSA** for SQL/LDAP — fetch the secret in
-> your service-start wrapper and export it as the corresponding `MEFOR_*` variable, or place the
-> DPAPI key file via your provisioning tool. The engine reads only env/`encryption_key_file`; it does
-> not call a vault directly (a thin broker is future work).
+> **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
+> HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:
+>
+> - `[store].key_provider = "vault"` unwraps the store key through Vault Transit.
+> - `[store].cipher_provider = "vault_transit"` does the at-rest encryption inside Transit instead.
+> - `[secrets].provider = "vault"` reads a credential from Vault KV, for a credential whose reference
+>   field is set.
+>
+> Each one's settings and preconditions are in [CONFIGURATION.md](CONFIGURATION.md), under
+> [`[store]`](CONFIGURATION.md#store--message-store--db) and
+> [`[secrets]`](CONFIGURATION.md#secrets--connector-secretprovider-selection); the `[store]` row also
+> says which other key providers are not built. For any other source, fetch the secret in your
+> service-start wrapper and export it as the corresponding `MEFOR_*` variable, or place the DPAPI key
+> file via your provisioning tool. That covers Windows Credential Manager, Azure Key Vault via a
+> **managed identity**, and any credential with no reference field. An AD **gMSA** has no
+> secret to export: for the SQL Server store, run the service as the gMSA with
+> `[store].auth = "integrated"`, as the walkthrough linked above describes.
 
 ### Lock down the config directory (CONFIG-2)
 
@@ -372,8 +383,10 @@ memory **hygiene** is not memory **encryption**.
 ## Verify it's running
 
 ```powershell
-curl http://127.0.0.1:8765/health        # -> {"status":"ok", ...}
+curl.exe --cacert <DataDir>\api-generated-cert.pem https://127.0.0.1:8765/health   # -> {"status":"ok", ...}
 ```
+
+`--cacert` names the certificate the engine minted on first start. If you set `[api].tls_cert_file`, pass your own certificate or CA bundle instead.
 
 Send a test message and confirm it flows through:
 

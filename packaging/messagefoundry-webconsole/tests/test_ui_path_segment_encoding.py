@@ -347,6 +347,12 @@ def test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read() 
     own gate: reaching the confirm page needs ``messages:resend``, reaching the detail page needs
     ``messages:view_raw``, and neither is skipped by landing on the other.
 
+    THE USER PAGE PAIR (BACKLOG #1143, ADR 0184 slice B) was read when it arrived and is benign on
+    the provenance argument. ``user_id`` is engine-minted and both pages read it back through
+    ``get_user``, which 404s on a miss. Both run the same gate, ``users:manage`` under the step-up
+    window, so landing on one from the other skips nothing. Neither GET writes: the link and unlink
+    POSTs each run their own action-bound gate.
+
     A new pair is not automatically a defect. It is a site somebody has to read, and nothing else in
     the tree would report it.
     """
@@ -397,6 +403,7 @@ def test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read() 
             "/ui/uploaded-logs/file/{file_id}",
             "/ui/uploaded-logs/file/{file_id}/resend-confirm",
         ),
+        ("GET", "/ui/users/{user_id}", "/ui/users/{user_id}/federated-identity"),
         (
             "POST",
             "/ui/dead-letters/{channel_id}/replay",

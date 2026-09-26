@@ -68,6 +68,7 @@ class PersistentConnection:
         queue_max: int = 1000,
         tracker: FailoverTracker | None = None,
         ledger: IntakeLedger | None = None,
+        on_strand: Callable[[int], None] | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -92,8 +93,46 @@ class PersistentConnection:
             2.0  # seconds to wait for in-flight ACKs at graceful stop (set by stop())
         )
         self._task: asyncio.Task[None] | None = None
+        # How many times this connection has been ESTABLISHED. It moves only on a successful open,
+        # so a caller that snapshots it before an event that closes the socket (the connscale
+        # reload probe, BACKLOG #1292) can wait until the connection is back rather than guess.
+        self._generation = 0
+        self._up = False  # True from a successful open until that socket's serve loop ends
+        # How many sockets ended while this side was NOT stopping: the peer closed or reset them.
+        # The connscale reload probe reads it after every connection is back, so a second close
+        # that took the replies can be told from an engine that never answered (BACKLOG #1292).
+        self._drops = 0
+        # Called on every reply (ACK or NAK) while set, and None otherwise. The connscale reload probe
+        # sets it only while it waits for the first reply after the reload, and clears it on that
+        # reply, so the steady-state read path pays one None check (BACKLOG #1292).
+        self._on_reply: Callable[[], None] | None = None
+        # Called with the SEND time (perf_counter_ns) of each send a close left unconfirmed, so the
+        # connscale reload probe can tell a send made inside its window from one that had already
+        # waited too long for an ACK (BACKLOG #1292). None by default. It runs only on a close, never
+        # per send, and the connscale driver wires it on every connection.
+        self._on_strand = on_strand
 
     # --- public API ----------------------------------------------------------
+
+    @property
+    def generation(self) -> int:
+        """The count of successful opens so far. It changes only when a NEW socket is up."""
+        return self._generation
+
+    @property
+    def up(self) -> bool:
+        """True while the current socket is open and being served. A socket the peer has closed
+        reads True until this side notices, so pair it with :attr:`generation`, never alone."""
+        return self._up
+
+    @property
+    def drops(self) -> int:
+        """How many sockets ended without this side stopping them: the peer closed or reset each."""
+        return self._drops
+
+    def set_on_reply(self, callback: Callable[[], None] | None) -> None:
+        """Call ``callback`` on every reply from now on, or stop calling anything with None."""
+        self._on_reply = callback
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"loadconn-{self._host}:{self._port}")
@@ -139,11 +178,21 @@ class PersistentConnection:
                 backoff = min(backoff * 2, _BACKOFF_MAX)
                 continue
             backoff = _BACKOFF_START
+            self._generation += 1
+            self._up = True
+            # Only the two ends a PEER causes count as a drop: `_serve` returning while this side is
+            # not stopping (the read loop saw EOF), or a socket error. A harness exception or a
+            # cancellation is not the engine closing anything, so it is not counted.
+            dropped = False
             try:
                 await self._serve(reader, writer)
+                dropped = not self._stop.is_set()
             except (OSError, ConnectionError):
-                pass
+                dropped = not self._stop.is_set()
             finally:
+                self._up = False
+                if dropped:
+                    self._drops += 1
                 self._fail_inflight()
                 writer.close()
                 with contextlib.suppress(ConnectionError, OSError):
@@ -239,6 +288,8 @@ class PersistentConnection:
                 self._tracker.on_ack(_seq)
         else:
             self._m.counters.nak += 1
+        if self._on_reply is not None:
+            self._on_reply()
         if on_done is not None:
             on_done()
 
@@ -246,8 +297,10 @@ class PersistentConnection:
         """On disconnect, count outstanding (sent, no ACK seen) as timeouts and release their slots."""
         if not self._inflight:
             return
-        for _seq, _send_ns, _cid, on_done in self._inflight:
+        for _seq, send_ns, _cid, on_done in self._inflight:
             self._m.counters.timeouts += 1
+            if self._on_strand is not None:
+                self._on_strand(send_ns)
             if self._ledger is not None:
                 self._ledger.record_unconfirmed(_cid, _seq)
             if on_done is not None:

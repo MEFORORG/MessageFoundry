@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import ValidationError
 
@@ -17,6 +17,8 @@ from messagefoundry.api.auth_models import (
     ChannelScope,
     CustomRoleInfo,
     CustomRoleRequest,
+    FederatedIdentityRequest,
+    FederatedIdentityView,
     PasswordResetResponse,
     RolesUpdateRequest,
     UserCreateRequest,
@@ -30,6 +32,7 @@ from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
 from messagefoundry.auth.service import (
+    STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
@@ -85,6 +88,28 @@ register_ui_action(
     r"^/ui/users/[^/?#]+/(revoke-sessions|delete)$",
     Permission.USERS_MANAGE,
 )
+# BACKLOG #1143 / #295 (ADR 0184 slice B): the federated-identity screen. Its two POSTs are
+# action-bound to admin_federated_identity, like their JSON twins, and NEITHER is registered: the link
+# POST carries a body, and an unlink is never auto-re-POSTed across a re-auth. Each stale POST maps
+# back to a GET page instead, the stepdown-confirm shape. Those two GET pages are the continuations,
+# and each is TAGGED, so /ui/reauth mints the one grant the POST that follows consumes. A fresh
+# login window opens the pages without minting one; the POST then bounces once through /ui/reauth
+# and the operator submits again. That is the admin_user_update lane's cost, accepted there first.
+register_ui_action(
+    r"^/ui/users/[^/?#]+/federated-identity$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    action=STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+)
+register_ui_action(
+    r"^/ui/users/[^/?#]+/federated-identity/unlink-confirm$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    action=STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+)
+
 register_ui_action(r"^/ui/roles/new$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
 register_ui_action(
     r"^/ui/roles/[^/?#]+/edit$", Permission.USERS_MANAGE, auto_retry=False, unlock=True
@@ -126,6 +151,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 all_roles,
                 error=error,
+                # BACKLOG #1143 (ADR 0184 slice B): the page states the federated link.
+                federated=admin.federated_identity_view(user, service),
             ),
             status_code=status_code,
         )
@@ -183,7 +210,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 email=form.get("email", "").strip() or None,
                 roles=roles,
             )
-            created = await admin.create_user(body=body, service=service, identity=identity)
+            created = await admin.create_user(
+                body=body, request=request, service=service, identity=identity
+            )
         except (ValidationError, HTTPException) as exc:
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
             all_roles = await admin.list_roles(service=service, _=identity)
@@ -222,15 +251,37 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         form = dict(await _form_pairs(request))
+        # BACKLOG #1139, ADR 0182 Amendment A. The notification address is sent only when the
+        # administrator changed it from the value the page showed (`notify_email_shown`). Comparing
+        # against the stored value instead would let a stale page revert another administrator's
+        # move. A form with no shown value predates the field and sends a typed value as is.
+        typed_notify = form.get("notify_email", "").strip()
+        shown_notify = form.get("notify_email_shown")
+        notify_changed = (
+            typed_notify != shown_notify.strip() if shown_notify is not None else bool(typed_notify)
+        )
+        if notify_changed and not typed_notify:
+            # The JSON twin refuses an explicit null for the same reason: it cannot be cleared.
+            return await _user_detail(
+                user_id,
+                service,
+                identity,
+                error="the notification address can be changed but not cleared",
+                status_code=400,
+            )
         try:
             # An HTML form always posts the full profile picture, so every field is set explicitly
             # ("" clears to None; an absent checkbox means enabled) — the PATCH partial semantics of
-            # the JSON handler don't apply to a form submit.
-            body = UserUpdateRequest(
-                display_name=form.get("display_name", "").strip() or None,
-                email=form.get("email", "").strip() or None,
-                disabled="disabled" in form,
-            )
+            # the JSON handler don't apply to a form submit. The notification address is the
+            # exception above.
+            fields: dict[str, object] = {
+                "display_name": form.get("display_name", "").strip() or None,
+                "email": form.get("email", "").strip() or None,
+                "disabled": "disabled" in form,
+            }
+            if notify_changed:
+                fields["notify_email"] = typed_notify
+            body = UserUpdateRequest.model_validate(fields)
             await admin.update_user(user_id, body=body, service=service, identity=identity)
         except (ValidationError, HTTPException) as exc:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
@@ -389,6 +440,181 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 user_id, service, identity, error=str(exc.detail), status_code=400
             )
         return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
+
+    # --- users: federated identity (BACKLOG #1143 / #295, ADR 0184 slice B) -----------------------
+    #
+    # The console's half of the only path that creates a federated binding. Both POSTs call the JSON
+    # handlers BY REFERENCE, so the service checks, the self-exclusion and the refusal mapping are
+    # the API's own. What a direct call SKIPS is the handler's require_step_up_action Depends, so
+    # each POST re-asserts it here with the same action. That dependency is the gate; the pages in
+    # front of it only decide what an operator is offered.
+    #
+    # The single-use grant is spent by the dependency, before the body is read. So a refused POST
+    # costs its grant, and trying again goes through /ui/reauth first. The JSON twin behaves the
+    # same, and the page says so beside the form.
+
+    async def _federated_view(user_id: str, service: AuthService) -> FederatedIdentityView:
+        user = await service.store.get_user(user_id)
+        if user is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        view: FederatedIdentityView = admin.federated_identity_view(user, service)
+        return view
+
+    async def _federated_screen(
+        user_id: str,
+        service: AuthService,
+        identity: Identity,
+        *,
+        notice: str = "",
+        error: str | None = None,
+        subject: str = "",
+        status_code: int = 200,
+    ) -> HTMLResponse:
+        view = await _federated_view(user_id, service)
+        return HTMLResponse(
+            pages.federated_identity_page(
+                view,
+                is_self=view.user_id == identity.user_id,
+                notice=notice,
+                error=error,
+                subject=subject,
+            ),
+            status_code=status_code,
+        )
+
+    def _still_shown(view: FederatedIdentityView, form: dict[str, str]) -> bool:
+        """Whether the pair the operator's page showed is still the stored pair.
+
+        The notify_email_shown guard on the user page, applied here: a link or unlink acts on the
+        stored binding, and a page opened before another administrator changed it would otherwise
+        replace or remove a binding its operator never saw. Both fields are required; a POST
+        without them is refused the same way. This narrows the window to the handler call. It does
+        not close it, and the service's own checks still run after it."""
+        shown = (form.get("shown_issuer"), form.get("shown_subject"))
+        return shown == (view.issuer or "", view.subject or "")
+
+    # The dependency already spent this POST's single-use grant, so a retry bounces through
+    # /ui/reauth first. "May", not "will": under [auth].require_action_step_up = false a fresh
+    # session window stands in for the grant and no re-auth is asked.
+    changed = (
+        "The link changed after this page was opened, so nothing was changed. The page now shows "
+        "the current link. Check it before you try again. A retry may ask you to re-authenticate "
+        "first."
+    )
+
+    @app.get("/ui/users/{user_id}/federated-identity", response_class=HTMLResponse)
+    async def ui_user_federated_identity(
+        user_id: str,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
+        m: str = Query("", max_length=16),
+    ) -> HTMLResponse:
+        return await _federated_screen(user_id, service, identity, notice=m)
+
+    @app.post("/ui/users/{user_id}/federated-identity/link")
+    async def ui_user_federated_link(
+        user_id: str,
+        request: Request,
+        service: AuthService = Depends(_service),
+        # Action-bound, as PUT /users/{id}/federated-identity is. Enforced HERE: the JSON dependency
+        # does not run on this path, because the handler FUNCTION is called through the seam.
+        identity: Identity = Depends(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+                Permission.USERS_MANAGE,
+                reauth_next=lambda r: r.url.path.removesuffix("/link"),
+            )
+        ),
+    ) -> Response:
+        assert_same_origin(request)
+        form = dict(await _form_pairs(request))
+        # Passed as typed. The service refuses surrounding spaces rather than trimming them, because
+        # the stored value must match the token byte for byte, and its refusal says so.
+        subject = form.get("subject", "")
+        # Echo a bounded value only: an oversized post must not size the refusal page.
+        echo = subject[:255]
+        view = await _federated_view(user_id, service)
+        if not _still_shown(view, form):
+            return await _federated_screen(
+                user_id, service, identity, error=changed, subject=echo, status_code=409
+            )
+        try:
+            body = FederatedIdentityRequest(subject=subject)
+        except ValidationError:
+            return await _federated_screen(
+                user_id,
+                service,
+                identity,
+                error="Enter the identity provider's subject (sub), 1 to 255 characters.",
+                subject=echo,
+                status_code=400,
+            )
+        try:
+            await admin.bind_user_federated_identity(
+                user_id, body=body, service=service, identity=identity
+            )
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                raise
+            return await _federated_screen(
+                user_id,
+                service,
+                identity,
+                error=str(exc.detail),
+                subject=echo,
+                status_code=exc.status_code,
+            )
+        # Relink versus link, from the pair this request checked above rather than from the
+        # handler's message text, which no seam pins.
+        outcome = "relinked" if view.linked else "linked"
+        return RedirectResponse(
+            f"/ui/users/{user_id}/federated-identity?m={outcome}", status_code=303
+        )
+
+    @app.get("/ui/users/{user_id}/federated-identity/unlink-confirm", response_class=HTMLResponse)
+    async def ui_user_federated_unlink_confirm(
+        user_id: str,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
+    ) -> HTMLResponse:
+        view = await _federated_view(user_id, service)
+        return HTMLResponse(
+            pages.federated_unlink_confirm_page(view, is_self=view.user_id == identity.user_id)
+        )
+
+    @app.post("/ui/users/{user_id}/federated-identity/unlink")
+    async def ui_user_federated_unlink(
+        user_id: str,
+        request: Request,
+        service: AuthService = Depends(_service),
+        # Action-bound, as DELETE /users/{id}/federated-identity is. A stale POST goes back to the
+        # confirm page rather than being re-POSTed, so the operator reads the consequence again.
+        identity: Identity = Depends(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+                Permission.USERS_MANAGE,
+                reauth_next=lambda r: r.url.path.removesuffix("/unlink") + "/unlink-confirm",
+            )
+        ),
+    ) -> Response:
+        assert_same_origin(request)
+        form = dict(await _form_pairs(request))
+        view = await _federated_view(user_id, service)
+        if not _still_shown(view, form):
+            return await _federated_screen(
+                user_id, service, identity, error=changed, status_code=409
+            )
+        try:
+            await admin.unbind_user_federated_identity(user_id, service=service, identity=identity)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                raise
+            return await _federated_screen(
+                user_id, service, identity, error=str(exc.detail), status_code=exc.status_code
+            )
+        return RedirectResponse(
+            f"/ui/users/{user_id}/federated-identity?m=unlinked", status_code=303
+        )
 
     @app.post("/ui/users/{user_id}/revoke-sessions")
     async def ui_user_revoke_sessions(

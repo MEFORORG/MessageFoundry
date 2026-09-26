@@ -53,7 +53,7 @@ MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_TRANSFORM=edit MEFOR_LOAD_SINK_PORT=2700 \
   python -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
 
 # 2) Drive it. --sink-port must match MEFOR_LOAD_SINK_PORT above.
-python -m harness --load fanout-baseline --engine http://127.0.0.1:8765 --token <T> \
+python -m harness --load fanout-baseline --engine https://127.0.0.1:8765 --cacert ./api-generated-cert.pem --token <T> \
   --sink-port 2700 --report-json out/load/run.json --report-csv out/load/run.csv
 ```
 

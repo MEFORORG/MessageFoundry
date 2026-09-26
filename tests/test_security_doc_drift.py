@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -68,9 +69,16 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # GET plus a stepdown POST for each of the planned and forced variants -- and no JSON route.
 # BACKLOG #1500 (ADR 0090 residual (a)) added two /ui routes -- the message resend confirm GET and the
 # body-less resend POST behind it -- and no JSON route: the resend endpoint already shipped with #123.
-_ROUTES_DEFAULT = 109
-_ROUTES_WITH_DOCS = 113
-_ROUTES_WITH_UI = 218
+# BACKLOG #1139 (ASVS 6.3.7) added one JSON route, POST /me/notify-email, and two /ui routes, the GET
+# and POST of /ui/account/notify-address: the way out of the missing-address confinement.
+# BACKLOG #1143 / #295 (ADR 0184 slice A) added two JSON routes -- PUT and DELETE
+# /users/{user_id}/federated-identity, the only path that binds a federated identity -- and no /ui
+# route: the console leg is slice B.
+# BACKLOG #1143 / #295 (ADR 0184 slice B) added four /ui routes and no JSON route: the
+# federated-identity screen and its unlink confirm page, and the link and unlink POSTs behind them.
+_ROUTES_DEFAULT = 112
+_ROUTES_WITH_DOCS = 116
+_ROUTES_WITH_UI = 227
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -123,16 +131,14 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("GET", "/ui/messages/{message_id}/attachments/{attachment_id}"),
         ("GET", "/ui/messages/{message_id}/parse-tree"),
         ("GET", "/ui/uploaded-logs"),
-        # BACKLOG #1227: the resend CONFIRM page. It cannot be step-up-gated — it IS the re-auth
-        # continuation, so a step-up there bounces the operator back to /ui/reauth forever. It is
-        # safe to leave on plain require_ui because it renders NO message body: a filename, an
-        # ordinal and a connection name, all of which the operator just supplied.
-        ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
-        # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload"): it now carries
-        # `require_ui_step_up`, so the derivation below no longer flags it. See docs/SECURITY.md
-        # item 3 of the behavioural-differences block.
+        # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload") and BACKLOG #1822 removed
+        # ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"): both now carry
+        # `require_ui_step_up`, so the derivation below no longer flags them. The confirm page was
+        # listed on the claim that a gate on a re-auth continuation loops; it does not, and
+        # test_uploaded_logs_ui.py measures that. See docs/SECURITY.md item 3 of the
+        # behavioural-differences block.
     }
 )
 
@@ -153,6 +159,7 @@ _PERMISSIONLESS_ROUTES = frozenset(
         ("POST", "/auth/logout"),
         ("GET", "/auth/me"),
         ("POST", "/me/password"),
+        ("POST", "/me/notify-email"),
         ("POST", "/me/reauth"),
         ("POST", "/auth/mfa-verify"),
         ("GET", "/me/mfa"),
@@ -336,8 +343,6 @@ _CONTEXTUAL_TOKENS = frozenset(
         "oidc_required_acr_values",
         "oidc_allowed_username_domains",
         "oidc_username_strip_domain",
-        # a time attribute x admin-population state that DENIES (disable + revoke + audit)
-        "bootstrap_expiry_hours",
         # DATA PLANE — the binding correction: these are pre-auth, IP-keyed ALLOW/DENY decisions too
         "source_ip_allowlist",
         "calling_ae_allowlist",
@@ -413,7 +418,6 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "ad_session_recheck_max_users", 200, "200 users"),
     ("auth", "ad_session_revoke_max", 5, "**5**"),
     ("auth", "ad_session_revoke_max_fraction", 0.34, "**0.34**"),
-    ("auth", "bootstrap_expiry_hours", 72, "72 h"),
     ("auth", "oidc_require_mfa_claim", True, "on"),
     # These three were documented but unpinned — precisely the defaults the trailing lanes plan to
     # move (#297's 8.3.2 route proposes an ADR-0080-style derived ad_session_recheck_seconds), so a
@@ -484,11 +488,6 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # trusts the IdP's certificate, not what the engine decides about a request it receives. A
         # certificate it rejects never yields an identity at all.
         "oidc_tls_crl_file",
-        # ASVS 6.4.5 arm 2: how long BEFORE the bootstrap deadline to start reminding an operator that
-        # the unclaimed first-run credential is about to be retired. Purely the timing of an advisory
-        # ALERT — no login, session or authorization outcome turns on it (contrast its sibling
-        # `bootstrap_expiry_hours`, which DISABLES the account and is therefore an inventoried input).
-        "bootstrap_warn_hours",
         # ASVS 3.7.3: destinations exempted from the "you are leaving this site" interstitial. It
         # decides whether the operator is SHOWN A NOTIFICATION before an outbound navigation — not
         # whether any request is authorized. No login, session, permission or authorization outcome
@@ -882,7 +881,7 @@ def test_every_engine_route_appears_in_the_route_map_with_its_permission_and_gat
 
 
 def _row_mismatches(
-    derived: dict[tuple[str, str], _DocRow], documented: dict[tuple[str, str], _DocRow]
+    derived: Mapping[tuple[str, str], _DocRow], documented: Mapping[tuple[str, str], _DocRow]
 ) -> list[str]:
     """Every route whose documented permission set or gate wrapper disagrees with the live app."""
     out: list[str] = []
@@ -1175,8 +1174,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     assert len(gated) == len(rows) - len(no_gate) - len(permissionless)
     # 87 -> 90: BACKLOG #1184's three needle-bearing POSTs, each gated exactly as its GET sibling.
     # 90 -> 91: BACKLOG #1494's POST /cluster/stepdown, gated on the new cluster:control.
-    assert len(gated) == 91, (
-        f"{len(gated)} permission-gated routes, not 91 — update the doc's totals."
+    # 91 -> 93: BACKLOG #1143's PUT and DELETE /users/{user_id}/federated-identity, users:manage.
+    assert len(gated) == 93, (
+        f"{len(gated)} permission-gated routes, not 93 — update the doc's totals."
     )
 
 

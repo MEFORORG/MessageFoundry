@@ -34,6 +34,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import OutboxStatus
+from messagefoundry.store.store import MessageStore
 
 PW = "a-strong-test-passphrase"
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -558,10 +559,12 @@ async def test_a_request_with_no_requester_id_is_refused_fail_closed(engine: Eng
     async with _client(engine, service, ON) as c:
         approval_id = (await _request_replay(c, await _token(c, "jdoe"))).json()["approval_id"]
         # Strip the id to model a row written before the column existed.
-        await engine.store._db.execute(
+        store = engine.store
+        assert isinstance(store, MessageStore)  # this reach-in is SQLite-specific
+        await store._db.execute(
             "UPDATE pending_approvals SET requester_user_id = NULL WHERE id = ?", (approval_id,)
         )
-        await engine.store._db.commit()
+        await store._db.commit()
         stale = await c.post(
             f"/approvals/{approval_id}/approve", headers=await _token(c, "approver")
         )

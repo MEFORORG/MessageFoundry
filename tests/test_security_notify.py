@@ -17,11 +17,17 @@ import pytest
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     EMAIL_CHANGED,
+    MFA_CREDENTIAL_REMOVED,
+    MFA_DISABLED,
+    NOTIFY_EMAIL_SET,
+    PASSWORD_RESET,
     RECOVERY_CODE_USED,
     SecurityEvent,
+    deadline_utc,
 )
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.security_notify import (
+    _SUBJECTS,
     SecurityEventNotifier,
     _build_body,
     security_notifier_from_settings,
@@ -165,6 +171,32 @@ def test_body_names_the_new_address_on_a_repoint_and_does_not_say_removed() -> N
     assert "removed" not in body.lower()
 
 
+def test_a_non_last_factor_removal_renders_its_own_subject_and_body() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): MFA_CREDENTIAL_REMOVED must be wired into BOTH renderers.
+
+    THE TEST EXISTS BECAUSE BOTH FALL BACK SILENTLY. ``_SUBJECTS.get`` degrades to a generic
+    "MessageFoundry security alert" and ``_DESCRIPTIONS.get`` to "A security event occurred on your
+    account", so a half-wired event type sends a mail that looks well-formed and tells the holder
+    nothing. Neither renderer raises, so nothing else in the suite would notice.
+
+    It also pins the one thing this arm must NOT say. The account still holds another second factor,
+    so the MFA_DISABLED wording would be a false statement in a security notice.
+    """
+    assert _SUBJECTS[MFA_CREDENTIAL_REMOVED] != _SUBJECTS[MFA_DISABLED]
+    body = _build_body(
+        SecurityEvent(
+            MFA_CREDENTIAL_REMOVED,
+            username="bob",
+            email="bob@example.org",
+            detail={"factor": "webauthn"},
+        )
+    )
+    assert "A security event occurred on your account." not in body
+    assert "removed" in body.lower()
+    # Says the account is still protected, and does not claim a disable.
+    assert "disabled" not in body.lower()
+
+
 def test_body_says_a_directory_repoint_came_from_the_directory() -> None:
     """BACKLOG #1139 (ASVS 6.3.7): where the change came from decides what the reader can DO. A
     directory-driven repoint is not editable in the console, so an unexplained one reads as a
@@ -194,6 +226,58 @@ def test_body_omits_the_directory_line_for_a_console_change() -> None:
     assert "directory" not in body.lower()
 
 
+def test_body_names_a_moved_notification_address_as_such() -> None:
+    """BACKLOG #1139, ADR 0182 Amendment A: an administrator moving the NOTIFICATION address sends
+    this notice to the old one, and it is the last that address gets. It must say which address
+    moved, and that later notices go elsewhere. The profile-change body is the control."""
+    moved = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            detail={"new_email": "new@example.org", "field": "notify_email"},
+        )
+    )
+    assert "An administrator changed the address that receives security notices" in moved
+    assert "New notification address: new@example.org" in moved
+    assert "Notices about later changes go to the new address" in moved
+    assert "New email on file" not in moved
+    # An administrator did it, so "if this was you" cannot apply.
+    assert "If this was you" not in moved
+    assert "If you did not expect this change" in moved
+
+    profile = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            detail={"new_email": "new@example.org"},
+        )
+    )
+    assert "New email on file: new@example.org" in profile
+    assert "Notices about later changes" not in profile
+    assert "If this was you" in profile
+
+
+def test_body_says_an_administrator_set_the_first_address() -> None:
+    """The holder's own fill says "if you did not set it". An administrator's fill must not, since
+    the holder never sets it on that path. The holder's own fill is the control."""
+    by_admin = _build_body(
+        SecurityEvent(
+            NOTIFY_EMAIL_SET,
+            username="bob",
+            email="new@example.org",
+            detail={"set_by": "administrator"},
+        )
+    )
+    assert "An administrator set this address" in by_admin
+    assert "If you did not set it" not in by_admin
+    assert "If this was you" not in by_admin
+
+    own = _build_body(SecurityEvent(NOTIFY_EMAIL_SET, username="bob", email="new@example.org"))
+    assert "If you did not set it" in own
+
+
 def test_body_states_the_remaining_recovery_code_count() -> None:
     """BACKLOG #1139 (ASVS 6.3.7): spending a recovery code permanently deletes a stored credential.
     The count is what makes the notice actionable; the code and its hash never appear."""
@@ -203,6 +287,41 @@ def test_body_states_the_remaining_recovery_code_count() -> None:
     assert "Recovery codes remaining: 3" in body
     assert "spent" in body.lower()
     assert "last recovery code" not in body.lower()  # only the zero arm says that
+
+
+def test_reset_body_states_the_deadline_in_the_api_surfaces_format() -> None:
+    """BACKLOG #1141 slice 2 (ASVS 6.4.5), limb (b): the reset notice reaches the HOLDER, so it
+    carries the instant the temporary password stops working. Rendered in the format the API refusal
+    and the console pages use, so the holder reads one string on every surface."""
+    stamp = 1_800_000_000.0
+    body = _build_body(
+        SecurityEvent(PASSWORD_RESET, username="bob", email="bob@x", detail={"expires_at": stamp})
+    )
+    rendered = deadline_utc(stamp)
+    assert rendered is not None
+    assert f"The temporary password stops working at {rendered}." in body
+    # An administrator did the reset, so the generic "no action is needed" close would contradict
+    # the deadline line. The reset notice closes on its own sentence.
+    assert "no action is needed" not in body
+    assert "If you did not expect this reset" in body
+
+
+def test_reset_body_states_no_deadline_without_one() -> None:
+    """Control: ``initial_password_expiry_hours = 0`` sends no instant, and the body must then say
+    nothing about one rather than a sentence with a hole in it."""
+    body = _build_body(SecurityEvent(PASSWORD_RESET, username="bob", email="bob@x"))
+    assert "stops working" not in body
+    assert "reset by an administrator" in body
+
+
+def test_reset_body_drops_an_unrenderable_deadline() -> None:
+    """The expiry setting has no upper bound, and ``fromtimestamp`` raises past year 9999 (3000 on
+    Windows). The API surfaces drop the sentence in that case; the notice does the same rather than
+    failing the send."""
+    body = _build_body(
+        SecurityEvent(PASSWORD_RESET, username="bob", email="bob@x", detail={"expires_at": 1e20})
+    )
+    assert "stops working" not in body
 
 
 def test_body_warns_when_the_last_recovery_code_is_spent() -> None:

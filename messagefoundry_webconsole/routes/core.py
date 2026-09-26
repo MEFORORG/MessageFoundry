@@ -400,10 +400,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Parse the urlencoded login form with stdlib — the engine has no python-multipart dep, so
         # Form()/request.form() would fail; a same-origin login POST is always urlencoded here.
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
-        # L5b (ADR 0068 §8): browser AD-password login rides the SAME auth.login seam as the
-        # JSON surface — allow-listed provider values only; absent stays LOCAL (regression-
-        # pinned). ONE session is minted per form POST, so the AD role-resync/revocation side
-        # effect fires once at login, never per navigation.
+        # L5b (ADR 0068 §8): the form rides the SAME auth.login seam as the JSON surface, with
+        # allow-listed provider values only; absent stays LOCAL (regression-pinned). The browser
+        # AD-password sign-in is RETIRED (BACKLOG #1137): the login page renders no provider
+        # selector, and "ad" stays in the allow-list only so the ENGINE (_dispatch_login) is the
+        # single point that refuses and audits it. Directory accounts sign in by Windows SSO or
+        # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
+        # (and the JSON /me/reauth).
         provider_value = form.get("provider", "local")
         if provider_value not in ("local", "ad"):
             return RedirectResponse("/ui/login?e=bad", status_code=303)
@@ -412,6 +415,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             form.get("password", ""),
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,
+            # ASVS 7.2.4: the Set-Cookie below REPLACES whatever session cookie this browser sent,
+            # so the engine ends that one session as part of a SUCCESSFUL mint, rather than leave
+            # it valid and unreachable until it expires. A failed sign-in ends nothing.
+            supersedes=session_token(request),
         )
         if not outcome.ok or outcome.token is None:
             return RedirectResponse("/ui/login?e=bad", status_code=303)
@@ -779,8 +786,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # Copying that pair here would charge the per-actor PHI budget for a surface that emits none, and
     # would refuse a role deliberately narrowed to resend-without-read.
     #
-    # The confirm page is PLAIN require_ui, not step-up: it is the re-auth CONTINUATION, so gating it
-    # with step-up would bounce the operator straight back to /ui/reauth in a loop.
+    # The confirm page is PLAIN require_ui, and NOT because it is the re-auth continuation: a gated
+    # continuation does not loop, since /ui/reauth refreshes the window before it redirects back
+    # (BACKLOG #1822 measured it on the uploaded-logs twin, which is now gated). It stays plain
+    # because the POST is the step-up-gated act, no JSON route with this method and permission
+    # carries a step-up, and the page reads nothing, as the next paragraph says.
     #
     # It reads NO message, which is what lets it stand on `messages:resend` alone. Everything it
     # renders is the operator's own query echoed back through the escaping builders, so it asserts
@@ -1228,7 +1238,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=True,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error="Invalid code.",
+                        error=(
+                            "Account locked. Try again later."
+                            if code_elevation.locked
+                            else "Invalid code."
+                        ),
                     )
                 )
         # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action. action.action

@@ -19,11 +19,13 @@ silently-dropped key leaves the setting it was meant to apply un-applied, with n
 reporting a problem. An unknown top-level **section** is still tolerated.
 
 The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
-oversight: the **env** and **CLI** layers still drop an unrecognized key silently. Env cannot be
-checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read straight from
-``os.environ`` by their consuming module and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``,
-``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership test would refuse a
-correctly-configured deployment; CLI keys are engine-written, never operator-spelled. The one
+oversight: the **env** layer and the ``cli`` mapping still drop an unrecognized key silently. Env
+cannot be checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read
+straight from ``os.environ`` by their consuming module and are not fields on any section
+(``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership
+test would refuse a correctly-configured deployment. ``cli`` keys are engine-written from parsed
+arguments, never operator-spelled; an operator's unknown flag never reaches them, because argparse
+refuses it first with exit 2. The one
 exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
 Anything stated to an operator about this refusal must carry that scope — see
 ``docs/CONFIGURATION.md``.
@@ -46,7 +48,14 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from messagefoundry.config.ai_policy import (
     AiDataScope,
@@ -222,6 +231,21 @@ class SqlAuth(str, Enum):  # noqa: UP042
     SQL = "sql"  # SQL login (username + password)
     INTEGRATED = "integrated"  # Windows Integrated auth
     ENTRA = "entra"  # Microsoft Entra ID (Azure AD)
+
+
+def refuse_a_blank_anchor_pin(value: str | None, setting: str) -> str | None:
+    """Refuse a trust-anchor SHA-256 pin that is set but blank (BACKLOG #1142).
+
+    ``None`` is the only spelling of "no pin". An empty or whitespace value, such as an environment
+    variable set to nothing, used to reach the anchor code as a pin and refuse there or, on a
+    connection, read as no pin at all. A blank pin is a mistake, so it refuses at load, naming the
+    setting. Shared with the per-connection ``tls_ca_pin`` check in ``auth/trust_anchors.py``."""
+    if value is not None and not value.strip():
+        raise ValueError(
+            f"{setting} is set but empty, so it pins nothing. Remove it for no pin, or set it to "
+            "the SHA-256 of the CA file (64 hex characters)"
+        )
+    return value
 
 
 class _Section(BaseModel):
@@ -601,7 +625,7 @@ class StoreSettings(_Section):
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
     ssl_root_cert: str | None = None
-    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the DB SERVER's certificate.
+    # BACKLOG #299: optional PEM file of CRLs checked against the DB SERVER's certificate.
     # The store hop builds its own context and resolves no trust anchor, so [tls].crl_file never reaches
     # it -- this is its own knob rather than a silent inheritance, the per-hop scoping error that item
     # warns about. POSTGRES ONLY, and only on the `ssl_root_cert` (pinned-CA) branch: that is the one
@@ -925,14 +949,16 @@ class ApiSettings(_Section):
     tls_key_password: str | None = None
     # Minimum negotiated TLS version floor (NIST SP 800-52r2: 1.2+). "1.2" or "1.3".
     tls_min_version: str = "1.2"
-    # Optional OpenSSL cipher string (default = the interpreter's secure defaults).
+    # Optional OpenSSL cipher string (default = the approved AEAD suites, BACKLOG #300).
     tls_ciphers: str | None = None
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
     #: Opt-in CRL for the mTLS client certificates `tls_client_ca_file` verifies (BACKLOG #1005).
-    #: A PEM carrying the CA **and** its CRL. Absent, client certificates are verified for chain
-    #: and RFC 5280 conformance but NOT for revocation -- measured, a revoked-but-chain-valid
-    #: client is ACCEPTED. Set it and a revoked partner certificate is refused at the handshake.
+    #: A PEM file holding the client CA's CRL. Put the CA itself in `tls_client_ca_file`, where the
+    #: #285 pin covers it: a certificate in this file the store lacks refuses start (BACKLOG #1890).
+    #: Absent, client certificates are verified for chain and RFC 5280 conformance but NOT for
+    #: revocation -- measured, a revoked-but-chain-valid client is ACCEPTED. Set it and a revoked
+    #: partner certificate is refused at the handshake.
     #:
     #: **An expired CRL refuses EVERY client, not only revoked ones**, so this is read at startup
     #: and refused loudly there rather than at the first partner handshake. See
@@ -1108,6 +1134,11 @@ class ApiSettings(_Section):
                 ) from exc
         return v
 
+    @field_validator("tls_client_ca_pin")
+    @classmethod
+    def _refuse_a_blank_client_ca_pin(cls, v: str | None) -> str | None:
+        return refuse_a_blank_anchor_pin(v, "[api].tls_client_ca_pin")
+
     @field_validator("tls_min_version")
     @classmethod
     def _check_tls_min_version(cls, v: str) -> str:
@@ -1205,7 +1236,7 @@ class TlsSettings(_Section):
     #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
-    # PEM path to a CRL (or a CA+CRL bundle) for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
+    # PEM path to a file of CRLs for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
     # the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
     # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
     # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
@@ -1763,7 +1794,7 @@ class LoggingSettings(_Section):
     forward_tls_verify: bool = True
     # Optional client cert (PEM cert+key chain) for mutual TLS to the collector. None = no client auth.
     forward_tls_client_cert: str | None = None
-    # Optional CRL (PEM, or a CA+CRL bundle) checked against the COLLECTOR's certificate (BACKLOG
+    # Optional PEM file of CRLs checked against the COLLECTOR's certificate (BACKLOG
     # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
     # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
     # would be the per-hop scoping error that item warns about. Applies only with
@@ -2138,8 +2169,10 @@ class AuthSettings(_Section):
     # active session. 0 = unlimited. Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
-    # re-verified its credential — at login or via POST /me/reauth — within this many seconds. The
-    # initial login counts as the first verification (sudo-timestamp model). Default 5 minutes.
+    # re-verified its credential -- at login, via POST /me/reauth, or with a code at
+    # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
+    # that owes no second factor counts as the first verification (sudo-timestamp model); a
+    # directory login (Kerberos, OIDC) does not (BACKLOG #1144). Default 5 minutes.
     step_up_max_age_seconds: int = 300
     # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), the durable-takeover
     # JSON routes — TOTP enroll/confirm, disable-MFA — require a fresh proof BOUND to
@@ -2168,7 +2201,7 @@ class AuthSettings(_Section):
     # secure default over back-compat. It cannot lock a fresh admin out: a required-but-unenrolled
     # Administrator can still reach the factor-enrollment routes (they are gated by a fresh PASSWORD
     # step-up bound to the enroll/confirm action, never by the MFA gate — see
-    # api/security.py:require_reauth_only_action), so the bootstrap admin enrolls TOTP then satisfies
+    # api/security.py:require_reauth_only_action), so a newly provisioned admin enrolls TOTP then satisfies
     # it. Set ``require_mfa = false`` (the documented opt-out) to revert to the single-factor default.
     # An off-loopback bind that serves local accounts MUST keep this on; ``serve`` makes that posture
     # explicit (sec-mfa-on) — on an exposed (non-loopback) PHI bind with this **explicitly opted out**
@@ -2238,28 +2271,13 @@ class AuthSettings(_Section):
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
-    # First-run bootstrap admin: auto-disabled once a second administrator exists, and (if still
-    # unclaimed — never password-changed) disabled this many hours after creation. 0 = no time expiry
-    # OF THE ACCOUNT, which is not the same as no expiry of its CREDENTIAL (BACKLOG #1245): the
-    # printed first-run password is separately bounded by `initial_password_expiry_hours`, so at 0 the
-    # account survives indefinitely while the credential still dies on that other clock. Setting this
-    # LONGER than that value has the same shape. The deadline surfaced in `bootstrap-admin.txt` is the
-    # EARLIER of the two for exactly this reason.
-    bootstrap_expiry_hours: int = 72
-    # ASVS 6.4.5 arm 2: how many hours BEFORE that auto-disable to start reminding an operator (via the
-    # `bootstrap_admin_expiring` AlertSink event) that the unclaimed first-run credential is about to be
-    # retired. The API-lifespan reminder fires once per process while now sits inside
-    # [expires_at - bootstrap_warn_hours, expires_at). Only meaningful when bootstrap_expiry_hours > 0.
-    bootstrap_warn_hours: int = 24
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
     # password, i.e. account takeover. Keyed on `password_changed_at`; a user who set their own password
-    # has `must_change_password=False` and is unaffected. THE BOOTSTRAP ADMIN IS NOT EXEMPT (BACKLOG
-    # #1245): it used to be, on the premise that `bootstrap_expiry_hours` covered it, but WP-3 retires
-    # an ACCOUNT while this expires a CREDENTIAL, and WP-3 cannot bound the credential at all when
-    # `bootstrap_expiry_hours = 0` or is set longer than this value. 0 = no expiry (not recommended on
-    # a PHI instance) — and note that setting THIS to 0 now also unbounds the first-run credential.
+    # has `must_change_password=False` and is unaffected. Every local account holding such a temporary
+    # password is in scope: the engine creates no default account (ADR 0183 Amendment A), so there is
+    # no carve-out to reason about. 0 = no expiry (not recommended on a PHI instance).
     initial_password_expiry_hours: int = 72
 
     # Active Directory / LDAP. The bind password is a secret: MEFOR_AUTH_AD_BIND_PASSWORD.
@@ -2384,7 +2402,7 @@ class AuthSettings(_Section):
     # REFUSES — always, independent of [security].enforcement (a substituted OIDC anchor permits JWKS
     # substitution + forged id_tokens). Dormant when None. Block-scoped (direct-read, not desugared).
     oidc_tls_ca_cert_pin: str | None = None
-    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the IdP's certificate. The
+    # BACKLOG #299: optional PEM file of CRLs checked against the IdP's certificate. The
     # IdP opener resolves no trust anchor, so [tls].crl_file cannot reach it -- this is its own knob
     # rather than a silent inheritance. A revoked IdP cert matters more than on a data hop: this is the
     # leg carrying the client secret, the authorization code and the identity assertion. Same
@@ -2488,6 +2506,11 @@ class AuthSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("ad_tls_ca_cert_pin", "oidc_tls_ca_cert_pin")
+    @classmethod
+    def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
+        return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
 
     @field_validator("oidc_clock_skew_seconds")
     @classmethod
@@ -3148,9 +3171,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         "content_match",  # #81 (ADR 0133): a code-first Handler ("Action Point") matched message content (PHI-free)
-        # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
-        # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
-        "bootstrap_admin_expiring",
+        # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
+        # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)
+        "initial_credential_expiring",
         # #122 (ADR 0162): an application-log sink was rolled after a write failure (stage 1) or is
         # UNWRITABLE and this process's connections were stopped (stage 2). Routable on its own so an
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
@@ -3159,6 +3182,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
         # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
         "approval_stale_requester",
+        # BACKLOG #315: a release by an approver account changed after the request, and an
+        # Administrator grant through the console API.
+        "approval_approver_provenance",
+        "administrator_granted",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
         "ad_reconcile_aborted",
@@ -3275,9 +3302,13 @@ class AlertRule(BaseModel):
     # --- match (all conditions must hold) ---
     event_type: str = "any"  # "any" | a member of _ALERT_EVENT_TYPES (validated below)
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
-    min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
+    # `default=` is spelled as a KEYWORD on every Field here, and must stay one: mypy's
+    # dataclass_transform support reads only the keyword, so a positional `Field(None, ...)` types
+    # the field as REQUIRED and every `AlertRule(...)` call that omits it reads as a missing
+    # argument. Runtime is identical either way (BACKLOG #1799 measured 207 such false errors).
+    min_depth: int | None = Field(default=None, ge=1)  # queue_buildup: match at/over this depth
     min_oldest_seconds: float | None = Field(
-        None, ge=0
+        default=None, ge=0
     )  # queue_buildup/message_stall: …or oldest-message age (s)
     # --- outcome ---
     severity: AlertSeverity = AlertSeverity.WARNING
@@ -3285,7 +3316,7 @@ class AlertRule(BaseModel):
         None  # None = every configured transport; [] = suppress entirely (event dropped, never sent)
     )
     cooldown_seconds: float | None = Field(
-        None, gt=0
+        default=None, gt=0
     )  # override realert_seconds for matching events
     # #146 (ADR 0014 amendment): per-rule EMAIL recipient override. None = the global [alerts].email_to
     # is used, byte-identical to before. A non-empty list re-targets the email transport for events this
@@ -3436,8 +3467,9 @@ class AlertsSettings(_Section):
     # security-notification channel exists — SMTP transport (the settings above) configured AND the
     # [auth].notify_security_events kill-switch on (both are what api/app.py needs to wire the notifier)
     # — so account-security events (lockout, password/roles change, new-IP admin action) always have a
-    # push channel, not just the pull-only /me/security-events feed. Set false to accept the pull-only
-    # feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
+    # push channel, not just the pull-only /me/security-events feed. That feed carries the user's own
+    # events, not an administrator's change to their account (auth/notifications.py states the rule).
+    # Set false to accept the pull-only feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
     # messagefoundry/__main__.py.
     security_notifications_required: bool = True
 
@@ -4683,16 +4715,10 @@ class SecuritySettings(_Section):
     # An operator who needs a specific one relaxed uses that gate's own switch — allow_unencrypted_phi,
     # block_unlisted_outbound, allow_keeping_phi_indefinitely, allow_single_factor_admin_when_exposed,
     # allow_unverified_alert_smtp_tls, [alerts].security_notifications_required, a per-connection
-    # cleartext_accepted, the process-wide MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement
-    # dial. Each of those is separately named, separately audited and separately reported; the retired
-    # lever was none of those things, and it silenced nineteen gates at once. Setting it is now REFUSED
-    # at load with a message naming this decision (see `_REMOVED_KEYS`).
-    #
-    # NOT `tls_revocation_attested`, which this comment offered beside cleartext_accepted until it was
-    # re-read. The field exists on the outbound model and the connectors consume it, but it has no
-    # factory parameter and no connections.toml key, so an operator cannot author it — and
-    # docs/DEPLOYMENT.md's maintenance rule names that exact field and forbids offering it as a lever.
-    # The blanket env var is the only revocation attestation that can actually be set.
+    # cleartext_accepted or tls_revocation_attested (each with its mandatory reason), the process-wide
+    # MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Each of those is separately
+    # named and separately audited; the retired lever was neither, and it silenced nineteen gates at
+    # once. Setting it is now REFUSED at load with a message naming this decision (see `_REMOVED_KEYS`).
     #
     # The production TIER stays: it is a true property of the instance and it drives the AI
     # data-scope ceiling and the DEBUG-log refusal, neither of which is a PHI gate.
@@ -5119,10 +5145,10 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "(BACKLOG #1279). The PHI gates this used to relax as a group each have their own switch — "
         "[security].allow_unencrypted_phi, block_unlisted_outbound, allow_keeping_phi_indefinitely, "
         "allow_single_factor_admin_when_exposed, allow_unverified_alert_smtp_tls, "
-        "[alerts].security_notifications_required, a per-connection cleartext_accepted, the "
-        "process-wide MEFOR_TLS_REVOCATION_ATTESTED (there is no per-connection revocation lever an "
-        "operator can author), or the [security].enforcement dial. Relax the one you mean, or "
-        "delete this line"
+        "[alerts].security_notifications_required, a per-connection cleartext_accepted or "
+        "tls_revocation_attested (each with its reason), the process-wide "
+        "MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Relax the one you mean, "
+        "or delete this line"
     ),
     ("ai", "data_class"): (
         "the data class was removed, not relocated: every instance now carries patient data "
@@ -5355,12 +5381,11 @@ def security_loosenings(
     load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
     It is not a ``[security]`` field, so the completeness floor (which iterates
     ``SecuritySettings.model_fields``) never covered it and its absence is not a floor-test gap. What
-    changed is the consequence: since #1245 removed the bootstrap's carve-out from the ASVS 6.4.1
-    gate, this value is the ONLY bound on the printed first-run administrator credential whenever
-    ``bootstrap_expiry_hours`` is 0 or longer than it. So setting it to 0 unbounds that credential,
-    and nothing in this registry says so. Reporting it needs a new REQUIRED parameter (every one here
-    is required by design, so an optional detector cannot be added quietly), which is a larger change
-    than the item that exposed it — filed as content rather than folded in.
+    matters is the consequence: it is the ONLY bound on an admin-issued temporary password, so
+    setting it to 0 unbounds every such credential, and nothing in this registry says so. Reporting it
+    needs a new REQUIRED parameter (every one here is required by design, so an optional detector
+    cannot be added quietly), which is a larger change than the item that exposed it — filed as
+    content rather than folded in.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -5444,8 +5469,9 @@ def security_loosenings(
         out.append(
             (
                 "require_encryption_for_remote",
-                "off-machine access is permitted WITHOUT TLS — bearer tokens and PHI would cross the network "
-                "in cleartext (still refused on a production-PHI bind)",
+                "off-machine access is permitted with no operator certificate — the API serves "
+                "on its self-signed placeholder, which no trust store vouches for, and inbound "
+                "listeners without tls bind in cleartext (still refused under enforcement=enforce)",
             )
         )
     if not sec.external_link_interstitial:

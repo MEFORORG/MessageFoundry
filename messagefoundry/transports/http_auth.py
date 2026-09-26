@@ -208,8 +208,9 @@ class OAuth2ClientCredentialsProvider:
         except InsecureHopRefused as exc:
             raise HttpAuthError(
                 "OAuth2 token endpoint over cleartext http would expose the client_secret; refused by "
-                "the instance security posture (use https, attest the hop as secure via "
-                "tls_hop_attested, or declare cleartext_accepted with a cleartext_reason)"
+                "the instance security posture (use https, attest the hop as secure with "
+                "tls_hop_attested and a tls_hop_attested_reason, or declare cleartext_accepted with a "
+                "cleartext_reason)"
             ) from exc
         if not client_id:
             raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_client_id' setting")
@@ -518,8 +519,8 @@ def digest_handler_from_settings(
     except InsecureHopRefused as exc:
         raise HttpAuthError(
             "HTTP Digest over cleartext http would expose the digest credential; refused by the "
-            "instance security posture (use https, attest the hop as secure via tls_hop_attested, or "
-            "declare cleartext_accepted with a cleartext_reason)"
+            "instance security posture (use https, attest the hop as secure with tls_hop_attested "
+            "and a tls_hop_attested_reason, or declare cleartext_accepted with a cleartext_reason)"
         ) from exc
     user = str(s.get("http_auth_user") or "")
     password = str(s.get("http_auth_password") or "")

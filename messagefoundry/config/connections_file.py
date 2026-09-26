@@ -131,6 +131,11 @@ _INBOUND_KEYS = frozenset(
         # the factory's schema would accept. Under [settings] it is refused.
         "tls_hop_attested",
         "tls_hop_attested_reason",
+        # ADR 0173: the per-connection revocation attestation for an mTLS listener. TOP-LEVEL for the
+        # same reason as the outbound cleartext pair below: a hop-policy declaration, not a transport
+        # setting the factory's schema would accept.
+        "tls_revocation_attested",
+        "tls_revocation_attested_reason",
     }
 )
 _OUTBOUND_KEYS = frozenset(
@@ -164,6 +169,10 @@ _OUTBOUND_KEYS = frozenset(
         # ADR 0092, owner ruling 2026-09-24: the per-connection hop attestation; see the inbound note.
         "tls_hop_attested",
         "tls_hop_attested_reason",
+        # ADR 0173: the per-connection revocation attestation for a verifying TLS hop; see the inbound
+        # note above.
+        "tls_revocation_attested",
+        "tls_revocation_attested_reason",
     }
 )
 
@@ -242,6 +251,13 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         # build_*_connection choke point, so this surface and the code-first one cannot drift.
         tls_hop_attested=_require_bool(table, "tls_hop_attested", where, default=False),
         tls_hop_attested_reason=_optional_str(table, "tls_hop_attested_reason", where),
+        # ADR 0173: absent = not attested; the flag/reason rules live in build_inbound_connection.
+        tls_revocation_attested=_require_bool(
+            table, "tls_revocation_attested", where, default=False
+        ),
+        tls_revocation_attested_reason=_optional_str(
+            table, "tls_revocation_attested_reason", where
+        ),
         source_file=source,
         source_line=None,
     )
@@ -288,6 +304,13 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         # this surface and the code-first outbound() surface cannot drift.
         cleartext_accepted=_require_bool(table, "cleartext_accepted", where, default=False),
         cleartext_reason=_optional_str(table, "cleartext_reason", where),
+        # ADR 0173: absent = not attested; the flag/reason rules live in build_outbound_connection.
+        tls_revocation_attested=_require_bool(
+            table, "tls_revocation_attested", where, default=False
+        ),
+        tls_revocation_attested_reason=_optional_str(
+            table, "tls_revocation_attested_reason", where
+        ),
         source_file=source,
         source_line=None,
     )
@@ -698,10 +721,10 @@ def _element_fits(value: Any, element: _Accepted) -> bool:
     **WHERE NO REFUSAL EXISTS THE VALUE GOES THROUGH, and that is a HOLE, not a decision this skip
     makes safe.** When #1809 measured it, at least three loaded clean, survived
     ``resolve_env_settings`` unchanged, and reached the connector as a literal ``{'env': ...}`` table.
-    Two now have a refusal at the factory seam: ``headers`` in ``_reject_envref_headers`` (BACKLOG
-    #1649), and ``odbc_params`` in ``_reject_envref_odbc_params``, which tests the raw-dict spelling
-    as well as an ``EnvRef`` (BACKLOG #1806). The third, any ``list[str]`` setting, was answered by
-    nothing at all and is not re-measured here. None of them is #1809 -- this check judges TYPES --
+    All three now have a refusal at the factory seam: ``headers`` in ``_reject_envref_headers``
+    (BACKLOG #1649), ``odbc_params`` in ``_reject_envref_odbc_params``, which tests the raw-dict
+    spelling as well as an ``EnvRef`` (BACKLOG #1806), and a list-valued setting in
+    ``_reject_envref_in_lists`` (BACKLOG #1820). None of them is #1809 -- this check judges TYPES --
     so a hole that remains needs its own row, not a patch here."""
     if isinstance(value, EnvRef) or _is_env_marker(value):
         return True

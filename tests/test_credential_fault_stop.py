@@ -26,7 +26,7 @@ DEST = "OB_REMOTE"
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "cred.db")
     yield s
     await s.close()

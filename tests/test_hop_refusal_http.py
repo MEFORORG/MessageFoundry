@@ -95,6 +95,9 @@ def _build(
             # tests that build a prod-PHI verified remote hop and expect SUCCESS attest revocation here
             # so the (distinct) cleartext #200 assertions stay the subject under test.
             tls_revocation_attested=revocation_attested,
+            tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
+            if revocation_attested
+            else None,
         )
     )
 
@@ -306,11 +309,23 @@ def test_fhir_lookup_loopback_read_allowed(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_fhir_lookup_attested_read_allowed_on_prod(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Driven through the ``FhirLookup()`` factory, the attestation's supported surface (owner ruling
+    2026-09-24), for the same reason as the cleartext test below: the executor validates the pair, so
+    a hand-written flag with no reason is refused rather than honoured."""
+    from messagefoundry.config import wiring
+    from messagefoundry.config.wiring import FhirLookup, Registry
+
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    reg = Registry()
+    monkeypatch.setattr(wiring, "_active", reg)
+    FhirLookup(
+        "L",
+        url="http://fhir.example.org/fhir",
+        tls_hop_attested=True,
+        tls_hop_attested_reason="TLS terminates at the site's FHIR gateway",
+    )
     with active_hop_posture(_PROD):
-        ex = FhirLookupExecutor(
-            {"L": {"url": "http://fhir.example.org/fhir", "tls_hop_attested": True}}
-        )
+        ex = FhirLookupExecutor({"L": reg.fhir_lookups["L"].settings})
     assert ex.connections == frozenset({"L"})
 
 

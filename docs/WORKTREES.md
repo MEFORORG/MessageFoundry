@@ -508,9 +508,17 @@ scripts\coord\claim-reconcile.ps1        # did the BRANCH land?  -Apply releases
 scripts\coord\claim-adjudicate.ps1       # is the KEY protected on origin/main?  never writes
 ```
 
-**`claim-reconcile.ps1` asks about the branch**, on four arms: containment in `origin/main`, a merged
-PR at this exact tip, blob-identity against the landing commit, and the branch being gone everywhere.
+**`claim-reconcile.ps1` asks about the branch**. For a holder that is gone it has four arms:
+containment in `origin/main`, a merged PR at this exact tip, blob-identity against the landing
+commit, and the branch being gone everywhere.
 Where it proves a landing, `-Apply` releases through `claim.ps1` and the ledger records it.
+
+**It also reads a claim whose holder still EXISTS (BACKLOG #1784).** That is the commoner stale claim.
+A session ends when its pull request opens, and nothing reads the merge. The conditions for releasing
+one, and what that arm cannot see, are in the script's own header. They are not copied here.
+
+The sweep touches only `claims/`, where the `claim.ps1` locks live. It never reads or writes `alloc/`.
+Those are `alloc.ps1` provenance records. The ledger gate reads them, and they are never released.
 
 **`claim-adjudicate.ps1` asks about the key**, because a branch is not the unit a claim is about.
 Measured 2026-08-18 on the live registry: 20 stranded claims sat on **six** branches, one carrying

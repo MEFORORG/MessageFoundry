@@ -6,10 +6,13 @@ Each test pins one fix from the security review so it can't silently regress:
   H1  PHI summaries are redacted for callers lacking messages:view_summary
   H2  AD requires LDAPS unless an explicit insecure override is set
   M2  must_change_password is enforced server-side (not merely advisory)
-  M3  the bootstrap one-time password goes to a restricted file, never the log
   M4  an AD login cannot adopt/overwrite a like-named local account
   M5  the last enabled administrator cannot be stripped of the admin role
   M6  /me/password requires the current password (defeats session-only takeover)
+
+M3 pinned that the first-run bootstrap password went to a restricted file and never the log. ADR
+0183 Amendment A, Wave 2, retired that account, so no such password or file exists and M3 went
+with it. ``tests/test_start_without_an_administrator.py`` pins that no file is written.
 """
 
 from __future__ import annotations
@@ -28,12 +31,12 @@ from pydantic import ValidationError
 from starlette.datastructures import Address
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import _emit_bootstrap_admin, _session_reaper
+from messagefoundry.api.app import _session_reaper
 from messagefoundry.auth import Role, hash_password
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError
-from messagefoundry.auth.service import AuthService, BootstrapAdmin
-from messagefoundry.config.settings import AuthSettings, StoreSettings
+from messagefoundry.auth.service import AuthService
+from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
 from tests._admin_account import ADMIN_USERNAME, create_admin
@@ -226,54 +229,6 @@ async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None
         tok = str(confirmed.json()["token"])  # the confirm re-keyed the session (ASVS 7.2.4)
         # Confirming satisfies THIS session's factor, so the estate is reachable again.
         assert (await c.get("/users", headers=_auth(tok))).status_code == 200
-
-
-# --- M3: bootstrap one-time password goes to a file, not the log -------------
-
-
-def test_bootstrap_password_written_to_file_not_log(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    store_settings = StoreSettings(path=str(tmp_path / "mf.db"))
-    boot = BootstrapAdmin(username="admin", password="S3cret-One-Time-Value")
-    with caplog.at_level(logging.WARNING):
-        _emit_bootstrap_admin(boot, store_settings)
-    secret_file = tmp_path / "bootstrap-admin.txt"
-    assert secret_file.exists()
-    assert "S3cret-One-Time-Value" in secret_file.read_text()
-    # the credential must never appear in the (NSSM-captured) log
-    assert "S3cret-One-Time-Value" not in caplog.text
-    assert "bootstrap-admin.txt" in caplog.text
-
-
-def test_bootstrap_file_and_log_state_the_expiry_deadline(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # ASVS 6.4.5 arm 1: the renewal deadline ships WITH the credential — the file body and the log line
-    # both carry the ISO instant, so "claim it before <ISO>" is not an out-of-band assumption.
-    import datetime
-
-    exp = 1_800_000_000.0
-    iso = datetime.datetime.fromtimestamp(exp, tz=datetime.UTC).isoformat()
-    store_settings = StoreSettings(path=str(tmp_path / "mf.db"))
-    boot = BootstrapAdmin(username="admin", password="one-time-value", expires_at=exp)
-    with caplog.at_level(logging.WARNING):
-        _emit_bootstrap_admin(boot, store_settings)
-    body = (tmp_path / "bootstrap-admin.txt").read_text()
-    assert iso in body and "expires" in body
-    assert iso in caplog.text  # the deadline is not a secret — safe to log
-    assert "one-time-value" not in caplog.text  # ...the password still is not
-
-
-def test_bootstrap_states_no_deadline_when_expiry_is_off(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # expires_at=None (bootstrap_expiry_hours=0) → no deadline line; byte-compatible with pre-6.4.5.
-    store_settings = StoreSettings(path=str(tmp_path / "mf.db"))
-    boot = BootstrapAdmin(username="admin", password="one-time-value", expires_at=None)
-    with caplog.at_level(logging.WARNING):
-        _emit_bootstrap_admin(boot, store_settings)
-    assert "expires" not in (tmp_path / "bootstrap-admin.txt").read_text()
 
 
 # --- M4: AD login cannot adopt a like-named local account --------------------
@@ -495,47 +450,6 @@ async def test_unknown_user_login_runs_password_verify(
     out = await service.login("ghost-user-does-not-exist", "whatever")
     assert not out.ok
     assert calls["n"] >= 1  # the dummy verify ran for the unknown user
-
-
-# --- #1141 (ASVS 6.4.5): the reminder gate must ask about BOTH bounds, not one -------------------
-
-
-@pytest.mark.parametrize(
-    ("bootstrap_hours", "credential_hours", "expected", "why"),
-    [
-        (
-            0,
-            0,
-            False,
-            "neither bound configured -- nothing can end the credential, so nothing to warn",
-        ),
-        (72, 0, True, "WP-3 account retirement only"),
-        (0, 72, True, "ASVS 6.4.1 CREDENTIAL expiry only -- THE ROW THAT WAS SILENTLY DEAD"),
-        (72, 72, True, "both bounds, the shipped default"),
-    ],
-)
-async def test_bootstrap_deadline_configured_covers_both_bounds(
-    engine: Engine, bootstrap_hours: int, credential_hours: int, expected: bool, why: str
-) -> None:
-    """The API lifespan gates the ASVS 6.4.5 reminder task on this, and the task is the ONLY consumer
-    of ``bootstrap_expiry_warning``. That method warns on the EARLIER of two bounds, so a gate asking
-    about one of them silently deletes the warning arm for the configuration where only the other is
-    set -- the third row. BACKLOG #1245 corrected the two deadline computations in auth/service.py
-    and never reached the gate deciding whether they ever run.
-
-    ASYMMETRIC BY CONSTRUCTION: a gate that simply returned True would pass three rows and fail the
-    first, and one that kept the old single-bound test passes three and fails the third. No single
-    wrong answer satisfies the table.
-    """
-    service = await _service(
-        engine,
-        AuthSettings(
-            require_mfa=False,
-            bootstrap_expiry_hours=bootstrap_hours,
-            initial_password_expiry_hours=credential_hours,
-        ),
-    )
-    assert service.bootstrap_deadline_configured is expected, why
 
 
 # --- #1167 (ASVS 11.2.4): the recovery-code walk must cost the same whatever is presented --------

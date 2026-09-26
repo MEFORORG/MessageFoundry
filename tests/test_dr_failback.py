@@ -60,7 +60,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _wait(predicate, timeout: float = 10.0) -> None:  # type: ignore[no-untyped-def]
+async def _wait(predicate, timeout: float = 10.0) -> None:
     elapsed = 0.0
     while not await predicate():
         await asyncio.sleep(0.05)

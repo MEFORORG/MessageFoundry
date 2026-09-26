@@ -28,6 +28,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_admin
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 NEW_USER = {"username": "newbie", "password": PW, "roles": ["viewer"]}
@@ -75,6 +76,7 @@ async def test_disabled_by_default_is_a_noop() -> None:
         service = AuthService(store, AuthSettings(), security_notifier=notifier)  # default off
         await service.initialize()
         token, _ = await _enabled_admin(service, client="10.1.1.1")
+        notifier.events.clear()  # setup's ACCOUNT_CREATED notice (BACKLOG #315), not under test
         # Even a wildly different address is a no-op while the feature is off.
         assert await service.flag_new_client_ip(token, "10.9.9.9", path="/users") is False
         assert notifier.events == []
@@ -91,6 +93,7 @@ async def test_new_ip_flags_audits_and_notifies() -> None:
         )
         await service.initialize()
         token, _ = await _enabled_admin(service, client="10.1.1.1")
+        notifier.events.clear()  # setup's ACCOUNT_CREATED notice (BACKLOG #315), not under test
         # Same address → not new; no side effects.
         assert await service.flag_new_client_ip(token, "10.1.1.1", path="/users") is False
         assert notifier.events == []
@@ -220,9 +223,8 @@ async def test_verify_mfa_reanchors_session_to_the_new_ip(
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
-        boot = await service.initialize()
-        assert boot is not None
-        out = await service.login("admin", boot.password, client="10.1.1.1")
+        admin = await create_admin(service)
+        out = await service.login(admin.username, admin.password, client="10.1.1.1")
         assert out.ok and out.identity is not None and out.token is not None
         identity, token = out.identity, out.token
         enroll = await service.begin_mfa_enrollment(identity)

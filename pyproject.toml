@@ -107,7 +107,8 @@ dependencies = [
 Homepage = "https://messagefoundry.org/"
 Documentation = "https://messagefoundry.org/"
 Repository = "https://github.com/MEFORORG/MessageFoundry"
-Issues = "https://github.com/MEFORORG/MessageFoundry/issues"
+# Contributing, not Issues: CONTRIBUTING.md states the routes (BACKLOG #1755).
+Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTING.md"
 
 [project.optional-dependencies]
 # The standalone PySide6 test HARNESS (harness/ — synthetic send/receive/load/failover GUI). The
@@ -473,7 +474,12 @@ extend-exclude = ["docs/benchmarks/results"]
 # (SIM), pyupgrade (UP), and import sorting (I). Adopted as a one-shot sweep: the safe backlog is
 # auto-fixed and the rest grandfathered with per-line `# noqa` so the required gate is green from a
 # clean baseline and NEW code must comply (the rubric's "blocking from a clean baseline" intent).
-extend-select = ["B", "C4", "SIM", "UP", "I"]
+#
+# RUF006 (BACKLOG #1093, CWE-772/404): a task created and not referenced can be garbage-collected
+# mid-flight, because the event loop holds tasks weakly. It is at least one resource-release rule
+# ruff already ships that the families above do not select. Adopted with its single finding fixed
+# (store/base.py `_salvage_late_borrow`), so it gates from a clean baseline.
+extend-select = ["B", "C4", "SIM", "UP", "I", "RUF006"]
 
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's dependency-injection idiom calls Depends()/Query()/etc. in argument defaults -- the
@@ -494,6 +500,33 @@ extend-immutable-calls = [
 [tool.mypy]
 python_version = "3.14"
 strict = true
+# Data, not modules: the config loader execs these with injected globals, and one has a hyphenated name.
+exclude = ['^tests/fixtures/']
+
+# BACKLOG #1799. CI type-checks tests/ with `mypy --explicit-package-bases tests` (the ci.yml step says
+# why the scope is what it is). THE FLAG IS ON THE COMMAND LINE, NOT HERE, ON PURPOSE. tests/ has no
+# __init__.py and its files import one another package-qualified, so without the flag mypy maps each
+# file to a bare name AND to `tests.<name>` and stops at "Source file found twice". Set globally, the
+# same flag breaks the bare `_helper` imports a config directory uses (CLAUDE.md section 4), which the
+# advisory mypy pass in `messagefoundry check` relies on.
+#
+# THE PROFILE. `strict` stays on, and exactly these six settings are relaxed. The four annotation
+# rules and disallow_any_generics go because a pytest test is idiomatically unannotated
+# (`def test_x(tmp_path):`), and requiring annotations was ~1,500 edits that found no defect.
+# warn_return_any is the one BEHAVIOURAL relaxation: a typed test helper may return Any (a
+# `json.loads` result, say) without a report. check_untyped_defs keeps every body checked, which is
+# where the defects were: a wrong keyword, bytes where str was annotated, an assert that could not
+# hold. warn_unused_ignores and the rest of strict still bind. tests/test_mypy_tests_scope.py pins
+# this key set.
+[[tool.mypy.overrides]]
+module = ["tests", "tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_untyped_decorators = false
+disallow_any_generics = false
+warn_return_any = false
+check_untyped_defs = true
 
 # Third-party libraries that ship no type stubs / py.typed marker.
 [[tool.mypy.overrides]]
@@ -501,5 +534,212 @@ strict = true
 # installed (the CI `test` leg, since ADR 0180's assertion needs it) mypy still type-checks them for
 # real -- ignore_missing_imports only suppresses the not-found error on an install without the extra,
 # so a contributor running mypy on a base install is not reddened by a lazy import they never execute.
-module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*", "psutil", "psutil.*", "urllib3", "urllib3.*", "requests", "requests.*"]
+module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*", "psutil", "psutil.*", "urllib3", "urllib3.*", "requests", "requests.*", "yaml", "yaml.*"]
+# yaml (PyYAML) ships no stubs and types-PyYAML is not a dependency; only tests/ imports it.
 ignore_missing_imports = true
+
+# Names tests/ imports BARE, which mypy cannot resolve. pytest's default rootdir import mode puts
+# tests/ itself on sys.path, so `from _totp_clock import ...` works at runtime; mypy maps the same file
+# to `tests._totp_clock` and cannot also give it the bare name (that is the "found twice" error above).
+# The scripts names are modules a test loads after putting a scripts/ directory on sys.path, and the
+# two `re._*` names are private stdlib modules typeshed does not ship. Each resolves to Any, so a call
+# into one is unchecked. The cure is the package-qualified import; a NEW bare import fails the gate.
+# IF `mypy tests` says import-not-found for a tests/ helper: write `from tests._x import ...` instead.
+[[tool.mypy.overrides]]
+module = ["_ast_sites", "_bash_resolver", "_cipher_registry", "_docs_toml", "_extras_probe", "_failover_load_support", "_fhir_fixtures", "_ingress_pace_probe", "_mfa_grant", "_pace_probe", "_phi_log_capture", "_session_mail_harness", "_totp_clock", "adr0075_batch_harness", "test_gate_installed_parity", "test_install_gate_wiring", "anchor_provenance", "anchor_report", "forbidden_members", "scan_forbidden", "scorecard", "stale_repo_slug_check", "re._constants", "re._parser"]
+ignore_missing_imports = true
+
+# THE RATCHET (BACKLOG #1799). These test modules carried type errors when tests/ entered the mypy
+# gate, and they are NOT type-checked at all: ignore_errors drops every error in the module, so new
+# code written into one of them is unchecked too. That is the cost of a module-level exemption, and
+# it is why the list may only shrink. Measured 2026-09-25 under the profile above, --platform linux:
+# 1,464 errors across these 177 modules (arg-type 503, index 281, unused-ignore 227, attr-defined 200,
+# the rest under 70 each). The list is the UNION of the linux and win32 passes, so it does not depend
+# on which platform ran it. The dominant shapes: indexing an Optional fetch result with no
+# `is not None` check, and a fake passed where a Protocol is expected.
+# RULES: never ADD a module here -- a new test module must pass. REMOVE one when you fix it, in the
+# same change, and lower the ceiling in tests/test_mypy_tests_scope.py with it. That test fails on a
+# list longer than its ceiling, on a name that no longer resolves to a file (a rename would hand the
+# next file to take the name a free pass), and on an unsorted or duplicated list. Nothing detects a
+# module that has become clean; that removal is by hand.
+[[tool.mypy.overrides]]
+module = [
+    "tests._dicom_sample",
+    "tests.test_accepts_seam",
+    "tests.test_actions",
+    "tests.test_ad_group_scope",
+    "tests.test_adr0071_crossing_count",
+    "tests.test_adr0071_dispatch_wiring_sqlserver",
+    "tests.test_adr0071_fusion_wiring",
+    "tests.test_adr0075_batch_backend_gate",
+    "tests.test_adr0075_batch_error_attribution",
+    "tests.test_adr0075_batch_golden_sql",
+    "tests.test_adr0075_rt_count_gate",
+    "tests.test_adr0157_demote_teardown",
+    "tests.test_alert_failover",
+    "tests.test_alert_state",
+    "tests.test_anon_parity",
+    "tests.test_api",
+    "tests.test_api_auth",
+    "tests.test_api_cluster_stepdown",
+    "tests.test_api_request_timeout",
+    "tests.test_api_tls",
+    "tests.test_asvs_phase0",
+    "tests.test_attachment_substrate",
+    "tests.test_audit_integrity",
+    "tests.test_auth_hardening",
+    "tests.test_auth_service",
+    "tests.test_backlog1548_writer_txn_cancel_unwind",
+    "tests.test_backup_runner",
+    "tests.test_batch_claim_worker",
+    "tests.test_bounded_egress_reads",
+    "tests.test_cert_cli",
+    "tests.test_cert_expiry",
+    "tests.test_checks",
+    "tests.test_ci_step_margin",
+    "tests.test_cli",
+    "tests.test_client_network_allowlist",
+    "tests.test_cluster",
+    "tests.test_cluster_graph_gating",
+    "tests.test_cluster_lease",
+    "tests.test_codex_bridge",
+    "tests.test_connection_resilience",
+    "tests.test_connection_scheduler",
+    "tests.test_connscale_compare",
+    "tests.test_connscale_config",
+    "tests.test_connscale_cpu_probe",
+    "tests.test_connscale_driver",
+    "tests.test_connscale_empty_claims_per_msg",
+    "tests.test_connscale_fuse",
+    "tests.test_connscale_postgres",
+    "tests.test_connscale_reload_window",
+    "tests.test_connscale_report",
+    "tests.test_coord_alloc_floor",
+    "tests.test_csv_formula_consistency",
+    "tests.test_database_cursor_close",
+    "tests.test_db_lookup",
+    "tests.test_db_lookup_live_runner",
+    "tests.test_delivery_document_reattach",
+    "tests.test_delivery_phase_timing",
+    "tests.test_dicom_scu",
+    "tests.test_docs_security_pathways",
+    "tests.test_dryrun",
+    "tests.test_dryrun_snapshot_parity",
+    "tests.test_ed_documents_e2e",
+    "tests.test_edit_resend",
+    "tests.test_email_destination",
+    "tests.test_estate_driver",
+    "tests.test_fhir_lookup",
+    "tests.test_fifo_index_migration",
+    "tests.test_group_commit",
+    "tests.test_harness_scenarios",
+    "tests.test_hl7_core_features",
+    "tests.test_hl7_raw_separators",
+    "tests.test_hop_refusal_http",
+    "tests.test_hop_refusal_rawtcp",
+    "tests.test_hop_refusal_revocation",
+    "tests.test_hop_refusal_wiring",
+    "tests.test_host_metrics",
+    "tests.test_http_auth",
+    "tests.test_impact",
+    "tests.test_inbound_http_intake_auth",
+    "tests.test_inbound_http_source",
+    "tests.test_inbound_http_sync_reply",
+    "tests.test_ingress_document_detach",
+    "tests.test_inline_fast_path",
+    "tests.test_install_gate_records_the_install",
+    "tests.test_leader_tasks",
+    "tests.test_lens_fanout",
+    "tests.test_log_write_guard",
+    "tests.test_mfa_access_gate",
+    "tests.test_mllp_tls",
+    "tests.test_nested_env_ref_headers_refusal",
+    "tests.test_oidc_max_age_auth_time",
+    "tests.test_outbound_batch",
+    "tests.test_outbound_forward_proxy",
+    "tests.test_outbound_signing",
+    "tests.test_outbound_simulate",
+    "tests.test_pool_warm",
+    "tests.test_pooled_rider",
+    "tests.test_pooled_runner",
+    "tests.test_postgres_store",
+    "tests.test_reference_sets",
+    "tests.test_reingress",
+    "tests.test_replay_purged_body",
+    "tests.test_resend",
+    "tests.test_response_capture",
+    "tests.test_response_headers_capture",
+    "tests.test_rest_transport",
+    "tests.test_restore_verify",
+    "tests.test_retention",
+    "tests.test_retry_cap_default",
+    "tests.test_sandbox_codec",
+    "tests.test_search_presets_api",
+    "tests.test_secret_rotation",
+    "tests.test_secret_rotation_watcher",
+    "tests.test_security_cli",
+    "tests.test_security_posture_defaults",
+    "tests.test_send_pacing",
+    "tests.test_service_cli",
+    "tests.test_service_control",
+    "tests.test_service_control_outcome",
+    "tests.test_session_rotation_primitive",
+    "tests.test_session_rotation_wiring",
+    "tests.test_settings",
+    "tests.test_settings_unknown_kwargs",
+    "tests.test_shard_recovery_engine",
+    "tests.test_shardcert_config",
+    "tests.test_shardcert_ladder",
+    "tests.test_shardcert_ladder_two_box",
+    "tests.test_smart_backend",
+    "tests.test_soap_body_secrets",
+    "tests.test_soap_wssecurity",
+    "tests.test_sqlserver_pool_executor",
+    "tests.test_sqlserver_store",
+    "tests.test_sqlserver_sync_handoff_offline",
+    "tests.test_staged_pipeline",
+    "tests.test_startup_attestation",
+    "tests.test_startup_fault_isolation",
+    "tests.test_store",
+    "tests.test_store_aad_binding",
+    "tests.test_store_encryption",
+    "tests.test_store_file_hardening",
+    "tests.test_store_once_deliver_many",
+    "tests.test_store_pool_acquire_timeout",
+    "tests.test_store_read_pool",
+    "tests.test_store_ssl",
+    "tests.test_supervisor",
+    "tests.test_sync_reply_cross_registry",
+    "tests.test_sync_reply_resolver",
+    "tests.test_sync_reply_seam",
+    "tests.test_synchronous_baseline",
+    "tests.test_task_resilience",
+    "tests.test_tee_mefor_api",
+    "tests.test_tee_relay",
+    "tests.test_timer_source",
+    "tests.test_tls_cipher_assertion_sites",
+    "tests.test_tls_policy",
+    "tests.test_tls_trust_anchor",
+    "tests.test_transform_concurrency",
+    "tests.test_transform_offloop",
+    "tests.test_transform_state",
+    "tests.test_tray_branding",
+    "tests.test_tray_config",
+    "tests.test_trust_anchors",
+    "tests.test_txn_per_message_cost_model",
+    "tests.test_update_check",
+    "tests.test_uploads",
+    "tests.test_uploads_cross_process_quota",
+    "tests.test_verify",
+    "tests.test_webauthn",
+    "tests.test_webauthn_store",
+    "tests.test_webconsole_seam_snapshot",
+    "tests.test_wiring",
+    "tests.test_wiring_engine",
+    "tests.test_wiring_reload",
+    "tests.test_wiring_serve",
+    "tests.test_ws_stats_revalidation",
+    "tests.test_x12_pipeline",
+    "tests.test_x12_rte",
+]
+ignore_errors = true

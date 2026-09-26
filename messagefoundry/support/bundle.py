@@ -30,7 +30,6 @@ answer here: the content is already known to be arbitrary, so no pattern set can
 
 from __future__ import annotations
 
-import asyncio
 import io
 import json
 import time
@@ -40,6 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry import __version__
+from messagefoundry.last_resort import run_guarded
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings, StoreBackend
@@ -145,7 +145,7 @@ def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
         return {"engine": engine.model_dump(), "db": None}
 
     try:
-        db_info = asyncio.run(_db_info(settings))
+        db_info = run_guarded(_db_info(settings))
     except Exception as exc:  # a missing/locked DB must not abort the bundle
         # No driver text: a store failure routinely quotes the whole DSN, host and login (#1571).
         return {

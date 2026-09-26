@@ -153,10 +153,12 @@ class EmailDestination(DestinationConnector):
             ):
                 raise ValueError(
                     "Email destination use_tls=false sends the message (and any credentials) over "
-                    f"cleartext SMTP; refused unless {INSECURE_TLS_ESCAPE_ENV} is set "
-                    "(dev/trusted-network only), or the connection sets tls_hop_attested=true (the hop "
-                    "IS secure by other means) or cleartext_accepted=true with a cleartext_reason (the "
-                    "hop is NOT secure and that is accepted) — use STARTTLS (the default)."
+                    "cleartext SMTP; refused unless the connection sets tls_hop_attested=true with a "
+                    "tls_hop_attested_reason (the hop IS secure by other means), or "
+                    "cleartext_accepted=true with a cleartext_reason (the hop is NOT secure and that "
+                    "is accepted), or "
+                    f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
+                    "(dev/trusted-network only) — use STARTTLS (the default)."
                 )
             # Credentials over an un-encrypted channel are never allowed, even with the escape: a
             # cleartext AUTH puts the password on the wire (the refuse_cleartext_credentials rule).
@@ -266,6 +268,7 @@ class EmailDestination(DestinationConnector):
                 cell="Email destination (verified SMTP TLS, no revocation check)",
                 description="delivers over verified SMTP TLS but performs no certificate revocation checking",
                 attested=config.tls_revocation_attested,
+                attested_reason=config.tls_revocation_attested_reason,
                 context=self._tls_context,
             ).enforce_construction()
 

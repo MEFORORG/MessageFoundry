@@ -27,10 +27,13 @@ import json
 import sys
 from pathlib import Path
 
+from harness.frame_cap import max_frame_bytes_arg
 from harness.reconcile.compare import DEFAULT_KEY, ReconcileResult, load_messages, reconcile
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
 from messagefoundry.config.models import AckMode
+from messagefoundry.console_streams import harden_console_streams
+from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES
 
 
 def _parse_field(spec: str) -> tuple[str, int]:
@@ -58,6 +61,7 @@ async def _run_capture(args: argparse.Namespace) -> int:
         host=args.host,
         ports=tuple(args.port),
         ack_mode=AckMode(args.ack_mode),
+        max_frame_bytes=args.max_frame_bytes,
     )
     await sink.start()
     print(
@@ -72,7 +76,9 @@ async def _run_capture(args: argparse.Namespace) -> int:
     finally:
         await sink.stop()
         print(
-            f"captured {sink.captured} message(s) ({sink.unparseable} unparseable)", file=sys.stderr
+            f"captured {sink.captured} message(s) ({sink.unparseable} unparseable, "
+            f"{sink.refused} refused over the frame cap)",
+            file=sys.stderr,
         )
     return 0
 
@@ -95,6 +101,11 @@ def _run_compare(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Both subcommands print RUNTIME values no source scan can see: `capture` echoes the operator's
+    # --out path, and `compare` prints render_text(), whose result line always carries a check or a
+    # cross mark cp1252 cannot encode. Without this, a redirected cp1252 stdout ABORTS `compare`
+    # and stderr turns a non-cp1252 path into backslash escapes (BACKLOG #1875). UTF-8 keeps both.
+    harden_console_streams(encoding="utf-8")
     parser = argparse.ArgumentParser(prog="harness.reconcile", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -109,6 +120,14 @@ def main(argv: list[str] | None = None) -> int:
         default="original",
         choices=[m.value for m in AckMode],
         help="ACK mode to send",
+    )
+    cap.add_argument(
+        "--max-frame-bytes",
+        type=max_frame_bytes_arg,
+        default=DEFAULT_MAX_FRAME_BYTES,
+        help="largest MLLP frame accepted; a bigger one drops its connection. 0 turns the cap off, "
+        "as on the engine's MLLP source; a negative value is refused "
+        "(default: %(default)s, the engine's MLLP default)",
     )
 
     cmp = sub.add_parser(

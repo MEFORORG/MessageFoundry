@@ -42,8 +42,9 @@ discriminator:
   :class:`TruncatedResponseError` is raised for by the length comparison.
 * **chunked** (``Transfer-Encoding: chunked``) -- ``length`` is ``None`` throughout, because the
   framing is in the stream rather than a header. A chunked reply declares no length, so it must
-  never be failed for lacking one. ``http.client`` catches a *truncated* chunked stream itself by
-  raising :class:`http.client.IncompleteRead`, which is translated here into the same error.
+  never be failed for lacking one. A *truncated* chunked stream is caught by the chunk decoder
+  below and raised as the same error. For any other reader, ``http.client``'s
+  :class:`~http.client.IncompleteRead` is translated into it.
 * **EOF-delimited** (no ``Content-Length``, not chunked, ``Connection: close``) -- ``length`` is
   also ``None``. The close *is* the framing, so a short body is the peer's whole reply and is
   legitimate.
@@ -69,12 +70,27 @@ and 5 read whichever came first, and ``Content-Length: 1_0`` reads ten bytes. Ea
 hand a wrong body to the caller as the peer's answer, with no truncation for the checks above to
 see.
 :func:`reply_framing_fault` refuses them before any body byte is read, under RFC 9112 section 6.
-See its docstring for the shapes and for why each one is refused.
+See its docstring for the shapes and for why each one is refused. It also refuses a header block
+the HTTP reader did not parse cleanly, because a framing header after a malformed line is lost.
+
+**A chunked body is decoded here, not by** ``http.client`` (BACKLOG #1979). ``http.client`` parses
+each chunk-size line with ``int(line, 16)``, so ``-5``, ``1_0``, ``+5``, ``0x5`` and `` 5 `` all
+parse. A negative size reaches ``fp.read(-5)``, which reads to the end of the stream, so the
+``limit + 1`` argument stopped bounding what was buffered. It also tosses the two bytes after each
+chunk's data without looking at them. :func:`read_reply_body` reads a chunked
+``http.client.HTTPResponse`` itself, from the response's underlying stream, under the RFC 9112
+section 7.1 grammar, and stops at the caller's byte count. Every bounded read here goes through it,
+and so do the OIDC token and JWKS reads.
 """
 
 from __future__ import annotations
 
+import email.message
+import email.parser
+import functools
 import http.client
+import logging
+import re
 from typing import Protocol
 
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -90,8 +106,11 @@ __all__ = [
     "drain_bounded",
     "read_bounded",
     "read_bounded_text",
+    "read_reply_body",
     "reply_framing_fault",
 ]
+
+logger = logging.getLogger(__name__)
 
 #: Ceiling on any response body the engine reads back off an egress hop.
 #:
@@ -167,12 +186,26 @@ class AmbiguousFramingError(EgressReplyError):
     length, and ``Transfer-Encoding`` on HTTP/1.0. There, a correct read depends on which field
     ``http.client`` happens to consult first. The shapes are listed on :func:`reply_framing_fault`.
 
+    Also raised part-way through a chunked body, at the first chunk-size line, chunk terminator or
+    trailer line that breaks the RFC 9112 section 7.1 grammar. By then some bytes have been read,
+    but none past the caller's byte count, and none is returned.
+
     A :class:`~messagefoundry.transports.base.DeliveryError`, therefore transient, like its two
     siblings: the delivery worker records it on the row, retries under the connection's policy and
     dead-letters it when the policy runs out. It is not a permanent
     :class:`~messagefoundry.transports.base.NegativeAckError`, because a misframed reply may come
     from an intermediary on one path rather than from the partner itself.
     """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        #: The fixed reason text, never a peer byte, so a caller can word its own message.
+        self.reason = reason
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # BaseException pickles and copies as cls(*self.args), and args holds only the message, so
+        # the keyword-only reason must travel with the constructor or the rebuild raises TypeError.
+        return (functools.partial(type(self), reason=self.reason), self.args, self.__dict__)
 
 
 class _SupportsRead(Protocol):
@@ -185,6 +218,12 @@ class _SupportsRead(Protocol):
     without naming it."""
 
     def read(self, amt: int, /) -> bytes: ...
+
+
+class _SupportsReadline(_SupportsRead, Protocol):
+    """The buffered stream under an ``http.client.HTTPResponse``, as the chunk decoder uses it."""
+
+    def readline(self, size: int, /) -> bytes: ...
 
 
 def read_bounded(
@@ -209,11 +248,7 @@ def read_bounded(
     """
     fault = reply_framing_fault(reader)
     if fault is not None:
-        # The reason is a closed-set string from reply_framing_fault, never a header value, so the
-        # message carries no peer-supplied bytes.
-        raise AmbiguousFramingError(
-            f"{connector} framed its response body ambiguously ({fault}); refusing to read it"
-        )
+        raise _framing_error(connector, fault)
     body = _read_capped(reader, limit, connector)
     # AFTER the ceiling check inside _read_capped, never before: an over-cap reply also leaves bytes
     # outstanding (the read stopped at limit + 1 by design), so testing completeness first would
@@ -251,17 +286,46 @@ def drain_bounded(
     It does not apply :func:`reply_framing_fault` either, for the same reason. A misframed reply
     changes WHICH bytes are read, and a drain uses none of them. ``urllib`` closes the connection
     after each ``open()``, so no later reply shares the stream a misread could desynchronise. The
-    byte bound still applies to whatever the header framing selects. It does not reach a chunk-size
-    line inside a chunked body, which :func:`reply_framing_fault` never sees either.
+    byte bound still applies to whatever the header framing selects.
+
+    A chunked body is decoded under the strict grammar here too, because that decoder is what keeps
+    a negative chunk size inside the byte bound (BACKLOG #1979). A drain stops at the first line it
+    cannot parse and does not raise. It logs a WARNING instead, so the stop is recorded rather than
+    silent. The WARNING carries a fixed reason, the request method and the status code, and nothing
+    else. It leaves ``connector`` out on purpose. Callers build it from configuration, at least a
+    redacted URL or a webhook host, and this log line should not depend on each caller's redaction
+    being complete. The cost is that the line does not name the hop. The exceptions this module
+    raises still carry ``connector``, and so rely on the caller's redaction.
     """
     try:
         _read_capped(reader, limit, connector)
     except TruncatedResponseError:
         return
+    except AmbiguousFramingError as exc:
+        method = getattr(reader, "_method", None)
+        status = getattr(reader, "status", None)
+        logger.warning(
+            "The reply to a %s request had a malformed body (status %s, %s); the drain stopped "
+            "there, and the call is not failed because the body is discarded",
+            method if method in _LOGGED_METHODS else "HTTP",
+            status if isinstance(status, int) else "unknown",
+            exc.reason,
+        )
+
+
+#: The request methods the drain WARNING may name. Anything else is logged as "HTTP", so the line
+#: holds only text from this module. HEAD is absent because a HEAD reply is never decoded, so it
+#: cannot reach the WARNING.
+_LOGGED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 
 
 #: Statuses whose reply has no body (RFC 9112 section 6.3, rule 1). See reply_framing_fault.
 _BODYLESS_STATUSES = frozenset({204, 304})
+
+
+def _status_has_no_body(status: int) -> bool:
+    """RFC 9112 section 6.3, rule 1: a 1xx, 204 or 304 reply has no body, whatever it declares."""
+    return status in _BODYLESS_STATUSES or 100 <= status < 200
 
 
 def reply_framing_fault(reader: object) -> str | None:
@@ -270,6 +334,21 @@ def reply_framing_fault(reader: object) -> str | None:
     RFC 9112 section 6 allows one reading of a reply's length, and a recipient that picks another is
     how a smuggled or split response gets through. Refused, at least:
 
+    * A header block the HTTP reader did not parse cleanly. ``http.client`` hands the header lines
+      to the email parser, which stops at the first line that is not a field line, records a
+      defect, and keeps every later line as unparsed payload. So a ``Content-Length`` or
+      ``Transfer-Encoding`` after a malformed line, or after a name with whitespace before its
+      colon, is silently lost, and the body is framed by what came before it or read to close.
+      Under a ``multipart/*`` or ``message/*`` type the lost lines are built into a preamble,
+      parts, an epilogue or a nested message instead, and are refused all the same. Also refused:
+      an mbox ``From `` line, which that parser takes silently, a field name that is not an RFC
+      9110 token, and a field value holding a control character. This check runs first, on every
+      status and on ``HEAD``. How it decides is on :func:`_header_block_fault`.
+      **Known to be missed, at least:** a bare CR followed by text that reads as a field line.
+      The email parser splits the line there and records nothing, so that text counts as a header
+      of its own, and the parse tree looks clean. Catching it needs the raw header bytes, and
+      ``http.client`` discards them before this function runs. Other shapes that leave no trace in
+      the parse tree would be missed the same way.
     * ``Transfer-Encoding`` on an HTTP/1.0 reply. Section 6.1 says the framing is then faulty.
     * ``Transfer-Encoding`` beside ``Content-Length``. Section 6.1 calls this a possible smuggling
       attempt that "ought to be handled as an error".
@@ -306,6 +385,10 @@ def reply_framing_fault(reader: object) -> str | None:
     get_all = getattr(headers, "get_all", None)
     if not callable(get_all):
         return None
+    if isinstance(headers, email.message.Message):
+        header_fault = _header_block_fault(headers)
+        if header_fault is not None:
+            return header_fault
     # A private attribute, read defensively: HTTPResponse keeps the request method only there, and
     # HTTPError delegates attribute reads to the response it wraps.
     if getattr(reader, "_method", None) == "HEAD":
@@ -313,7 +396,7 @@ def reply_framing_fault(reader: object) -> str | None:
     te_fields: list[str] = [str(v) for v in (get_all("Transfer-Encoding") or [])]
     cl_fields: list[str] = [str(v).strip(" \t") for v in (get_all("Content-Length") or [])]
     status = getattr(reader, "status", None)
-    if isinstance(status, int) and (status in _BODYLESS_STATUSES or 100 <= status < 200):
+    if isinstance(status, int) and _status_has_no_body(status):
         return "Transfer-Encoding on a response that has no body" if te_fields else None
     if te_fields:
         if getattr(reader, "version", None) == 10:
@@ -348,18 +431,48 @@ def reply_framing_fault(reader: object) -> str | None:
 def _read_capped(reader: _SupportsRead, limit: int, connector: str) -> bytes:
     """The byte ceiling, shared by :func:`read_bounded` and :func:`drain_bounded`.
 
-    Raises :class:`ResponseTooLargeError` past the bound, and :class:`TruncatedResponseError` for a
-    stream the peer cut mid-body (which ``http.client`` reports as
-    :class:`~http.client.IncompleteRead`). Completeness against a DECLARED length is the caller's
-    business, because only :func:`read_bounded` wants it.
+    Raises :class:`ResponseTooLargeError` past the bound. :func:`read_reply_body` raises
+    :class:`TruncatedResponseError` for a stream the peer cut mid-body, and
+    :class:`AmbiguousFramingError` for a chunked body that breaks its grammar. Completeness against a
+    DECLARED length is the caller's business, because only :func:`read_bounded` wants it.
     """
     if limit < 1:
         # A zero or negative ceiling would mean "unbounded", which is the defect this module exists
         # to close. Caught here as a programming error rather than shipped as a disable switch.
         raise ValueError(f"read_bounded needs a positive limit, got {limit}")
+    body = read_reply_body(reader, limit + 1, connector=connector)
+    if len(body) > limit:
+        raise ResponseTooLargeError(
+            f"{connector} returned a response body over the {limit}-byte bound; "
+            "refusing to buffer the rest"
+        )
+    return body
+
+
+def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes:
+    """Read at most ``amt`` bytes of a reply body, as ``reader.read(amt)`` would, but strictly.
+
+    The low-level read under the bounded helpers here. It applies no ceiling of its own: a caller
+    asks for one byte past its bound and judges the length. It does not call
+    :func:`reply_framing_fault` either; the caller does that first where it wants the header checks.
+
+    A chunked ``http.client.HTTPResponse``, or the ``HTTPError`` that wraps one, is decoded by
+    :func:`_read_chunked_strict` rather than by ``http.client``. Anything else is read with
+    ``reader.read(amt)``. **Call it once per response, not in a loop:** a chunked response is closed
+    after the call, so a second call returns ``b""`` as if the body had ended.
+
+    Raises :class:`TruncatedResponseError` when the peer closed part-way through the body, and
+    :class:`AmbiguousFramingError` when a chunked body breaks the RFC 9112 section 7.1 grammar.
+    """
+    if amt < 1:
+        # A negative count means "read to end of stream", which is the defect this function closes.
+        raise ValueError(f"read_reply_body needs a positive byte count, got {amt}")
+    resp = _chunked_response(reader)
+    if resp is not None:
+        return _read_chunked_strict(resp, amt, connector)
     cut_short = False
     try:
-        body = bytes(reader.read(limit + 1))
+        body = bytes(reader.read(amt))
     except http.client.IncompleteRead:
         # http.client detects this shape itself but raises an HTTPException, which matches none of
         # the connectors' except arms and would escape send() as an internal error.
@@ -371,20 +484,253 @@ def _read_capped(reader: _SupportsRead, limit: int, connector: str) -> bytes:
         # `__context__.__cause__.partial` for any sink logging with exc_info, PHI by CLAUDE.md
         # section 9. `from None` alone does not do this: it clears `__cause__` and leaves
         # `__context__`. Leaving the handler first clears the exception being handled, so the new
-        # error references nothing.
-        #
-        # No byte count: `partial` is EMPTY for the common chunked case (`_read_chunked` appends to
-        # its accumulator only after a whole chunk arrives), so a count here would report 0 for a
-        # peer that sent real bytes and read as "the peer sent nothing".
-        raise TruncatedResponseError(
-            f"{connector} closed the connection part-way through the response body"
-        )
-    if len(body) > limit:
-        raise ResponseTooLargeError(
-            f"{connector} returned a response body over the {limit}-byte bound; "
-            "refusing to buffer the rest"
-        )
+        # error references nothing. This arm now serves only readers other than a chunked
+        # HTTPResponse, which _read_chunked_strict decodes.
+        raise _truncated_error(connector)
     return body
+
+
+def _framing_error(connector: str, reason: str) -> AmbiguousFramingError:
+    # The reason is always a fixed string from this module, never a header value or a body byte, so
+    # the message carries nothing the peer supplied.
+    return AmbiguousFramingError(
+        f"{connector} framed its response body ambiguously ({reason}); refusing to read it",
+        reason=reason,
+    )
+
+
+def _truncated_error(connector: str) -> TruncatedResponseError:
+    return TruncatedResponseError(
+        f"{connector} closed the connection part-way through the response body"
+    )
+
+
+# --- the header block -----------------------------------------------------------------------------
+
+#: An RFC 9110 section 5.6.2 token, the grammar of a field name and of a chunk extension name.
+_TCHARS = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
+_TOKEN = f"[{_TCHARS}]+"
+_FIELD_NAME = re.compile(_TOKEN)
+#: A folded line break inside a raw field value, which RFC 9112 section 5.2 lets a user agent
+#: accept in a response, and the controls RFC 9110 section 5.5 forbids in a value (HTAB allowed).
+_OBS_FOLD = re.compile(r"\r?\n[ \t]")
+_VALUE_CTL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def _header_block_fault(headers: email.message.Message) -> str | None:
+    """Why the header block did not parse as RFC 9112 field lines, or ``None`` when it did.
+
+    The test is a comparison, not a list of places a lost line can land. ``http.client`` discards
+    the raw header bytes before any caller sees the reply, so this rebuilds the block from the
+    fields the email parser DID find, parses that with an empty body, and requires the two parse
+    trees to match. A clean block has an empty body, so its tree is exactly the reference's. A line
+    the parser did not take as a field line must have gone somewhere else: a defect, an mbox
+    envelope, a body string, a nested message, or a ``multipart/*`` preamble, part or epilogue.
+    A line that lands in any of those makes the trees differ, whatever the ``Content-Type`` says
+    (BACKLOG #1125). A line lost without leaving a trace in the tree is missed. At least one such
+    shape is known: see :func:`reply_framing_fault`.
+
+    A Message built in code, with no body parsed, has no lost line to find. Its payload is
+    ``None``, which the parser never leaves on a block it read, so the comparison is skipped.
+
+    Each reason is a fixed string that names the header block, and never echoes a field value.
+    """
+    parsed = headers.get_payload() is not None or bool(headers.defects)
+    reference = _reparse_fields(headers) if parsed else headers
+    if _defect_names(headers) != _defect_names(reference):
+        return "a header line the HTTP reader could not parse"
+    if _parse_tree(headers) != _parse_tree(reference):
+        return "header lines the HTTP reader left unparsed"
+    for name, value in headers.raw_items():
+        if not _FIELD_NAME.fullmatch(name):
+            return "a header field name that is not a token"
+        if _VALUE_CTL.search(_OBS_FOLD.sub(" ", value)):
+            return "a header field value holding a control character"
+    return None
+
+
+def _reparse_fields(msg: email.message.Message) -> email.message.Message:
+    """``msg``'s own fields, re-parsed as a clean header block with an empty body.
+
+    The same parser class and policy ``http.client`` used, so a ``multipart/*`` or ``message/*``
+    type builds the same empty structure it builds for a clean reply. Values are raw, folds
+    included, and the parser strips the space after the colon, so each field parses back as itself.
+    """
+    block = "".join(f"{name}: {value}\r\n" for name, value in msg.raw_items()) + "\r\n"
+    reparsed: email.message.Message = email.parser.Parser(
+        _class=type(msg), policy=msg.policy
+    ).parsestr(block)
+    return reparsed
+
+
+def _defect_names(msg: email.message.Message) -> list[str]:
+    return [type(d).__name__ for d in msg.defects]
+
+
+def _parse_tree(msg: email.message.Message) -> tuple[object, ...]:
+    """Everything the email parser built from a header block, as a comparable value.
+
+    Covers each place the parser can put a line: the fields, an mbox envelope, the defects, the
+    preamble and epilogue of a ``multipart/*`` body, and the payload, recursing into nested parts.
+    """
+    payload = msg.get_payload()
+    body: object = payload
+    if isinstance(payload, list):
+        body = tuple(
+            _parse_tree(part)
+            if isinstance(part, email.message.Message)
+            else ("not a message", type(part).__name__)
+            for part in payload
+        )
+    return (
+        msg.get_unixfrom(),
+        tuple(msg.raw_items()),
+        _defect_names(msg),
+        msg.preamble,
+        msg.epilogue,
+        body,
+    )
+
+
+# --- the chunked body -----------------------------------------------------------------------------
+#
+# RFC 9112 section 7.1:
+#   chunked-body = *chunk last-chunk trailer-section CRLF
+#   chunk        = chunk-size [ chunk-ext ] CRLF chunk-data CRLF
+#   chunk-size   = 1*HEXDIG
+#   last-chunk   = 1*("0") [ chunk-ext ] CRLF
+#   chunk-ext    = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+#   chunk-ext-val = token / quoted-string
+
+#
+# The patterns are str, matched against each line decoded as latin-1 by _read_chunk_line, which maps
+# every byte to the code point of the same value. So \x80-\xff below means the same bytes it would
+# in a bytes pattern, and the static ReDoS scan in tests/test_security_static.py can read them; it
+# reads str only.
+#
+# The extension group repeats POSSESSIVELY (*+). Each element has one parse: the token class and
+# the whitespace exclude ";", "=" and '"', and a quoted string ends at the first '"' that no
+# backslash escapes, because its plain text excludes both '"' and "\". So a ";" inside a quoted
+# value cannot start a repetition, and giving one back can never lead to a match. Possessive says
+# so to the regex engine and to the scan. If _QUOTED ever admits '"' or "\" in its plain text, or
+# loses its closing quote, that no longer holds: possessive would then refuse legal lines.
+
+_QUOTED = r'"(?:[\t \x21\x23-\x5b\x5d-\x7e\x80-\xff]|\\[\t \x21-\x7e\x80-\xff])*"'
+_CHUNK_EXT = (
+    r"(?:[ \t]*;[ \t]*" + _TOKEN + r"(?:[ \t]*=[ \t]*(?:" + _TOKEN + "|" + _QUOTED + r"))?)*+"
+)
+_CHUNK_SIZE_LINE = re.compile("([0-9A-Fa-f]+)" + _CHUNK_EXT)
+#: A trailer field line. It is discarded unread, but a line that is not one is a framing fault.
+_TRAILER_LINE = re.compile(_TOKEN + r":[\t\x20-\x7e\x80-\xff]*")
+#: A folded continuation of the trailer line before it, accepted as a header fold is.
+_TRAILER_FOLD = re.compile(r"[ \t][\t\x20-\x7e\x80-\xff]*")
+
+#: The line and field-count limits ``http.client`` applies to header lines, applied here to chunk
+#: lines and trailer fields. Neither is a new number.
+_MAX_LINE = 65536
+_MAX_TRAILER_FIELDS = 100
+
+
+def _chunked_response(reader: object) -> http.client.HTTPResponse | None:
+    """The chunked ``HTTPResponse`` behind ``reader``, or ``None`` when there is none.
+
+    A 2xx arrives as the ``HTTPResponse`` itself. A non-2xx arrives as the ``urllib`` ``HTTPError``
+    that wraps it, which keeps the response on ``.fp``.
+    """
+    resp = reader if isinstance(reader, http.client.HTTPResponse) else getattr(reader, "fp", None)
+    if isinstance(resp, http.client.HTTPResponse) and resp.chunked is True:
+        return resp
+    return None
+
+
+def _read_chunked_strict(resp: http.client.HTTPResponse, amt: int, connector: str) -> bytes:
+    """Decode ``resp``'s chunked body from its underlying stream, returning at most ``amt`` bytes.
+
+    Closes the response afterwards, whatever happened, so nothing reads the rest of a stream this
+    decoder stopped part-way through.
+    """
+    try:
+        fp = resp.fp
+        if fp is None:
+            return b""  # already read or closed, which is what http.client returns too
+        if getattr(resp, "_method", None) == "HEAD" or _status_has_no_body(resp.status):
+            # No body exists (RFC 9112 section 6.3), whatever the headers say. http.client would
+            # try to read a chunked one here and wait on the peer for it.
+            return b""
+        return _decode_chunked(fp, amt, connector)
+    finally:
+        resp.close()
+
+
+#: The most one ``read`` asks for. A chunk-size line can declare far more than the peer sends, and
+#: ``BufferedReader.read(n)`` allocates ``n`` bytes before it learns that, so a large chunk is read
+#: in pieces of this size. ``http.client._safe_read`` grows its buffer for the same reason.
+_READ_PIECE = 1024 * 1024
+
+
+def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
+    # One bytearray rather than a list of chunks: a peer sending many tiny chunks would otherwise
+    # cost an object per chunk, far past the byte bound.
+    body = bytearray()
+    while True:
+        line = _read_chunk_line(fp, connector)
+        if line is None:
+            raise _truncated_error(connector)
+        match = _CHUNK_SIZE_LINE.fullmatch(line)
+        if match is None:
+            raise _framing_error(connector, "a chunk-size line that is not plain hexadecimal")
+        size = int(match.group(1), 16)
+        if size == 0:
+            break
+        want = min(size, amt - len(body))
+        while want:
+            data = fp.read(min(want, _READ_PIECE))
+            if not data:
+                raise _truncated_error(connector)
+            body += data
+            want -= len(data)
+        if len(body) >= amt:
+            # The caller's count is reached. The rest of the stream is left unread, and the
+            # response is closed by the caller of this function.
+            return bytes(body)
+        after = fp.read(2)
+        if len(after) < 2:
+            raise _truncated_error(connector)
+        if after != b"\r\n":
+            raise _framing_error(connector, "chunk data not followed by CRLF")
+    field_seen = False
+    for _ in range(_MAX_TRAILER_FIELDS + 1):
+        line = _read_chunk_line(fp, connector)
+        if not line:
+            # An empty line ends the trailer section. A clean end of stream between lines ends it
+            # too. The last chunk has arrived by then, so the body is settled. http.client accepts
+            # this ending as well, because some servers send it.
+            return bytes(body)
+        if _TRAILER_LINE.fullmatch(line) is not None:
+            field_seen = True
+        elif not (field_seen and _TRAILER_FOLD.fullmatch(line)):
+            raise _framing_error(connector, "a trailer line that is not a header field")
+    # Folded continuation lines count toward the limit too, which keeps the loop bounded.
+    raise _framing_error(connector, "more trailer lines than the reader allows")
+
+
+def _read_chunk_line(fp: _SupportsReadline, connector: str) -> str | None:
+    """One CRLF-terminated line of the chunked framing, without its CRLF, decoded as latin-1.
+
+    Decoded here, once, so every grammar check gets the str its pattern needs. latin-1 maps each
+    byte to one code point and cannot fail. ``None`` when the stream ended cleanly before the line
+    began. A line cut part-way is a truncation.
+    """
+    line = fp.readline(_MAX_LINE + 1)
+    if not line:
+        return None
+    if len(line) > _MAX_LINE:
+        raise _framing_error(connector, "a chunked-body line longer than the reader allows")
+    if not line.endswith(b"\n"):
+        raise _truncated_error(connector)
+    if not line.endswith(b"\r\n"):
+        raise _framing_error(connector, "a chunked-body line not ended by CRLF")
+    return line[:-2].decode("latin-1")
 
 
 def read_bounded_text(

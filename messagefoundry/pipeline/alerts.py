@@ -155,16 +155,28 @@ class AlertSink(Protocol):
         :meth:`cert_expiry`) so an operator can route a rotation reminder apart from a cert-expiry alert."""
         ...
 
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
-        """The first-run **bootstrap admin** is still UNCLAIMED (never password-changed) and now sits
-        inside its retirement warn window — an operator must sign in and change the password (or stand
-        up a second administrator) before the unclaimed credential is auto-disabled (ASVS 6.4.5). ``name``
-        labels the credential (``"bootstrap-admin"``); ``expires_at`` is the ISO instant it is disabled;
-        ``hours_remaining`` is the whole hours left (``0`` in the final hour). Carries **only** the
-        deadline + hours — **never** the password or any secret, and no message content (no PHI). Emitted
-        once per process (an in-memory latch on :class:`~messagefoundry.auth.service.AuthService`) by the
-        API-lifespan reminder task. Dedicated (not reusing :meth:`secret_rotation_due`) so an operator can
-        route a first-run-credential reminder apart from a long-lived-secret rotation reminder."""
+    def initial_credential_expiring(
+        self, name: str, *, expires_at: str, hours_remaining: int
+    ) -> None:
+        """An **admin-issued temporary password** (a create-user or reset credential, still
+        ``must_change_password``) is UNCLAIMED and near the instant the login gate stops accepting it
+        (ASVS 6.4.5, BACKLOG #1141). ``name`` is ``user:<holder's username>``, so the throttle and
+        the alert instance key per account; ``expires_at`` is the ISO instant; ``hours_remaining`` is
+        the whole hours left (``0`` in the final hour).
+
+        The prefix does not hide the event from rules. ``AlertRule.connection`` defaults to ``"*"``,
+        so a catch-all rule matches it. Where a catch-all rule is the first match, its ``mute`` or
+        ``transports=[]`` silences this reminder. Its ``control_action`` is dispatched at ``name``,
+        or, when the rule sets ``control_target``, at that real connection, which it restarts. Scope
+        such rules to real connection names or to one ``event_type``. Rules apply only where
+        ``[alerts]`` has a transport; without one, :class:`LoggingAlertSink` logs every event.
+
+        The engine cannot reach the holder of a credential it handed to an administrator, so this goes
+        to the operator: tell the holder, or, if the credential lapses unclaimed, reset it again. The
+        alert does not resolve itself when the holder claims it, so check the account before a
+        reset. Carries **only** the
+        username, the deadline and the hours: never the password, and no message content (no PHI).
+        Emitted once per credential per process by the API-lifespan reminder task."""
         ...
 
     def approval_stale_requester(self, approval_id: str, *, operation: str, reason: str) -> None:
@@ -176,6 +188,30 @@ class AlertSink(Protocol):
         operation key and the slug only: no username, no params, no message content (no PHI). The
         ``approval.stale_requester`` audit row is the durable record; this is the page. Emitted by
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""
+        ...
+
+    def approval_approver_provenance(
+        self, name: str, *, operation: str, changed: tuple[str, ...]
+    ) -> None:
+        """A held dual-control request was RELEASED by an approver whose account changed after the
+        request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``). The release
+        went ahead: this flags it and refuses nothing. ``name`` is ``approval:<approval id>``. The
+        colon is outside the connection-name grammar, so a rule's ``control_action`` can never land
+        on a real connection through it (BACKLOG #1898). ``changed`` holds one or more of
+        ``account_created``, ``password_changed`` and ``totp_enrolled``. Carries the key, the
+        operation key and the slugs only: no username, no params, no PHI. The
+        ``approval.approver_provenance`` audit row is the durable record. Emitted by
+        :class:`~messagefoundry.api.approvals.ApprovalGate`."""
+        ...
+
+    def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        """The built-in Administrator role was granted through the console API (BACKLOG #315). Every
+        approver is an Administrator, so this is how a second approver gets minted. ``via`` is
+        ``account_created`` or ``roles_changed`` with ``name`` = ``user:<username>``, or
+        ``ad_group_map`` with ``name`` = ``ad-group:<group>`` when a group newly maps to the role.
+        Both keys are outside the connection-name grammar for the same reason as
+        :meth:`approval_approver_provenance`. ``granted_by`` is the acting administrator's username.
+        No PHI. Emitted by the API's user-administration routes, never from ``auth/``."""
         ...
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
@@ -212,7 +248,9 @@ class AlertSink(Protocol):
     def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
         """Startup self-attestation found loaded engine module(s) that do not match the installed
         wheel ``RECORD`` baseline — a runtime in-place tamper tripwire (ADR 0041 D3, #54). ``name``
-        labels the source (``"engine-integrity"``); ``reason`` is a PHI-free summary string;
+        labels the source; startup attestation uses at least ``"engine-integrity"``, and
+        :mod:`messagefoundry.integrity` defines its other subjects, including the web console's
+        (BACKLOG #1802). ``reason`` is a PHI-free summary string;
         ``drift_count`` is how many module files drifted. Carries no file content (no PHI, nothing
         sensitive). Emitted by :func:`~messagefoundry.integrity.run_startup_attestation`. Dedicated
         rather than reusing :meth:`connection_stopped` so an operator can route/triage a tamper signal
@@ -439,10 +477,13 @@ class LoggingAlertSink:
                 last_rotated,
             )
 
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
+    def initial_credential_expiring(
+        self, name: str, *, expires_at: str, hours_remaining: int
+    ) -> None:
         log.warning(
-            "ALERT bootstrap_admin_expiring: %r is UNCLAIMED and is auto-disabled in %d hour(s) "
-            "(expires %s) — sign in and change the password, or add a second admin, before then",
+            "ALERT initial_credential_expiring: the temporary password issued to %r is UNCLAIMED and "
+            "stops working in %d hour(s) (expires %s) -- the holder must sign in and change it, or "
+            "an administrator must reset it again after it lapses",
             name,
             hours_remaining,
             expires_at,
@@ -454,6 +495,25 @@ class LoggingAlertSink:
             operation,
             approval_id,
             reason,
+        )
+
+    def approval_approver_provenance(
+        self, name: str, *, operation: str, changed: tuple[str, ...]
+    ) -> None:
+        log.warning(
+            "ALERT approval_approver_provenance: %s request %r was released by an approver whose "
+            "account changed after the request (%s)",
+            operation,
+            name,
+            ", ".join(changed),
+        )
+
+    def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        log.warning(
+            "ALERT administrator_granted: %r was given the Administrator role (%s) by %r",
+            name,
+            via,
+            granted_by,
         )
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:

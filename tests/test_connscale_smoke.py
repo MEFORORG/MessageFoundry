@@ -160,7 +160,8 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
 
     Four properties, and none is weaker than the old assertion wherever the probe worked:
 
-    1. Where the probe READ, the count must be positive — the wall exists. Unchanged.
+    1. Where the probe READ, the count must be positive — the wall exists — and the record must name
+       the PIDs the peak was summed over and the PID the walk started from (BACKLOG #1210).
     2. Where it did not, the record must NAME a cause. An unattributable gap FAILS. A tolerance that
        swallowed it would buy a green by destroying the only evidence of what went wrong, which is the
        failure mode this whole change exists to remove.
@@ -173,6 +174,19 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
     for r in records:
         if r.fd_count_peak is not None:
             assert r.fd_count_peak > 0, r
+            # BACKLOG #1210 arm 2: a measured peak names the processes it summed, and the walk's
+            # starting PID that anchors them. A number with no covering set is the anonymous reading
+            # that let a stale-ppid adoption stand as the engine's FD count. WHAT THIS GUARDS, AND WHAT
+            # IT DOES NOT: the probe always fills the set when it reads a peak, so this fails when the
+            # provenance is DROPPED between the probe and the record -- a runner or report change that
+            # stops threading it. It does not detect an adoption; that needs a reader comparing the
+            # members against the expected tree, and the walk's validation is what prevents one.
+            assert r.fd_count_peak_pids and r.fd_probe_root_pid is not None, (
+                f"UNATTRIBUTED PEAK -- wall #4 read {r.fd_count_peak} at {r.sweep_mode}@N={r.count} "
+                f"and the record does not say which processes that sum covered "
+                f"(fd_count_peak_pids={r.fd_count_peak_pids!r}, "
+                f"fd_probe_root_pid={r.fd_probe_root_pid!r}). Record: {r}"
+            )
             continue
         causes = tuple(r.fd_probe_degraded)
         scope = f"{r.fd_probe_degraded_ticks} of {r.fd_probe_ticks} probe tick(s) degraded"
@@ -338,9 +352,11 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
     empty-claims band was retired (BACKLOG #1211) no SLO grades ``empty_claims_per_msg`` against
     ``_MONOTONIC_TOLERANCE``; the renderer says so on the table it prints, and an OUTSIDE BAND row
     there fails nothing. The width is still imported rather than retyped for a different reason:
-    holding it at the value the harvested readings were measured under is what keeps new rows
-    directly comparable with those already harvested. ``fd_count_monotonic`` does still enforce the
-    same constant, so a second copy here would remain a second definition regardless.
+    holding it at the value the harvested readings were measured under keeps the BAND the same one.
+    The VALUES changed window at BACKLOG #1420, so rows from before that change do not compare with
+    rows after it; the JSON copy's ``rate_window`` says which is which. ``fd_count_monotonic`` does
+    still enforce the same constant, so a second copy here would remain a second definition
+    regardless.
     """
     _append_step_summary(
         report.render_readings_markdown(
@@ -502,10 +518,11 @@ def test_the_sweep_produces_one_record_per_mode_and_count(smoke_report: ConnScal
 def test_every_step_took_at_least_two_in_hold_samples(smoke_report: ConnScaleReport) -> None:
     """BACKLOG #1430, END TO END: the hold must produce a WINDOW, not a point.
 
-    Every rate and every peak this record carries is derived from the step's in-hold readings, and a
-    step that took one reading has a window of zero width -- ``_empty_claim_rates`` and
-    ``_throughput_rates`` then reach two samples only by counting the post-drain final, and
-    ``in_pipeline_peak`` and the wall #1/#2 peaks are each a single instant wearing the word "peak".
+    Every rate this record carries is derived from the step's in-hold readings, and a step that took
+    one reading has a window of zero width -- ``_empty_claim_rates`` and ``_throughput_rates`` read a
+    rate window that EXCLUDES the post-drain final (BACKLOG #1420), so they return zeros and wall #3
+    goes ungraded. ``in_pipeline_peak`` and the wall #1/#2 peaks read that one reading plus the
+    post-drain final, so each is two instants wearing the word "peak".
     That was the state in 20 of 20 cells, and NOTHING FAILED ON IT: no test asserted a floor on the
     sample count, and ``report.py``'s diagnostic text calls a low probe-tick count "a coarse gauge,
     not a fault". This assertion is what makes the state visible.
@@ -532,7 +549,14 @@ def test_no_loss_reconciles_at_every_step(smoke_report: ConnScaleReport) -> None
     """
     for r in smoke_report.records:
         assert r.sent > 0, r
-        assert r.no_loss.ok, (r.sweep_mode, r.count, r.no_loss.detail)
+        # A STRING, not a tuple. Pytest shortens each element of a tuple message, and on
+        # 2026-09-25 that cut the #1292 audit verdict off the end of this line in CI, so the red
+        # read as engine loss while the verdict that cleared the engine sat in the part not shown.
+        assert r.no_loss.ok, (
+            f"{r.sweep_mode}@N={r.count}: sent={r.sent} acked={r.acked} nak={r.nak} "
+            f"timeouts={r.timeouts} reload_stranded={r.reload_stranded} "
+            f"reload_seconds={r.reload_seconds} -- {r.no_loss.detail}"
+        )
 
 
 def test_no_accept_acked_message_is_absent_from_the_stopped_engines_store(

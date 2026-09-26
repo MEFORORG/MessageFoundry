@@ -127,14 +127,14 @@ python -m messagefoundry serve --config samples/config --db ./messagefoundry.db 
 
 When the engine runs from somewhere other than the repo root (e.g. under the service), anchor the value files with `--project-root <repo-root>` so `env()` values don't silently resolve empty — see [INSTALL-GUIDE.md](INSTALL-GUIDE.md).
 
-**Network / auth posture.** The API binds **`127.0.0.1:8765`** and **requires authentication** by default. A non-loopback bind without TLS is refused at startup; configure native TLS (or an upstream terminator) to expose it. Details: [SECURITY.md](SECURITY.md) and [DEPLOYMENT.md](DEPLOYMENT.md).
+**Network / auth posture.** The API binds **`127.0.0.1:8765`**, serves HTTPS, and **requires authentication** by default. With no `[api].tls_cert_file` configured, the engine mints a self-signed certificate on first run ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). That certificate serves loopback, but it does not satisfy the startup gate for a non-loopback bind. On the shipped posture, exposing the API takes your own certificate (`[api].tls_cert_file`) or a trusted upstream TLS terminator, plus the further gates [DEPLOYMENT.md](DEPLOYMENT.md) lists. Details: [SECURITY.md](SECURITY.md).
 
 **Store encryption.** Every instance carries patient data, so `serve` **refuses to start** with no store encryption key configured — on `dev` as much as on `prod`. Mint one with `messagefoundry gen-key` (set it as `MEFOR_STORE_ENCRYPTION_KEY`), or on Windows DPAPI-protect it to a file with `messagefoundry protect-key --generate --out <file>` and point `[store].encryption_key_file` at it. To run keyless anyway, set `[security].allow_unencrypted_phi = true` — and under the shipped `[security].enforcement = enforce`, `allow_unencrypted_phi_under_strict_enforcement = true` as well. The dial alone does not clear this refusal. Both acks are audited at every start. The full key story is in [PHI.md](PHI.md).
 
 Confirm it's up:
 
 ```powershell
-curl http://127.0.0.1:8765/health
+curl.exe --cacert .\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
 ### 4. Scaffold your own config repo
@@ -497,10 +497,10 @@ The console is served by the engine itself, so start the engine first (note the 
 python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 ```
 
-Then open the web console in a browser (the engine serves it at `/ui` when `[api].serve_ui` is on):
+Then open the web console in a browser. With the `messagefoundry-webconsole` wheel installed, the engine serves it at `/ui` by default; `[security].serve_web_console = false` turns it off:
 
 ```
-http://127.0.0.1:8765/ui
+https://127.0.0.1:8765/ui
 ```
 
 When the engine requires authentication (the default), a **Sign in** form appears first:
@@ -521,7 +521,7 @@ The pages hang off a **top nav** of hover/focus dropdowns: **Traffic** (Connecti
 
 - **Status** — read-only health: engine (version, uptime, PID, inbounds running/total, endpoints in+out, engine-wide msg/s), store (path, size, free disk, journal mode, message/event/audit row counts), the effective security posture, and the active-passive **Cluster** roster + DR state. **Run integrity check** runs `PRAGMA quick_check` on demand, and **Reset statistics** zeroes the counters. When `[service].report_status` is on, a **Hosting service** badge reports the NSSM service's state — a read-out only, with no start/stop controls; manage the service itself per [SERVICE.md](SERVICE.md).
 
-- **Users** (reading needs `users:read`; every change needs `users:manage`) — RBAC administration across three cross-linked pages: **Users** (`+ New user`, then a per-user page with Profile, Roles, Channel scope, and account actions — *Reset password*, *Reset MFA*, *Sign out all sessions*, *Delete user*), **Roles** (user-definable custom roles over the built-in permission catalog, [ADR 0045](adr/0045-custom-rbac-roles.md)), and **AD group mappings**. Each body-carrying form opens inside a fresh step-up window, and every operation is audited server-side. Role definitions live in [SECURITY.md](SECURITY.md).
+- **Users** (reading needs `users:read`; every change needs `users:manage`) — RBAC administration across three cross-linked pages: **Users** (`+ New user`, then a per-user page with Profile, Roles, Channel scope, and account actions — *Reset password*, *Reset MFA*, *Sign out all sessions*, *Delete user*, plus a *Federated sign-in* card that opens `/ui/users/{user_id}/federated-identity` to link, relink or unlink the account's OIDC identity, each change behind a fresh re-authentication for the action `admin_federated_identity` unless `[auth].require_action_step_up = false`; only a directory account that carries its immutable directory id, the `objectGUID` a Windows SSO sign-in records, can be linked, and that screen says so where it cannot), **Roles** (user-definable custom roles over the built-in permission catalog, [ADR 0045](adr/0045-custom-rbac-roles.md)), and **AD group mappings**. Each body-carrying form opens inside a fresh step-up window, and every operation is audited server-side. Role definitions live in [SECURITY.md](SECURITY.md).
 
 - **Alerts** — the engine's **active alert instances** (open and acknowledged) plus the loaded `[alerts]` rules ([ADR 0044](adr/0044-operator-alert-state.md) refining [ADR 0014](adr/0014-alerting-rules-engine.md)). Each instance carries severity, status, event type, connection, occurrence count, first/last seen, reason, and who acknowledged it, with **Ack** / **Resolve** / windowed **Suspend** / **Resume** actions. Rule *editing* stays config-file driven; the rule list is shown read-only (event type, connection, min depth, min age, severity, transports, cooldown — transports reported present-or-not, secrets omitted). The notifications themselves still fan out through the engine's AlertSink (see [Monitoring dispositions and troubleshooting](#monitoring-dispositions-and-troubleshooting)).
 
@@ -615,7 +615,7 @@ The SMTP password is a secret — supply it via `MEFOR_ALERTS_EMAIL_PASSWORD`, n
 - **A lane stopped processing.** A `connection_stopped` alert means an outbound's worker halted on an internal/code error (`internal_error = stop`). The messages are preserved for replay; fix the cause, then reload/restart the connection.
 - **A connection shows `failed`.** A connection that can't build or bind **at startup** (bad settings, a port already in use) is isolated as a degraded `failed` status instead of taking the engine down — every other lane keeps running ([ADR 0031](adr/0031-startup-connection-fault-isolation.md)). Fix the config/bind, then recover it: restart an inbound (`POST /connections/{name}/start`), or reload to rebuild a failed outbound. (Reload itself stays fail-fast — a broken config is rejected whole, never partially applied.)
 - **Backlog growing.** A `queue_buildup` alert usually means a head is retrying its way toward the cap and blocking its FIFO lane, or the downstream is down. Check the destination, then inspect/purge or replay the blocking row.
-- **Console can't reach the engine.** The API binds `127.0.0.1:8765` by default and requires auth; confirm the engine is serving (`python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev`), that `[api].serve_ui` is on with the `messagefoundry-webconsole` distribution installed, and that your browser is pointed at that host/port's `/ui`.
+- **Console can't reach the engine.** The API binds `127.0.0.1:8765` by default and requires auth; confirm the engine is serving (`python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev`), that the `messagefoundry-webconsole` distribution is installed and `[security].serve_web_console` has not been set to `false`, and that your browser is pointed at `https://` on that host/port's `/ui`.
 - **Low disk / store growing.** `GET /status` reports DB size and free disk; a `storage_threshold` alert fires past `[retention].max_db_mb`. Tune retention in `[retention]` ([CONFIGURATION.md](CONFIGURATION.md)) — purges null PHI bodies while keeping the message/disposition rows, so counts and audit stay intact. The row is kept; its PHI columns — operator-attached `metadata` included — are blanked.
 
 ---
