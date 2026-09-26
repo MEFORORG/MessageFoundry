@@ -93,7 +93,7 @@ from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -2551,7 +2551,8 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     only, and a row that broke that rule would never verify. Then appends ONE range row, MAC'd under
     the active key, carrying the closed range's digest and the outgoing key's handover tag. It rewrites
     no existing row, so the off-box tee and every recorded anchor stay valid. A no-op when the current
-    range is already under the active key.
+    range is already under the active key, though it still verifies the chain first and refuses when
+    the key the chain names for that range is not configured (BACKLOG #1945).
 
     OFFLINE ONLY, like ``rekey-audit``: another process keeps the range it read at open, so an engine
     left running would go on appending under the old key after the range row and break the chain."""
@@ -2571,21 +2572,31 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     current, current_from = host._audit_range_key_id, host._audit_range_from
     if current is None or current_from is None:
         return False, "the audit chain does not record which key its current range is under"
-    if current == active_id:
-        return True, f"audit chain already under the active key (range from id={current_from})"
-    if active_id in host._audit_range_keys:
+    # BACKLOG #1945: `current` is where NEW rows go, and settle_audit_ranges moves that to the active
+    # key when the chain's own current range is under a key that is not configured. Read as the
+    # chain's state, a dropped key looked like "already under the active key", and this reported OK
+    # over a chain audit-verify calls broken. The chain's own answer is the last key its ranges name.
+    # Settle leaves that list non-empty on a trusted chain; the fallback covers a host it never ran on.
+    # Past the check below the two names agree, since settle moves `current` only off a missing key.
+    recorded = host._audit_range_keys[-1] if host._audit_range_keys else current
+    out_secret = _audit_secret_for(recorded, host._audit_mac_keys, host._audit_mac_fn)
+    if out_secret is None:
+        # Worded for an empty range too, which audit-verify still passes: the range cannot be closed,
+        # and the first row added to it will not verify.
+        return False, (
+            f"the audit chain's current range (from id={current_from}) is keyed under audit key "
+            f"{recorded!r}, which is not configured, so the range cannot be closed and rows added to "
+            "it do not verify. Configure that key again (a store key goes back in "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED) and re-run"
+        )
+    if current != active_id and active_id in host._audit_range_keys:
         return False, (
             "the active store key already keyed an earlier audit range, and a key opens one range "
             "only; rotate to a NEW key rather than back to a previous one"
         )
-    out_secret = _audit_secret_for(current, host._audit_mac_keys, host._audit_mac_fn)
-    if out_secret is None:
-        return False, (
-            f"the audit chain's current range is keyed under audit key {current!r}, which is not "
-            "configured; restore it to MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run"
-        )
     # ONE read, verified and sealed from the same rows, so the closing record cannot describe a
-    # different chain from the one the verify passed.
+    # different chain from the one the verify passed. The no-op below verifies too: its OK is read
+    # as "the rotation is done", so it must not stand over a chain audit-verify fails (#1945).
     rows = await host._audit_rows(AUDIT_ALL_ROWS)
     ok, msg = verify_audit_rows(
         rows,
@@ -2596,11 +2607,15 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         capable=host._audit_mac_key is not None or host._audit_mac_fn is not None,
     )
     if not ok:
+        if current == active_id:
+            return False, f"the audit chain is under the active key but does not verify: {msg}"
         return False, f"refusing to roll a broken audit chain: {msg}"
+    if current == active_id:
+        return True, f"audit chain already under the active key (range from id={current_from})"
     split = bisect.bisect_left([int(r["id"]) for r in rows], current_from)
     closes = audit_range_closing(
         rows[split:],
-        key_id=current,
+        key_id=recorded,
         from_id=current_from,
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
@@ -3425,6 +3440,19 @@ def seed_notify_email(email: str | None) -> str | None:
     present but undeliverable. NULL states plainly that the account has never carried one.
     """
     return email.strip() or None if email is not None else None
+
+
+def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
+    """The ``users.notify_email`` a ``create_user`` INSERT binds, on all three backends.
+
+    ``typed`` wins when given: an administrator's address for a directory account whose ``mail``
+    was not adopted (BACKLOG #2021), bound in the same INSERT so no crash can leave the row with
+    none. The caller has already checked it. Otherwise ``email`` is seeded (:func:`seed_notify_email`)
+    unless ``adopt`` is ``False`` (BACKLOG #2014).
+    """
+    if typed is not None:
+        return typed
+    return seed_notify_email(email) if adopt else None
 
 
 def require_notify_email(email: str) -> str:
@@ -7739,6 +7767,7 @@ class MessageStore:
         message_type: str | None,
         summary: str | None,
         peek_failed: bool = False,
+        peek_error: str | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one INFLIGHT ``Stage.RESPONSE`` work-row and produce the re-ingressed message+ingress
@@ -7860,7 +7889,8 @@ class MessageStore:
             cur = await self._db.execute("SELECT 1 FROM messages WHERE id=?", (new_mid,))
             already = await cur.fetchone() is not None
             if not already:
-                # 5. The re-ingressed message (RECEIVED, or RECEIVED→ERROR on a non-peekable HL7 body).
+                # 5. The re-ingressed message (RECEIVED, or RECEIVED→ERROR on a body the worker refused:
+                #    a non-peekable HL7 body, or an oversize body of any type, BACKLOG #1914).
                 child_meta = json.dumps(
                     {
                         "correlation_id": origin_id,
@@ -7881,7 +7911,9 @@ class MessageStore:
                     source_type="reingress",
                     summary=summary,
                     metadata=child_meta,
-                    error="re-ingress body failed HL7 peek" if peek_failed else None,
+                    error=(
+                        (peek_error or "re-ingress body failed HL7 peek") if peek_failed else None
+                    ),
                     now=now,
                 )
                 # 6. The ingress queue row — UNLESS peek_failed (an ERROR message owes no work).
@@ -9225,21 +9257,28 @@ class MessageStore:
         any decrypt; rows are walked newest-first and decrypt+match runs **off the event loop** (the
         per-row AES-GCM decrypt + HL7 parse is CPU work). The scan stops after ``spec.scan_limit``
         decrypts (``truncated=True``) or ``limit`` matches, whichever first — the hard cost ceiling that
-        keeps this slow-by-construction read safe to expose."""
+        keeps this slow-by-construction read safe to expose.
+
+        The candidate ``SELECT`` returns at most ``spec.fetch_limit`` rows, so the cap bounds the rows
+        and bodies held in memory, not only the decrypts (BACKLOG #2068). It does not bound the
+        database's own work: choosing those rows may still examine every candidate (a multi-channel
+        scope sorts them all, and a ``status`` filter on SQLite reads past ``raw`` to reach it)."""
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
-        # Stream candidates newest-first under one read snapshot; decrypt+match each off the loop. We
-        # select only id + the two cipher-covered columns we match on — never a whole detail row.
+        # Read candidates under one read snapshot; decrypt+match each off the loop. The inner SELECT
+        # picks the newest `fetch_limit` ids without selecting `raw`; only those rows are read whole.
+        # A LIMIT on the outer SELECT alone is not enough: a multi-channel RBAC scope sorts in a temp
+        # B-tree, which evaluated every candidate's body and last event before the LIMIT (#2068).
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
                 f" status, error, summary, metadata, raw, {_LAST_EVENT_COLUMN}"
-                f" FROM messages{where}"
-                " ORDER BY received_at DESC, id DESC",
-                params,
+                " FROM messages WHERE id IN"
+                f" (SELECT id FROM messages{where} ORDER BY received_at DESC, id DESC LIMIT ?)",
+                (*params, spec.fetch_limit),
             )
-            candidates = list(await cur.fetchall())
+            candidates = newest_first(await cur.fetchall())
         return await asyncio.to_thread(self._scan_rows, spec, candidates, limit)
 
     def _scan_rows(
@@ -10248,6 +10287,7 @@ class MessageStore:
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
+        notify_email: str | None = None,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
@@ -10262,7 +10302,7 @@ class MessageStore:
                     auth_provider,
                     display_name,
                     email,
-                    seed_notify_email(email) if adopt_notify_email else None,
+                    birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
                     now,
                     now,
                     password_hash,

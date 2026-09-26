@@ -31,7 +31,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import (
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from messagefoundry import __version__
 from messagefoundry.console_streams import harden_console_streams
@@ -5818,12 +5818,78 @@ def _rekey_audit(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+class _OfflineProbe(NamedTuple):
+    """What :func:`_sqlite_store_held_elsewhere` found. ``unchecked`` names why it could not answer."""
+
+    held: bool = False
+    unchecked: str | None = None
+    #: A readable SQLite file with no ``audit_log`` table, a zero-byte file included: opening it
+    #: would build and key a new store in it rather than rotate one.
+    not_a_store: bool = False
+
+
+def _sqlite_store_held_elsewhere(path: str) -> _OfflineProbe:
+    """Whether another connection has the SQLite store at ``path`` open (BACKLOG #1915).
+
+    It reads the lock SQLite already keeps. In WAL mode a connection holds a SHARED lock on the
+    database file from its first read until it closes, so a serving engine holds one for as long as
+    it runs. A connection in EXCLUSIVE locking mode needs an EXCLUSIVE lock to read, and with
+    ``timeout=0`` it fails at once with SQLITE_BUSY while any other is open. That holds only in WAL
+    mode: in a rollback journal an idle connection holds no lock, so a store the open could not put
+    in WAL is reported unchecked, not free.
+
+    Opened ``mode=rw``, so it never creates a missing file. The URI has no authority part and carries
+    the path percent-encoded, so a UNC or mapped-drive path reaches the file the store opens, which
+    ``Path.as_uri()`` does not. A file SQLite cannot read as a database is left to the store open that
+    follows, which reports it."""
+    import urllib.parse
+
+    uri = "file:" + urllib.parse.quote(path, safe="/\\:") + "?mode=rw"
+    try:
+        probe = sqlite3.connect(uri, uri=True, timeout=0, isolation_level=None)
+    except sqlite3.Error as exc:
+        return _OfflineProbe(unchecked=f"the probe could not open it ({exc})")
+    try:
+        probe.execute("PRAGMA locking_mode=EXCLUSIVE")
+        found = probe.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_log'"
+        ).fetchone()
+        mode = str(probe.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    except sqlite3.Error as exc:
+        # The low byte is the primary code, so an extended BUSY code counts as held too. A Python-side
+        # error carries no code at all.
+        code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+        if code == sqlite3.SQLITE_BUSY:
+            return _OfflineProbe(held=True)
+        if code == sqlite3.SQLITE_NOTADB:
+            return _OfflineProbe()  # the store open reports it, and nothing is rotated
+        return _OfflineProbe(unchecked=f"the probe could not read it ({exc})")
+    finally:
+        probe.close()
+    if found is None:
+        return _OfflineProbe(not_a_store=True)
+    if mode != "wal":
+        return _OfflineProbe(
+            unchecked=f"it is in journal mode {mode!r}, where an idle engine holds no lock"
+        )
+    return _OfflineProbe()
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
     Run **offline** (engine stopped): set ``MEFOR_STORE_ENCRYPTION_KEY`` to the NEW active key and keep
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
     rotate. After it finishes, the retired key can be removed.
+
+    **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
+    a store another connection holds, which is how a serving engine holds it; see
+    :func:`_sqlite_store_held_elsewhere`. At least these gaps remain. An engine started AFTER that
+    check is not seen, since the command's own connections hold the same lock from then on; the audit
+    roll's head check refuses an audit row that lands inside its read, and nothing refuses a data
+    write. A store the probe cannot read, or one not in WAL mode, is not checked, and the command
+    prints a note. And on PostgreSQL or SQL Server nothing is checked; the command prints a note
+    there too.
 
     **Invocation bound (ASVS 11.3.4).** ``key_id`` is a one-way SHA-256 fingerprint of the DEK, so the
     NEW key has no ``cipher_meta`` row and its persisted AES-GCM invocation count starts at zero for
@@ -5872,11 +5938,39 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
+    if settings.store.backend == StoreBackend.SQLITE:
+        if not Path(settings.store.path).exists():
+            print(
+                f"error: no store at {settings.store.path} (check --db / [store].path)",
+                file=sys.stderr,
+            )
+            return 2
+        probe = _sqlite_store_held_elsewhere(settings.store.path)
+        if probe.held:
+            print(
+                f"error: the store at {settings.store.path} is open in another process -- a running "
+                "engine, or another command. rotate-key runs offline: stop the engine and anything "
+                "else using the store, then re-run. Nothing was changed.",
+                file=sys.stderr,
+            )
+            return 2
+        if probe.not_a_store:
+            print(
+                f"error: {settings.store.path} is a SQLite database with no audit_log table, so it is "
+                "not a MessageFoundry store; refusing to build and key a new one in it "
+                "(check --db / [store].path)",
+                file=sys.stderr,
+            )
+            return 2
+        unchecked = probe.unchecked
+    else:
+        unchecked = f"it is a {settings.store.backend.value} store"
+    if unchecked is not None:
         print(
-            f"error: no store at {settings.store.path} (check --db / [store].path)", file=sys.stderr
+            f"note: rotate-key could not check for a running engine: {unchecked}. Confirm every "
+            "engine using this store is stopped: a live engine keeps writing under the old key.",
+            file=sys.stderr,
         )
-        return 2
 
     async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
@@ -5976,10 +6070,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if not rolled_ok:
-        # The data is rotated but the audit chain is not: its current range is still under the prior
-        # key, so dropping that key now would leave the newest range unverifiable. Say so, and fail.
+        # The data is rotated but the audit chain is not settled: its current range is still under
+        # the prior key, that range's key is missing, or the chain does not verify (BACKLOG #1945).
+        # Dropping a key now could leave the newest range unverifiable. Say so, and fail.
         print(
-            f"error: the audit chain was not rolled to the active key — {rolled_msg}. Do NOT remove "
+            f"error: the audit chain step did not complete — {rolled_msg}. Do NOT remove "
             "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until `messagefoundry rotate-key` completes "
             "without this error.",
             file=sys.stderr,

@@ -793,6 +793,62 @@ def test_exchange_code_too_deep_reply_is_a_flow_error(monkeypatch: pytest.Monkey
     assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
 
 
+def _refusing_exchange(status: int, body: bytes = b'{"error":"invalid_grant"}') -> None:
+    oidc.exchange_code(
+        token_endpoint="https://idp.example/token",
+        client_id="c",
+        client_secret="SYNTHETIC-SECRET",
+        code="x",
+        redirect_uri="http://localhost/cb",
+        code_verifier="v",
+        opener=_RaisingOpener(  # type: ignore[arg-type]
+            urllib.error.HTTPError(
+                "https://idp.example/token",
+                status,
+                "refused",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(body),
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        # RFC 6749 section 5.2's answer to a bad code, and the same code on an IdP that uses 403.
+        (400, b'{"error":"invalid_grant"}'),
+        (403, b'{"error":"invalid_grant"}'),
+        # The engine's own faults are 4xx too, and land here on purpose: the audit row's status tells
+        # them apart, and no body is read to do it.
+        (400, b'{"error":"invalid_client","hint":"client_secret=SYNTHETIC-SECRET"}'),
+        (401, b'{"error":"invalid_client"}'),
+        (403, b"<html>blocked</html>"),
+        (429, b""),
+    ],
+)
+def test_every_4xx_is_the_endpoint_answering(status: int, body: bytes) -> None:
+    """BACKLOG #1948. A signed-out caller chooses the ``code``, so an answer to it must be told apart
+    from an outage, and stay a FlowError so every existing ``except FlowError`` still catches it. The
+    chain is severed as for its parent, and nothing from the body reaches the error."""
+    with pytest.raises(oidc.TokenRefusedError, match=f"returned HTTP {status}") as excinfo:
+        _refusing_exchange(status, body)
+    assert isinstance(excinfo.value, oidc.FlowError)
+    assert excinfo.value.status == status
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+    assert "SYNTHETIC-SECRET" not in f"{excinfo.value!r}"
+    assert "error" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 302])
+def test_a_5xx_or_3xx_stays_an_outage(status: int) -> None:
+    """A 5xx is the IdP failing and a 3xx a redirect the no-redirect opener refuses. Neither is an
+    answer to the grant, so each stays a plain FlowError and still marks the IdP unavailable."""
+    with pytest.raises(oidc.FlowError, match=f"returned HTTP {status}") as excinfo:
+        _refusing_exchange(status)
+    assert not isinstance(excinfo.value, oidc.TokenRefusedError)
+
+
 class _TripwireOpener:
     """An opener that fails the test if it is ever reached — the shape a "refused before the wire"
     claim needs. A stub that returned a body could not tell a refusal apart from a completed POST."""
