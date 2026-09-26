@@ -816,10 +816,24 @@ class FhirLookupSpec:
     :class:`EnvRef` values (put secrets like ``bearer_token`` / ``smart_private_key`` in :func:`env`).
 
     Mutable ``settings`` dict so :func:`~messagefoundry.transports.smart.with_smart_backend` can compose
-    SMART auth onto it (the dataclass stays frozen — only the dict is mutated)."""
+    SMART auth onto it (the dataclass stays frozen — only the dict is mutated).
+
+    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) are the declaration,
+    held outside the mutable ``settings``; why is in ``wiring_runner._fhir_lookup_settings``. They are
+    coherence-checked here too, so a spec built directly cannot attest without a reason."""
 
     name: str
     settings: dict[str, Any]
+    tls_revocation_attested: bool = False
+    tls_revocation_attested_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            _check_revocation_attestation(
+                self.tls_revocation_attested, self.tls_revocation_attested_reason
+            )
+        except ValueError as exc:
+            raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
 
 
 def FhirLookup(
@@ -928,10 +942,17 @@ def FhirLookup(
     )
     _refuse_attested_and_accepted(f"fhir lookup {name!r}", tls_hop_attested, cleartext_accepted)
     if tls_revocation_attested:
-        # The same keys _dest_config mirrors for an outbound, read by token_provider_from_settings.
+        # A copy for code that reads spec.settings. The executor never trusts it: it gets the typed
+        # fields below, re-mirrored by wiring_runner._fhir_lookup_settings.
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
-    spec = FhirLookupSpec(name, settings)
+        settings["tls_revocation_attested_connection"] = name
+    spec = FhirLookupSpec(
+        name,
+        settings,
+        tls_revocation_attested=tls_revocation_attested,
+        tls_revocation_attested_reason=tls_revocation_attested_reason,
+    )
     _active_registry().add_fhir_lookup(spec)
     return spec
 

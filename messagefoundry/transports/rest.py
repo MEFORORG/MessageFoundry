@@ -831,6 +831,7 @@ def refuse_unrevoked_verified_hop(
     revocation_attested: bool = False,
     revocation_attested_reason: str | None = None,
     opener: urllib.request.OpenerDirector | None = None,
+    connection: str | None = None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
 
@@ -851,7 +852,10 @@ def refuse_unrevoked_verified_hop(
     ``VERIFY_CRL_CHECK_LEAF`` on a per-hop opener — relaxes the gate instead of being refused with
     advice to configure the CRL it already has. **Callers that pass it must call this AFTER building
     the opener**; omitting it keeps the pre-#1498 behaviour, which is correct for a caller whose hop
-    rides the shared import-time opener that can carry no CRL."""
+    rides the shared import-time opener that can carry no CRL.
+
+    ``connection`` is the declaring connection's name, recorded in the audit line logged when an
+    attestation crosses the refusal, so the record leads back to the declaration (ADR 0173)."""
     if scheme != "https":
         return
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -861,6 +865,7 @@ def refuse_unrevoked_verified_hop(
         description="delivers over verified https but performs no certificate revocation checking",
         attested=revocation_attested,
         attested_reason=revocation_attested_reason,
+        connection=connection,
         context=None if opener is None else opener_tls_context(opener, connector=connector),
     ).enforce_construction()
 
@@ -1575,6 +1580,7 @@ class RestDestination(DestinationConnector):
                 connector="REST destination",
                 revocation_attested=config.tls_revocation_attested,
                 revocation_attested_reason=config.tls_revocation_attested_reason,
+                connection=config.name,
             )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It

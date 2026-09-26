@@ -270,6 +270,7 @@ class EmailDestination(DestinationConnector):
                 description="delivers over verified SMTP TLS but performs no certificate revocation checking",
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
+                connection=config.name,
                 context=self._tls_context,
             ).enforce_construction()
 
