@@ -652,9 +652,9 @@ HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery fai
 disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
-`max_header_bytes`), `400` (a malformed request line or header, or framing this listener will not guess at -- including at least any `Transfer-Encoding`, a duplicated or non-digit `Content-Length`, whitespace before a header colon, a folded header line, a bare CR or LF, a control character in a header value, an HTTP version other than 1.x, and a non-zero body declared on a method other than `POST`/`PUT`/`PATCH`), `411` (a `POST`/`PUT`/`PATCH` with no `Content-Length`; the body is never read to EOF), `503` (at
+`max_header_bytes`), `400` (a malformed request line or header, or framing this listener will not guess at -- including at least any `Transfer-Encoding`, a duplicated or non-digit `Content-Length`, whitespace before a header colon, a folded header line, a bare CR or LF, a control character in a header value, an HTTP version other than 1.x, a missing `Host` on any version but HTTP/1.0, more than one `Host`, and a non-zero body declared on a method other than `POST`/`PUT`/`PATCH`), `411` (a `POST`/`PUT`/`PATCH` with no `Content-Length`; the body is never read to EOF), `503` (at
 `max_connections` — the connection is accepted, then refused and closed at the application layer).
-`GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`. Methods are case-sensitive (RFC 9110), so a lowercase `get` or `post` is not a probe or an intake request.
+`GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`. A probe is held to the same head rules as any request, so an HTTP/1.1 probe must send one `Host` header. Methods are case-sensitive (RFC 9110), so a lowercase `get` or `post` is not a probe or an intake request.
 
 **Synchronous captured-downstream reply (`reply_from`, ADR 0154 increment B).** Naming `reply_from` makes
 the HTTP turn **block** until the named outbound's reply has been captured **and committed to the store**,
