@@ -651,12 +651,17 @@ def _render_batch(group: Sequence[tuple[str, tuple[Any, ...]]]) -> tuple[str, tu
     Two deliberate non-issues: (1) when the group's trailing read is the applock, the rendered batch
     carries TWO ``SET NOCOUNT ON`` (one prepended here, one inside ``_SQL_APPLOCK``) — idempotent and
     harmless, left as-is rather than string-surgery on a reliability-core constant. (2) ``SET NOCOUNT
-    ON`` is a session setting that persists on the pooled connection, but it does NOT corrupt the store's
-    ``cursor.rowcount``-dependent ops (mark_failed / purge / reset_stale_inflight): NOCOUNT suppresses the
-    informational "rows affected" *token*, while ``SQLRowCount`` for a directly-executed DML statement is
-    still populated — and the unbatched path already runs this same ``SET NOCOUNT ON`` (via the finalize
-    applock) on every handoff, so batching adds no new exposure. The SS-gated NOCOUNT-parity test guards
-    this."""
+    ON`` is a session setting that persists on the pooled connection. The unbatched path already runs
+    the same ``SET NOCOUNT ON`` (via the finalize applock) on every handoff, so batching adds no new
+    exposure.
+
+    **CORRECTED 2026-09-26 (ADR 0157 Inc 3, PR 1576 CI).** This docstring used to say NOCOUNT does
+    not corrupt the ``cursor.rowcount``-dependent ops because ``SQLRowCount`` is still populated. On
+    the hosted SQL Server legs a guarded UPDATE that matched NO row, run under ``SET NOCOUNT ON``, did
+    not report 0. So a reader that branches on a zero rowcount can take the wrong branch on a pooled
+    connection. The ADR 0075 parity test does not guard this: it does not pin the connection, it
+    asserts ``>= 1``, and it never runs a zero-match statement. The epoch fence was moved to an OUTPUT
+    rowset for this reason. The other rowcount readers were not examined."""
     parts = ["SET NOCOUNT ON;"]
     params: list[Any] = []
     for sql, p in group:
@@ -1933,10 +1938,8 @@ class SqlServerStore:
     # + postgres-store CI legs on PR #1078; the allow-list gate itself stays, for future backends.
     supports_reference_sets = True
     backend = StoreBackend.SQLSERVER
-    # H1 fence state (ADR 0157). Class-level defaults as well as the __init__ assignments, so a store
-    # built without __init__ (several offline suites use object.__new__) reads "no epoch armed". That
-    # keeps every claim and terminal resolve character-identical to pre-H1 for any caller that never
-    # calls set_leader_epoch, instead of raising AttributeError on the first resolve.
+    # H1 fence state (ADR 0157). Class defaults so a store built via object.__new__ (several offline
+    # suites) reads as unfenced, and its SQL stays character-identical, instead of raising.
     _leader_epoch: int | None = None
     _lease_key: str | None = None
 
@@ -3691,13 +3694,10 @@ class SqlServerStore:
     ) -> None:
         """Run a TERMINAL resolve UPDATE, raising :class:`_FencedWrite` when the fence rejected it.
 
-        When ``checked``, the UPDATE carries ``OUTPUT inserted.id`` and a rejection is an EMPTY output
-        rowset. It is never read from ``cursor.rowcount``: the finalize applock runs ``SET NOCOUNT ON``,
-        which persists on the pooled connection, and under it the row count is not reported, so a
-        rowcount check would let every fenced write land (measured on the hosted SQL Server legs). An
-        OUTPUT rowset is returned whatever NOCOUNT says. ``fetchall`` also drains it, so the next
-        statement on ``cur`` starts clean (EF-6). ``checked`` is False when no guard was spliced, so the
-        unfenced path reads nothing; a vanished row there is the no-op the callers already expect."""
+        When ``checked``, the UPDATE carries ``OUTPUT inserted.id`` and a rejection is an EMPTY rowset.
+        Never ``cursor.rowcount``: under the ``SET NOCOUNT ON`` pooled connections keep, a zero-match
+        UPDATE did not report 0 on the hosted SQL Server legs, so the fence never fired. ``checked`` is
+        False when no guard was spliced, so the unfenced path reads nothing."""
         await cur.execute(sql, params)
         if checked and not await cur.fetchall():
             raise _FencedWrite(method, ids)
@@ -8137,7 +8137,7 @@ class SqlServerStore:
                 # ADR 0157 C1: guard the DEAD branch ONLY. The retry branch returns the row to
                 # PENDING; fencing THAT would leave it INFLIGHT, turning a permitted duplicate into a
                 # forbidden strand. On the retry branch the suffix is "", so the statement and params
-                # are byte-identical to pre-Inc-3, and checked=False means the rowcount is never read.
+                # are byte-identical to pre-Inc-3, and checked=False means no result is read.
                 output, guard, guard_params = (
                     self._resolve_guard() if status == OutboxStatus.DEAD.value else ("", "", ())
                 )
@@ -8266,9 +8266,8 @@ class SqlServerStore:
         :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        output, guard, guard_params = (
-            self._resolve_guard()
-        )  # ADR 0157 C1: TERMINAL, once for the loop
+        # ADR 0157 C1: TERMINAL, once for the loop.
+        output, guard, guard_params = self._resolve_guard()
         all_ids = tuple(outbox_ids)  # a rejection re-pends ALL N, as in mark_batch_done
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:

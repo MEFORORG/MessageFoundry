@@ -312,11 +312,9 @@ async def test_fenced_batch_is_all_or_nothing_and_repends_every_member(store: An
 def _force_nocount(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """Run ``SET NOCOUNT ON`` on every cursor this store opens.
 
-    That is the production state, not a contrived one: the finalize applock opens with
-    ``SET NOCOUNT ON``, the setting is session-scoped, and a pooled connection keeps it. A fresh
-    test store has not run a finalize yet, so without this a fence test can pass against a row count
-    that production never sees. It did: the first Inc 3 build read ``cursor.rowcount``, every other
-    test here passed, and under NOCOUNT the fence never fired."""
+    That is the production state: the finalize applock opens with ``SET NOCOUNT ON`` and a pooled
+    connection keeps it. A fresh test store has not run a finalize yet, so without this a fence test
+    can pass against a row count production never sees."""
     real_cursor = store._cursor
 
     @asynccontextmanager
@@ -359,7 +357,6 @@ async def test_a_current_leaders_write_lands_under_nocount_on(
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
     assert await _ledger_count(store, claimed.id) == 1
     assert store.fenced_writes == 0
-    assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.INFLIGHT.value
 
 
 # --- C5: the UNORDERED claim path ------------------------------------------------------------

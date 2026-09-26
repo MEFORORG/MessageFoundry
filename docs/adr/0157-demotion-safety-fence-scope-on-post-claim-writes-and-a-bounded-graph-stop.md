@@ -652,7 +652,7 @@ corrected it. Two paths now resolve a fenced row in bounded time on SQL Server:
 Neither uses Inc 2's layers. Inc 2 as built still earns its place, but for a different strand: the
 rows a stopped worker leaves behind.
 
-**Tests.** `tests/test_adr0157_sqlserver_fence_offline.py` has 17 tests and is not gated, so it runs
+**Tests.** `tests/test_adr0157_sqlserver_fence_offline.py` has 16 tests and is not gated, so it runs
 on every leg. It holds the structural gate over every `queue` status write in `store/sqlserver.py`,
 the twin of `tests/test_adr0157_fence_scope.py`, and behaviour tests against fake cursors. Its fake
 cursor reports a row count of `-1` on every statement, as under NOCOUNT, so a fence that trusts

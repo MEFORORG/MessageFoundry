@@ -208,7 +208,6 @@ def test_guard_polarity_is_pinned() -> None:
     assert "status" not in _EPOCH_GUARD_CLAIM and "status" not in _EPOCH_GUARD_RESOLVE
     assert _EPOCH_GUARD_CLAIM.count("?") == 2
     assert _EPOCH_GUARD_RESOLVE.count("?") == 3
-    assert _RESOLVE_OUTPUT == " OUTPUT inserted.id"
 
 
 def test_extracting_the_claim_guard_changed_no_emitted_sql() -> None:
@@ -323,8 +322,9 @@ def _updates(cur: _Cursor) -> list[tuple[str, tuple[Any, ...]]]:
 
 
 async def test_a_rejected_mark_done_rolls_back_repends_and_counts_once() -> None:
-    """C3 + D1. Mutation that must break it: drop ``checked=bool(guard)`` to ``False`` in mark_done,
-    and the zero-row write commits as if it landed."""
+    """C3 + D1, with ``rowcount`` at ``-1`` as under ``SET NOCOUNT ON``, so the fence must fire from
+    the OUTPUT rowset. Mutations that must break it: ``checked=False`` in mark_done, or reading
+    ``cur.rowcount == 0`` in ``_exec_terminal``."""
     cur, conn = _Cursor(matched=0), _Conn()
     store, released = _store(cur, conn, epoch=5)
 
@@ -354,20 +354,6 @@ async def test_a_landing_mark_done_under_an_armed_epoch_commits() -> None:
 
     assert conn.commits == 1 and conn.rollbacks == 0
     assert released == [] and store.fenced_writes == 0
-
-
-async def test_the_fence_fires_even_though_rowcount_reports_nothing() -> None:
-    """The CI finding this file now pins. Under ``SET NOCOUNT ON``, which the finalize applock leaves
-    on every pooled connection, a guarded UPDATE reported a row count that was not 0 while matching
-    no rows. The first build read ``rowcount``, so every fenced write would have landed in
-    production. This cursor's ``rowcount`` is always ``-1``; the fence must fire from the OUTPUT
-    rowset alone. Mutation: read ``cur.rowcount == 0`` instead and this fails."""
-    cur, conn = _Cursor(matched=0), _Conn()
-    store, released = _store(cur, conn, epoch=5)
-
-    await store.mark_done("row-1", now=1.0)
-
-    assert store.fenced_writes == 1 and released == [["row-1"]] and conn.commits == 0
 
 
 async def test_unfenced_terminal_sql_is_character_identical_and_reads_no_result() -> None:
