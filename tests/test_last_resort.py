@@ -163,8 +163,11 @@ async def test_mllp_handler_exception_is_caught_and_redacted(
             reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
             writer.write(frame("MSH|^~\\&|s|f|r|rf|20260616||ADT^A01|1|P|2.5.1\rPID|1||x"))
             await writer.drain()
-            # the listener catches the handler error, logs it, and drops the connection → EOF
-            assert await asyncio.wait_for(reader.read(), timeout=5) == b""
+            # the listener catches the handler error, logs it, answers AE, then closes (BACKLOG
+            # #1619; it used to close with no reply). The NAK text is fixed, so no PHI.
+            nak = await asyncio.wait_for(reader.readuntil(b"\x1c"), timeout=5)
+            assert b"MSA|AE|1|" in nak
+            assert b"DOE" not in nak and b"JANE" not in nak
             writer.close()
             await writer.wait_closed()
         # the server survived — it still accepts a fresh connection

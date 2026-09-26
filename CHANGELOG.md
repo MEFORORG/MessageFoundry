@@ -108,6 +108,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **An MLLP listener now answers a store outage at intake with a NAK before it closes the
+  connection.** When the inbound handler faulted, for example because the store could not commit
+  the message, the listener closed the socket with no reply and logged the event as
+  `framing_error`. It now sends an `AE` (a `CE` in enhanced mode) with fixed text, then closes,
+  and records a new `handler_error` connection event. An inbound that sends no replies keeps its
+  socket, so frames already sent behind the failed one are still handled. The message is still
+  not accepted, and the sender resends it. The NAK has no message row, so it is not in the ACK
+  capture stream. ([BACKLOG #1619](docs/BACKLOG.md))
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
   `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other

@@ -279,6 +279,9 @@ _EVENT_KINDS = (
     "frame_oversize",
     "peer_reset",
     "framing_error",
+    # BACKLOG #1619 -- the MLLP listener's inbound handler faulted on a frame it read cleanly (a
+    # store outage at the ingress commit is the reachable case). Not a framing fault, so not that kind.
+    "handler_error",
     # BACKLOG #1662 — the DATABASE poll source, on a row it cannot turn into a body. The first
     # non-listener kind: a poll source has no peer, so its rows carry a NULL peer_host.
     "row_undecodable",
