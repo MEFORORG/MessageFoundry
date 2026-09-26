@@ -394,7 +394,9 @@ def _run_backup(tmp_path: Path, *, allow_unencrypted: bool) -> subprocess.Comple
 
     A child process, not ``main(argv)`` in-process: the whole question is what the PROCESS did about
     handlers, and running it in-process would answer it against pytest's handlers instead of the
-    subcommand's own empty list.
+    subcommand's own. (That was an empty list when this was written. This run passes ``--json``, so
+    main() now installs a filtered stderr sink first, per BACKLOG #1489, and the record must still
+    reach a handler.)
     """
     config = tmp_path / "config"
     config.mkdir()
@@ -464,16 +466,18 @@ def test_backup_subcommand_ships_its_failure_audit_row_off_box(tmp_path) -> None
     proc = _run_backup(tmp_path, allow_unencrypted=False)
 
     # POSITIVE CONTROL, and it is the discriminating one: this WARNING is emitted by the SAME
-    # process on the SAME handler-less root, and it reaches stderr through the standard library's
-    # last-resort handler. So stderr demonstrably works here, and an absent audit record is a real
-    # drop rather than a stream nobody could write to.
+    # process through the SAME root handler the audit record would reach. That root was
+    # handler-less when this test was written; this run passes `--json`, so it now gets main()'s
+    # filtered stderr sink (BACKLOG #1489). So stderr demonstrably works here,
+    # and an absent audit record is a real drop rather than a stream nobody could write to.
     assert proc.returncode == 1
     assert "ALERT backup_failed" in proc.stderr, proc.stderr
 
     records = _audit_records_in(proc.stderr)
     assert [r["action"] for r in records] == ["dr_backup"], (
-        "the WARNING on this process reached stderr but the tee's INFO record did not -- the "
-        f"last-resort handler is warning-only. stderr was:\n{proc.stderr}"
+        "the WARNING on this process reached stderr but the tee's INFO record did not -- an "
+        "INFO record needs a handler below WARNING, and the stdlib's last resort is warning-only. "
+        f"stderr was:\n{proc.stderr}"
     )
     # A prefix, not a nested `json.loads`: `safe_text` bounds `detail`'s LENGTH, so this row reaches
     # the wire truncated mid-string and is no longer parseable JSON. The content still travelled.
@@ -482,8 +486,10 @@ def test_backup_subcommand_ships_its_failure_audit_row_off_box(tmp_path) -> None
 
 @contextlib.contextmanager
 def _handlerless_process():
-    """Put the process into the shape every subcommand except serve and supervise starts in: no root
-    handler and no handler on ``messagefoundry.audit``. Both handler lists are restored on the way
+    """Put the process into the handler-less shape: no root handler and no handler on
+    ``messagefoundry.audit``. When written, every subcommand except serve and supervise dispatched in
+    this shape. Since BACKLOG #1441 ``__main__.main`` installs a root sink first, so this now models
+    a process that logs without going through ``main()``, such as a library caller or a script. Both handler lists are restored on the way
     out, so no later test inherits the stripped shape. (Only those two lists -- a test that calls
     ``configure_logging`` inside the block also re-levels the uvicorn loggers, which is the steady
     state any other caller leaves behind anyway.)

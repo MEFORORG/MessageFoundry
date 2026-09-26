@@ -4,11 +4,19 @@
 
 from __future__ import annotations
 
+import argparse
+import ast
+import contextlib
+import inspect
 import json
+import logging
+import textwrap
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
+import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import load_settings
 
@@ -3068,3 +3076,211 @@ def test_the_boot_path_reports_a_directory_service_config_without_a_traceback(
     """
     assert main([command, "--service-config", str(tmp_path)]) == 2
     assert capsys.readouterr().err.startswith("error: ")
+
+
+# --- BACKLOG #1441: every non-serve subcommand logs through the PHI filter chain ----------------
+#
+# Before this fix, only `serve` and `supervise` (and any `--json` run) installed a root handler. Every
+# other subcommand ran with none, so a WARNING-or-above record went to the standard library's
+# `logging.lastResort`: no filters, no formatter, straight to stderr as written. These tests put the
+# process into that shape and plant a synthetic PID segment. No real PHI.
+
+_SYNTHETIC_PID = "PID|1||123456^^^HOSP^MR||DOE^JANE^Q||19800101|F"
+# Two fragments of the segment that redaction must remove. Either one surviving is a leak.
+_PID_FRAGMENTS = ("123456^^^HOSP", "DOE^JANE")
+#: What main() is allowed to leave alone, because the subcommand configures logging itself. Pinned
+#: here as an exact set so adding a name to the exemption is a visible edit to this file.
+_SELF_CONFIGURING = frozenset({"serve", "supervise"})
+
+
+@contextlib.contextmanager
+def _handlerless_root() -> Iterator[logging.Logger]:
+    """Strip the root logger to the shape a real CLI process starts in: no handlers at all.
+
+    Entered inside the test BODY, not as a fixture: pytest's logging plugin re-attaches its capture
+    handlers to the root logger at the start of each test phase, so a fixture that strips them in
+    setup would watch them come back for the call (the same measurement
+    ``tests/test_audit_offbox_tee.py::_handlerless_process`` records). Both the handler list and the
+    level are restored on the way out, which also removes whatever main() installed."""
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    root.handlers.clear()
+    try:
+        yield root
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def _phi_logging_probe(seen: dict[str, object]) -> Callable[[argparse.Namespace], int]:
+    """A stand-in subcommand body: records the root handlers it runs under, then logs one WARNING
+    whose message AND attached traceback both carry the synthetic segment."""
+
+    def probe(args: argparse.Namespace) -> int:
+        seen["handlers"] = list(logging.getLogger().handlers)
+        log = logging.getLogger("messagefoundry.store")
+        try:
+            raise ValueError(f"row rejected: {_SYNTHETIC_PID}")
+        except ValueError:
+            log.warning("probe: could not persist %s", _SYNTHETIC_PID, exc_info=True)
+        return 0
+
+    return probe
+
+
+def _assert_redacted_on_stderr(capsys: pytest.CaptureFixture[str], command: str) -> None:
+    captured = capsys.readouterr()
+    err = captured.err
+    # The control: the record DID reach stderr. Without it an absent line would pass as redacted.
+    assert "probe: could not persist" in err, (
+        f"`{command}`: the WARNING never reached stderr: {err!r}"
+    )
+    assert "row rejected" in err, f"`{command}`: the traceback never reached stderr: {err!r}"
+    for fragment in _PID_FRAGMENTS:
+        assert fragment not in err, (
+            f"`{command}` logged a WARNING with the synthetic PID segment unredacted, so it ran with "
+            f"no filtered root handler (BACKLOG #1441). stderr was:\n{err}"
+        )
+    assert "[redacted]" in err
+    # stdout is the data channel; a diagnostic must never land there.
+    assert captured.out == "", f"`{command}` wrote a log record to stdout: {captured.out!r}"
+
+
+def test_backup_warning_is_redacted_through_the_real_argument_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The measured case from the ledger row, through real argparse and real dispatch. Only the
+    subcommand body is replaced, so the record is deterministic."""
+    seen: dict[str, object] = {}
+    monkeypatch.setitem(cli_module._DISPATCH, "backup", _phi_logging_probe(seen))
+    argv = ["backup", "--db", str(tmp_path / "x.db"), "--destination", str(tmp_path / "out")]
+    with _handlerless_root():
+        assert main(argv) == 0
+    _assert_redacted_on_stderr(capsys, "backup")
+    # Exactly one sink, so the record is printed once, not once per handler.
+    handlers = seen["handlers"]
+    assert isinstance(handlers, list) and len(handlers) == 1
+
+
+@pytest.mark.parametrize("command", sorted(set(cli_module._DISPATCH) - _SELF_CONFIGURING))
+def test_every_subcommand_logs_through_the_phi_filter_chain(
+    command: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The guard against a NEW subcommand skipping the handler. It walks ``_DISPATCH`` itself, so a
+    subcommand added tomorrow is covered the day it is registered, with no edit here.
+
+    ``parse_args`` is patched to return just the command, because every subparser has its own
+    required arguments and this test is about what main() does around dispatch, not argparse."""
+    seen: dict[str, object] = {}
+    monkeypatch.setitem(cli_module._DISPATCH, command, _phi_logging_probe(seen))
+    monkeypatch.setattr(
+        argparse.ArgumentParser,
+        "parse_args",
+        lambda self, args=None, namespace=None: argparse.Namespace(command=command),
+    )
+    with _handlerless_root():
+        assert main([command]) == 0
+    _assert_redacted_on_stderr(capsys, command)
+    # Exactly one sink, so a record prints once. A second handler would double every line.
+    handlers = seen["handlers"]
+    assert isinstance(handlers, list) and len(handlers) == 1
+
+
+def _calls(function: Callable[..., object], name: str) -> bool:
+    """Whether ``function``'s body contains a real call to ``name``. An AST walk, so a comment or a
+    docstring mentioning the name does not count, as it would for a substring search."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    return any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+        for node in ast.walk(tree)
+    )
+
+
+def test_the_logging_exemption_covers_only_subcommands_that_configure_their_own() -> None:
+    """An exemption from main()'s handler is only safe for a subcommand that installs the chain
+    itself. Pin the set, and prove each member really calls ``configure_logging``, so the exemption
+    cannot be used as a way to skip the chain.
+
+    What this does NOT prove is that the call comes before the subcommand's first log record. It
+    does not for ``serve``, whose pre-configure window is the residual named at
+    ``_CONFIGURES_OWN_LOGGING``."""
+    assert cli_module._CONFIGURES_OWN_LOGGING == _SELF_CONFIGURING
+    # Both controls read THIS test: it calls `_calls`, and it names configure_logging only in its
+    # docstring and a message string, which must not count as a call.
+    this_test = test_the_logging_exemption_covers_only_subcommands_that_configure_their_own
+    assert _calls(this_test, "_calls")
+    assert not _calls(this_test, "configure_logging")
+    for command in _SELF_CONFIGURING:
+        assert _calls(cli_module._DISPATCH[command], "configure_logging"), (
+            f"`{command}` is exempt from main()'s filtered stderr handler but does not call "
+            "configure_logging, so it would log through the unfiltered logging.lastResort."
+        )
+
+
+@pytest.mark.parametrize("command", sorted(_SELF_CONFIGURING))
+def test_main_really_consults_the_exemption(command: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half of the pin above: main() must READ the set. Without this, a main() that
+    stopped checking it would still pass every other test here, since they all skip these names."""
+    seen: dict[str, object] = {}
+    monkeypatch.setitem(cli_module._DISPATCH, command, _phi_logging_probe(seen))
+    monkeypatch.setattr(
+        argparse.ArgumentParser,
+        "parse_args",
+        lambda self, args=None, namespace=None: argparse.Namespace(command=command),
+    )
+    with _handlerless_root():
+        assert main([command]) == 0
+    assert seen["handlers"] == [], f"main() installed a sink for exempt `{command}`"
+
+
+def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Path) -> None:
+    """The fix rests on one premise: a real ``python -m messagefoundry`` process reaches main() with
+    NO root handler, so main() installs its sink. Every in-process test above creates that shape by
+    hand. This runs a child, not ``--json`` (which has its own path, #1489), so the premise is
+    measured. If an import ever started adding a root handler, main() would skip its sink and the
+    in-process tests would stay green."""
+    import subprocess
+    import sys
+
+    driver = tmp_path / "warn_in_a_subcommand.py"
+    driver.write_text(
+        "import logging\n"
+        "import messagefoundry.__main__ as m\n"
+        "def _probe(args):\n"
+        "    print('handlers-at-dispatch', len(logging.getLogger().handlers))\n"
+        f"    logging.getLogger('messagefoundry.store').warning('probe: %s', {_SYNTHETIC_PID!r})\n"
+        "    return 0\n"
+        "print('handlers-before-main', len(logging.getLogger().handlers))\n"
+        "m._DISPATCH['hl7schema'] = _probe\n"
+        "raise SystemExit(m.main(['hl7schema']))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(driver)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stderr}"
+    assert "handlers-before-main 0" in proc.stdout, proc.stdout
+    assert "handlers-at-dispatch 1" in proc.stdout, proc.stdout
+    assert "probe: PID|" in proc.stderr, f"the WARNING never reached stderr: {proc.stderr!r}"
+    for fragment in _PID_FRAGMENTS:
+        assert fragment not in proc.stderr + proc.stdout, proc.stderr
+
+
+def test_a_host_that_already_configured_logging_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """main() adds a sink only when the root has NONE. A process that already has one, an embedding
+    host or pytest's own capture, keeps its handlers. That is also why the `caplog` tests in this
+    suite keep capturing: replacing the root handlers would empty them, as the ledger row measured."""
+    seen: dict[str, object] = {}
+    monkeypatch.setitem(cli_module._DISPATCH, "backup", _phi_logging_probe(seen))
+    before = list(logging.getLogger().handlers)
+    with caplog.at_level(logging.WARNING):
+        assert main(["backup"]) == 0
+    assert seen["handlers"] == before  # what the subcommand ran under
+    assert list(logging.getLogger().handlers) == before
+    assert any("probe: could not persist" in r.getMessage() for r in caplog.records)

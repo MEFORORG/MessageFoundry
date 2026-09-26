@@ -1,7 +1,7 @@
 [build-system]
 # EXACT `==`, in lockstep with the engine's table. The reason is stated once, above that table in the
 # root pyproject.toml.
-requires = ["hatchling==1.32.0"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 # Second distribution: the MessageFoundry TEST HARNESS, published alongside the engine in lockstep
@@ -76,13 +76,14 @@ Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTIN
 # (BACKLOG #1702). Sub-directories are still mapped whole and recurse, so only the top level is listed.
 #
 # DO NOT REACH FOR `exclude` HERE. It cannot fix this, and that is measured rather than assumed.
-# hatchling 1.32.0's `recurse_forced_files` (hatchling/builders/plugin/interface.py) never calls
-# `include_path`, so a force-included file is filtered only by hatchling's own EXCLUDED_FILES and
-# EXCLUDED_DIRECTORIES -- every file-selection option is inert over it. `exclude = ["CLAUDE.md"]` was
-# added beside the whole-directory mapping and the wheel BUILT AND LISTED: 101 members, with
-# `harness/CLAUDE.md` still among them, identical to the build without it. `include` and `only-include`
-# are dead here for the same reason. Enumerating is the only route. (The ENGINE'S root pyproject.toml
-# does use `exclude` for its own nested CLAUDE.md, because its package tree is walked, not mapped.)
+# hatchling 1.32.0's `recurse_forced_files` (hatchling/builders/plugin/interface.py; unchanged at the
+# 1.32.4 pin, see tests/_force_include.py) never calls `include_path`, so a force-included file is
+# filtered only by hatchling's own EXCLUDED_FILES and EXCLUDED_DIRECTORIES -- every file-selection
+# option is inert over it. `exclude = ["CLAUDE.md"]` was added beside the whole-directory mapping and
+# the wheel BUILT AND LISTED: 101 members, with `harness/CLAUDE.md` still among them, identical to the
+# build without it. `include` and `only-include` are dead here for the same reason. Enumerating is the
+# only route. (The ENGINE'S root pyproject.toml does use `exclude` for its own nested CLAUDE.md,
+# because its package tree is walked, not mapped.)
 #
 # THE COST, IN BOTH DIRECTIONS. A NEW top-level file or directory under harness/ does not ship until it
 # is added here. And an entry left behind after its file is deleted is WORSE than not shipping: hatchling
