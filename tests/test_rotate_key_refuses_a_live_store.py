@@ -122,5 +122,85 @@ def test_the_probe_does_not_create_a_store(tmp_path: Path) -> None:
     from messagefoundry.__main__ import _sqlite_store_held_elsewhere
 
     missing = tmp_path / "absent.db"
-    assert not _sqlite_store_held_elsewhere(str(missing))
+    probe = _sqlite_store_held_elsewhere(str(missing))
+    assert not probe.held and probe.unchecked is not None
     assert not missing.exists()
+
+
+def test_a_path_with_uri_characters_is_probed_as_the_file_it_names(tmp_path: Path) -> None:
+    """The probe builds a URI, so `#`, `?` and `%` in a path must reach the same file."""
+    from messagefoundry.__main__ import _sqlite_store_held_elsewhere
+
+    odd = tmp_path / "a#b%c d"
+    odd.mkdir()
+    db = odd / "s.db"
+    holder = sqlite3.connect(db)
+    try:
+        holder.execute("PRAGMA journal_mode=WAL")
+        holder.execute("CREATE TABLE audit_log (x)")
+        holder.commit()
+        holder.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+        assert _sqlite_store_held_elsewhere(str(db)).held
+    finally:
+        holder.close()
+    assert _sqlite_store_held_elsewhere(str(db)) == (False, None, False)
+
+
+def test_a_rollback_journal_store_is_reported_unchecked_not_free(tmp_path: Path) -> None:
+    """Outside WAL an idle connection holds no lock, so a free probe proves nothing there."""
+    from messagefoundry.__main__ import _sqlite_store_held_elsewhere
+
+    db = tmp_path / "delete-mode.db"
+    idle = sqlite3.connect(db)
+    try:
+        idle.execute("CREATE TABLE audit_log (x)")
+        idle.commit()
+        probe = _sqlite_store_held_elsewhere(str(db))
+    finally:
+        idle.close()
+    assert not probe.held
+    assert probe.unchecked is not None and "journal mode" in probe.unchecked, probe
+
+
+def test_a_zero_byte_file_is_refused_not_keyed_as_a_new_store(
+    rotation: tuple[Path, str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty file is a valid empty SQLite database; opening it would build a new store in it."""
+    db, _a, _b = rotation
+    empty = db.with_name("typo.db")
+    empty.write_bytes(b"")
+    assert main(["rotate-key", "--db", str(empty)]) == 2
+    assert "no audit_log table" in capsys.readouterr().err
+    assert empty.stat().st_size == 0, "a refused rotation must write nothing"
+
+
+def test_a_server_backend_store_prints_the_note_rather_than_passing_silently(
+    rotation: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """PostgreSQL and SQL Server expose no lock the probe can read, so the command must say so."""
+    from messagefoundry.config import settings as settings_mod
+    from messagefoundry.config.settings import ServiceSettings, StoreBackend
+    from messagefoundry.store import base as store_base
+
+    db, _a, _b = rotation
+    real = settings_mod.load_settings
+
+    def as_postgres(*args: object, **kwargs: object) -> ServiceSettings:
+        got = real(*args, **kwargs)  # type: ignore[arg-type]
+        store = got.store.model_copy(update={"backend": StoreBackend.POSTGRES})
+        return got.model_copy(update={"store": store})
+
+    reached: list[bool] = []
+
+    async def no_server(_settings: object) -> None:
+        reached.append(True)
+        raise NotImplementedError("test stub: no server is reached")
+
+    monkeypatch.setattr(settings_mod, "load_settings", as_postgres)
+    monkeypatch.setattr(store_base, "open_store", no_server)
+    assert main(["rotate-key", "--db", str(db)]) == 2
+    err = capsys.readouterr().err
+    assert "could not check for a running engine" in err and "postgres store" in err, err
+    assert reached, "the note warns and goes on; it must not turn into a refusal"

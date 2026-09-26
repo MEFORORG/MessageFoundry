@@ -2575,50 +2575,47 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     # BACKLOG #1945: `current` is where NEW rows go, and settle_audit_ranges moves that to the active
     # key when the chain's own current range is under a key that is not configured. Read as the
     # chain's state, a dropped key looked like "already under the active key", and this reported OK
-    # over a chain audit-verify calls broken. The chain's own answer is the last key its ranges name;
-    # on a trusted chain that list is never empty.
+    # over a chain audit-verify calls broken. The chain's own answer is the last key its ranges name.
+    # Settle leaves that list non-empty on a trusted chain; the fallback covers a host it never ran on.
+    # Past the check below the two names agree, since settle moves `current` only off a missing key.
     recorded = host._audit_range_keys[-1] if host._audit_range_keys else current
     out_secret = _audit_secret_for(recorded, host._audit_mac_keys, host._audit_mac_fn)
     if out_secret is None:
+        # Worded for an empty range too, which audit-verify still passes: the range cannot be closed,
+        # and the first row added to it will not verify.
         return False, (
             f"the audit chain's current range (from id={current_from}) is keyed under audit key "
-            f"{recorded!r}, which is not configured, so audit-verify reports the chain broken; "
-            "restore that key to MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run"
+            f"{recorded!r}, which is not configured, so the range cannot be closed and rows added to "
+            "it do not verify. Configure that key again (a store key goes back in "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED) and re-run"
         )
-
-    async def verified() -> tuple[Sequence[Mapping[str, Any]], bool, str | None]:
-        rows = await host._audit_rows(AUDIT_ALL_ROWS)
-        ok, msg = verify_audit_rows(
-            rows,
-            keyed_from=host._audit_keyed_from,
-            first_key_id=host._audit_first_key_id,
-            mac_keys=host._audit_mac_keys,
-            mac_fn=host._audit_mac_fn,
-            capable=host._audit_mac_key is not None or host._audit_mac_fn is not None,
-        )
-        return rows, ok, msg
-
-    if current == active_id:
-        # Nothing to roll, but OK here is read as "the rotation is done", so it must not stand over
-        # a chain audit-verify would fail (BACKLOG #1945).
-        _rows, ok, msg = await verified()
-        if not ok:
-            return False, f"the audit chain is under the active key but does not verify: {msg}"
-        return True, f"audit chain already under the active key (range from id={current_from})"
-    if active_id in host._audit_range_keys:
+    if current != active_id and active_id in host._audit_range_keys:
         return False, (
             "the active store key already keyed an earlier audit range, and a key opens one range "
             "only; rotate to a NEW key rather than back to a previous one"
         )
     # ONE read, verified and sealed from the same rows, so the closing record cannot describe a
-    # different chain from the one the verify passed.
-    rows, ok, msg = await verified()
+    # different chain from the one the verify passed. The no-op below verifies too: its OK is read
+    # as "the rotation is done", so it must not stand over a chain audit-verify fails (#1945).
+    rows = await host._audit_rows(AUDIT_ALL_ROWS)
+    ok, msg = verify_audit_rows(
+        rows,
+        keyed_from=host._audit_keyed_from,
+        first_key_id=host._audit_first_key_id,
+        mac_keys=host._audit_mac_keys,
+        mac_fn=host._audit_mac_fn,
+        capable=host._audit_mac_key is not None or host._audit_mac_fn is not None,
+    )
     if not ok:
+        if current == active_id:
+            return False, f"the audit chain is under the active key but does not verify: {msg}"
         return False, f"refusing to roll a broken audit chain: {msg}"
+    if current == active_id:
+        return True, f"audit chain already under the active key (range from id={current_from})"
     split = bisect.bisect_left([int(r["id"]) for r in rows], current_from)
     closes = audit_range_closing(
         rows[split:],
-        key_id=current,
+        key_id=recorded,
         from_id=current_from,
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
