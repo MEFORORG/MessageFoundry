@@ -567,7 +567,7 @@ def test_a_roll_up_that_is_the_only_failing_job_is_still_named() -> None:
 def test_a_cancelled_sibling_is_never_named_as_the_cause() -> None:
     """The merge queue cancels siblings on the way out, so counting one would misattribute every
     ejection -- the same rule the job's own `if:` applies to the run."""
-    cancelled = {
+    cancelled: dict[str, object] = {
         "name": "test (ubuntu-latest, py3.14)",
         "conclusion": "cancelled",
         "steps": [{"name": "Tests (pytest)", "conclusion": "cancelled"}],

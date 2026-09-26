@@ -158,7 +158,7 @@ def test_the_dicom_factory_still_rejects_an_unknown_key() -> None:
     """Positive control on the reachability tests above. If the factory swallowed arbitrary keywords,
     each of those assertions would pass without the parameter existing at all."""
     with pytest.raises(TypeError):
-        wiring.DICOM(ae_title="AE", mefor_no_such_intake_key_1114=1.0)
+        wiring.DICOM(ae_title="AE", mefor_no_such_intake_key_1114=1.0)  # type: ignore[call-arg]
 
 
 def test_the_dicom_factory_default_is_still_off() -> None:

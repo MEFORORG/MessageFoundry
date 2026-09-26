@@ -127,15 +127,15 @@ class MessageSearchRequest(RequestModel):
     """
 
     content: SearchText | None = None
-    field_path: str | None = Field(None, max_length=32)
+    field_path: str | None = Field(default=None, max_length=32)
     field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
     channel_id: ConnectionName | None = None
     status: StatusFilter | None = None
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(50, ge=1, le=500)
-    scan_limit: int | None = Field(None, ge=1)
+    limit: int = Field(default=50, ge=1, le=500)
+    scan_limit: int | None = Field(default=None, ge=1)
 
 
 class MessageExportRequest(MessageSearchRequest):
@@ -144,7 +144,7 @@ class MessageExportRequest(MessageSearchRequest):
     to the export route's own ceiling."""
 
     ids: list[ResourceId] = Field(default_factory=list, max_length=MAX_EXPORT_IDS)
-    limit: int = Field(1000, ge=1, le=100_000)
+    limit: int = Field(default=1000, ge=1, le=100_000)
 
 
 class UploadedMessageSearchRequest(RequestModel):
@@ -153,13 +153,13 @@ class UploadedMessageSearchRequest(RequestModel):
     :class:`MessageSearchRequest` rather than a subclass of it."""
 
     content: SearchText | None = None
-    field_path: str | None = Field(None, max_length=32)
+    field_path: str | None = Field(default=None, max_length=32)
     field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(50, ge=1, le=500)
-    offset: int = Field(0, ge=0)
+    limit: int = Field(default=50, ge=1, le=500)
+    offset: int = Field(default=0, ge=0)
 
 
 class OutboxInfo(PhiGatedModel):
@@ -1569,14 +1569,14 @@ class SearchPresetCriteria(RequestModel):
     rest and every save/recall is step-up-gated + audited."""
 
     content: SearchText | None = None
-    field_path: str | None = Field(None, max_length=32)
+    field_path: str | None = Field(default=None, max_length=32)
     field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
     channel_id: ConnectionName | None = None
     status: StatusFilter | None = None
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(50, ge=1, le=500)
+    limit: int = Field(default=50, ge=1, le=500)
 
 
 class SearchPresetInfo(BaseModel):

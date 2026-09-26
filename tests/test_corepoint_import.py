@@ -15,7 +15,6 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry import corepoint_import
 from messagefoundry.checks import run_checks
 from messagefoundry.corepoint_import import (
     Action,
@@ -596,7 +595,7 @@ def test_parse_export_converts_a_recursion_error_from_json_loads(
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")
 
-    monkeypatch.setattr(corepoint_import.json, "loads", _raise_recursion)
+    monkeypatch.setattr("messagefoundry.corepoint_import.json.loads", _raise_recursion)
     with pytest.raises(CorepointImportError, match="nested too deeply"):
         parse_export('{"channels": []}')
 

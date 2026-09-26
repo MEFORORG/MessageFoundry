@@ -11,7 +11,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any
@@ -647,7 +647,7 @@ def test_json_formatter_includes_redacted_exception() -> None:
     assert "ValueError" in obj["exception"] and "RuntimeError" in obj["exception"]
 
 
-def _has(filters: list[logging.Filter], cls: type) -> bool:
+def _has(filters: Sequence[object], cls: type) -> bool:
     return any(isinstance(f, cls) for f in filters)
 
 

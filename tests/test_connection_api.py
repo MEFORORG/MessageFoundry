@@ -509,7 +509,7 @@ class _RaisingOpener:
 def _http_dest(cls: type, exc: Exception):
     ctype = ConnectorType.REST if cls is RestDestination else ConnectorType.SOAP
     dest = cls(Destination(name="OB", type=ctype, settings={"url": "https://x.example/api"}))
-    dest._opener = _RaisingOpener(exc)  # type: ignore[attr-defined]
+    dest._opener = _RaisingOpener(exc)
     return dest
 
 

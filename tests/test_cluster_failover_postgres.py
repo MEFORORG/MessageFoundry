@@ -328,19 +328,19 @@ async def test_resumed_ex_leader_is_fenced_after_real_handover(coords) -> None:
     assert b_epoch is not None and b_epoch > a_epoch  # fresh acquire advanced the fencing token
 
     # One queued head on a single FIFO lane.
-    mid = await store.enqueue_message(  # type: ignore[attr-defined]
+    mid = await store.enqueue_message(
         channel_id="IB", raw=_RAW, deliveries=[("OB1", "p")], now=100.0
     )
 
     # A resumes past its temporal self-fence holding the STALE epoch — the durable fence must reject it.
-    store.set_leader_epoch(a_epoch, lease_key=lease_key)  # type: ignore[attr-defined]
-    assert await store.claim_next_fifo("OB1", now=200.0) is None  # type: ignore[attr-defined]
-    outbox = await store.outbox_for(mid)  # type: ignore[attr-defined]
+    store.set_leader_epoch(a_epoch, lease_key=lease_key)
+    assert await store.claim_next_fifo("OB1", now=200.0) is None
+    outbox = await store.outbox_for(mid)
     assert outbox[0]["status"] == OutboxStatus.PENDING.value  # head untouched — A delivered nothing
     assert outbox[0]["attempts"] == 0  # the rejected claim didn't even bump attempts
 
     # The current leader (B's epoch) claims the same head: the lane is intact, only the live leader drains.
-    store.set_leader_epoch(b_epoch, lease_key=lease_key)  # type: ignore[attr-defined]
-    claimed = await store.claim_next_fifo("OB1", now=201.0)  # type: ignore[attr-defined]
+    store.set_leader_epoch(b_epoch, lease_key=lease_key)
+    claimed = await store.claim_next_fifo("OB1", now=201.0)
     assert claimed is not None and claimed.message_id == mid
-    await store.mark_done(claimed.id, now=202.0)  # type: ignore[attr-defined]
+    await store.mark_done(claimed.id, now=202.0)

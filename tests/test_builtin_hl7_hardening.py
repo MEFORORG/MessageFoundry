@@ -385,7 +385,7 @@ class _CountingScanner:
         self._pattern = pattern
         self.iterations = 0
 
-    def finditer(self, text: str):  # type: ignore[no-untyped-def]
+    def finditer(self, text: str):
         for match in self._pattern.finditer(text):  # type: ignore[attr-defined]
             self.iterations += 1
             yield match
@@ -547,7 +547,8 @@ async def test_over_budget_message_records_error_and_naks_before_any_ingress_row
     assert rows[0]["status"] == MessageStatus.ERROR.value
     assert "escape expansion exceeds budget" in rows[0]["error"]
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue")
-    assert (await cur.fetchone())["n"] == 0  # nothing reached the ingress stage
+    count = await cur.fetchone()
+    assert count is not None and count["n"] == 0  # nothing reached the ingress stage
 
 
 async def test_under_budget_message_still_reaches_the_ingress_stage(store: MessageStore) -> None:

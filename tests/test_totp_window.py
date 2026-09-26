@@ -26,6 +26,7 @@ don't pass one)."""
 from __future__ import annotations
 
 import hmac
+from typing import Any
 
 import pytest
 
@@ -156,9 +157,9 @@ class _CompareCounter:
         self.calls = 0
         self._real = hmac.compare_digest
 
-    def __call__(self, a: object, b: object) -> bool:
+    def __call__(self, a: Any, b: Any) -> bool:  # Any: compare_digest is overloaded str/buffer
         self.calls += 1
-        return bool(self._real(a, b))  # type: ignore[arg-type]
+        return bool(self._real(a, b))
 
 
 def _compare_count(code: str, *, now: float, window: int, monkeypatch: pytest.MonkeyPatch) -> int:

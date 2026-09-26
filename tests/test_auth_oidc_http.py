@@ -27,12 +27,18 @@ from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
 from messagefoundry.auth.trust_anchors import TrustAnchorError
 
 
+def _handlers(opener: urllib.request.OpenerDirector) -> list[Any]:
+    # `handlers` is a real instance attribute that typeshed does not declare.
+    handlers: list[Any] = vars(opener)["handlers"]
+    return handlers
+
+
 def _handler_types(opener: urllib.request.OpenerDirector) -> set[str]:
-    return {type(h).__name__ for h in opener.handlers}
+    return {type(h).__name__ for h in _handlers(opener)}
 
 
 def _https_context(opener: urllib.request.OpenerDirector) -> ssl.SSLContext:
-    https = next(h for h in opener.handlers if type(h).__name__ == "HTTPSHandler")
+    https = next(h for h in _handlers(opener) if type(h).__name__ == "HTTPSHandler")
     return https._context  # noqa: SLF001 - the context is not otherwise reachable
 
 

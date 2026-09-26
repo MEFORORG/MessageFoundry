@@ -707,11 +707,10 @@ async def test_file_validate_directory_leave_mode_requires_only_read(
     # A leave-in-place source (#142) never writes to the poll dir, so validate_directory checks READ
     # only — a read-only share passes. Force the write probe to fail: leave mode must NOT call it (so it
     # still passes), while a move-mode source on the same dir DOES fail (write required).
-    import messagefoundry.transports.file as filemod
-
     inbox = tmp_path / "ro"
     inbox.mkdir()
-    monkeypatch.setattr(filemod.tempfile, "mkstemp", _raise_locked)  # any write probe raises
+    # Any write probe raises. A dotted target, because the module does not re-export `tempfile`.
+    monkeypatch.setattr("messagefoundry.transports.file.tempfile.mkstemp", _raise_locked)
     leave = FileSource(
         Source(
             type=ConnectorType.FILE,

@@ -32,8 +32,8 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     active_hop_posture,
 )
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline.wiring_runner import (
-    WiringError,
     _inbound_insecure_bind_permitted,
     check_dimse_tls_exposure,
     check_http_tls_exposure,

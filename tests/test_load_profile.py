@@ -182,10 +182,11 @@ def test_closed_loop_profile_sweeps_concurrency_with_conformance_slo() -> None:
         assert ph.loop == "closed"
         assert ph.concurrency is not None and ph.concurrency >= 1
     # The measured (sustained) phases step concurrency upward to find the throughput ceiling.
-    measured = [ph.concurrency for ph in p.phases if ph.measured]
+    # `is not None` narrows only; the loop above already asserted every phase has a concurrency.
+    measured = [ph.concurrency for ph in p.phases if ph.measured and ph.concurrency is not None]
     assert len(measured) >= 2 and measured == sorted(measured)
     # The sender pool must exceed the highest concurrency, or the pool (not the engine) is the cap.
-    assert p.pool_size > max(c for c in measured if c is not None)
+    assert p.pool_size > max(measured)
     # Conformance-tier SLO only: zero loss enforced, no throughput floor (throughput is measured here).
     assert p.default_slo.zero_loss is True
     assert p.default_slo.min_sustained_msg_s is None

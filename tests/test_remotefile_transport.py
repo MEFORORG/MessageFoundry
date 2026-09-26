@@ -1344,7 +1344,7 @@ async def test_dest_probe_ensures_dir(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_dest_probe_permanent_error_is_negative_ack(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _FakeClient()
 
-    def _boom(remote_dir: str) -> None:
+    def _boom(remote_dir: str) -> bool:
         raise _RemoteError("auth failed", permanent=True)
 
     client.ensure_dir = _boom  # type: ignore[method-assign]

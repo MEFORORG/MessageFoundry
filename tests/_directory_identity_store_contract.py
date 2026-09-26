@@ -299,11 +299,9 @@ async def _assert_username_compare_is_byte_exact(store: Any) -> None:
     # The control: a byte-identical collision IS refused, so the success below is a fact about case
     # rather than about the guard being absent.
     await store.set_user_username("case-mover", "Alice", now=2_000.0)
-    assert (
-        await store.get_user(  # type: ignore[union-attr]
-            "case-mover"
-        )
-    ).username == "bob", "the guard did not refuse a byte-identical collision"
+    assert (await store.get_user("case-mover")).username == "bob", (
+        "the guard did not refuse a byte-identical collision"
+    )
 
     await store.set_user_username("case-mover", "alice", now=3_000.0)
     moved = await store.get_user("case-mover")

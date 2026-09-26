@@ -44,7 +44,7 @@ ADT_A01 = (
 )
 
 
-def _registry(route, handlers, *, strict: bool = False, accepts=None) -> Registry:  # type: ignore[no-untyped-def]
+def _registry(route, handlers, *, strict: bool = False, accepts=None) -> Registry:
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
@@ -139,22 +139,22 @@ def handle_fhir(msg: Message) -> Send:
     return Send("out", msg)
 
 
-def _handler_invocation(trace: dict) -> dict:  # type: ignore[type-arg]
+def _handler_invocation(trace: dict) -> dict:
     return next(inv for inv in trace["invocations"] if inv["kind"] == "handler")
 
 
-def _router_invocation(trace: dict) -> dict:  # type: ignore[type-arg]
+def _router_invocation(trace: dict) -> dict:
     return next(inv for inv in trace["invocations"] if inv["kind"] == "router")
 
 
-def _all_assigned(inv: dict) -> dict:  # type: ignore[type-arg]
+def _all_assigned(inv: dict) -> dict:
     out: dict = {}
     for ev in inv["events"]:
         out.update(ev.get("assigned", {}))
     return out
 
 
-def _all_writes(inv: dict) -> list:  # type: ignore[type-arg]
+def _all_writes(inv: dict) -> list:
     return [w for ev in inv["events"] for w in ev.get("writes", [])]
 
 
@@ -203,7 +203,7 @@ def test_routed_to_never_invents_a_name_the_run_did_not_route_to() -> None:
     Found by an independent review of the first cut, which shipped exactly that coercion.
     """
     for returned in (b"h", bytearray(b"h"), memoryview(b"h"), range(2)):
-        reg = _registry(lambda msg, r=returned: r, {"h": handle_transform})  # type: ignore[misc]
+        reg = _registry(lambda msg, r=returned: r, {"h": handle_transform})
         traced = trace_dry_run(reg, ADT_A01)
         inv = _router_invocation(traced)
         assert inv["routed_to"] == [], f"{returned!r} invented {inv['routed_to']}"
@@ -284,7 +284,7 @@ def test_routed_to_still_declines_to_drain_a_generator_router() -> None:
     assert traced["handlers"] == plain.handlers == ["h"]
 
 
-def _two_out_registry(handle) -> Registry:  # type: ignore[no-untyped-def]
+def _two_out_registry(handle) -> Registry:
     """``_registry`` plus a second outbound, so a fan-out has two distinguishable destinations."""
     reg = _registry(route_to_h, {"h": handle})
     reg.add_outbound(
@@ -418,7 +418,7 @@ def test_gate_live_fhir_lookup_identical_and_annotated() -> None:
 
 
 def test_gate_coverage_intact_prev_tracer_restored() -> None:
-    def sentinel(frame, event, arg):  # type: ignore[no-untyped-def]
+    def sentinel(frame, event, arg):
         return sentinel
 
     prev = sys.gettrace()
@@ -542,7 +542,7 @@ def _write_config(tmp_path: Path) -> tuple[str, str]:
     return str(cfg), str(msg)
 
 
-def test_cli_trace_flag_emits_json(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+def test_cli_trace_flag_emits_json(tmp_path: Path, capsys) -> None:
     cfg, msg = _write_config(tmp_path)
     rc = main(["dryrun", "--config", cfg, "--messages", msg, "--trace", "--json"])
     assert rc == 0
@@ -558,7 +558,7 @@ def test_cli_trace_flag_emits_json(tmp_path: Path, capsys) -> None:  # type: ign
     assert assigned.get("mrn") == "REDACTED"
 
 
-def test_cli_trace_show_phi(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+def test_cli_trace_show_phi(tmp_path: Path, capsys) -> None:
     cfg, msg = _write_config(tmp_path)
     rc = main(["dryrun", "--config", cfg, "--messages", msg, "--trace", "json", "--show-phi"])
     assert rc == 0
