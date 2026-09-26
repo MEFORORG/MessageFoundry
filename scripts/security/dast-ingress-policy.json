@@ -6,10 +6,10 @@
     "cases_per_plane": "measured mllp 58 (40 catalogue + 18 mutations), tcp 9, x12 15 (9 catalogue + 6 mutations)",
     "min_frames_decoded": "measured tcp 7 and x12 9 (6 catalogue + 3 mutation)",
     "min_mllp_frames_decoded": "measured 54 (36 catalogue + 18 mutation)",
-    "min_mllp_accepted_replies": "measured 39 (25 catalogue)",
-    "min_mllp_rejected_replies": "measured 10 in the catalogue (14 with mutations) after merging engine PR 1583, up from 8, because both blank-segment frames then got a NAK. Re-measured 9 in the catalogue (13 with mutations) on 2026-09-26 with engine PR 1579 merged: BACKLOG #1594 drops the empty line, so the blank-segment frame that decodes is now accepted (catalogue accepted replies 25 -> 26) and only its invalid-UTF-8 face is NAKed. The floor follows the catalogue's own count to 9, because the frame's correct reply moved, so a mutation draw cannot trip it",
+    "min_mllp_accepted_replies": "measured 39 (25 catalogue). Re-measured 40 (26 catalogue) on 2026-09-26 with engine PR 1579 merged, because the blank-segment frame that decodes is now accepted",
+    "min_mllp_rejected_replies": "measured 10 in the catalogue (14 with mutations) after merging engine PR 1583, up from 8, because both blank-segment frames then got a NAK. Re-measured 9 in the catalogue (13 with mutations) on 2026-09-26 with engine PR 1579 merged. BACKLOG #1594 drops the empty line, so the blank-segment frame that decodes is now accepted. Only its invalid-UTF-8 face is still NAKed. The floor follows the catalogue's own count down to 9, because that frame's correct reply changed. A mutation draw still cannot trip it",
     "min_liveness_probes": "measured 82, one per case",
-    "min_log_records_seen": "measured 32 INFO+ engine records; the floor only proves the watch was fed",
+    "min_log_records_seen": "measured 32 INFO+ engine records. Re-measured 22 on 2026-09-26 with engine PR 1579 merged, because the blank-segment frames no longer fault the handler and log it. The floor only proves the watch was fed",
     "resource_bounds": "measured heap growth between -50695 and +19628 bytes, handles +0 to +2, tasks +0 over 2 passes across four runs; the leak canary measured heap +8413697 and handles +32",
     "wall_seconds": "measured about 7 for the seeded run"
   },

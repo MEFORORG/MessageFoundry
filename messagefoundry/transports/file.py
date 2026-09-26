@@ -141,12 +141,18 @@ def render_filename(template: str, payload: str, *, fallback: str) -> str:
             return fallback
         try:
             value = peek.field(match.group(1))
-        except PEEK_READ_FAULTS:
+        except PEEK_READ_FAULTS as exc:
             # A read on an accepted peek is not expected to raise. A blank segment once made it raise
             # IndexError, and uncaught that escaped send() outside the DeliveryError contract
             # (BACKLOG #1623). BACKLOG #1594 fixed the blank segment at the parse; this catch stays
             # for any other parser fault, the same family the pre-ACK callers catch. A name that
-            # cannot be read takes the fallback.
+            # cannot be read takes the fallback, and the log says so, because a silent fallback
+            # hides a parser fault. The path comes from operator config; no field value is logged.
+            logger.warning(
+                "FILE filename placeholder {%s} read raised %s; using the fallback name",
+                match.group(1),
+                type(exc).__name__,
+            )
             value = None
         return _sanitize(value) if value else fallback
 

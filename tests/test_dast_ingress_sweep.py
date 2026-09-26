@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.mllpcodec import frame
-from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT
+from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT, MLLPSource
 from scripts.security.dast_ingress_sweep import (
     KNOWN_DEFECT_DISCRIMINATORS,
     Budget,
@@ -39,7 +39,12 @@ from scripts.security.dast_ingress_sweep import (
     reference_frames,
     run_case,
 )
-from scripts.security.dast_ingress_target import CANARIES, CANARY_DETECTOR, ingress_target
+from scripts.security.dast_ingress_target import (
+    CANARIES,
+    CANARY_DETECTOR,
+    MLLP_INBOUND,
+    ingress_target,
+)
 
 _REPO = Path(__file__).resolve().parents[1]
 _POLICY_PATH = _REPO / "scripts" / "security" / "dast-ingress-policy.json"
@@ -311,6 +316,34 @@ async def test_a_blank_segment_among_pipelined_frames_is_answered_like_any_other
         result = await _run_alone(Case(name, "mllp", payload), _budget())
         assert (result.handled, result.accepted, result.rows, result.faults) == (2, 2, 2, 0), result
         assert not result.findings, result.findings
+
+
+async def test_a_live_handler_fault_is_recognised_and_never_tolerated() -> None:
+    """Live control for the handler-fault branch, so it is not tested only against hand-built bytes.
+    The MLLP handler raises on one frame, so the listener sends its real BACKLOG #1619 NAK and closes.
+    If that NAK's text or shape drifts, the sweep would go blind to handler faults; this reds instead."""
+    fault_body = b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|FAULT1|P|2.5.1\rPID|1\r"
+    after = b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|AFTER1|P|2.5.1\rPID|1\r"
+    settings = dict(_policy()["posture"], canary_stall_seconds=1.0)
+    async with ingress_target(settings) as target:
+        mllp = target.runner._sources[MLLP_INBOUND]
+        assert isinstance(mllp, MLLPSource) and mllp._handler is not None
+        real = mllp._handler
+
+        async def _fault_on_one(raw: bytes) -> str | None:
+            if b"FAULT1" in raw:
+                raise RuntimeError("injected handler fault")
+            return await real(raw)
+
+        mllp._handler = _fault_on_one
+        result = await run_case(
+            target, Case("fault-first", "mllp", frame(fault_body) + frame(after)), _budget()
+        )
+    assert (result.faults, result.first_fault, result.handled) == (1, 0, 1), result
+    assert any(
+        f["detector"] == "reply" and "inbound handler" in f["detail"] for f in result.findings
+    ), result.findings
+    assert result.known_defect == "", result
 
 
 def test_a_handler_fault_is_never_tolerated() -> None:

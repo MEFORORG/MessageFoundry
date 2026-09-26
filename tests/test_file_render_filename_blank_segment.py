@@ -15,12 +15,13 @@ Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Win
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.parsing.peek import PEEK_READ_FAULTS, Peek
+from messagefoundry.parsing.peek import Peek
 from messagefoundry.transports.file import FileDestination, render_filename
 
 # A blank segment between MSH and PID: the "\r\r" used to fault every field read.
@@ -28,7 +29,8 @@ _BLANK_SEGMENT = (
     "MSH|^~\\&|SND|FAC|RCV|FAC|20260101120000||ADT^A01|CTL1623|P|2.5.1\r\rPID|1||12345\r"
 )
 
-#: One concrete type from each family ``PEEK_READ_FAULTS`` names, so the catch is pinned to all three.
+#: One concrete type from each family ``PEEK_READ_FAULTS`` names. The fallback tests below go red for
+#: any of them the catch in ``file.py`` stops covering, which is what pins the catch to all three.
 _FAULTS = (IndexError, TypeError, ValueError)
 
 
@@ -56,11 +58,6 @@ def _destination(tmp_path: Path) -> FileDestination:
     )
 
 
-def test_every_injected_fault_is_one_the_catch_names() -> None:
-    """Otherwise a fault type could be tested here that the guard in ``file.py`` does not claim."""
-    assert all(issubclass(fault, PEEK_READ_FAULTS) for fault in _FAULTS)
-
-
 def test_a_blank_segment_names_its_file_by_msh10() -> None:
     """BACKLOG #1594: the blank line is dropped at the parse, so MSH-10 reads and names the file."""
     assert Peek.parse(_BLANK_SEGMENT).field("MSH-10") == "CTL1623"
@@ -76,13 +73,18 @@ def test_the_injected_fault_really_faults_a_field_read(faulting_read: type[Excep
 
 
 def test_render_filename_falls_back_when_the_field_read_faults(
-    faulting_read: type[Exception],
+    faulting_read: type[Exception], caplog: pytest.LogCaptureFixture
 ) -> None:
     """Mutation: remove the ``except PEEK_READ_FAULTS`` around the field read. Red: the injected
-    fault escapes."""
-    assert render_filename("{MSH-10}.hl7", _BLANK_SEGMENT, fallback="message.hl7") == (
-        "message.hl7.hl7"
-    )
+    fault escapes. The fallback is logged by fault type and placeholder, never by the fault's text."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        assert render_filename("{MSH-10}.hl7", _BLANK_SEGMENT, fallback="message.hl7") == (
+            "message.hl7.hl7"
+        )
+    [record] = [r for r in caplog.records if r.name == "messagefoundry.transports.file"]
+    assert record.levelno == logging.WARNING
+    assert faulting_read.__name__ in record.getMessage() and "MSH-10" in record.getMessage()
+    assert "injected" not in record.getMessage()
 
 
 async def test_send_delivers_under_the_fallback_name(

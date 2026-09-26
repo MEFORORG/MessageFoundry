@@ -14,9 +14,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   heap, handle and task growth, and no message content logged at INFO or above. Each detector has a
   canary that must trip it. The seeded run and the canaries run in the existing required test legs.
   A new advisory `dast-ingress` job in `dast.yml` adds a nightly randomized budget. The first run
-  found three engine defects, each pinned by a strict xfail and not fixed here. A blank segment faults
-  the inbound handler; that one is now fixed (`BACKLOG #1594`), and its tests assert the fixed
-  behaviour. An alphanumeric MSH-1 gets an ACK whose MSA-1 cannot be read.
+  found three engine defects, each pinned by a strict xfail. A blank segment faulted the inbound
+  handler; `BACKLOG #1594` has since fixed that, and its tests now assert the fix (see Fixed).
+  An alphanumeric MSH-1 gets an ACK whose MSA-1 cannot be read.
   The raw-TCP and X12 listeners have no frame deadline. See ADR 0155's 2026-09-26 amendment.
   (`BACKLOG #318`)
 - **Dual control now flags a release whose approver account is new or was just taken over, and an
@@ -120,6 +120,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A message with a blank line between segments is now accepted and recorded, not dropped.** A
+  sender that ends segments with CRLF and adds an empty line produced an empty segment. Every field
+  read on it raised, so the MLLP listener wrote no row and sent no ACK or NAK. The parser now drops
+  empty segment lines before it reads, so the message is ACKed `AA` and recorded `RECEIVED`. The
+  stored raw keeps the blank line. A parsed `Message` does not, so a Handler's re-encoded output has
+  no blank line. A field read that still faults for another reason records `ERROR` and NAKs `AR`.
+  (`BACKLOG #1594`)
 - **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
   stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
   stage stopped draining while intake kept acknowledging, and the engine still read healthy. The

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import NoReturn
@@ -290,19 +291,22 @@ async def test_a_faulting_peek_read_is_the_runners_ar_not_the_listeners_handler_
     await source.start(_handler)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
-        replies = []
-        for _ in range(2):  # the second frame proves the connection stayed open
-            writer.write(frame(_SHAPES["control"]))
-            await writer.drain()
-            replies.append(await asyncio.wait_for(reader.readuntil(bytes([EB, CR])), 3.0))
-        writer.close()
-        await writer.wait_closed()
+        try:
+            for index in range(2):  # the second frame proves the connection stayed open
+                writer.write(frame(_SHAPES["control"]))
+                await writer.drain()
+                reply = b""  # a closed socket reads as no reply, and the assert below names it
+                with contextlib.suppress(ConnectionError, asyncio.IncompleteReadError):
+                    reply = await asyncio.wait_for(reader.readuntil(bytes([EB, CR])), 3.0)
+                assert _HANDLER_FAILURE_NAK_TEXT.encode() not in reply, (index, reply)
+                assert b"MSA|AR|" in reply and b"peek read failed" in reply, (index, reply)
+        finally:
+            writer.close()
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
     finally:
         await asyncio.wait_for(source.stop(), timeout=5.0)
 
-    for reply in replies:
-        assert b"MSA|AR|" in reply and b"peek read failed" in reply, reply
-        assert _HANDLER_FAILURE_NAK_TEXT.encode() not in reply, reply
     assert "handler_error" not in events, events
     rows = await _rows(store)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
