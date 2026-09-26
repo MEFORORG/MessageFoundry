@@ -267,7 +267,19 @@ class DirectDestination(DestinationConnector):
         self._recipient_cert = _load_cert(
             "recipient_cert", _read_file("recipient_cert", s.get("recipient_cert"))
         )
-        _require_key_strength(self._recipient_cert.public_key(), "recipient_cert")
+        recipient_key = self._recipient_cert.public_key()
+        # RSA only, because the envelope is. The pinned cryptography's PKCS7EnvelopeBuilder raises
+        # `TypeError: Only RSA keys are supported at this time` for any other recipient key, so an EC
+        # cert would construct cleanly and then fail every send (BACKLOG #1918). The signer and the
+        # trust anchor are NOT restricted: add_signer and verify_directly_issued_by both take EC.
+        if not isinstance(recipient_key, rsa.RSAPublicKey):
+            kind = "EC" if isinstance(recipient_key, ec.EllipticCurvePublicKey) else "non-RSA"
+            raise ValueError(
+                f"Direct destination 'recipient_cert' carries an {kind} public key; S/MIME "
+                "encryption here supports only RSA recipient keys, so every send would fail. "
+                "Supply the partner's RSA encryption certificate."
+            )
+        _require_key_strength(recipient_key, "recipient_cert")
         # Trust anchor — the CA(s) the recipient cert must chain to. Verified at construction so a cert
         # from an untrusted issuer is refused before we ever encrypt PHI to it.
         self._verify_recipient_trusted(_read_file("trust_anchor", s.get("trust_anchor")))

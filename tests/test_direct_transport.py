@@ -865,6 +865,76 @@ def test_an_unapproved_ec_curve_is_refused(pki: dict[str, Any], tmp_path: Path) 
         DirectDestination(_dest(pki, signing_cert=str(cert_p), signing_key=str(key_p)))
 
 
+# --- recipient key type: RSA only, refused at construction (BACKLOG #1918) ---------------------------
+#
+# The pinned cryptography's PKCS7EnvelopeBuilder does RSA key transport and nothing else. An EC
+# recipient cert used to pass construction (it clears the EC curve list) and then fail every send.
+# The refusal is scoped to the recipient: the signer and the trust anchor take EC, and are pinned so
+# below, because the library limit is on the ENVELOPE and not on the key type in general.
+
+
+def _ec_recipient(pki: dict[str, Any], tmp_path: Path) -> str:
+    _, cert = _mint_ec_leaf("ec-recipient@hisp.example", pki["ca_key"], pki["ca_cert"])
+    path = tmp_path / "ec_recip.crt"
+    _write_pem(path, cert)
+    return str(path)
+
+
+def test_an_ec_recipient_cert_is_refused_at_construction(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="recipient_cert.*RSA"):
+        DirectDestination(_dest(pki, recipient_cert=_ec_recipient(pki, tmp_path)))
+
+
+def test_pkcs7_envelope_builder_still_refuses_an_ec_recipient(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    """Library-drift tripwire for the refusal above. If a later cryptography envelopes to an EC
+    recipient, this fails, and the construction refusal is refusing a partner the library could now
+    serve -- re-read BACKLOG #1918 before widening it."""
+    _, cert = _mint_ec_leaf("ec-recipient@hisp.example", pki["ca_key"], pki["ca_cert"])
+    with pytest.raises(TypeError, match="Only RSA"):
+        pkcs7.PKCS7EnvelopeBuilder().set_data(b"synthetic").add_recipient(cert)
+
+
+def test_an_ec_trust_anchor_issuing_an_rsa_recipient_still_constructs(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # POSITIVE CONTROL: the refusal is about the ENVELOPE target, not EC anywhere in the chain. An EC
+    # CA signing an RSA recipient verifies with verify_directly_issued_by on the pinned library.
+    ca_key = ec.generate_private_key(ec.SECP384R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "EC Direct CA")])
+    now = datetime.datetime.now(datetime.UTC)
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA384())
+    )
+    recip_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    recip_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "rsa-recip")]))
+        .issuer_name(ca_name)
+        .public_key(recip_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(ca_key, hashes.SHA384())
+    )
+    anchor_p = tmp_path / "ec_ca.crt"
+    recip_p = tmp_path / "rsa_recip_of_ec_ca.crt"
+    _write_pem(anchor_p, ca_cert)
+    _write_pem(recip_p, recip_cert)
+    DirectDestination(_dest(pki, recipient_cert=str(recip_p), trust_anchor=str(anchor_p)))
+
+
 # --- library-capability tripwire for BACKLOG #1168 --------------------------------------------------
 
 # ASVS 11.3.1 fails on this connector for a reason that lives OUTSIDE this repository, and #1168

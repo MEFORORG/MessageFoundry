@@ -1823,7 +1823,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `signing_cert` | — (required) | path to the sender's PEM/DER signing **certificate** |
 | `signing_key` | — (required) | path to the sender's PEM/DER signing **private key** |
 | `signing_key_password` | — | passphrase for an encrypted `signing_key` — a **secret**, via `env()` |
-| `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target) |
+| `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target). Must carry an **RSA** key: the S/MIME envelope supports RSA key transport only, so an EC certificate is refused at construction |
 | `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to |
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
 | `subject` | `""` | static `Subject` |
@@ -1834,8 +1834,9 @@ these messages, and the SMTP relay accepts them before anyone tries.
 
 **Fail-loud at construction.** Every piece of crypto material is loaded and cross-checked when the connector
 is built — so `messagefoundry check` / dry-run / start catches it, never the first message: a malformed
-key/cert, a `signing_key` whose public half **does not match** `signing_cert`, and a `recipient_cert` **not
-issued by** any supplied `trust_anchor` (PHI is never encrypted to a certificate from an untrusted issuer).
+key/cert, a `signing_key` whose public half **does not match** `signing_cert`, a `recipient_cert` whose key
+is **not RSA**, and a `recipient_cert` **not issued by** any supplied `trust_anchor` (PHI is never encrypted
+to a certificate from an untrusted issuer).
 The trust check is deliberately **one level** (the recipient cert chains directly to a supplied anchor, or is
 a self-signed correspondent cert pinned as its own anchor) — full multi-level path building is deferred. No
 hostname/SAN match is done: a Direct address is an email, not a TLS SNI. Errors name the *setting* only,
