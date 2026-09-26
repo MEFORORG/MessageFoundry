@@ -1791,12 +1791,40 @@ class AuthService:
         public_origin: str,
     ) -> LoginOutcome:
         """Redeem a staged flow: pop it (single-use), constant-time-compare ``state``, then run the
-        full exchange + verification through :meth:`authenticate_oidc`.
+        full exchange + verification through :meth:`_authenticate_oidc`.
 
         The flow cache stays private to the service, so route code never holds the PKCE verifier or
         the nonce. A missing/expired flow and a ``state`` mismatch are both audited with closed-set
         slugs and are deliberately indistinguishable to the caller.
+
+        **This is the THIRD challenge seam, and every failed outcome is held to a fixed deadline**
+        (BACKLOG #1947, ASVS 6.3.8), the same wrapper shape as :meth:`login` and
+        :meth:`authenticate_kerberos`. ``GET /ui/oidc/callback`` calls this method and nothing else,
+        so the pad is sited here rather than in the route. The inner leg calls
+        :meth:`_authenticate_oidc`, not the public wrapper, so one challenge is padded once.
+
+        What it removes: the refusals after the token exchange (``federated_subject_not_bound``, the
+        disabled and locked checks, ``not_in_directory``, the directory outage) cost different store
+        and directory work, and each now answers at one instant. What it does NOT remove: a slow IdP
+        can push the post-exchange refusals into a later slot than the pre-exchange ones
+        (``state_unknown``, ``state_mismatch``). That split tells the caller whether its own flow
+        cookie and ``state`` were good, which it already knows, and nothing about any account.
         """
+        started = time.monotonic()
+        outcome = await self._complete_oidc_login(
+            flow_id=flow_id, state=state, code=code, client=client, public_origin=public_origin
+        )
+        return await self._equalize_failure(outcome, started, seam="oidc")
+
+    async def _complete_oidc_login(
+        self,
+        *,
+        flow_id: str,
+        state: str,
+        code: str,
+        client: str | None,
+        public_origin: str,
+    ) -> LoginOutcome:
         if not self.oidc_enabled or self._oidc_flows is None:
             await self._directory_reject_audit("<oidc>", "oidc", "not_configured")
             return LoginOutcome(
@@ -1811,7 +1839,8 @@ class AuthService:
         if not oidc.state_matches(flow.state, state):
             await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch")
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
-        return await self.authenticate_oidc(
+        # The INNER leg: the public wrapper would pad a second time inside this challenge's pad.
+        return await self._authenticate_oidc(
             code,
             flow,
             redirect_uri=self._oidc_redirect_uri(public_origin),
@@ -1819,6 +1848,27 @@ class AuthService:
         )
 
     async def authenticate_oidc(
+        self,
+        code: str,
+        flow: PendingFlow,
+        *,
+        redirect_uri: str,
+        client: str | None = None,
+    ) -> LoginOutcome:
+        """Complete a federated login, with every failed outcome held to a fixed deadline.
+
+        A public entry point in its own right, so it pads its own failures (BACKLOG #1947, ASVS
+        6.3.8) rather than relying on :meth:`complete_oidc_login` to do it. The body is
+        :meth:`_authenticate_oidc`; the wrapper shape is :meth:`login`'s, so a refusal added there
+        later inherits the pad instead of quietly escaping it.
+        """
+        started = time.monotonic()
+        outcome = await self._authenticate_oidc(
+            code, flow, redirect_uri=redirect_uri, client=client
+        )
+        return await self._equalize_failure(outcome, started, seam="oidc")
+
+    async def _authenticate_oidc(
         self,
         code: str,
         flow: PendingFlow,

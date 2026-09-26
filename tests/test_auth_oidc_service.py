@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from typing import Any
@@ -1431,5 +1433,141 @@ async def test_an_unbind_tells_the_holder(rsa_key: rsa.RSAPrivateKey) -> None:
         [notice] = [e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_UNBOUND]
         assert notice.username == "jdoe"
         assert "S-1-alice" not in str(notice.detail)
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1947 (ASVS 6.3.8): every failed federated challenge answers at a fixed deadline -------
+#
+# ``login`` and ``authenticate_kerberos`` held their failures to ``_equalize_failure``; the two OIDC
+# entry points did not, so a refusal after the token exchange (an unbound pair, a disabled or locked
+# row, an account the directory no longer holds) answered at a different instant from one before it.
+# These tests read which seam padded and how often, never the wall clock: the pad's one sleep site is
+# replaced, so nothing here waits.
+
+
+class _PadSpy:
+    """Records each seam the service padded under, and replaces the sleep so nothing waits."""
+
+    def __init__(self, service: AuthService, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.seams: list[str] = []
+        real = service._equalize_failure
+
+        async def spy(outcome: LoginOutcome, started: float, *, seam: str) -> LoginOutcome:
+            if not outcome.ok:
+                self.seams.append(seam)
+            return await real(outcome, started, seam=seam)
+
+        async def no_sleep(_deadline: float) -> None:
+            return None
+
+        monkeypatch.setattr(service, "_equalize_failure", spy)
+        monkeypatch.setattr("messagefoundry.auth.service._sleep_until", no_sleep)
+
+
+def _verified(subject: str = DEFAULT_SUB) -> oidc.FederatedPrincipal:
+    now = time.time()
+    return oidc.FederatedPrincipal(
+        username="jdoe",
+        subject=subject,
+        issuer="https://idp.example",
+        amr=("pwd", "mfa"),
+        acr=None,
+        expires_at=now + 600,
+        auth_time=now,
+    )
+
+
+async def _callback(
+    service: AuthService, *, flow_id: str | None = None, state: str | None = None
+) -> LoginOutcome:
+    """Drive the callback leg the way ``GET /ui/oidc/callback`` does: stage a flow, then redeem it."""
+    staged_id, url = await service.begin_oidc_login(
+        client="127.0.0.1", public_origin="https://ops.example"
+    )
+    staged_state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
+    return await service.complete_oidc_login(
+        flow_id=staged_id if flow_id is None else flow_id,
+        state=staged_state if state is None else state,
+        code=AUTH_CODE,
+        client="127.0.0.1",
+        public_origin="https://ops.example",
+    )
+
+
+@pytest.mark.parametrize(
+    ("branch", "reason"),
+    [
+        ("flow_unknown", "state_unknown"),
+        ("state_mismatch", "state_mismatch"),
+        ("not_bound", FEDERATED_SUBJECT_NOT_BOUND),
+        ("not_in_directory", "not_in_directory"),
+        ("idp_down", "idp_unavailable"),
+    ],
+)
+async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, branch: str, reason: str
+) -> None:
+    """The branches span both sides of the token exchange, which is the split #1947 is about.
+
+    Exactly ONE pad per challenge: the callback's inner leg calls ``_authenticate_oidc`` and not the
+    public wrapper, so a second pad cannot stack inside the first."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(None if branch == "not_in_directory" else PRINCIPAL)
+        service = await _service(store, rsa_key, ldap=ldap)
+        spy = _PadSpy(service, monkeypatch)
+
+        def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
+            if branch == "idp_down":
+                raise urllib.error.URLError("idp down")
+            return _verified("S-1-nobody" if branch == "not_bound" else DEFAULT_SUB)
+
+        monkeypatch.setattr(service, "_exchange_and_validate", exchange)
+        out = await _callback(
+            service,
+            flow_id="no-such-flow" if branch == "flow_unknown" else None,
+            state="wrong-state" if branch == "state_mismatch" else None,
+        )
+        assert not out.ok and out.reason == reason
+        assert spy.seams == ["oidc"]
+    finally:
+        await store.close()
+
+
+async def test_a_successful_callback_is_not_padded(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A success has already told the caller the account exists; padding it only slows sign-in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        spy = _PadSpy(service, monkeypatch)
+        monkeypatch.setattr(service, "_exchange_and_validate", lambda *_a, **_k: _verified())
+        out = await _callback(service)
+        assert out.ok, out
+        assert spy.seams == []
+    finally:
+        await store.close()
+
+
+async def test_authenticate_oidc_pads_its_own_refusals(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``authenticate_oidc`` is public, so it pads itself rather than relying on its caller: both
+    the cheapest refusal (federation off, no work at all) and one past the exchange."""
+    store = await MessageStore.open(":memory:")
+    try:
+        off = AuthService(store, AuthSettings())
+        off_spy = _PadSpy(off, monkeypatch)
+        out = await off.authenticate_oidc(AUTH_CODE, _flow(), redirect_uri="https://ops.example/cb")
+        assert not out.ok and out.reason == "not_configured"
+        assert off_spy.seams == ["oidc"]
+
+        service = await _service(store, rsa_key, bind=None)
+        spy = _PadSpy(service, monkeypatch)
+        out = await _oidc_login(service, monkeypatch, rsa_key)
+        assert not out.ok and out.reason == FEDERATED_SUBJECT_NOT_BOUND
+        assert spy.seams == ["oidc"]
     finally:
         await store.close()
