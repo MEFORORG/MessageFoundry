@@ -65,6 +65,12 @@ def _file_source(directory: Path, **over: Any) -> FileSource:
     return src
 
 
+async def _settle(src: FileSource) -> None:
+    """Take the settle poll (BACKLOG #1811). A file's first sighting only records its stat and charges
+    nothing, so the scan after this one is the one these ceiling tests measure."""
+    await src._scan_once()
+
+
 def _drop(directory: Path, count: int, *, first: int = 0) -> None:
     """Write ``count`` numbered HL7 files. Zero-padded so name order is numeric order, which is the
     source's default ``sort`` — a test that could not predict the order could not name the leftovers."""
@@ -95,6 +101,7 @@ async def test_file_scan_stops_at_the_ceiling_and_leaves_the_rest_in_place(
     src = _file_source(inbox)  # no operator configuration at all — the shipped default applies
     handler = _RecordingHandler()
     src._handler = handler
+    await _settle(src)
     with caplog.at_level(logging.INFO, logger=_FILE_LOGGER):
         await src._scan_once()
     assert len(handler.bodies) == 3
@@ -116,7 +123,11 @@ async def test_file_second_scan_drains_the_deferred_files(
 
     Red mutation: make the ceiling drop its overflow (quarantine or unlink the untouched candidates at
     the break). The first scan still reports three hand-offs, and only this test goes red — the second
-    scan finds nothing and the last two messages never arrive."""
+    scan finds nothing and the last two messages never arrive.
+
+    Second red mutation (BACKLOG #1811): charge the settle wait against the budget. The settle poll then
+    records only three files, the two deferred ones are first seen on the second scan, and only three
+    messages arrive. A deferred file must not have to settle twice."""
     from messagefoundry.transports import file as file_mod
 
     monkeypatch.setattr(file_mod, "DEFAULT_MAX_ITEMS_PER_POLL", 3)
@@ -126,6 +137,8 @@ async def test_file_second_scan_drains_the_deferred_files(
     src = _file_source(inbox)
     handler = _RecordingHandler()
     src._handler = handler
+    await _settle(src)
+    assert handler.bodies == []
     await src._scan_once()
     await src._scan_once()
     assert len(handler.bodies) == 5  # every file, once — nothing dropped, nothing duplicated
@@ -151,6 +164,7 @@ async def test_file_scan_below_the_ceiling_is_unchanged(
     handler = _RecordingHandler()
     src._handler = handler
     with caplog.at_level(logging.INFO, logger=_FILE_LOGGER):
+        await _settle(src)
         await src._scan_once()
     assert len(handler.bodies) == 3
     assert _pending(inbox) == []
@@ -190,6 +204,7 @@ async def test_file_unlimited_scan_takes_everything(
     src = _file_source(inbox, poll_max_files=0)
     handler = _RecordingHandler()
     src._handler = handler
+    await _settle(src)
     await src._scan_once()
     assert len(handler.bodies) == 5
     assert _pending(inbox) == []
@@ -226,6 +241,7 @@ async def test_file_stuck_files_do_not_charge_the_ceiling(
     src = _file_source(inbox)
     handler = _RecordingHandler()
     src._handler = handler
+    await _settle(src)
     await src._scan_once()
     assert [b.decode() for b in handler.bodies] == [_ADT.format(n=3), _ADT.format(n=4)]
     assert _pending(inbox) == ["a_locked1.hl7", "a_locked2.hl7"]  # still there, still retryable
@@ -253,6 +269,7 @@ async def test_a_tick_in_progress_stops_when_the_source_stops(tmp_path: Path) ->
         return None
 
     src._handler = handler
+    await _settle(src)
     await src._scan_once()
     assert len(seen) == 2, "the scan ignored the stop signal and drained the whole directory"
     assert len(_pending(inbox)) == 5, "the unscanned remainder must be left in place"
