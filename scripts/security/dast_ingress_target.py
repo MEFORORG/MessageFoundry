@@ -109,6 +109,25 @@ class IngressTarget:
         assert isinstance(source, MLLPSource | TcpSource | X12Source), type(source)
         return source._active
 
+    def connection_tasks(self) -> int:
+        """Per-connection listener tasks still running on this loop, released or not.
+
+        A listener drops ``_active`` BEFORE it closes the socket and writes the ``closed`` event, so
+        a connection can be released and its task still alive, holding a socket, until the store
+        write lands. The resource snapshot waits on this so a slow store write is not read as growth.
+        Matched on each listener's own ``_on_client`` read with no default, so a rename raises rather
+        than making the wait return at once.
+        """
+        names = set()
+        for source in self.runner._sources.values():
+            assert isinstance(source, MLLPSource | TcpSource | X12Source), type(source)
+            names.add(type(source)._on_client.__qualname__)
+        return sum(
+            1
+            for task in asyncio.all_tasks()
+            if not task.done() and getattr(task.get_coro(), "__qualname__", "") in names
+        )
+
 
 def _free_ports(count: int) -> list[int]:
     """``count`` distinct loopback ports the OS has just handed out.
