@@ -111,7 +111,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
+from messagefoundry.store.gcm_bound import (
+    bounded_cipher,
+    checkpoint_invocations,
+    reserve_invocations_ahead,
+)
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -120,6 +124,7 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport
+from messagefoundry.store.schema_verify import verify_live_schema
 
 log = logging.getLogger(__name__)
 
@@ -4387,6 +4392,16 @@ class MessageStore:
             # can reach this connection yet.
             async with _writer_txn(db, asyncio.Lock()):
                 await cls._migrate(db)
+                # BACKLOG #1720: every CREATE is IF NOT EXISTS and every migration is additive, so an
+                # object an incompatible version left under an expected name was skipped, not fixed.
+                # Checked before the commit, so a refusal rolls the migrations back.
+                await verify_live_schema(
+                    db,
+                    schema=_SCHEMA,
+                    migrate=cls._migrate,
+                    path=path,
+                    keyed=bounded_cipher(cipher) is not None,
+                )
                 await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
             # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
