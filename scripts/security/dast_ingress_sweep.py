@@ -799,18 +799,21 @@ class Resources:
     )
 
 
-async def _quiesce(target: IngressTarget, budget: Budget) -> None:
-    """Let every connection finish before a resource snapshot. A released connection's task can
-    outlive its release by a store write, and on a loaded runner that write can take seconds, so the
-    wait is on the tasks themselves. A task that never finishes is still counted once the bound
-    passes: that is a leak, and hiding it is not this wait's job."""
+async def _quiesce(target: IngressTarget, budget: Budget) -> int:
+    """Let every connection finish before a resource snapshot, and return how many did not.
+
+    A released connection's task can outlive its release by a store write, and on a loaded runner
+    that write can take seconds, so the wait is on the tasks themselves. A task still running when
+    the bound passes is returned, and the caller reports it: one caught in the BASELINE snapshot
+    would otherwise be subtracted out of every later growth figure and never named."""
     for plane in PLANES:
         await _settle(target, plane, budget.settle_seconds)
     deadline = time.monotonic() + budget.settle_seconds
-    while target.connection_tasks() and time.monotonic() < deadline:
+    while (running := target.connection_tasks()) and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
     await asyncio.sleep(0.05)
     gc.collect()
+    return running
 
 
 async def measure_resources(
@@ -832,12 +835,19 @@ async def measure_resources(
             if (failure := await probe_liveness(target, plane, 0, budget)) is not None:
                 findings.append(finding("liveness", plane, label, failure))
 
+    async def quiesce(label: str) -> None:
+        if running := await _quiesce(target, budget):
+            detail = (
+                f"{running} listener connection task(s) still running {budget.settle_seconds}s on"
+            )
+            findings.append(finding("time", "all", label, detail))
+
     started_here = not tracemalloc.is_tracing()
     if started_here:
         tracemalloc.start()
     try:
         await one_pass("resource-warmup")
-        await _quiesce(target, budget)
+        await quiesce("resource-warmup")
         heap0, handles0, tasks0 = (
             tracemalloc.get_traced_memory()[0],
             _handles(),
@@ -845,7 +855,7 @@ async def measure_resources(
         )
         for number in range(passes):
             await one_pass(f"resource-pass-{number + 1}")
-        await _quiesce(target, budget)
+        await quiesce(f"resource-pass-{passes}")
         return Resources(
             passes=passes,
             heap_growth_bytes=tracemalloc.get_traced_memory()[0] - heap0,
@@ -881,6 +891,9 @@ def load_policy(path: Path) -> dict[str, Any]:
 PROFILE_BOUNDS = frozenset(
     {"case_seconds", "stall_close_seconds", "settle_seconds", "connect_seconds"}
 )
+#: The most a profile may raise a bound to. Past it a wedged listener stops being a named time finding
+#: and becomes the test runner's per-test watchdog killing the process, which names nothing.
+PROFILE_CEILING_SECONDS = 60.0
 
 
 def apply_profile(policy: dict[str, Any], name: str | None) -> dict[str, Any]:
@@ -891,7 +904,6 @@ def apply_profile(policy: dict[str, Any], name: str | None) -> dict[str, Any]:
     never lower a floor, loosen a resource bound or silence a detector.
     """
     merged = copy.deepcopy(policy)
-    merged["active_profile"] = name
     if name is None:
         return merged
     profile = policy.get("profiles", {}).get(name)
@@ -906,8 +918,11 @@ def apply_profile(policy: dict[str, Any], name: str | None) -> dict[str, Any]:
             raised, strict = float(value), float(policy["budget"][key])
         except (KeyError, TypeError, ValueError) as exc:
             raise PolicyError(f"profile {name!r} budget.{key} is unusable: {exc!r}") from exc
-        if raised < strict:
-            raise PolicyError(f"profile {name!r} lowers budget.{key} below the strict {strict}")
+        if not strict <= raised <= PROFILE_CEILING_SECONDS:  # also refuses NaN
+            raise PolicyError(
+                f"profile {name!r} sets budget.{key} to {raised}, outside the strict {strict} "
+                f"to the ceiling {PROFILE_CEILING_SECONDS}"
+            )
         merged["budget"][key] = raised
     return merged
 
@@ -1014,7 +1029,6 @@ async def run_sweep(
         "scope": "see docs/adr/0155-dast-dynamic-security-testing-of-the-running-engine.md, Scope boundary",
         "seed": seed,
         "canary": canary,
-        "profile": policy.get("active_profile"),
         "budget": asdict(budget),
         "posture": posture_out,
         "wall_seconds": round(time.monotonic() - started, 2),
@@ -1179,6 +1193,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    receipt["profile"] = args.profile
     try:
         code, messages = evaluate(receipt, policy)
         verdict = {0: "PASS", 1: "FINDINGS", 2: "COULD NOT MEASURE (fail closed)"}[code]
