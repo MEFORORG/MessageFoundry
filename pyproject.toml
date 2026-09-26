@@ -384,6 +384,8 @@ ci-scanners = [
 #                  spec the inline install already carried, so this move adds hashes for the transitives
 #                  without changing which version resolves. THIS IS THE ONE STATEMENT OF THAT REASONING;
 #                  the test suite's FLOOR_BY_DESIGN entry points here rather than repeating it.
+#                  Dependabot WIDENS this cap rather than respecting it (PR 1552 did), so
+#                  .github/dependabot.yml ignores `>=7.4.0`; move both together.
 # Both are installed from `ci/locks/release-tools.lock` with `--require-hashes`, alongside the signing
 # tool above. One group and one lock rather than three: the three tools run on the same runners at the
 # same trust level, and a second lock would be another artifact to export, diff, resync and audit for a

@@ -84,6 +84,13 @@ updates:
     # 4.1.0, 4.2.0, 4.3.0, 4.4.0, 4.5.0; measured against PyPI 2026-09-03), but the 3.x series did
     # ship them (3.5.1, 3.6.7), so a 4.4.1 is possible. This range leaves the 4.4.x patch track open
     # and blocks only the minor bump the ruling declined.
+    #
+    # `cyclonedx-bom` is the same WIDENED-CAP case as annotated-types and ruff, not a sigstore-style
+    # ruling. PR 1552 rewrote the release-tools `~=7.3.1` to `>=7.3.1,<7.5.0` and locked 7.4.0, which
+    # silently lifted a deliberate ceiling. Why the ceiling exists is the cyclonedx-bom note above
+    # `release-tools` in pyproject.toml; read it there. The range leaves the 7.3.x patch track open.
+    # The trade-off note above holds: security.yml runs pip-audit over ci/locks/release-tools.lock.
+    # Lift this entry in the same PR that moves the pyproject spec to a validated 7.4.
     ignore:
       - dependency-name: "annotated-types"
         versions: [">=0.8.0"]
@@ -91,6 +98,8 @@ updates:
         versions: [">=0.16.0"]
       - dependency-name: "sigstore"
         versions: [">=4.5.0"]
+      - dependency-name: "cyclonedx-bom"
+        versions: [">=7.4.0"]
     groups:
       # Version-update grouping (applies-to defaults to version-updates).
       python-deps:
