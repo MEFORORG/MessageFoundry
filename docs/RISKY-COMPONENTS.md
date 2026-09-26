@@ -23,7 +23,7 @@ That is **41 distributions**, recorded in
 | Names in `pyproject.toml`, core only | 19 | Misses everything transitive. Over half of what runs is absent. |
 | Names in `pyproject.toml`, core plus every extra | 42 | Still direct-only, and mixes in extras nobody enabled. |
 | **Core runtime closure** | **41** | **Used here.** What a default install actually executes. |
-| `requirements.lock` | 101 | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
+| `requirements.lock` | A superset | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
 
 An install that enables an extra (`postgres`, `sqlserver`, `sftp`, `dicom`, `fhir`, `xml`, `x12`,
 `webauthn`, `otel`, `vault`, `harness`) carries dependencies **outside** this set. Those are not

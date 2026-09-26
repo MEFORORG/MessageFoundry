@@ -33,8 +33,8 @@ name: Dependabot lock resync
 #    sdist) + "uv export" (serializes the existing lock) execute NO package code — so no
 #    attacker-controlled build backend ever runs while the token is on the runner.
 #  - ONE repository script runs: scripts/security/runtime_closure.py (BACKLOG #1812), under the
-#    runner's own python3 with nothing installed. It is standard-library only
-#    (tests/test_dep1_lock_resync_lockstep.py enforces that), reads two tracked text files and writes
+#    runner's own python3 with nothing installed. It is standard-library only (import names checked
+#    by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed there), reads two files, writes
 #    one. The checkout pins the SHA that triggered the run, and a "pull_request" run takes THIS
 #    workflow's definition from that same PR, so anyone able to change the script could already
 #    change the steps around it.

@@ -11,7 +11,8 @@ this module to do it, so the gate and the regenerator read the lock the same way
 STANDARD LIBRARY ONLY. ``.github/workflows/dependabot-lock-resync.yml`` runs this with the runner's
 ``python3`` right after it re-exports the core lock, and that job installs nothing on purpose (read
 its SECURITY MODEL block). A third-party import here would fail there and leave every Dependabot PR
-red. ``tests/test_dep1_lock_resync_lockstep.py`` enforces the rule.
+red. ``tests/test_dep1_lock_resync_lockstep.py`` checks the imports. That check runs on this
+project's newer Python, so it misses at least a module or API newer than the runner's python3.
 
 Run from anywhere; paths resolve from this file:
 

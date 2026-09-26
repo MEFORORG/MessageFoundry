@@ -207,15 +207,13 @@ def test_the_counts_printed_on_the_page_are_the_real_ones() -> None:
     assert len(designated) + len(excluded) == len(_closure()), (
         "the two tables do not sum to the closure size"
     )
-    # The scope section's denominator counts. The requirements.lock row drifted from 100 to 101
-    # with nothing reporting it, which is why these are pinned too.
+    # The scope section's closure size, derived from the closure file, which the gate below holds
+    # equal to the core lock. It changes only when a core package arrives or leaves, which needs a
+    # designation edit on this page anyway. There is deliberately no requirements.lock count: it
+    # moved with every dev or extra dependency, so any Dependabot PR could red it.
     closure_size = len(_closure())
     assert f"That is **{closure_size} distributions**" in text, (
         f"the scope section does not state the closure size, {closure_size}"
-    )
-    lock_size = len(runtime_closure.lock_versions(_LOCK))
-    assert f"| `requirements.lock` | {lock_size} |" in text, (
-        f"the denominator table's requirements.lock row does not say {lock_size}"
     )
 
 

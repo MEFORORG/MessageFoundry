@@ -207,10 +207,11 @@ def test_the_regenerator_imports_only_the_standard_library() -> None:
 
     The resync installs no project and no packages, on purpose (its SECURITY MODEL block), so a
     third-party import would fail there and leave every Dependabot PR red. The runner's python3 is
-    older than this project's (3.12 on ubuntu-24.04), so the grammar is checked at 3.12 as well.
-    ``sys.stdlib_module_names`` is this interpreter's list, so a module new since 3.12 still passes
-    here; the script-mode run in ``tests/test_risky_component_designation.py`` does not catch that
-    either. It is a residual, and a narrow one.
+    older than this project's (3.12 on ubuntu-24.04, the image ubuntu-latest named on 2026-09-26),
+    so the grammar is checked at 3.12 as well, on a best-effort basis. This check and the
+    script-mode run in ``tests/test_risky_component_designation.py`` both use this interpreter, so
+    they miss at least a stdlib module or API newer than the runner's. The Manager accepted that
+    residual on 2026-09-26.
     """
     script = _ROOT / _REGENERATOR.split()[1]
     tree = ast.parse(script.read_text(encoding="utf-8"), feature_version=(3, 12))
