@@ -209,12 +209,15 @@ def test_the_api_listener_refuses_a_lowered_level_that_skipped_the_settings_vali
     """``model_construct`` skips pydantic validation, which is the one path that could hand the
     builder an unvalidated string. The control builds the same settings without the directive."""
     cert, key = _ec_pair(tmp_path)
-    fields = {"tls_cert_file": str(cert), "tls_key_file": str(key)}
-    bypassed = ApiSettings.model_construct(tls_ciphers=f"@SECLEVEL=0:{ECDSA_SUITE}", **fields)
+
+    def construct(ciphers: str) -> ApiSettings:
+        return ApiSettings.model_construct(
+            tls_cert_file=str(cert), tls_key_file=str(key), tls_ciphers=ciphers
+        )
+
     with pytest.raises(ValueError, match=r"API/UI listener: .*security level 0"):
-        build_api_ssl_context(bypassed)
-    control = ApiSettings.model_construct(tls_ciphers=ECDSA_SUITE, **fields)
-    assert build_api_ssl_context(control).security_level == 2
+        build_api_ssl_context(construct(f"@SECLEVEL=0:{ECDSA_SUITE}"))
+    assert build_api_ssl_context(construct(ECDSA_SUITE)).security_level == 2
 
 
 # --- the harm: an RSA-1024 server certificate, on a real handshake --------------------------------
