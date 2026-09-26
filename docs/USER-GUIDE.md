@@ -127,7 +127,7 @@ python -m messagefoundry serve --config samples/config --db ./messagefoundry.db 
 
 When the engine runs from somewhere other than the repo root (e.g. under the service), anchor the value files with `--project-root <repo-root>` so `env()` values don't silently resolve empty — see [INSTALL-GUIDE.md](INSTALL-GUIDE.md).
 
-**Network / auth posture.** The API binds **`127.0.0.1:8765`**, serves HTTPS, and **requires authentication** by default. With no `[api].tls_cert_file` configured, the engine mints a self-signed certificate on first run ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). No trust store vouches for that certificate, so a non-loopback bind is refused at startup until you configure your own certificate (`[api].tls_cert_file`) or a trusted upstream TLS terminator. Details: [SECURITY.md](SECURITY.md) and [DEPLOYMENT.md](DEPLOYMENT.md).
+**Network / auth posture.** The API binds **`127.0.0.1:8765`**, serves HTTPS, and **requires authentication** by default. With no `[api].tls_cert_file` configured, the engine mints a self-signed certificate on first run ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). That certificate serves loopback, but it does not satisfy the startup gate for a non-loopback bind. Exposing the API takes your own certificate (`[api].tls_cert_file`) or a trusted upstream TLS terminator, plus the further gates [DEPLOYMENT.md](DEPLOYMENT.md) lists. Details: [SECURITY.md](SECURITY.md).
 
 **Store encryption.** Every instance carries patient data, so `serve` **refuses to start** with no store encryption key configured — on `dev` as much as on `prod`. Mint one with `messagefoundry gen-key` (set it as `MEFOR_STORE_ENCRYPTION_KEY`), or on Windows DPAPI-protect it to a file with `messagefoundry protect-key --generate --out <file>` and point `[store].encryption_key_file` at it. To run keyless anyway, set `[security].allow_unencrypted_phi = true` — and under the shipped `[security].enforcement = enforce`, `allow_unencrypted_phi_under_strict_enforcement = true` as well. The dial alone does not clear this refusal. Both acks are audited at every start. The full key story is in [PHI.md](PHI.md).
 
@@ -497,7 +497,7 @@ The console is served by the engine itself, so start the engine first (note the 
 python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 ```
 
-Then open the web console in a browser. The engine serves it at `/ui` by default; `[security].serve_web_console = false` turns it off:
+Then open the web console in a browser. With the `messagefoundry-webconsole` wheel installed, the engine serves it at `/ui` by default; `[security].serve_web_console = false` turns it off:
 
 ```
 https://127.0.0.1:8765/ui

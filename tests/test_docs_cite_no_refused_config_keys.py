@@ -790,28 +790,90 @@ def test_no_doc_presents_a_refused_config_key_as_config(doc: pathlib.Path) -> No
 # two withheld rows nobody can re-measure. So the stricter rule runs only where it matters most:
 # the documents docs/README.md sequences for a first operator, read from that index.
 #
-# The rule: a line naming a refused key in its `[section].key` spelling is a defect unless the line
-# says it is refused (`_DISCLAIMS`). No baseline, no replacement-section exemption. The bare `key`
-# spelling is not read: without its section it collides with live keys (see `_dotted_assignment`).
+# The rule: a SENTENCE naming a refused key with its section (`[section].key` or `[section] key`) is
+# a defect unless that sentence says it is refused (`_DISCLAIMS`). No baseline, no replacement-section
+# exemption. The bare `key` spelling is not read: without its section it collides with live keys
+# (see `_dotted_assignment`).
+#
+# WHY A SENTENCE AND NOT A LINE. These documents write a paragraph as one physical line or wrap it
+# over several, and neither is a sentence. Judged per line, one "refused" anywhere in a one-line
+# paragraph exempted every key in it: a refused key planted into USER-GUIDE's posture paragraph read
+# clean because "a non-loopback bind is refused" shared the line. Judged per line the other way, a
+# disclaimer wrapped onto the next line is lost -- DEPLOYMENT.md names `[api].host` on one line and
+# says "rejected at load" on the next. So wrapped prose is joined into units first, then split into
+# sentences, and the disclaimer has to sit in the key's own sentence.
 # ---------------------------------------------------------------------------------------------
 
 _NAMED: tuple[tuple[str, str, re.Pattern[str]], ...] = tuple(
-    (section, key, re.compile(rf"(?<![\w.])\[{re.escape(section)}\]\.{re.escape(key)}(?!\w)"))
+    (
+        section,
+        key,
+        re.compile(rf"(?<![\w.])\[{re.escape(section)}\](?:\.|\s+){re.escape(key)}(?!\w)"),
+    )
     for section, key in _REFUSED_KEYS
 )
 
+# A line that is a unit of its own: a heading or a table row.
+_SINGLE_LINE_UNIT = re.compile(r"^\s*(?:#|\|)")
+# A line that opens a new unit rather than continuing the prose above it: a list item.
+_OPENS_A_UNIT = re.compile(r"^\s*(?:[-*+]|\d+\.)\s")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def _prose_units(text: str) -> list[tuple[int, str]]:
+    """``(first line number, text)`` for each paragraph, list item, heading, row and code line.
+
+    Wrapped prose is joined so a sentence split over lines is read whole. A code line stays alone:
+    joining a comment to the command under it would let one exempt the other.
+    """
+    units: list[tuple[int, str]] = []
+    parts: list[str] = []
+    start = 0
+    in_fence = False
+
+    def flush() -> None:
+        if parts:
+            units.append((start, " ".join(parts)))
+            parts.clear()
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.lstrip()
+        while line.startswith(">"):  # a blockquote's wrapped lines are still one paragraph
+            line = line[1:].lstrip()
+        if line.startswith("```"):
+            flush()
+            in_fence = not in_fence
+            continue
+        if in_fence or not line or _SINGLE_LINE_UNIT.match(line):
+            flush()
+            if line:
+                units.append((lineno, line))
+            continue
+        if _OPENS_A_UNIT.match(line):
+            flush()
+        if not parts:
+            start = lineno
+        parts.append(line)
+    flush()
+    return units
+
 
 def _named_refused_keys(text: str) -> list[tuple[int, str]]:
-    """Every line naming a refused key by its dotted spelling without saying it is refused."""
+    """``(line, key)`` for each sentence naming a refused key without saying it is refused.
+
+    The line is where the sentence's unit starts, which for wrapped prose can sit a few lines above
+    the key itself.
+    """
     hits: list[tuple[int, str]] = []
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if _DISCLAIMS.search(line):
-            continue
-        hits.extend(
-            (lineno, f"[{section}].{key}")
-            for section, key, pattern in _NAMED
-            if pattern.search(line)
-        )
+    for lineno, unit in _prose_units(text):
+        for sentence in _SENTENCE_END.split(unit):
+            if _DISCLAIMS.search(sentence):
+                continue
+            hits.extend(
+                (lineno, f"[{section}].{key}")
+                for section, key, pattern in _NAMED
+                if pattern.search(sentence)
+            )
     return hits
 
 
@@ -844,6 +906,33 @@ def test_the_strict_rule_exempts_a_line_documenting_the_refusal() -> None:
         "(the old [api].serve_ui spelling is refused at config load)"
     )
     assert _named_refused_keys(line) == []
+
+
+def test_an_unrelated_refusal_in_the_next_sentence_does_not_exempt_a_key() -> None:
+    """The per-line form read this as clean. The disclaimer has to be in the key's own sentence."""
+    paragraph = (
+        'A non-loopback bind is refused at startup. Set `[api].host = "0.0.0.0"` to expose the API.'
+    )
+    assert _named_refused_keys(paragraph) == [(1, "[api].host")]
+
+
+def test_a_disclaimer_wrapped_onto_the_next_line_still_exempts() -> None:
+    """DEPLOYMENT.md's shape: the key on one line, "rejected at load" on the next, one sentence."""
+    wrapped = (
+        "   (a non-loopback bind with sign-in disabled is refused). The legacy `[api].host`\n"
+        "   / `[auth].enabled` keys are **rejected at load** -- they moved to `[security]`.\n"
+    )
+    assert _named_refused_keys(wrapped) == []
+
+
+def test_the_spaced_spelling_is_read_too() -> None:
+    assert _named_refused_keys("Confirm `[api] serve_ui` is on.") == [(1, "[api].serve_ui")]
+
+
+def test_a_code_comment_does_not_exempt_the_line_under_it() -> None:
+    """Fence lines stay separate units, so a disclaiming comment covers only its own line."""
+    fence = "```toml\n# the old spelling is refused at load\n[api] serve_ui\n```\n"
+    assert _named_refused_keys(fence) == [(3, "[api].serve_ui")]
 
 
 def test_the_sequenced_documents_name_no_refused_key() -> None:
