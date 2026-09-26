@@ -186,7 +186,7 @@ async def test_a_filesystem_without_fsync_still_delivers(
     would fail the lane forever.
 
     Mutation: let every fsync OSError propagate. Red: ``send`` raises ``DeliveryError``."""
-    monkeypatch.setattr(file_mod, "_file_fsync_unsupported_logged", False)
+    monkeypatch.setattr(file_mod, "_fsync_unsupported_dirs", set())
 
     def unsupported(_fd: int) -> None:
         raise OSError(errno.EINVAL, "Invalid argument")

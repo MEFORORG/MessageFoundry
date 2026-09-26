@@ -125,7 +125,7 @@ async def test_a_scan_failure_logs_no_traceback_at_error(
     assert errors, "the scan failure must still be logged"
     assert all(r.exc_info is None for r in errors), "a traceback was logged at ERROR"
     assert "RuntimeError" in errors[0].getMessage()
-    assert "in scan_fails" in errors[0].getMessage(), "the raising frame is not named"
+    assert "file.py:" in errors[0].getMessage(), "the raising site is not named"
 
 
 def test_a_failed_archive_claim_on_a_bumped_name_logs_no_partner_name(

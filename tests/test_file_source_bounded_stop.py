@@ -216,3 +216,39 @@ async def test_stop_never_cancels_a_leave_mode_ledger_write(
     await asyncio.wait_for(source.stop(), 5)
 
     assert len(ledger.marked) == 1, "the ledger write was cut short"
+
+
+async def test_a_cancelled_stop_does_not_cut_a_store_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner may give up on a stop() (a demotion's bounded wait). That must not cancel a poll
+    task inside a store call: the stop signal is set, so the task exits at its next check.
+
+    Mutation: cancel the poll task unconditionally when stop() is cancelled. Red: the hand-off is
+    cut short."""
+    monkeypatch.setattr(file_mod, "_STOP_GRACE_S", 5.0)
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "one.hl7").write_bytes(_MSG.format(n=1).encode("ascii"))
+    source = _source(inbox)
+    in_handler = asyncio.Event()
+    committed: list[bool] = []
+
+    async def slow_commit(_raw: bytes) -> str | None:
+        in_handler.set()
+        await asyncio.sleep(0.5)
+        committed.append(True)
+        return None
+
+    await source.start(slow_commit)
+    poll_task = source._task
+    assert poll_task is not None
+    await asyncio.wait_for(in_handler.wait(), 5)
+    stopping = asyncio.create_task(source.stop())
+    await asyncio.sleep(0.05)
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    await asyncio.wait_for(asyncio.gather(poll_task, return_exceptions=True), 5)
+
+    assert committed == [True], "the hand-off was cut short by a cancelled stop"

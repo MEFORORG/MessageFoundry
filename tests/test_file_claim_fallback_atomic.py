@@ -188,3 +188,37 @@ def test_a_cross_filesystem_source_is_published_by_link_from_the_staged_copy(
     assert claimed.read_bytes() == _PAYLOAD
     assert exclusive_opens == []
     assert sorted(p.name for p in out_dir.iterdir()) == ["msg.hl7"]
+
+
+def test_a_placeholder_close_error_removes_the_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A network mount can report a deferred write error at close(). The empty placeholder is ours
+    and must not stay at the final name, where a poller would take it for a delivered file.
+
+    Mutation: close the placeholder outside the cleanup guard. Red: an empty ``msg.hl7`` stays."""
+    source, out_dir = _drop(tmp_path)
+    real_close = os.close
+    placeholder_fds: list[int] = []
+    real_open = os.open
+
+    def spy_open(path: str | os.PathLike[str], flags: int, *a: object, **k: object) -> int:
+        fd = real_open(path, flags, *a, **k)  # type: ignore[arg-type]
+        if flags & os.O_EXCL and not str(path).endswith(".part"):
+            placeholder_fds.append(fd)
+        return fd
+
+    def close_fails(fd: int) -> None:
+        real_close(fd)
+        if fd in placeholder_fds:
+            raise OSError(errno.EIO, "deferred write error")
+
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "close", close_fails)
+    monkeypatch.setattr(file_mod, "_RENAME_REFUSES_OVERWRITE", False)
+
+    with pytest.raises(OSError, match="deferred write error"):
+        _claim_unique(source, out_dir / "msg.hl7")
+
+    assert list(out_dir.iterdir()) == []
