@@ -59,6 +59,7 @@ import logging
 import posixpath
 import ssl
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
@@ -727,23 +728,32 @@ def _open_sftp_within(client: Any, seconds: float) -> Any:
 
 _PARAMIKO_AUTH_TIMEOUT = "Authentication timeout."
 _PARAMIKO_NO_SESSION = "No existing session"
+_PARAMIKO_BANNER_ERROR = "Error reading SSH protocol banner"
+_KEX_TIMED_OUT = "the banner and key exchange timed out"
 
 
-def _io_fault(exc: BaseException | None) -> BaseException | None:
-    """``exc`` itself, or the exception it was raised while handling, if that is a socket or EOF
-    fault; otherwise ``None``."""
-    for candidate in (exc, None if exc is None else exc.__context__):
-        if isinstance(candidate, (OSError, EOFError)):
-            return candidate
+def _transport_io_fault(exc: BaseException | None) -> BaseException | None:
+    """The socket or EOF fault the transport thread hit before the key exchange, or ``None``.
+
+    That is ``exc`` itself when the thread raised a bare one, or the cause of paramiko's banner-read
+    wrapper. ``__context__`` is trusted ONLY on that wrapper: on any other exception it may be
+    whatever the calling thread happened to be handling, which says nothing about the peer."""
+    if isinstance(exc, (OSError, EOFError)):
+        return exc
+    if exc is not None and str(exc).startswith(_PARAMIKO_BANNER_ERROR):
+        cause = exc.__context__
+        if isinstance(cause, (OSError, EOFError)):
+            return cause
     return None
 
 
 def _sftp_slow_peer(
-    paramiko: Any, exc: BaseException, client: Any
+    paramiko: Any, exc: BaseException, client: Any, *, waited_full_bound: bool
 ) -> tuple[str | None, BaseException | None]:
     """Decide whether a failed ``SSHClient.connect`` came from a slow or dropped peer rather than a
     refusal (BACKLOG #1999). Returns the reason to report, or ``None`` for a refusal, and the
     exception the transport thread left behind, if this read one, so the caller can report it.
+    ``waited_full_bound`` says whether the connect ran for at least the connect timeout.
 
     THIS DOCSTRING IS THE ONE PLACE THE PARAMIKO FACTS BELOW ARE STATED. Read against paramiko 5.0.0.
 
@@ -767,32 +777,39 @@ def _sftp_slow_peer(
     exchange between the raise and this read, so an active transport is enough on its own.
 
     The transport thread's own banner read wraps any failure as ``SSHException("Error reading SSH
-    protocol banner")``, chained from what it caught: ``TimeoutError`` for a silent peer,
+    protocol banner")``, implicitly chained from what it caught: ``TimeoutError`` for a silent peer,
     ``EOFError`` or a reset for one that dropped the connection. That exception reaches the caller
     when the thread dies before ``start_client`` returns, or it is left on the transport, read here
     by ``get_exception``, when the thread dies in between. A dropped connection is transient for the
     same reason a dropped TCP connect is. A key-exchange mismatch dies with no socket fault chained,
     so it stays permanent, and so does everything after the exchange, host-key rejection included.
 
-    paramiko also bounds the key exchange with ``Transport.handshake_timeout``, 15 s, which
-    ``SSHClient.connect`` does not expose. Past it the thread raises a bare ``EOFError``, which is
-    already transient as a dropped connection.
+    **A banner-read timeout counts only after the full bound.** The read waits ``banner_timeout``
+    for the first line but only 2 s for each line after it. So a non-SSH service on the port, one
+    that sends a line of its own and then waits, fails the same way about 2 s in. That is a
+    misconfiguration, not a slow peer, and it stays permanent.
+
+    paramiko also waits at most ``Transport.handshake_timeout``, 15 s, for the server's first
+    key-exchange message. ``SSHClient.connect`` has no keyword for it; only a custom
+    ``transport_factory`` could change it, and this connector passes none. Past it the thread
+    raises a bare ``EOFError``, which is transient as a dropped connection.
     """
     if isinstance(exc, paramiko.AuthenticationException):
         return ("authentication timed out" if str(exc) == _PARAMIKO_AUTH_TIMEOUT else None), None
     transport = client.get_transport()
     if transport is None:
         return None, None
-    if transport.is_active() and (
-        not transport.initial_kex_done or str(exc) == _PARAMIKO_NO_SESSION
-    ):
-        return "the banner and key exchange timed out", None
-    if transport.initial_kex_done:
+    # Read with a default so that a paramiko which renamed the attribute falls back to the
+    # pre-#1999 permanent classification rather than raising out of the connector.
+    kex_done = getattr(transport, "initial_kex_done", True)
+    if transport.is_active() and (not kex_done or str(exc) == _PARAMIKO_NO_SESSION):
+        return _KEX_TIMED_OUT, None
+    if kex_done:
         return None, None
     late = transport.get_exception()
-    fault = _io_fault(exc) or _io_fault(late)
+    fault = _transport_io_fault(exc) or _transport_io_fault(late)
     if isinstance(fault, TimeoutError):
-        return "the banner and key exchange timed out", late
+        return (_KEX_TIMED_OUT if waited_full_bound else None), late
     if fault is not None:
         return "the server dropped the connection during the banner and key exchange", late
     return None, late
@@ -838,6 +855,7 @@ class _SftpClient(_RemoteClient):
         client is closed on every failure."""
         paramiko = _import_paramiko()
         client = paramiko.SSHClient()
+        started = time.monotonic()
         try:
             self._dial(paramiko, client)
         except paramiko.SSHException as exc:
@@ -845,7 +863,12 @@ class _SftpClient(_RemoteClient):
             # matters most on the timeout path, where the transport thread is still waiting on the
             # peer and would otherwise hold the socket past this call.
             try:
-                reason, late = _sftp_slow_peer(paramiko, exc, client)
+                reason, late = _sftp_slow_peer(
+                    paramiko,
+                    exc,
+                    client,
+                    waited_full_bound=time.monotonic() - started >= self._timeout,
+                )
             finally:
                 client.close()
             detail = str(exc) if late is None else f"{exc} (the transport saw {late!r})"
@@ -858,12 +881,13 @@ class _SftpClient(_RemoteClient):
                     permanent=False,
                 ) from exc
             if isinstance(exc, paramiko.AuthenticationException):
-                # #109 (ADR 0095): auth rejection = a CREDENTIAL fault (account-lockout risk) — the
-                # delivery worker STOP-and-retains instead of dead-lettering + re-authing the backlog.
+                # #109 (ADR 0095): auth rejection is a CREDENTIAL fault (account-lockout risk), so
+                # the delivery worker STOP-and-retains instead of dead-lettering and re-authing the
+                # backlog.
                 raise _RemoteError(
                     f"SFTP authentication failed: {detail}", permanent=True, credential_fault=True
                 ) from exc
-            # SSHException covers an unknown/rejected host key (RejectPolicy) — a security stop the
+            # SSHException covers an unknown/rejected host key (RejectPolicy): a security stop the
             # operator must resolve, so it's permanent, not a retry.
             raise _RemoteError(f"SFTP connection rejected: {detail}", permanent=True) from exc
         except (OSError, EOFError) as exc:
