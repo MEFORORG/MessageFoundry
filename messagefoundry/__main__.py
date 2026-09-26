@@ -5353,10 +5353,11 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 return ("audit-refused", user.username, str(exc))
             try:
                 await store.set_user_notify_email(user.id, email=address)
-            except Exception as exc:
+            except BaseException as exc:
                 # The row above now records a change that did not happen, so say so in the log too.
-                # Whatever the failure was (BACKLOG #1983): the compensating row must not depend on
-                # this command recognising the error, since a missed class leaves a false log.
+                # Whatever the failure was (BACKLOG #1983), Ctrl-C included: the compensating row
+                # must not depend on this command recognising the error, since a missed class
+                # leaves a false log.
                 try:
                     await store.record_audit(
                         "auth.admin_notify_email_set_failed", actor=actor, detail=detail

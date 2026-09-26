@@ -584,7 +584,7 @@ def _fake_drivers(monkeypatch: pytest.MonkeyPatch) -> dict[str, type[Exception]]
         "asyncpg.PostgresError": type("PostgresError", (Exception,), {}),
         "asyncpg.InterfaceError": type("InterfaceError", (Exception,), {}),
         "asyncpg.InternalClientError": type("InternalClientError", (Exception,), {}),
-        "pyodbc.Error": type("Error", (Exception,), {}),
+        "pyodbc.DatabaseError": type("DatabaseError", (Exception,), {}),
     }
     for dotted, cls in classes.items():
         module, name = dotted.split(".")
@@ -615,7 +615,7 @@ def _run_on(
         "asyncpg.PostgresError",
         "asyncpg.InterfaceError",
         "asyncpg.InternalClientError",
-        "pyodbc.Error",
+        "pyodbc.DatabaseError",
         "OSError",
     ],
 )
@@ -649,7 +649,7 @@ def test_a_server_backend_failed_row_that_also_fails_is_said(
 def test_a_server_backend_audit_refusal_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    store = _DriverStore(audit=_fake_drivers(monkeypatch)["pyodbc.Error"]("audit refused"))
+    store = _DriverStore(audit=_fake_drivers(monkeypatch)["pyodbc.DatabaseError"]("audit refused"))
     assert _run_on(store, tmp_path, monkeypatch, name="audit") == 1
     assert "audit row goes first" in _error(capsys)
     assert store.audited == [] and store.written is False
@@ -688,25 +688,36 @@ def test_a_write_error_that_is_not_a_store_error_is_still_audited_but_not_report
     assert store.written is False
 
 
+def test_a_write_cancelled_by_ctrl_c_is_still_audited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C reaches an awaiting coroutine as ``CancelledError``, a ``BaseException``. It passes
+    through, but only after the compensating row is appended."""
+    store = _DriverStore(write=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        _run_on(store, tmp_path, monkeypatch, name="cancel")
+    assert store.audited == [_ACTION, f"{_ACTION}_failed"]
+
+
 def test_store_driver_errors_names_each_installed_driver(monkeypatch: pytest.MonkeyPatch) -> None:
     import sys
 
     from messagefoundry.store.base import store_driver_errors
 
     classes = _fake_drivers(monkeypatch)
-    assert set(store_driver_errors()) == {sqlite3.Error, *classes.values()}
+    assert set(store_driver_errors()) == {sqlite3.DatabaseError, *classes.values()}
     # An absent extra is left out rather than failing the import. `None` in sys.modules makes the
     # import raise ImportError, as a missing package does.
     monkeypatch.setitem(sys.modules, "asyncpg", None)
     monkeypatch.setitem(sys.modules, "pyodbc", None)
-    assert store_driver_errors() == (sqlite3.Error,)
+    assert store_driver_errors() == (sqlite3.DatabaseError,)
 
 
 @pytest.mark.parametrize(
     ("driver", "roots"),
     [
         ("asyncpg", ("PostgresError", "InterfaceError", "InternalClientError")),
-        ("pyodbc", ("Error",)),
+        ("pyodbc", ("DatabaseError",)),
     ],
 )
 def test_store_driver_errors_names_the_real_driver_roots(

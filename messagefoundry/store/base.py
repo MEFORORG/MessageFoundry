@@ -2257,17 +2257,21 @@ def store_driver_errors() -> tuple[type[Exception], ...]:
     """The base exception classes the database drivers behind each backend raise (BACKLOG #1983).
 
     For a caller that must catch a refused store call on every backend, such as a CLI command that
-    opens its store through :func:`open_store`. ``sqlite3.Error`` alone covers only SQLite: asyncpg's
-    errors (PostgreSQL) and pyodbc's (SQL Server, through aioodbc) subclass neither it nor
-    ``RuntimeError``, and the store layer has no common engine type that wraps them. A connection
-    lost at the socket can also surface as a plain ``OSError``, which is not listed here.
+    opens its store through :func:`open_store`. ``sqlite3.DatabaseError`` alone covers only SQLite:
+    asyncpg's errors (PostgreSQL) and pyodbc's (SQL Server, through aioodbc) subclass neither it nor
+    ``RuntimeError``, and the store layer has no common engine type that wraps them.
+
+    Driver errors only. A caller adds the rest itself: ``RuntimeError`` for the engine's own
+    refusals (the acquire timeout, a keyless audit append) and ``OSError`` for a connection lost at
+    the socket. For the two DB-API drivers this names ``DatabaseError``, not the ``Error`` root, so
+    an interface misuse such as a bad bind still reads as a defect rather than a refusal.
 
     The two server drivers are optional extras, so each is imported here, guarded, and left out
     when it is absent. A driver that is not installed cannot have raised anything.
     """
     import sqlite3
 
-    errors: list[type[Exception]] = [sqlite3.Error]
+    errors: list[type[Exception]] = [sqlite3.DatabaseError]
     try:
         import asyncpg
     except ImportError:
@@ -2281,7 +2285,7 @@ def store_driver_errors() -> tuple[type[Exception], ...]:
     except ImportError:
         pass
     else:
-        errors.append(pyodbc.Error)
+        errors.append(pyodbc.DatabaseError)  # a lost link is OperationalError, beneath it
     return tuple(errors)
 
 
