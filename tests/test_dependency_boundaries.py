@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -36,7 +37,9 @@ _PACKAGE_FORBIDDEN: dict[str, tuple[str, ...]] = {
     "transports": ("messagefoundry.store", "messagefoundry.pipeline"),
 }
 
-_ENGINE_ROOT = Path(__file__).resolve().parents[1] / "messagefoundry"
+_ROOT_PACKAGE = "messagefoundry"
+_REPO = Path(__file__).resolve().parents[1]
+_ENGINE_ROOT = _REPO / _ROOT_PACKAGE
 
 # BACKLOG #1747 walk floor: the fewest `*.py` files the walk must reach in each engine package
 # before a clean verdict over that package means anything. Pinned WELL UNDER the census taken at
@@ -81,6 +84,12 @@ def _imported_modules(path: Path, root: Path) -> set[str]:
     Resolved rather than skipped: a boundary test that `from ..store import ...` walks straight
     through is not a boundary test. The tree uses absolute imports throughout today, so this changes
     no current verdict — it closes the bypass before someone finds it.
+
+    `from messagefoundry import store` is recorded as `messagefoundry.store` as well as
+    `messagefoundry` (BACKLOG #1697). Every forbidden unit here is a SUBPACKAGE of the root, so that
+    spelling named a forbidden package while the walk saw only the permitted root. Only the root
+    gets this treatment: `from messagefoundry.store import base` already matches on its module, and
+    recording `messagefoundry.store.base` beside it would report one line twice.
     """
     mods: set[str] = set()
     package = _package_of(path, root)
@@ -89,12 +98,16 @@ def _imported_modules(path: Path, root: Path) -> set[str]:
             mods.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             if node.level == 0:
-                if node.module:
-                    mods.add(node.module)
-                continue
-            # `from . import x` -> the package itself; `from ..store import x` -> one level up.
-            base = package.rsplit(".", node.level - 1)[0]
-            mods.add(f"{base}.{node.module}" if node.module else base)
+                if not node.module:
+                    continue
+                module = node.module
+            else:
+                # `from . import x` -> the package itself; `from ..store import x` -> one level up.
+                base = package.rsplit(".", node.level - 1)[0]
+                module = f"{base}.{node.module}" if node.module else base
+            mods.add(module)
+            if module == _ROOT_PACKAGE:
+                mods.update(f"{module}.{a.name}" for a in node.names if a.name != "*")
     return mods
 
 
@@ -119,10 +132,14 @@ def test_forbidden_engine_imports_all_name_something_real() -> None:
 
     `_TRAY_FORBIDDEN` is covered here too (BACKLOG #1716). Its positive control plants an importable
     stub for any name without a dot, so a misspelled third-party entry there passes its own control
-    by construction; this is what catches a misspelled in-tree one."""
-    repo = Path(__file__).resolve().parents[1]
+    by construction; this is what catches a misspelled in-tree one. `_CLIENT_FORBIDDEN` (BACKLOG
+    #1697) is covered for the same reason."""
+    repo = _REPO
     for entry in (
-        _FORBIDDEN + _TRAY_FORBIDDEN + tuple(m for v in _PACKAGE_FORBIDDEN.values() for m in v)
+        _FORBIDDEN
+        + _TRAY_FORBIDDEN
+        + _CLIENT_FORBIDDEN
+        + tuple(m for v in _PACKAGE_FORBIDDEN.values() for m in v)
     ):
         if not entry.startswith("messagefoundry"):
             continue
@@ -363,7 +380,11 @@ def test_the_forbidden_rules_are_written_lowercase() -> None:
     # `_scan` lowercases the MODULE it read and not the RULE, so a rule spelled `PySide6` or
     # `FastAPI` can never match: present in the table, reading as enforced, catching nothing.
     # `_FORBIDDEN` honours that by convention only — this states the convention.
-    rules = [*_FORBIDDEN, *(r for rs in _PACKAGE_FORBIDDEN.values() for r in rs)]
+    rules = [
+        *_FORBIDDEN,
+        *_CLIENT_FORBIDDEN,
+        *(r for rs in _PACKAGE_FORBIDDEN.values() for r in rs),
+    ]
     mixed = [r for r in rules if r != r.lower()]
     assert not mixed, f"the matcher never lowercases a rule, so these match nothing: {mixed}"
 
@@ -436,6 +457,321 @@ def test_relative_imports_are_resolved_not_skipped(tmp_path: Path) -> None:
         "messagefoundry.transports",
         "messagefoundry.parsing",
     }
+
+
+# --- BACKLOG #1697: the INWARD rule for clients ----------------------------------------------------
+#
+# CLAUDE.md section 4 lets a client import `parsing/` and forbids the rest of the engine runtime. Until
+# this block nothing checked that for any client, and eight harness files plus `samples/send_mllp.py`
+# imported `transports.mllp` or `config` for MLLP framing and `AckMode`. Those moved to the leaf
+# `messagefoundry.mllpcodec`; this walk keeps them out.
+#
+# THE RULE IS NARROWER THAN "ONLY PARSING", ON PURPOSE. It forbids the four runtime packages and
+# nothing else, so `apiclient`, `generators`, `mllpcodec`, `timezone`, `pki` and the web console's
+# seam pass. The seam deserves a sentence because the item asked for it on this list: the web console
+# imports `messagefoundry.api._ui_seam` and `messagefoundry.auth` by design (ADR 0065, BACKLOG #1220),
+# and neither is under the four packages below, so it needs no entry. An entry that matches nothing
+# is exactly what `test_the_client_allow_list_is_exactly_what_the_tree_uses` refuses.
+#
+# WHAT THIS DOES NOT SEE, named rather than implied. It is a STATIC walk, as `_scan` is. A lazy root
+# export (`from messagefoundry import MLLP`, which loads `config.wiring` on first touch) passes, and
+# so does anything that arrives transitively: `import messagefoundry.parsing` still loads `config`
+# through `parsing/sniff.py` and `logging_setup`, which is BACKLOG #1596's to fix, not this walk's.
+
+#: The client trees, walked from the repository root. `harness` and `samples` are not packages (no
+#: `__init__.py`), so this walk checks `is_dir` only, where the engine walk checks importability.
+_CLIENT_ROOTS = ("harness", "tee", "samples", "messagefoundry_webconsole")
+
+#: The engine runtime packages a client may not import directly.
+_CLIENT_FORBIDDEN = (
+    "messagefoundry.config",
+    "messagefoundry.pipeline",
+    "messagefoundry.store",
+    "messagefoundry.transports",
+)
+
+#: Walk floors for the client trees, pinned about half the census taken for BACKLOG #1697 (harness
+#: 77, tee 18, samples 18, messagefoundry_webconsole 35), for the reason `_MIN_FILES_WALKED` gives.
+_MIN_CLIENT_FILES_WALKED: dict[str, int] = {
+    "harness": 35,
+    "tee": 8,
+    "samples": 8,
+    "messagefoundry_webconsole": 15,
+}
+
+
+class _Allowance(NamedTuple):
+    """One named exception to the client rule: which forbidden packages, and why."""
+
+    packages: frozenset[str]
+    reason: str
+
+
+#: The NAMED allow-list. A key ending in `/` covers a directory; any other key is one file. Each
+#: entry names the forbidden packages it permits, so an allowed file reaching a NEW one still reds.
+_CLIENT_ALLOWED: Mapping[str, _Allowance] = MappingProxyType(
+    {
+        "harness/config/": _Allowance(
+            frozenset({"messagefoundry.config"}),
+            "engine config modules the loader runs via --config; they are the engine's input",
+        ),
+        "harness/load/shardcert.py": _Allowance(
+            frozenset({"messagefoundry.config", "messagefoundry.pipeline", "messagefoundry.store"}),
+            "certifies an engine-shard plan by running the loader and the sharding planner itself",
+        ),
+        "harness/load/connscale/runner.py": _Allowance(
+            frozenset({"messagefoundry.config", "messagefoundry.store"}),
+            "owns the engine subprocess, and resets and inspects that engine's store between steps",
+        ),
+    }
+)
+
+
+class _ClientScan(NamedTuple):
+    """What one client walk found. `used` maps each allow-list key to the packages it excused."""
+
+    violations: tuple[str, ...]
+    walked: Mapping[str, int]
+    used: Mapping[str, frozenset[str]]
+
+
+def _allowance_key(rel: str, allowed: Mapping[str, _Allowance]) -> str | None:
+    """The allow-list key covering `rel` (a POSIX path under the repo), or None."""
+    for key in allowed:
+        if rel == key or (key.endswith("/") and rel.startswith(key)):
+            return key
+    return None
+
+
+def _forbidden_root(module: str, forbidden: tuple[str, ...]) -> str | None:
+    """The entry of `forbidden` that `module` falls under, with `_is_forbidden`'s matching."""
+    return next((f for f in forbidden if _is_forbidden(module, (f,))), None)
+
+
+def _client_scan(
+    repo: Path,
+    clients: Sequence[str],
+    floors: Mapping[str, int],
+    forbidden: tuple[str, ...],
+    allowed: Mapping[str, _Allowance],
+) -> _ClientScan:
+    """Walk each client tree under `repo` for `forbidden` imports that `allowed` does not excuse.
+
+    It takes every input as an argument so the controls below drive THIS function over a planted
+    tree, for the reason `_scan` gives. It carries the #1747 refusals the same way: the client list
+    and the floor table must agree, no floor may sit under `_MIN_FLOOR`, a missing tree raises, and
+    each tree's walk must meet its floor. Relative imports resolve under the client's own name, so
+    `from .keying import Keyer` in `tee/anon/` reads as `tee.anon.keying`.
+    """
+    disagree = set(clients) ^ set(floors)
+    if disagree:
+        raise AssertionError(f"client list and floor table disagree on: {sorted(disagree)}")
+    weak = {c: n for c, n in floors.items() if n < _MIN_FLOOR}
+    if weak:
+        raise AssertionError(f"floors low enough to disarm the guard: {weak}")
+    violations: list[str] = []
+    walked: dict[str, int] = {}
+    used: dict[str, set[str]] = {}
+    for client in clients:
+        directory = repo / client
+        if not directory.is_dir():
+            raise AssertionError(f"walk target is not a directory: {directory}")
+        seen = 0
+        for py in sorted(directory.rglob("*.py")):
+            modules = _imported_modules(py, directory)
+            seen += 1
+            rel = py.relative_to(repo).as_posix()
+            key = _allowance_key(rel, allowed)
+            for module in sorted(modules):
+                root = _forbidden_root(module, forbidden)
+                if root is None:
+                    continue
+                if key is not None and root in allowed[key].packages:
+                    used.setdefault(key, set()).add(root)
+                else:
+                    violations.append(f"{rel} imports {module}")
+        walked[client] = seen
+    short = {c: n for c, n in walked.items() if n < floors[c]}
+    if short:
+        raise AssertionError(f"walk fell under its floor: {short} (floors {dict(floors)})")
+    return _ClientScan(
+        tuple(violations),
+        MappingProxyType(walked),
+        MappingProxyType({k: frozenset(v) for k, v in used.items()}),
+    )
+
+
+@cache
+def _real_client_scan() -> _ClientScan:
+    return _client_scan(
+        _REPO, _CLIENT_ROOTS, _MIN_CLIENT_FILES_WALKED, _CLIENT_FORBIDDEN, _CLIENT_ALLOWED
+    )
+
+
+def test_clients_import_no_engine_runtime_package_outside_the_allow_list() -> None:
+    violations = _real_client_scan().violations
+    assert not violations, violations
+
+
+def test_the_client_allow_list_is_exactly_what_the_tree_uses() -> None:
+    # An allow-list entry that outlives its need is a silent widening: the next import of that package
+    # from that path lands green with nobody deciding it. So every entry must name a path that exists,
+    # and must be USED, package by package. Narrow an entry when its file stops needing a package.
+    for key in _CLIENT_ALLOWED:
+        target = _REPO / key.rstrip("/")
+        assert target.is_dir() if key.endswith("/") else target.is_file(), f"{key} is not there"
+    used = dict(_real_client_scan().used)
+    declared = {k: a.packages for k, a in _CLIENT_ALLOWED.items()}
+    assert used == declared, f"the tree uses {used}, the allow-list declares {declared}"
+
+
+def test_the_client_walk_fires_on_the_real_tree_without_its_allow_list() -> None:
+    # The positive control over the REAL tree rather than a planted one: with the allow-list emptied,
+    # the walk must report every allow-listed path. A walk that cannot see the imports it excuses
+    # would pass the two tests above for the wrong reason.
+    scan = _client_scan(_REPO, _CLIENT_ROOTS, _MIN_CLIENT_FILES_WALKED, _CLIENT_FORBIDDEN, {})
+    reported = {v.split(" imports ", 1)[0] for v in scan.violations}
+    for key in _CLIENT_ALLOWED:
+        hits = [r for r in reported if r == key or (key.endswith("/") and r.startswith(key))]
+        assert hits, f"emptying the allow-list reported nothing under {key}"
+    stray = {r for r in reported if _allowance_key(r, _CLIENT_ALLOWED) is None}
+    assert not stray, f"reported outside every allow-list entry: {sorted(stray)}"
+
+
+# (the rule a row proves or "" for a negative row, the planted file, its import line, flagged?)
+_CLIENT_PLANTED: list[tuple[str, str, str, bool]] = [
+    ("messagefoundry.config", "harness/x.py", "from messagefoundry.config import AckMode\n", True),
+    ("messagefoundry.pipeline", "tee/x.py", "import messagefoundry.pipeline.sharding\n", True),
+    (
+        "messagefoundry.store",
+        "samples/x.py",
+        "from messagefoundry.store.base import open_store\n",
+        True,
+    ),
+    (
+        "messagefoundry.transports",
+        "messagefoundry_webconsole/x.py",
+        "from messagefoundry.transports.mllp import frame\n",
+        True,
+    ),
+    # The root spelling `_imported_modules` now resolves: it names a forbidden subpackage.
+    ("messagefoundry.store", "harness/x.py", "from messagefoundry import store\n", True),
+    # An allowed file reaching a package its entry does NOT name still reds: entries are per package.
+    (
+        "messagefoundry.transports",
+        "harness/load/shardcert.py",
+        "import messagefoundry.transports\n",
+        True,
+    ),
+    # Negative rows. The leaf this item built, the permitted `parsing`, the web console's seam, a lazy
+    # root export, a package whose name only STARTS like a forbidden one, and an allowed file using
+    # exactly what its entry names.
+    ("", "harness/x.py", "from messagefoundry.mllpcodec import AckMode, frame\n", False),
+    ("", "harness/x.py", "from messagefoundry.parsing.peek import Peek\n", False),
+    (
+        "",
+        "messagefoundry_webconsole/x.py",
+        "from messagefoundry.api._ui_seam import UiDeps\n",
+        False,
+    ),
+    ("", "samples/x.py", "from messagefoundry import MLLP, inbound\n", False),
+    ("", "harness/x.py", "import messagefoundry.configuration_notes\n", False),
+    ("", "harness/load/shardcert.py", "from messagefoundry.pipeline.sharding import plan\n", False),
+    ("", "harness/config/g.py", "from messagefoundry.config.models import RetryPolicy\n", False),
+]
+
+_PLANT_FLOORS = dict.fromkeys(_CLIENT_ROOTS, _MIN_FLOOR)
+
+
+def _plant_clients(repo: Path) -> None:
+    """Every client tree under `repo`, each holding `_MIN_FLOOR` clean modules."""
+    for client in _CLIENT_ROOTS:
+        (repo / client).mkdir(parents=True)
+        for i in range(_MIN_FLOOR):
+            (repo / client / f"clean{i}.py").write_text("import json\n", encoding="utf-8")
+
+
+def test_every_client_rule_has_a_planted_case() -> None:
+    planted = {rule for rule, _, _, flagged in _CLIENT_PLANTED if flagged}
+    assert planted == set(_CLIENT_FORBIDDEN), sorted(planted ^ set(_CLIENT_FORBIDDEN))
+
+
+@pytest.mark.parametrize(("rule", "path", "line", "flagged"), _CLIENT_PLANTED)
+def test_the_client_walk_sees_a_planted_import(
+    tmp_path: Path, rule: str, path: str, line: str, flagged: bool
+) -> None:
+    _plant_clients(tmp_path)
+    target = tmp_path / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(line, encoding="utf-8")
+    scan = _client_scan(tmp_path, _CLIENT_ROOTS, _PLANT_FLOORS, _CLIENT_FORBIDDEN, _CLIENT_ALLOWED)
+    if not flagged:
+        assert scan.violations == (), scan.violations
+        return
+    # Exactly one report, against the planted file and not a clean one, naming THIS row's rule.
+    assert len(scan.violations) == 1, scan.violations
+    reported_path, module = scan.violations[0].split(" imports ", 1)
+    assert reported_path == path, scan.violations
+    assert _forbidden_root(module, _CLIENT_FORBIDDEN) == rule, scan.violations
+
+
+def test_the_client_walk_resolves_a_relative_import_under_the_client(tmp_path: Path) -> None:
+    _plant_clients(tmp_path)
+    (tmp_path / "tee" / "anon").mkdir()
+    module = tmp_path / "tee" / "anon" / "hl7.py"
+    module.write_text("from .keying import Keyer\nfrom .. import store\n", encoding="utf-8")
+    # `from .. import store` inside tee/ is tee's own `store`, never the engine's: no report.
+    assert _imported_modules(module, tmp_path / "tee") == {"tee.anon.keying", "tee"}
+    scan = _client_scan(tmp_path, _CLIENT_ROOTS, _PLANT_FLOORS, _CLIENT_FORBIDDEN, {})
+    assert scan.violations == (), scan.violations
+
+
+def test_the_client_walk_refuses_the_shapes_that_would_make_it_vacuous(tmp_path: Path) -> None:
+    _plant_clients(tmp_path)
+    args = (_CLIENT_FORBIDDEN, _CLIENT_ALLOWED)
+    with pytest.raises(AssertionError, match="disagree"):
+        _client_scan(tmp_path, [], _PLANT_FLOORS, *args)
+    with pytest.raises(AssertionError, match="disarm"):
+        _client_scan(tmp_path, _CLIENT_ROOTS, {**_PLANT_FLOORS, "tee": 1}, *args)
+    with pytest.raises(AssertionError, match="under its floor"):
+        _client_scan(tmp_path, _CLIENT_ROOTS, {**_PLANT_FLOORS, "tee": _MIN_FLOOR + 1}, *args)
+    shutil.rmtree(tmp_path / "samples")
+    with pytest.raises(AssertionError, match="not a directory"):
+        _client_scan(tmp_path, _CLIENT_ROOTS, _PLANT_FLOORS, *args)
+
+
+def test_the_mllp_leaf_loads_no_engine_runtime_package() -> None:
+    # The leaf's own promise, in a fresh interpreter for the reason the api test below gives: importing
+    # `messagefoundry.mllpcodec` (which brings `messagefoundry.framing`) loads none of the four runtime
+    # packages and not `parsing` either, since `build_ack` imports it on call.
+    code = (
+        "import sys\n"
+        "import messagefoundry.mllpcodec\n"
+        "bad = sorted(m for m in sys.modules if m.split('.')[:2] in (\n"
+        "    ['messagefoundry', 'config'], ['messagefoundry', 'pipeline'],\n"
+        "    ['messagefoundry', 'store'], ['messagefoundry', 'transports'],\n"
+        "    ['messagefoundry', 'parsing']))\n"
+        "assert 'messagefoundry.framing' in sys.modules, 'the leaf no longer loads its codec'\n"
+        "assert not bad, bad\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_engine_homes_still_export_the_moved_names() -> None:
+    # Engine callers kept their import paths (BACKLOG #1697): each old home re-exports the SAME object.
+    import messagefoundry.config.models as models
+    import messagefoundry.framing as framing
+    import messagefoundry.mllpcodec as codec
+    import messagefoundry.transports.framing as tframing
+    import messagefoundry.transports.mllp as tmllp
+
+    assert models.AckMode is codec.AckMode
+    for name in ("SB", "EB", "CR", "DEFAULT_MAX_FRAME_BYTES", "frame", "MLLPDecoder", "build_ack"):
+        assert getattr(tmllp, name) is getattr(codec, name), name
+    assert tmllp.MLLPFrameError is codec.MLLPFrameError
+    for name in tframing.__all__:
+        assert getattr(tframing, name) is getattr(framing, name), name
 
 
 def test_importing_api_does_not_eagerly_pull_fastapi() -> None:
@@ -526,9 +862,10 @@ def test_importing_api_does_not_eagerly_pull_fastapi() -> None:
 # replacement: an AST walk cannot see a forbidden package arriving TRANSITIVELY behind an allowed
 # import, which is the one thing this probe is for. Measured on this tree: a walk over all 17 tray
 # files for all seven names finds zero hits, so it would pass on arrival. It is not built here
-# because the walk helper it would reuse (`_imported_modules` above) does not record the
-# `from messagefoundry import config` spelling, and repairing that belongs to the walk's own change,
-# not to this one. Unfiled; named by subject rather than by a number nobody has allocated.
+# because the walk helper it would reuse (`_imported_modules` above) did not record the
+# `from messagefoundry import config` spelling, and repairing that belonged to the walk's own change,
+# not to this one. BACKLOG #1697 has since repaired that spelling, for the client walk's sake; the
+# tray's static walk is still unbuilt. Unfiled; named by subject rather than by an unallocated number.
 _TRAY_FORBIDDEN = (
     "PySide6",
     "fastapi",
