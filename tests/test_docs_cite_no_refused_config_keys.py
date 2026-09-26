@@ -51,6 +51,7 @@ from typing import Final
 
 import pytest
 from _docs_toml import TOML_FENCE_RE, line_contexts
+from _sequenced_docs import sequenced_documents
 
 from messagefoundry.config.settings import _RELOCATED_TO_SECURITY, _REMOVED_KEYS
 
@@ -776,3 +777,83 @@ def test_no_doc_presents_a_refused_config_key_as_config(doc: pathlib.Path) -> No
             f"A reader who copies these gets a ValueError at load.\n{shown}\n"
             f"Use the [security] spelling from _RELOCATED_TO_SECURITY instead."
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# THE SIX SEQUENCED OPERATOR DOCUMENTS ARE HELD TO A STRICTER RULE, AT ZERO (BACKLOG #1749).
+#
+# The assignment-shape scan above is right for the corpus and blind to prose. USER-GUIDE told a
+# reader at two sites that the console is served "when `[api].serve_ui` is on" -- an instruction to
+# confirm a key the loader refuses -- and the scan returned nothing for either line, because neither
+# carries an `=`. Widening the scan corpus-wide to any NAMED key would re-baseline the ADRs (which
+# record what a relocated key did, by name, on purpose), pull in docs/SECURITY.md, and land on the
+# two withheld rows nobody can re-measure. So the stricter rule runs only where it matters most:
+# the documents docs/README.md sequences for a first operator, read from that index.
+#
+# The rule: a line naming a refused key in its `[section].key` spelling is a defect unless the line
+# says it is refused (`_DISCLAIMS`). No baseline, no replacement-section exemption. The bare `key`
+# spelling is not read: without its section it collides with live keys (see `_dotted_assignment`).
+# ---------------------------------------------------------------------------------------------
+
+_NAMED: tuple[tuple[str, str, re.Pattern[str]], ...] = tuple(
+    (section, key, re.compile(rf"(?<![\w.])\[{re.escape(section)}\]\.{re.escape(key)}(?!\w)"))
+    for section, key in _REFUSED_KEYS
+)
+
+
+def _named_refused_keys(text: str) -> list[tuple[int, str]]:
+    """Every line naming a refused key by its dotted spelling without saying it is refused."""
+    hits: list[tuple[int, str]] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if _DISCLAIMS.search(line):
+            continue
+        hits.extend(
+            (lineno, f"[{section}].{key}")
+            for section, key, pattern in _NAMED
+            if pattern.search(line)
+        )
+    return hits
+
+
+# The two USER-GUIDE lines BACKLOG #1749 fixed, as they stood before the fix. The first is verbatim;
+# the second is trimmed to its clause. They are the control because they are the case the rule is for.
+_PRE_FIX_USER_GUIDE_LINES = (
+    "Then open the web console in a browser "
+    "(the engine serves it at `/ui` when `[api].serve_ui` is on):",
+    "confirm the engine is serving, that `[api].serve_ui` is on with the "
+    "`messagefoundry-webconsole` distribution installed, and that your browser is pointed at that "
+    "host/port's `/ui`.",
+)
+
+
+@pytest.mark.parametrize("line", _PRE_FIX_USER_GUIDE_LINES)
+def test_the_strict_rule_catches_what_the_assignment_scan_misses(line: str) -> None:
+    """PAIRED CONTROL: the corpus scan reads the defect as clean, and the strict rule does not.
+
+    If the first assertion ever fails, the corpus scan has learned prose and this rule may be
+    redundant. If the second fails, the strict rule has gone blind and the zero below means nothing.
+    """
+    assert _citations(line) == [], "the assignment scan now sees prose; revisit the strict rule"
+    assert _named_refused_keys(line) == [(1, "[api].serve_ui")]
+
+
+def test_the_strict_rule_exempts_a_line_documenting_the_refusal() -> None:
+    """INSTALL-GUIDE names `[api].serve_ui` to say it is refused. That line is right and passes."""
+    line = (
+        "# [security].serve_web_console = false "
+        "(the old [api].serve_ui spelling is refused at config load)"
+    )
+    assert _named_refused_keys(line) == []
+
+
+def test_the_sequenced_documents_name_no_refused_key() -> None:
+    """The six sequenced documents name no refused key without saying it is refused."""
+    found = {
+        rel: hits
+        for rel in sequenced_documents()
+        if (hits := _named_refused_keys((REPO / rel).read_text(encoding="utf-8")))
+    }
+    assert not found, (
+        "a sequenced operator document names a key the loader REFUSES, without saying so:\n"
+        + "\n".join(f"    {rel} line {n}: {key}" for rel, hits in found.items() for n, key in hits)
+    )

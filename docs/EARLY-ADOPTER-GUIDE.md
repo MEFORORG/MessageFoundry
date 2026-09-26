@@ -218,7 +218,7 @@ host.
 | Extra | Pulls in | When |
 |---|---|---|
 | `postgres` | `asyncpg` (no OS dep; ships compiled wheels) | Using the PostgreSQL backend (recommended prod path) |
-| `console` | PySide6 + keyring | Running the desktop admin console |
+| `harness` | PySide6 | Running the standalone send/receive test harness (the operator console is the separate `messagefoundry-webconsole` wheel) |
 | `sftp` | paramiko | SFTP connectors |
 | `sqlserver` | `aioodbc` **+ OS-level Microsoft ODBC Driver 18** | The SQL Server *store* backend (`backend=sqlserver`, production) and the DATABASE connector family. |
 | `dev` | pytest/ruff/mypy/httpx | Development & CI |
