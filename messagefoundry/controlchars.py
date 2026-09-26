@@ -41,9 +41,20 @@ WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591).
 ``_is_control_char`` below exists to close. This module imports nothing, so it is the one place both
 can reach. Nothing else about that move is load-bearing; the other files cite this paragraph.
 
-DELIBERATELY NOT FOLDED IN. ``parsing/sniff.py`` tests the same code points but is a genuinely
-different predicate: it is byte-wise rather than character-wise and subtracts an allowlist, because
-a text sniffer must tolerate tab, CR and LF. Folding it in would change its behaviour.
+DELIBERATELY NOT FOLDED IN. ``parsing/sniff.py``'s ``nontext_upload_reason`` counts the same code
+points, but it is a different predicate. It works on bytes, not characters. It also subtracts its
+own allowlist of controls a text file may carry. Folding it in would change its behaviour. The same
+file's archive member-name check does import :func:`has_control_char`; only the density count is
+carved out.
+
+At least two more sites spell an overlapping range on purpose, and a widening here must not reach
+them. This is not a survey of every such site; these two were read under BACKLOG #1273.
+
+  * ``spreadsheet.py``'s ``_LEADING_NOISE`` is C0 plus DEL plus a zero-width/BOM family. It models
+    what a spreadsheet importer drops before it judges a cell. That is a fact about importers, not
+    about an injection alphabet. It has a harness mirror, and its own docstring says why.
+  * ``transports/soap.py``'s ``_XML_ILLEGAL_RE`` is the C0 slice of XML 1.0's ``Char`` rule. It
+    leaves out tab, LF and CR, and it has no DEL, which XML allows. That standard fixes the set.
 
 THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this test, import it.
 """
