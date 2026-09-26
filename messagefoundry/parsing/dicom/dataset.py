@@ -162,8 +162,15 @@ class DicomDataset:
     def measurements(self) -> list[SrMeasurement]:
         """Every SR ``NUM`` measurement, depth-first through the ``ContentSequence`` tree (an SR nests
         measurements under ``CONTAINER`` items). Empty for a non-SR object or an SR with no numeric
-        content."""
-        return list(_walk_num(getattr(self._ds, "ContentSequence", None)))
+        content.
+
+        Raises :class:`~messagefoundry.parsing.dicom.errors.DicomError` if the tree cannot be read.
+        pydicom keeps a defined-length sequence raw until it is first read, so a malformed or deeply
+        nested one fails here, after ``parse`` returned, and not inside it (BACKLOG #1599)."""
+        try:
+            return list(_walk_num(getattr(self._ds, "ContentSequence", None)))
+        except parse_error_types() as exc:
+            raise DicomError("SR content tree is not a parseable DICOM sequence") from exc
 
 
 def _walk_num(content_sequence: Any) -> Iterator[SrMeasurement]:

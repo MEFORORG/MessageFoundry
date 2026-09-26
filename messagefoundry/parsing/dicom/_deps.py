@@ -75,12 +75,14 @@ def parse_error_types() -> tuple[type[BaseException], ...]:
     ``tests/test_dicom_parse_error_contract.py`` fails if that module grows a third one the tuple
     misses. pydicom also raises ``NotImplementedError`` for an unknown VR (``values.py``), and its
     sequence reader recurses once per nesting level, so a deeply nested ``SQ`` raises
-    ``RecursionError`` (BACKLOG #1599; the stack has unwound to the parse method's handler by the
-    time it runs, so wrapping it cannot re-trip the limit). Enumerated
-    at pydicom 3.0.2, and "at least": the list covers what was found, not everything a later pydicom
-    can raise. The stdlib members cover the truncation and garbage decode paths. The accessors on a
-    parsed :class:`~messagefoundry.parsing.dicom.dataset.DicomDataset` read values after ``parse``
-    returns, outside this wrap.
+    ``RecursionError`` (BACKLOG #1599; the stack has unwound to the handler by the time it runs, so
+    wrapping it cannot re-trip the limit). An undefined-length ``SQ`` is read inside ``dcmread``; a
+    defined-length one stays raw until first read, so it raises from the accessor that reads it.
+    Enumerated at pydicom 3.0.2, and "at least": the list covers what was found, not everything a
+    later pydicom can raise. The stdlib members cover the truncation and garbage decode paths. The
+    accessors on a parsed :class:`~messagefoundry.parsing.dicom.dataset.DicomDataset` read values
+    after ``parse`` returns, outside this wrap; ``measurements()``, which walks the whole SR tree,
+    applies the same tuple itself.
 
     Never add bare ``RuntimeError`` or ``Exception``. :func:`load_dcmread` and
     :func:`load_header_readers` raise ``RuntimeError`` for a missing or broken ``[dicom]`` extra, a
