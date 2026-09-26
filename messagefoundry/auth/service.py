@@ -501,13 +501,8 @@ class FederatedSubjectHeld(RuntimeError):
 
 
 class UsernameTaken(RuntimeError):
-    """:meth:`AuthService.create_local_user` lost the race for its username (BACKLOG #1808).
-
-    ``POST /users`` checks the name first, but two creates of one name can both pass that check.
-    The store's UNIQUE index then refuses the second insert. Without this class that refusal
-    reached the API's global handler as a 500. The route answers 409 with the pre-check's text, so
-    the loser sees the same refusal either way.
-    """
+    """:meth:`AuthService.create_local_user` lost a concurrent create's race for its username
+    (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text."""
 
 
 class DirectoryObjectIdMissing(ValueError):
@@ -558,8 +553,9 @@ def _is_integrity_refusal(exc: BaseException) -> bool:
     ``UniqueViolationError``, pyodbc's ``IntegrityError`` -- and naming them would make this module
     import-aware of every driver and silently stop covering a backend added later. The ONE copy of
     this test. At least these call it: the webauthn duplicate-label race (ADR 0068 section 4), the
-    cached-username refresh, the federated bind, and the local-account username race (BACKLOG #1808). ``_refresh_cached_username`` records why the test is on
-    "Integrity" and not "IntegrityError", and the one engine class the name test would wrongly absorb.
+    cached-username refresh, the federated bind, and the local-account username race (BACKLOG
+    #1808). ``_refresh_cached_username`` records why the test is on "Integrity" and not
+    "IntegrityError", and the one engine class the name test would wrongly absorb.
     """
     mro = "".join(t.__name__ for t in type(exc).__mro__)
     return "Integrity" in mro or "UniqueViolation" in mro
@@ -2831,8 +2827,9 @@ class AuthService:
             # site is inside `run_startup_attestation`, which runs before any listener binds, and
             # neither `store/` nor `auth/` imports the module. Recorded because the day something
             # raises it from a store or auth path, every handler that calls this predicate could
-            # silently report a conflict instead of a refused attestation -- a fail-closed control absorbed by
-            # a fail-open one. If that class ever moves, test on identity here, not on a name.
+            # silently report a conflict instead of a refused attestation -- a fail-closed control
+            # absorbed by a fail-open one. If that class ever moves, test on identity here, not on a
+            # name.
             if not _is_integrity_refusal(exc):
                 raise
             # Re-read rather than guess who won: this is an error path, the cost is irrelevant, and an
@@ -4563,9 +4560,14 @@ class AuthService:
             # The concurrent duplicate-label race (ADR 0068 §4): each backend raises its own
             # integrity class (sqlite3.IntegrityError / asyncpg UniqueViolationError / pyodbc
             # IntegrityError) — rendered as the same legible error as a pre-checked duplicate.
-            if _is_integrity_refusal(exc):
-                raise ValueError("label already in use") from exc
-            raise
+            if not _is_integrity_refusal(exc):
+                raise
+            # BACKLOG #1807: the same classes carry the user_id foreign-key refusal, raised when the
+            # account is deleted mid-enrolment. Told apart by re-reading the account, never by the
+            # driver's message: that text can echo the operator-chosen label.
+            if await self._store.get_user(user.id) is None:
+                raise ValueError("no such user") from exc
+            raise ValueError("label already in use") from exc
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
         # rotated — the reverse order writes nothing and still reports success.

@@ -1339,7 +1339,7 @@ async def test_the_reset_notice_to_a_disabled_account_carries_no_deadline() -> N
         await store.close()
 
 
-async def _race_for_the_name(store: MessageStore, monkeypatch: pytest.MonkeyPatch) -> None:
+def _race_for_the_name(store: MessageStore, monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the next ``create_user`` lose the BACKLOG #1808 race: a rival row takes the name first,
     then the real insert runs and meets the UNIQUE index, as a concurrent create would."""
     original = store.create_user
@@ -1361,7 +1361,7 @@ async def test_a_lost_username_race_raises_username_taken(
     try:
         service = AuthService(store, AuthSettings())
         await service.initialize()
-        await _race_for_the_name(store, monkeypatch)
+        _race_for_the_name(store, monkeypatch)
         with pytest.raises(UsernameTaken, match="username already exists") as raised:
             await service.create_local_user(
                 username="carol",

@@ -844,7 +844,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 actor=identity.username,
             )
         except UsernameTaken as exc:
-            # A concurrent create took the name after the check above (BACKLOG #1808).
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         user = await service.store.get_user(user_id)
         assert user is not None
