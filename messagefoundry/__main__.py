@@ -47,6 +47,7 @@ from messagefoundry.logging_setup import (
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings
 
 
@@ -5260,6 +5261,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # BACKLOG #2034: the [security].enforcement dial `serve` hands the lifespan as
+    # trust_anchors_enforcing, derived the same way. AuthService checks the OIDC and AD trust anchors
+    # when it is built, and it enforces when no dial is passed. Without this, a weak anchor that
+    # `serve` only warns about at `warn` would make this command refuse.
+    trust_anchors_enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+
     async def administrator_exists() -> bool:
         from messagefoundry.store.base import StoreNotFoundError
 
@@ -5273,16 +5280,20 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except StoreNotFoundError:
             return False
         try:
-            return await AuthService(store, settings.auth).has_enabled_administrator()
+            service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
+            return await service.has_enabled_administrator()
         finally:
             await store.close()
 
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.store.crypto import StoreKeylessError
 
     try:
         exists = run_guarded(administrator_exists())
     except StoreKeylessError as exc:
         return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
+    except TrustAnchorError as exc:
+        return _emit_trust_anchor_refusal(exc, as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if exists:
@@ -5328,7 +5339,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     "shell, so the store opened KEYLESS; refusing to provision. Make the key the "
                     "service runs with readable here and re-run."
                 )
-            outcome = await AuthService(store, settings.auth).provision_first_administrator(
+            service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
+            outcome = await service.provision_first_administrator(
                 username=args.username,
                 password=password,
                 display_name=args.display_name,
@@ -5351,6 +5363,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         outcome, store_path = run_guarded(run())
     except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
         return _emit_error(str(exc), as_json=args.json)
+    except TrustAnchorError as exc:
+        return _emit_trust_anchor_refusal(exc, as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
@@ -7069,6 +7083,20 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
     else:
         print(f"error: {message}", file=sys.stderr)
     return 2
+
+
+def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
+    """Report a trust anchor ``provision-admin`` refused, and return exit 1 (BACKLOG #2034).
+
+    ``AuthService`` checks the OIDC and AD anchors when it is built, so a command that builds one
+    refuses an anchor ``serve`` would refuse. The anchor's own text is kept whole: its later lines are
+    the commands that fix the file. Without this arm ``main``'s dispatch floor would report only the
+    exception type and a redacted message (BACKLOG #1863)."""
+    return _emit_error(
+        f"{exc}\nThis command applies the trust-anchor check `serve` applies, so it provisioned "
+        "nothing. Fix the anchor and re-run.",
+        as_json=as_json,
+    )
 
 
 class _OperatorJsonError(Exception):
