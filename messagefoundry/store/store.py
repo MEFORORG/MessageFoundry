@@ -3972,7 +3972,8 @@ CREATE TABLE IF NOT EXISTS secret_rotation_meta (
 # The latest event of each listed message, for the tracking view (list_messages, search_messages).
 # BACKLOG #1726: MAX(id) reads ix_events_message as a covering scan and fetches one row by primary key,
 # where an ORDER BY id sorted each message's events in a temp B-tree (that index orders by ts, not id).
-# A message with no events yields NULL.
+# A message with no events yields NULL. It correlates on `messages.id`, so use it only where the query
+# names `messages` without an alias.
 _LAST_EVENT_COLUMN = (
     "(SELECT event FROM message_events e WHERE e.id ="
     " (SELECT MAX(e2.id) FROM message_events e2 WHERE e2.message_id = messages.id)) AS last_event"

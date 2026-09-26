@@ -72,7 +72,8 @@ async def _seed(store: MessageStore, n: int = 240) -> None:
         channel = _CHANNELS[i % len(_CHANNELS)]
         received_at = 100.0 + (i // 3)  # three messages share each timestamp
         status = "error" if i % 7 == 0 else "processed"
-        messages.append((mid, channel, received_at, status))
+        mtype = ("ADT^A01", "ORU^R01")[i % 2]
+        messages.append((mid, channel, received_at, f"C{i % 40}", mtype, status))
         # 0 to 3 events; ts DEcreasing with id, so the ts order and the id order disagree.
         events += [(mid, received_at + 10.0 - k, f"ev{k}") for k in range(i % 4)]
         for dest in rnd.sample(_DESTS, 2):
@@ -94,7 +95,7 @@ async def _seed(store: MessageStore, n: int = 240) -> None:
         # An ingress row the outbound aggregate must ignore.
         queue.append((f"i{i:04d}", mid, Stage.INGRESS.value, channel, None, "done", 0.0, 0.0))
     # A pair with only cancelled rows: it must still appear, with every figure zero or None.
-    messages.append(("m_cancel", "IB_ONLY_CANCELLED", 50.0, "processed"))
+    messages.append(("m_cancel", "IB_ONLY_CANCELLED", 50.0, None, None, "processed"))
     queue.append(
         (
             "q_cancel",
@@ -109,7 +110,8 @@ async def _seed(store: MessageStore, n: int = 240) -> None:
     )
     db = store._db
     await db.executemany(
-        "INSERT INTO messages (id, channel_id, received_at, raw, status) VALUES (?,?,?,'MSH|x',?)",
+        "INSERT INTO messages (id, channel_id, received_at, control_id, message_type, raw, status)"
+        " VALUES (?,?,?,?,?,'MSH|x',?)",
         messages,
     )
     await db.executemany(
@@ -193,6 +195,10 @@ _FILTERS: tuple[tuple[Any, ...], ...] = (
     (None, None, None, None, ["IB_A", "IB_C"], None, None),
     (None, None, None, None, None, 110.0, 140.0),
     ("IB_A", None, None, None, None, 120.0, None),
+    (None, None, None, "C7", None, None, None),  # control_id repeats across channels
+    ("IB_B", None, None, "C7", None, None, None),
+    (None, None, "ORU^R01", None, None, None, None),
+    (None, None, None, "no-such-control", None, None, None),  # a miss walks everything
 )
 
 
@@ -231,9 +237,9 @@ async def test_list_messages_old_and_new_return_the_same_rows(store: MessageStor
 
 
 async def test_connection_metrics_returns_every_figure_unchanged(store: MessageStore) -> None:
-    """Differential: every inbound and destination figure with the new index against the same
-    store with it dropped, across since and rate windows. The metrics SQL itself did not change;
-    this pins that the new index does not change what the planner's chosen plan returns."""
+    """Every inbound and destination figure, with the new index and with it dropped, across since
+    and rate windows. The metrics SQL did not change, and today's planner picks the same plan in both
+    arms, so this guards the day a planner or a later edit starts using ix_messages_received there."""
     await _seed(store)
     windows = (
         (0.0, 200.0, 60.0),
@@ -271,10 +277,12 @@ async def test_connection_metrics_returns_every_figure_unchanged(store: MessageS
 async def test_an_existing_store_gains_the_index_on_its_next_open(tmp_path: Path) -> None:
     path = tmp_path / "old.db"
     s = await MessageStore.open(path)
-    await _seed(s, n=10)
-    await _drop_index(s)  # the store as a build before #1726 left it
-    assert not await _has_index(s)
-    await s.close()
+    try:
+        await _seed(s, n=10)
+        await _drop_index(s)  # the store as a build before #1726 left it
+        assert not await _has_index(s)
+    finally:
+        await s.close()
     s = await MessageStore.open(path)
     try:
         assert await _has_index(s)
