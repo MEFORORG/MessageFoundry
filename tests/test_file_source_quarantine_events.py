@@ -115,3 +115,32 @@ async def test_a_failing_sink_never_stops_the_quarantine(tmp_path: Path) -> None
     await source._scan_once()
 
     assert (inbox / ".error" / _NAME).exists()
+
+
+async def test_a_quarantine_whose_move_failed_records_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drop that could not be moved (a read-only share, a locked file) is still in place and is
+    examined again next scan. Recording it as quarantined would be false, and would write one row
+    per poll for as long as it stays.
+
+    Mutation: emit regardless of the move's result. Red: an event is recorded."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / _NAME).write_bytes(_HL7)
+    source = FileSource(
+        Source(type=ConnectorType.FILE, settings={"directory": str(inbox), "max_file_bytes": 10})
+    )
+    sink = _Sink()
+    source.on_connection_event = sink
+
+    async def handler(_raw: bytes) -> str | None:
+        return None
+
+    source._handler = handler
+    monkeypatch.setattr(FileSource, "_move", staticmethod(lambda _path, _dest: False))
+
+    await source._scan_once()
+
+    assert sink.events == []
+    assert (inbox / _NAME).exists()

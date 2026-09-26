@@ -13,6 +13,7 @@ Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Win
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import stat
@@ -21,6 +22,8 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.transports import file as file_mod
+from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.file import FileDestination, _claim_unique
 
 _PAYLOAD = "MSH|^~\\&|SND|FAC|RCV|FAC|20260101120000||ADT^A01|CTL1618|P|2.5.1\rPID|1||12345\r"
@@ -147,3 +150,73 @@ async def test_a_refused_directory_flush_is_logged_once_and_never_fails_the_deli
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out-1.hl7", "out.hl7"]
     warnings = [r for r in caplog.records if "could not be fsync'd" in r.getMessage()]
     assert len(warnings) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a directory fsync exists only on POSIX")
+async def test_a_transient_directory_flush_failure_is_retried_on_the_next_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Only an UNSUPPORTED directory fsync is remembered. A transient one (EIO) must not switch the
+    flush off for the life of the process.
+
+    Mutation: latch on any OSError. Red: the second publish logs no second warning."""
+    real_fsync = os.fsync
+
+    def eio_on_dirs(fd: int) -> None:
+        if _is_dir_fd(fd):
+            raise OSError(5, "Input/output error")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", eio_on_dirs)
+    destination = _destination(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        await destination.send(_PAYLOAD)
+        await destination.send(_PAYLOAD)
+
+    warnings = [r for r in caplog.records if "could not be fsync'd" in r.getMessage()]
+    assert len(warnings) == 2
+
+
+async def test_a_filesystem_without_fsync_still_delivers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Some FUSE, WebDAV and network mounts answer fsync with EINVAL or ENOTSUP. Deliveries worked
+    there before the flush existed, so an unsupported flush is logged once, not raised: raising
+    would fail the lane forever.
+
+    Mutation: let every fsync OSError propagate. Red: ``send`` raises ``DeliveryError``."""
+    monkeypatch.setattr(file_mod, "_file_fsync_unsupported_logged", False)
+
+    def unsupported(_fd: int) -> None:
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    monkeypatch.setattr(os, "fsync", unsupported)
+    destination = _destination(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        await destination.send(_PAYLOAD)
+        await destination.send(_PAYLOAD)
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out-1.hl7", "out.hl7"]
+    notes = [r for r in caplog.records if "does not support fsync" in r.getMessage()]
+    assert len(notes) == 1
+
+
+async def test_a_failed_flush_still_fails_the_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EIO means the bytes are not known to be on disk, so the delivery fails and is retried, and
+    nothing is published.
+
+    Mutation: treat every fsync OSError as unsupported. Red: the file is published."""
+
+    def eio(_fd: int) -> None:
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(os, "fsync", eio)
+
+    with pytest.raises(DeliveryError):
+        await _destination(tmp_path).send(_PAYLOAD)
+
+    assert list(tmp_path.iterdir()) == []

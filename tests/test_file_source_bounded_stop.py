@@ -79,7 +79,7 @@ async def test_stop_never_cancels_a_hand_off_in_progress(
     the grace, and the file is then disposed of normally: the grace restarts when the hand-off ends,
     so the archive move after it is not cut at an arbitrary step boundary either.
 
-    Mutation: cancel regardless of ``_handing_off``. Red: the hand-off is cancelled mid-commit."""
+    Mutation: cancel regardless of ``_in_store_call``. Red: the hand-off is cancelled mid-commit."""
     monkeypatch.setattr(file_mod, "_STOP_GRACE_S", 0.25)
     inbox = tmp_path / "in"
     inbox.mkdir()
@@ -127,4 +127,92 @@ async def test_a_stop_between_batch_hand_offs_leaves_the_file_to_be_re_read(
 
     assert len(handed_off) == 1
     assert batch.exists(), "an interrupted batch file must stay in place to be re-read whole"
-    assert not source._handing_off
+    assert not source._in_store_call
+
+
+async def test_two_overlapping_stops_both_wait_for_the_poll_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shutdown during a reload: the second stop() must not return, and close the credential
+    context, while the first is still waiting on the poll task.
+
+    Mutation: clear ``self._task`` before waiting. Red: the second stop returns with the task live."""
+    monkeypatch.setattr(file_mod, "_STOP_GRACE_S", 0.3)
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    source = _source(inbox)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_listing() -> list[Path]:
+        entered.set()
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(source, "_candidates", blocked_listing)
+
+    async def handler(_raw: bytes) -> str | None:
+        return None
+
+    await source.start(handler)
+    poll_task = source._task
+    assert poll_task is not None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        first = asyncio.create_task(source.stop())
+        await asyncio.sleep(0)  # let the first stop start waiting
+        await asyncio.wait_for(source.stop(), 3)
+        assert poll_task.done(), "the second stop returned while the poll task was still running"
+        await asyncio.wait_for(first, 3)
+    finally:
+        release.set()
+
+
+class _SlowLedger:
+    """A leave-mode ledger whose write outlasts the stop grace."""
+
+    def __init__(self) -> None:
+        self.marked: list[str] = []
+
+    async def is_processed(self, _key: str) -> bool:
+        return False
+
+    async def mark_processed(self, key: str) -> None:
+        await asyncio.sleep(1.0)
+        self.marked.append(key)
+
+    async def prune(self) -> None:
+        return None
+
+
+async def test_stop_never_cancels_a_leave_mode_ledger_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger write is a store call like the hand-off. Cut short, the file is re-ingested next
+    start, and on a pooled server connection the connection itself could be left mid-call.
+
+    Mutation: drop the store-call guard around ``_leave_record``. Red: the write never lands."""
+    monkeypatch.setattr(file_mod, "_STOP_GRACE_S", 0.25)
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "one.hl7").write_bytes(_MSG.format(n=1).encode("ascii"))
+    source = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "poll_seconds": 0.05, "after_read": "leave"},
+        )
+    )
+    ledger = _SlowLedger()
+    source.processed_ledger = ledger
+    handed_off = asyncio.Event()
+
+    async def handler(_raw: bytes) -> str | None:
+        handed_off.set()
+        return None
+
+    await source.start(handler)
+    await asyncio.wait_for(handed_off.wait(), 5)
+    await asyncio.sleep(0.1)  # into the slow ledger write
+    await asyncio.wait_for(source.stop(), 5)
+
+    assert len(ledger.marked) == 1, "the ledger write was cut short"

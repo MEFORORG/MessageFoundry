@@ -18,6 +18,7 @@ about a config **Handler**: its return is routed like any other (and an inadmiss
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import logging
 import os
@@ -25,11 +26,12 @@ import re
 import shutil
 import tempfile
 import time
+import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, BinaryIO, TypeVar
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -366,8 +368,7 @@ class FileDestination(DestinationConnector):
                 # delivered, durably, the moment send() returns. Without this the bytes could still
                 # sit in the page cache then, and a power loss would leave an empty file at the final
                 # name that nothing re-delivers. The rename below is atomic for visibility only.
-                handle.flush()
-                os.fsync(handle.fileno())
+                _flush_to_disk(handle)
             if self._overwrite:
                 os.replace(tmp, target)  # atomic overwrite; consumes tmp
                 consumed = True
@@ -406,10 +407,12 @@ class FileDestination(DestinationConnector):
         POSIX makes a rename or a link durable only once the DIRECTORY is fsync'd. Windows exposes no
         directory handle through :func:`os.open`, so there is nothing to call there and this returns.
 
-        A failure is logged once per destination and then no longer attempted, rather than raised. The
-        file is already published under its final name with its bytes flushed, so failing the delivery
-        now would make the worker retry and publish a duplicate beside it. Some network filesystems
-        refuse a directory fsync outright, and a WARNING on every delivery there would be noise."""
+        A failure is logged rather than raised. The file is already published under its final name
+        with its bytes flushed, so failing the delivery now would make the worker retry and publish a
+        duplicate beside it. A filesystem that does not SUPPORT a directory fsync (some network mounts
+        refuse it outright) is logged once and not asked again, since a WARNING on every delivery there
+        would be noise. Any other failure is taken as transient: it is logged and the next publish
+        tries again, so one hiccup cannot switch the flush off for the life of the process."""
         if os.name != "posix" or self._dir_fsync_unsupported:
             return
         try:
@@ -419,13 +422,14 @@ class FileDestination(DestinationConnector):
             finally:
                 os.close(dir_fd)
         except OSError as exc:
-            self._dir_fsync_unsupported = True
+            unsupported = exc.errno in _FSYNC_UNSUPPORTED_ERRNOS
+            self._dir_fsync_unsupported = unsupported
             logger.warning(
                 "file destination %s: the directory could not be fsync'd after a publish (%s); each "
-                "file's bytes are still flushed, but a crash may lose a just-published name. Not "
-                "retried for this destination.",
+                "file's bytes are still flushed, but a crash may lose a just-published name.%s",
                 self.directory,
                 safe_exc(exc),
+                " Not retried for this destination." if unsupported else "",
             )
 
 
@@ -495,10 +499,11 @@ class FileSource(SourceConnector):
         self._skipping = False  # whether the last tick was gated out (for a single transition log)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        # True while the poll task is inside a pipeline hand-off, which stop() never cancels, and when
-        # the last one ended, so stop() gives the task a full grace after it (#1620).
-        self._handing_off = False
-        self._handoff_ended = 0.0
+        # True while the poll task is inside a store call (a pipeline hand-off or a leave-mode ledger
+        # read or write), which stop() never cancels, and when the last one ended, so stop() gives the
+        # task a full grace after it (#1620).
+        self._in_store_call = False
+        self._store_call_ended = 0.0
         # Alternate Windows/UNC credential (ADR 0132, #111). None (the default) => the ambient
         # service-account identity, byte-identical. On a non-Windows host a configured credential
         # raises CredentialUnsupportedError here (a build error), never a silent no-op.
@@ -584,12 +589,16 @@ class FileSource(SourceConnector):
                 # it still reports running, and re-raise inside stop()/reload (review H-4). Log and
                 # retry on the next interval.
                 #
-                # Scrubbed, as MLLP's last-resort arm is (BACKLOG #1625): an exception from this loop
-                # can render a partner-chosen file name into its message, and a traceback at ERROR
-                # would carry it unredacted. The traceback stays available at DEBUG.
+                # Scrubbed, as MLLP's last-resort arm is (BACKLOG #1625): a traceback at ERROR prints
+                # the exception text unredacted, and that text can carry a partner-chosen file name.
+                # safe_exc redacts and bounds it but cannot swap a name it does not know, so this arm
+                # is safer than before, not proven clean. The raising frame's location is kept at
+                # ERROR, so a programming error is still findable without DEBUG; the full traceback
+                # stays available at DEBUG.
                 logger.error(
-                    "file source scan failed for %s; retrying next poll: %s",
+                    "file source scan failed for %s at %s; retrying next poll: %s",
                     self.directory,
+                    _raise_site(exc),
                     safe_exc(exc),
                 )
                 logger.debug("file source scan failure traceback", exc_info=True)
@@ -627,15 +636,22 @@ class FileSource(SourceConnector):
         OS timeout. So after :data:`_STOP_GRACE_S` the task is cancelled and the abandonment is logged.
         The thread finishes on its own; nothing waits for it.
 
-        **A pipeline hand-off is never cancelled.** While the task is inside one, stop() keeps waiting
-        in grace-sized steps, as it did before this bound existed: the hand-off is the durable store
-        commit, and cutting it would leave the message's fate to the store's cancellation handling.
-        Cancelling anywhere else is safe for count-and-log: a file is moved only after every one of
-        its messages is handed off, so an interrupted file is re-read whole on the next start
-        (at-least-once, the same shape as a failed hand-off). The grace restarts when a hand-off
-        ends, so the task always gets a full one to reach its next stop check before it is cut."""
+        **A store call is never cancelled.** That covers a pipeline hand-off (the durable commit) and
+        the leave-mode ledger read, write and prune. While the task is inside one, stop() keeps
+        waiting in grace-sized steps, as it did before this bound existed: cutting a store call would
+        leave its outcome to the backend's cancellation handling, and on a pooled server connection
+        possibly the connection's state too. Cancelling anywhere else is safe for count-and-log: a
+        file is moved only after every one of its messages is handed off, so an interrupted file is
+        re-read whole on the next start (at-least-once, the same shape as a failed hand-off). The
+        grace restarts when a store call ends, so the task always gets a full one to reach its next
+        stop check before it is cut. The wait is therefore bounded for a blocked SHARE call, and
+        only as bounded as the store for a store call.
+
+        The task stays referenced until it has finished, so a second stop() that overlaps the first
+        (shutdown during a reload) waits for the same task instead of closing the credential context
+        under it."""
         self._stop.set()
-        task, self._task = self._task, None
+        task = self._task
         if task is not None:
             deadline = time.monotonic() + _STOP_GRACE_S
             try:
@@ -644,11 +660,11 @@ class FileSource(SourceConnector):
                     done, _pending = await asyncio.wait({task}, timeout=timeout)
                     if done:
                         break
-                    if self._handing_off:
-                        # A hand-off is finishing its commit: never cut it; look again in a grace.
+                    if self._in_store_call:
+                        # A store call is finishing: never cut it; look again in a grace.
                         deadline = time.monotonic() + _STOP_GRACE_S
                         continue
-                    deadline = max(deadline, self._handoff_ended + _STOP_GRACE_S)
+                    deadline = max(deadline, self._store_call_ended + _STOP_GRACE_S)
                     if time.monotonic() < deadline:
                         continue
                     task.cancel()
@@ -668,6 +684,8 @@ class FileSource(SourceConnector):
             # reload quiesce, outside its rollback (review H-4). _run already guards scans; this is
             # the belt-and-suspenders. It also collects the cancellation from the arm above.
             await asyncio.gather(task, return_exceptions=True)
+            if self._task is task:
+                self._task = None
         # Release the alternate-credential context (worker thread + any token) AFTER the poll task has
         # quiesced, so no identity leaks across a stop/reload. No-op when no credential is configured.
         if self._cred_ctx is not None:
@@ -698,7 +716,9 @@ class FileSource(SourceConnector):
             file_key: str | None = None
             if self.after_read == "leave":
                 file_key = self._file_key(path, before)
-                if await self._leave_already_ingested(file_key):
+                with self._store_call():
+                    already = await self._leave_already_ingested(file_key)
+                if already:
                     continue
             if self.max_file_bytes is not None and before[0] > self.max_file_bytes:
                 # Transport-level reject *before* any message is read — parallels MLLP dropping an
@@ -710,7 +730,8 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     self.max_file_bytes,
                 )
-                await self._run_fs(self._move, path, self.error_dir)
+                if not await self._run_fs(self._move, path, self.error_dir):
+                    continue  # still in place; logged by _move and examined again next scan
                 await self._emit_event(
                     "file_oversize",
                     reason=f"{before[0]} bytes exceeds max_file_bytes {self.max_file_bytes}",
@@ -754,7 +775,8 @@ class FileSource(SourceConnector):
                         safe_name(path.name),
                         safe_exc(exc, file_name=path.name),
                     )
-                    await self._run_fs(self._move, path, self.error_dir)
+                    if not await self._run_fs(self._move, path, self.error_dir):
+                        continue  # still in place; logged by _move and examined again next scan
                     await self._emit_event(
                         "file_decompress_failed", reason=safe_exc(exc, file_name=path.name)
                     )
@@ -778,7 +800,8 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     declared,
                 )
-                await self._run_fs(self._move, path, self.error_dir)
+                if not await self._run_fs(self._move, path, self.error_dir):
+                    continue  # still in place; logged by _move and examined again next scan
                 await self._emit_event(
                     "file_content_mismatch",
                     reason=f"does not match declared content type {declared}",
@@ -799,7 +822,8 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     safe_exc(exc, file_name=path.name),
                 )
-                await self._run_fs(self._move, path, self.error_dir)
+                if not await self._run_fs(self._move, path, self.error_dir):
+                    continue  # still in place; logged by _move and examined again next scan
                 await self._emit_event(
                     "file_scan_rejected", reason=safe_exc(exc, file_name=path.name)
                 )
@@ -818,9 +842,9 @@ class FileSource(SourceConnector):
                     safe_exc(exc, file_name=path.name),
                 )
                 continue
-            self._handing_off = True
             try:
-                completed = await self._emit(raw)
+                with self._store_call():
+                    completed = await self._emit(raw)
             except Exception as exc:
                 # The handler records every message-level outcome (parse/validation/routing → ERROR)
                 # itself and returns, so an exception escaping here is an infrastructure failure: the
@@ -840,9 +864,6 @@ class FileSource(SourceConnector):
                     safe_exc(exc, file_name=path.name),
                 )
                 continue
-            finally:
-                self._handing_off = False
-                self._handoff_ended = time.monotonic()
             if not completed:
                 # Stopped between a batch file's hand-offs (#1620). The file stays put, so the next
                 # start re-reads it whole and re-emits every message (at-least-once, no dropped tail).
@@ -858,12 +879,14 @@ class FileSource(SourceConnector):
             if self.after_read == "leave" and file_key is not None:
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit), so a
                 # partial-emit crash re-reads and re-emits the whole file (at-least-once), never dropping.
-                await self._leave_record(file_key)
+                with self._store_call():
+                    await self._leave_record(file_key)
                 newly_recorded += 1
         if newly_recorded and self.processed_ledger is not None:
             # Bound the ledger's growth (age + count); only when this tick recorded something, so a stable
             # read-only share (nothing new) never churns the store.
-            await self.processed_ledger.prune()
+            with self._store_call():
+                await self.processed_ledger.prune()
 
     async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
         """Record a quarantine in the connection-event log (BACKLOG #1621), **fail-soft**.
@@ -884,6 +907,16 @@ class FileSource(SourceConnector):
             await sink(kind, None, reason)
         except Exception as exc:  # noqa: BLE001 - observer only; a capture bug can't stop ingest
             logger.warning("file source connection-event emit failed: %s", safe_exc(exc))
+
+    @contextmanager
+    def _store_call(self) -> Iterator[None]:
+        """Mark the poll task as inside a store call, which :meth:`stop` never cancels (#1620)."""
+        self._in_store_call = True
+        try:
+            yield
+        finally:
+            self._in_store_call = False
+            self._store_call_ended = time.monotonic()
 
     def _at_ceiling(self, disposed: int, remaining: int) -> bool:
         """True when this scan has spent its per-tick budget (``poll_max_files``) and must stop, leaving
@@ -1059,7 +1092,7 @@ class FileSource(SourceConnector):
                 "file source could not list %s (pattern %r): %s",
                 self.directory,
                 self.pattern,
-                _describe_listing_error(exc),
+                _describe_os_error(exc),
             )
             return []
         files = [
@@ -1172,8 +1205,10 @@ class FileSource(SourceConnector):
             self._move(path, self.processed_dir)
 
     @staticmethod
-    def _move(path: Path, dest_dir: Path) -> None:
-        """Archive ``path`` into ``dest_dir`` under a name claimed ATOMICALLY (BACKLOG #1046).
+    def _move(path: Path, dest_dir: Path) -> bool:
+        """Archive ``path`` into ``dest_dir`` under a name claimed ATOMICALLY (BACKLOG #1046). Returns
+        whether the move completed, meaning the original is gone from the watch directory. A caller
+        records a quarantine only then (BACKLOG #1621): a file that stayed is examined again next scan.
 
         This used to be ``path.replace(_unique(...))`` — a check-then-act pair, where ``_unique``
         asked ``exists()`` and ``replace`` then overwrote whatever was at the name it chose. Two
@@ -1192,13 +1227,15 @@ class FileSource(SourceConnector):
             _claim_unique(path, dest_dir / path.name)
         except OSError as exc:
             # A stuck file (locked / dest unwritable) stays and is re-read; log it (FILE-4).
+            # No path in the log: the claim may fail on a BUMPED name (``name-1.ext``), which
+            # safe_exc's file_name swap does not match, so the OS text stands in for the message.
             logger.warning(
                 "could not move %s to %s: %s",
                 safe_name(path.name),
                 dest_dir.name,
-                safe_exc(exc, file_name=path.name),
+                _describe_os_error(exc),
             )
-            return
+            return False
         try:
             path.unlink()
         except OSError as exc:
@@ -1208,6 +1245,8 @@ class FileSource(SourceConnector):
                 dest_dir.name,
                 safe_exc(exc, file_name=path.name),
             )
+            return False
+        return True
 
 
 # --- helpers -----------------------------------------------------------------
@@ -1274,6 +1313,39 @@ def scan_inbound_file(raw: bytes, source: str) -> None:
 _RENAME_REFUSES_OVERWRITE = os.name == "nt"
 
 
+#: errno values meaning "this filesystem does not support fsync here", not "the flush failed". Some
+#: FUSE, WebDAV and network mounts answer an fsync this way; a failed flush (EIO, ENOSPC) never does.
+_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
+    {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, getattr(errno, "ENOSYS", errno.EINVAL)}
+)
+
+#: Set once a file fsync has been refused as unsupported, so that is logged once per process.
+_file_fsync_unsupported_logged = False
+
+
+def _flush_to_disk(handle: BinaryIO) -> None:
+    """Flush ``handle`` and fsync it, before its file is published anywhere (BACKLOG #1618).
+
+    A filesystem that does not SUPPORT fsync is logged once and not treated as a failure: the write
+    worked before this flush existed, and turning an unsupported flush into a delivery error would
+    make such a destination fail forever on a lane that retries. A real flush failure (EIO, ENOSPC)
+    still raises, because then the bytes are not known to be on disk."""
+    global _file_fsync_unsupported_logged
+    handle.flush()
+    try:
+        os.fsync(handle.fileno())
+    except OSError as exc:
+        if exc.errno not in _FSYNC_UNSUPPORTED_ERRNOS:
+            raise
+        if not _file_fsync_unsupported_logged:
+            _file_fsync_unsupported_logged = True
+            logger.warning(
+                "file transport: this filesystem does not support fsync (%s); files are published "
+                "without a durable flush, so a crash may leave one empty. Logged once.",
+                safe_exc(exc),
+            )
+
+
 def _claim_unique(tmp: Path, target: Path) -> Path:
     """Publish ``tmp``'s bytes at ``target`` (or ``name-1.ext``, ``name-2.ext``, … if taken), never
     clobbering an existing file and never consuming ``tmp``.
@@ -1293,13 +1365,18 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
     if claimed is not None:
         return claimed
     staged = _stage_copy(tmp, target.parent)
+    consumed = False
     try:
         claimed = _link_free_name(staged, target)
-        return claimed if claimed is not None else _publish_staged(staged, target)
+        if claimed is None:
+            claimed = _publish_staged(staged, target)
+            consumed = True  # renamed onto the final name, so there is no staged file left
+        return claimed
     finally:
-        # After a link the staged name is a second link to the published file; after a rename or
-        # replace it is already gone. Either way nothing of ours may be left behind.
-        _discard(staged)
+        # After a link the staged name is a second link to the published file, and after a failure
+        # it is a full copy. Either way it must go, and a failure to remove it must be heard.
+        if not consumed:
+            _discard(staged)
 
 
 def _free_names(target: Path) -> Iterator[Path]:
@@ -1347,9 +1424,7 @@ def _stage_copy(source: Path, directory: Path) -> Path:
         # first and to raise, the fd would stay open and the unlink would fail on Windows.
         with os.fdopen(fd, "wb") as handle, open(source, "rb") as reader:
             shutil.copyfileobj(reader, handle)
-            # Durable before anyone can see it under the final name (BACKLOG #1618).
-            handle.flush()
-            os.fsync(handle.fileno())
+            _flush_to_disk(handle)  # durable before anyone can see it under the final name (#1618)
         placed = True
     finally:
         if not placed:
@@ -1397,10 +1472,14 @@ def _discard(path: Path) -> None:
     watch by design, so a scanner or a reader holding the file open is ordinary here, and an escaping
     unlink error would hide the full volume or dropped share behind a cleanup message.
 
+    Only called while the file should still exist, so ``FileNotFoundError`` is not taken as success:
+    on Windows a dropped UNC share surfaces as ``FileNotFoundError`` too, and the copy is still there
+    when the share returns (the same reading as ``FileDestination._remove_temp``, BACKLOG #1862).
+
     The name is logged as a safe label (BACKLOG #1625): on the archive move a placeholder carries the
     partner's own file name, and the ``OSError`` renders that path into its message too."""
     try:
-        path.unlink(missing_ok=True)
+        path.unlink()
     except OSError as exc:
         logger.warning(
             "could not remove the file %s after a failed claim: %s",
@@ -1409,13 +1488,23 @@ def _discard(path: Path) -> None:
         )
 
 
-def _describe_listing_error(exc: OSError | ValueError) -> str:
-    """A log-safe account of a failed directory listing (BACKLOG #1625).
+def _raise_site(exc: BaseException) -> str:
+    """Where ``exc`` was raised, as ``module.py:line in function``: code coordinates, never data."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return "an unknown location"
+    last = frames[-1]
+    return f"{Path(last.filename).name}:{last.lineno} in {last.name}"
 
-    Under ``recursive`` the failing path can be a partner-created SUBDIRECTORY, whose name is as
-    partner-chosen as a file's and is not known here to swap for a label. So an ``OSError`` is
-    reported by its type, errno and OS text, never its path. A ``ValueError`` is an invalid glob
-    pattern, which is operator configuration."""
+
+def _describe_os_error(exc: OSError | ValueError) -> str:
+    """A log-safe account of a filesystem error whose path may be partner-chosen (BACKLOG #1625).
+
+    Used where the path is not known here to swap for a label: a failed directory listing, whose path
+    under ``recursive`` can be a partner-created SUBDIRECTORY, and a failed archive claim, whose path
+    can be a bumped ``name-1.ext``. An ``OSError`` is reported by its type, errno and OS text, never
+    its path. A ``ValueError`` from a listing is an invalid glob pattern, which is operator
+    configuration."""
     if isinstance(exc, OSError):
         return f"{type(exc).__name__}: [Errno {exc.errno}] {exc.strerror or ''}".rstrip()
     return safe_exc(exc)

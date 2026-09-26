@@ -79,8 +79,10 @@ _LOGON32_PROVIDER_WINNT50 = 3
 #: ON AN INBOUND SOURCE IT IS NOW REACHABLE TOO (BACKLOG #1620). ``FileSource.stop`` waits for its
 #: poll task for ``file._STOP_GRACE_S``, then cancels it and reaches ``close`` with the wedged share
 #: call still in flight on this worker. The drain below then waits its own bound and logs, so a
-#: source's stop against a dead share costs at most the two bounds together. It used to await the
-#: poll task with no timeout and never reach ``close`` at all, which left this drain unreachable.
+#: source's stop against a dead share costs the two bounds together. That is the SHARE case only:
+#: ``FileSource.stop`` never cancels a task inside a store call, and there it waits as long as the
+#: store does. It used to await the poll task with no timeout and never reach ``close`` at all, which
+#: left this drain unreachable.
 #:
 #: See :meth:`CredentialContext.close` for why the wait cannot simply be blocking.
 _CLOSE_DRAIN_TIMEOUT_S = 5.0

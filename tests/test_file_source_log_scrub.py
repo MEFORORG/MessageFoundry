@@ -18,7 +18,9 @@ import asyncio
 import errno
 import logging
 import os
+import shutil
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
@@ -123,3 +125,61 @@ async def test_a_scan_failure_logs_no_traceback_at_error(
     assert errors, "the scan failure must still be logged"
     assert all(r.exc_info is None for r in errors), "a traceback was logged at ERROR"
     assert "RuntimeError" in errors[0].getMessage()
+    assert "in scan_fails" in errors[0].getMessage(), "the raising frame is not named"
+
+
+def test_a_failed_archive_claim_on_a_bumped_name_logs_no_partner_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Partners resend names, so the archive claim often lands on ``name-1.ext``. ``safe_exc``
+    swaps only the exact basename, so an ``OSError`` carrying the bumped name used to be logged in
+    the clear.
+
+    Mutation: log the claim failure with ``safe_exc(exc, file_name=path.name)``. Red: the bumped
+    name, MRN included, is in the log."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    dropped = inbox / f"{_MRN}_ADT.hl7"
+    dropped.write_bytes(b"PAYLOAD")
+    bumped = str(tmp_path / "processed" / f"{_MRN}_ADT-1.hl7")
+
+    def claim_fails(_tmp: Path, _target: Path) -> Path:
+        raise PermissionError(errno.EACCES, "Permission denied", "tmpab12.part", None, bumped)
+
+    monkeypatch.setattr(file_mod, "_claim_unique", claim_fails)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        assert FileSource._move(dropped, tmp_path / "processed") is False
+
+    lines = [r.getMessage() for r in caplog.records if "could not move" in r.getMessage()]
+    assert lines and "Permission denied" in lines[0], lines
+    assert _MRN not in lines[0], lines
+
+
+def test_a_staged_copy_that_vanished_is_reported_not_taken_as_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """On Windows a dropped UNC share surfaces as FileNotFoundError, and the full copy is still there
+    when the share returns. Cleanup must say so rather than treat it as already gone.
+
+    Mutation: ``unlink(missing_ok=True)`` in ``_discard``. Red: no warning."""
+    source = tmp_path / "src.bin"
+    source.write_bytes(b"PAYLOAD")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    def die_mid_copy(_src: object, dst: BinaryIO, *_a: object, **_k: object) -> None:
+        dst.write(b"TRUNC")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def share_gone(self: Path, **_k: object) -> None:
+        raise FileNotFoundError(errno.ENOENT, "The network path was not found", str(self))
+
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(shutil, "copyfileobj", die_mid_copy)
+    monkeypatch.setattr(Path, "unlink", share_gone)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(OSError, match="space"):
+        _claim_unique(source, out_dir / "out.hl7")
+
+    assert any("failed claim" in r.getMessage() for r in caplog.records)
