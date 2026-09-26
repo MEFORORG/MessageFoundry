@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import http.client
 import io
 import logging
+import pickle
 import socket
 import sys
 import threading
@@ -557,6 +559,21 @@ def test_a_multipart_type_does_not_hide_a_lost_header_line() -> None:
         assert "header" in fault
         with pytest.raises(AmbiguousFramingError):
             read_bounded(_wire(raw), connector="c")
+
+
+def test_the_framing_error_survives_pickle_and_copy() -> None:
+    """``reason`` is keyword-only and not in ``args``, so the default exception reduce could not
+    rebuild it. A copy or a cross-process hop must keep both the message and the reason."""
+    original = AmbiguousFramingError("c framed its body ambiguously", reason="a fixed reason")
+    for clone in (
+        pickle.loads(pickle.dumps(original)),
+        copy.copy(original),
+        copy.deepcopy(original),
+    ):
+        assert type(clone) is AmbiguousFramingError
+        assert str(clone) == str(original)
+        assert clone.reason == "a fixed reason"
+        assert clone.args == original.args
 
 
 @pytest.mark.parametrize("shape", list(_HEADER_CONTROLS), ids=list(_HEADER_CONTROLS))

@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import email.message
 import email.parser
+import functools
 import http.client
 import logging
 import re
@@ -200,6 +201,11 @@ class AmbiguousFramingError(EgressReplyError):
         super().__init__(message)
         #: The fixed reason text, never a peer byte, so a caller can word its own message.
         self.reason = reason
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # BaseException pickles and copies as cls(*self.args), and args holds only the message, so
+        # the keyword-only reason must travel with the constructor or the rebuild raises TypeError.
+        return (functools.partial(type(self), reason=self.reason), self.args, self.__dict__)
 
 
 class _SupportsRead(Protocol):

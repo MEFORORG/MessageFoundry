@@ -472,9 +472,10 @@ All notable changes to MessageFoundry are documented here. The format follows
     without them all the same;
   - a header line with no name, a first line that is a continuation, a `From ` line, a field
     name that is not an RFC 9110 token, or a field value holding a control character such as NUL;
-  - a chunk-size line that is not plain hex digits, such as `-5`, `1_0`, `+5`, `0x5`, ` 5` or
-    `5 ` (whitespace before or after the size).
-    0.4.0 parsed these with `int()`. On a negative size it read to the end of the stream, past
+  - a chunk-size line that is not plain hex digits, such as `-5`, `1_0`, `+5`, `0x5` or ` 5`
+    (whitespace before the size). Whitespace after the size, as in `5 `, is refused too, unless a
+    chunk extension follows it. `5 ;ext` still reads, because RFC 9112 allows whitespace before the
+    `;`. 0.4.0 parsed these with `int()`. On a negative size it read to the end of the stream, past
     the reply's byte bound, and only then failed;
   - a chunk line ended by a bare LF, or holding a bare CR, and chunk data not followed by CRLF;
   - a trailer line that is not a field line, or more than 100 trailer lines, counting folded
