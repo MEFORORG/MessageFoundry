@@ -937,10 +937,18 @@ class _FakeWS:
     """Minimal duck-typed WebSocket for unit-testing authorize_ui_ws (headers/cookies/app.state/url)."""
 
     def __init__(
-        self, origin: str | None, host: str | None, cookie: str | None, app: object
+        self,
+        origin: str | None,
+        host: str | None,
+        cookie: str | None,
+        app: object,
+        peer: tuple[str, int] = ("127.0.0.1", 123),
     ) -> None:
         self.headers = {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
         self.app = app
+        # ``.client`` is what ``client_ip`` reads for the denial rows (ADR 0150, BACKLOG #1644). A
+        # real address by default, never None, so a client assertion cannot pass as None == None.
+        self.client = SimpleNamespace(host=peer[0], port=peer[1])
         # A real Starlette WebSocket carries ``.url``; the #192 cookie-name resolver
         # (session_cookie_name → effective_https) reads ``.url.scheme`` to key the cookie name off the
         # effective scheme. Model the handshake scheme from the page origin — a cleartext http page
@@ -953,6 +961,11 @@ class _FakeWS:
         self.url = SimpleNamespace(scheme=scheme, path="/ws/stats")
         cookie_name = "__Host-mf_session" if scheme == "wss" else "mf_session"
         self.cookies = {cookie_name: cookie} if cookie is not None else {}
+
+
+#: A named, non-loopback handshake peer (TEST-NET-3), so a client assertion compares a value this file
+#: chose rather than a default that also matches a loopback login row.
+_WS_PEER = ("203.0.113.9", 55123)
 
 
 async def _token(engine: Engine, service: AuthService, user: str) -> tuple[object, str]:
@@ -1038,13 +1051,15 @@ async def test_ws_cookie_auth_permission_denial_is_audited(engine: Engine) -> No
     assert await _denials() == []
 
     # VIEWER holds monitoring:read but not config:deploy, so the permission loop is what refuses.
-    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app, peer=_WS_PEER)
     identity, tok = await authorize_ui_ws(ws, Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
     assert identity is None and tok is None  # behaviour unchanged: the caller still falls through
 
     rows = await _denials()
     assert len(rows) == 1, "the refused handshake left no denial row"
     assert rows[0]["actor"] == "vw"
+    # ADR 0150, BACKLOG #1644: the row names the handshake's host. RED when client= is dropped.
+    assert rows[0]["client"] == _WS_PEER[0]
     assert json.loads(str(rows[0]["detail"])) == {
         "permission": "config:deploy",
         "path": "/ws/stats",
@@ -1091,13 +1106,15 @@ async def test_ws_cookie_auth_mfa_pending_refusal_is_audited(engine: Engine) -> 
     # Negative control: the sign-in above audits, but it audits nothing of this action.
     assert await _rows("auth.mfa_denied") == []
 
-    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app, peer=_WS_PEER)
     identity, tok = await authorize_ui_ws(ws, Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
     assert identity is None and tok is None  # behaviour unchanged: the caller still falls through
 
     rows = await _rows("auth.mfa_denied")
     assert len(rows) == 1, "the MFA-pending handshake left no record"
     assert rows[0]["actor"] == "op"
+    # ADR 0150, BACKLOG #1644: the row names the handshake's host. RED when client= is dropped.
+    assert rows[0]["client"] == _WS_PEER[0]
     # Exact equality, for the same reason the permission-denial row asserts it: the row carries the
     # PATH and nothing else. Widening it to the full URL would put an operator's query string — where
     # a clinician's search terms live — into the hash chain.
@@ -2420,6 +2437,46 @@ async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
             "a stale step-up was not sent to re-auth carrying the purge it interrupted"
         )
         assert r.status_code == 303
+
+
+async def test_console_purge_writes_the_connection_purge_row(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #1641, the console path: a /ui purge leaves a ``connection_purge`` outcome row.
+
+    The row is written in ``purge_connection``'s body so both planes carry it; the JSON plane is
+    pinned in tests/test_api.py. The console reaches that handler BY REFERENCE across the seam, and
+    its own gate audits denials only, so before the handler wrote the row a browser purge left no
+    trace at all. This pins that the console call really lands on the audited body.
+
+    RED when the ``record_audit("connection_purge", ...)`` call is removed from ``purge_connection``.
+    The 303 alone cannot carry this: a purge that cancelled and wrote nothing redirects the same way.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _start_two_out(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    await rr.stop_outbound("out1")
+    await _wait_quiesced(engine, "out1")
+    # Queued AFTER the stop, so the paused lane cannot deliver it and the purge has one row to cancel.
+    await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")  # a fresh login is a recent step-up
+        assert await engine.store.list_audit(action="connection_purge") == []  # control
+        r = await c.post(
+            "/ui/connections/out1/purge/all", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/ui", r.text
+
+    rows = await engine.store.list_audit(action="connection_purge")
+    assert len(rows) == 1, f"expected one connection_purge row, got {len(rows)}"
+    assert rows[0]["actor"] == "op"
+    assert json.loads(str(rows[0]["detail"])) == {
+        "connection": "out1",
+        "scope": "all",
+        "cancelled": 1,
+    }
 
 
 def test_connections_fragment_renders_selection_checkbox() -> None:
