@@ -72,7 +72,7 @@ from messagefoundry.store.base import (
     warm_pool_connections,
     warm_pool_target,
 )
-from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -9538,8 +9538,8 @@ class SqlServerStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
-        # The inner SELECT picks the newest `fetch_limit` ids without `raw`; only those rows are read
-        # whole (BACKLOG #2068, see ``MessageStore.search_messages``).
+        # The inner SELECT picks the newest `fetch_limit` ids without selecting `raw`; only those rows
+        # are read whole (BACKLOG #2068, see ``MessageStore.search_messages``).
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata, raw,"
@@ -9547,11 +9547,10 @@ class SqlServerStore:
             "  ORDER BY e.id DESC) AS last_event"
             " FROM messages WHERE id IN"
             f" (SELECT id FROM messages{where}"
-            "  ORDER BY received_at DESC, id DESC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY)"
-            " ORDER BY received_at DESC, id DESC",
+            "  ORDER BY received_at DESC, id DESC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY)",
             (*params, spec.fetch_limit),
         )
-        return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
+        return await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit)
 
     def _scan_rows(
         self, spec: SearchSpec, candidates: list[dict[str, Any]], limit: int

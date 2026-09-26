@@ -15,8 +15,10 @@ matches and (because matching may parse HL7) is run **off the event loop** by th
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 from messagefoundry.parsing.peek import HL7PeekError, Peek, parse_path
 
@@ -56,13 +58,25 @@ class SearchSpec:
     target: SearchTarget
     scan_limit: int
 
+    def __post_init__(self) -> None:
+        # make_spec clamps; a spec built any other way must already be in range, or SQLite would take
+        # `LIMIT 0` / `LIMIT -1` (no limit at all) from fetch_limit and the cap would vanish (#2068).
+        if not 1 <= self.scan_limit <= MAX_SCAN_LIMIT:
+            raise ValueError(f"scan_limit must be in [1, {MAX_SCAN_LIMIT}], got {self.scan_limit}")
+
     @property
     def fetch_limit(self) -> int:
         """How many candidate rows a backend's ``SELECT`` may read (BACKLOG #2068): the scan cap plus
         one. The extra row is never decrypted; its presence is how ``_scan_rows`` tells "stopped at
-        the cap" (``truncated``) from "saw every candidate". Floored like :func:`make_spec` clamps, so
-        a directly built spec can never hand SQLite ``LIMIT -1``, which means no limit at all."""
-        return max(1, self.scan_limit) + 1
+        the cap" (``truncated``) from "saw every candidate"."""
+        return self.scan_limit + 1
+
+
+def newest_first(rows: Iterable[Any]) -> list[Any]:
+    """Order fetched candidates newest-first, as the scan walks them. Done here rather than by an
+    outer SQL ``ORDER BY``, which would make the database sort the rows with their bodies (and may
+    spill them to temp files) when the rows are already in memory (BACKLOG #2068)."""
+    return sorted(rows, key=lambda r: (r["received_at"], r["id"]), reverse=True)
 
 
 class ContentSearchError(ValueError):

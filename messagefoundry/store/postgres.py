@@ -87,7 +87,7 @@ from messagefoundry.store.base import (
     warm_pool_connections,
     warm_pool_target,
 )
-from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -6095,8 +6095,8 @@ class PostgresStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
-        # The inner SELECT picks the newest `fetch_limit` ids without `raw`; only those rows are read
-        # whole (BACKLOG #2068, see ``MessageStore.search_messages``).
+        # The inner SELECT picks the newest `fetch_limit` ids without selecting `raw`; only those rows
+        # are read whole (BACKLOG #2068, see ``MessageStore.search_messages``).
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata, raw,"
@@ -6104,12 +6104,11 @@ class PostgresStore:
             "  ORDER BY e.id DESC LIMIT 1) AS last_event"
             " FROM messages WHERE id IN"
             f" (SELECT id FROM messages{where}"
-            f"  ORDER BY received_at DESC, id DESC LIMIT ${len(params) + 1})"
-            " ORDER BY received_at DESC, id DESC",
+            f"  ORDER BY received_at DESC, id DESC LIMIT ${len(params) + 1})",
             *params,
             spec.fetch_limit,
         )
-        return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
+        return await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit)
 
     def _scan_rows(
         self, spec: SearchSpec, candidates: Sequence[Any], limit: int

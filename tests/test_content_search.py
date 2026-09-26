@@ -15,6 +15,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -66,14 +67,23 @@ def test_make_spec_clamps_scan_limit() -> None:
     assert spec0.scan_limit == 1
 
 
-def test_fetch_limit_is_one_past_the_scan_cap_and_never_below_two() -> None:
-    """BACKLOG #2068: the SELECT reads one row past the cap, and a spec built without make_spec's
-    clamp can never produce SQLite's ``LIMIT -1``, which means no limit at all."""
+def test_fetch_limit_is_one_past_the_scan_cap() -> None:
+    """BACKLOG #2068: the SELECT reads one row past the cap."""
     assert make_spec(content="x", field_path=None, field_value=None, scan_limit=3).fetch_limit == 4
-    raw = SearchSpec(
-        substring="x", field_path=None, field_value=None, target=SearchTarget.BOTH, scan_limit=-2
-    )
-    assert raw.fetch_limit == 2
+
+
+@pytest.mark.parametrize("scan_limit", [0, -2, 10_001])
+def test_a_spec_built_outside_make_spec_refuses_an_out_of_range_cap(scan_limit: int) -> None:
+    """A spec built without make_spec's clamp must not reach a backend: ``scan_limit`` -2 would hand
+    SQLite ``LIMIT -1``, which means no limit at all (BACKLOG #2068)."""
+    with pytest.raises(ValueError, match="scan_limit"):
+        SearchSpec(
+            substring="x",
+            field_path=None,
+            field_value=None,
+            target=SearchTarget.BOTH,
+            scan_limit=scan_limit,
+        )
 
 
 def test_row_matches_substring_case_insensitive() -> None:
@@ -205,6 +215,75 @@ async def test_scan_cap_bounds_the_rows_fetched(
         await assert_search_select_is_capped(store, monkeypatch)
     finally:
         await store.close()
+
+
+async def test_a_capped_search_returns_the_newest_matches_newest_first(tmp_path: Path) -> None:
+    """The cap keeps the newest candidates, and matched rows come back newest-first and decoded."""
+    store = await MessageStore.open(tmp_path / "enc.db", cipher=make_cipher(generate_key()))
+    try:
+        for i in range(6):
+            await store.enqueue_message(
+                channel_id="IB_A", raw=ADT, deliveries=[], control_id=f"C{i}", now=100.0 + i
+            )
+        spec = make_spec(content="JANE", field_path=None, field_value=None, scan_limit=2)
+        result = await store.search_messages(spec, allowed_channels=["IB_A", "IB_B"])
+        assert [r["control_id"] for r in result.rows] == ["C5", "C4"]
+        assert result.truncated is True
+    finally:
+        await store.close()
+
+
+async def test_a_scoped_search_loads_bodies_only_for_the_rows_it_keeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2068: a multi-channel RBAC scope makes SQLite sort its candidates. With the LIMIT on
+    the outer SELECT, that sort evaluated `raw` for EVERY candidate before the LIMIT applied, so the
+    rows handed back were capped while the read was not. The rows-fetched contract cannot see that.
+
+    This runs the store's own search SQL against the same file with `raw` wrapped in a counting
+    function, so it counts what SQLite evaluates. The outer-LIMIT shape evaluated it 10 times here."""
+    import sqlite3
+
+    import aiosqlite
+
+    db = tmp_path / "enc.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    try:
+        for i in range(12):
+            await store.enqueue_message(
+                channel_id=f"IB_{i % 3}", raw=ADT, deliveries=[], control_id=f"C{i}"
+            )
+        seen: list[tuple[str, tuple[object, ...]]] = []
+        real_execute = aiosqlite.Connection.execute
+
+        async def _capture(self: Any, sql: str, parameters: Any = None) -> Any:
+            if " raw, " in sql:
+                seen.append((sql, tuple(parameters or ())))
+            return await real_execute(self, sql, parameters)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", _capture)
+        spec = make_spec(content="zzz", field_path=None, field_value=None, scan_limit=3)
+        result = await store.search_messages(spec, allowed_channels=["IB_0", "IB_1", "IB_2"])
+        assert result.truncated is True
+    finally:
+        await store.close()
+
+    [(sql, params)] = seen
+    evaluated = 0
+
+    def _touch(value: str | None) -> str | None:
+        nonlocal evaluated
+        evaluated += 1
+        return value
+
+    con = sqlite3.connect(db)
+    try:
+        con.create_function("touch", 1, _touch)
+        rows = con.execute(sql.replace(" raw, ", " touch(raw), ", 1), params).fetchall()
+    finally:
+        con.close()
+    assert len(rows) == spec.fetch_limit
+    assert evaluated == spec.fetch_limit, f"SQLite evaluated raw for {evaluated} rows"
 
 
 async def test_result_cap_limits_returned_rows(tmp_path: Path) -> None:

@@ -93,7 +93,7 @@ from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -9225,28 +9225,28 @@ class MessageStore:
         any decrypt; rows are walked newest-first and decrypt+match runs **off the event loop** (the
         per-row AES-GCM decrypt + HL7 parse is CPU work). The scan stops after ``spec.scan_limit``
         decrypts (``truncated=True``) or ``limit`` matches, whichever first — the hard cost ceiling that
-        keeps this slow-by-construction read safe to expose. The candidate ``SELECT`` returns at most
-        ``spec.fetch_limit`` rows and loads bodies for those rows only, so the cap bounds memory, not
-        only the decrypts (BACKLOG #2068). Choosing those rows can still visit every candidate when
-        the plan must sort, but that sort carries ids, not bodies."""
+        keeps this slow-by-construction read safe to expose.
+
+        The candidate ``SELECT`` returns at most ``spec.fetch_limit`` rows, so the cap bounds the rows
+        and bodies held in memory, not only the decrypts (BACKLOG #2068). It does not bound the
+        database's own work: choosing those rows may still examine every candidate (a multi-channel
+        scope sorts them all, and a ``status`` filter on SQLite reads past ``raw`` to reach it)."""
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
-        # Read candidates newest-first under one read snapshot; decrypt+match each off the loop. The
-        # inner SELECT picks the newest `fetch_limit` ids without touching `raw`; only those rows are
-        # then read whole. A single LIMIT on the outer SELECT is not enough: a multi-channel RBAC
-        # scope (`channel_id IN (...)`) sorts in a temp B-tree, which reads every candidate's body and
-        # last event before the LIMIT applies (BACKLOG #2068).
+        # Read candidates under one read snapshot; decrypt+match each off the loop. The inner SELECT
+        # picks the newest `fetch_limit` ids without selecting `raw`; only those rows are read whole.
+        # A LIMIT on the outer SELECT alone is not enough: a multi-channel RBAC scope sorts in a temp
+        # B-tree, which evaluated every candidate's body and last event before the LIMIT (#2068).
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
                 f" status, error, summary, metadata, raw, {_LAST_EVENT_COLUMN}"
                 " FROM messages WHERE id IN"
-                f" (SELECT id FROM messages{where} ORDER BY received_at DESC, id DESC LIMIT ?)"
-                " ORDER BY received_at DESC, id DESC",
+                f" (SELECT id FROM messages{where} ORDER BY received_at DESC, id DESC LIMIT ?)",
                 (*params, spec.fetch_limit),
             )
-            candidates = list(await cur.fetchall())
+            candidates = newest_first(await cur.fetchall())
         return await asyncio.to_thread(self._scan_rows, spec, candidates, limit)
 
     def _scan_rows(

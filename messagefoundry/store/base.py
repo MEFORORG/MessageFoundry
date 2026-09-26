@@ -1037,9 +1037,9 @@ class QueueStore(StoreLifecycle, Protocol):
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): metadata pre-filter in SQL, then decrypt +
         match each candidate body in memory off the event loop — the only mechanism that works while the
-        store cipher is on (the at-rest bytes are per-row random-nonced AES-GCM ciphertext). The
-        candidate ``SELECT`` returns at most ``spec.fetch_limit`` rows and loads bodies for those rows
-        only, so the scan cap bounds memory and not only the decrypts (BACKLOG #2068)."""
+        store cipher is on (the at-rest bytes are per-row random-nonced AES-GCM ciphertext). What the
+        scan cap bounds (rows held in memory, since BACKLOG #2068) is stated once, on
+        ``MessageStore.search_messages``."""
         ...
 
     async def list_dead(
