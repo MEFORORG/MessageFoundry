@@ -1013,6 +1013,53 @@ does not disable its row. It re-diffs roles only for principals that hold a live
 requester who was disabled, deleted or demoted in the directory after making a request can still pass
 this check. Probing the directory at release is not built.
 
+**One Administrator is enough to defeat dual control (BACKLOG #315).** The control cannot prove
+that two people concurred, and nothing in the engine can. Only an Administrator holds
+`approvals:approve`, and every Administrator also holds `users:manage`. So an Administrator can create
+a second Administrator account and choose its password. An Administrator can also take over an
+existing one: `POST /users/{id}/reset-password` returns the temporary password to the caller, and
+`POST /users/{id}/reset-mfa` removes the target's second factors. Either way, that one person can then
+request an action and approve it. Creating accounts and changing roles cannot be placed under
+approval, because `[approvals].operations` has no user-management key. The server does refuse
+self-approval by user id. A second account is a second user id, so that refusal does not stop this.
+
+An auditor would be wrong to read `approval.approved` as proof that two people agreed. Treat it as
+proof that two accounts did.
+
+What the engine does instead is make the cheap routes loud. It refuses none of them:
+
+| Signal | When | Where it goes |
+|---|---|---|
+| `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, or `PUT /ad-group-map` newly maps a group to it | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator |
+| `client` on the `user.created` audit row | An account created through `POST /users` | The creating administrator's address, like the approval rows |
+| `account_created` notice | An account created through `POST /users` with a notification address | The new account's own notification address |
+
+**These signals miss at least five routes.** Each ends in one person holding two approver accounts
+with no page.
+
+- **Takeover before the request.** An existing Administrator's password and second factor are reset
+  before the request is filed. All three timestamps predate the request, so the release is not
+  flagged. No role changed, so `administrator_granted` does not fire either. Only the audit rows for
+  the resets record it.
+- **Mint before the request.** A new Administrator created before the request is not flagged at
+  release. Its `administrator_granted` alert fired when it was created.
+- **Promotion after the request.** Promotion changes none of the three timestamps, so the release is
+  not flagged. Its `administrator_granted` alert is the only page.
+- **Re-enabling a disabled Administrator, or binding a directory Administrator's federated
+  identity.** Neither changes a timestamp or grants a role, so neither pages.
+- **A directory grant.** An account that gets Administrator because the *directory* added it to a
+  group already mapped to Administrator raises no alert. The engine never sees that grant.
+
+The check also flags some releases that changed nothing. A login that rehashes a password after an
+argon2 parameter change restamps `password_changed_at`, so each approver's first release after such a
+change is flagged. The comparison uses two clocks, the requester's and the store writer's, so the
+skew described under the dwell floor shifts it too.
+
+The provenance check flags rather than refuses on purpose. A refusal would stop only the careless
+route, and it would also refuse an honest directory approver whose engine row is created at first
+sign-in.
+
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
 sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
@@ -1090,7 +1137,8 @@ gate **also** requires the session's second factor: an MFA-required caller is re
 `X-MFA-Required` until `POST /auth/mfa-verify` succeeds (TOTP or a single-use recovery code), so these
 routes need both a fresh step-up window **and** the MFA factor. The window is not always a password:
 a code proved at the MFA gate stamps it too (see above). The step-up window composes with the
-dual-control approval above (the requester re-verifies; an independent approver still releases the action).
+dual-control approval above: the requester re-verifies, and a second account releases the action.
+That second account need not belong to a second person; see BACKLOG #315 under dual-control approval.
 
 ### Multi-factor authentication (TOTP, WP-14)
 

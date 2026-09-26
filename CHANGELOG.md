@@ -7,6 +7,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Dual control now flags a release whose approver account is new or was just taken over, and an
+  Administrator grant pages.** One Administrator can create or take over a second approver account,
+  so dual control cannot prove two people agreed; `docs/SECURITY.md` now says so, and ADR 0041's
+  "two colluding insiders" residual is corrected to one. A release whose approver account was
+  created, had its password changed, or enrolled TOTP after the request writes an
+  `approval.approver_provenance` audit row and raises the `approval_approver_provenance` alert. The
+  release still goes ahead. Creating an Administrator, promoting to it, or newly mapping a directory
+  group to it raises the `administrator_granted` alert. The `user.created` audit row now records the
+  creating administrator's address, and an account created with a notification address gets an
+  `account_created` notice. Both alert types can be targeted by `[[alerts.rules]]`.
+  (`BACKLOG #315`)
 - **`credential_expires_at` tells a client when an admin-issued temporary password stops working.**
   `POST /auth/login` returns it in `LoginResponse` when `must_change_password` is set. `POST /users`
   returns it in `UserSummary` for the account it creates. It is a Unix timestamp, read from the same
