@@ -8,8 +8,8 @@ statement of the same rule a few hundred lines EARLIER, where a reader meets it 
 * **positive control** -- a planted early contradiction must be listed as EARLY. Every other arm
   rests on this one, because a report that lists nothing is also what a broken search prints;
 * **clean case** -- a key that appears only on its anchored line yields no restatement at all;
-* **the limits are counted, not hidden** -- a keyless anchored line and a too-common key both show up
-  in the header, so a short list cannot pass for full coverage;
+* **the limits are counted, not hidden** -- a keyless anchored line, a too-common key and an
+  unresolved anchor all show up in the totals, so a short list cannot pass for full coverage;
 * **no requirement identifier** -- a sentinel row id appears in no output, refusals included;
 * **unknown is not zero** -- a missing record, a root that contains it, and a record with no prose
   anchor all exit 2 and print no totals.
@@ -29,6 +29,8 @@ from scripts.asvs.restatement_report import main as report_main
 from scripts.asvs.scorecard import load_scorecard
 
 SENTINEL_ID = "ZZ.SENTINEL.9"
+SECOND_ID = "ZZ.SENTINEL.8"
+NL = "\n"
 
 #: The anchored, CORRECT statement. Its key is what the search looks for.
 ANCHORED = "MFA is enforced for every account while `[security].require_mfa` is on (the default)."
@@ -39,24 +41,28 @@ EARLY_WRONG = "Only the Administrator must use MFA; set `[security].require_mfa`
 def _doc(*, early: str | None = EARLY_WRONG, later: str | None = None) -> str:
     lines = ["# Security", "", early or "Intro text.", "", "## MFA", "", ANCHORED, ""]
     lines.append(later or "Closing text.")
-    return "\n".join(lines) + "\n"
+    return NL.join(lines) + NL
 
 
-def _record(path: Path, *entries: tuple[str, int, str]) -> Path:
-    body = [
-        "[scorecard]",
-        'anchor_commit = "0000000"',
-        "",
-        "[[cell]]",
-        f'id = "{SENTINEL_ID}"',
-        "level = 1",
-        'verdict = "pass"',
-        'last_verified = "2026-09-26"',
-    ]
-    for doc, line, expect in entries:
-        body += ["", "[[cell.evidence]]", f'path = "{doc}"', f"line = {line}"]
-        body.append(f"expect = {json.dumps(expect)}")
-    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+def _write(engine: Path, *lines: str) -> None:
+    (engine / "docs" / "SEC.md").write_text(NL.join(lines) + NL, encoding="utf-8")
+
+
+Entry = tuple[str, int, str]
+
+
+def _record(path: Path, *entries: Entry, second: tuple[Entry, ...] = ()) -> Path:
+    """A loadable record: one row citing ``entries``, and a second row citing ``second`` if given."""
+    body = ["[scorecard]", 'anchor_commit = "0000000"']
+    for cell_id, cited in ((SENTINEL_ID, entries), (SECOND_ID, second)):
+        if not cited:
+            continue
+        body += ["", "[[cell]]", f'id = "{cell_id}"', "level = 1", 'verdict = "pass"']
+        body.append('last_verified = "2026-09-26"')
+        for doc, line, expect in cited:
+            body += ["", "[[cell.evidence]]", f'path = "{doc}"', f"line = {line}"]
+            body.append(f"expect = {json.dumps(expect)}")
+    path.write_text(NL.join(body) + NL, encoding="utf-8")
     return path
 
 
@@ -73,6 +79,11 @@ def _run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]
     return code, captured.out + captured.err
 
 
+def _found(record: Path, engine: Path, max_hits: int = 3) -> set[tuple[int, str, str]]:
+    result = census(load_scorecard(record), engine, max_hits=max_hits)
+    return {(f.line, f.key, f.position) for f in result.findings.values()}
+
+
 def test_a_planted_early_contradiction_is_reported(
     engine: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -83,6 +94,7 @@ def test_a_planted_early_contradiction_is_reported(
     assert code == 0
     assert "EARLY restatements            : 1" in out
     assert "EARLY  docs/SEC.md:3  restates `[security].require_mfa`  (anchored at :7)" in out
+    assert out.startswith("# asvs-restatement-report scorecard=sha256:")
     assert SENTINEL_ID not in out
 
 
@@ -91,17 +103,28 @@ def test_a_key_only_on_its_anchored_line_yields_nothing(engine: Path, tmp_path: 
     (engine / "docs" / "SEC.md").write_text(_doc(early=None), encoding="utf-8")
     record = _record(tmp_path / "r.toml", ("docs/SEC.md", 7, ANCHORED))
     result = census(load_scorecard(record), engine, max_hits=3)
-    assert result.findings == set()
-    assert result.anchored_lines == 1
-    assert result.keyless_lines == 0
+    assert result.findings == {}
+    assert result.anchored == {("docs/SEC.md", 7)}
+    assert result.keyless == set()
+    assert result.unresolved == 0
 
 
-def test_a_restatement_after_the_first_anchor_is_later(engine: Path, tmp_path: Path) -> None:
+def test_a_restatement_after_the_anchor_is_later(engine: Path, tmp_path: Path) -> None:
     doc = _doc(early=None, later="Turn `[security].require_mfa` off to opt out.")
     (engine / "docs" / "SEC.md").write_text(doc, encoding="utf-8")
     record = _record(tmp_path / "r.toml", ("docs/SEC.md", 7, ANCHORED))
-    [finding] = census(load_scorecard(record), engine, max_hits=3).findings
-    assert (finding.line, finding.position) == (9, LATER)
+    assert _found(record, engine) == {(9, "[security].require_mfa", LATER)}
+
+
+def test_early_is_judged_against_the_keys_own_anchor(engine: Path, tmp_path: Path) -> None:
+    """A wrong line before its OWN claim's anchor is EARLY, even after an unrelated first anchor."""
+    _write(engine, "first `k_aaa`", "", "wrong `k_bbb`", "", "right `k_bbb`")
+    record = _record(
+        tmp_path / "r.toml",
+        ("docs/SEC.md", 1, "first `k_aaa`"),
+        ("docs/SEC.md", 5, "right `k_bbb`"),
+    )
+    assert _found(record, engine) == {(3, "k_bbb", EARLY)}
 
 
 def test_the_rows_own_anchored_lines_are_never_findings(engine: Path, tmp_path: Path) -> None:
@@ -110,43 +133,70 @@ def test_the_rows_own_anchored_lines_are_never_findings(engine: Path, tmp_path: 
     record = _record(
         tmp_path / "r.toml", ("docs/SEC.md", 3, EARLY_WRONG), ("docs/SEC.md", 7, ANCHORED)
     )
-    assert census(load_scorecard(record), engine, max_hits=3).findings == set()
+    assert _found(record, engine) == set()
 
 
-def test_keyless_lines_and_common_keys_are_counted(engine: Path, tmp_path: Path) -> None:
-    """The instrument's blind spots appear in its totals rather than as a silently shorter list."""
-    doc = _doc(early="See `x_key`, `x_key`.\n`x_key`\n`x_key`\nPlain prose with no key.")
-    (engine / "docs" / "SEC.md").write_text(doc, encoding="utf-8")
+def test_a_line_two_rows_reach_is_listed_once_and_early_wins(engine: Path, tmp_path: Path) -> None:
+    """Row one anchors line 5, so line 2 is EARLY for it; row two anchors line 1, so LATER for it."""
+    _write(engine, "intro `k_one`", "restated `k_one`", "", "", "row one `k_one`")
+    record = _record(
+        tmp_path / "r.toml",
+        ("docs/SEC.md", 5, "row one `k_one`"),
+        second=(("docs/SEC.md", 1, "intro `k_one`"),),
+    )
+    result = census(load_scorecard(record), engine, max_hits=3)
+    at_two = [f for f in result.findings.values() if f.line == 2]
+    assert [f.position for f in at_two] == [EARLY]
+    assert len(result.anchored) == 2
+
+
+def test_a_key_inside_a_longer_identifier_is_not_a_restatement(
+    engine: Path, tmp_path: Path
+) -> None:
+    _write(engine, "see `require_mfa_for_admins`", "", "anchor `require_mfa`")
+    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 3, "anchor `require_mfa`"))
+    assert _found(record, engine) == set()
+
+
+def test_blind_spots_are_counted(engine: Path, tmp_path: Path) -> None:
+    """Keyless lines, too-common keys and unresolved anchors appear in the totals."""
+    _write(engine, "# Security", "", "See `x_key`.", "`x_key`", "`x_key`", "Plain prose.")
     record = _record(
         tmp_path / "r.toml",
         ("docs/SEC.md", 1, "# Security"),
-        ("docs/SEC.md", 3, "See `x_key`, `x_key`."),
+        ("docs/SEC.md", 3, "See `x_key`."),
+        ("docs/SEC.md", 9, "a statement no longer in the file"),
+        ("docs/GONE.md", 1, "anything"),
     )
-    result = census(load_scorecard(record), engine, max_hits=2)
-    assert result.keyless_lines == 1
-    assert result.common_keys == 1
-    assert result.findings == set()
+    result = census(load_scorecard(record), engine, max_hits=1)
+    assert result.keyless == {("docs/SEC.md", 1)}
+    assert result.common == {("docs/SEC.md", "x_key")}
+    assert result.unresolved == 2
+    assert result.findings == {}
 
 
 def test_a_multi_line_anchor_covers_every_line_it_spans(engine: Path, tmp_path: Path) -> None:
-    doc = "intro `k_one`\nfirst `k_one`\nsecond `k_two`\nlater `k_two`\n"
-    (engine / "docs" / "SEC.md").write_text(doc, encoding="utf-8")
-    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 2, "first `k_one`\nsecond"))
-    found = {
-        (f.line, f.key, f.position)
-        for f in census(load_scorecard(record), engine, max_hits=3).findings
-    }
-    assert found == {(1, "k_one", EARLY), (4, "k_two", LATER)}
+    _write(engine, "intro `k_one`", "first `k_one`", "second `k_two`", "later `k_two`")
+    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 2, "first `k_one`" + NL + "second"))
+    assert _found(record, engine) == {(1, "k_one", EARLY), (4, "k_two", LATER)}
+
+
+def test_a_trailing_newline_does_not_claim_the_next_line(engine: Path, tmp_path: Path) -> None:
+    _write(engine, "anchor `k_one`", "next `k_zzz`")
+    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 1, "anchor `k_one`" + NL))
+    result = census(load_scorecard(record), engine, max_hits=3)
+    assert result.anchored == {("docs/SEC.md", 1)}
 
 
 def test_code_paths_are_not_searched(engine: Path, tmp_path: Path) -> None:
-    (engine / "mod.py").write_text("x = 1  # `k_one`\ny = 2  # `k_one`\n", encoding="utf-8")
+    (engine / "mod.py").write_text("x = 1  # `k_one`" + NL + "y = 2  # `k_one`" + NL, "utf-8")
     record = _record(tmp_path / "r.toml", ("mod.py", 1, "x = 1"))
-    assert census(load_scorecard(record), engine, max_hits=3).anchored_lines == 0
+    assert census(load_scorecard(record), engine, max_hits=3).anchored == set()
 
 
-def test_claim_keys_are_backticked_spans_in_order() -> None:
+def test_claim_keys_keep_backtick_pairing_around_short_spans() -> None:
     assert claim_keys("a `one` b `two` c `one` `x`") == ["one", "two"]
+    assert claim_keys("set `on` to enable `[api].tls_cert_file` now") == ["[api].tls_cert_file"]
 
 
 @pytest.mark.parametrize("case", ["missing", "contained", "no_prose"])
@@ -159,7 +209,7 @@ def test_an_unmeasured_run_exits_2_and_prints_no_totals(
     elif case == "contained":
         record = _record(engine / "r.toml", ("docs/SEC.md", 7, ANCHORED))
     else:
-        (engine / "mod.py").write_text("x = 1\n", encoding="utf-8")
+        (engine / "mod.py").write_text("x = 1" + NL, encoding="utf-8")
         record = _record(tmp_path / "r.toml", ("mod.py", 1, "x = 1"))
     code, out = _run(["--scorecard", str(record), "--root", str(engine)], capsys)
     assert code == 2

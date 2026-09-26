@@ -4,27 +4,30 @@
 
 BACKLOG #1396. A graded row in the scorecard cites lines of a prose document as its evidence. A
 repair pass tends to visit those lines and nothing else, so a wrong restatement of the same claim
-elsewhere in the file survives every pass. When it sits EARLIER than the row's first anchor, a reader
-meets the wrong version first. The anchor set records where evidence was found, never where the
-claim is repeated, and treating it as a work list is the defect.
+elsewhere in the file survives every pass. When it sits EARLIER than the anchor, a reader meets the
+wrong version first. The anchor set records where evidence was found, never where the claim is
+repeated, and treating it as a work list is the defect.
 
 **What this does.** For each graded row and each prose file (``.md``) it cites, it takes the
 backticked spans on the anchored lines as the row's claim keys: config keys, routes, flags and
 symbols, which are the words a stale claim most often gets wrong and which grep finds verbatim. It
-then lists every line of that file that carries a key and is not one of the row's own anchored lines.
-A line before the row's first anchor is EARLY; any other is LATER.
+then lists every line of that file that carries a key as a whole token and is not one of the row's
+own anchored lines. A line before the first anchored line carrying that key is EARLY; any other is
+LATER. A line two rows both reach is listed once.
 
 **What this cannot do, stated so nobody reads more into a short list than is there.**
 
 * It finds restatements, not contradictions. Whether a line disagrees with the anchor is a reading.
+* A prose anchor that no longer resolves has no line, so it is not searched. The report counts them.
 * An anchored line with no backticked span has no key, so its claim is never searched. The report
   counts those lines, and that count is the part of the record this instrument does not reach.
-* A key on more than ``--max-hits`` lines of its file is skipped as too common to discriminate.
-  That count is printed too, so a raised cap shows what it costs in noise.
+* A key on more than ``--max-hits`` unanchored lines of its file is skipped as too common to
+  discriminate. That count is printed too, so a raised cap shows what it costs in noise.
 
-**Disclosure.** Same rule as ``anchor_report.py``: file paths, line numbers and counts, and never a
-requirement identifier or a verdict. The finding type has no field for either, so no later edit can
-print one. A key is quoted from the engine document, which is public.
+**Disclosure.** No requirement identifier and no verdict: the finding type has no field for either,
+so no later edit can print one. It prints MORE than ``anchor_report.py`` does, namely the document
+lines that serve as evidence. So this is a local instrument. Do not wire it into a workflow whose
+log is public, and do not paste its output into a public pull request.
 
 Usage::
 
@@ -44,13 +47,15 @@ from pathlib import Path
 # these as bare scripts with only this directory on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from anchor_report import EXIT_OK, _refuse, _refuse_unreadable  # noqa: E402
+from anchor_report import EXIT_OK, _refuse, _refuse_unreadable, provenance  # noqa: E402
 from scorecard import ANCHOR_LOCATED, Cell, load_scorecard, locate_anchor  # noqa: E402
 
 #: Prose documents only. A code file restating a key is a call site, not a second claim.
 PROSE_SUFFIX = ".md"
-#: A backticked span of at least three characters on one line.
-KEY = re.compile(r"`([^`\n]{3,})`")
+#: One backticked span. Matched at ANY length so the backtick pairing stays right when a line has a
+#: short span such as `on`; the length floor is applied afterwards, in :func:`claim_keys`.
+SPAN = re.compile(r"`([^`\n]+)`")
+MIN_KEY = 3
 EARLY = "EARLY"
 LATER = "LATER"
 
@@ -68,85 +73,110 @@ class Restatement:
 
 @dataclass
 class Census:
-    findings: set[Restatement] = field(default_factory=set)
-    anchored_lines: int = 0
-    keyless_lines: int = 0
-    common_keys: int = 0
+    findings: dict[tuple[str, int, str], Restatement] = field(default_factory=dict)
+    anchored: set[tuple[str, int]] = field(default_factory=set)
+    keyless: set[tuple[str, int]] = field(default_factory=set)
+    common: set[tuple[str, str]] = field(default_factory=set)
+    unresolved: int = 0
 
 
 def claim_keys(text: str) -> list[str]:
-    """The backticked spans in ``text``, in order of first appearance, without repeats."""
-    return list(dict.fromkeys(KEY.findall(text)))
+    """The backticked spans in ``text`` of at least MIN_KEY characters, first appearance order."""
+    return list(dict.fromkeys(k for k in SPAN.findall(text) if len(k.strip()) >= MIN_KEY))
+
+
+def _hits(lines: list[str], key: str) -> list[int]:
+    # Whole-token match: `require_mfa` must not be found inside `require_mfa_for_admins`.
+    token = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])")
+    return [n for n, text in enumerate(lines, start=1) if token.search(text)]
 
 
 def census(cells: list[Cell], root: Path, *, max_hits: int) -> Census:
     """Every unanchored restatement of every row's claim keys, per prose file the row cites."""
     result = Census()
-    cache: dict[str, str | None] = {}
+    texts: dict[str, str | None] = {}
+    lines_of: dict[str, list[str]] = {}
+    hits_of: dict[tuple[str, str], list[int]] = {}
     for cell in cells:
-        spans: dict[str, list[tuple[int, int]]] = {}
+        spans: dict[str, set[int]] = {}
         for anchor in cell.evidence:
             if not anchor.path.endswith(PROSE_SUFFIX):
                 continue
-            if anchor.path not in cache:
+            if anchor.path not in texts:
                 target = root / anchor.path
-                cache[anchor.path] = (
+                text = (
                     target.read_text(encoding="utf-8", errors="replace")
                     if target.is_file()
                     else None
                 )
-            text = cache[anchor.path]
-            if text is None:
-                continue
+                texts[anchor.path] = text
+                # split("\n"), NOT splitlines(): locate_anchor numbers lines by "\n" alone, and
+                # splitlines() also breaks on form feeds and U+2028, which would shift every number.
+                lines_of[anchor.path] = text.split("\n") if text is not None else []
+            text = texts[anchor.path]
             # The one locator the gate uses. A token that is gone or ambiguous has no line, and a
             # guessed line would search from a place the record does not actually point at.
-            found = locate_anchor(text, anchor.expect)
-            if found.status != ANCHOR_LOCATED or found.line is None:
+            found = locate_anchor(text, anchor.expect) if text is not None else None
+            if found is None or found.status != ANCHOR_LOCATED or found.line is None:
+                result.unresolved += 1
                 continue
-            last = found.line + anchor.expect.count("\n")
-            spans.setdefault(anchor.path, []).append((found.line, last))
-        for path, cited in spans.items():
-            _scan(result, path, (cache[path] or "").splitlines(), cited, max_hits)
+            last = found.line + anchor.expect.rstrip("\n").count("\n")
+            spans.setdefault(anchor.path, set()).update(range(found.line, last + 1))
+        for path, anchored in spans.items():
+            _scan(result, path, lines_of[path], anchored, max_hits, hits_of)
     return result
 
 
 def _scan(
-    result: Census, path: str, lines: list[str], cited: list[tuple[int, int]], max_hits: int
+    result: Census,
+    path: str,
+    lines: list[str],
+    anchored: set[int],
+    max_hits: int,
+    hits_of: dict[tuple[str, str], list[int]],
 ) -> None:
-    anchored = {n for first, last in cited for n in range(first, last + 1)}
-    first_anchor = min(anchored)
     source: dict[str, int] = {}
     for n in sorted(anchored):
+        result.anchored.add((path, n))
         keys = claim_keys(lines[n - 1]) if n <= len(lines) else []
-        result.anchored_lines += 1
         if not keys:
-            result.keyless_lines += 1
+            result.keyless.add((path, n))
         for key in keys:
             source.setdefault(key, n)
     for key, anchor_line in source.items():
-        hits = [i for i, text in enumerate(lines, start=1) if key in text]
-        if len(hits) > max_hits:
-            result.common_keys += 1
+        if (path, key) not in hits_of:
+            hits_of[(path, key)] = _hits(lines, key)
+        unanchored = [n for n in hits_of[(path, key)] if n not in anchored]
+        if len(unanchored) > max_hits:
+            result.common.add((path, key))
             continue
-        for n in hits:
-            if n not in anchored:
-                position = EARLY if n < first_anchor else LATER
-                result.findings.add(Restatement(path, n, key, anchor_line, position))
+        for n in unanchored:
+            position = EARLY if n < anchor_line else LATER
+            seen = result.findings.get((path, n, key))
+            # A line two rows reach is one line. EARLY wins, because it is the one a reader meets
+            # before any anchored statement of the claim.
+            if seen is None or (position == EARLY and seen.position == LATER):
+                result.findings[(path, n, key)] = Restatement(path, n, key, anchor_line, position)
 
 
-def render(result: Census, *, max_hits: int, early_only: bool) -> list[str]:
-    early = sum(1 for f in result.findings if f.position == EARLY)
+def render(
+    result: Census, *, max_hits: int, early_only: bool, scorecard: Path, root: Path
+) -> list[str]:
+    findings = list(result.findings.values())
+    early = sum(1 for f in findings if f.position == EARLY)
     shown = sorted(
-        (f for f in result.findings if f.position == EARLY or not early_only),
-        key=lambda f: (f.position != EARLY, f.path, f.line, f.key),
+        (f for f in findings if f.position == EARLY or not early_only),
+        key=lambda f: (f.position != EARLY, f.path, f.line, f.key, f.anchor_line),
     )
     out = [
+        provenance("asvs-restatement-report", scorecard, root),
         "ASVS restatement report -- where is an anchored claim repeated where no anchor looks?",
-        f"  anchored prose lines searched : {result.anchored_lines}",
-        f"  of those, carrying NO key     : {result.keyless_lines} (their claim is NOT searched)",
-        f"  keys skipped as too common    : {result.common_keys} (on more than {max_hits} lines)",
-        f"  EARLY restatements            : {early} (before the row's first anchor)",
-        f"  LATER restatements            : {len(result.findings) - early}",
+        f"  prose anchors NOT resolving   : {result.unresolved} (not searched)",
+        f"  anchored prose lines searched : {len(result.anchored)}",
+        f"  of those, carrying NO key     : {len(result.keyless)} (their claim is NOT searched)",
+        f"  keys skipped as too common    : {len(result.common)} (more than {max_hits} other lines)",
+        f"  EARLY restatements            : {early} (before the anchored line carrying the key)",
+        f"  LATER restatements            : {len(findings) - early}",
     ]
     if shown:
         out.append("")
@@ -192,10 +222,21 @@ def main(argv: list[str] | None = None) -> int:
         return _refuse_unreadable(args.scorecard, exc)
 
     result = census(cells, args.root, max_hits=args.max_hits)
-    if result.anchored_lines == 0:
+    if not result.anchored:
         # An empty search space would print a reassuring zero that examined nothing.
         return _refuse("no prose anchor resolved in this tree, so nothing was searched")
-    print("\n".join(render(result, max_hits=args.max_hits, early_only=args.early_only)))
+    report = render(
+        result,
+        max_hits=args.max_hits,
+        early_only=args.early_only,
+        scorecard=args.scorecard,
+        root=args.root,
+    )
+    # Keys are quoted from the documents, and some carry characters a cp1252 console cannot encode.
+    # Escape them rather than die mid-report with a traceback that exits 1, the findings code.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
+    print("\n".join(report))
     return EXIT_OK
 
 
