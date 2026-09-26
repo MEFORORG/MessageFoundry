@@ -867,8 +867,10 @@ row only. The two export rows are made safe as their own row says.
 - A Handler's live lookup result is data it reads to shape its output, not content the product keeps
   as a message ([ADR 0010](adr/0010-handler-callable-db-lookup.md),
   [ADR 0043](adr/0043-fhir-read-lookup.md)). `fhir_lookup` reads are capped at
-  `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB. `db_lookup` returns every row its statement selects, and the
-  engine sets no row cap, so the Handler's statement is the bound.
+  `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB. `db_lookup` reads are capped at `max_rows` rows per call,
+  default `DEFAULT_DB_LOOKUP_MAX_ROWS` = 500, charged at the fetch. A larger result fails the lookup
+  rather than being truncated. There is no byte cap, so a row's own width is still the statement's
+  bound.
 - `/ui/static` serves first-party assets that ship in the package. `AllowlistedStaticFiles` serves
   only `ALLOWED_STATIC_EXTENSIONS` (`.css`, `.js`), and it sends no `Content-Disposition`.
 - The API routes not listed above that take a body are treated as parameter routes, capped by
@@ -1373,6 +1375,23 @@ reads through a stored procedure — which this gate refuses anyway.
 > This is a **separate principal** from the engine's own store login. `[store]` settings govern the
 > database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
 > a credential the operator configures per connection.
+
+#### A lookup that selects too many rows fails the message
+
+Each `DatabaseLookup(...)` takes `max_rows`, default `500`. A `db_lookup` call whose statement selects
+more rows than that raises `DbLookupError`, and the Handler's message goes to `ERROR` like any other
+lookup failure. The engine never hands the Handler a truncated result, because a Handler shaping a
+message from the first 500 rows of a larger set would be wrong with nothing to say so.
+
+The ceiling is charged at the fetch (BACKLOG #1730). The executor asks the driver for at most
+`max_rows + 1` rows, so a broad predicate is refused with at most one row past the ceiling held in the
+transform worker, not the whole result set. The driver may still spend time discarding the unread rows
+when the cursor closes. The error names the connection and the ceiling, never the statement or a row.
+
+A lookup that shapes one message rarely needs more than a handful of rows. If a feed needs a large
+table, a synced `Reference(...)` is the better fit. `max_rows=0` removes the ceiling. A negative
+or fractional value stops `serve` building the lookup. `messagefoundry check` refuses it in its build
+leg, which runs when the config has a `messagefoundry.toml`. The ceiling counts rows, not bytes.
 
 #### Static credentials on every backend hop
 
@@ -2954,7 +2973,7 @@ reading this page already applies to a file the scan never opened.
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
-| DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
+| DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings); a `db_lookup` call fetches at most `max_rows` (500) plus one, and [refuses a larger result](#a-lookup-that-selects-too-many-rows-fails-the-message) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
 | Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | a borrow that cannot be satisfied within `DatabaseRef(acquire_timeout=…)` (default 30 s) raises `StoreAcquireTimeout`, failing that set's sync | the sync task is isolated per reference set; the previous snapshot keeps serving reads and the AlertSink fires. The bound also keeps one wedged source from stalling the sequential pass over the other sets |
 | Internal sources — Timer / Loopback / PassThrough | n/a — they open no socket and reach no external system | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn's own defaults (no `limit_concurrency` / `timeout_keep_alive` is passed); per-actor 429 throttles bound abuse: login 10 per IP and 60 global per 60 s, PHI reads 120 per actor per 60 s, admin writes 12 per actor per second | over a throttle the request gets `429` and an audit row; the connection stays usable | the caller backs off; the window rolls |
