@@ -24,6 +24,7 @@ included) — re-encoding/normalisation is :class:`~messagefoundry.parsing.x12.m
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 
 from messagefoundry.parsing.x12.delimiters import (
@@ -38,8 +39,10 @@ __all__ = ["split", "X12FrameReader", "check_integrity"]
 # Offset of the segment terminator within the ISA (mirrors delimiters._SEGMENT_TERM_OFFSET, but kept
 # local so the byte reader needs only this module + the public ISA length).
 _SEGMENT_TERM_OFFSET = 105
-_WHITESPACE_BYTES = b" \t\r\n\x0b\x0c"
 _WHITESPACE_STR = " \t\r\n\x0b\x0c"
+# A segment that is the IEA trailer, after cosmetic whitespace. Matched in place with pos/endpos, so the
+# check never copies a segment, however long.
+_IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
 
 
 def split(raw: str) -> list[str]:
@@ -92,6 +95,12 @@ class X12FrameReader:
     def __init__(self, max_interchange_bytes: int | None = None) -> None:
         self._buf = bytearray()
         self.max_interchange_bytes = max_interchange_bytes
+        # Resume points for the segment walk over the open interchange at the front of ``_buf``. The
+        # feed size is the sender's choice, so rescanning from the ISA on every feed would make
+        # reassembly quadratic (BACKLOG #1595). ``_seg_start`` is where the segment still being
+        # received begins; ``_scan`` is where the terminator search picks up, at or after it.
+        self._seg_start = 0
+        self._scan = 0
 
     def feed(self, data: bytes) -> Iterator[bytes]:
         self._buf.extend(data)
@@ -124,30 +133,31 @@ class X12FrameReader:
             self._check_cap()
             return None
         terminator = self._terminator(buf)
-        # Cheap guard: don't walk segments until an IEA could plausibly be present.
-        if buf.find(b"IEA", 3) == -1:
-            self._check_cap()
-            return None
-        seg_start = 0
+        # Walk the segments, resuming where the last feed stopped. The ISA stays at the front of the
+        # buffer until its frame is taken or the buffer is cleared, and both reset the resume points,
+        # so they always describe this interchange. Each byte is searched about once in total.
         while True:
-            idx = buf.find(terminator, seg_start)
+            idx = buf.find(terminator, self._scan)
             if idx == -1:
+                # Back off by all but one terminator byte, so a CR+LF split across two feeds is found.
+                self._scan = max(self._seg_start, len(buf) - len(terminator) + 1)
                 self._check_cap()
                 return None  # IEA not complete yet
-            if bytes(buf[seg_start:idx]).lstrip(_WHITESPACE_BYTES)[:3] == b"IEA":
+            if _IEA_SEGMENT.match(buf, self._seg_start, idx):
                 end = idx + len(terminator)
                 if self.max_interchange_bytes is not None and end > self.max_interchange_bytes:
                     # A complete interchange that still exceeds the cap is rejected (a too-large
                     # message), not relayed — mirrors the eager cap on the shared FrameDecoder.
-                    self._buf.clear()
+                    self._clear()
                     raise X12FrameError(
                         f"X12 interchange ({end} bytes) exceeds the "
                         f"{self.max_interchange_bytes}-byte cap"
                     )
                 frame = bytes(buf[:end])
                 del buf[:end]
+                self._seg_start = self._scan = 0
                 return frame
-            seg_start = idx + len(terminator)
+            self._seg_start = self._scan = idx + len(terminator)
 
     @staticmethod
     def _terminator(buf: bytearray) -> bytes:
@@ -157,14 +167,18 @@ class X12FrameReader:
             return b"\r\n"
         return term
 
+    def _clear(self) -> None:
+        self._buf.clear()
+        self._seg_start = self._scan = 0
+
     def _check_cap(self) -> None:
-        # Called from every path that returns with the interchange still open. Only two of those can
-        # grow the buffer without bound: "no IEA in sight" and the segment walk. The rest are already
-        # capped by the control flow that reaches them (a 2-byte noise tail, or a partial ISA, so 106
-        # bytes at most), and could not fire unless the cap were smaller than one ISA header. The two
-        # that can grow are the ones tests/test_x12_parsing.py pins; keep them pinned if this moves.
+        # Called from every path that returns with the interchange still open. Only one of those can
+        # grow the buffer without bound: the segment walk. The rest are already capped by the control
+        # flow that reaches them (a 2-byte noise tail, or a partial ISA, so 106 bytes at most), and
+        # could not fire unless the cap were smaller than one ISA header. tests/test_x12_parsing.py
+        # pins the walk's cap twice, with and without "IEA" in element data; keep both if this moves.
         if self.max_interchange_bytes is not None and len(self._buf) > self.max_interchange_bytes:
-            self._buf.clear()
+            self._clear()
             raise X12FrameError(
                 f"X12 interchange exceeded {self.max_interchange_bytes} bytes before the IEA segment"
             )

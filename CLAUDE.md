@@ -324,7 +324,9 @@ recency.
 **The fleet wiki is the memory every seat on every account can search.** Query it for the subject
 of your work before you act, and write a lesson, decision, gotcha or correction after; a miss never
 blocks. A note is advice: where it disagrees with the tree or an owner instruction, the tree wins,
-and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how.
+and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how. Where
+`install-coordination.ps1` has wired `mefor-wiki`, a Stop hook prompts for a note after substantive
+work, and `wiki: nothing to record` is a fine answer.
 
 **Run korus's wiki scripts by path, FROM YOUR ENGINE WORKTREE.** This repository has no
 `ccx.config.json`, so without `-StateRoot` a query reads no inbox and still prints `no note`. Work
@@ -601,10 +603,15 @@ gates a merge**, and no seat has to clear one.
    PR body when it opens the PR.
 2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
    push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at
-   tool-call time: `worktree_gate.ps1`, installed to `%USERPROFILE%\.claude\hooks\` by
-   `scripts/worktree/install-gate.ps1`, and `collision_gate.ps1`, wired by
-   `scripts/coord/install-coordination.ps1`, deny the Write, Edit or
-   Bash call itself. CI arrives later, when the process is gone.
+   tool-call time and deny the tool call itself. Each one sees only some tools.
+   `collision_gate.ps1`, wired by `scripts/coord/install-coordination.ps1`, sees Write, Edit,
+   MultiEdit and NotebookEdit, and nothing else. `worktree_gate.ps1`, installed to
+   `%USERPROFILE%\.claude\hooks\` by `scripts/worktree/install-gate.ps1`, sees at least those four
+   tools and Bash and PowerShell. On the four edit tools it judges the file being written. On a
+   shell call it judges only git commands, by verb, config key and the repository or worktree they
+   target. **So neither guard intercepts an ordinary shell write, such as a redirect into a
+   file.** The worktree gate's own deny text says a shell route around a denied write still breaks
+   its rule. CI arrives later, when the process is gone.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
 4. Its process exits when it has pushed and reported. The Manager opens the PR, often one PR for
    several Builders' branches. The worktree stays behind. **A Builder in its own session -- started

@@ -63,7 +63,11 @@ from messagefoundry.config.settings import (
     hop_insecure_escape_downgrades,
     insecure_tls_allowed,
 )
-from messagefoundry.config.tls_policy import InsecureHopRefused, current_hop_posture
+from messagefoundry.config.tls_policy import (
+    HOP_ATTESTATION_LEVER,
+    InsecureHopRefused,
+    current_hop_posture,
+)
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -172,10 +176,12 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = F
     if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
         raise ValueError(
             "DATABASE connection TLS is weakened (trust_server_certificate=true or encrypt=false), "
-            "which is MITM-able. Use a trusted server certificate with encrypt=true, or "
-            f"set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn to allow "
-            "it for a trusted-network dev/test bind (the escape has no effect while enforcing, the "
-            "default)."
+            "which is MITM-able. Use a trusted server certificate with encrypt=true; set "
+            f"{HOP_ATTESTATION_LEVER} on the connection if the hop is "
+            "secure by other means (a proxy-terminated or isolated segment; reported as a loosening); "
+            f"or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn to "
+            "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "
+            "the default)."
         )
     if (trust or not encrypt) and attested:
         _audit_attested_weakened_tls("DATABASE connection")
@@ -1555,6 +1561,46 @@ def _bind_lookup_params(
         raise DbLookupError(f"db_lookup on {connection!r}: missing parameter {exc}") from exc
 
 
+#: Row ceiling for one ``db_lookup`` call when its ``DatabaseLookup`` sets no ``max_rows``
+#: (BACKLOG #1730). The same number as the poll sources' ``DEFAULT_MAX_ITEMS_PER_POLL``, but a
+#: different kind of bound. A poll ceiling DEFERS the rows it does not take, and they wait in the table.
+#: This one REFUSES the lookup, so the Handler's message goes to ERROR. It sits well above a lookup that
+#: shapes one message, such as a patient's orders or identifiers, and below a result that belongs in a
+#: synced ``Reference`` instead. ``DatabaseLookup(max_rows=...)`` moves it; ``0`` removes it.
+DEFAULT_DB_LOOKUP_MAX_ROWS = 500
+
+
+def _lookup_max_rows(value: Any, connection: str) -> int | None:
+    """Read one lookup connection's ``max_rows``: a positive ceiling, or ``None`` for the documented
+    ``0`` opt-out. Unset (``None``) takes :data:`DEFAULT_DB_LOOKUP_MAX_ROWS`.
+
+    Anything but a whole, non-negative number is refused at construction, which ``serve`` reaches at
+    start and ``messagefoundry check`` reaches in its build leg. A bool is an ``int`` to Python, so
+    ``max_rows=True`` would otherwise read as a ceiling of one row, and ``int(2.5)`` would quietly
+    read as 2.
+
+    The refusals name the connection and the setting, never the value: settings arrive here already
+    env()-resolved, and a resolved value stays out of an error the same way ``resolve_env_settings``
+    keeps it out (BACKLOG #1183)."""
+    if value is None:
+        return DEFAULT_DB_LOOKUP_MAX_ROWS
+    whole = f"DatabaseLookup {connection!r} max_rows must be a whole number (value withheld)"
+    if isinstance(value, bool):
+        raise ValueError(whole)
+    try:
+        ceiling = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(whole) from None
+    if not isinstance(value, str) and ceiling != value:  # 2.5 or Decimal("2.5"), not truncated
+        raise ValueError(whole)
+    if ceiling < 0:
+        raise ValueError(
+            f"DatabaseLookup {connection!r} max_rows must be a positive number of rows, or 0 for "
+            "no ceiling (value withheld)"
+        )
+    return ceiling or None
+
+
 class DatabaseLookupExecutor:
     """Pooled executor for handler-callable **live** lookups (``db_lookup``, ADR 0010).
 
@@ -1588,6 +1634,7 @@ class DatabaseLookupExecutor:
         self._dsn: dict[str, str] = {}
         self._pool_max: dict[str, int] = {}
         self._acquire_timeout: dict[str, float] = {}
+        self._max_rows: dict[str, int | None] = {}
         for cname, s in connections.items():
             for req in ("server", "database"):
                 if not s.get(req):
@@ -1595,8 +1642,8 @@ class DatabaseLookupExecutor:
             # Per-connection insecure-hop attestation (#200), honoured here as the DATABASE
             # destination and poll source honour theirs: a live read crosses the same wire a write
             # does, so dropping it refused a hop the operator had attested. The mapping is the only
-            # carrier this cell has (no Source/Destination model), and reading it does not make the
-            # setting authorable — see :func:`hop_attestation_from_settings`.
+            # carrier this cell has (no Source/Destination model); DatabaseLookup() writes it there
+            # from its own tls_hop_attested parameter — see :func:`hop_attestation_from_settings`.
             attested = hop_attestation_from_settings(s)
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.
@@ -1605,6 +1652,7 @@ class DatabaseLookupExecutor:
             self._acquire_timeout[cname] = float(
                 s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT)
             )
+            self._max_rows[cname] = _lookup_max_rows(s.get("max_rows"), cname)
         self._pools: dict[str, Any] = {}
         self._locks: dict[str, asyncio.Lock] = {c: asyncio.Lock() for c in self._dsn}
 
@@ -1634,10 +1682,16 @@ class DatabaseLookupExecutor:
         query carrying no write keyword and no second statement) before anything executes. That gate is
         a statement test, not read-only authority — see this class's docstring for what actually bounds
         the connection. Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a
-        non-read-only statement, a missing parameter, or a DB/driver error — the transform worker turns
-        it into that message's ``ERROR`` /
-        dead-letter disposition. Runs on the engine loop (the handler thread bridges in via
-        ``run_coroutine_threadsafe``), so a slow query never blocks the loop, only its own worker thread."""
+        non-read-only statement, a missing parameter, a result larger than the connection's
+        ``max_rows``, or a DB/driver error — the transform worker turns it into that message's
+        ``ERROR`` / dead-letter disposition. Runs on the engine loop (the handler thread bridges in via
+        ``run_coroutine_threadsafe``), so a slow query never blocks the loop, only its own worker thread.
+
+        The row ceiling is charged at the fetch, not after it (BACKLOG #1730). The driver is asked for at
+        most ``max_rows + 1`` rows, so a statement whose predicate matches far more than a Handler can
+        use is refused having buffered one row past the ceiling, never the whole result set. The result
+        is never truncated: a Handler that got the first ``max_rows`` rows of a larger set would shape
+        its message from a partial answer and nothing would say so."""
         if connection not in self._dsn:
             known = ", ".join(sorted(self._dsn)) or "(none declared)"
             raise DbLookupError(
@@ -1662,7 +1716,26 @@ class DatabaseLookupExecutor:
             cur = await conn.cursor()
             await cur.execute(sql, bound)
             columns = [d[0] for d in cur.description] if cur.description else []
-            rows = list(await cur.fetchall())
+            limit = self._max_rows[connection]
+            rows: list[Any] = []
+            if limit is None:
+                rows = list(await cur.fetchall())
+            else:
+                # Loop because a driver may hand back fewer rows than asked while more remain. The +1
+                # row is the only way to tell "exactly max_rows" from "more than max_rows"; the source
+                # poll avoids it because its rows can carry a whole message body, but here the extra
+                # row is read only on the way to refusing the lookup.
+                while len(rows) <= limit:
+                    batch = list(await cur.fetchmany(limit + 1 - len(rows)))
+                    if not batch:
+                        break
+                    rows.extend(batch)
+                if len(rows) > limit:
+                    # PHI-free: the connection and the ceiling only, never the statement or a row.
+                    raise DbLookupError(
+                        f"db_lookup on {connection!r} returned more than max_rows={limit} rows; "
+                        "narrow the statement, or raise max_rows on this DatabaseLookup"
+                    )
         except DbLookupError:
             raise
         except Exception as exc:

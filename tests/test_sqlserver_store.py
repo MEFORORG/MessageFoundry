@@ -3089,6 +3089,75 @@ async def test_supports_pt_reingress_true_ss(store) -> None:
     assert store.supports_pt_reingress is True
 
 
+# BACKLOG #1580: a PT completion marker stays out of replay, bulk dead replay and resend. Mirrors
+# tests/test_passthrough.py. This fixture is keyless, where the #1560 erased-body predicate already
+# skipped the marker's literal '' body, so the stamp and the resend source read are the arms that fail
+# without the fix here; tests/test_replay_erased_body_scope.py pins the SQL on every backend.
+
+
+async def _ss_pt_parent(store, *, outbound: bool, depth_capped: bool = False) -> str:
+    metadata = json.dumps({"correlation_depth": 3}) if depth_capped else None
+    parent, routed = await _ss_seed_routed(store, metadata=metadata, now=100.0)
+    assert await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[("OB_REAL", "MSH|out")] if outbound else [],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        correlation_depth_cap=3,
+        now=110.0,
+    )
+    return parent
+
+
+async def _ss_deliver(store, *, now: float) -> int:
+    items = await store.claim_ready(now=now, stage=Stage.OUTBOUND.value, destination_name="OB_REAL")
+    for item in items:
+        await store.mark_done(item.id, now=now)
+    return len(items)
+
+
+async def test_pt_marker_is_stamped_and_a_mixed_replay_ends_processed_ss(store) -> None:
+    from messagefoundry.store.store import PASSTHROUGH_MARKER_HANDLER
+
+    parent = await _ss_pt_parent(store, outbound=True)
+    rows = {r["destination_name"]: r for r in await store.outbox_for(parent)}
+    assert rows["PT_NEXT"]["handler_name"] == PASSTHROUGH_MARKER_HANDLER
+    assert rows["OB_REAL"]["handler_name"] is None
+    assert await _ss_deliver(store, now=120.0) == 1
+    assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
+
+    assert await store.replay(parent, now=200.0) == 1  # the real delivery only
+    assert await _ss_deliver(store, now=210.0) == 1
+    assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
+    assert await store.dead_letter_missing_destinations({"OB_REAL"}, now=300.0) == 0
+    assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_pt_marker_is_never_a_resend_source_ss(store) -> None:
+    from messagefoundry.store.store import ResendSourceNotFound
+
+    parent = await _ss_pt_parent(store, outbound=True)
+    assert await _ss_deliver(store, now=120.0) == 1
+    outcome = await store.resend_to(
+        message_id=parent, to="OB_STANDBY", idempotency_key=uuid4().hex, now=200.0
+    )
+    assert outcome.status == "resent" and outcome.from_destination == "OB_REAL"
+
+    alone = await _ss_pt_parent(store, outbound=False)
+    with pytest.raises(ResendSourceNotFound):
+        await store.resend_to(
+            message_id=alone, to="OB_STANDBY", idempotency_key=uuid4().hex, now=300.0
+        )
+
+
+async def test_pt_depth_capped_marker_stays_out_of_bulk_dead_replay_ss(store) -> None:
+    capped = await _ss_pt_parent(store, outbound=False, depth_capped=True)
+    assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
+    assert await store.replay_dead(now=200.0) == 0
+    assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
+
+
 # --- ADR 0064: schema-init fast-path -------------------------------------------
 
 

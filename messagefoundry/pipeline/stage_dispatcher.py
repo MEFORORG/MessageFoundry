@@ -23,10 +23,17 @@ outbound / response). The dispatcher still depends only on injected callables/va
 keeps this module free of an import cycle and makes the wiring a typed constructor contract rather than
 a coupling.
 
+**Supervision (BACKLOG #1609).** A claimer or sweep task that dies with an exception while running is
+respawned in place on the same partition, as the per_lane supervisors respawn their workers. The
+replacement first releases the rows its predecessor had claimed but not dispatched, so it cannot deliver
+a lane's next row ahead of a stranded head. Repeated deaths back off, and a claimer death stays visible
+in :attr:`StageDispatcher.claimer_faults`, which the runner reports as a degraded stage.
+
 **Concurrency discipline.** All dispatcher state is mutated **only on the event loop, never under a
 lock** (mirroring the runner's ``_lane_events`` / ``EmptyClaimCounters``): every transition is
-synchronous except a claimer's single ``await claim_fifo_heads`` and a serializer's ``await
-process_item`` / ``await release_claimed``. A state read must never be separated from its mutation by an
+synchronous except a claimer's single ``await claim_fifo_heads`` (plus, only on a supervisor respawn,
+its opening backoff sleep and ``await release_claimed`` in ``_adopt_abandoned``) and a serializer's
+``await process_item`` / ``await release_claimed``. A state read must never be separated from its mutation by an
 ``await`` — the conservation law (``slots_free + processing_lanes + reserved == max_processing_lanes``)
 and the ``busy_violations`` counter assert this holds.
 """
@@ -62,6 +69,21 @@ _LANE_ERROR_BACKOFF_SECONDS = 1.0
 # Claimer store-error backoff: the whole chunk's lanes return to READY and this claimer's partition
 # pauses ~this long (chunk-scoped; raise K to shrink the blast radius). ADR 0066 §11 item 1.
 _CLAIM_ERROR_BACKOFF_SECONDS = 1.0
+# BACKLOG #1609: claimer/sweep respawn pacing. The FIRST respawn is immediate, matching the per_lane
+# worker supervisors (wiring_runner._on_worker_done). A replacement that dies again before it has run
+# cleanly (iterated, then kept running) for _RESPAWN_STABLE_SECONDS waits base * 2**(streak - 1),
+# capped, so a fault that kills every replacement at once backs off instead of spinning. The window is
+# measured from the first healthy iteration, never from the spawn, so a capped wait cannot pass it.
+_RESPAWN_BACKOFF_BASE_SECONDS = 0.5
+_RESPAWN_BACKOFF_CAP_SECONDS = 30.0
+_RESPAWN_STABLE_SECONDS = 30.0
+
+
+def _capped_backoff(base: float, exp: int, cap: float) -> float:
+    """``base * 2**exp`` capped at ``cap``. The exponent is clamped to 0..20 so a never-resetting
+    streak cannot blow up ``2**exp``; ``float(...)`` pins the type, because ``int ** (variable int)``
+    is typed Any by mypy (the negative-exponent overload)."""
+    return min(float(base * (2 ** min(max(exp, 0), 20))), cap)
 
 
 class LaneResultKind(Enum):
@@ -162,12 +184,34 @@ class _LaneState:
 @dataclass
 class _Claimer:
     """One claimer partition: a ready-deque (FIFO fairness across lanes) + a companion membership set
-    for O(1) coalescing (never enqueue a lane twice) + a wake Event. ``task`` is filled at start()."""
+    for O(1) coalescing (never enqueue a lane twice) + a wake Event. ``task`` is filled at start(), and
+    replaced in place when the supervisor respawns a dead claimer (BACKLOG #1609); the partition's
+    deque and Event outlive any one task.
+
+    ``abandoned`` and ``orphan_ids`` hand a dead task's interrupted round-trip to its replacement: the
+    lanes it had reserved but not dispatched (held CLAIMING, slot still reserved) and the rows it had
+    claimed for them (INFLIGHT). ``_claim_and_dispatch`` records both before it re-raises; the
+    replacement releases the rows and only then re-readies the lanes (:meth:`_adopt_abandoned`)."""
 
     ready: deque[str] = field(default_factory=deque)
     ready_set: set[str] = field(default_factory=set)
     event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[None] | None = None
+    abandoned: list[str] = field(default_factory=list)
+    orphan_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _Supervised:
+    """Supervision record for one claimer or sweep task (BACKLOG #1609). Created at its first death;
+    a task that never died has none, which keeps the per-iteration health check a failed dict get."""
+
+    is_claimer: bool
+    streak: int = (
+        0  # consecutive deaths not separated by _RESPAWN_STABLE_SECONDS of healthy running
+    )
+    healthy_since: float | None = None  # when the current replacement was first seen iterating
+    fault: str | None = None  # why it is down; None once recovered
 
 
 @dataclass(frozen=True)
@@ -347,6 +391,9 @@ class StageDispatcher:
         self._lock_timeout_last_lanes = 0
         # Debug tripwire: the one-consumer-per-lane invariant. Must stay 0 (the 200-lane soak asserts).
         self._busy_violations = 0
+        # BACKLOG #1609 claimer/sweep supervision, keyed by task name (see _Supervised).
+        self._supervised: dict[str, _Supervised] = {}
+        self._respawns = 0
 
     # --- lane -> claimer partition ------------------------------------------
 
@@ -513,12 +560,28 @@ class StageDispatcher:
             self._call_later = asyncio.get_running_loop().call_later
         for lane in self._lane_provider():
             self.mark_ready(lane, woken=False)  # seed-all-READY (recovery-source, not a wake)
-        for i, claimer in enumerate(self._claimers):
-            claimer.task = asyncio.create_task(self._claimer_loop(claimer), name=f"claimer-{i}")
-            claimer.task.add_done_callback(functools.partial(self._on_task_done, f"claimer-{i}"))
-        self._sweep_task = asyncio.create_task(self._sweep_loop(), name="sweep")
-        self._sweep_task.add_done_callback(functools.partial(self._on_task_done, "sweep"))
+        for i in range(len(self._claimers)):
+            self._spawn_task(i)
+        self._spawn_task(None)
         await self._run_sweep_once()  # immediate first sweep (arms due lanes / not-due timers)
+
+    @staticmethod
+    def _task_name(index: int | None) -> str:
+        return "sweep" if index is None else f"claimer-{index}"
+
+    def _spawn_task(self, index: int | None, *, delay: float = 0.0) -> None:
+        """Start (or, from the supervisor, restart) claimer ``index`` on its existing partition, or
+        the sweep when ``index`` is None."""
+        name = self._task_name(index)
+        task: asyncio.Task[None]
+        if index is None:
+            task = asyncio.create_task(self._sweep_loop(delay=delay), name=name)
+            self._sweep_task = task
+        else:
+            claimer = self._claimers[index]
+            task = asyncio.create_task(self._claimer_loop(claimer, name, delay=delay), name=name)
+            claimer.task = task
+        task.add_done_callback(functools.partial(self._on_task_done, index))
 
     async def quiesce(self, budget: float) -> bool:
         """COOPERATIVE stop (ADR 0157 Inc 5): stop claiming, let every live serializer reach its
@@ -563,7 +626,10 @@ class StageDispatcher:
             watched.update(live)
             if not live:
                 self._reap(watched)
-                return True
+                # A dead claimer's rows that its replacement had not yet released are INFLIGHT too, so
+                # the contract is not met. They are NOT released here: this path runs because the
+                # lease may be lost, and an unfenced release could re-pend a row a successor holds.
+                return not any(claimer.orphan_ids for claimer in self._claimers)
             remaining = deadline - loop.time()
             if remaining <= 0:
                 self._reap(watched)
@@ -610,6 +676,8 @@ class StageDispatcher:
         for handle in self._timers.values():
             handle.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # Rows a dead claimer left claimed and its replacement had not yet released stay INFLIGHT
+        # for reset_stale_inflight, exactly like a cancelled serializer's (the rule above).
         # POST-gather clear — safe now that every task is done (mirrors _teardown_unsafe:1187-1204).
         self._states.clear()
         self._timers.clear()
@@ -619,38 +687,195 @@ class StageDispatcher:
             claimer.ready.clear()
             claimer.ready_set.clear()
             claimer.task = None
+            claimer.abandoned.clear()
+            claimer.orphan_ids.clear()
         self._slots_free = self._max_processing_lanes
+        # A start()-after-stop() begins with a clean supervision record: every task is new.
+        self._supervised.clear()
         self._running = False
 
-    def _on_task_done(self, name: str, task: asyncio.Task[None]) -> None:
-        """Claimer/sweep supervision — these should only finish on shutdown (their loops swallow +
-        back off). If one dies unexpectedly while running, log LOUDLY rather than silently stalling a
-        stage. (Respawning the loop in place is still not implemented — a dead claimer wedges its
-        partition until the engine restarts; that is a known gap, NOT "the dispatcher is unwired", which
-        this docstring used to claim and which the module header corrects.) Expected cancellation/stop is
-        a no-op."""
+    def _on_task_done(self, index: int | None, task: asyncio.Task[None]) -> None:
+        """Claimer/sweep supervision (BACKLOG #1609). These tasks should finish only on shutdown:
+        their loops catch store errors and back off. One that dies with an exception while running is
+        RESPAWNED in place, the way the per_lane supervisors respawn their workers. ``index`` is the
+        claimer's partition, or ``None`` for the sweep.
+
+        Without this a dead claimer silently stopped its whole stage (``pooled_claimers_per_stage``
+        defaults to 1) while intake kept acknowledging. What its interrupted round-trip left behind was
+        recorded on the partition before it died (:meth:`_abandon_claim`), and the replacement repairs
+        it before claiming (:meth:`_adopt_abandoned`). Repeated deaths back off; the fault stays in
+        :attr:`claimer_faults` per :meth:`_mark_task_healthy`. Expected cancellation/stop, and a stale
+        task already replaced, are no-ops."""
         if self._stop.is_set() or not self._running or task.cancelled():
             return
         exc = task.exception()
-        if exc is not None:
-            log.error(
-                "StageDispatcher %s task %r exited unexpectedly",
+        if exc is None:
+            return  # a loop only returns once _stop is set, which the guard above already covered
+        current = self._sweep_task if index is None else self._claimers[index].task
+        if current is not task:
+            return  # already replaced
+        name = self._task_name(index)
+        sup = self._supervised.setdefault(name, _Supervised(is_claimer=index is not None))
+        if sup.healthy_since is not None and (
+            time.monotonic() - sup.healthy_since >= _RESPAWN_STABLE_SECONDS
+        ):
+            sup.streak = 0  # it had run cleanly for the stable window: this is a fresh fault
+        delay = (
+            0.0
+            if sup.streak == 0
+            else _capped_backoff(
+                _RESPAWN_BACKOFF_BASE_SECONDS, sup.streak - 1, _RESPAWN_BACKOFF_CAP_SECONDS
+            )
+        )
+        sup.streak += 1
+        sup.healthy_since = None
+        self._respawns += 1
+        # The exception TYPE only: this string reaches /status, and a message could carry anything.
+        # No backoff figure: the text outlives the wait it would describe.
+        sup.fault = (
+            f"{name} exited unexpectedly ({type(exc).__name__}); {sup.streak} consecutive death(s)"
+        )
+        if index is not None:
+            # A death OUTSIDE the dispatch loop (the claim-error handler, _assemble_chunk) records no
+            # abandonment of its own. Only this claimer's task moves its lanes into CLAIMING, and it
+            # is dead, so every such lane is abandoned by definition. Neither path holds claimed rows.
+            claimer = self._claimers[index]
+            held = set(claimer.abandoned)
+            for lane, st in self._states.items():
+                if (
+                    st.phase is _LanePhase.CLAIMING
+                    and lane not in held
+                    and self._owning_claimer(lane) is claimer
+                ):
+                    claimer.abandoned.append(lane)
+        log.error(
+            "StageDispatcher %s task %r exited unexpectedly; respawning (consecutive death %d, "
+            "delay %.2fs)",
+            self._stage.value,
+            name,
+            sup.streak,
+            delay,
+            exc_info=exc,
+        )
+        self._spawn_task(index, delay=delay)
+
+    def _abandon_claim(
+        self, claimer: _Claimer, lanes: list[str], by_lane: dict[str, list[OutboxItem]]
+    ) -> None:
+        """Record, synchronously and before the claimer task dies, what its round-trip had reserved
+        and claimed but not dispatched (``lanes`` is the undispatched suffix of the chunk).
+
+        A lane a serializer took is skipped; it finishes normally. A lane already moved on (READY,
+        IDLE, PAUSED) is skipped too. Every other lane is still CLAIMING, or PROCESSING with no task,
+        with its slot reserved. It is held CLAIMING: a wake only sets ``dirty`` there, a pause only
+        sets ``pause_pending``, and the lane is re-readied only after its rows are released
+        (:meth:`_adopt_abandoned`). Readying it any earlier would let a pause report the lane
+        quiesced while its head is still INFLIGHT."""
+        for lane in lanes:
+            st = self._states.get(lane)
+            if st is None or lane in self._lane_tasks:
+                continue
+            if st.phase not in (_LanePhase.CLAIMING, _LanePhase.PROCESSING):
+                continue
+            st.phase = _LanePhase.CLAIMING
+            claimer.abandoned.append(lane)
+            claimer.orphan_ids.extend(item.id for item in by_lane.get(lane, ()))
+
+    async def _adopt_abandoned(self, name: str, claimer: _Claimer) -> None:
+        """A replacement claimer's first act: release its predecessor's claimed-but-undispatched rows,
+        then re-ready the lanes it abandoned (:meth:`_abandon_claim`).
+
+        The rows are INFLIGHT, and ``claim_fifo_heads`` reads only PENDING rows. A replacement that
+        claimed before releasing would take the NEXT row of the lane and deliver it ahead of the
+        stranded head, a per-lane FIFO break, while the head waited for a restart.
+        ``release_claimed`` undoes the claim's ``attempts`` increment and keeps each row's ``seq``, so
+        the rows come back as the lane's head in their original order. It is retried until it
+        succeeds or the dispatcher stops; a stop leaves the rows INFLIGHT for
+        ``reset_stale_inflight``, as it does a cancelled serializer's.
+
+        Each abandoned lane then leaves CLAIMING exactly as an empty claim does: slot released, and
+        PAUSED if an operator pause landed meanwhile, else READY."""
+        while claimer.orphan_ids and not self._stop.is_set():
+            ids = list(claimer.orphan_ids)
+            try:
+                await self._store.release_claimed(ids)
+            except Exception:  # noqa: BLE001 — retry below; claiming past the head would break FIFO
+                log.warning(
+                    "StageDispatcher %s %s could not release %d row(s) its predecessor claimed; "
+                    "retrying in %.1fs",
+                    self._stage.value,
+                    name,
+                    len(ids),
+                    _CLAIM_ERROR_BACKOFF_SECONDS,
+                    exc_info=True,
+                )
+                await self._sleep_or_stop(_CLAIM_ERROR_BACKOFF_SECONDS)
+                continue
+            claimer.orphan_ids.clear()
+            log.warning(
+                "StageDispatcher %s %s released %d row(s) its predecessor claimed but never "
+                "dispatched",
                 self._stage.value,
                 name,
-                exc_info=exc,
+                len(ids),
             )
+        if self._stop.is_set():
+            return
+        end_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
+        for lane in claimer.abandoned:
+            st = self._states.get(lane)
+            if st is None or st.phase is not _LanePhase.CLAIMING:
+                continue
+            self._release_slot()
+            self._drop_lane_episode(st, end_ns)
+            if st.pause_pending:
+                st.phase = _LanePhase.PAUSED
+                st.pause_pending = False
+                st.dirty = False
+                self._fire_paused(lane)
+            else:
+                self._to_ready(lane, woken=st.ready_woken)
+        claimer.abandoned.clear()
+
+    def _mark_task_healthy(self, name: str) -> None:
+        """The task named ``name`` is iterating: stamp when its current incarnation was first seen
+        doing so. A task that never died has no record, so this is one failed dict get on the hot
+        path. Whether the fault still counts is decided at READ time (:meth:`_fault_active`), so an
+        idle claimer that never iterates again still ages out of it."""
+        sup = self._supervised.get(name)
+        if sup is not None and sup.healthy_since is None:
+            sup.healthy_since = time.monotonic()
+
+    @staticmethod
+    def _fault_active(sup: _Supervised) -> bool:
+        """After a single death the fault clears at the replacement's first healthy iteration. After
+        repeated deaths it clears only once that replacement has run for ``_RESPAWN_STABLE_SECONDS``,
+        so a fault that kills the claimer on some round-trips and not others does not read healthy on
+        most polls. Monotonic time: a wall-clock step must not move either window."""
+        if sup.fault is None or sup.healthy_since is None:
+            return sup.fault is not None
+        return sup.streak > 1 and time.monotonic() - sup.healthy_since < _RESPAWN_STABLE_SECONDS
 
     # --- claimer loop (T8-T12) ----------------------------------------------
 
-    async def _claimer_loop(self, claimer: _Claimer) -> None:
+    async def _claimer_loop(self, claimer: _Claimer, name: str, *, delay: float = 0.0) -> None:
         """Drain up to ``min(slots_free, claim_lane_chunk)`` READY lanes, claim their head-prefixes in
         ONE ``claim_fifo_heads`` round-trip, and dispatch by outcome. Never awaits processing — a slow
         lane cannot stall its siblings' claim service (ADR 0066 §4.3). Backpressure is claim-gated: when
-        no slots are free the claimer parks on its Event until a serializer frees one."""
+        no slots are free the claimer parks on its Event until a serializer frees one.
+
+        On a supervisor respawn (BACKLOG #1609) it first backs off ``delay``, then repairs what its
+        predecessor abandoned (:meth:`_adopt_abandoned`), and only then claims."""
+        if delay > 0:
+            await self._sleep_or_stop(delay)
+        if claimer.abandoned or claimer.orphan_ids:
+            await self._adopt_abandoned(name, claimer)
         while not self._stop.is_set():
             # Wait for BOTH ready work AND a free slot (re-checked at the top, so a dropped Event.set()
             # between wait() and clear() can never lose a wakeup — state, not the event, is the truth).
             if not claimer.ready or self._slots_free <= 0:
+                # Reaching the idle wait means this claimer served every lane it had: healthy.
+                self._mark_task_healthy(name)
                 await claimer.event.wait()
                 claimer.event.clear()
                 continue
@@ -662,6 +887,7 @@ class StageDispatcher:
                 self._emit_lane_episode()
                 continue
             await self._claim_and_dispatch(claimer, lanes)
+            self._mark_task_healthy(name)  # a completed round-trip: the partition is being served
 
     def _assemble_chunk(self, claimer: _Claimer) -> list[str]:
         """Pop READY lanes into a claim chunk, reserving one processing slot per lane as it is added
@@ -734,74 +960,87 @@ class StageDispatcher:
             )
             await self._sleep_or_stop(_CLAIM_ERROR_BACKOFF_SECONDS)
             return
-        if self._claim_phase_timing:
-            # Recorded synchronously (no await between the read and the counter writes), so a sibling
-            # claimer at K>1 can never interleave a partial update. Counts only — a lane is a
-            # destination_name, so lane NAMES never reach the log (PHI rule). `rearm` lanes were
-            # consumed in place by the H2 skip-and-complete: real work, so booking them as empty
-            # overhead would invert the churn metric during a dedup/failover pass.
-            self._claim_phase_stats.record_claim(
-                time.perf_counter_ns() - _claim_t0,
-                lanes=len(lanes),
-                rows=sum(len(v) for v in result.by_lane.values()),
-                rearm=len(result.rearm),
-            )
-            self._claim_phase_stats.maybe_emit(
-                stage=self._stage.value, claimers=len(self._claimers)
-            )
-        # ONE clock read for every non-service release this dispatch pass books (they all end at the same
-        # instant — the claim has returned and this loop is await-free). Zero when the lever is off.
-        rel_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
-        # BACKLOG #1270: did THIS round-trip abort on a store lock timeout? An ATTEMPT-level fact, so
-        # it is read once here and booked once below — never per lane. Booking it per lane is the
-        # arithmetic half of #1270's first defect: at the default chunk one abort moved the operator
-        # counter by 256 and the log line said "256 of 256 lane(s)", from zero observations.
-        lock_timeout = result.lock_timeout
-        for lane in lanes:
-            st = self._states[lane]
-            items = result.by_lane.get(lane)
-            if items:  # T9: claimed a prefix -> PROCESSING (the reserved slot is now consumed)
-                if st.phase is not _LanePhase.CLAIMING:
-                    self._busy_violations += 1  # invariant break — claimed a non-CLAIMING lane
-                st.phase = _LanePhase.PROCESSING
-                self._spawn_serializer(lane, items)
-                # A pause_pending lane that claimed items carries pause_pending into the serializer's
-                # terminal transition, which routes it to PAUSED after this <=1 head finishes.
-            elif st.pause_pending:
-                # An operator pause landed while CLAIMING and the claim came back EMPTY (or rearm-only):
-                # the lane is already quiesced (no row claimed, the reserved slot never consumed), so
-                # route it STRAIGHT to PAUSED — a pause must never drop to a claimable IDLE / re-ready.
-                self._release_slot()
-                self._drop_lane_episode(st, rel_ns)  # S_lane DROP: no service was rendered
-                st.phase = _LanePhase.PAUSED
-                st.pause_pending = False
-                st.dirty = False
-                self._fire_paused(lane)
-            elif (
-                lane in result.rearm
-            ):  # T10: head consumed in-store (H2/poison) -> immediate re-claim
-                self._release_slot()
-                # S_lane DROP (rearm): claim-only, the lane never entered PROCESSING. These are frequent
-                # and sub-millisecond — booking them as SERVICE would drag S_lane down toward the bare
-                # claim time and manufacture the "lanes do not bind" verdict on the load-bearing question.
-                # They ARE lane occupancy, though (the lane sat reserved across the whole shared claim
-                # round-trip), so they go to `dropped` — discarding them outright is what would make the
-                # negative branch of the ARM 1 test unfalsifiable.
-                self._drop_lane_episode(st, rel_ns)
-                self._to_ready(lane, woken=st.ready_woken)
-            else:  # EMPTY
-                self._release_slot()
-                self._drop_lane_episode(
-                    st, rel_ns
-                )  # S_lane DROP: same as rearm — occupancy, not service
-                # The lane-level books are unchanged: an aborted claim is still an EMPTY claim for
-                # every lane it covered, because that is what happened to each lane. What is NOT
-                # recorded here is any per-lane cause — see the attempt-level booking below.
-                self._record_empty(woken=st.ready_woken)
-                if st.dirty:  # T11: a wake raced the claim -> re-claim now, no sweep wait
-                    self._to_ready(lane, woken=True)
-                else:  # T12
-                    st.phase = _LanePhase.IDLE
+        # BACKLOG #1609: from here to the end of the dispatch loop the claimed rows are INFLIGHT and
+        # owned by this task alone. `dispatched` counts the lanes fully handled, so if anything below
+        # raises, lanes[dispatched:] is EXACTLY what this round-trip abandoned. It is recorded for
+        # the replacement before the exception kills the task (see _abandon_claim).
+        dispatched = 0
+        try:
+            if self._claim_phase_timing:
+                # Recorded synchronously (no await between the read and the counter writes), so a sibling
+                # claimer at K>1 can never interleave a partial update. Counts only — a lane is a
+                # destination_name, so lane NAMES never reach the log (PHI rule). `rearm` lanes were
+                # consumed in place by the H2 skip-and-complete: real work, so booking them as empty
+                # overhead would invert the churn metric during a dedup/failover pass.
+                self._claim_phase_stats.record_claim(
+                    time.perf_counter_ns() - _claim_t0,
+                    lanes=len(lanes),
+                    rows=sum(len(v) for v in result.by_lane.values()),
+                    rearm=len(result.rearm),
+                )
+                self._claim_phase_stats.maybe_emit(
+                    stage=self._stage.value, claimers=len(self._claimers)
+                )
+            # ONE clock read for every non-service release this dispatch pass books (they all end at the same
+            # instant — the claim has returned and this loop is await-free). Zero when the lever is off.
+            rel_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
+            # BACKLOG #1270: did THIS round-trip abort on a store lock timeout? An ATTEMPT-level fact, so
+            # it is read once here and booked once below — never per lane. Booking it per lane is the
+            # arithmetic half of #1270's first defect: at the default chunk one abort moved the operator
+            # counter by 256 and the log line said "256 of 256 lane(s)", from zero observations.
+            lock_timeout = result.lock_timeout
+            for lane in lanes:
+                st = self._states[lane]
+                items = result.by_lane.get(lane)
+                if items:  # T9: claimed a prefix -> PROCESSING (the reserved slot is now consumed)
+                    if st.phase is not _LanePhase.CLAIMING:
+                        self._busy_violations += 1  # invariant break — claimed a non-CLAIMING lane
+                    st.phase = _LanePhase.PROCESSING
+                    self._spawn_serializer(lane, items)
+                    # A pause_pending lane that claimed items carries pause_pending into the serializer's
+                    # terminal transition, which routes it to PAUSED after this <=1 head finishes.
+                elif st.pause_pending:
+                    # An operator pause landed while CLAIMING and the claim came back EMPTY (or rearm-only):
+                    # the lane is already quiesced (no row claimed, the reserved slot never consumed), so
+                    # route it STRAIGHT to PAUSED — a pause must never drop to a claimable IDLE / re-ready.
+                    self._release_slot()
+                    self._drop_lane_episode(st, rel_ns)  # S_lane DROP: no service was rendered
+                    st.phase = _LanePhase.PAUSED
+                    st.pause_pending = False
+                    st.dirty = False
+                    self._fire_paused(lane)
+                elif (
+                    lane in result.rearm
+                ):  # T10: head consumed in-store (H2/poison) -> immediate re-claim
+                    self._release_slot()
+                    # S_lane DROP (rearm): claim-only, the lane never entered PROCESSING. These are frequent
+                    # and sub-millisecond — booking them as SERVICE would drag S_lane down toward the bare
+                    # claim time and manufacture the "lanes do not bind" verdict on the load-bearing question.
+                    # They ARE lane occupancy, though (the lane sat reserved across the whole shared claim
+                    # round-trip), so they go to `dropped` — discarding them outright is what would make the
+                    # negative branch of the ARM 1 test unfalsifiable.
+                    self._drop_lane_episode(st, rel_ns)
+                    self._to_ready(lane, woken=st.ready_woken)
+                else:  # EMPTY
+                    # The lane-level books are unchanged: an aborted claim is still an EMPTY claim for
+                    # every lane it covered, because that is what happened to each lane. What is NOT
+                    # recorded here is any per-lane cause — see the attempt-level booking below.
+                    # Booked BEFORE the slot release (#1609): the injected observer is the one call
+                    # here that could raise, and a lane _abandon_claim finds still CLAIMING must still
+                    # hold its slot.
+                    self._record_empty(woken=st.ready_woken)
+                    self._release_slot()
+                    self._drop_lane_episode(
+                        st, rel_ns
+                    )  # S_lane DROP: same as rearm — occupancy, not service
+                    if st.dirty:  # T11: a wake raced the claim -> re-claim now, no sweep wait
+                        self._to_ready(lane, woken=True)
+                    else:  # T12
+                        st.phase = _LanePhase.IDLE
+                dispatched += 1
+        except Exception:
+            self._abandon_claim(claimer, lanes[dispatched:], result.by_lane)
+            raise
         # BACKLOG #1270: ONE booking and at most one line per aborted ROUND-TRIP, at INFO, counts only.
         # (1) The unit is the ATTEMPT. The store rolled the transaction back and read no row, so "at
         # least one row this claim needed was held" is the whole of what is known — which lane, and
@@ -1035,11 +1274,7 @@ class StageDispatcher:
         clamped so a never-resetting ``retry_forever`` streak can't blow up ``2**streak`` (base * 2**6
         already exceeds the ~60 s cap). 10 consecutive zero-progress faults span ~4 min of wall clock —
         the count is really a duration gate."""
-        exp = min(max(streak, 0), 20)
-        # float(...) pins the type: int ** (variable int) is typed Any by mypy (negative-exponent
-        # overload), which would otherwise leak Any out of this float-returning function.
-        backoff = float(_LANE_ERROR_BACKOFF_SECONDS * (2**exp))
-        return min(backoff, self._infra_fault_backoff_cap)
+        return _capped_backoff(_LANE_ERROR_BACKOFF_SECONDS, streak, self._infra_fault_backoff_cap)
 
     async def _drain_lane(
         self, lane: str, items: list[OutboxItem]
@@ -1304,9 +1539,12 @@ class StageDispatcher:
 
     # --- sweep (T18-T21) — the bounded, clock-driven at-least-once backstop ---
 
-    async def _sweep_loop(self) -> None:
+    async def _sweep_loop(self, *, delay: float = 0.0) -> None:
         """Run one sweep every ``sweep_interval`` OR immediately when ``sweep_now`` is set (recovery).
-        An independent task, so sustained wake traffic can never starve the backstop (ADR 0066 §4.4)."""
+        An independent task, so sustained wake traffic can never starve the backstop (ADR 0066 §4.4).
+        ``delay`` is set only on a backed-off supervisor respawn (BACKLOG #1609)."""
+        if delay > 0:
+            await self._sleep_or_stop(delay)
         while not self._stop.is_set():
             try:  # noqa: SIM105
                 await asyncio.wait_for(self._sweep_now.wait(), timeout=self._sweep_interval)
@@ -1321,6 +1559,7 @@ class StageDispatcher:
                 raise
             except Exception:  # noqa: BLE001 — a sweep error must not kill the backstop
                 log.warning("StageDispatcher %s sweep failed", self._stage.value, exc_info=True)
+            self._mark_task_healthy(self._task_name(None))  # a pass completed, failed or not
 
     async def _run_sweep_once(self) -> None:
         """Page ``list_fifo_lanes`` (after-cursor), intersect EACH page with this engine's registry lanes
@@ -1382,6 +1621,24 @@ class StageDispatcher:
         return self._busy_violations
 
     @property
+    def claimer_faults(self) -> dict[str, str]:
+        """``{claimer task name: reason}`` for each claimer that died and has not recovered per
+        :meth:`_mark_task_healthy` (BACKLOG #1609): its partition is not draining. Empty when healthy.
+
+        CLAIMERS only. A dead sweep is respawned and logged the same way, but the claimers keep
+        draining on producer wakes without it, so it is not reported as a stage that is not draining."""
+        return {
+            name: sup.fault
+            for name, sup in self._supervised.items()
+            if sup.is_claimer and sup.fault is not None and self._fault_active(sup)
+        }
+
+    @property
+    def respawns(self) -> int:
+        """How many claimer/sweep tasks the supervisor has respawned since construction."""
+        return self._respawns
+
+    @property
     def processing_lanes(self) -> int:
         return len(self._lane_tasks)
 
@@ -1416,6 +1673,13 @@ class StageDispatcher:
         to gate outbound status/purge). False for an unknown lane."""
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.PAUSED
+
+    def stopped(self, key: str) -> bool:
+        """Whether ``key`` is in the STOPPED phase (a STOP not yet re-armed). The runner reads it before
+        a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm. False
+        for an unknown lane."""
+        st = self._states.get(key)
+        return st is not None and st.phase is _LanePhase.STOPPED
 
     def is_dirty(self, key: str) -> bool:
         st = self._states.get(key)

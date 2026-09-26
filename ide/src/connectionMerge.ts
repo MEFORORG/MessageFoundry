@@ -77,6 +77,8 @@ export const READ_SCHEMA_KEYS: Record<Direction, ReadonlySet<string>> = {
     "schedule",
     "auto_start",
     "deployed",
+    "tls_hop_attested",
+    "tls_hop_attested_reason",
   ]),
   outbound: new Set([
     "name",
@@ -95,6 +97,8 @@ export const READ_SCHEMA_KEYS: Record<Direction, ReadonlySet<string>> = {
     "schedule",
     "auto_start",
     "deployed",
+    "tls_hop_attested",
+    "tls_hop_attested_reason",
   ]),
 };
 

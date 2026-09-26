@@ -734,8 +734,16 @@ class RawMessage:
 
     def json(self) -> Any:
         """Parse the body as JSON. Raises ``json.JSONDecodeError`` on malformed input — a Handler can
-        return ``None`` (FILTERED) or let it raise (ERROR / dead-letter)."""
-        return json.loads(self.raw)
+        return ``None`` (FILTERED) or let it raise (ERROR / dead-letter).
+
+        That includes a body nested past the decoder's depth limit, which ``json`` reports as a
+        ``RecursionError`` (a ``RuntimeError``, not a ``ValueError``); it is converted here so the
+        documented type is the only one (BACKLOG #1600). The converted error carries an empty ``doc``
+        and position 0, never the body, which can be PHI."""
+        try:
+            return json.loads(self.raw)
+        except RecursionError as exc:
+            raise json.JSONDecodeError("JSON body is nested too deeply to parse", "", 0) from exc
 
     def xml(self) -> Element:
         """Parse the body as XML, **hardened against XXE / entity-expansion** (ADR 0004, BACKLOG #31).

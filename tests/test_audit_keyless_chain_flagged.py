@@ -212,11 +212,13 @@ def _loosening_names(audit_chain_unkeyed: bool | None) -> set[str]:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            None,
-            audit_chain_unkeyed,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=audit_chain_unkeyed,
         )
     }
 

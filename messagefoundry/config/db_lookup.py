@@ -110,7 +110,9 @@ def db_lookup(
 
     Raises :class:`DbLookupError` if there is no active runner (called on a Router, in dry-run / Test
     Bench, or in a graph with no ``DatabaseLookup``), if ``connection`` is unknown, if a parameter is
-    missing, or if the connection/query fails — surfacing as that message's ``ERROR`` / dead-letter."""
+    missing, if the statement selects more rows than the connection's ``max_rows`` (default 500; the
+    result is refused, never truncated), or if the connection/query fails — surfacing as that
+    message's ``ERROR`` / dead-letter."""
     runner = _active.get()
     if runner is None:
         raise DbLookupError(

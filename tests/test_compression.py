@@ -19,10 +19,12 @@ import zipfile
 import zlib
 from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any, Literal
 
 import pytest
 
 from messagefoundry.parsing import compression
+from messagefoundry.parsing._bounded_inflate import InflateResult
 from messagefoundry.parsing.compression import (
     CompressionError,
     deflate_compress,
@@ -636,8 +638,7 @@ def test_gzip_multi_round_member_with_trailing_bytes_ends() -> None:  # #1964
 @pytest.mark.timeout(30)
 def test_zip_multi_round_member_with_trailing_bytes_ends() -> None:  # #1964
     # zipfile runs its own loop, bounded by each member's compressed size. Pin only that it ends.
-    # Whether bytes after the archive should be refused, as deflate now does, is a separate question
-    # and deliberately not pinned here.
+    # That bytes after the archive are refused is pinned by the #1976 tests below, not here.
     archive = zip_compress({"a.bin": _MULTI_ROUND}) + b"X"
 
     def call() -> object:
@@ -648,3 +649,389 @@ def test_zip_multi_round_member_with_trailing_bytes_ends() -> None:  # #1964
             return "refused"
 
     _returns_within(call)
+
+
+# --- #1598: every zipfile failure is a CompressionError that names no member ------
+
+# The filename is patient-shaped on purpose: zipfile's RuntimeError for an encrypted member and its
+# BadZipFile for a bad CRC both embed it.
+_PHI_NAME = "SMITH_JOHN_MRN123.txt"
+
+
+def _two_member_zip_with_second_patched(*, flag: int = 0, method: int | None = None) -> bytes:
+    """A stored two-member archive whose SECOND member has ``flag`` OR-ed into its 16-bit
+    general-purpose flags and, if given, ``method`` as its compression method, in both the local header and the
+    central directory. Stored bodies contain no ``PK`` signature, so the header search is exact."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("ok.txt", b"first")
+        zf.writestr(_PHI_NAME, b"second")
+    blob = bytearray(buf.getvalue())
+    # (signature, offset of the flags field, offset of the method field) for each header kind.
+    for signature, flag_at, method_at in ((b"PK\x03\x04", 6, 8), (b"PK\x01\x02", 8, 10)):
+        second = blob.index(signature, blob.index(signature) + 1)
+        blob[second + flag_at] |= flag & 0xFF
+        blob[second + flag_at + 1] |= flag >> 8
+        if method is not None:
+            blob[second + method_at : second + method_at + 2] = method.to_bytes(2, "little")
+    return bytes(blob)
+
+
+def test_zip_patch_helper_control_archive_still_decompresses() -> None:  # #1598
+    # Control: with nothing patched the helper's archive is well formed, so the refusals below come
+    # from the flag and the method, not from a helper that corrupts the archive.
+    assert zip_decompress(_two_member_zip_with_second_patched(), max_output_bytes=None) == {
+        "ok.txt": b"first",
+        _PHI_NAME: b"second",
+    }
+
+
+def _second_member_body_corrupted() -> bytes:
+    # One byte of the stored body changes, so zipfile's CRC check fails with a BadZipFile whose
+    # message is "Bad CRC-32 for file '<name>'".
+    blob = _two_member_zip_with_second_patched()
+    return blob.replace(b"second", b"Second", 1)
+
+
+def _second_member_name_not_utf8() -> bytes:
+    # The UTF-8 name flag, with a name byte that is not UTF-8, in both headers. zipfile raises a
+    # builtin UnicodeDecodeError whose .object holds the raw name bytes.
+    blob = _two_member_zip_with_second_patched(flag=0x0800)
+    return blob.replace(b"SMITH_", b"SMITH\xff")
+
+
+def _central_directory_offset_too_large() -> bytes:
+    # The end record claims the central directory starts 1000 bytes later than it does, so zipfile
+    # computes a negative member offset and BytesIO.seek raises ValueError("negative seek value").
+    # The #1976 layout check sees that offset first and refuses the archive before any member opens,
+    # so zip_decompress never reaches the seek. The case stays to pin that this refusal names no
+    # member either, and the control below pins that the shape still breaks zipfile itself.
+    blob = bytearray(_two_member_zip_with_second_patched())
+    eocd = blob.rindex(b"PK\x05\x06")
+    offset = int.from_bytes(blob[eocd + 16 : eocd + 20], "little")
+    blob[eocd + 16 : eocd + 20] = (offset + 1000).to_bytes(4, "little")
+    return bytes(blob)
+
+
+def _second_member_codec_corrupted(compress_type: int) -> bytes:
+    # A compressed member whose first stream bytes are garbage. Neither lzma.LZMAError nor
+    # compression.zstd.ZstdError is an OSError.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("ok.txt", b"first")
+        zf.writestr(zipfile.ZipInfo(_PHI_NAME), b"second" * 50, compress_type=compress_type)
+    blob = bytearray(buf.getvalue())
+    local = blob.index(b"PK\x03\x04", blob.index(b"PK\x03\x04") + 1)
+    name_len, extra_len = (
+        int.from_bytes(blob[local + 26 : local + 28], "little"),
+        int.from_bytes(blob[local + 28 : local + 30], "little"),
+    )
+    data_at = local + 30 + name_len + extra_len
+    # LZMA: the properties after zipfile's 4-byte version/size prefix. Zstandard: the frame magic.
+    start = 4 if compress_type == zipfile.ZIP_LZMA else 0
+    blob[data_at + start : data_at + start + 5] = b"\xff" * 5
+    return bytes(blob)
+
+
+def _second_member_zstd_corrupted() -> bytes:
+    pytest.importorskip("compression.zstd", reason="this Python build has no Zstandard support")
+    return _second_member_codec_corrupted(zipfile.ZIP_ZSTANDARD)
+
+
+_UNSUPPORTED = "member 2 uses a zip feature this reader does not support"
+
+
+@pytest.mark.parametrize(
+    ("build", "reason"),
+    [
+        pytest.param(
+            lambda: _two_member_zip_with_second_patched(flag=0x01),
+            _UNSUPPORTED,
+            id="encrypted-flag",
+        ),
+        pytest.param(
+            lambda: _two_member_zip_with_second_patched(method=98), _UNSUPPORTED, id="method-98"
+        ),
+        pytest.param(
+            _second_member_body_corrupted, r"member 2 is corrupt.*\(BadZipFile\)", id="bad-crc"
+        ),
+        pytest.param(
+            lambda: _second_member_codec_corrupted(zipfile.ZIP_LZMA),
+            r"member 2 is corrupt.*\(LZMAError\)",
+            id="lzma-corrupt",
+        ),
+        pytest.param(
+            _second_member_zstd_corrupted, r"member 2 is corrupt.*\(ZstdError\)", id="zstd-corrupt"
+        ),
+        pytest.param(
+            _second_member_name_not_utf8,
+            r"^zip archive is corrupt.*\(UnicodeDecodeError\)",
+            id="name-not-utf8",
+        ),
+        pytest.param(
+            _central_directory_offset_too_large,
+            r"^data before the start of the zip archive$",
+            id="cd-offset-past-archive",
+        ),
+    ],
+)
+def test_zip_unreadable_member_is_a_compression_error_naming_no_filename(
+    build: Callable[[], bytes], reason: str
+) -> None:  # #1598
+    blob = build()
+    with pytest.raises(CompressionError, match=reason) as exc:
+        zip_decompress(blob, max_output_bytes=None)
+    # PHI guard: the member name must not reach the message or anything chained to it. zipfile's own
+    # messages embed it, so a `from exc` would carry the name on __cause__, and a raise inside the
+    # handler would carry it on __context__.
+    assert "SMITH" not in str(exc.value)
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+
+
+def test_zip_negative_seek_shape_still_breaks_zipfile() -> None:  # #1598, #1976
+    # Control for the negative-seek case above: the layout check now refuses that archive first, so
+    # this pins that the shape itself is still the one zipfile fails on with a negative seek.
+    zf = zipfile.ZipFile(io.BytesIO(_central_directory_offset_too_large()))
+    with zf, pytest.raises(ValueError, match="negative seek value"):
+        zf.read(zf.infolist()[0])
+
+
+# --- #1977: one bounded-inflate primitive, two trailing rules ------------------------------------
+
+
+def _raw_deflate(body: bytes) -> bytes:
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    return compressor.compress(body) + compressor.flush()
+
+
+def test_both_callers_run_the_one_shared_inflate_loop() -> None:  # #1977
+    # Two copies of one loop let a fix reach one and not the other, which is how #1964 happened.
+    from messagefoundry.parsing import _bounded_inflate
+    from messagefoundry.parsing.dicom import _inflate as dicom_inflate
+
+    assert vars(compression)["bounded_inflate"] is _bounded_inflate.bounded_inflate
+    assert vars(dicom_inflate)["bounded_inflate"] is _bounded_inflate.bounded_inflate
+    # The #1964 window-boundary tests size their streams in compression._CHUNK windows.
+    assert compression._CHUNK == _bounded_inflate.CHUNK
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize(
+    "trailing",
+    [b"X", b"\x00", zlib.compress(b"second stream")],
+    ids=["byte", "nul-pad", "second-stream"],
+)
+@pytest.mark.parametrize("body", [b"\x00" * 100, _MULTI_ROUND], ids=["one-round", "multi-round"])
+@pytest.mark.parametrize("keep_output", [True, False], ids=["keep", "discard"])
+@pytest.mark.parametrize("exact_ceiling", [True, False], ids=["exact", "window"])
+def test_the_shared_loop_pins_both_trailing_rules(
+    body: bytes, trailing: bytes, keep_output: bool, exact_ceiling: bool
+) -> None:  # #1977
+    # The same stream and the same tail through both rules. "refuse" is the codec's rule and "stop"
+    # is the DICOM guard's. The multi-round body is the #1964 shape that used to loop forever.
+    from messagefoundry.parsing._bounded_inflate import InflateTrailingData, bounded_inflate
+
+    stream = _raw_deflate(body) + trailing
+
+    def run(rule: Literal["refuse", "stop"]) -> object:
+        return bounded_inflate(
+            stream,
+            zlib.decompressobj(-zlib.MAX_WBITS),
+            max_output_bytes=_CAP,
+            trailing=rule,
+            keep_output=keep_output,
+            exact_ceiling=exact_ceiling,
+        )
+
+    with pytest.raises(InflateTrailingData):
+        _returns_within(lambda: run("refuse"))
+    stopped = _returns_within(lambda: run("stop"))
+    assert stopped == InflateResult(body if keep_output else b"", len(body), eof=True)
+
+
+def test_the_shared_loop_refuses_an_unknown_trailing_rule() -> None:  # #1977
+    # The Literal type binds only under mypy. A mistyped rule must not fall through to "stop", the
+    # permissive one, and silently accept a tail.
+    from messagefoundry.parsing._bounded_inflate import bounded_inflate
+
+    with pytest.raises(ValueError, match="unknown trailing-data rule"):
+        bounded_inflate(
+            zlib.compress(b"x") + b"JUNK",
+            zlib.decompressobj(),
+            max_output_bytes=None,
+            trailing="Refuse",  # type: ignore[arg-type]
+            keep_output=True,
+            exact_ceiling=True,
+        )
+
+
+@pytest.mark.parametrize("rule", ["refuse", "stop"])
+@pytest.mark.parametrize("keep_output", [True, False], ids=["keep", "discard"])
+def test_the_shared_loop_ceiling_stops_one_byte_over_or_one_window_over(
+    rule: Literal["refuse", "stop"], keep_output: bool
+) -> None:  # #1977
+    # exact_ceiling=True is the codec's promise: at most one byte past the ceiling. False is the DICOM
+    # guard's old request size: the count may pass the ceiling by up to one window before it fires.
+    from messagefoundry.parsing._bounded_inflate import (
+        CHUNK,
+        InflateCeilingExceeded,
+        bounded_inflate,
+    )
+
+    produced: dict[bool, int] = {}
+    for exact in (True, False):
+        counting = _CountingDecompressor(zlib.decompressobj(-zlib.MAX_WBITS))
+        with pytest.raises(InflateCeilingExceeded) as caught:
+            bounded_inflate(
+                _raw_deflate(_MULTI_ROUND),
+                counting,
+                max_output_bytes=1024,
+                trailing=rule,
+                keep_output=keep_output,
+                exact_ceiling=exact,
+            )
+        assert caught.value.ceiling == 1024
+        produced[exact] = counting.produced
+    assert produced[True] == 1025
+    assert 1025 < produced[False] <= 1024 + CHUNK
+
+
+def test_the_shared_loop_reports_a_truncated_stream_and_leaves_the_verdict_to_the_caller() -> None:
+    # #1977: the codec refuses a truncated stream and the DICOM guard stands aside for dcmread, so the
+    # loop reports it rather than deciding.
+    from messagefoundry.parsing._bounded_inflate import bounded_inflate
+
+    stream = _raw_deflate(b"hello world" * 100)[:-4]
+    result = bounded_inflate(
+        stream,
+        zlib.decompressobj(-zlib.MAX_WBITS),
+        max_output_bytes=None,
+        trailing="refuse",
+        keep_output=True,
+        exact_ceiling=True,
+    )
+    assert result.eof is False
+
+
+def test_dicom_guard_still_stands_aside_for_a_break_inside_the_crossing_window() -> None:  # #1977
+    # The DICOM verdict the shared loop must not move. The guard asks zlib for a whole window each
+    # round, so a stream that breaks inside the window that crosses the cap raises zlib.error first
+    # and is left to dcmread, whose decode path answers Cannot Understand. Asking for one byte past
+    # the cap would call it a bomb, and the SCP answers a bomb with Out of Resources, which a sender
+    # may retry.
+    from messagefoundry.parsing.dicom._inflate import bounded_inflate_or_error
+    from messagefoundry.parsing.dicom.errors import DicomBombError
+
+    compressor = zlib.compressobj(0, zlib.DEFLATED, -zlib.MAX_WBITS)
+    prefix = compressor.compress(b"A" * 5000) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    corrupt = prefix + bytes([0xFF] * 6)
+    with pytest.raises(zlib.error):
+        zlib.decompressobj(-zlib.MAX_WBITS).decompress(corrupt)  # the stream really is corrupt
+    bounded_inflate_or_error(corrupt, max_bytes=4000)  # crosses the cap in the breaking window
+    bounded_inflate_or_error(corrupt, max_bytes=6000)  # breaks under the cap
+    # Control: the same prefix, valid to its end, IS over the cap.
+    valid = prefix + compressor.flush()
+    with pytest.raises(DicomBombError):
+        bounded_inflate_or_error(valid, max_bytes=4000)
+
+
+class _CountingDecompressor:
+    """Wraps a real decompressor and counts every byte it hands back."""
+
+    def __init__(self, inner: Any) -> None:
+        self.produced = 0
+        self._inner = inner
+
+    def decompress(self, data: Any, max_length: int = 0, /) -> bytes:
+        piece: bytes = self._inner.decompress(data, max_length)
+        self.produced += len(piece)
+        return piece
+
+    def flush(self) -> bytes:
+        piece: bytes = self._inner.flush()
+        self.produced += len(piece)
+        return piece
+
+    @property
+    def eof(self) -> bool:
+        return bool(self._inner.eof)
+
+    @property
+    def unconsumed_tail(self) -> bytes:
+        return bytes(self._inner.unconsumed_tail)
+
+    @property
+    def unused_data(self) -> bytes:
+        return bytes(self._inner.unused_data)
+
+
+# --- #1976: zip_decompress refuses bytes outside the archive ---------------------------------------
+
+
+def _zip_with_comment(comment: bytes) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(zipfile.ZipInfo("a.bin", date_time=(1980, 1, 1, 0, 0, 0)), b"payload")
+        zf.comment = comment
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("comment", [b"", b"an archive comment"], ids=["no-comment", "comment"])
+def test_zip_clean_archive_is_accepted(comment: bytes) -> None:  # #1976
+    # The declared comment is part of the archive, so it is not trailing data.
+    assert zip_decompress(_zip_with_comment(comment), max_output_bytes=_CAP) == {
+        "a.bin": b"payload"
+    }
+
+
+@pytest.mark.parametrize("tail", [1, 1000], ids=["one-byte", "1000-bytes"])
+@pytest.mark.parametrize("comment", [b"", b"an archive comment"], ids=["no-comment", "comment"])
+def test_zip_refuses_a_small_tail_after_the_archive(tail: int, comment: bytes) -> None:  # #1976
+    # zipfile finds the end record by scanning back from the end, so a tail inside its 64 KiB window
+    # opened and read normally, and the extra bytes were dropped without a word.
+    archive = _zip_with_comment(comment) + b"J" * tail
+    with pytest.raises(CompressionError, match="trailing data after the end of the zip archive"):
+        zip_decompress(archive, max_output_bytes=_CAP)
+
+
+def test_zip_refuses_a_tail_past_the_end_record_scan_window() -> None:  # #1976
+    # Past the window zipfile cannot find the end record at all, so stdlib already refuses it as
+    # corrupt. Pinned so both tail sizes stay refused whichever check catches them.
+    archive = zip_compress({"a.bin": b"payload"}) + b"J" * 70_000
+    with pytest.raises(CompressionError):
+        zip_decompress(archive, max_output_bytes=_CAP)
+
+
+def test_zip_refuses_a_comment_shorter_than_it_declares() -> None:  # #1976
+    # zipfile reads a short comment without complaint. The archive ends before its own end record
+    # says it does, so it is truncated, and the codec refuses a truncated input.
+    archive = _zip_with_comment(b"an archive comment")[:-5]
+    with pytest.raises(CompressionError, match="truncated zip archive comment"):
+        zip_decompress(archive, max_output_bytes=_CAP)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"J" * 100,
+        zip_compress({"first.bin": b"first payload"}),
+        zip_compress({"first.bin": b"first payload"}) + b"J" * 70_000,
+    ],
+    ids=["junk", "first-archive", "archive-and-long-junk"],
+)
+def test_zip_refuses_bytes_before_the_archive(prefix: bytes) -> None:  # #1976
+    # zipfile skips anything in front of the archive as prepended data, so a joined pair returned only
+    # the second archive's members and dropped the first without a word. The last case is also a tail
+    # past the scan window after the first archive, which ends in a valid archive and so opens.
+    archive = prefix + zip_compress({"second.bin": b"second payload"})
+    with pytest.raises(CompressionError, match="data before the start of the zip archive"):
+        zip_decompress(archive, max_output_bytes=_CAP)
+
+
+def test_zip_refuses_bytes_before_an_empty_archive() -> None:  # #1976
+    # An empty archive has no member offset to check, so the end record itself must start the input.
+    empty = zip_compress({})
+    assert zip_decompress(empty, max_output_bytes=_CAP) == {}
+    with pytest.raises(CompressionError, match="data before the start of the zip archive"):
+        zip_decompress(b"J" * 10 + empty, max_output_bytes=_CAP)

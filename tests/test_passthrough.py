@@ -36,6 +36,12 @@ from messagefoundry.pipeline.dryrun import transform_one
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.store import (
+    _NOT_PT_MARKER,
+    PASSTHROUGH_MARKER_HANDLER,
+    ResendSourceNotFound,
+)
 from messagefoundry.transports.passthrough import PassThroughSource
 
 
@@ -383,6 +389,227 @@ async def test_transform_handoff_no_pt_is_byte_identical(store: MessageStore) ->
     pmsg = await store.get_message(parent)
     # No deliveries, no PT → the routed handler produced nothing → FILTERED.
     assert pmsg is not None and pmsg["status"] == MessageStatus.FILTERED.value
+
+
+# --------------------------------------------- completion markers stay out of replay (BACKLOG #1580)
+#
+# A Send into a PT inbound leaves an already-terminal outbound MARKER row on the parent. It is
+# bookkeeping: its lane is an INBOUND name, so no delivery worker drains it. Replay used to re-pend it
+# like real work. On a mixed parent the real redelivery then finished while the marker sat pending, the
+# parent stayed ROUTED, and the startup sweep later dead-lettered the marker and recorded a DELIVERED
+# message as ERROR.
+#
+# Every test runs keyless AND keyed. The keyed arm is the one that reproduces the defect: a keyless
+# store writes the marker's empty body as a literal '' and the #1560 erased-body predicate already
+# skipped it by accident, while a keyed store encrypts '' into a real cell that looks replayable. The
+# keyless arm is the control that the fix does not break the path that already worked.
+
+
+@pytest.fixture(params=["keyless", "keyed"])
+async def pt_store(request: Any, tmp_path: Any) -> Any:
+    cipher = make_cipher(generate_key()) if request.param == "keyed" else None
+    s = await MessageStore.open(tmp_path / f"pt_replay_{request.param}.db", cipher=cipher)
+    yield s
+    await s.close()
+
+
+async def _deliver(store: MessageStore, dest: str, *, now: float) -> int:
+    """Claim and complete every due outbound row on ``dest``, as its delivery worker would."""
+    items = await store.claim_ready(now=now, stage=Stage.OUTBOUND.value, destination_name=dest)
+    for item in items:
+        await store.mark_done(item.id, now=now)
+    return len(items)
+
+
+async def _fail(store: MessageStore, dest: str, *, now: float) -> int:
+    """Claim and dead-letter every due outbound row on ``dest`` (a permanent delivery failure)."""
+    items = await store.claim_ready(now=now, stage=Stage.OUTBOUND.value, destination_name=dest)
+    for item in items:
+        await store.dead_letter_now(item.id, "permanent reject", now=now)
+    return len(items)
+
+
+async def _pending_on(store: MessageStore, lane: str) -> int:
+    """Non-terminal queue rows on ``lane`` at any stage. A marker lane must always read zero."""
+    cur = await store._db.execute(
+        "SELECT COUNT(*) AS n FROM queue WHERE destination_name=? AND status IN (?, ?)",
+        (lane, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    return int(row["n"])
+
+
+async def _status(store: MessageStore, message_id: str) -> str:
+    msg = await store.get_message(message_id)
+    assert msg is not None
+    return str(msg["status"])
+
+
+async def _handoff(
+    store: MessageStore,
+    *,
+    outbound: bool,
+    depth_capped: bool = False,
+    routed_id: str = "routed-1",
+) -> str:
+    """A parent whose one handler Sends into ``PT_NEXT`` and, when ``outbound``, also to ``OB_REAL``.
+    ``depth_capped`` puts the parent at the correlation cap, so its marker lands DEAD. Returns the id."""
+    metadata = json.dumps({"correlation_depth": 3}) if depth_capped else None
+    parent, routed = await _seed_routed(store, metadata=metadata, routed_id=routed_id, now=100.0)
+    assert await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[("OB_REAL", "MSH|out")] if outbound else [],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        correlation_depth_cap=3,
+        now=101.0,
+    )
+    return parent
+
+
+async def test_passthrough_marker_carries_the_explicit_stamp(pt_store: MessageStore) -> None:
+    # The discriminator every replay path keys on. The real outbound sibling is the control: it must
+    # NOT carry the stamp, or replay would skip real work too.
+    parent = await _handoff(pt_store, outbound=True)
+    rows = {r["destination_name"]: r for r in await pt_store.outbox_for(parent)}
+    assert rows["PT_NEXT"]["handler_name"] == PASSTHROUGH_MARKER_HANDLER
+    assert rows["OB_REAL"]["handler_name"] is None
+
+
+def test_the_marker_predicate_names_the_stamp_and_the_outbound_stage() -> None:
+    # _NOT_PT_MARKER is a literal so the AST gate can read it; this is what keeps it honest.
+    assert f"'{PASSTHROUGH_MARKER_HANDLER}'" in _NOT_PT_MARKER
+    assert f"'{Stage.OUTBOUND.value}'" in _NOT_PT_MARKER
+    assert "COALESCE(handler_name" in _NOT_PT_MARKER
+
+
+async def test_replay_of_a_passthrough_only_parent_creates_no_work(pt_store: MessageStore) -> None:
+    parent = await _handoff(pt_store, outbound=False)
+    assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
+
+    # Nothing to re-send: the marker has no body and nothing could drain it.
+    assert await pt_store.replay(parent, now=200.0) == 0
+    assert await _pending_on(pt_store, "PT_NEXT") == 0
+    assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
+    # And a restart's orphan sweep finds nothing to kill, so the parent stays truthful.
+    assert await pt_store.dead_letter_missing_destinations({"OB_REAL"}, now=300.0) == 0
+    assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
+
+
+async def test_replay_of_a_mixed_parent_ends_processed_across_a_restart(
+    pt_store: MessageStore,
+) -> None:
+    parent = await _handoff(pt_store, outbound=True)
+    assert await _deliver(pt_store, "OB_REAL", now=110.0) == 1
+    assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
+
+    # RE-SEND mode: only the real delivery goes back into flight.
+    assert await pt_store.replay(parent, now=200.0) == 1
+    assert await _pending_on(pt_store, "PT_NEXT") == 0
+    assert await _status(pt_store, parent) == MessageStatus.ROUTED.value
+    assert await _deliver(pt_store, "OB_REAL", now=210.0) == 1
+    assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
+
+    # The restart sweep registers outbound names only. It must find no marker to dead-letter.
+    assert await pt_store.dead_letter_missing_destinations({"OB_REAL"}, now=300.0) == 0
+    assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
+
+
+async def test_recover_replay_of_a_mixed_parent_redelivers_and_ends_processed(
+    pt_store: MessageStore,
+) -> None:
+    # RECOVER mode: the real delivery failed; the marker is DONE and must stay untouched.
+    parent = await _handoff(pt_store, outbound=True)
+    assert await _fail(pt_store, "OB_REAL", now=110.0) == 1
+    assert await _status(pt_store, parent) == MessageStatus.ERROR.value
+
+    assert await pt_store.replay(parent, now=200.0) == 1
+    assert await _deliver(pt_store, "OB_REAL", now=210.0) == 1
+    assert await _pending_on(pt_store, "PT_NEXT") == 0
+    assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
+
+
+async def test_replay_leaves_a_depth_capped_marker_dead_and_the_parent_truthfully_errored(
+    pt_store: MessageStore,
+) -> None:
+    # The depth-cap breach is a real failure no replay can repair: there is no child body to resend.
+    # Replay recovers the real delivery and leaves the DEAD marker as it is, so the parent ends ERROR
+    # rather than stuck ROUTED behind a pending marker nothing drains.
+    parent = await _handoff(pt_store, outbound=True, depth_capped=True)
+    assert await _fail(pt_store, "OB_REAL", now=110.0) == 1
+
+    assert await pt_store.replay(parent, now=200.0) == 1
+    assert await _pending_on(pt_store, "PT_NEXT") == 0
+    assert await _deliver(pt_store, "OB_REAL", now=210.0) == 1
+    assert await _status(pt_store, parent) == MessageStatus.ERROR.value
+
+    # A parent whose ONLY row is the dead marker: nothing is replayable, and it stays ERROR.
+    alone = await _handoff(pt_store, outbound=False, depth_capped=True, routed_id="routed-2")
+    assert await _status(pt_store, alone) == MessageStatus.ERROR.value
+    assert await pt_store.replay(alone, now=300.0) == 0
+    assert await _pending_on(pt_store, "PT_NEXT") == 0
+    assert await _status(pt_store, alone) == MessageStatus.ERROR.value
+
+
+async def test_bulk_dead_replay_skips_a_depth_capped_marker(pt_store: MessageStore) -> None:
+    capped = await _handoff(pt_store, outbound=False, depth_capped=True)
+    # Control: an ordinary dead delivery on another message, which bulk replay must still recover.
+    control = await pt_store.enqueue_message(
+        channel_id="IB_REAL", raw="MSH|c", deliveries=[("OB_REAL", "MSH|c-out")], now=100.0
+    )
+    assert await _fail(pt_store, "OB_REAL", now=110.0) == 1
+
+    assert await pt_store.replay_dead(now=200.0) == 1
+    assert await _pending_on(pt_store, "PT_NEXT") == 0
+    # The capped parent is not reverted to ROUTED with nothing re-queued behind it.
+    assert await _status(pt_store, capped) == MessageStatus.ERROR.value
+    assert await _status(pt_store, control) == MessageStatus.ROUTED.value
+    # Scoped to the marker's own lane, it re-queues nothing and changes nothing.
+    assert await pt_store.replay_dead(destination_name="PT_NEXT", now=300.0) == 0
+    assert await _status(pt_store, capped) == MessageStatus.ERROR.value
+
+
+async def test_a_dead_marker_does_not_hold_the_parents_attachments(pt_store: MessageStore) -> None:
+    # The attachment clean-up keeps a streaming attachment while any row could still be delivered or
+    # replayed. A dead marker can never be replayed, so it must not pin the parent's attachment.
+    capped = await _handoff(pt_store, outbound=False, depth_capped=True)
+    # Control: an ordinary dead delivery IS replayable and must still hold its message's attachment.
+    control = await pt_store.enqueue_message(
+        channel_id="IB_REAL", raw="MSH|c", deliveries=[("OB_REAL", "MSH|c-out")], now=100.0
+    )
+    assert await _fail(pt_store, "OB_REAL", now=110.0) == 1
+    fragment = pt_store._attachment_still_referenced_sql("?")
+    statuses = (OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value, OutboxStatus.DEAD.value)
+
+    async def held(message_id: str) -> bool:
+        cur = await pt_store._db.execute(f"SELECT {fragment} AS held", (message_id, *statuses))
+        row = await cur.fetchone()
+        assert row is not None
+        return bool(row["held"])
+
+    assert await held(control) is True
+    assert await held(capped) is False
+
+
+async def test_resend_to_never_takes_a_marker_as_its_source(pt_store: MessageStore) -> None:
+    # Mixed parent, no `from_`: the one real delivered body is the only source. Counting the marker
+    # as a second source made this ambiguous.
+    parent = await _handoff(pt_store, outbound=True)
+    assert await _deliver(pt_store, "OB_REAL", now=110.0) == 1
+    outcome = await pt_store.resend_to(
+        message_id=parent, to="OB_STANDBY", idempotency_key="k-mixed", now=200.0
+    )
+    assert outcome.status == "resent" and outcome.from_destination == "OB_REAL"
+    assert await _pending_on(pt_store, "PT_NEXT") == 0
+
+    # A pass-through-only parent has no delivered body at all, which is what the refusal must say.
+    alone = await _handoff(pt_store, outbound=False, routed_id="routed-2")
+    with pytest.raises(ResendSourceNotFound):
+        await pt_store.resend_to(
+            message_id=alone, to="OB_STANDBY", idempotency_key="k-alone", now=300.0
+        )
 
 
 # --------------------------------------------------------- backend allow-list (fail-fast at start)

@@ -146,7 +146,7 @@ rules:
       # the line count would not re-fire the finding — that is what the test is for. If the line moves,
       # RE-ANCHOR it; do not broaden it to the file. The pin below catches a moved line (see the header).
       # anchor-pin: && github.triggering_actor == 'dependabot[bot]' }}
-      - dependabot-lock-resync.yml:76
+      - dependabot-lock-resync.yml:84
 
   self-repository:
     ignore:

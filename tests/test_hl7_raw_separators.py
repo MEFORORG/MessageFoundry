@@ -272,3 +272,20 @@ async def test_send_with_flag_emits_raw_separators_on_the_wire(persistent: bool)
 async def test_send_with_flag_fails_loud_on_non_hl7() -> None:
     with pytest.raises(DeliveryError, match="hl7_raw_separators emit failed"):
         await _receive_one("this is not an HL7 message", {"hl7_raw_separators": True})
+
+
+@pytest.mark.parametrize("truncated", ["MSH\rPID|1", "MSH|\rPID|1", "MSH"])
+async def test_send_with_flag_maps_a_truncated_header_to_a_delivery_error(truncated: str) -> None:
+    # BACKLOG #1601's sibling: these headers raise AssertionError or IndexError inside python-hl7
+    # or the built-in parser, which the send() catch used to miss. The port is closed, so a
+    # DeliveryError naming the emit proves the failure came before any I/O.
+    dest = MLLPDestination(
+        Destination(
+            name="out",
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 1, "timeout_seconds": 1},
+            hl7_raw_separators=True,
+        )
+    )
+    with pytest.raises(DeliveryError, match="hl7_raw_separators emit failed"):
+        await dest.send(truncated)

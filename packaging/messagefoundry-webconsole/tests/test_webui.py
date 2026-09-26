@@ -1331,6 +1331,19 @@ def test_derive_health_warns_on_low_disk() -> None:
     assert health == "warn" and reason is not None and "low disk" in reason
 
 
+def test_derive_health_down_on_a_pooled_stage_that_is_not_draining() -> None:
+    """BACKLOG #1609: a dead pooled claimer stops its whole stage while intake keeps acknowledging
+    and every connection reads healthy, so the heart must say DOWN and name the stage -- and it must
+    outrank a coexisting warn (low disk here) for the tooltip."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    sysinfo = _sysinfo(3 * _GIB)
+    sysinfo.engine.stages_degraded = {"ingress": "claimer-0 exited unexpectedly (RuntimeError)"}
+    health, reason = _derive_health(sysinfo, None, None, None)
+    assert health == "down"
+    assert reason == "pipeline stage not draining: ingress"
+
+
 def test_derive_health_critical_on_very_low_disk() -> None:
     from messagefoundry_webconsole.routes.status import _derive_health
 

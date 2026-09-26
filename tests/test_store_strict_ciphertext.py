@@ -244,11 +244,13 @@ def test_the_setting_ships_off_and_on_is_a_named_loosening() -> None:
                 AuthSettings(),
                 AlertsSettings(),
                 SecretRotationSettings(),
-                (),
-                (),
-                (),
-                None,
-                None,
+                cleartext_hops=(),
+                expiry_relaxed_hops=(),
+                unverified_db_hops=(),
+                attested_hops=(),
+                revocation_attested_hops=(),
+                store_privilege=None,
+                audit_chain_unkeyed=None,
             )
         )
 

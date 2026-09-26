@@ -2187,10 +2187,13 @@ def _serve(args: argparse.Namespace) -> int:
     # security_loosenings() feeds both this warning and the read-only GET /security/posture view.
     # The connection graph is NOT loaded yet here (the Engine loads it inside the ASGI lifespan, well
     # below), so this early warning covers the SETTINGS-scoped switches only and passes empty lists for
-    # all THREE connection-scoped deviations. That is not a silent subset: each is reported moments
+    # all the connection-scoped deviations. That is not a silent subset: most are also logged moments
     # later — per connection — by the connector's own construction-time WARN (the ADR 0153 acceptance
-    # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection),
-    # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
+    # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection;
+    # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal; at least the
+    # bind gates' and raw-TCP guard's tls_hop_attested line, though a DatabaseRef sync logs nothing),
+    # and all of them completely by `messagefoundry check` and GET /security/posture, which both have
+    # the graph.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
@@ -2203,21 +2206,23 @@ def _serve(args: argparse.Namespace) -> int:
         settings.auth,
         settings.alerts,
         settings.secret_rotation,
-        (),
-        (),
-        (),
-        None,
-        None,
+        cleartext_hops=(),
+        expiry_relaxed_hops=(),
+        unverified_db_hops=(),
+        attested_hops=(),
+        revocation_attested_hops=(),
+        store_privilege=None,
+        audit_chain_unkeyed=None,
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
         _seclog.warning(
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
-            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired and generic-ODBC "
-            "DATABASE TLS declarations are NOT in this list — the graph is not loaded yet; they are "
-            "reported by the connector construction gate, `messagefoundry check` and "
-            "GET /security/posture. Nor is the store-principal privilege observation (#1008) — the "
+            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, generic-ODBC "
+            "DATABASE TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
+            "reported by `messagefoundry check` and GET /security/posture, and most also by the "
+            "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
             len(_loosenings),
             "; ".join(f"{name} ({risk})" for name, risk in _loosenings),
@@ -3649,6 +3654,25 @@ def _serve(args: argparse.Namespace) -> int:
     settings.security.block_unlisted_outbound = settings.egress.deny_by_default
     settings.security.delete_message_bodies_after_days = settings.retention.messages_days
 
+    # BACKLOG #1276: THE ENGINE ALWAYS SERVES TLS. Owner ruling 2026-08-22 (option 3), which
+    # SUPERSEDES ADR 0143's premise that the console is hardened "over a cleartext loopback
+    # secure-context WITHOUT auto-TLS". An operator certificate always wins; with none configured
+    # the engine mints a self-signed placeholder rather than opening a cleartext socket.
+    #
+    # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
+    # DAST target each decide it their own way, which is the defect this item exists to remove.
+    from messagefoundry.api.tls import ensure_api_tls_material, generated_state_dir
+
+    _material = ensure_api_tls_material(
+        settings.api, state_dir=generated_state_dir(settings.store.path)
+    )
+    # Minted HERE, before the app is built, so the expiry monitor below watches the certificate this
+    # listener actually presents. [api].tls_cert_file is the PRE-mint config value and is empty
+    # exactly when the engine minted, so handing the monitor that value left the generated pair
+    # unwatched (BACKLOG #1276). None only behind a declared upstream terminator: the engine then
+    # serves no certificate of its own, so it has none to watch.
+    _served_api_cert = _material[0] if _material is not None else None
+
     app = create_managed_app(
         store_settings=settings.store,
         security_settings=settings.security,
@@ -3703,7 +3727,7 @@ def _serve(args: argparse.Namespace) -> int:
         update_check_settings=settings.update_check,
         backup_settings=settings.backup,
         dr_settings=settings.dr,
-        api_tls_cert_file=settings.api.tls_cert_file,
+        api_tls_cert_file=_served_api_cert,  # the SERVED cert, generated or operator (#1276)
         # ASVS 6.4.5: operator-held copies of inbound service callers' client certs — watched by the same
         # [cert_monitor] scan, so a caller's cert cannot expire unnoticed while it has stopped connecting.
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
@@ -3782,22 +3806,8 @@ def _serve(args: argparse.Namespace) -> int:
         "http": floored_http_protocol_class(),
         "ws": floored_ws_protocol_class(),
     }
-    # BACKLOG #1276: THE ENGINE ALWAYS SERVES TLS. Owner ruling 2026-08-22 (option 3), which
-    # SUPERSEDES ADR 0143's premise that the console is hardened "over a cleartext loopback
-    # secure-context WITHOUT auto-TLS". An operator certificate always wins; with none configured
-    # the engine mints a self-signed placeholder rather than opening a cleartext socket.
-    #
-    # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
-    # DAST target each decide it their own way, which is the defect this item exists to remove.
-    from messagefoundry.api.tls import (
-        build_api_ssl_context,
-        ensure_api_tls_material,
-        generated_state_dir,
-    )
+    from messagefoundry.api.tls import build_api_ssl_context
 
-    _material = ensure_api_tls_material(
-        settings.api, state_dir=generated_state_dir(settings.store.path)
-    )
     if _material is not None:
         _cert, _key = _material
         # _key is None when the operator embedded the private key in the cert PEM (tls_key_file is
@@ -6735,7 +6745,7 @@ def _security(args: argparse.Namespace) -> int:
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
-        # store — so it can see NEITHER the three per-connection declarations NOR the two store
+        # store — so it can see NEITHER the per-connection declarations NOR the two store
         # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
         # declares BOTH gaps
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
@@ -6744,14 +6754,25 @@ def _security(args: argparse.Namespace) -> int:
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
-                sec, _store, _auth, _alerts, _rotation, (), (), (), None, None
+                sec,
+                _store,
+                _auth,
+                _alerts,
+                _rotation,
+                cleartext_hops=(),
+                expiry_relaxed_hops=(),
+                unverified_db_hops=(),
+                attested_hops=(),
+                revocation_attested_hops=(),
+                store_privilege=None,
+                audit_chain_unkeyed=None,
             )
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
     #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
     #: read at all (the file did not load); the scope string is the standing limitation above. It names
-    #: ALL THREE connection-scoped deviations (#333) — naming only cleartext_accepted made the DECLARED
+    #: ALL the connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
     #: scope itself incomplete, which is the same defect one level up.
     #:
     #: BACKLOG #1852 added a FOURTH gap and it is named for that same reason. This command reads the
@@ -6764,8 +6785,8 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
-            "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
-            "included, and neither are the store-principal privilege and audit-chain keying "
+            "cleartext_accepted, tls_allow_expired, generic-ODBC DATABASE TLS, tls_hop_attested and "
+            "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "

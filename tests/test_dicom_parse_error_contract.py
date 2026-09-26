@@ -20,6 +20,7 @@ All objects here are synthetic and PHI-free.
 from __future__ import annotations
 
 import base64
+import sys
 import traceback
 from collections.abc import Callable, Sequence
 
@@ -27,6 +28,7 @@ import pytest
 
 pytest.importorskip("pydicom", reason="DICOM parse-contract tests need the [dicom] extra")
 
+from pydicom.dataset import Dataset  # noqa: E402
 from pydicom.errors import BytesLengthException  # noqa: E402
 
 from messagefoundry.parsing.dicom import (  # noqa: E402
@@ -210,3 +212,130 @@ def test_the_tuple_never_catches_a_deploy_error(deploy_error: type[BaseException
     """A missing or broken ``[dicom]`` extra raises ``RuntimeError``. Catching it would dead-letter
     every DICOM message as bad data instead of failing the deploy."""
     assert not issubclass(deploy_error, parse_error_types())
+
+
+# --- BACKLOG #1599: a deeply nested sequence --------------------------------------------------------
+
+
+def _recursing_dcmread(*_args: object, **_kwargs: object) -> object:
+    raise RecursionError("simulated deep SQ nesting")
+
+
+@pytest.mark.parametrize(("surface", "parse", "wrapper"), _SURFACES, ids=[s[0] for s in _SURFACES])
+def test_a_recursion_error_from_dcmread_is_a_dicom_error(
+    monkeypatch: pytest.MonkeyPatch, surface: str, parse: _Parse, wrapper: type[DicomError]
+) -> None:
+    """pydicom's sequence reader recurses once per nesting level, so a crafted object with a few
+    hundred nested ``ContentSequence`` items raises ``RecursionError`` out of ``dcmread``.
+
+    THE TRIGGER IS A RAISED ``RecursionError``, NOT REAL NESTING. The depth at which a real object
+    overflows is a property of the runner's stack, not of this code, and a test keyed to it went
+    red on one runner and green on another (BACKLOG #1222; the write-up is
+    ``tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error``). What the contract
+    needs is the handler, and that needs no real overflow."""
+    module = peek_module if surface == "peek" else dataset_module
+    monkeypatch.setattr(module, "load_dcmread", lambda: _recursing_dcmread)
+    seed = make_sr_part10()
+    _inflate.guard_part10_deflate(seed, force=False)  # the guard passes it, so dcmread is reached
+    _assert_wrapped(parse, wrapper, seed, RecursionError, raised_in="_recursing_dcmread")
+
+
+def test_recursion_error_is_named_and_is_not_a_deploy_error() -> None:
+    # The type facts the handler depends on: RecursionError is a RuntimeError, so naming it must
+    # not widen the tuple to the RuntimeError a missing [dicom] extra raises (checked above).
+    assert issubclass(RecursionError, parse_error_types())
+    assert issubclass(RecursionError, RuntimeError)
+    assert not issubclass(RecursionError, ValueError)
+
+
+def _sr_item(value_type: str, code: str = "") -> Dataset:
+    item = Dataset()
+    item.ValueType = value_type
+    if value_type == "NUM":
+        concept = Dataset()
+        concept.CodeValue = code
+        item.ConceptNameCodeSequence = [concept]
+    return item
+
+
+def test_the_measurement_walk_keeps_depth_first_order() -> None:
+    """Control for the iterative walk: pre-order, a parent's NUM before its subtree, and a subtree
+    before the parent's later siblings."""
+    root = Dataset()
+    container = _sr_item("CONTAINER")
+    inner = _sr_item("CONTAINER")
+    inner.ContentSequence = [_sr_item("NUM", "c")]
+    parent_num = _sr_item("NUM", "b")
+    parent_num.ContentSequence = [inner, _sr_item("NUM", "d")]
+    container.ContentSequence = [parent_num, _sr_item("NUM", "e")]
+    root.ContentSequence = [_sr_item("NUM", "a"), container, _sr_item("NUM", "f")]
+    codes = [m.concept_code for m in DicomDataset(root).measurements()]
+    assert codes == ["a", "b", "c", "d", "e", "f"]
+
+
+def test_the_measurement_walk_does_not_recurse_on_a_deep_tree() -> None:
+    """The walk runs after ``parse`` returns, outside the parse wrap, so a recursive walk would raise
+    ``RecursionError`` out of ``measurements()`` on an in-memory tree nested past the interpreter
+    limit. The depth is keyed to ``sys.getrecursionlimit()``: the walk is pure Python, so that limit,
+    not the C stack, is what a recursive walk would meet."""
+    depth = sys.getrecursionlimit() + 200
+    root = Dataset()
+    level = root
+    for _ in range(depth):
+        child = _sr_item("CONTAINER")
+        level.ContentSequence = [child]
+        level = child
+    level.ContentSequence = [_sr_item("NUM", "deepest")]
+    assert [m.concept_code for m in DicomDataset(root).measurements()] == ["deepest"]
+
+
+def test_a_recursion_error_reading_the_sr_tree_is_a_dicom_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pydicom converts a defined-length sequence only when it is read, so a deep one raises from
+    ``measurements()``, after ``parse`` returned. Manufactured, for the reason the dcmread test above
+    gives (BACKLOG #1222)."""
+
+    def _recursing_walk(_content: object) -> object:
+        raise RecursionError("simulated deep SQ nesting")
+
+    monkeypatch.setattr(dataset_module, "_walk_num", _recursing_walk)
+    parsed = DicomDataset.parse(make_sr_part10())
+    with pytest.raises(DicomError, match="SR content tree") as excinfo:
+        parsed.measurements()
+    assert isinstance(excinfo.value.__cause__, RecursionError)
+
+
+def _defined_outer_deep_inner_sr(depth: int) -> bytes:
+    """A Part-10 SR whose ``ContentSequence`` has a defined length, holding ``depth`` nested
+    undefined-length sequences. ``dcmread`` keeps the defined-length outer one raw, so the nesting
+    is first read by ``measurements()``."""
+    base = make_sr_part10(measurements=())
+    base = base[
+        : base.rindex(b"\x40\x00\x30\xa7")
+    ]  # drop the empty ContentSequence, the last element
+    sq, undefined = b"\x40\x00\x30\xa7SQ\x00\x00", b"\xff\xff\xff\xff"
+    item, item_end, seq_end = (
+        b"\xfe\xff\x00\xe0",
+        b"\xfe\xff\x0d\xe0\x00\x00\x00\x00",
+        b"\xfe\xff\xdd\xe0\x00\x00\x00\x00",
+    )
+    inner = (sq + undefined + item + undefined) * depth + (item_end + seq_end) * depth
+    item_block = item + len(inner).to_bytes(4, "little") + inner
+    return base + sq + len(item_block).to_bytes(4, "little") + item_block
+
+
+def test_a_deep_defined_length_sr_tree_never_escapes_untyped() -> None:
+    """The real shape, through pydicom's lazy conversion, which the tests above stub out. It asserts
+    only that nothing untyped escapes: whether this depth overflows depends on the runner, so the
+    DicomError itself is pinned by the manufactured test above, not here."""
+    parsed = DicomDataset.parse(_defined_outer_deep_inner_sr(sys.getrecursionlimit() + 100))
+    try:
+        assert parsed.measurements() == []
+    except DicomError as exc:
+        assert isinstance(exc.__cause__, RecursionError)
+
+
+def test_a_shallow_defined_length_sr_tree_reads_cleanly() -> None:
+    # Control: the same builder at a small depth is a well-formed object with no measurements.
+    assert DicomDataset.parse(_defined_outer_deep_inner_sr(5)).measurements() == []

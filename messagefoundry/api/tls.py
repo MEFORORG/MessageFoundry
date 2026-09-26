@@ -10,8 +10,14 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 
 from __future__ import annotations
 
+import errno
 import logging
+import os
 import ssl
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -102,6 +108,13 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
 #: ``[api].tls_generated_dir`` setting: a knob for a question with one sensible answer.
 _GENERATED_CERT_NAME = GENERATED_CERT_NAME
 _GENERATED_KEY_NAME = "api-generated-key.pem"
+#: The first-run mint's lock, beside the pair. It holds no data and is never deleted: the OS lock on
+#: it is the whole mechanism (see :func:`_generated_pair_lock`), so the file is only a handle.
+_GENERATED_LOCK_NAME = "api-generated.lock"
+#: How long a starting engine waits for ANOTHER process's mint before it gives up. A mint is one
+#: P-256 key and two small writes, so this is far past any real mint; it bounds only a hung holder.
+_MINT_LOCK_TIMEOUT_S = 60.0
+_MINT_LOCK_POLL_S = 0.05
 
 
 def _generated_pair(state_dir: Path) -> tuple[Path, Path]:
@@ -195,10 +208,13 @@ def plan_api_tls_material(api: ApiSettings, *, state_dir: Path) -> ApiTlsPlan:
 def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
     """Remove a lone half of a previously generated pair, so the mint that follows can re-run.
 
-    Called only once the reuse branch has established that BOTH files are not present, so at most
-    one of these exists. A half-pair is unusable -- reuse needs both -- and the key half is also a
-    TRAP: the mint falls through, :func:`_write_private_key`'s ``O_EXCL`` refuses the surviving key,
-    and the engine fails to start. On EVERY start, permanently, naming no file to delete. ADR 0172
+    Called only under :func:`_generated_pair_lock`, once the reuse branch has established that BOTH
+    files are not present, so at most one of these exists. The lock is what makes "a lone half" mean
+    DEBRIS: without it, a lone key could be another process's mint in progress (BACKLOG #1276).
+
+    A half-pair is unusable -- reuse needs both -- and the key half is also a TRAP: the mint falls
+    through, :func:`_write_private_key`'s ``O_EXCL`` refuses the surviving key, and the engine
+    fails to start. On EVERY start, permanently, naming no file to delete. ADR 0172
     makes the generated pair the default first-run path, so that is a fresh deployment that never
     comes up rather than an edge case.
 
@@ -222,7 +238,162 @@ def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
             "unusable and would refuse every later start. Re-minting both.",
             orphan,
         )
-        orphan.unlink()
+        _unlink_generated(orphan)
+
+
+#: Windows ERROR_SHARING_VIOLATION: another process holds the file open without delete sharing.
+_WINERROR_SHARING_VIOLATION = 32
+_UNLINK_RETRY_S = 2.0
+
+
+def _unlink_generated(path: Path) -> None:
+    """Delete one generated file, riding out a brief Windows sharing violation.
+
+    On Windows a file another process holds open cannot be deleted, and a certificate is exactly the
+    file other processes open: the tray pins it, and backup or antivirus may scan it. That hold is
+    momentary, so a refusal is retried for :data:`_UNLINK_RETRY_S` before it propagates. Any other
+    error, and every error off Windows, propagates at once.
+    """
+    deadline = time.monotonic() + _UNLINK_RETRY_S
+    while True:
+        try:
+            path.unlink()
+            return
+        except PermissionError as exc:
+            shared = getattr(exc, "winerror", None) == _WINERROR_SHARING_VIOLATION
+            if not shared or time.monotonic() >= deadline:
+                raise
+        time.sleep(_MINT_LOCK_POLL_S)
+
+
+def _why_generated_pair_is_unusable(cert_path: Path, key_path: Path) -> str | None:
+    """``None`` when the two files load as ONE serving pair, else the TLS layer's reason why not.
+
+    The predicate is the serving path's own: ``load_cert_chain`` is what uvicorn calls, and it
+    refuses a certificate whose public key is not the key's (``KEY_VALUES_MISMATCH``), a truncated
+    PEM, and an empty file. Checking presence alone is what let a mismatched pair be reused on every
+    start while every start failed to serve it (BACKLOG #1276).
+
+    **Only a CONTENT refusal is reported.** ``ssl.SSLError`` means the bytes are wrong. Any other
+    ``OSError`` -- a denied read, a sharing violation -- says nothing about the bytes, so it
+    propagates: a key the engine merely failed to READ must never be treated as one it may delete.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        # The empty-bytes password callback: fail deterministically rather than prompt on a TTY,
+        # as build_api_ssl_context does. The engine never writes an encrypted generated key.
+        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path, password=lambda: b"")
+    except ssl.SSLError as exc:
+        return str(exc)
+    return None
+
+
+def _discard_unusable_pair(cert_path: Path, key_path: Path, reason: str) -> None:
+    """Remove a complete but unusable generated pair, so the mint that follows can replace it.
+
+    Reached only under :func:`_generated_pair_lock`, with both files present and
+    :func:`_why_generated_pair_is_unusable` naming a content refusal. **This is not a rotation.** A
+    pair that loads is never replaced; this one cannot serve, and reusing it failed every start
+    until someone deleted it by hand. The mismatched shape is exactly what two processes minting
+    into one state dir used to leave (BACKLOG #1276), and a disk fault can leave the others.
+
+    Logged at WARNING, per ADR 0172 decision 6: replacing a key on disk is never silent. The reason
+    is the TLS layer's error text, which names the refusal and carries no key material.
+    """
+    log.warning(
+        "discarding an unusable generated TLS pair at %s and %s: they do not load as one serving "
+        "pair (%s). Re-minting both.",
+        cert_path,
+        key_path,
+        reason,
+    )
+    # Cert first. Should the key's unlink still fail, a lone key is left, which the next start
+    # discards as a half-pair, so no ordering leaves anything a later start cannot recover.
+    _unlink_generated(cert_path)
+    _unlink_generated(key_path)
+
+
+def _try_lock(fd: int) -> bool:
+    """Take an exclusive OS lock on ``fd`` without blocking. ``False`` when another handle holds it.
+
+    An OS lock rather than an ``O_EXCL`` lock FILE, because the kernel releases it when its holder
+    dies. A lock file left by a SIGKILL or a power loss would block every later start, which is the
+    same unrecoverable shape the half-pair discard exists to prevent. Both forms conflict between
+    separate opens of the file, within one process as well as across processes.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            # Measured on Windows: a held range refuses with EACCES. EDEADLOCK is the CRT's other
+            # documented contention code. Anything else is a real fault and propagates.
+            if exc.errno in (errno.EACCES, errno.EDEADLOCK):
+                return False
+            raise
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _unlock(fd: int) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _generated_pair_lock(state_dir: Path) -> Iterator[None]:
+    """Hold the ONE-WRITER lock for the generated pair in ``state_dir``, waiting a bounded time.
+
+    **Why the pair needs one.** ``serve --shards`` starts N engine processes that all derive the
+    same state dir, so on a first run they all find no pair at once. Unserialised, one process won
+    the key's ``O_EXCL`` create and every other died with ``FileExistsError``; worse, a process
+    arriving between another's key and cert writes read a lone key as debris, deleted it, and minted
+    its own, and the first then overwrote that cert, leaving a mismatched pair that failed every
+    later start.
+    Under this lock exactly one process mints, and every other waits, then reuses that pair.
+
+    **One shared pair for all shards** is what this keeps, and it is correct: the minted identity is
+    ``[api].host`` and shards differ only by port. The lock does not choose it over one pair per
+    shard; it removes the crash and the corruption from the answer the shared state dir already
+    gave.
+
+    Raises ``TimeoutError`` naming the lock file when a holder outlives
+    :data:`_MINT_LOCK_TIMEOUT_S`, rather than waiting forever on a hung process.
+    """
+    lock_path = state_dir / _GENERATED_LOCK_NAME
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        deadline = time.monotonic() + _MINT_LOCK_TIMEOUT_S
+        while not _try_lock(fd):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"{lock_path} has been held for over {_MINT_LOCK_TIMEOUT_S:g}s by another "
+                    "start minting the API TLS pair; if no other engine start is running, the "
+                    "holder is hung -- stop it and start again"
+                )
+            time.sleep(_MINT_LOCK_POLL_S)
+        try:
+            yield
+        finally:
+            _unlock(fd)
+    finally:
+        os.close(fd)
 
 
 #: BUILTIN\Users, by SID so the grant does not depend on the host's display language.
@@ -275,7 +446,18 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     only the certificate, is then made readable by local users so the tray can pin it
     (:func:`_let_local_users_read_cert`).
 
-    **A HALF-PAIR IS THE EXCEPTION, and it re-mints rather than refusing** -- see
+    **ONE WRITER (BACKLOG #1276).** Every ``serve --shards`` shard shares this state dir, so any
+    discard and the mint run under :func:`_generated_pair_lock`, after the reuse check is repeated
+    there. A process that loses the race waits, then reuses the winner's pair; it neither crashes
+    nor deletes a key another process is still writing. A pair that already loads is reused before
+    the lock is taken (:func:`_loads_without_the_lock`).
+
+    **REUSE MEANS THE PAIR LOADS, not that two files exist.** A pair that fails
+    :func:`_why_generated_pair_is_unusable` (a cert that is not the key's, a truncated file) is
+    discarded with a WARNING and re-minted -- see :func:`_discard_unusable_pair`. A pair that loads
+    is never replaced here, so this is recovery, not rotation.
+
+    **A HALF-PAIR IS THE OTHER EXCEPTION, and it re-mints rather than refusing** -- see
     :func:`_discard_half_minted_pair`. Reuse needs BOTH files, so one alone is unusable AND a trap:
     the O_EXCL refusal above would fire on the survivor at every later start, permanently.
 
@@ -288,6 +470,11 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     generated pair. ``build_api_ssl_context`` performs no expiry check, so on day 366 the engine
     would serve an expired certificate every client rejects. The rotation shape is an open decision
     on #1276; until it lands, ``CertExpiryRunner`` alarms on this path like any other served cert.
+    That holds because ``serve`` hands the monitor the path this function RETURNS, not
+    ``[api].tls_cert_file``, which is empty exactly when a pair was minted -- so passing the config
+    value left the generated certificate unwatched. ``tests/test_api_tls.py`` pins the wiring. The
+    alarm fires from ``[cert_monitor].warn_days`` out (0 turns the monitor off), and it re-mints
+    nothing: the reuse branch below returns an expired pair unchanged on every later start.
     """
     # The branch order lives in plan_api_tls_material, so the read-only reporter and the minting
     # path cannot disagree about which certificate the bind presents. Two of the three branches
@@ -301,14 +488,47 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
         return plan.material()
 
     cert_path, key_path = _generated_pair(state_dir)
-    if cert_path.exists() and key_path.exists():
+    if _loads_without_the_lock(cert_path, key_path):
         return str(cert_path), str(key_path)
-    _discard_half_minted_pair(cert_path, key_path)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with _generated_pair_lock(state_dir):
+        # Re-decided UNDER the lock: a process that waited here finds the pair the holder just
+        # minted, and reuses it. Only here may a failed check lead to a discard.
+        if cert_path.exists() and key_path.exists():
+            reason = _why_generated_pair_is_unusable(cert_path, key_path)
+            if reason is None:
+                return str(cert_path), str(key_path)
+            _discard_unusable_pair(cert_path, key_path, reason)
+        else:
+            _discard_half_minted_pair(cert_path, key_path)
+        _mint_generated_pair(api, cert_path, key_path)
+    return str(cert_path), str(key_path)
 
+
+def _loads_without_the_lock(cert_path: Path, key_path: Path) -> bool:
+    """True when the pair already loads, read WITHOUT the lock. Every other answer is ``False``.
+
+    Safe because a pair that loads is never replaced, so seeing one is final. A read that races a
+    mint in progress sees a partial or vanishing file and answers ``False``, and the caller then
+    decides again under the lock. So nothing here raises and nothing here deletes. The point of
+    reading first is that the common start -- a pair minted long ago -- needs no write access to the
+    state dir and no OS lock support, which is what it needed before the lock existed.
+    """
+    try:
+        return (
+            cert_path.exists()
+            and key_path.exists()
+            and _why_generated_pair_is_unusable(cert_path, key_path) is None
+        )
+    except OSError:
+        return False
+
+
+def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> None:
+    """Mint the pair into two ABSENT paths. Call only under :func:`_generated_pair_lock`."""
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
 
-    state_dir.mkdir(parents=True, exist_ok=True)
     # 365 days, inheriting the `cert self-signed` CLI default rather than inventing a second
     # lifetime for the same primitive.
     cert_pem, key_pem = pki.make_self_signed(api.host, [], 365)
@@ -333,4 +553,3 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
         api.host,
         cert_path,
     )
-    return str(cert_path), str(key_path)

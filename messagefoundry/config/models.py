@@ -3,7 +3,7 @@
 """Connector configuration models — the transport-level building blocks.
 
 A :class:`Source`/:class:`Destination` is a transport endpoint (type + free-form
-``settings`` validated by the connector plugin) plus delivery behaviour. The code-first
+``settings`` validated by the connector) plus delivery behaviour. The code-first
 wiring layer (:mod:`messagefoundry.config.wiring`) builds these from a connection's
 ``ConnectionSpec`` to resolve connectors via the registry; routing/filtering/transforming
 is done in code-first Router/Handler scripts, not here.
@@ -35,7 +35,7 @@ from messagefoundry.mllpcodec import AckMode as AckMode
 
 class ConnectorType(str, Enum):  # noqa: UP042
     """Built-in transport connectors. A closed set: a new transport is a new member here, and no
-    plugin can add a value at runtime. Whether to open it is BACKLOG #1624."""
+    plugin can add a value at runtime. Opening it to plugins would be new work."""
 
     MLLP = "mllp"
     TCP = "tcp"  # raw TCP with configurable delimiter framing (X12 over TCP, ADR 0003)
@@ -200,10 +200,10 @@ def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
     Same three fail-loud rules as :func:`_check_hop_attestation` — this is that validator with the
     mapping read in front of it, so the two cells cannot drift from the modelled ones or each other.
 
-    A mapping is the ONLY carrier for those cells, and reading one here does **not** make the setting
-    authorable: neither ``DatabaseLookup()`` nor ``DatabaseRef()`` takes the parameter and neither has
-    a ``connections.toml`` surface, so a direct embedding is the only way to populate it. Giving a
-    factory the parameter is a separate question."""
+    A mapping is the ONLY carrier for those cells. ``DatabaseLookup()`` and ``DatabaseRef()`` write the
+    pair into it from their own ``tls_hop_attested`` parameters (owner ruling 2026-09-24), and
+    ``config.wiring.attested_secure_hops`` reads the same mapping, so the loosening report names every
+    attestation this reader honours."""
     attested = bool(settings.get("tls_hop_attested", False))
     reason = settings.get("tls_hop_attested_reason")
     _check_hop_attestation(attested, None if reason is None else str(reason))
