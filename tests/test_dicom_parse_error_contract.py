@@ -20,6 +20,7 @@ All objects here are synthetic and PHI-free.
 from __future__ import annotations
 
 import base64
+import traceback
 from collections.abc import Callable, Sequence
 
 import pytest
@@ -109,25 +110,32 @@ def _cases(seeds: Sequence[tuple[str, bytes, type[BaseException]]]) -> list[obje
 
 
 def _assert_wrapped(
-    parse: _Parse, wrapper: type[DicomError], seed: bytes, cause: type[BaseException]
+    parse: _Parse,
+    wrapper: type[DicomError],
+    seed: bytes,
+    cause: type[BaseException],
+    raised_in: str | None = None,
 ) -> None:
+    """``parse(seed)`` raises ``wrapper`` around a ``cause``. With ``raised_in``, the cause's
+    traceback must pass through that function, which pins the path a case says it covers."""
     with pytest.raises(wrapper) as excinfo:
         parse(seed)
-    assert isinstance(excinfo.value.__cause__, cause), (
-        f"expected the {wrapper.__name__} to wrap a {cause.__name__}, "
-        f"got {type(excinfo.value.__cause__).__name__}"
+    inner = excinfo.value.__cause__
+    assert isinstance(inner, cause), (
+        f"expected the {wrapper.__name__} to wrap a {cause.__name__}, got {type(inner).__name__}"
     )
+    if raised_in is not None:
+        frames = [frame.name for frame in traceback.extract_tb(inner.__traceback__)]
+        assert raised_in in frames, f"expected the {cause.__name__} from {raised_in}, got {frames}"
 
 
 @pytest.mark.parametrize(("parse", "wrapper", "seed", "cause"), _cases(_GUARD_PATH))
 def test_a_header_the_guard_replay_rejects_is_a_dicom_error(
     parse: _Parse, wrapper: type[DicomError], seed: bytes, cause: type[BaseException]
 ) -> None:
-    # Pin the path: without this, the case would pass unchanged if the guard stopped raising and
-    # dcmread met the error instead, which is what the without-the-guard test already covers.
-    with pytest.raises(cause):
-        _inflate.guard_part10_deflate(seed, force=False)
-    _assert_wrapped(parse, wrapper, seed, cause)
+    # dcmread would raise the same class, so the frame check is what separates this path from the
+    # without-the-guard test below.
+    _assert_wrapped(parse, wrapper, seed, cause, raised_in="guard_part10_deflate")
 
 
 @pytest.mark.parametrize(
@@ -138,7 +146,7 @@ def test_a_body_element_dcmread_rejects_is_a_dicom_error(
     parse: _Parse, wrapper: type[DicomError], seed: bytes, cause: type[BaseException]
 ) -> None:
     _inflate.guard_part10_deflate(seed, force=False)  # the guard passes it, so dcmread meets it
-    _assert_wrapped(parse, wrapper, seed, cause)
+    _assert_wrapped(parse, wrapper, seed, cause, raised_in="read_partial")
 
 
 @pytest.mark.parametrize(("parse", "wrapper", "seed", "cause"), _cases(_GUARD_PATH))
@@ -154,7 +162,7 @@ def test_a_header_dcmread_rejects_is_a_dicom_error_without_the_guard(
     here. It covers the order in which the two run changing, or the guard being taken out."""
     monkeypatch.setattr(peek_module, "guard_part10_deflate", _no_guard)
     monkeypatch.setattr(dataset_module, "guard_part10_deflate", _no_guard)
-    _assert_wrapped(parse, wrapper, seed, cause)
+    _assert_wrapped(parse, wrapper, seed, cause, raised_in="read_partial")
 
 
 @pytest.mark.parametrize(

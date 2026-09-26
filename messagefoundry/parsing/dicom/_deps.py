@@ -66,9 +66,8 @@ def load_header_readers() -> ModuleType:
 def parse_error_types() -> tuple[type[BaseException], ...]:
     """The exception tuple a read of **untrusted** DICOM bytes may raise, from ``dcmread``, the deflate
     guard's header replay, or the peek's read of a value pydicom converts lazily. The parse methods
-    wrap each one into a PHI-safe
-    :class:`~messagefoundry.parsing.dicom.errors.DicomError`, so a malformed object dead-letters
-    (``ERROR``) instead of escaping the parse contract.
+    wrap each one into a PHI-safe :class:`~messagefoundry.parsing.dicom.errors.DicomError`, so a
+    malformed object dead-letters (``ERROR``) instead of escaping the parse contract.
 
     The rule: a pydicom exception that does not descend from a member here escapes, so it must be
     named. Neither class in ``pydicom.errors`` is a ``ValueError``: ``InvalidDicomError`` and
