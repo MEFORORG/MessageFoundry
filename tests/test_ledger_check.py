@@ -457,6 +457,9 @@ def test_the_refusal_never_builds_a_SHELL_COMMAND_from_the_staged_path(repo: Pat
 
     code, out = run_check(repo)
     assert code == 1
+    # Pin WHICH refusal fired. Since BACKLOG #2002 the row rule also refuses this file (the row links
+    # 0002-second.md), so `code == 1` alone would pass with the restore refusal gone.
+    assert "is a RESTORE, but not of the bytes" in out
     # The refusal fired on the number, so the hostile basename must not appear in the remedy at all.
     assert "$(id)" not in out
     assert "`whoami`" not in out
@@ -636,6 +639,61 @@ def test_a_new_adr_with_no_index_row_is_blocked(repo: Path) -> None:
     code, out = run_check(repo)
     assert code == 1
     assert "no row in docs/adr/README.md" in out
+
+
+def test_a_new_adr_whose_row_names_ANOTHER_file_is_blocked(repo: Path) -> None:
+    """BACKLOG #2002. The gate asked only whether the new number HAD a row, never what it named.
+
+    Allocated, and 0002 has a row, so before the fix this exited 0 with 0002-new.md unindexed.
+    """
+    write(repo, "docs/adr/0002-new.md", "# 0002 -- New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="something-else", title="New")
+        + "\n",
+    )
+    allocate(repo, "adr", "0002")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002's row in docs/adr/README.md does not link the 0002 file" in out
+
+
+def test_a_new_adr_whose_row_names_ANOTHER_file_is_blocked_in_CI_mode(repo: Path) -> None:
+    """BACKLOG #2002, the --ci backstop. CI skips ownership, never the row rule."""
+    write(repo, "docs/adr/0002-new.md", "# 0002 -- New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="something-else", title="New")
+        + "\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "new ADR, wrong row")
+
+    code, out = run_check(repo, "--ci")
+    assert code == 1, out
+    assert "does not link the 0002 file" in out
+
+
+def test_a_reused_base_number_gets_ONE_refusal_not_two(repo: Path) -> None:
+    """BACKLOG #2002. The row-names-file rule is scoped to NEW numbers: a base number already got it
+    as the companion question, and a second block for the same file would only repeat that one."""
+    write(repo, "docs/adr/0001-second-thing.md", "# 0001 -- Second\n")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 already exists" in out
+    assert "does not link the 0001 file" not in out
 
 
 def test_a_pre_existing_unindexed_adr_does_not_block_unrelated_commits(repo: Path) -> None:

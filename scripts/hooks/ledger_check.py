@@ -164,7 +164,7 @@ def _row_links_as_own(row: str, basename: str) -> bool:
     Anchored with INDEX_ROW for the same reason index_row is (BACKLOG #2003).
     """
     m = INDEX_ROW.match(row)
-    return bool(m) and row[m.end() :].startswith(f"({basename})")
+    return m is not None and row[m.end() :].startswith(f"({basename})")
 
 
 def row_names_file(row: str, basename: str) -> bool:
@@ -675,6 +675,23 @@ class Ledger:
                     "An ADR that is not in the index is invisible — the tail-append hazard shows up as a "
                     "DROPPED ROW, not as a conflict. Three ADRs were already lost this way.",
                     "add its row to docs/adr/README.md in THIS commit",
+                )
+            elif number not in base_adrs and not row_names_file(
+                index_row(head_readme, number), basename
+            ):
+                # BACKLOG #2002. A row for the number is not enough: a row naming a DIFFERENT file
+                # leaves this one unindexed. A base number already got this test above, as the
+                # companion question, so asking it again there would only repeat that refusal.
+                # The text names the number, not the staged basename: a filename is attacker-
+                # influenceable and _safe_for_message folds but does not quote (see
+                # test_the_refusal_never_builds_a_SHELL_COMMAND_from_the_staged_path).
+                self.fail(
+                    f"ADR {number}'s row in docs/adr/README.md does not link the {number} file "
+                    "this commit adds",
+                    "A row for the number exists, but it does not link this file, so this ADR is "
+                    "invisible in the index while the number reads as indexed.",
+                    "make the row link this file (a second file under one number is linked inside "
+                    "the row, as a declared companion)",
                 )
 
         duplicated = sorted({n for n in rows if rows.count(n) > 1})
