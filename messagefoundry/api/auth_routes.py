@@ -99,6 +99,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
     STEP_UP_ACTION_SESSION_TERMINATE,
+    USERNAME_TAKEN,
     AuthService,
     CurrentPasswordCheck,
     FederatedSubjectHeld,
@@ -828,7 +829,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> UserSummary:
         await _validate_roles(service, body.roles)
         if await service.store.get_user_by_username(body.username) is not None:
-            raise HTTPException(status.HTTP_409_CONFLICT, "username already exists")
+            raise HTTPException(status.HTTP_409_CONFLICT, USERNAME_TAKEN)
         violations = service.password_violations(body.password, username=body.username)
         if violations:
             raise HTTPException(

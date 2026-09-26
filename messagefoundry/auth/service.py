@@ -286,6 +286,10 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
+#: The text ``POST /users`` answers a taken username with, from its pre-check and from
+#: :class:`UsernameTaken` alike (BACKLOG #1808).
+USERNAME_TAKEN = "username already exists"
+
 _T = TypeVar("_T")
 
 
@@ -547,7 +551,13 @@ class FederatedBinding:
 
 
 def _is_integrity_refusal(exc: BaseException) -> bool:
-    """Whether ``exc`` is a backend's UNIQUE-constraint refusal, matched by MRO NAME.
+    """Whether ``exc`` is a backend's integrity refusal, matched by MRO NAME.
+
+    It matches a foreign-key refusal as well as a UNIQUE one. sqlite3 raises the same
+    ``IntegrityError`` for both (measured). asyncpg's ``ForeignKeyViolationError`` sits under
+    ``IntegrityConstraintViolationError`` in its documented hierarchy, not measured here because
+    asyncpg is an optional install. ``finish_webauthn_registration`` depends on this, since it tells
+    the two apart only after this returns true (BACKLOG #1807).
 
     Each backend raises its own class -- ``sqlite3.IntegrityError``, asyncpg's
     ``UniqueViolationError``, pyodbc's ``IntegrityError`` -- and naming them would make this module
@@ -2816,9 +2826,10 @@ class AuthService:
             # a rename of one asyncpg class cannot silently drop the backend.
             #
             # THIS APPLIES TO THE TWO SIBLING SITES TOO, and since BACKLOG #1143 there is one copy:
-            # `_is_integrity_refusal`, which this site, the webauthn label race and the federated
-            # bind all call. `__mro__` appears once in the engine, inside it. Until #1143 it appeared
-            # three times, all in this module, all in this substring form.
+            # `_is_integrity_refusal`, which at least this site, the webauthn label race, the
+            # federated bind and the local-account create (BACKLOG #1808) call. `__mro__` appears
+            # once in the engine, inside it. Until #1143 it appeared three times, all in this
+            # module, all in this substring form.
             #
             # THE COST OF A NAME TEST, NAMED ONCE: it matches on a string, so an unrelated class whose
             # name happens to contain "Integrity" would be swallowed here. The engine HAS one --
@@ -4857,7 +4868,7 @@ class AuthService:
             # makes this a username conflict. Anything else re-raises untouched.
             if await self._store.get_user_by_username(username) is None:
                 raise
-            raise UsernameTaken("username already exists") from exc
+            raise UsernameTaken(USERNAME_TAKEN) from exc
         await self._store.set_user_roles(user_id, roles, assigned_by=actor)
         await self._audit(
             "user.created", actor=actor, detail=_json({"username": username, "roles": list(roles)})

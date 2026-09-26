@@ -117,10 +117,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   The second insert then met the store's UNIQUE index, and that error reached the API's catch-all
   handler as a `500`. The engine now catches it and answers `409` with the same text the check
   gives. The web console's create-user form shows that text too. (`BACKLOG #1808`)
-- **Adding a passkey to an account deleted mid-enrolment now says `no such user`.** It used to
-  say `label already in use`, because every store refusal of the insert got that answer. On SQLite
-  and PostgreSQL the insert is refused by the foreign key to the account. The engine now re-reads
-  the account to tell the two refusals apart. (`BACKLOG #1807`)
+- **On SQLite and PostgreSQL, adding a passkey to an account deleted mid-enrolment now says `no
+  such user`.** It used to say `label already in use`, because every store refusal of the insert
+  got that answer. On those two backends the insert is refused by the foreign key to the account.
+  The engine now re-reads the account to tell the two refusals apart. SQL Server has no such foreign
+  key, so there the insert is not refused and this change does not apply. (`BACKLOG #1807`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
