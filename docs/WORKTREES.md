@@ -493,6 +493,75 @@ same invocation wherever one is possible (a refusal test refuses the whole run b
 a session arrives, the fence dies, the metadata is touched — before answering, which reproduces the
 race deterministically with no threads and no sleeps.
 
+## A scheduled hygiene report that deletes nothing — `hygiene-report.ps1`
+
+[`hygiene-report.ps1`](../scripts/worktree/hygiene-report.ps1) writes a report on the state of every
+clone, and proposes a cleanup list the owner can approve as a batch. **It deletes nothing.** It
+never removes, prunes, resets, checks out, cleans or pushes. It prints `git worktree remove`
+commands for a person to run. Owner ruling 2026-09-26: a script on a schedule, with zero model
+calls, and nothing deleted automatically.
+
+For the engine clone, and for the `<primary>-vault` sibling when it exists, it reports:
+
+1. The primary checkout: its branch, its uncommitted files, and how far it is ahead of or behind
+   `origin/main` after a `git fetch origin main`. In a shallow clone those counts are a floor.
+2. Every worktree: path, branch, whether the directory still exists, last commit date, uncommitted
+   count, and whether its branch merged.
+3. Installed-hook drift, read by running that clone's own `install-git-hooks.ps1 -Status`. It also
+   lists hook sources that changed on `origin/main` since its merge base with the checkout. That
+   matters because `-Status` compares against the checkout, not against `main`.
+4. A proposed removal list, and a separate **NEEDS A HUMAN LOOK** list.
+
+"Merged" comes from one `gh pr list --state merged` call per clone, because squash merges hide a
+landing from `git merge-base`. Only a same-repository PR into `main` counts. When gh is missing or
+fails, every merge reads UNKNOWN and nothing is proposed. A Builder branch folded into a Manager's
+wave PR has no merged PR under its own name. It reads NOT MERGED and is left alone.
+
+A merged worktree is proposed for removal only when all of these hold:
+
+- Its tip is the exact head of the merged PR. A branch that moved on after the merge is held.
+- The PR merged more than 24 hours ago (`-HoldHours`).
+- No git activity in the last 72 hours (`-IdleHours`, the same default `prune-merged.ps1` uses). It
+  reads the commit date, the worktree's private git files, and the last reflog entry.
+- `git status` lists nothing. An untracked `.venv` alone is held too, because removing it needs
+  `--force`.
+- No lock, no nested worktree, and no session record in it, live or dead.
+
+Any merged worktree that fails one of those goes to NEEDS A HUMAN LOOK with its reasons. The session
+check is the liveness fence `prune-merged.ps1` uses, with the same limit. It cannot see a session
+writing into a worktree by absolute path. `git worktree remove` also deletes gitignored files, such
+as a `.venv`, caches, or a local `.env`.
+
+It writes `hygiene-<yyyy-MM-dd>.md` and a `.json` twin, plus `latest.md` and `latest.json`, to
+`<git common dir>/mefor-coord/hygiene/`. A later run the same day replaces that day's pair. Nothing
+deletes old reports. It also writes `last-run.txt`, which reads `OK` or `FAILED` with the reason, so
+a stale `latest.md` is not mistaken for a current one. Measured 2026-09-26 over about 580 worktrees in
+two clones: a day's pair was about 700 KB. One run took one to two minutes with the fetch skipped.
+
+Its `git status` calls use `--no-optional-locks`, so a run does not rewrite any worktree's index.
+That matters because `prune-merged.ps1` reads the index time as a sign that someone is working there.
+Its fetch uses `--no-auto-maintenance`, so it never starts a `gc` that would expire reflogs.
+
+```powershell
+pwsh -NoProfile -File scripts\worktree\hygiene-report.ps1              # run it once, by hand
+pwsh -NoProfile -File scripts\worktree\register-hygiene-task.ps1 -WhatIf   # show the task, register nothing
+pwsh -NoProfile -File scripts\worktree\register-hygiene-task.ps1           # every 6 hours, from a plain terminal
+pwsh -NoProfile -File scripts\worktree\register-hygiene-task.ps1 -EveryHours 12
+pwsh -NoProfile -File scripts\worktree\register-hygiene-task.ps1 -Unregister
+```
+
+The task runs the **primary checkout's** copy of the report, as you, at run level Limited. It refuses
+to register or unregister from inside Claude Code. After you run the proposed removals, run `claim-reconcile.ps1`
+(below) to release the claims those worktrees held.
+
+The Lander owns the hygiene its own merges leave (see CLAUDE.md section 5). After it lands a PR that
+changes a hook, it flags that the installed hooks are stale. It also reports merged branches whose
+worktrees still exist. This report is where it reads both.
+
+Tests: [`tests/test_worktree_hygiene_report.py`](../tests/test_worktree_hygiene_report.py). They
+parse the script and fail on any git verb outside a read-only list, with a positive control. They
+also drive it against a temp repository with a fake gh.
+
 ## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
 
 `prune-merged.ps1` releases the claims held by a worktree **it** removes, behind a merged-and-clean-and
