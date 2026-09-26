@@ -155,9 +155,9 @@ class StoreLifecycle(Protocol):
         """Produce a **consistent single-file snapshot** of the store at ``dest_path`` (ADR 0049 DR
         backup) — never a raw file copy under WAL. **SQLite only**: on the server-DB backends
         (postgres/sqlserver) this raises :class:`DbaDelegatedError` (DB-tier backup is DBA-delegated,
-        #52). ``method`` is ``"vacuum_into"`` (default — ``VACUUM INTO`` on the writer connection under
-        the store lock, mandatory off-peak) or ``"online_backup"`` (the page-batched SQLite Online Backup
-        API, low-contention).
+        #52). ``method`` is ``"vacuum_into"`` (default — ``VACUUM INTO``, a defragmented copy) or
+        ``"online_backup"`` (the SQLite Online Backup API, a page-for-page copy). Neither holds the store
+        write lock for the copy (BACKLOG #1937): only the WAL checkpoint does.
 
         The snapshot is **point-in-time consistent and non-mutating**: it first checkpoints the WAL, then
         copies the DB **as it is** — it never claims, mutates, resets, completes, or dead-letters a

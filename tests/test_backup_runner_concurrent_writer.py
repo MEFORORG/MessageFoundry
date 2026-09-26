@@ -7,27 +7,31 @@ runs both snapshot mechanisms against a QUIESCENT store. This adds the missing c
 asyncio task hammering the store WRITE path (``enqueue_message``, under ``Store._lock``) WHILE a snapshot
 runs — the busy-store case an operator actually faces.
 
-**What the live code actually does** (``messagefoundry/store/store.py::MessageStore.snapshot_to``): BOTH
-``vacuum_into`` AND ``online_backup`` wrap their whole body in ``async with self._lock``. So a same-store
-asyncio writer is **blocked for the snapshot's full duration in BOTH methods** — the online-backup API
-yields the *SQLite* write lock to *other connections* between page batches, but not this store's single
-asyncio write lock, and the store funnels every write through that one lock + writer connection. We assert
-that TRUE behavior (serialization for both) rather than a differential — see the return notes for why the
-"online_backup lets the store's own writer advance" framing does not hold against this code.
+**BACKLOG #1937 reversed what this file used to assert.** Before it, BOTH methods ran the copy on the
+writer connection inside ``async with self._lock``, and this test pinned that: the writer advanced at most
+one row during a snapshot. On a deploying site that would have stalled every store write, logins included,
+for the whole copy. Now only the WAL checkpoint holds the lock; the copy runs on a dedicated ``mode=ro``
+connection in one read transaction. So a store write completes WHILE the copy is still running, and the
+copy stays point-in-time and intact.
 
-The block is proven from the lock structure (deterministic), not a wall-clock threshold, so it does not
-flake on a jittery Windows CI runner (cf. the "MF CI Test Flakes" memory)."""
+The overlap is proven with a gate, not a wall-clock threshold, so it does not flake on a jittery Windows
+CI runner: the copy's own connection worker thread is held at the start of the copy until the test has
+seen a write complete. On the pre-#1937 code that held thread is the writer's, under the store lock, so
+the write cannot complete and the test fails on its bound."""
 
 from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
+import aiosqlite
 import pytest
 
-import messagefoundry.store.store as store_mod
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import make_cipher
 
@@ -112,9 +116,120 @@ def _sqlite_count(db_path: Path, table: str) -> int:
 # --- the test ----------------------------------------------------------------
 
 
+#: How long the gated copy waits for the test before proceeding anyway, so a failure never hangs the
+#: suite. Far above the bound a write gets, so the write's own bound is what fails first.
+_GATE_SECONDS = 30.0
+#: How long a store write issued during the gated copy may take. A write off the lock takes
+#: milliseconds; under the pre-#1937 lock it can never finish while the copy is held.
+_WRITE_BOUND_SECONDS = 5.0
+
+
+def _gate_the_copy(
+    monkeypatch: pytest.MonkeyPatch, gate: threading.Event, entered: threading.Event
+) -> None:
+    """Hold the snapshot COPY at its start, on the worker thread of whichever connection runs it.
+
+    Wraps ``VACUUM INTO`` and ``Connection.backup`` so that, before the real copy, the connection's own
+    aiosqlite worker thread blocks on ``gate``. That occupies exactly the thread and the lock position
+    a long copy would, so a store write issued meanwhile completes only if the copy runs off both the
+    store lock and the writer connection. Reads aiosqlite's private ``_execute``, the one way to run a
+    callable on that connection's thread; a rename errors here rather than passing silently.
+    """
+
+    def _hold(conn: aiosqlite.Connection) -> Any:
+        def _wait() -> None:
+            entered.set()
+            gate.wait(_GATE_SECONDS)
+
+        return conn._execute(_wait)
+
+    real_execute = aiosqlite.Connection.execute
+    real_backup = aiosqlite.Connection.backup
+
+    def gated_execute(self: aiosqlite.Connection, sql: str, parameters: Any = None) -> Any:
+        # Pass every other statement through untouched, keeping aiosqlite's await-or-`async with`
+        # return object; only the copy statement becomes a coroutine.
+        if not sql.lstrip().upper().startswith("VACUUM INTO"):
+            return real_execute(self, sql, parameters)
+
+        async def _run() -> Any:
+            await _hold(self)
+            return await real_execute(self, sql, parameters)
+
+        return _run()
+
+    async def gated_backup(self: aiosqlite.Connection, target: Any, **kwargs: Any) -> None:
+        await _hold(self)
+        await real_backup(self, target, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", gated_execute)
+    monkeypatch.setattr(aiosqlite.Connection, "backup", gated_backup)
+
+
+async def _until(predicate: Callable[[], bool], *, timeout: float, what: str) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        await asyncio.sleep(0.005)
+
+
 @pytest.mark.parametrize("snapshot_method", ["vacuum_into", "online_backup"])
-async def test_snapshot_serializes_concurrent_writer_and_stays_consistent(
+async def test_a_store_write_completes_while_the_snapshot_copy_runs(
     tmp_path: Path, snapshot_method: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1937: the copy must not hold the store write lock (or the writer connection).
+
+    Fails on the pre-#1937 code: there the gated thread is the writer's, inside ``self._lock``, so the
+    write below times out on ``_WRITE_BOUND_SECONDS``."""
+    from messagefoundry.store.crypto import generate_key
+
+    n = 20
+    store = await _store_with_rows_n(tmp_path / "msg.db", generate_key(), n)
+    gate, entered = threading.Event(), threading.Event()
+    dest = tmp_path / "snap.db"
+    try:
+        _gate_the_copy(monkeypatch, gate, entered)
+        snap = asyncio.create_task(store.snapshot_to(dest, method=snapshot_method))
+        try:
+            await _until(
+                lambda: entered.is_set() or snap.done(),
+                timeout=_GATE_SECONDS,
+                what="the snapshot copy to start",
+            )
+            if snap.done():
+                await snap  # it failed before reaching the copy: surface that error, not a timeout
+                pytest.fail("the snapshot finished without ever starting a gated copy")
+            try:
+                await asyncio.wait_for(
+                    store.enqueue_message(
+                        channel_id="during",
+                        raw="MSH|^~\\&|during-body",
+                        deliveries=[("d1", "OUT|during")],
+                        control_id="DURING-1",
+                        now=50000.0,
+                    ),
+                    timeout=_WRITE_BOUND_SECONDS,
+                )
+            except TimeoutError:
+                pytest.fail(
+                    f"{snapshot_method}: a store write waited more than {_WRITE_BOUND_SECONDS}s "
+                    f"on a running snapshot copy; the copy holds the store write lock"
+                )
+            assert not snap.done(), "the snapshot finished before the write; nothing overlapped"
+        finally:
+            gate.set()
+            await snap
+    finally:
+        monkeypatch.undo()
+        await store.close()
+    assert _sqlite_integrity_ok(dest)
+    assert _sqlite_count(dest, "messages") >= n
+
+
+@pytest.mark.parametrize("snapshot_method", ["vacuum_into", "online_backup"])
+async def test_snapshot_under_a_concurrent_writer_stays_consistent(
+    tmp_path: Path, snapshot_method: str
 ) -> None:
     from messagefoundry.store.crypto import generate_key
 
@@ -130,40 +245,13 @@ async def test_snapshot_serializes_concurrent_writer_and_stays_consistent(
     try:
         await writer.reached(25)  # the writer is actively committing rows before we snapshot
 
-        # (1) SERIALIZATION: the store write lock is held for the whole snapshot, so the concurrent
-        # writer makes essentially NO forward progress DURING the snapshot — at most the single write
-        # already in flight when the snapshot grabbed the lock can finish. TRUE for BOTH methods
-        # (deterministic from the `async with self._lock` that wraps both branches; not a timing bound).
-        #
-        # MEASURE THE LOCK-HELD REGION, NOT THE WHOLE CALL (BACKLOG #1634, SDS-3.8). `snapshot_to`
-        # releases the lock and THEN restricts the copy's permissions, and since #1634 that
-        # restriction is an `await` — so the writer legitimately resumes before the call returns, and
-        # a count taken after it answers a different question than the one asserted here. The probe
-        # sits on `_secure_file_async` because the coroutine reaches it from the lock release with no
-        # await in between: it records the count AT the boundary, deterministically, before it hands
-        # off to the thread. Reading the count after `snapshot_to` returned measured 32 rows of
-        # perfectly correct post-lock progress as a serialization failure.
-        at_lock_release: list[int] = []
-        real_secure = store_mod._secure_file_async
-
-        async def _probe(path: object, **kw: object) -> None:
-            at_lock_release.append(writer.count)
-            await real_secure(path, **kw)  # type: ignore[arg-type]
-
-        monkeypatch.setattr(store_mod, "_secure_file_async", _probe)
-
+        # (1) The snapshot runs under a live writer. Whether any given write lands inside the copy is
+        # timing, so it is not asserted here; the gated test above proves the overlap deterministically.
         c0 = writer.count
         dest = tmp_path / "snap.db"
         await store.snapshot_to(dest, method=snapshot_method)
-        monkeypatch.undo()
-        assert at_lock_release, "snapshot_to no longer restricts the snapshot file"
-        advanced = at_lock_release[0] - c0
-        assert advanced <= 1, (
-            f"{snapshot_method}: the writer advanced {advanced} rows DURING the snapshot; the store "
-            f"write lock should have blocked it for the snapshot's full duration"
-        )
 
-        # (2) NO DEADLOCK: once the snapshot releases the lock the writer resumes and makes progress.
+        # (2) NO DEADLOCK: the writer keeps making progress after the snapshot.
         await writer.reached(writer.count + 25)
     finally:
         writer.stop()

@@ -11788,18 +11788,27 @@ class MessageStore:
 
         ``method``:
 
-        * ``"vacuum_into"`` (default) — ``VACUUM INTO`` on the **writer** connection under the store
-          lock (it is a WRITE statement and cannot run on a ``query_only`` read connection). It contends
-          the store write lock for its duration, exactly like :meth:`vacuum`, so the BackupRunner must
-          schedule it OFF-PEAK (mandatory, not advisory). Produces a fresh, fully-checkpointed,
-          defragmented copy.
-        * ``"online_backup"`` — SQLite's Online Backup API (``Connection.backup``), which copies pages
-          incrementally and yields between batches, so it does NOT hold the write lock for the whole
-          copy. The low-contention option for a large/busy store.
+        * ``"vacuum_into"`` (default) — ``VACUUM INTO``: a fresh, fully-checkpointed, defragmented copy.
+        * ``"online_backup"`` — SQLite's Online Backup API (``Connection.backup``): a page-for-page copy,
+          without the defragmenting rebuild.
 
-        ``VACUUM INTO`` and the Online Backup API both run on the aiosqlite connection's own worker
-        thread (off the event loop). Refuses an existing destination file (a stale ``-wal``/``-shm`` next
-        to it would corrupt the copy) and an in-memory store (nothing to snapshot)."""
+        **Neither method holds the store write lock for the copy (BACKLOG #1937).** Only the WAL
+        checkpoint below runs under ``self._lock`` on the writer. The copy itself runs on a dedicated
+        ``mode=ro`` connection opened for this one snapshot, in a single read transaction. Under WAL a
+        reader never blocks the writer, so every store write -- logins included -- proceeds during the
+        copy, and the copy is still point-in-time: a row committed after the copy began is simply in the
+        next backup. Before #1937 both methods ran on the writer connection inside ``self._lock``, so a
+        snapshot would have stalled every store write for its whole duration on a deploying site.
+
+        Why ``mode=ro`` and not a pooled read connection: those are ``PRAGMA query_only=ON``, and
+        SQLite refuses ``VACUUM INTO`` there ("attempt to write a readonly database") although the
+        statement writes only the destination. A ``mode=ro`` source connection accepts it and still
+        cannot write the store.
+
+        The copy runs on that connection's aiosqlite worker thread (off the event loop). Refuses an
+        existing destination file (a stale ``-wal``/``-shm`` next to it would corrupt the copy) and an
+        in-memory store (nothing to snapshot, and a second connection to ``:memory:`` is a different
+        database)."""
         if self.path == ":memory:":
             raise ValueError("cannot snapshot an in-memory store (no file to copy)")
         dest = Path(dest_path)
@@ -11810,35 +11819,45 @@ class MessageStore:
                 f"unknown snapshot method {method!r}; expected 'vacuum_into' or 'online_backup'"
             )
         async with _writer_guard(self._db, self._lock):
-            # Fold the latest committed WAL frames into the main DB so the snapshot is point-in-time and
-            # the -wal sidecar is empty. The guard's entry rollback leaves no open transaction to block
-            # the checkpoint, so these commits commit nothing; taken bare, they made another block's
-            # abandoned work durable (BACKLOG #1803). They stay because each is one more call on the
-            # connection's worker, which releases the result aiosqlite kept from the previous call.
-            # Fully drain the PRAGMA's result cursor (an open cursor would leave "SQL statements in
-            # progress" and abort the VACUUM INTO below).
+            # Fold the latest committed WAL frames into the main DB so the -wal sidecar starts the copy
+            # empty. The copy's consistency does not depend on this: its read transaction sees the WAL
+            # either way. This is the ONLY part of a snapshot that holds the store write lock, and it is
+            # bounded by SQLite's ~1000-page auto-checkpoint rather than by the store's size. The guard's
+            # entry rollback leaves no open transaction to block the checkpoint, so this commit commits
+            # nothing; taken bare, it made another block's abandoned work durable (BACKLOG #1803). It
+            # stays because it is one more call on the connection's worker, which releases the result
+            # aiosqlite kept from the previous call. The PRAGMA's cursor is drained and closed so it
+            # leaves no statement in progress for the next writer.
             await self._commit()
             cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             await cur.fetchall()
             await cur.close()
+        # The copy, OFF the writer lock (BACKLOG #1937). `timeout` is sqlite3's busy timeout, matching the
+        # pooled readers, so opening the snapshot waits out a transient lock rather than failing.
+        source = await aiosqlite.connect(
+            Path(self.path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0
+        )
+        try:
             if method == "vacuum_into":
-                # VACUUM INTO is a WRITE statement on the writer connection; it cannot run inside a
-                # transaction or with another statement in progress. Parameter-bound so the path can't
-                # inject. Holds the write lock for its duration (off-peak scheduling is the caller's job).
-                await self._commit()
-                await self._db.execute("VACUUM INTO ?", (str(dest),))
+                # One statement, so one read transaction: point-in-time. Parameter-bound so the path
+                # can't inject.
+                await source.execute("VACUUM INTO ?", (str(dest),))
             else:
-                # SQLite Online Backup API: open a fresh destination connection and copy pages into it,
-                # page-batched + yielding, then close it. aiosqlite.Connection.backup runs the underlying
-                # sqlite3 backup on the source connection's worker thread (off the event loop).
                 target = await aiosqlite.connect(str(dest))
                 try:
-                    await self._db.backup(target)
+                    # Leave `pages` at its default, which copies the whole database in ONE backup step,
+                    # so one read transaction. Stepping in batches from a connection other than the
+                    # writer would restart the copy each time the writer commits, and on a busy store
+                    # it might never finish.
+                    await source.backup(target)
                 finally:
                     await target.close()
                     # A snapshot runs on a live engine, so the per-backup worker thread must be gone
                     # before this returns — otherwise a snapshot schedule accretes non-daemon threads.
                     await _await_connection_worker_exit(target)
+        finally:
+            await source.close()
+            await _await_connection_worker_exit(source)  # same reason as the target's
         # Tighten the snapshot file's permissions: it is a full copy of the (PHI-bearing) store. The
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.

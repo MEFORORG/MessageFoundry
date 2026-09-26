@@ -446,8 +446,8 @@ class BackupRunner:
                 raise BackupError("write", f"archive already exists: {occupied}")
 
         # Build everything under one temp dir. The CONSISTENT SNAPSHOT must run on the ENGINE event loop
-        # (store.snapshot_to serialises on the store lock and drives aiosqlite, which is bound to this
-        # loop — it does its own off-loop PRAGMA work). The CPU/IO-heavy tar + AEAD then run OFF the loop
+        # (store.snapshot_to takes the store lock for its WAL checkpoint and drives aiosqlite, which is
+        # bound to this loop — it does its own off-loop copy, off the store lock since BACKLOG #1937). The CPU/IO-heavy tar + AEAD then run OFF the loop
         # in a worker thread over the snapshot file (never blocking asyncio, never the whole store in RAM).
         with tempfile.TemporaryDirectory(prefix="mefor-backup-") as tmp:
             tmpdir = Path(tmp)
