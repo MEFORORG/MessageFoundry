@@ -1040,6 +1040,11 @@ class _FakeSSHClient:
     def open_sftp(self) -> Any:
         raise AssertionError("connect should have raised before open_sftp under RejectPolicy")
 
+    def get_transport(self) -> Any:
+        # A host-key rejection arrives on a negotiated transport; why that matters to the connector
+        # is stated in remotefile._sftp_slow_peer's docstring (BACKLOG #1999).
+        return SimpleNamespace(initial_kex_done=True, is_active=lambda: True)
+
     def close(self) -> None:
         pass
 
@@ -1056,8 +1061,8 @@ class _SSHException(Exception):
     pass
 
 
-class _AuthException(Exception):
-    pass
+class _AuthException(_SSHException):
+    """Subclasses the SSH exception, as ``paramiko.AuthenticationException`` does."""
 
 
 class _FakeTransport:

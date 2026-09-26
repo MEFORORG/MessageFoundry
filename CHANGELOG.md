@@ -318,6 +318,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   got that answer. On those two backends the insert is refused by the foreign key to the account.
   The engine now re-reads the account to tell the two refusals apart. SQL Server has no such foreign
   key, so there the insert is not refused and this change does not apply. (`BACKLOG #1807`)
+- **An SFTP server that is slow to connect is now retried, not dead-lettered or treated as a bad
+  credential.** A server that did not finish the SSH banner or key exchange within the connect
+  timeout was classed as a permanent error, so the delivery would dead-letter on first deployment.
+  One that did not answer authentication in time was classed as a credential fault, so the lane
+  would stop (ADR 0095) though no credential was wrong. Both are now transient, and so is a server
+  that drops the connection before the key exchange completes. A host-key rejection stays
+  permanent, and an authentication refusal stays a credential fault. The connector now also closes
+  the half-open client whenever the connect fails. (`BACKLOG #1999`)
 - **The FHIR parsers and the OIDC token exchange no longer put their input on the exception
   chain.** `FhirPeek.parse`, `FhirResource.parse` and `exchange_code` each raised a content-free
   error `from exc`. The chained decode error holds the whole input: the FHIR body, or the token
