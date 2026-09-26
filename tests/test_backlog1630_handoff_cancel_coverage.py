@@ -30,17 +30,22 @@ Each failure arm reads the durable state through a SECOND, read-only ``sqlite3``
 connection sees only committed rows, so it cannot be fooled by the writer connection's own view of
 its uncommitted work.
 
-The keyed POSITIVE CONTROL at the end is load-bearing. In the keyed-close test nothing checks
-``in_transaction`` before ``close()``, so the durable read is the only check, and it means something
-only if ``close()``'s settlement really would commit an open transaction. The control shows it does.
-The next-writer control documents the same mechanism for the probe the unkeyed tests run; there the
-``in_transaction`` assertion fails first, so that probe is a second line rather than the only one.
+Since BACKLOG #1803, every short writer runs under ``_writer_guard``, which ROLLS BACK a
+transaction it finds open when it takes the writer lock (ADR 0159, the #1803 amendment). So the
+next writer and ``close()``'s settlement no longer commit a half-body: they discard it and log at
+ERROR. The unwind these tests cover and that guard are now two layers over the same end state.
+
+The CONTROLS at the end pin both halves of what the durable reads rely on. A transaction left open
+by hand is discarded by each probe, with the guard's ERROR logged and the probe's own write durable,
+so the probe really ran. And the same half-body committed directly, the way the next writer used to,
+IS seen by the durable reader, so a clean read is not a reader that cannot see a leak.
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import sqlite3
 from collections.abc import Callable, Coroutine, Iterator
 from contextlib import contextmanager
@@ -422,46 +427,63 @@ async def test_keyed_close_after_a_cancelled_handoff_commits_nothing(
         await store.close()
 
 
-# --- positive controls: each probe really does commit an open transaction ------------------------
+# --- controls: each probe discards an open transaction, and the reader sees a committed leak ---
 
 
 @pytest.mark.parametrize("probe", ["next-writer", "keyed-close"])
-async def test_probe_commits_a_transaction_left_open(tmp_path: Path, probe: str) -> None:
-    """Leave a transaction open by hand, the way an ``except Exception`` unwind used to, and show
-    each probe above makes its half-body durable. This is the defect the tests above rule out; if a
-    probe stopped writing, this test fails and the clean results above stop meaning anything.
+async def test_probe_discards_a_transaction_left_open(
+    tmp_path: Path, probe: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Leave a transaction open by hand, the way an ``except Exception`` unwind used to, then run the
+    probe. Before BACKLOG #1803 the probe committed the half-body; now its ``_writer_guard`` rolls it
+    back on entry. The claimed row survives, the guard's ERROR is logged, and the probe's own write
+    is durable, so the probe did run.
 
-    Both probes depend on a writer that takes the lock and commits with NO ``BEGIN`` of its own:
-    ``record_connection_event`` and, inside ``close()``, ``add_cipher_invocations``. If either is
-    moved onto ``_writer_txn`` (ADR 0159's deferred work), its ``BEGIN`` raises on the open
-    transaction and this control goes red. That means the PROBE needs replacing with another
-    no-``BEGIN`` writer, not that the engine regressed."""
+    Then commit the same half-body directly, which is what the next writer used to do, and show the
+    durable reader sees the row gone. Without that arm, a clean durable read could mean a reader that
+    cannot see a leak at all."""
     path = tmp_path / f"control-{probe}.db"
-    if probe == "keyed-close":
-        store = await _open_keyed(path, generate_key())
-    else:
-        store = await MessageStore.open(path)
+    key = generate_key()
+    store = await (_open_keyed(path, key) if probe == "keyed-close" else MessageStore.open(path))
     closed = False
     try:
         _mid, ingress_id = await _prepare(store)
+        reserved = _persisted_invocations(path) if probe == "keyed-close" else 0
         # A route handoff's first statement, with no unwind after it.
         await store._db.execute("BEGIN")
         await store._db.execute("DELETE FROM queue WHERE id=?", (ingress_id,))
         assert store._db.in_transaction
-        with _durable(path) as con:
-            assert _one(con, "SELECT COUNT(*) FROM queue WHERE id=?", (ingress_id,)) == 1
 
-        if probe == "next-writer":
-            await store.record_connection_event(
-                connection="control", transport="mllp", direction="inbound", kind="probe"
-            )
-        else:
-            await store.close()
-            closed = True
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.store.store"):
+            if probe == "next-writer":
+                await store.record_connection_event(
+                    connection="control", transport="mllp", direction="inbound", kind="probe"
+                )
+                assert not store._db.in_transaction
+            else:
+                await store.close()
+                closed = True
+        assert any("still open" in r.getMessage() for r in caplog.records), caplog.text
     finally:
         if not closed:
             await store.close()
 
     with _durable(path) as con:
+        _assert_claim_survived(con, ingress_id)
+        if probe == "next-writer":
+            events = _one(con, "SELECT COUNT(*) FROM connection_event WHERE connection='control'")
+            assert events == 1, "the probe's own write is not durable, so it may never have run"
+    if probe == "keyed-close":
+        assert _persisted_invocations(path) < reserved, "close() did not settle"
+
+    # The reader is armed: the same half-body, committed, is visible to it.
+    store = await (_open_keyed(path, key) if probe == "keyed-close" else MessageStore.open(path))
+    try:
+        await store._db.execute("BEGIN")
+        await store._db.execute("DELETE FROM queue WHERE id=?", (ingress_id,))
+        await store._db.commit()
+    finally:
+        await store.close()
+    with _durable(path) as con:
         remaining = _one(con, "SELECT COUNT(*) FROM queue WHERE id=?", (ingress_id,))
-    assert remaining == 0, f"the {probe} probe did not commit the open transaction"
+    assert remaining == 0, "the durable reader did not see a committed DELETE"
