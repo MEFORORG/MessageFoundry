@@ -3470,6 +3470,12 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS ix_messages_channel  ON messages(channel_id, received_at);
 CREATE INDEX IF NOT EXISTS ix_messages_control  ON messages(channel_id, control_id);
+-- BACKLOG #1726: the tracking view's newest-first page (ORDER BY received_at DESC, id DESC) walks this
+-- index and stops at LIMIT, instead of sorting every row the store has ever received. `id` is the
+-- ORDER BY's tie-break, so the index yields the full order with no temp B-tree. It also serves the
+-- received_at date filter. Here rather than _migrate: both columns date from the first release and this
+-- batch runs on every open, so an existing store builds it (one O(rows) pass) on its next open.
+CREATE INDEX IF NOT EXISTS ix_messages_received ON messages(received_at, id);
 
 -- Generic staged-queue table (staged pipeline, ADR 0001). One table for every stage; the `stage`
 -- column discriminates ingress | routed | outbound rows. Supersedes the original `outbox` table
@@ -3964,6 +3970,17 @@ CREATE TABLE IF NOT EXISTS secret_rotation_meta (
     last_rotated  TEXT NOT NULL       -- ISO YYYY-MM-DD the fingerprint last changed (auto-detected rotation)
 );
 """
+
+# The latest event of each listed message, for the tracking view (list_messages, search_messages).
+# BACKLOG #1726: it picks the row by MAX(id) rather than `ORDER BY e.id DESC LIMIT 1`. Both name the
+# same row, since id is unique. ix_events_message is (message_id, ts) with id as its implicit rowid
+# tail, so it orders a message's events by ts, not id; the ORDER BY form therefore sorted each
+# message's events in a temp B-tree. MAX(id) reads that index as a covering scan and then fetches one
+# row by primary key. A message with no events still yields NULL.
+_LAST_EVENT_COLUMN = (
+    "(SELECT event FROM message_events e WHERE e.id ="
+    " (SELECT MAX(e2.id) FROM message_events e2 WHERE e2.message_id = messages.id)) AS last_event"
+)
 
 # Columns added after the initial release; ALTER-ed in on open for existing DBs.
 # `documents_pruned` (#47, ADR 0042): a nullable epoch timestamp set when retention strips an embedded
@@ -9080,19 +9097,22 @@ class MessageStore:
             received_to,
         )
         async with self._read() as db:
-            cur = await db.execute(
-                "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
-                " status, error, summary, metadata,"
-                " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
-                "  ORDER BY e.id DESC LIMIT 1) AS last_event"
-                f" FROM messages{where}"
-                " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?",
-                (*params, limit, offset),
-            )
+            cur = await db.execute(self._list_messages_sql(where), (*params, limit, offset))
             return [
                 self._decode_row(r, "messages", (r["id"],), "error", "summary", "metadata")
                 for r in await cur.fetchall()
             ]
+
+    @staticmethod
+    def _list_messages_sql(where: str) -> str:
+        """The page query :meth:`list_messages` runs, split out so a test can read its plan
+        (BACKLOG #1726). ``where`` comes from :meth:`_message_filter`; LIMIT and OFFSET are bound."""
+        return (
+            "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
+            f" status, error, summary, metadata, {_LAST_EVENT_COLUMN}"
+            f" FROM messages{where}"
+            " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?"
+        )
 
     async def count_messages(
         self,
@@ -9148,9 +9168,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
-                " status, error, summary, metadata, raw,"
-                " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
-                "  ORDER BY e.id DESC LIMIT 1) AS last_event"
+                f" status, error, summary, metadata, raw, {_LAST_EVENT_COLUMN}"
                 f" FROM messages{where}"
                 " ORDER BY received_at DESC, id DESC",
                 params,
@@ -11780,6 +11798,11 @@ class MessageStore:
         for cid, (read, errored) in counts.items():  # since-window rows w/o an all-time row
             inbound[cid] = InboundMetrics(read=int(read), errored=int(errored or 0), last_at=None)
 
+        # This aggregate still reads every outbound row the store holds (BACKLOG #1726, left open).
+        # last_done_at is all-time, written and recent_done filter on updated_at, and the group set is
+        # every (channel, destination) pair with any row. No queue index carries updated_at or that
+        # pair, so each done row is a table read, and no rewrite over the existing indexes avoids it.
+        # Bounding it takes a new queue index, which every queue insert and status change would pay.
         cur = await db.execute(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN (?,?) THEN 1 ELSE 0 END) AS queue_depth,"
