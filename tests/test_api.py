@@ -1223,6 +1223,14 @@ async def test_connections_standalone_row_stays_null_over_traffic_it_cannot_attr
     for field in ("queue_depth", "written", "errored", "backlog_seconds"):
         assert row[field] is None, field  # not measured on this row -- and never a false 0
 
+    # Once that row is cancelled it reads zero on every count, so the zero is measured again. The
+    # queue row itself stays in the store, so this arm fails if null keys on "any edge ever existed",
+    # which would pin the row to null for good after one old message.
+    assert (await client.post("/connections/out1/purge")).json()["cancelled"] == 1
+    [row] = await _out1_rows(client)
+    assert (row["queue_depth"], row["written"], row["errored"]) == (0, 0, 0)
+    assert row["backlog_seconds"] == 0.0
+
 
 async def test_engine_not_started_returns_503(tmp_path: Path) -> None:
     # App with no engine bound (and no lifespan to set one) → 503 on engine routes.

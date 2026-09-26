@@ -513,12 +513,14 @@ class ConnectionRow(BaseModel):
     listen peer/port; destination rows carry queue/written/dead/backlog/delivered-age and the
     remote peer/port. Unused fields are None so the UI can render blanks.
 
-    On a count, ``0`` means "measured as zero" and ``None`` means "not measured on this row"; ``None``
-    never stands in for a zero (BACKLOG #1817). Among the reasons a count is ``None``: the field does
-    not apply to this row's role, or the row is a standalone destination row (no traffic edge here)
-    whose outbound does carry traffic from an inbound this node does not run -- another engine shard's,
-    or one a reload removed. A standalone row whose outbound has no traffic at all reports ``0``. For
-    the ages and ``backlog_seconds``, read each field's own note: ``None`` there can mean a stall."""
+    On a count, ``0`` means "measured as zero" and ``None`` means "not measured on this row". ``None``
+    never stands in for a zero (BACKLOG #1817). A count is ``None`` in at least these cases: the field
+    does not apply to this row's role, or the row is a standalone destination row (its outbound has no
+    edge row here) and the outbound has live traffic from an inbound this node does not run. A
+    standalone row whose outbound has no such traffic reports ``0``. A standalone row never reports
+    ``idle_seconds`` or ``delivered_age_seconds``, and on one ``backlog_seconds`` is ``0.0`` beside a
+    measured zero and ``None`` beside ``None`` counts. On an edge row, ``backlog_seconds`` ``None``
+    means queued with nothing draining, which can be a stall."""
 
     role: str  # "source" | "destination"
     channel_id: str

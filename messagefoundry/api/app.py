@@ -2307,7 +2307,9 @@ def create_app(
             emitted_dests: set[str] = set()
             for (cid, dname), dm in metrics.destinations.items():
                 if cid not in reg.inbound:
-                    continue  # a declarative-channel edge, already emitted above
+                    # An inbound this node does not run (another engine shard's, or one no longer in
+                    # the config): no row here. Its outbound's standalone row reads null (#1817).
+                    continue
                 if scoped:
                     # A channel-scoped user must not see shared-outbound topology (peer IP/port/state) —
                     # the same denial connection_metadata/test/purge apply to a shared outbound.
@@ -2434,13 +2436,22 @@ def create_app(
                 )
                 standalone[oname] = (status, None)
             # BACKLOG #1817: `null` on a count means "not measured" and `0` means "measured as zero", and
-            # a standalone row can be either. The metrics above group EVERY outbound-stage queue row, so
-            # an outbound with no edge at all has no queue row: its counters are a measured zero. An
-            # outbound WITH edges, none of them shown here, keeps null: those edges belong to an inbound
-            # this node does not run (another engine shard's, or one a reload removed). Folding them in
-            # would count a sibling shard's live traffic on every shard, and a per-row stats reset keys
-            # on this row's name, so it could never zero what the row showed.
-            edged_outbounds = {ename for (_cid, ename) in metrics.destinations}
+            # a standalone row can be either. The metrics above group EVERY outbound-stage queue row, and
+            # a standalone outbound's edges (if any) are all skipped ones, from inbounds this node does
+            # not run. If each of those reads zero now (nothing queued, nothing written or dead since the
+            # engine started), the row's counters are a measured zero. If any reads non-zero, the row
+            # keeps null rather than fold it in: folding would count a sibling engine shard's live
+            # traffic on every shard, and a per-row stats reset keys on this row's name, so it could
+            # never zero what the row showed.
+            busy_unshown = (
+                set()
+                if scoped
+                else {
+                    ename
+                    for (_cid, ename), dm in metrics.destinations.items()
+                    if dm.queue_depth or dm.written or dm.dead
+                }
+            )
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:
                     continue  # channel-scoped users never see shared-outbound topology (see above)
@@ -2449,7 +2460,7 @@ def create_app(
                     continue  # a removed/draining outbound has no spec to render; shown dests are covered
                 dmethod = _method_label(oc.spec.type.value)
                 dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
-                count: int | None = None if dname in edged_outbounds else 0
+                measured_zero: int | None = None if dname in busy_unshown else 0
                 rows.append(
                     ConnectionRow(
                         role="destination",
@@ -2462,15 +2473,15 @@ def create_app(
                         method=dmethod,
                         peer=dpeer,
                         port=dport,
-                        # The ages stay None either way. Measured, there is no queue row to age (no
-                        # delivery yet, nothing queued), as on an edge row before its first message.
-                        queue_depth=count,
+                        # This row does not report the ages. With a measured zero nothing is queued,
+                        # so there is no queued item to age and no queue to clear.
+                        queue_depth=measured_zero,
                         idle_seconds=None,
                         alerts_active=open_alerts.get(dname, 0),
-                        errored=count,
+                        errored=measured_zero,
                         read=None,
-                        written=count,
-                        backlog_seconds=None if count is None else _backlog(count, 0),
+                        written=measured_zero,
+                        backlog_seconds=None if measured_zero is None else 0.0,
                         delivered_age_seconds=None,
                         simulated=rr.outbound_simulated(dname),
                         paused=rr.outbound_quiesced(dname),
