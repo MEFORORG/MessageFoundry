@@ -280,6 +280,36 @@ async def test_creating_an_administrator_raises_the_grant_alert(engine: Engine) 
     assert {str(r["client"]) for r in created if r["actor"] == "admin1"} == {"127.0.0.1"}
 
 
+async def test_an_administrator_create_that_loses_the_username_race_pages_nobody(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A create that loses the username race (BACKLOG #1808, 409) granted nobody anything, so the
+    #315 alert must not fire for it and no ``user.created`` row may name it."""
+    service = await _service(engine)
+    await _add(service, "admin1", Role.ADMINISTRATOR)
+    sink = _Sink()
+    original = engine.store.create_user
+
+    async def racing(**kwargs: Any) -> None:
+        # A rival takes the name between the route's check and this insert.
+        monkeypatch.setattr(engine.store, "create_user", original)
+        await original(user_id="a" * 32, username=kwargs["username"], auth_provider="local")
+        await original(**kwargs)
+
+    async with _app_client(engine, service, sink) as c:
+        headers = await _token(c, "admin1")
+        monkeypatch.setattr(engine.store, "create_user", racing)
+        r = await c.post(
+            "/users",
+            headers=headers,
+            json={"username": "contested", "password": PW, "roles": [Role.ADMINISTRATOR.value]},
+        )
+        assert r.status_code == 409, r.text
+    assert sink.events == []
+    created = await engine.store.list_audit(action="user.created")
+    assert not [r for r in created if r["actor"] == "admin1"]
+
+
 async def test_promoting_to_administrator_raises_the_grant_alert(engine: Engine) -> None:
     """Promotion mints an approver exactly as creation does, so it must page too."""
     service = await _service(engine)
