@@ -866,15 +866,16 @@ async def test_a_malformed_fhir_reply_is_a_lookup_error(exc: Exception) -> None:
 
 async def test_a_deeply_nested_fhir_reply_is_a_lookup_error() -> None:
     # BACKLOG #1980: json.loads raises RecursionError on a deeply nested body. FhirPeek maps it to
-    # FhirPeekError since BACKLOG #1600, so the RecursionError is one link down the chain; the
-    # lookup's own RecursionError arm stays as the guard if that mapping ever regresses. 200 KB is
-    # far under the read bound.
+    # FhirPeekError since BACKLOG #1600, naming the class in its message and keeping no chain
+    # (BACKLOG #2048); the lookup's own RecursionError arm stays as the guard if that mapping ever
+    # regresses. 200 KB is far under the read bound.
     ex, _ = _executor(body=b"[" * 200_000)
     with pytest.raises(FhirLookupError, match="unparseable") as err:
         await ex.read("epic", "Patient/123")
     cause = err.value.__cause__
     assert isinstance(cause, FhirPeekError)
-    assert isinstance(cause.__cause__, RecursionError)
+    assert "(RecursionError)" in str(cause)
+    assert cause.__cause__ is None and cause.__context__ is None
 
 
 async def test_a_timeout_the_read_raised_is_not_called_a_bridge_wait(
