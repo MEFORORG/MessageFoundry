@@ -8354,6 +8354,10 @@ def _hop_policy(oc: OutboundConnection) -> tuple[object, ...]:
         oc.tls_hop_attested_reason,
         oc.cleartext_accepted,
         oc.cleartext_reason,
+        # ADR 0173: the revocation guard is built from these too, so withdrawing the attestation alone
+        # must rebuild the connector, exactly as for tls_hop_attested above.
+        oc.tls_revocation_attested,
+        oc.tls_revocation_attested_reason,
     )
 
 

@@ -540,7 +540,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
-  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off egress hop and a weakened database TLS
+  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
   hop. If the claim is false, the payload and any credential the connection carries cross in the clear,
   and nothing about the hop looks wrong afterwards.
 - **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
@@ -551,9 +551,10 @@ This section is kept rather than deleted, because the claim it used to make is t
   exists to be trusted when audited.
 - **Compensating controls:** whatever the reason names. Keep it true: when the proxy or the segment
   changes, the attestation has to change with it.
-- **It is never silent:** a suppressed enforcing refusal is logged at WARNING, and at least the
-  inbound bind gates and the connectors' hop guards put the reason on that line. The OAuth2 and SMART
-  token-endpoint seams do not. The complete record is the two reports. `messagefoundry check` prints a
+- **It is always reported, though not always logged:** at least the inbound bind gates and the
+  raw-TCP/MLLP hop guard log a suppressed enforcing refusal at WARNING with the reason. The OAuth2 and
+  SMART token-endpoint seams and the database weakened-TLS line do not put the reason on it, and a
+  `DatabaseRef` sync logs nothing. The complete record is the two reports. `messagefoundry check` prints a
   `tls-hop-attested` line listing the **whole** attested set, and `GET /security/posture` carries a
   `tls_hop_attested` loosening naming every attesting declaration of each kind above. Each gate and
   both reports read the attestation from the same place, so a hop cannot be crossed on an attestation

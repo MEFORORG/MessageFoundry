@@ -206,6 +206,32 @@ async def test_reload_rebuilds_an_outbound_whose_hop_attestation_alone_changed(
         await runner.stop()
 
 
+async def test_reload_rebuilds_an_outbound_whose_revocation_attestation_alone_changed(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The same rule for ADR 0173's ``tls_revocation_attested``, which also lives outside `spec` and
+    feeds the connector's revocation guard at construction. Withdrawing it alone must rebuild the
+    connector, or the old guard keeps crossing the hop until a restart."""
+    import dataclasses
+
+    inbox, out = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    attested = _deliver_registry(inbox, out)
+    attested.outbound["file_out"] = dataclasses.replace(
+        attested.outbound["file_out"],
+        tls_revocation_attested=True,
+        tls_revocation_attested_reason="partner PKI runs OCSP at the site edge",
+    )
+    runner = RegistryRunner(attested, store, poll_interval=0.02)
+    await runner.start()
+    try:
+        first = runner._destinations["file_out"]
+        await runner.reload(_deliver_registry(inbox, out))
+        assert runner._destinations["file_out"] is not first
+    finally:
+        await runner.stop()
+
+
 async def test_reload_preserves_inflight_outbox(store: MessageStore, tmp_path: Path) -> None:
     """Rows already claimed/sending when a reload happens must still be delivered (no loss)."""
     reg = Registry()

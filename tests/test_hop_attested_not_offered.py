@@ -27,7 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
-from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+from messagefoundry.config.tls_policy import HOP_ATTESTATION_LEVER, HopPosture, active_hop_posture
 from messagefoundry.config.wiring import HOP_ATTESTATION_KEYS, WiringError
 from messagefoundry.pipeline.wiring_runner import (
     check_dimse_tls_exposure,
@@ -66,9 +66,11 @@ def _no_blanket_escape(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _assert_offers_the_supported_lever(message: str) -> None:
-    """The lever with its reason, and no route into the transport settings, which the loader refuses."""
-    assert LEVER in message
-    assert REASON_KEY in message
+    """The lever with its reason, and no route into the transport settings, which the loader refuses.
+
+    It asserts the whole spelling: the flag name alone is a substring of the reason key, so checking
+    the two names separately could not tell a refusal that names the flag from one that does not."""
+    assert HOP_ATTESTATION_LEVER in message
     for settings_route in ("[settings]", "spec.settings", "settings["):
         assert settings_route not in message
 
