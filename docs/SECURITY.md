@@ -1035,13 +1035,18 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 | `client` on the `user.created` audit row | Every local account creation | The creating administrator's address, like the approval rows |
 | `account_created` notice | Every local account creation that has a notification address | The new account's own notification address |
 
-**Two limits apply to these signals.** An approver account minted or taken over *before* the request
-passes all three timestamp comparisons, so the release is not flagged. The `administrator_granted`
-alert is the signal for that route. A directory (AD) account that gets Administrator from the
-AD-group map at sign-in raises no `administrator_granted` alert, because that grant happens in the
-directory. And the provenance check flags rather than refuses on purpose. A refusal would stop only
-the careless route, and it would also refuse an honest directory approver whose engine row is created
-at first sign-in.
+**These signals miss at least three routes.**
+
+- An approver account minted or taken over *before* the request passes all three timestamp
+  comparisons, so the release is not flagged. The `administrator_granted` alert is the only signal.
+- An existing account promoted to Administrator *after* the request is not flagged either, because
+  promotion changes none of the three timestamps. Again, `administrator_granted` is the only signal.
+- A directory (AD) account that gets Administrator from the AD-group map at sign-in raises no
+  `administrator_granted` alert, because that grant happens in the directory.
+
+The provenance check flags rather than refuses on purpose. A refusal would stop only the careless
+route, and it would also refuse an honest directory approver whose engine row is created at first
+sign-in.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
