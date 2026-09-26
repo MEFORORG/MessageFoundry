@@ -18,6 +18,8 @@ from typing import NamedTuple
 
 import pytest
 
+import messagefoundry
+
 # CLAUDE.md §4: the engine packages never import the API, the console, or their frameworks.
 _ENGINE_PACKAGES = ["pipeline", "transports", "parsing", "store", "config"]
 #: ``messagefoundry_webconsole`` replaced ``messagefoundry.console`` here (BACKLOG #1615). The old
@@ -32,6 +34,8 @@ _FORBIDDEN = ("fastapi", "pyside6", "messagefoundry.api", "messagefoundry_webcon
 # reaches either only through runner-injected callables (the `ConnectionEventSink` shape), which is
 # what lets intake auth write an audit row without the listener ever holding a store handle. True of
 # the tree already — nothing enforced it, so it was one careless import from silently becoming false.
+# `parsing/` has a stricter inward rule, an ALLOWLIST rather than entries here; see the end of this
+# file (BACKLOG #1596).
 _PACKAGE_FORBIDDEN: dict[str, tuple[str, ...]] = {
     "transports": ("messagefoundry.store", "messagefoundry.pipeline"),
 }
@@ -75,12 +79,17 @@ def _package_of(path: Path, root: Path) -> str:
     return ".".join([root.name, *rel.parts])
 
 
-def _imported_modules(path: Path, root: Path) -> set[str]:
+def _imported_modules(path: Path, root: Path, *, with_names: bool = False) -> set[str]:
     """Absolute dotted names `path` imports, with relative imports resolved to absolute.
 
     Resolved rather than skipped: a boundary test that `from ..store import ...` walks straight
     through is not a boundary test. The tree uses absolute imports throughout today, so this changes
     no current verdict — it closes the bypass before someone finds it.
+
+    `with_names` also records `<module>.<name>` for each name a `from` import takes, so
+    `from messagefoundry import config` reads as `messagefoundry.config` and not as the bare root.
+    Off by default because the deny-list walk above was graded without it; the `parsing/` allowlist
+    below turns it on (BACKLOG #1596).
     """
     mods: set[str] = set()
     package = _package_of(path, root)
@@ -89,12 +98,16 @@ def _imported_modules(path: Path, root: Path) -> set[str]:
             mods.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             if node.level == 0:
-                if node.module:
-                    mods.add(node.module)
-                continue
-            # `from . import x` -> the package itself; `from ..store import x` -> one level up.
-            base = package.rsplit(".", node.level - 1)[0]
-            mods.add(f"{base}.{node.module}" if node.module else base)
+                if not node.module:
+                    continue
+                target = node.module
+            else:
+                # `from . import x` -> the package itself; `from ..store import x` -> one level up.
+                base = package.rsplit(".", node.level - 1)[0]
+                target = f"{base}.{node.module}" if node.module else base
+            mods.add(target)
+            if with_names:
+                mods.update(f"{target}.{a.name}" for a in node.names if a.name != "*")
     return mods
 
 
@@ -703,3 +716,219 @@ def test_the_tray_probe_resolves_a_forbidden_package_by_its_dotted_prefix() -> N
         "the parent package is in the run, so the EXACT branch could have produced that match and "
         "this test no longer isolates the prefix branch"
     )
+
+
+# --- BACKLOG #1596: parsing/'s client carve-out, as one allowlist checked two ways -------------------
+#
+# CLAUDE.md section 4 lets a client import `parsing/` because it is a pure library, and forbids a
+# client `config/`, `pipeline/`, `store/` and `transports/`. Nothing checked it, and it was false:
+# `sniff.py` took `ContentType` from `config.models`, and `parsing/__init__.py` took the hl7 log
+# silencer from `logging_setup`, which imports `config.tls_policy`. Measured at d2db0e014 before the
+# fix: a fresh `import messagefoundry.parsing` loaded 51 `messagefoundry` modules, ten of them outside
+# `parsing`, among them `config`, `config.models` and `config.tls_policy`.
+#
+# AN ALLOWLIST, NOT AN ABSENCE LIST. The tray guard above names what must be missing. This one names
+# what `parsing/` may reach outside itself, so a module no entry names reds on arrival instead of
+# slipping through. Adding an entry claims the module is a stdlib-only leaf like the ones here.
+#
+# TWO HALVES, BECAUSE EACH IS BLIND WHERE THE OTHER SEES. Both cover `parsing/` AND the leaves it
+# may reach, since a leaf that grows an engine import carries that import into parsing.
+# 1. The STATIC walk reads every import statement, including one deferred into a function body. It
+#    records `from messagefoundry import X` as `messagefoundry.X`, and maps X through the root's lazy
+#    export table when X is an export rather than a submodule. It cannot see a forbidden layer
+#    arriving BEHIND an allowed import, or attribute access such as `import messagefoundry` followed
+#    by `messagefoundry.config`.
+# 2. The RUNTIME probe imports every one of those modules in a fresh interpreter and reads
+#    `sys.modules`, so it sees the whole transitive closure. It never runs a function body, so a
+#    deferred import is invisible to it.
+# NEITHER SEES A STRING IMPORT. A deferred `importlib.import_module("messagefoundry.config")` passes
+# both halves. Review is what catches that one.
+_PARSING_MAY_REACH = (
+    "messagefoundry.parsing",
+    "messagefoundry.content_type",
+    "messagefoundry.controlchars",
+    "messagefoundry.phi_log_silencer",
+    "messagefoundry.timezone",
+)
+
+#: The allowlisted modules outside `parsing/`. Each is a single top-level file.
+_PARSING_LEAVES = tuple(m for m in _PARSING_MAY_REACH if m != "messagefoundry.parsing")
+
+
+def _parsing_may_reach(module: str) -> bool:
+    """True iff `module` is outside the engine, the bare package root, or under an allowed prefix.
+
+    The bare root is allowed EXACTLY and never as a prefix. `import messagefoundry.parsing` has to
+    load it, and a `messagefoundry.` prefix would admit the whole engine."""
+    if module != "messagefoundry" and not module.startswith("messagefoundry."):
+        return True
+    return module == "messagefoundry" or any(
+        module == p or module.startswith(p + ".") for p in _PARSING_MAY_REACH
+    )
+
+
+def _through_lazy_root(module: str) -> str:
+    """`messagefoundry.<export>` -> the module that export lives in, per the root's lazy table.
+
+    `from messagefoundry import AckMode` loads `config.models` at runtime, and
+    `from messagefoundry import to_zone` loads only `timezone`. Reading both as the bare name would
+    get the first right by accident and the second wrong."""
+    head, _, name = module.rpartition(".")
+    if head == "messagefoundry" and name in messagefoundry._LAZY_EXPORTS:
+        return messagefoundry._LAZY_EXPORTS[name]
+    return module
+
+
+def _parsing_static_scan(root: Path, leaves: Sequence[str] = _PARSING_LEAVES) -> _Scan:
+    """Walk `root/parsing` and each leaf file for an engine import off `_PARSING_MAY_REACH`.
+
+    A leaf that is missing raises rather than being skipped, for the reason `_scan` gives."""
+    directory = root / "parsing"
+    if not directory.is_dir():
+        raise AssertionError(f"walk target is not a directory: {directory}")
+    leaf_files = [root / f"{leaf.rsplit('.', 1)[1]}.py" for leaf in leaves]
+    missing = [str(f) for f in leaf_files if not f.is_file()]
+    if missing:
+        raise AssertionError(f"allowlisted leaves not found: {missing}")
+    violations: list[str] = []
+    walked = {"parsing": 0, "leaves": 0}
+    for py, bucket in [
+        *((p, "parsing") for p in sorted(directory.rglob("*.py"))),
+        *((p, "leaves") for p in leaf_files),
+    ]:
+        modules = {_through_lazy_root(m) for m in _imported_modules(py, root, with_names=True)}
+        walked[bucket] += 1
+        violations.extend(
+            f"{py.relative_to(root)} imports {m}"
+            for m in sorted(modules)
+            if not _parsing_may_reach(m)
+        )
+    return _Scan(tuple(violations), MappingProxyType(walked))
+
+
+def test_parsing_imports_nothing_outside_its_allowlist() -> None:
+    scan = _parsing_static_scan(_ENGINE_ROOT)
+    assert not scan.violations, scan.violations
+    # A walk that opened nothing gives the same clean answer as a clean package; see `_scan`.
+    assert scan.walked["parsing"] >= _MIN_FILES_WALKED["parsing"], dict(scan.walked)
+    assert scan.walked["leaves"] == len(_PARSING_LEAVES), dict(scan.walked)
+
+
+@pytest.mark.parametrize(
+    ("line", "expect"),
+    [
+        # The two edges #1596 removed, as they were written.
+        ("from messagefoundry.config.models import ContentType\n", "messagefoundry.config.models"),
+        ("from messagefoundry.logging_setup import x\n", "messagefoundry.logging_setup"),
+        # The spellings the deny-list walk above records as the bare root, one of them deferred.
+        (
+            "def f():\n    from messagefoundry import logging_setup\n",
+            "messagefoundry.logging_setup",
+        ),
+        ("from .. import store\n", "messagefoundry.store"),
+        # A lazy root export that lives in config.models. `clean.py` holds one that does not.
+        ("from messagefoundry import AckMode\n", "messagefoundry.config.models"),
+        # A module no rule had to name.
+        ("import messagefoundry.uploads\n", "messagefoundry.uploads"),
+    ],
+)
+def test_the_parsing_walk_sees_a_planted_engine_import(
+    tmp_path: Path, line: str, expect: str
+) -> None:
+    root = tmp_path / "messagefoundry"
+    (root / "parsing").mkdir(parents=True)
+    # Every allowed shape at once. None of these may be reported, or the walk answers yes to all.
+    (root / "parsing" / "clean.py").write_text(
+        "import json\n"
+        "import messagefoundry\n"
+        "from . import sniff\n"
+        "from messagefoundry.parsing.peek import peek\n"
+        "from messagefoundry.timezone import to_zone\n"
+        "from messagefoundry.content_type import ContentType\n"
+        "from messagefoundry import to_zone as z, ContentType as C\n",
+        encoding="utf-8",
+    )
+    (root / "parsing" / "planted.py").write_text(line, encoding="utf-8")
+
+    scan = _parsing_static_scan(root, leaves=())
+    assert scan.walked == {"parsing": 2, "leaves": 0}, dict(scan.walked)
+    assert f"parsing{os.sep}planted.py imports {expect}" in scan.violations, scan.violations
+    assert not [v for v in scan.violations if "clean.py" in v], scan.violations
+
+
+_PARSING_PROBE_MARK = "MEFOR-PARSING-PROBE:"
+
+
+class _ParsingProbe(NamedTuple):
+    """What one fresh-interpreter import of every `parsing` module saw."""
+
+    #: `messagefoundry` modules that landed off `_PARSING_MAY_REACH`.
+    outside: frozenset[str]
+    #: Every `messagefoundry.parsing` module that landed.
+    inside: frozenset[str]
+
+
+def _parsing_import_probe(plant: str = "") -> _ParsingProbe:
+    """Import every module under `messagefoundry.parsing` in a fresh interpreter.
+
+    Fresh for the reason `test_importing_api_does_not_eagerly_pull_fastapi` gives. `plant` runs
+    first, so a control can stand in for a parsing module that reached a forbidden layer. Every
+    module imports on a base install today, because the optional codecs defer their third-party
+    imports into function bodies; a module that stops doing so fails the probe loudly.
+    """
+    code = (
+        "import importlib, json, pkgutil, sys\n"
+        f"{plant}\n"
+        "import messagefoundry.parsing as p\n"
+        "for info in pkgutil.walk_packages(p.__path__, 'messagefoundry.parsing.'):\n"
+        "    importlib.import_module(info.name)\n"
+        f"for leaf in {_PARSING_LEAVES!r}:\n"
+        "    importlib.import_module(leaf)\n"
+        "names = [m for m in sys.modules if m == 'messagefoundry' or m.startswith('messagefoundry.')]\n"
+        f"print({_PARSING_PROBE_MARK!r} + json.dumps(sorted(names)))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
+    marked = [ln for ln in result.stdout.splitlines() if ln.startswith(_PARSING_PROBE_MARK)]
+    assert len(marked) == 1, f"the probe printed {len(marked)} marked lines: {result.stdout!r}"
+    loaded: list[str] = json.loads(marked[0].removeprefix(_PARSING_PROBE_MARK))
+    inside = frozenset(
+        m
+        for m in loaded
+        if m == "messagefoundry.parsing" or m.startswith("messagefoundry.parsing.")
+    )
+    outside = frozenset(m for m in loaded if not _parsing_may_reach(m))
+    return _ParsingProbe(outside, inside)
+
+
+def test_importing_parsing_loads_nothing_outside_its_allowlist() -> None:
+    probe = _parsing_import_probe()
+    assert not probe.outside, (
+        f"importing messagefoundry.parsing loaded {sorted(probe.outside)}, which CLAUDE.md section "
+        f"4's client carve-out does not cover (allowed: {_PARSING_MAY_REACH})"
+    )
+    # A probe that loaded next to nothing gives the same clean answer as a clean package.
+    floor = _MIN_FILES_WALKED["parsing"]
+    assert len(probe.inside) >= floor, f"only {len(probe.inside)} parsing modules (floor {floor})"
+    # The module that carried the config edge must be in the run, or its fix is not what went green.
+    assert "messagefoundry.parsing.sniff" in probe.inside, sorted(probe.inside)
+
+
+@pytest.mark.parametrize(
+    ("plant", "expect"),
+    [
+        # The two edges #1596 removed, planted back. Each must red the allowlist on its own.
+        ("import messagefoundry.config.models", "messagefoundry.config.models"),
+        ("import messagefoundry.logging_setup", "messagefoundry.logging_setup"),
+        # A runtime layer the allowlist never had to name to exclude.
+        ("import messagefoundry.store.base", "messagefoundry.store"),
+    ],
+)
+def test_the_parsing_probe_sees_a_planted_engine_import(plant: str, expect: str) -> None:
+    # The control that fires. Without it, a probe that cannot see a forbidden module and a package
+    # that is genuinely clean give the same green. The negative arm is the clean test above: the
+    # allowed leaves load on every run and must not be reported.
+    probe = _parsing_import_probe(plant)
+    assert expect in probe.outside, f"planted `{plant}`; the probe reported {sorted(probe.outside)}"

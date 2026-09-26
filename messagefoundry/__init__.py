@@ -43,7 +43,6 @@ if TYPE_CHECKING:
         AckMode,
         BatchConfig,
         BuildupThreshold,
-        ContentType,
         InternalErrorPolicy,
         OrderingMode,
         RetryPolicy,
@@ -92,6 +91,7 @@ if TYPE_CHECKING:
         outbound,
         router,
     )
+    from messagefoundry.content_type import ContentType
     from messagefoundry.diagnostics import checkpoint, log_note
     from messagefoundry.fhirsearch import FhirRaw, FhirToken
     from messagefoundry.parsing.compression import (
@@ -150,7 +150,7 @@ _LAZY_EXPORTS: dict[str, str] = {
     "AckMode": "messagefoundry.config.models",
     "BatchConfig": "messagefoundry.config.models",
     "BuildupThreshold": "messagefoundry.config.models",
-    "ContentType": "messagefoundry.config.models",
+    "ContentType": "messagefoundry.content_type",
     "InternalErrorPolicy": "messagefoundry.config.models",
     "OrderingMode": "messagefoundry.config.models",
     "RetryPolicy": "messagefoundry.config.models",

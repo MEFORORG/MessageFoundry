@@ -152,7 +152,8 @@ __all__ = [
 # benign-but-unmapped escape sequences (hl7/util.py unescape), a PHI leak hit on every message via
 # summarize(). Silence its loggers the moment the parsing layer — the only thing that triggers
 # unescape — is imported, so CLI/embedded paths that never call configure_logging() are covered too.
-# Idempotent; configure_logging() also calls it for the serve path.
-from messagefoundry.logging_setup import silence_phi_prone_dependency_loggers as _silence_hl7
+# Idempotent; configure_logging() also calls it for the serve path. Imported from its stdlib-only leaf
+# and not from logging_setup, which would load the config layer into this package (BACKLOG #1596).
+from messagefoundry.phi_log_silencer import silence_phi_prone_dependency_loggers as _silence_hl7
 
 _silence_hl7()
