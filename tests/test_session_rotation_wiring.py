@@ -29,6 +29,7 @@ from messagefoundry.auth.service import STEP_UP_ACTION_MFA_ENROLL, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import ADMIN_USERNAME, login_admin
 
 
 async def _store() -> MessageStore:
@@ -39,14 +40,6 @@ async def _service(**settings: object) -> tuple[AuthService, MessageStore]:
     store = await _store()
     settings.setdefault("login_rate_limit_enabled", False)
     return AuthService(store, AuthSettings(**settings)), store
-
-
-async def _bootstrap_login(service: AuthService) -> tuple[Identity, str, str]:
-    boot = await service.initialize()
-    assert boot is not None
-    out = await service.login("admin", boot.password)
-    assert out.ok and out.identity is not None and out.token is not None
-    return out.identity, out.token, boot.password
 
 
 async def _enable_totp(
@@ -92,7 +85,7 @@ async def test_reauth_rotates_the_session() -> None:
     """
     service, store = await _service()
     try:
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         elevation = await service.reauth(identity, password, token=token)
         assert elevation.ok
         await _assert_rotated(service, token, elevation.token)
@@ -108,14 +101,14 @@ async def test_verify_mfa_rotates_the_session(monkeypatch: pytest.MonkeyPatch) -
     """
     service, store = await _service(require_mfa=True)
     try:
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         t0 = 1_000_000.0
         secret, token = await _enable_totp(
             service, identity, token, monkeypatch=monkeypatch, instant=t0
         )
 
         # Re-login to get a genuinely MFA-PENDING session, which is the state under test.
-        out = await service.login("admin", password)
+        out = await service.login(ADMIN_USERNAME, password)
         assert out.token is not None
         pending = out.token
         assert await service.mfa_satisfied(pending) is False
@@ -140,7 +133,7 @@ async def test_confirm_mfa_enrollment_rotates_the_session() -> None:
     """
     service, store = await _service()
     try:
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
 
         elevation = await service.confirm_mfa_enrollment(
@@ -165,13 +158,13 @@ async def test_the_elevated_state_is_readable_on_the_new_token(
     """
     service, store = await _service(require_mfa=True)
     try:
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         t0 = 1_000_000.0
         secret, _ = await _enable_totp(
             service, identity, token, monkeypatch=monkeypatch, instant=t0
         )
 
-        out = await service.login("admin", password)
+        out = await service.login(ADMIN_USERNAME, password)
         assert out.token is not None
         t1 = t0 + totp.DEFAULT_PERIOD
         pin_totp_clock(monkeypatch, t1)
@@ -201,14 +194,14 @@ async def test_a_failed_elevation_rotates_nothing(
     """
     service, store = await _service()
     try:
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         if ceremony == "reauth":
             elevation = await service.reauth(identity, "wrong-password", token=token)
         elif ceremony == "verify_mfa":
             await _enable_totp(
                 service, identity, token, monkeypatch=monkeypatch, instant=1_000_000.0
             )
-            out = await service.login("admin", password)
+            out = await service.login(ADMIN_USERNAME, password)
             assert out.token is not None
             token = out.token
             elevation = await service.verify_mfa(token, "000000")
@@ -235,7 +228,7 @@ async def test_a_ceremony_on_a_revoked_session_fails_closed() -> None:
     """
     service, store = await _service()
     try:
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         await service.store.revoke_session(hash_token(token))
 
         elevation = await service.reauth(identity, password, token=token)
@@ -259,7 +252,7 @@ async def test_the_action_grant_is_minted_against_the_new_token() -> None:
     """
     service, store = await _service()
     try:
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         elevation = await service.reauth(
             identity, password, token=token, purpose=STEP_UP_ACTION_MFA_ENROLL
         )
@@ -291,7 +284,7 @@ async def test_the_passkey_legs_rotate_the_session() -> None:
     rp, origin = "t", "http://t"
     service, store = await _service(require_mfa=False)
     try:
-        identity, token, password = await _bootstrap_login(service)
+        identity, token, password = await login_admin(service)
         soft = SoftAuthenticator(rp_id=rp, origin=origin)
 
         opts = json.loads(
@@ -313,7 +306,7 @@ async def test_the_passkey_legs_rotate_the_session() -> None:
         assert token is not None
 
         # A fresh MFA-pending session, then the assertion leg.
-        out = await service.login("admin", password)
+        out = await service.login(ADMIN_USERNAME, password)
         assert out.token is not None
         options = await service.begin_webauthn_assertion(out.token, rp_id=rp)
         assert options is not None

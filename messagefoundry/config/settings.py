@@ -19,11 +19,13 @@ silently-dropped key leaves the setting it was meant to apply un-applied, with n
 reporting a problem. An unknown top-level **section** is still tolerated.
 
 The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
-oversight: the **env** and **CLI** layers still drop an unrecognized key silently. Env cannot be
-checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read straight from
-``os.environ`` by their consuming module and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``,
-``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership test would refuse a
-correctly-configured deployment; CLI keys are engine-written, never operator-spelled. The one
+oversight: the **env** layer and the ``cli`` mapping still drop an unrecognized key silently. Env
+cannot be checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read
+straight from ``os.environ`` by their consuming module and are not fields on any section
+(``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership
+test would refuse a correctly-configured deployment. ``cli`` keys are engine-written from parsed
+arguments, never operator-spelled; an operator's unknown flag never reaches them, because argparse
+refuses it first with exit 2. The one
 exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
 Anything stated to an operator about this refusal must carry that scope — see
 ``docs/CONFIGURATION.md``.
@@ -46,7 +48,14 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from messagefoundry.config.ai_policy import (
     AiDataScope,
@@ -222,6 +231,21 @@ class SqlAuth(str, Enum):  # noqa: UP042
     SQL = "sql"  # SQL login (username + password)
     INTEGRATED = "integrated"  # Windows Integrated auth
     ENTRA = "entra"  # Microsoft Entra ID (Azure AD)
+
+
+def refuse_a_blank_anchor_pin(value: str | None, setting: str) -> str | None:
+    """Refuse a trust-anchor SHA-256 pin that is set but blank (BACKLOG #1142).
+
+    ``None`` is the only spelling of "no pin". An empty or whitespace value, such as an environment
+    variable set to nothing, used to reach the anchor code as a pin and refuse there or, on a
+    connection, read as no pin at all. A blank pin is a mistake, so it refuses at load, naming the
+    setting. Shared with the per-connection ``tls_ca_pin`` check in ``auth/trust_anchors.py``."""
+    if value is not None and not value.strip():
+        raise ValueError(
+            f"{setting} is set but empty, so it pins nothing. Remove it for no pin, or set it to "
+            "the SHA-256 of the CA file (64 hex characters)"
+        )
+    return value
 
 
 class _Section(BaseModel):
@@ -925,7 +949,7 @@ class ApiSettings(_Section):
     tls_key_password: str | None = None
     # Minimum negotiated TLS version floor (NIST SP 800-52r2: 1.2+). "1.2" or "1.3".
     tls_min_version: str = "1.2"
-    # Optional OpenSSL cipher string (default = the interpreter's secure defaults).
+    # Optional OpenSSL cipher string (default = the approved AEAD suites, BACKLOG #300).
     tls_ciphers: str | None = None
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
@@ -1107,6 +1131,11 @@ class ApiSettings(_Section):
                     "collapsing every client source IP to the proxy)"
                 ) from exc
         return v
+
+    @field_validator("tls_client_ca_pin")
+    @classmethod
+    def _refuse_a_blank_client_ca_pin(cls, v: str | None) -> str | None:
+        return refuse_a_blank_anchor_pin(v, "[api].tls_client_ca_pin")
 
     @field_validator("tls_min_version")
     @classmethod
@@ -2138,8 +2167,10 @@ class AuthSettings(_Section):
     # active session. 0 = unlimited. Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
-    # re-verified its credential — at login or via POST /me/reauth — within this many seconds. The
-    # initial login counts as the first verification (sudo-timestamp model). Default 5 minutes.
+    # re-verified its credential -- at login, via POST /me/reauth, or with a code at
+    # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
+    # that owes no second factor counts as the first verification (sudo-timestamp model); a
+    # directory login (Kerberos, OIDC) does not (BACKLOG #1144). Default 5 minutes.
     step_up_max_age_seconds: int = 300
     # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), the durable-takeover
     # JSON routes — TOTP enroll/confirm, disable-MFA — require a fresh proof BOUND to
@@ -2168,7 +2199,7 @@ class AuthSettings(_Section):
     # secure default over back-compat. It cannot lock a fresh admin out: a required-but-unenrolled
     # Administrator can still reach the factor-enrollment routes (they are gated by a fresh PASSWORD
     # step-up bound to the enroll/confirm action, never by the MFA gate — see
-    # api/security.py:require_reauth_only_action), so the bootstrap admin enrolls TOTP then satisfies
+    # api/security.py:require_reauth_only_action), so a newly provisioned admin enrolls TOTP then satisfies
     # it. Set ``require_mfa = false`` (the documented opt-out) to revert to the single-factor default.
     # An off-loopback bind that serves local accounts MUST keep this on; ``serve`` makes that posture
     # explicit (sec-mfa-on) — on an exposed (non-loopback) PHI bind with this **explicitly opted out**
@@ -2238,28 +2269,13 @@ class AuthSettings(_Section):
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
-    # First-run bootstrap admin: auto-disabled once a second administrator exists, and (if still
-    # unclaimed — never password-changed) disabled this many hours after creation. 0 = no time expiry
-    # OF THE ACCOUNT, which is not the same as no expiry of its CREDENTIAL (BACKLOG #1245): the
-    # printed first-run password is separately bounded by `initial_password_expiry_hours`, so at 0 the
-    # account survives indefinitely while the credential still dies on that other clock. Setting this
-    # LONGER than that value has the same shape. The deadline surfaced in `bootstrap-admin.txt` is the
-    # EARLIER of the two for exactly this reason.
-    bootstrap_expiry_hours: int = 72
-    # ASVS 6.4.5 arm 2: how many hours BEFORE that auto-disable to start reminding an operator (via the
-    # `bootstrap_admin_expiring` AlertSink event) that the unclaimed first-run credential is about to be
-    # retired. The API-lifespan reminder fires once per process while now sits inside
-    # [expires_at - bootstrap_warn_hours, expires_at). Only meaningful when bootstrap_expiry_hours > 0.
-    bootstrap_warn_hours: int = 24
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
     # password, i.e. account takeover. Keyed on `password_changed_at`; a user who set their own password
-    # has `must_change_password=False` and is unaffected. THE BOOTSTRAP ADMIN IS NOT EXEMPT (BACKLOG
-    # #1245): it used to be, on the premise that `bootstrap_expiry_hours` covered it, but WP-3 retires
-    # an ACCOUNT while this expires a CREDENTIAL, and WP-3 cannot bound the credential at all when
-    # `bootstrap_expiry_hours = 0` or is set longer than this value. 0 = no expiry (not recommended on
-    # a PHI instance) — and note that setting THIS to 0 now also unbounds the first-run credential.
+    # has `must_change_password=False` and is unaffected. Every local account holding such a temporary
+    # password is in scope: the engine creates no default account (ADR 0183 Amendment A), so there is
+    # no carve-out to reason about. 0 = no expiry (not recommended on a PHI instance).
     initial_password_expiry_hours: int = 72
 
     # Active Directory / LDAP. The bind password is a secret: MEFOR_AUTH_AD_BIND_PASSWORD.
@@ -2488,6 +2504,11 @@ class AuthSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("ad_tls_ca_cert_pin", "oidc_tls_ca_cert_pin")
+    @classmethod
+    def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
+        return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
 
     @field_validator("oidc_clock_skew_seconds")
     @classmethod
@@ -3148,9 +3169,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         "content_match",  # #81 (ADR 0133): a code-first Handler ("Action Point") matched message content (PHI-free)
-        # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
-        # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
-        "bootstrap_admin_expiring",
+        # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
+        # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)
+        "initial_credential_expiring",
         # #122 (ADR 0162): an application-log sink was rolled after a write failure (stage 1) or is
         # UNWRITABLE and this process's connections were stopped (stage 2). Routable on its own so an
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
@@ -3436,8 +3457,9 @@ class AlertsSettings(_Section):
     # security-notification channel exists — SMTP transport (the settings above) configured AND the
     # [auth].notify_security_events kill-switch on (both are what api/app.py needs to wire the notifier)
     # — so account-security events (lockout, password/roles change, new-IP admin action) always have a
-    # push channel, not just the pull-only /me/security-events feed. Set false to accept the pull-only
-    # feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
+    # push channel, not just the pull-only /me/security-events feed. That feed carries the user's own
+    # events, not an administrator's change to their account (auth/notifications.py states the rule).
+    # Set false to accept the pull-only feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
     # messagefoundry/__main__.py.
     security_notifications_required: bool = True
 
@@ -5354,12 +5376,11 @@ def security_loosenings(
     load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
     It is not a ``[security]`` field, so the completeness floor (which iterates
     ``SecuritySettings.model_fields``) never covered it and its absence is not a floor-test gap. What
-    changed is the consequence: since #1245 removed the bootstrap's carve-out from the ASVS 6.4.1
-    gate, this value is the ONLY bound on the printed first-run administrator credential whenever
-    ``bootstrap_expiry_hours`` is 0 or longer than it. So setting it to 0 unbounds that credential,
-    and nothing in this registry says so. Reporting it needs a new REQUIRED parameter (every one here
-    is required by design, so an optional detector cannot be added quietly), which is a larger change
-    than the item that exposed it — filed as content rather than folded in.
+    matters is the consequence: it is the ONLY bound on an admin-issued temporary password, so
+    setting it to 0 unbounds every such credential, and nothing in this registry says so. Reporting it
+    needs a new REQUIRED parameter (every one here is required by design, so an optional detector
+    cannot be added quietly), which is a larger change than the item that exposed it — filed as
+    content rather than folded in.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second

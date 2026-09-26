@@ -55,6 +55,6 @@ Use the contact route already documented in [`.github/SECURITY.md`](../.github/S
 [GitHub private security advisory](https://github.com/MEFORORG/MessageFoundry/security/advisories/new),
 which is always available and stays private to the maintainers, or email the maintainer at the address
 on the GitHub profile. If you cannot reach a maintainer privately within a few business days, that
-page's documented fallback applies — a **non-detail** public issue, title only (for example,
+page's documented fallback applies — a **non-detail** public post, title only (for example,
 "requesting a private security contact"). Never put vulnerability detail, reproduction steps, or any
-message content in a public issue.
+message content in a public post.

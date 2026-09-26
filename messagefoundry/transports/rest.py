@@ -59,6 +59,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     insecure_hop_disposition,
     is_loopback_hop_host,
+    narrow_to_approved_suites,
     relax_verify_expiry,
     resolve_trust_anchor,
     urllib_handler_context,
@@ -366,6 +367,7 @@ def _insecure_opener(
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     # Verification is off, but the traffic is still encrypted, so the suite list still matters: assert
     # forward secrecy here too (ASVS 12.1.2), after the verify-off configuration is applied.
     harden_cipher_suites(ctx, connector="HTTP-family destination (TLS verification disabled)")
@@ -393,6 +395,7 @@ def _expiry_relaxed_opener(
     trust store, and vice versa."""
     ctx = build_verifying_client_context(trust_anchor)
     relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="HTTP-family destination (expired-certificate tolerance)")
     return urllib.request.build_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers

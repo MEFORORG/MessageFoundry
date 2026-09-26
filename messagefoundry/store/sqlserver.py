@@ -9675,7 +9675,8 @@ class SqlServerStore:
         self, username: str, *, limit: int = 100
     ) -> list[dict[str, Any]]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
-        /me/security-events`` (ASVS 6.3.5/6.3.7); admin-initiated changes go out-of-band by email."""
+        /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
+        user only by email, when one can be sent. ``auth/notifications.py`` states the rule."""
         return await self._fetchall(
             "SELECT TOP (?) ts, action, detail FROM audit_log "
             "WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC",
@@ -10357,14 +10358,34 @@ class SqlServerStore:
         )
 
     async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015)."""
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015); see ``AuthStore``."""
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
-            (issuer, subject, now, user_id),
+        sql = (
+            "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
+            " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
+            if expect_unbound
+            else "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
         )
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    sql,
+                    (issuer, subject, now, user_id),
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(count) > 0
 
     async def clear_user_federated_subject(
         self, user_id: str, *, now: float | None = None

@@ -65,7 +65,7 @@ _CONTROL_EXIT = 99
 # The identifying clause of the gate's refusal (messagefoundry/api/app.py). Copied, because the
 # shipped message is an inline f-string body with no exported constant -- see this file's PR for
 # the unfiled cleanup note.
-_REFUSAL = "no enabled Administrator has a notification address"
+_REFUSAL = "no enabled Administrator exists"
 
 _CHILD = """
 import asyncio
@@ -93,9 +93,9 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s %(mess
 
 # SMTP is fully wired on purpose: the transport gate in ``__main__`` would call this channel
 # healthy. A green transport over an undeliverable notice is the whole of #1020. The store starts
-# empty, so the only account that will exist is the bootstrap administrator the lifespan itself
-# mints -- created with no address, which is the genuine first-run state rather than a synthetic
-# row resembling it.
+# empty and, since ADR 0183 Amendment A, the lifespan mints no account into it, so the gate refuses
+# for want of any Administrator. That is the genuine first-run state rather than a synthetic row
+# resembling it.
 app = create_managed_app(
     db_path=Path(_TMP) / "phi.db",
     poll_interval=0.05,

@@ -52,7 +52,8 @@ dev = ["messagefoundry[dev]"]
 [project.urls]
 Homepage = "https://messagefoundry.org/"
 Source = "https://github.com/MEFORORG/MessageFoundry"
-Issues = "https://github.com/MEFORORG/MessageFoundry/issues"
+# Contributing, not Issues: CONTRIBUTING.md states the routes (BACKLOG #1755).
+Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTING.md"
 
 [tool.hatch.build.targets.wheel]
 # The import package is two levels up (the repo root); pull the whole tree into the wheel. The static

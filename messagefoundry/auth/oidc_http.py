@@ -9,9 +9,13 @@ callable as injected arguments, precisely so the network policy lives in one rev
 
 Trust model, mirroring ``ad_tls_ca_cert_file``:
 
-* ``ca_cert_file`` **set** → trust *exactly* that PEM (``ssl.create_default_context(cafile=…)``). The
-  OS verifier will not treat a ``load_verify_locations`` cert as an anchor on Windows, so pinning is
-  pinned-only, not additive — the same semantics ``apiclient`` documents for its ``cacert``.
+* ``ca_cert_file`` **set** -> trust *exactly* that PEM (``ssl.create_default_context(cadata=...)``),
+  pinned-only, not additive: the same semantics ``apiclient`` documents for its ``cacert``. The PEM
+  is loaded from the bytes the anchor check read, never by a second open of the file (BACKLOG #1142,
+  slice 2). This used to say the OS verifier would not treat a ``load_verify_locations`` cert as an
+  anchor on Windows. No OS verifier runs on the plain stdlib context built here, and that claim was
+  not re-measured for ``truststore``. The ``cadata=`` measurement that replaces it is stated once, at
+  :func:`~messagefoundry.auth.trust_anchors.verified_anchor_cadata`.
 * ``ca_cert_file`` **unset** → ``ssl.create_default_context()``, whose ``load_default_certs`` DOES
   consult the Windows machine store (CPython iterates ``('CA', 'ROOT')`` on win32 — measured: 79
   anchors on a stock domain-joined box), so a group-policy-published AD-CS enterprise root is honoured.
@@ -41,8 +45,12 @@ from collections.abc import Callable
 from typing import Any
 
 from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
-from messagefoundry.auth.trust_anchors import AnchorSpec, enforce_anchor
-from messagefoundry.config.tls_policy import harden_cipher_suites, harden_crl_check
+from messagefoundry.auth.trust_anchors import oidc_anchor_spec, verified_anchor_cadata
+from messagefoundry.config.tls_policy import (
+    harden_cipher_suites,
+    harden_crl_check,
+    narrow_to_approved_suites,
+)
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
     EgressReplyError,
@@ -103,19 +111,20 @@ def build_idp_opener(
     carries the client secret, the authorization code and the identity assertion, so accepting a
     revoked-but-unexpired IdP cert would be an authentication-material exposure.
     """
-    if ca_cert_file:
-        enforce_anchor(
-            AnchorSpec("oidc", "[auth].oidc_tls_ca_cert_file", ca_cert_file, pin),
-            enforcing=enforcing,
-        )
     # Both branches are plain stdlib contexts: no shared mutable verification state, so this opener is
     # safe to share across the asyncio.to_thread workers that drive the two IdP legs. See the module
     # docstring for why truststore is not used here.
-    ctx = (
-        ssl.create_default_context(cafile=ca_cert_file)
-        if ca_cert_file
-        else ssl.create_default_context()
-    )
+    if ca_cert_file:
+        # BACKLOG #1142, slice 2: load the bytes the pin, ACL and path check just read, as cadata=.
+        # cafile= here would open the file a second time, and a swap between the two reads would be
+        # trusted unchecked. A non-empty cadata= makes create_default_context skip the OS store, as
+        # cafile= does. An EMPTY one would load the whole OS store, because it tests cadata for
+        # truth, so anchor_cadata refuses an anchor with no PEM block before it gets here. A
+        # certificate inside crl_file still joins the store, by path: see verified_anchor_cadata.
+        cadata = verified_anchor_cadata(oidc_anchor_spec(ca_cert_file, pin), enforcing=enforcing)
+        ctx = ssl.create_default_context(cadata=cadata)
+    else:
+        ctx = ssl.create_default_context()
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
     # BACKLOG #299: revocation checking, loaded after the trust store is final so harden_crl_check's
@@ -126,6 +135,7 @@ def build_idp_opener(
     # Assert forward secrecy on the FINAL context (ASVS 12.1.2): this hop carries the client secret,
     # the authorization code and the identity assertion, so a recorded session that a future key
     # compromise could decrypt is an authentication-material exposure, not just a confidentiality one.
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="OIDC identity provider (token + JWKS)")
     return urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx))
 

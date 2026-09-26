@@ -1,8 +1,9 @@
 # AI-off completeness matrix — the deterministic build experience
 
 **Why this exists.** In a PHI environment, builders often cannot use AI assist at all — MessageFoundry's
-AI is environment-clamped on an OFF→PHI-safe spectrum, RBAC-gated by `ai:assist`, and even when on only
-ever sends `code_only`, never message bodies (CLAUDE.md §9, [`docs/AI.md`](AI.md)). A prod/PHI instance can
+AI is environment-clamped on an OFF→PHI-safe spectrum, RBAC-gated by `ai:assist`, and even when it is
+on, the IDE builds only `code_only` prompts. That is IDE behaviour, not an engine check on content; see
+[`docs/AI.md`](AI.md#the-ide-decides-what-the-assistant-sends-and-the-engine-checks-only-a-label). A prod/PHI instance can
 clamp it **OFF** entirely. So the IDE must be a **complete** authoring experience with AI off — not a
 degraded one.
 

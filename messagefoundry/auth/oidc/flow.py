@@ -86,6 +86,11 @@ class PendingFlow:
     return_to: str
     client_ip: str
     deadline: float
+    #: The hash of the session the browser presented at the START leg, if any (ASVS 7.2.4). The
+    #: callback cannot read it for itself: the session cookie is SameSite=Strict and the IdP's
+    #: redirect back is a cross-site navigation, so the browser withholds it there. Staged as a hash,
+    #: never the token, so a cache dump yields nothing that authenticates.
+    prior_session_hash: str | None = None
 
 
 class FlowCache:
@@ -155,6 +160,7 @@ def start_flow(
     client_ip: str,
     ttl_seconds: float = DEFAULT_FLOW_TTL_SECONDS,
     clock: Callable[[], float] = time.monotonic,
+    prior_session_hash: str | None = None,
 ) -> tuple[str, PendingFlow]:
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
@@ -169,6 +175,7 @@ def start_flow(
         return_to=return_to,
         client_ip=client_ip,
         deadline=clock() + ttl_seconds,
+        prior_session_hash=prior_session_hash,
     )
     cache.put(flow_id, flow)
     return flow_id, flow

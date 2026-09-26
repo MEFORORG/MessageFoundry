@@ -1319,6 +1319,8 @@ def MLLP(
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
+    tls_ca_pin: str
+    | None = None,  # INBOUND: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
@@ -1414,6 +1416,11 @@ def MLLP(
     verifies the server cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
     and may present ``tls_cert_file`` for mTLS.
 
+    **The inbound CA is checked before it is trusted** (BACKLOG #1142). ``tls_ca_pin`` is its
+    optional SHA-256. A pin that does not match refuses. Under ``[security].enforcement = enforce``
+    the engine also refuses a CA another account can replace, or one whose permissions it cannot
+    read; a matching pin lets the second case load. The Http and DICOM listeners take the same key.
+
     ``verify_ack_control_id`` (**outbound only**, BACKLOG #82) tightens the *accept* decision: when
     ``True``, a **positive** ACK (MSA-1 AA/CA) is accepted only if its MSA-2 (message control id)
     equals the sent message's MSH-10 — a reply carrying a different control id is treated as a
@@ -1445,8 +1452,9 @@ def MLLP(
 
     ``tls_ciphers`` (**both directions**, ADR 0188) is the opt-in OpenSSL cipher string for **this
     hop**, the per-connection sibling of ``[api].tls_ciphers``. Unset (the default) the listener and
-    the destination build exactly the context they build today — the interpreter's inherited suite
-    list, six CBC-SHA2 suites included, which is what keeps a legacy hospital peer negotiable. Set, the
+    the destination offer the approved AEAD suites, the default on every hop the engine builds
+    (BACKLOG #300). A legacy peer that speaks only CBC cannot negotiate TLS 1.2 with them, and this
+    setting cannot reopen CBC: the fix is a reviewed change to ``_APPROVED_TLS_SUITES``. Set, the
     string is validated by the **same** strict allow-list that guards ``[api].tls_ciphers`` (AEAD-only,
     forward-secret, encrypting, peer-authenticating, 128-bit floor) and then applied, so opting in
     NARROWS this one hop. A rejected string fails loud at construction, surfaced by
@@ -1481,6 +1489,7 @@ def MLLP(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_crl_file": tls_crl_file,
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
@@ -1690,6 +1699,7 @@ def Http(
     | EnvRef
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str | None = None,  # trust anchor — opt-in mTLS (require + verify a client cert)
+    tls_ca_pin: str | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
     | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     # --- Intake authentication (ADR 0154 D6) — a PEER control on this connector, not admin RBAC ---
@@ -1815,6 +1825,7 @@ def Http(
         "tls_key_file": tls_key_file,
         "tls_key_password": tls_key_password,
         "tls_ca_file": tls_ca_file,
+        "tls_ca_pin": tls_ca_pin,
         "tls_crl_file": tls_crl_file,
         "intake_auth": intake_auth,
         "intake_api_key": intake_api_key,
@@ -2573,6 +2584,9 @@ def DICOM(
     tls_ca_file: str
     | EnvRef
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
+    tls_ca_pin: str
+    | EnvRef
+    | None = None,  # SCP: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
     | EnvRef
     | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
@@ -2632,9 +2646,10 @@ def DICOM(
 
     **Per-connection suite list (``tls_ciphers``, both directions, ADR 0188).** The opt-in OpenSSL
     cipher string for **this** hop, the per-connection sibling of ``[api].tls_ciphers``. Unset (the
-    default) the SCP and the SCU build exactly the context they build today — the interpreter's
-    inherited suite list, six CBC-SHA2 suites included, which is what keeps an older modality or PACS
-    negotiable. Set, the string is validated by the **same** strict allow-list that guards
+    default) the SCP and the SCU offer the approved AEAD suites, the default on every hop the engine
+    builds (BACKLOG #300). An older modality or PACS that speaks only CBC cannot negotiate TLS 1.2 with
+    them, and this setting cannot reopen CBC: the fix is a reviewed change to
+    ``_APPROVED_TLS_SUITES``. Set, the string is validated by the **same** strict allow-list that guards
     ``[api].tls_ciphers`` (AEAD-only, forward-secret, encrypting, peer-authenticating, 128-bit floor)
     and then applied, so opting in NARROWS this one hop. A rejected string fails loud at construction,
     surfaced by ``messagefoundry check`` / dry-run."""
@@ -2653,6 +2668,7 @@ def DICOM(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_crl_file": tls_crl_file,
             "tls_allow_expired": tls_allow_expired,
             "tls_ciphers": tls_ciphers,
@@ -3173,7 +3189,7 @@ def Sftp(
     port: int | EnvRef = 22,
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
-    private_key: str | EnvRef | None = None,  # PEM private key text/path — secret, use env()
+    private_key: str | EnvRef | None = None,  # RSA private key TEXT, not a path — secret, use env()
     key_password: str | EnvRef | None = None,  # passphrase for an encrypted key — secret, use env()
     known_hosts: str | EnvRef | None = None,  # extra known_hosts file (system hosts always loaded)
     remote_dir: str | EnvRef,

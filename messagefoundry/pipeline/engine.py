@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -243,6 +243,7 @@ class Engine:
         registry_guard: Callable[[Registry], None] | None = None,
         sandbox_settings: SandboxSettings | None = None,
         log_dir: str | None = None,
+        registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
     ) -> None:
         self.store = store
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
@@ -260,6 +261,12 @@ class Engine:
         # before the shard filter, so it sees the whole graph. It raises WiringError to refuse. `serve` passes the opt-in
         # [security].require_nonstatic_credentials gate here (BACKLOG #1182); None = no guard.
         self._registry_guard = registry_guard
+        # An optional async check over every graph this engine is about to RUN: the first load (by the
+        # managed app) and every real reload, after the shard filter, before the swap. Dry runs skip
+        # it, because it writes audit rows. It gets the graph and this instance's env() values and
+        # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
+        # (BACKLOG #1142, slice 3); None = no preflight.
+        self._registry_preflight = registry_preflight
         # Cluster coordination seam (Track B Step 3). None → the no-op NullCoordinator, so single-node
         # (SQLite and single-node Postgres) is byte-identical: is_leader() is always True and
         # start()/stop() do nothing. A DbCoordinator (built by build_coordinator on an enabled [cluster]
@@ -1743,6 +1750,14 @@ class Engine:
         if self._registry_guard is not None:
             self._registry_guard(registry)
 
+    async def preflight_registry(self, registry: Registry) -> None:
+        """Run the engine's registry preflight over ``registry``; raises ``WiringError`` to refuse it.
+
+        A no-op when none was configured. Public for the same reason as :meth:`guard_registry`: the
+        managed app's first load reaches ``add_registry`` directly."""
+        if self._registry_preflight is not None:
+            await self._registry_preflight(registry, self._env_values)
+
     async def reload(
         self,
         config_dir: str | Path | None = None,
@@ -1895,6 +1910,10 @@ class Engine:
                 "refusing to reload to an empty graph"
             )
         runner = self._registry_runner
+        if not dry_run:
+            # The graph this process will run, so after the shard filter. Before anything is swapped,
+            # so a refusal leaves the live graph as it was (BACKLOG #1142, slice 3).
+            await self.preflight_registry(registry)
         if dry_run:
             # Validate against THIS environment without swapping: build-check every connector (which
             # resolves env() refs against this instance's values and raises on a missing key or bad
