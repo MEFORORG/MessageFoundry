@@ -361,6 +361,7 @@ def _loosening_names(attested_hops: tuple[str, ...]) -> list[str]:
             expiry_relaxed_hops=(),
             unverified_db_hops=(),
             attested_hops=attested_hops,
+            revocation_attested_hops=(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )

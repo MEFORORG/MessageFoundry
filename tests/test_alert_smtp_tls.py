@@ -215,6 +215,7 @@ def _names(**kw: Any) -> list[str]:
             expiry_relaxed_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
+            revocation_attested_hops=(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -262,6 +263,7 @@ def test_an_unconfigured_alert_transport_reports_no_hop_deviation() -> None:
             expiry_relaxed_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
+            revocation_attested_hops=(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )

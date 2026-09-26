@@ -4715,9 +4715,9 @@ class SecuritySettings(_Section):
     # An operator who needs a specific one relaxed uses that gate's own switch — allow_unencrypted_phi,
     # block_unlisted_outbound, allow_keeping_phi_indefinitely, allow_single_factor_admin_when_exposed,
     # allow_unverified_alert_smtp_tls, [alerts].security_notifications_required, a per-connection
-    # cleartext_accepted or tls_revocation_attested (each with its mandatory reason), the process-wide
-    # MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Each of those is separately
-    # named and separately audited; the retired lever was neither, and it silenced nineteen gates at
+    # cleartext_accepted, tls_hop_attested or tls_revocation_attested (each with its mandatory reason),
+    # the process-wide MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Each of those
+    # is separately named and separately audited; the retired lever was neither, and it silenced nineteen gates at
     # once. Setting it is now REFUSED at load with a message naming this decision (see `_REMOVED_KEYS`).
     #
     # The production TIER stays: it is a true property of the instance and it drives the AI
@@ -5145,8 +5145,8 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "(BACKLOG #1279). The PHI gates this used to relax as a group each have their own switch — "
         "[security].allow_unencrypted_phi, block_unlisted_outbound, allow_keeping_phi_indefinitely, "
         "allow_single_factor_admin_when_exposed, allow_unverified_alert_smtp_tls, "
-        "[alerts].security_notifications_required, a per-connection cleartext_accepted or "
-        "tls_revocation_attested (each with its reason), the process-wide "
+        "[alerts].security_notifications_required, a per-connection cleartext_accepted, "
+        "tls_hop_attested or tls_revocation_attested (each with its reason), the process-wide "
         "MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Relax the one you mean, "
         "or delete this line"
     ),
@@ -5355,6 +5355,7 @@ def security_loosenings(
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
     attested_hops: Sequence[str],
+    revocation_attested_hops: Sequence[str],
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
 ) -> list[tuple[str, str]]:
@@ -5367,11 +5368,11 @@ def security_loosenings(
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), four per-connection
+    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, a generic-ODBC ``DATABASE`` hop
-    with TLS unenforced (#333), and ``tls_hop_attested`` (owner ruling 2026-09-24) -- the store
-    principal's OBSERVED privilege posture (#1008), and the OBSERVED keying of the audit chain
-    (#1905). It is NOT yet
+    with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
+    ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
+    (#1008), and the OBSERVED keying of the audit chain (#1905). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -5412,16 +5413,18 @@ def security_loosenings(
     ``None`` has the same meaning as for ``store_privilege`` -- no store is open at this call site, so
     nothing was observed -- and is never read as a clean result.
 
-    The four sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
+    The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
     ``tls_allow_expired`` (#129 / ADR 0094), ``unverified_db_hops`` is a generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment), and
-    ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24). They arrive as
+    ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24), and
+    ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173). They arrive as
     plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``; ``unverified_generic_db_hops``, which walks inbound as well as
-    outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads). A caller that
+    outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
+    ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``). A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
@@ -5735,6 +5738,23 @@ def security_loosenings(
                 f"see ({named}) — the engine stops protecting those hops and ALLOWs a cleartext or "
                 "verify-off crossing it would otherwise refuse; if an attestation is false, the payload "
                 "and any credential cross in the clear",
+            )
+        )
+    if revocation_attested_hops:
+        named = ", ".join(sorted(revocation_attested_hops))
+        # BOTH halves, for the reason tls_allow_expired gives above, and each stated only as far as
+        # it is true. The attestation relaxes ONE refusal (revocation) wherever it would apply; it
+        # does not claim the hop verifies a chain, because authoring checks only the flag/reason
+        # pair and cannot know the hop's TLS shape. What it cannot do is reach a cleartext or
+        # verify-off hop, whose own refusals it never lifts -- that is the true mitigation.
+        out.append(
+            (
+                "tls_revocation_attested",
+                f"{len(revocation_attested_hops)} connection(s) attest that certificate revocation "
+                f"is checked outside the engine ({named}) — wherever the posture-keyed revocation "
+                "refusal would apply to those hops it is lifted, so a revoked certificate is caught "
+                "only if that external PKI control works; the attestation never lifts a cleartext "
+                "or verify-off refusal",
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like

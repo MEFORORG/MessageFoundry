@@ -216,6 +216,7 @@ def _loosening_names(audit_chain_unkeyed: bool | None) -> set[str]:
             expiry_relaxed_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
+            revocation_attested_hops=(),
             store_privilege=None,
             audit_chain_unkeyed=audit_chain_unkeyed,
         )

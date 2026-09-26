@@ -70,8 +70,9 @@ def main() -> int:
     if executed < args.min_executed:
         print(
             f"::error::the tooling marker EXECUTED only {executed} tests (floor {args.min_executed}) "
-            f"-- the partition is not being applied; check tests/tooling_manifest.txt and the "
-            f"pytest_collection_modifyitems hook in tests/conftest.py that reads it"
+            f"-- the partition is not being applied; check tests/tooling_manifest.txt, the parser "
+            f"that reads it in tests/_tooling_manifest.py, and the pytest_collection_modifyitems "
+            f"hook in tests/conftest.py that applies the marker"
         )
         return 1
     return 0

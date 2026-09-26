@@ -72,16 +72,17 @@ section reference.
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
+| | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 
-**Eight of these do not live in `[security]`.** `[store].aad_bind`,
+**At least nine of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds` and
 `[secret_rotation].enforce_store_key_expiry` sit in their own
-sections for cohesion, and the last four are per-**connection** facts, not service
+sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 first four are named by `security_loosenings()` from the loaded
-`[store]`/`[auth]`/`[secret_rotation]` sections; the last
-three are resolved from the loaded connection graph and passed in by name (see their entries below for
+`[store]`/`[auth]`/`[secret_rotation]` sections; the per-connection
+rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
 
 > **Scope, stated plainly.** The registry covers *every* `[security]` switch (a completeness floor in
@@ -600,8 +601,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 > `connections.toml` key (not under `[settings]`), always paired with a mandatory
 > `tls_revocation_attested_reason`.
 > [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
-> §1.5 item 4. It is **not** in the switch table above, because that table lists what
-> `security_loosenings()` reports, and this does not reach it yet; see the last bullet.
+> §1.5 item 4.
 - **What you lose:** the engine's refusal of a *verifying* TLS hop that checks no certificate
   revocation. On an outbound hop that is the `RevocationHopGuard` refusal (stdlib `ssl` fetches no
   OCSP or CRL). On an mTLS listener it is the `check_inbound_revocation` refusal of a listener with
@@ -618,9 +618,14 @@ This section is kept rather than deleted, because the claim it used to make is t
   instance would otherwise refuse, the engine logs a WARNING naming the hop and your reason, at every
   construction. That record is a log line, not an `audit` table row, for the reason given under
   `cleartext_accepted` above.
-- **Where it is NOT reported yet:** `messagefoundry check`, `security_loosenings()` and
-  `GET /security/posture` do not list the attested set, as they do for `cleartext_accepted` and
-  `tls_allow_expired`. Until they do, find it by searching your config for `tls_revocation_attested`.
+- **It is never silent:** the WARNING above at each construction where it suppresses a refusal; a
+  `tls-revocation-attested` line in `messagefoundry check` naming every attesting connection and its
+  reason; and a `tls_revocation_attested` entry in `security_loosenings()`, and so in
+  `GET /security/posture` on a running engine. All three walk inbound, outbound and `FhirLookup`
+  connections; inbound names are prefixed `inbound:` and lookups `fhir_lookup:`. **Not** the
+  serve-time loosening warning, which fires before the graph is loaded, exactly as for
+  `cleartext_accepted`. Where it is NOT reported is the same list as `cleartext_accepted` above:
+  `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
 
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
 > **Connection-scoped**, and unlike the two above it is not a flag anyone sets — it is the *absence* of a

@@ -108,6 +108,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A failed SMART token mint in `fhir_lookup` now raises `FhirLookupError`, not a raw
+  `DeliveryError`.** A lookup mints its bearer before the GET, outside the handling that maps
+  every other lookup failure. So a token endpoint that was down, refused the client, or sent a bad
+  reply let the provider's own error escape. A Handler that catches `FhirLookupError`, as the lookup
+  contract says to, would have missed it. The mint now maps to `FhirLookupError`, with the cause
+  chained. The message names the redacted token URL and a status or reason. It never carries the
+  client assertion or the reply body. An over-length configured token URL maps the same way, with
+  a fixed message. Three more raw errors reached a Handler from `fhir_lookup` and now map the same
+  way:
+  - A read that gets no result within the Handler's 30-second wait. That wait covers the token mint
+    and the GET together, and each has its own 30-second default. So a token endpoint that never
+    answers used to surface as a bare `TimeoutError`.
+  - A malformed status or header line from the FHIR server itself. The message names the error
+    class only.
+  - The same malformed reply from the token endpoint.
+
+  The SMART provider also raised errors outside its own `DeliveryError` contract: for a malformed
+  status line, a deeply nested reply, and an `expires_in` too large for a float. It now raises
+  `DeliveryError` for each. So a FHIR or REST destination using SMART would retry them as transient
+  failures rather than treat them as internal errors. An `expires_in` of `1e999` parses as infinity,
+  and the provider would have cached that token forever. It now caches a token for at most one hour
+  after the expiry skew, and treats a `NaN` lifetime as a missing one. A deeply nested FHIR reply to
+  a lookup now maps to `FhirLookupError` too. The lookup executor's probe method has no caller yet and
+  gets the same mappings.
+  (`BACKLOG #1980`)
 - **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
   it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
   `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals
@@ -185,6 +210,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   could write it there and pass the enforcing cleartext-bind refusal unreported. Those settings keys
   are now refused at load, naming the supported surface. Owner ruling 2026-09-24; registry entry in
   `docs/SECURITY-LOOSENING.md`.
+- **BREAKING: `zip_decompress` now refuses any bytes before or after the archive.** Stdlib
+  `zipfile` finds the archive's end record by scanning back from the end of the input, and skips
+  anything in front of the archive as prepended data. So an archive with up to about 64 KiB of extra
+  bytes after it, or with any bytes before it, opened and read normally, and those bytes were dropped
+  without a word. Two archives joined end to end returned only the second one's members. On first
+  deployment, a Handler unpacking an untrusted archive would have taken those members and never
+  learned that anything else was there. Now bytes outside the archive raise `CompressionError`, the
+  same rule `deflate_decompress` follows. That includes a self-extracting archive's stub, so a
+  Handler must strip the stub first. An archive comment is part of the archive and is still
+  accepted. A comment shorter than its end record declares is refused as truncated. Bytes hidden
+  between two members are still not checked. ([BACKLOG #1976](docs/BACKLOG.md))
 - **Startup attestation now checks the web console, not just the engine.** The console ships as its
   own wheel, `messagefoundry-webconsole`, and runs inside the engine process. Attestation compared
   only the engine wheel's files, so a console file edited, added or deleted in place went unseen.
@@ -638,8 +674,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   with nothing that could set it, and on the inbound side the runner never filled it, so the attested
   branch of the mTLS listener's revocation check could not fire. A flag without a reason fails at load.
   Each time the attestation lets a hop through that an enforcing instance would refuse, the engine logs
-  a WARNING naming the hop and the reason. The revocation refusals name this lever again. It is not yet
-  listed by `messagefoundry check` or `security_loosenings()`.
+  a WARNING naming the hop and the reason. The revocation refusals name this lever again.
+- **The per-connection revocation attestation is now reported, like `cleartext_accepted` (ADR 0173).**
+  `messagefoundry check` has a `tls-revocation-attested` line naming every attesting connection and
+  its reason. `security_loosenings()`, and so `GET /security/posture`, has a `tls_revocation_attested`
+  entry. Both walk inbound, outbound and `FhirLookup` connections. Before this, the only record was the
+  WARNING logged at construction.
 - **BREAKING — sign-in now checks a stored passkey with the same rule as registration.** This
   reverses two promises in the 0.4.0 notes: "Passkeys registered on 0.3.2 still work" and "A
   passkey already registered on another curve still signs in". Neither holds any more. A stored

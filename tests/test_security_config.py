@@ -44,6 +44,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         expiry_relaxed_hops=(),
         unverified_db_hops=(),
         attested_hops=(),
+        revocation_attested_hops=(),
         store_privilege=None,
         audit_chain_unkeyed=None,
     )

@@ -143,6 +143,7 @@ __all__ = [
     "validate_config",
     "accepted_cleartext_hops",
     "expiry_relaxed_hops",
+    "revocation_attested_hops",
     "unverified_generic_db_hops",
     "overbroad_smart_scopes",
     "static_credential_db_hops",
@@ -4878,6 +4879,43 @@ def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
         for oc in registry.outbound.values()
         if oc.spec.settings.get("tls_allow_expired")
     )
+
+
+def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every connection that declares ``tls_revocation_attested``, as ``(name, reason)`` (ADR 0173).
+
+    The SINGLE reader of the attested set, on the same contract as :func:`accepted_cleartext_hops`, so
+    ``messagefoundry check``, ``security_loosenings()`` and ``GET /security/posture`` can never report
+    different sets. Sorted by name for a stable, diffable list.
+
+    The attestation says a revocation-checking PKI covers the hop OUTSIDE the engine, so the posture-
+    keyed revocation refusal is lifted wherever it would apply there. That suppression is logged as a
+    WARNING with the reason where it happens, and a log line is not the surface anyone queries later
+    -- this is. It lists what is DECLARED, not only hops where a refusal was actually lifted.
+
+    It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
+    ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
+    ``fhir_lookups`` (the SMART token hop a lookup signs in to). Inbound and outbound carry it as typed
+    fields, like ``cleartext_accepted``; a ``FhirLookup`` has no connection model, so it lands in the
+    spec's ``settings`` dict. Names are prefixed ``inbound:`` and ``fhir_lookup:`` because those are
+    separate namespaces that could otherwise collide with an outbound's name.
+
+    Pure -- it reads the loaded graph and touches nothing else."""
+    out: list[tuple[str, str]] = [
+        (oc.name, oc.tls_revocation_attested_reason or "(none recorded)")
+        for oc in registry.outbound.values()
+        if oc.tls_revocation_attested
+    ]
+    out.extend(
+        (f"inbound:{ic.name}", ic.tls_revocation_attested_reason or "(none recorded)")
+        for ic in registry.inbound.values()
+        if ic.tls_revocation_attested
+    )
+    for spec in registry.fhir_lookups.values():
+        if spec.settings.get("tls_revocation_attested"):
+            reason = spec.settings.get("tls_revocation_attested_reason")
+            out.append((f"fhir_lookup:{spec.name}", str(reason) if reason else "(none recorded)"))
+    return sorted(out)
 
 
 def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:

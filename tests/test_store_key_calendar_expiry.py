@@ -244,6 +244,7 @@ def test_the_opt_out_is_a_NAMED_security_loosening() -> None:
             expiry_relaxed_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
+            revocation_attested_hops=(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
@@ -269,6 +270,7 @@ def test_the_shipped_default_is_not_reported_as_a_loosening() -> None:
             expiry_relaxed_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
+            revocation_attested_hops=(),
             store_privilege=None,
             audit_chain_unkeyed=None,
         )
