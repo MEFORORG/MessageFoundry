@@ -3,7 +3,7 @@
 
 # ADR 0172 — The engine always serves TLS, minting a self-signed certificate on first run
 
-- **Status:** Accepted (2026-08-22)
+- **Status:** Accepted (2026-08-22); amended 2026-09-26 (early, audited renewal)
 - **Date:** 2026-08-22
 - **Supersedes:** [ADR 0143](0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)'s *decision*, not its analysis — see "What of 0143 survives" below
 - **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) · [ADR 0065](0065-web-ops-dashboard.md) · [ADR 0118](0118-secure-by-default-security-configuration-section.md) · BACKLOG #1276
@@ -100,13 +100,15 @@ none configured the engine mints a self-signed pair on first run, persists it, a
    strictly better than cleartext, strictly worse than an operator chain. A browser shows a trust
    interstitial until it is imported.
 5. **Mint-once, then reuse.** `_write_private_key` refuses to overwrite, so a second start loads
-   rather than rotating.
+   rather than rotating. *Amended 2026-09-26: mint once, reuse while fresh, renew early -- see the
+   amendment below.*
 6. **Re-minting an expired pair is AUDITED, never silent** (owner ruling, 2026-08-22). Nothing
    re-mints today and `build_api_ssl_context` performs no expiry check, so an unrefreshed pair
    would serve an expired certificate every client rejects. *Silent* is the defect in replacing a
    key on disk, not *replaces*: an audited re-mint keeps this decision true without a human and
    leaves a trail. Timing (at startup versus inside the expiry warn window) is a build detail —
-   both mutate disk identically, so the security question is settled for both.
+   both mutate disk identically, so the security question is settled for both. *Built 2026-09-26:
+   renewal at startup, and one audit row per re-mint -- see the amendment below.*
 
 **Storage:** beside the store database. That directory is already the engine's own writable
 state, already operator-controlled via `--db` / `[store].path`, and is **not** operator-authored
@@ -148,3 +150,55 @@ reaches the engine over plaintext, and 0143's http-safe subset is what covers it
 - **No deployment axis** ([§0](../../CLAUDE.md)) — zero instances, so nothing is served in the
   clear today and no upgrade breaks anyone. The change is cheap now and gets dearer with every
   client that learns the scheme its own way.
+
+## Amendment (2026-09-26) — early, audited renewal of the generated pair (owner ruling)
+
+**Owner ruling 2026-09-26, given to a Manager seat in session: the engine renews its generated pair
+early, at startup, and audits every replacement.** This amends decisions 5 and 6. It supersedes
+nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
+
+1. **Decision 5 now reads: mint once, reuse while fresh, renew early.** A start that finds a pair
+   with at least a third of its own lifetime left reuses it and writes nothing. A start that finds
+   less than a third left, or an expired pair, renews it: a new key and a new certificate under the
+   same two file names. For the 365-day pair a third is about 122 days. The threshold is a share of
+   the certificate's own validity period, so it does not hang on the 365 constant.
+2. **Why a third, and why early.** A renewal lands at an ordinary restart, such as a patch reboot,
+   months before any client could see an expired certificate. Renewing at expiry would leave the
+   engine serving a rejected certificate until the next restart after that day.
+3. **Only the engine's own pair is ever renewed.** Renewal needs all three: no `[api].tls_cert_file`
+   configured, the pair at the generated path beside the store, and a certificate of the shape the
+   engine mints. That shape is subject equal to issuer, a signature its own key verifies, and
+   `CA=false`. Anything else at that path is served as found, and a WARNING says why it was not
+   renewed. Under `tls_terminated_upstream` the engine serves no certificate, so it renews none.
+4. **At startup only, never mid-run.** Renewal runs under the one-writer lock that already
+   serialises the first-run mint, so N engine shards starting together renew once and the rest
+   reuse the result. The expiry monitor, which watches the served certificate, stays the alarm for
+   an engine that is never restarted.
+5. **How it replaces.** The new key is staged under a temporary name with `_write_private_key`
+   (`O_EXCL`, `0o600`, Windows DACL), and the new certificate beside it with the local-users read
+   grant the tray needs. The certificate is then moved over the live name first, and the key second.
+   A failure before the first move keeps an old pair that still serves, and the next start tries
+   again; an expired old pair has nothing to fall back on, so the start fails. A crash between the
+   two moves leaves a new certificate beside the old key. That pair does not load, so the next
+   start discards it, mints a fresh one, and reports it as an unusable pair.
+6. **Decision 6, realised: every re-mint of an existing pair is audited.** A renewal, a replaced
+   unusable pair, and a replaced half-pair each write one `api.tls_generated_pair_replaced` row to
+   the store's existing hash-chained audit log. The row carries the reason, the certificate path,
+   and the old and new SHA-256 fingerprints and expiry dates. It never carries key material. The
+   replacement happens before the store is open, so `serve` hands the event to the app, and the
+   lifespan writes the row as soon as the store opens, before any listener binds. A WARNING is also
+   logged at the moment of the renewal. A failed audit write cannot undo the replacement, so it does
+   not stop the engine; it is logged at ERROR with the whole record. A first-run mint replaces
+   nothing and writes no row.
+7. **One pair for all engine shards is now DECIDED, not accidental.** `serve --shards` gives every
+   shard the same state directory, which is why they already shared one pair; BACKLOG #1276 called
+   that accidentally correct. It is correct because the minted identity is `[api].host` and the
+   shards differ only by port. **The consequence to know:** a shard restarted alone inside the
+   renewal window, such as a crashed shard the supervisor restarts, renews the pair on disk while
+   its siblings keep serving the old certificate from memory. Both are valid, but a client pinning
+   one sees the other as unknown until the siblings restart. Restart the whole service after a
+   renewal to bring them together.
+8. **What an operator does after a renewal.** The renewed certificate is a new certificate. A
+   browser trust-store import and any copied `--cacert` file must be done again with the new
+   `api-generated-cert.pem`. The tray pins that file from the data directory; teaching it to notice
+   a changed fingerprint while it runs is separate work under BACKLOG #1276.
