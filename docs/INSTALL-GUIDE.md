@@ -85,7 +85,7 @@ the **GitHub CLI** (`gh` ≥ 2.49), and optionally `sigstore` (`pip install sigs
 file that passes.
 
 ```powershell
-$V = "0.1.0"   # the exact version you intend to install
+$V = "0.4.0"   # the exact version you intend to install
 
 # Download the wheel + its Sigstore bundle from that release's assets
 gh release download "v$V" --repo MEFORORG/MessageFoundry `
@@ -120,7 +120,7 @@ re-resolve the package name against the folder at install time, or `pip` could s
 different file than the one you just checked:
 
 ```powershell
-$V = "0.1.0"
+$V = "0.4.0"
 pip download "messagefoundry==$V" --no-deps -d .\verify
 if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit $LASTEXITCODE)" }
 
@@ -170,7 +170,7 @@ my-config-repo/
 ├─ environments/prod.toml
 ├─ messages/sets/example_adt.hl7   # a synthetic fixture (NO real PHI) that gates `check`
 ├─ messagefoundry.toml             # THIS instance's settings (environment + posture + store + API + egress)
-├─ requirements.txt                # pins the engine:  messagefoundry==0.1.0
+├─ requirements.txt                # pins the engine:  messagefoundry==0.4.0
 ├─ .github/workflows/check.yml     # CI: install the pinned engine + run `messagefoundry check` on every PR
 ├─ .vscode/settings.json           # points the VS Code extension at config/ + messages/
 ├─ .gitignore  .gitattributes      # excludes stores, secrets, captures, venvs, caches

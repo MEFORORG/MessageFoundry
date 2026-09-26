@@ -232,6 +232,16 @@ def test_guard_keeps_the_blanket_env_apart_from_the_per_connection_flag(
     assert guard.attested is False  # NOT OR'd in — that fold is what the clamp removed
 
 
+def test_the_connection_refusal_names_only_levers_an_operator_can_set() -> None:
+    """SDS-3.7 applied to the connection-shaped refusal TEXT. It offered ``tls_revocation_attested=true
+    on this connection``, but no ``outbound()`` factory parameter or ``connections.toml`` key sets that
+    field, so the remedy could not be performed. ``[tls].crl_file`` is a real setting and must stay."""
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused) as exc:
+        _guard(REMOTE).enforce_construction()
+    assert "[tls].crl_file" in str(exc.value)
+    assert "tls_revocation_attested" not in str(exc.value)
+
+
 def test_guard_audits_attestation_that_suppresses_prod_refusal(caplog) -> None:
     with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
         _guard(REMOTE, attested=True).enforce_construction()

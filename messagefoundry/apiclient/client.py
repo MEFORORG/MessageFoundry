@@ -463,7 +463,12 @@ class EngineClient:
         # (the load harness, any non-[console] install) must NOT need it just to construct a client.
         verify: ssl.SSLContext | bool = True
         if self.base_url.lower().startswith("https"):
-            verify = _build_verify_context(cacert, tls_client_cert, tls_client_key)
+            try:
+                verify = _build_verify_context(cacert, tls_client_cert, tls_client_key)
+            except OSError as exc:  # ssl.SSLError is an OSError
+                # A missing or non-PEM path is operator input, so it surfaces as the ApiError every
+                # caller already handles rather than as a traceback out of a GUI slot or a CLI run.
+                raise ApiError(f"cannot load TLS material for {self.base_url}: {exc}") from exc
         self._http = httpx.Client(base_url=self.base_url, timeout=timeout, verify=verify)
         self._token_cell = _TokenCell()
         self._user: CurrentUser | None = None
