@@ -278,9 +278,13 @@ async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIt
     here, the one known source left is a writer rollback that outran ``_ROLLBACK_TIMEOUT`` and
     is still pending.
 
-    If that entry rollback cannot be confirmed, because it failed or is still pending past its bound,
-    the guard raises :class:`AbandonedTransactionError` and never runs the block. Running it would
-    let its DML join the stranger's transaction, which is the torn write this guard exists to stop."""
+    If the bounded entry rollback leaves the transaction open, it either timed out or failed. The
+    guard then awaits one more rollback, unbounded. After a timeout that rollback queues behind the
+    pending one on aiosqlite's single worker thread, so it waits no longer than this block's own
+    statements would have. After a failure it most likely fails again, and that error propagates
+    before the block runs. If the transaction is somehow still open after it, the guard raises
+    :class:`AbandonedTransactionError`. In no case does the block run inside the stranger's
+    transaction, which is the torn write this guard exists to stop."""
     async with lock:
         if db.in_transaction:
             log.error(
@@ -290,6 +294,8 @@ async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIt
             )
             if await _unwind_txn(db, role="writer"):
                 raise asyncio.CancelledError
+            if db.in_transaction:
+                await db.rollback()
             if db.in_transaction:
                 raise AbandonedTransactionError(
                     "the writer connection still holds an abandoned transaction after the entry"
@@ -11660,11 +11666,16 @@ class MessageStore:
 
         The guard's entry rollback is what ensures that, so the ``_commit()`` below has no
         transaction to commit. Taken bare, that commit made any transaction another block had
-        abandoned durable (BACKLOG #1803). It stays for its other effect: sqlite3's ``commit()``
-        resets statements still in progress on the connection."""
+        abandoned durable (BACKLOG #1803). It stays for its other effect: it is one more call on the
+        connection's worker, and aiosqlite keeps the previous call's result alive until the next
+        call runs, so an undrained cursor from the last writer is released before the checkpoint.
+        The PRAGMA's own cursor is drained and closed for the same reason, so it cannot leave a
+        statement in progress for the next caller, such as :meth:`vacuum`."""
         async with _writer_guard(self._db, self._lock):
             await self._commit()
-            await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await cur.fetchall()
+            await cur.close()
 
     async def vacuum(self) -> None:
         """Rebuild the database file to reclaim space freed by purges (SQLite ``VACUUM``). VACUUM holds
@@ -11672,8 +11683,9 @@ class MessageStore:
         RetentionRunner schedules it at a daily off-peak time and it is off by default. Must run
         outside a transaction (VACUUM cannot run inside one); the guard's entry rollback ensures that
         without committing another block's abandoned work (BACKLOG #1803). The ``_commit()`` below
-        therefore commits nothing; it stays because VACUUM also refuses to run beside a statement
-        still in progress, and sqlite3's ``commit()`` resets those."""
+        therefore commits nothing. It stays because VACUUM also refuses to run beside a statement
+        still in progress: aiosqlite keeps the previous call's result alive until the next call runs,
+        and this one extra call releases an undrained cursor the last caller left."""
         async with _writer_guard(self._db, self._lock):
             await self._commit()
             await self._db.execute("VACUUM")
@@ -11713,7 +11725,8 @@ class MessageStore:
             # Fold the latest committed WAL frames into the main DB so the snapshot is point-in-time and
             # the -wal sidecar is empty. The guard's entry rollback leaves no open transaction to block
             # the checkpoint, so these commits commit nothing; taken bare, they made another block's
-            # abandoned work durable (BACKLOG #1803). They stay to reset statements still in progress.
+            # abandoned work durable (BACKLOG #1803). They stay because each is one more call on the
+            # connection's worker, which releases the result aiosqlite kept from the previous call.
             # Fully drain the PRAGMA's result cursor (an open cursor would leave "SQL statements in
             # progress" and abort the VACUUM INTO below).
             await self._commit()

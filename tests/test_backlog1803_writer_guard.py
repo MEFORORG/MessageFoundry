@@ -203,28 +203,82 @@ async def test_a_transaction_left_open_by_another_block_is_rolled_back_on_entry(
         await db.close()
 
 
-async def test_an_entry_rollback_that_cannot_clear_refuses_the_writer(
+async def _bounded_unwind_gave_up(_db: aiosqlite.Connection, *, role: str) -> bool:
+    """Stands in for `_unwind_txn` after it timed out or logged a failure: nothing rolled back."""
+    return False
+
+
+async def test_an_entry_rollback_that_gave_up_is_retried_before_the_block_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If the entry rollback fails, or is still pending past its bound, the stranger's transaction
-    is still open. Running the block would let its DML join that transaction, so the guard refuses
-    and the block never runs."""
+    """After a bounded rollback times out, the guard's second rollback queues behind the pending one
+    and clears the stranger's transaction, so an innocent writer still runs, and runs clean."""
     db = await _fresh(tmp_path)
     lock = asyncio.Lock()
+    monkeypatch.setattr(store_mod, "_unwind_txn", _bounded_unwind_gave_up)
+    try:
+        await db.execute("INSERT INTO t VALUES ('stranger')")
+        async with _writer_guard(db, lock):
+            assert not db.in_transaction, "the block ran inside the stranger's transaction"
+            await db.execute("INSERT INTO t VALUES ('mine')")
+            await db.commit()
+        assert await _keys(db) == ["mine"]
+    finally:
+        await db.close()
 
-    async def rollback_that_does_nothing(_db: aiosqlite.Connection, *, role: str) -> bool:
-        return False  # as _unwind_txn does after a logged failure or a timeout
 
-    monkeypatch.setattr(store_mod, "_unwind_txn", rollback_that_does_nothing)
+async def test_an_entry_rollback_that_fails_refuses_the_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rollback that fails leaves the stranger's transaction open. The failure propagates and the
+    block never runs, because its DML would join that transaction."""
+    db = await _fresh(tmp_path)
+    lock = asyncio.Lock()
+    real_rollback = db.rollback
+    monkeypatch.setattr(store_mod, "_unwind_txn", _bounded_unwind_gave_up)
+
+    async def failing_rollback() -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
     ran = False
     try:
         await db.execute("INSERT INTO t VALUES ('stranger')")
-        with pytest.raises(AbandonedTransactionError):
+        db.rollback = failing_rollback  # type: ignore[method-assign]
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
             async with _writer_guard(db, lock):
                 ran = True
         assert not ran, "the guard ran a writer on a connection holding a stranger's transaction"
         assert not lock.locked()
     finally:
+        db.rollback = real_rollback  # type: ignore[method-assign]
+        await db.rollback()
+        await db.close()
+
+
+async def test_a_transaction_that_survives_both_rollbacks_refuses_the_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last line: if the transaction is still open after both rollbacks, the guard raises
+    rather than run the block inside it."""
+    db = await _fresh(tmp_path)
+    lock = asyncio.Lock()
+    real_rollback = db.rollback
+    monkeypatch.setattr(store_mod, "_unwind_txn", _bounded_unwind_gave_up)
+
+    async def rollback_that_does_nothing() -> None:
+        return None
+
+    ran = False
+    try:
+        await db.execute("INSERT INTO t VALUES ('stranger')")
+        db.rollback = rollback_that_does_nothing  # type: ignore[method-assign]
+        with pytest.raises(AbandonedTransactionError):
+            async with _writer_guard(db, lock):
+                ran = True
+        assert not ran
+        assert not lock.locked()
+    finally:
+        db.rollback = real_rollback  # type: ignore[method-assign]
         await db.rollback()
         await db.close()
 
@@ -301,10 +355,6 @@ async def test_a_duplicate_username_leaves_no_open_transaction(tmp_path: Path) -
             await store.create_user(
                 user_id="alice-2", username="alice", auth_provider="local", now=2_000.0
             )
-        # An early-return writer must not hand a leaked transaction on. This one reads, finds no
-        # such user and returns before any DML.
-        assert await store.consume_totp_step("nobody", 1) is False
-        assert not store._db.in_transaction, "an early-return writer handed on an open transaction"
         # The double-submit shape: the WINNER's own next step opens a transaction of its own. With
         # the loser's refusal left open, that BEGIN failed and the winner got a 500.
         await store.set_user_roles("alice", [])
@@ -409,14 +459,19 @@ async def test_an_incref_of_a_missing_attachment_leaves_no_open_transaction(
         await store.close()
 
 
-@pytest.mark.parametrize("writer", ["wal_checkpoint", "vacuum", "withdraw_ad_channel_scope"])
-async def test_a_maintenance_or_late_writer_never_commits_a_strangers_transaction(
+@pytest.mark.parametrize(
+    "writer",
+    ["wal_checkpoint", "vacuum", "snapshot_to", "withdraw_ad_channel_scope", "consume_totp_step"],
+)
+async def test_a_maintenance_or_late_writer_never_passes_on_a_strangers_transaction(
     tmp_path: Path, writer: str
 ) -> None:
-    """``wal_checkpoint`` and ``vacuum`` used to open with a bare ``COMMIT`` to clear the connection,
-    which made any transaction another block had abandoned durable. ``withdraw_ad_channel_scope`` was
-    added after the 2026-09-18 census and took the lock bare. All three now run under the guard, so a
-    stranger's open write is rolled back on entry instead of riding out on their commit."""
+    """``wal_checkpoint``, ``vacuum`` and ``snapshot_to`` used to open with a bare ``COMMIT`` to
+    clear the connection, which made any transaction another block had abandoned durable.
+    ``withdraw_ad_channel_scope`` was added after the 2026-09-18 census and took the lock bare.
+    ``consume_totp_step`` stands for the early-return writers: taken bare, its read-only exit handed
+    the open transaction on to the next writer. All of them now run under the guard, so a stranger's
+    open write is rolled back on entry instead of riding out on a commit or being handed on."""
     store = await _store(tmp_path)
     try:
         # Left open on the writer, as a leaking block would leave it.
@@ -426,6 +481,10 @@ async def test_a_maintenance_or_late_writer_never_commits_a_strangers_transactio
         assert store._db.in_transaction
         if writer == "withdraw_ad_channel_scope":
             assert await store.withdraw_ad_channel_scope("nobody", "[]") is False
+        elif writer == "consume_totp_step":
+            assert await store.consume_totp_step("nobody", 1) is False  # the early return
+        elif writer == "snapshot_to":
+            await store.snapshot_to(tmp_path / "snapshot.db")
         else:
             await getattr(store, writer)()
         assert not store._db.in_transaction

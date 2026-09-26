@@ -13,9 +13,10 @@ issue no DML, and it checks that claim for each of them rather than taking the r
 Sibling of `tests/test_writer_txn_is_the_only_begin.py`, which pins the other half: that `BEGIN`
 appears only inside `_writer_txn`.
 
-WHAT THIS CANNOT SEE: a lock reached under another name (`lock = self._lock; async with lock:`), or
-DML an allowlisted block reaches through a `self.` helper. It guards against an honest new writer
-reaching for the old shape, not against evasion.
+WHAT THIS CANNOT SEE: a lock reached under another name (`lock = self._lock; async with lock:`), a
+writer that takes no lock at all, or DML or a commit an allowlisted block reaches through a `self.`
+helper (such as `_add_cipher_invocations_locked`). It guards against an honest new writer reaching
+for the old shape, not against evasion.
 """
 
 from __future__ import annotations
