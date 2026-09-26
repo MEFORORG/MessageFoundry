@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.09.04.1"
+$GateVersion = "2026.09.26.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -602,7 +602,8 @@ function Get-ChdirTargetRaw([string]$Text) {
 
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw,
                                    [switch]$AllTargets, [switch]$BaseFallback,
-                                   [switch]$ExplicitFirst, [string]$CarriedGitDir = "") {
+                                   [switch]$ExplicitFirst, [string]$CarriedGitDir = "",
+                                   [switch]$RepositoryOnly) {
     <#
     THREE OPT-IN SWITCHES, ALL DEFAULT OFF. Rules 3 and 3d call this with three positional arguments
     and are therefore byte-identical to before; only rule 3c opts in. That is deliberate blast-radius
@@ -641,6 +642,14 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     current DENY into an ALLOW, deliberately and in one measured shape (a governed cwd whose write the
     environment sends to an UNGOVERNED repository). Ranking it any lower would leave that refusal naming
     a repository the write never touches.
+
+    ``-RepositoryOnly`` -- return ONLY the repository tokens (the promoted `--git-dir`/`GIT_DIR` values,
+    and only under -ExplicitFirst; then the carried one), and nothing else: no `-C`, no base, no
+    working-tree token (BACKLOG #1869).
+    It is a DIFFERENT QUESTION rather than a longer list, which is why it is a separate call and not an
+    append: rule 3 asks it only for a HEAD-moving verb, where the REPOSITORY a token names is exactly
+    what decides whose HEAD moves. OFF IS BYTE-IDENTICAL, because the switch returns before either
+    branch below is reached, so every existing caller sees the list it has always seen.
     #>
     $out = @()
 
@@ -808,6 +817,18 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
         $rooted = $(if ($postC -and -not [System.IO.Path]::IsPathRooted($CarriedGitDir)) { Join-Path $postC $CarriedGitDir } else { $CarriedGitDir })
         $carried += $rooted
         $carried += (Join-Path $rooted "..")
+    }
+
+    # BEFORE $explicit, and before either branch, so the switch's OFF state cannot reach it. $promoted
+    # rides on -ExplicitFirst here exactly as it does below: that switch is the caller's answer to "does
+    # THIS invocation carry its own repository token", and without it a `--git-dir` belonging to an
+    # earlier command on the line would decide. $carried needs no such gate, for the reason the else
+    # branch below gives.
+    if ($RepositoryOnly) {
+        $repo = @()
+        if ($ExplicitFirst) { $repo += $promoted }
+        $repo += $carried
+        return @($repo | Where-Object { $_ })
     }
 
     $explicit = @()
@@ -2149,6 +2170,53 @@ re-dispatch. If you were only going to READ, do it directly -- reads are never b
 $gitInvocation = '(^|[\s;&|(''"\\/`])git(\.exe)?["'']?(\s|$)'
 
 # ---------------------------------------------------------------------------------------------------
+# THE VERB SPLIT RULE 3 DID NOT HAVE (BACKLOG #1869). Which of rule 3's verbs MOVE THE HEAD of the
+# repository they act on -- either which ref HEAD names, or which commit that ref names. It is the same
+# question rule 3b's per-verb ruling asks, and it answers the same way, with two narrowings that are
+# the whole reason this function reads arguments at all:
+#
+#   checkout, switch    MOVE, unless a `--` follows the verb. `checkout <ref> -- <path>` restores files
+#                       and leaves HEAD where it was, which is the pathspec case class A also allows.
+#   reset               MOVES ONLY WHEN IT NAMES A COMMIT, meaning a positional argument before any
+#                       `--`. `reset --hard` with no argument rewrites the tree and index and leaves
+#                       HEAD alone, and it MUST keep passing: withholding the repository token from rule
+#                       3 exists precisely so that shape is not refused.
+#   rebase, merge, cherry-pick, revert, am
+#                       MOVE, in every spelling. No destination analysis, for class B's reason: the
+#                       `--abort` forms move HEAD too.
+#   restore, stash, clean, apply
+#                       NEVER MOVE HEAD, so the repository token stays withheld from them.
+#
+# A RESET THAT NAMES A PATH IS READ AS NAMING A COMMIT. `reset HEAD f.txt` has a positional and is
+# treated as a HEAD move. That is a false deny, in the safe direction, and it is kept on purpose:
+# telling a commit from a path needs the repository, and a guess that errs toward ALLOW is the failure
+# this file keeps paying for.
+#
+# Reads the RAW line, anchored on the git invocation that owns the verb, because the scan string has
+# quoted spans blanked and `reset --hard "main"` would lose its only positional there -- which would
+# turn a HEAD move into an ALLOW.
+# ---------------------------------------------------------------------------------------------------
+function Test-VerbMovesHead([string]$Verb, [string]$Line) {
+    if ($Verb -in @("rebase", "merge", "cherry-pick", "revert", "am")) { return $true }
+    if ($Verb -notin @("checkout", "switch", "reset")) { return $false }
+    $at = [regex]::Match($Line, '\bgit(\.exe)?\b[^|;&]*?\s' + [regex]::Escape($Verb) + '(?=\s|$)')
+    # No anchor means the verb was found some other way; answer as though it moves HEAD, so an
+    # unparsed spelling denies rather than slipping through.
+    if (-not $at.Success) { return $true }
+    $after = $Line.Substring($at.Index + $at.Length)
+    $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
+    $toks = @($after -split '\s+' | Where-Object { $_ })
+    if ($Verb -ne "reset") { return (-not ($toks -contains '--')) }
+    # A plain loop, not a pipeline over a slice: `$(...)` unrolls an empty slice to $null, and piping
+    # $null into a filter runs it once on $null.
+    foreach ($t in $toks) {
+        if ($t -eq '--') { return $false }
+        if (-not $t.StartsWith('-')) { return $true }
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------------------------------------------
 # Rule 3 -- a git command that SWAPS THE PRIMARY'S WORKING TREE out from under the sessions standing
 # in it. This is not a hypothetical: a sibling session ran `git checkout <its-branch>` in the shared
 # primary and then detached HEAD, and every other session's files silently became a different commit's
@@ -2979,6 +3047,10 @@ $cleanupBullet
     # must not second-guess it -- `cd <primary> && git -C <sibling> rebase` acts on the sibling, and
     # denying it because the primary's path appears in the `cd` is a false positive.
     $anyInferredTarget = $false
+    # Set when a HEAD-moving verb reaches a governed repository through a REPOSITORY token alone
+    # (BACKLOG #1869); see the block inside the loop. Kept apart from $root because the harm differs:
+    # the tree is untouched, and the deny text must say what does move.
+    $headRoot = $null ; $headVerb = $null
     foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         # Match a git invocation however it is spelled: git, git.exe, or an absolute path to either.
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
@@ -3005,6 +3077,55 @@ $cleanupBullet
             if ($hit) { $root = $hit ; $verb = $segVerb ; $verbLine = $seg.Raw ; $targetRaw = $c ; break }
         }
         if ($root) { break }
+
+        # THE REPOSITORY TOKEN, FOR A HEAD-MOVING VERB ONLY (BACKLOG #1869). The candidate list above
+        # withholds `--git-dir` and `GIT_DIR` from this rule, correctly for the TREE: they select the
+        # repository and not the working tree, so `git --git-dir=<governed>/.git clean -fd` from an
+        # ungoverned cwd leaves the governed files alone and must keep passing. But the same token DOES
+        # decide whose HEAD a HEAD-moving verb moves. `git --git-dir=<governed>/.git checkout <branch>`
+        # from an ungoverned cwd repoints the governed HEAD and leaves its files where they were, so a
+        # co-tenant standing in the primary sees modifications it never made. That was ALLOWED; the
+        # split below closes it without handing the token back to the tree-only verbs.
+        #
+        # THE SAME OWNERSHIP GATE RULE 3c USES. The promoted token counts only when THIS invocation's
+        # own window carries one, read off the blanked scan from the separator before the owning git
+        # token up to the verb, so a `--git-dir` in a commit message or on an earlier command in the
+        # chain does not decide. A carried GIT_DIR (an earlier `export` or `$env:` assignment) is read
+        # up to the verb, as rule 3c reads it up to the disarm.
+        #
+        # EVERY repository token the resolver returns is tried, not only the one git would use. A line
+        # carrying tokens for two commands can therefore refuse on the other command's token. That is
+        # a false deny, in the safe direction, and it is the price of never guessing which token wins.
+        #
+        # WHAT THIS DOES NOT COVER, read as "at least the following": a repository token naming a
+        # LINKED worktree's git dir under `.claude/worktrees/` (Test-Governed exempts it, and rule 3b
+        # does not read repository tokens either); every resolver residual rule 3c already lists, such
+        # as a token value containing a space; and a GIT_DIR set by an earlier tool call.
+        if (-not $headRoot -and (Test-VerbMovesHead $segVerb $seg.Raw)) {
+            $vm = [regex]::Match($seg.Scan, "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)")
+            $vIdx = $(if ($vm.Success) { $vm.Groups['verb'].Index } else { $seg.Scan.Length })
+            $own = $null
+            foreach ($g in @([regex]::Matches($seg.Scan, $gitInvocation))) {
+                if ($g.Index -le $vIdx) { $own = $g } else { break }
+            }
+            $ownStart = 0
+            if ($own) {
+                $sepBefore = [regex]::Matches($seg.Scan.Substring(0, $own.Index), '[;&|(){}]')
+                if ($sepBefore.Count -gt 0) {
+                    $last = $sepBefore[$sepBefore.Count - 1]
+                    $ownStart = $last.Index + $last.Length
+                }
+            }
+            if ($ownStart -gt $vIdx) { $ownStart = $vIdx }
+            $ownRepoToken = ($seg.Scan.Substring($ownStart, $vIdx - $ownStart) -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
+            $carriedHead = Resolve-CarriedGitDir ($seg.Prior + $seg.Scan.Substring(0, $vIdx))
+            if ($ownRepoToken -or $carriedHead) {
+                foreach ($c in @(Get-GitTargetCandidatesRaw $seg.Raw $segPrefix $cwdRaw -RepositoryOnly -ExplicitFirst:$ownRepoToken -CarriedGitDir $carriedHead)) {
+                    $hit = Test-Governed (Get-ComparablePath $c $cwdRaw)
+                    if ($hit) { $headRoot = $hit ; $headVerb = $segVerb ; break }
+                }
+            }
+        }
     }
     if (-not $verb) { exit 0 }
 
@@ -3084,28 +3205,25 @@ $cleanupBullet
             #
             # WHAT THE ALLOW DOES NOT SAY, because "allowed here" must not be read as "harmless". It is
             # scoped to the WORKING TREE and nothing wider. Two things it does not bound, both measured
-            # on the shipped gate with a control, both pinned by the test named above rather than
-            # certified here:
+            # on the shipped gate with a control. The index is pinned by the test named above; the HEAD
+            # by test_a_repository_token_cannot_move_a_governed_HEAD_either and its neighbours:
             #
             #   THE INDEX. The same allowed command rewrites the named repository's index -- a file
             #   staged in the primary goes back to untracked after `git --git-dir=<primary>/.git reset
             #   --hard` runs from an ungoverned cwd.
             #
-            #   THE HEAD, AND THIS ONE IS A LIVE FAIL-OPEN. `git --git-dir=<primary>/.git checkout
-            #   <branch>` from an ungoverned cwd is ALLOWED, and it really moves the primary's HEAD
-            #   while leaving its files where they are -- so a co-tenant session standing in the
-            #   primary sees modifications it never made, which is verbatim the harm rule 3's own deny
-            #   text describes. Control: the same verb spelled without the token DENIES, so the gate
-            #   and the rig both work and the allow belongs to this spelling. ATTRIBUTED: the
-            #   pre-correction resolver, which appended $promoted for this rule, DENIED it; withholding
-            #   the token to fix the false deny above is what opened this. Closing it needs a verb
-            #   split this rule does not have today -- `clean` and `reset --hard` must keep allowing,
-            #   `checkout` must not -- so it is named here rather than half-fixed.
+            #   THE HEAD, AND THIS WAS A LIVE FAIL-OPEN UNTIL BACKLOG #1869. `git --git-dir=<primary>/.git
+            #   checkout <branch>` from an ungoverned cwd was ALLOWED, and it really moved the primary's
+            #   HEAD while leaving its files where they were -- so a co-tenant session standing in the
+            #   primary saw modifications it never made. The allow above is still scoped to the TREE;
+            #   the HEAD half is now closed by a VERB SPLIT inside the segment loop (Test-VerbMovesHead
+            #   and the -RepositoryOnly resolver call), which hands the repository token back to rule 3
+            #   for HEAD-moving verbs only. `clean` and `reset` with no commit named keep allowing
+            #   through the same token; `checkout`, `reset <commit>` and the class B verbs deny.
             #
-            # DO NOT READ "rule 3b governs a HEAD" AS COVER FOR THE SECOND ONE. An earlier draft of this
-            # paragraph said exactly that and it is false for this token class; 3b judges a linked
-            # worktree's HEAD, not a repository named by `--git-dir` from outside. A reassurance that
-            # sends the reader away from a live gap is the defect this whole block exists to retire.
+            # DO NOT READ "rule 3b governs a HEAD" AS COVER FOR THIS. It is false for this token class;
+            # 3b judges a linked worktree's HEAD, not a repository named by `--git-dir` from outside.
+            # The verb split is what covers it, and only for a token naming a governed repository.
             #
             # Still deliberately conservative: `cd <primary>; cd <elsewhere>; git checkout` denies. Once a
             # command has stepped into the primary this hook stops reasoning about where it stepped next.
@@ -3113,6 +3231,30 @@ $cleanupBullet
                 '(?:\s+(?:/d|-path|-literalpath))?\s+["'']?' + $boundary
             if ($normalized -match $dirChange) { $root = $r; break }
         }
+    }
+    if (-not $root -and $headRoot) {
+        # THE TREE IS NOT WHAT MOVES HERE, SO THE TEXT DOES NOT SAY IT IS. Rule 3's own refusal below
+        # talks about the working tree; this one is the HEAD-only harm, and a refusal that misdescribes
+        # what it blocked teaches people to route around the gate.
+        $hDisplayQ = Get-SafeForCommand $headRoot.Display
+        $hVerbMsg = Get-SafeForMessage $headVerb
+        Write-Deny -Rule "3" -Detail "git $headVerb via repository token" -Reason @"
+BLOCKED: 'git $hVerbMsg' names the SHARED PRIMARY's repository ($(Get-SafeForMessage $headRoot.Display)) through --git-dir or GIT_DIR, and would move that checkout's HEAD.
+
+The files under the primary stay where they are, but its HEAD would name a different branch or commit.
+Every session standing in that directory then sees modifications it never made, and nothing in its own
+history explains them. Running from outside the primary does not change whose HEAD moves: the
+repository token decides that, not the directory you are standing in.
+
+What to do instead:
+  * To BUILD, work in your own worktree, with no --git-dir or GIT_DIR pointing at the primary:
+        pwsh -NoProfile -File $(Get-SafeForCommand $headRoot.Display -Suffix '\scripts\worktree\new.ps1') -Name <short-kebab-task-name>
+  * To READ another branch WITHOUT moving anything, use the plumbing:
+        git -C $hDisplayQ show <ref>:<path>        git -C $hDisplayQ log <ref>
+
+If none of those fit, STOP and tell the user: "I need to move the primary checkout's HEAD and the
+worktree gate blocked it." The primary's HEAD belongs to the user, not to a session.
+"@
     }
     if (-not $root) {
         # Not the shared primary. It may still be a governed LINKED WORKTREE being hijacked onto an
