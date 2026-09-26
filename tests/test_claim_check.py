@@ -6,9 +6,10 @@ Each test drives the REAL hook as a subprocess against a REAL throwaway git repo
 and real claim records — the same shape as tests/test_worktree_gate.py. Nothing is monkeypatched, because
 the thing under test is precisely how the hook reads git and the shared claim registry.
 
-The gate is deliberately narrow, and most of these tests pin what it must NOT block: a docs-only commit, a
-body-only mention, a commit with no BACKLOG token. A coordination gate that fires on those gets disabled
-by the first person it annoys, and then it protects nothing.
+The claim rule is deliberately narrow, and most of these tests pin what it must NOT block: a docs-only
+commit, a body-only mention, a commit with no BACKLOG token. A coordination gate that fires on those gets
+disabled by the first person it annoys, and then it protects nothing. The one rule that fires on every
+commit is the subject-shape rule of BACKLOG #1347, at the end of this file, and a reword satisfies it.
 """
 
 from __future__ import annotations
@@ -300,3 +301,137 @@ def test_the_live_tree_really_contains_files_this_guard_changes() -> None:
         f"only {len(reclassified)} file(s) sit under a documentation prefix with an executable or "
         "config extension; this guard was measured against 30"
     )
+
+
+# ------------------------------------------ BACKLOG #1347: every `#N` in the subject says what it is
+#
+# The claim rule can only see a number a BACKLOG token governs. A subject reading `(#1318, #1320)`
+# declared nothing, so it passed this gate while #1318 was claimed by another worktree -- and every
+# citation grep since read both items as unbuilt. The gate now refuses any `#N` in the subject that
+# is neither governed by a BACKLOG token nor labelled `PR #N`, with one exception: the trailing
+# `(#N)` a squash merge appends. Each refusal below is paired with the allowed shape beside it.
+
+
+@pytest.mark.parametrize(
+    ("subject", "rewrite"),
+    [
+        # Shape B from the row itself: no BACKLOG token at all.
+        (
+            "init writes a loadable config (#1318, #1320)",
+            "(BACKLOG #1318, #1320)",
+        ),
+        # A bare number standing BEFORE a group. The group is suggested with the cited item first.
+        ("fix(x): #5 regresses (BACKLOG #6)", "(BACKLOG #6, #5)"),
+        # Past the next `(`, a BACKLOG token governs nothing -- so a second group is bare.
+        ("fix(x): pair (BACKLOG #5) and (#6, #7)", "(BACKLOG #5, #6, #7)"),
+        # A synonym the citation checks cannot read.
+        ("fix(x): sweep nine files (ledger item #1552)", "(BACKLOG #1552)"),
+        # A subject that STARTS with `#N` is a subject, not a git comment line.
+        ("#1134: retire the stale corpus-size claims", "(BACKLOG #1134)"),
+        # A closed group ends what its token governs: #7 here is as likely a pull request.
+        ("fix(x): thing (BACKLOG #42) closes #7", "(BACKLOG #42, #7)"),
+        # A conventional-commit scope is the WORD, not the `BACKLOG #` token.
+        ("docs(backlog): file #1754 and #1755", "(BACKLOG #1754, #1755)"),
+    ],
+)
+def test_a_bare_number_in_the_subject_is_REFUSED_with_the_rewrite(
+    repo: Path, subject: str, rewrite: str
+) -> None:
+    _git(repo, "add", "code.py")
+    r = _run(repo, subject)
+    assert r.returncode == 1, f"a bare #N passed:\n{r.stderr}"
+    assert "no 'BACKLOG #' token governs" in r.stderr
+    assert rewrite in r.stderr, f"the refusal must spell the rewrite {rewrite!r}:\n{r.stderr}"
+    assert "NOT CLAIMED" not in r.stderr, "the subject refusal must come first, on its own"
+
+
+def test_the_bare_number_refusal_fires_on_a_docs_only_commit_too(repo: Path) -> None:
+    """A citation check reads a docs commit's subject exactly as it reads a code commit's, so the
+    docs-only exit that protects banner flips from the CLAIM rule does not apply to this one. The
+    twin is `test_docs_only_commit_is_never_blocked`, which still passes in the house form."""
+    _git(repo, "add", "docs/BACKLOG.md")
+    r = _run(repo, "docs(backlog): file #1401 and #1402")
+    assert r.returncode == 1
+    assert "(BACKLOG #1401, #1402)" in r.stderr
+
+
+def test_the_bare_number_refusal_fires_on_an_empty_diff_too(repo: Path) -> None:
+    """`git commit --amend` of a message is exactly where a subject gets reworded, and the reworded
+    subject is what a citation check will read."""
+    assert _run(repo, "fix(x): thing (#1318, #1320)").returncode == 1
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        # The squash suffix alone, and after a group.
+        "chore: tidy up (#1503)",
+        "docs(backlog): flip banner (BACKLOG #42) (#1503)",
+        # A revert of a squash-merged commit keeps the suffix inside its closing quote.
+        'Revert "docs(backlog): flip banner (BACKLOG #42) (#1503)"',
+        # Labelled pull requests.
+        "docs: record the PR #1397 retirement",
+        "Merge pull request #339 from MEFORORG/some-branch",
+        # The house form: prefix once, siblings bare.
+        "docs(backlog): four gates (BACKLOG #1319, #1322, #1323, #1331)",
+        # A bare BACKLOG token with no parenthetical governs what follows it.
+        "docs(backlog): BACKLOG #42, #43 flipped",
+        # Not a `#N` at all.
+        "docs(adr): finish ADR 0179 and ASVS 11.4.1",
+        # A git template comment line before the subject is still skipped.
+        "# Please enter the commit message\ndocs: tidy up",
+    ],
+)
+def test_a_labelled_or_suffix_number_is_ALLOWED(repo: Path, subject: str) -> None:
+    _git(repo, "add", "docs/BACKLOG.md")
+    r = _run(repo, subject)
+    assert r.returncode == 0, f"{subject!r} was refused:\n{r.stderr}"
+
+
+def test_a_bare_number_in_the_BODY_is_still_allowed(repo: Path) -> None:
+    """The subject declares what a commit implements; the body cites freely."""
+    _git(repo, "add", "docs/BACKLOG.md")
+    assert _run(repo, "docs: tidy up\n\nFound while landing #1318 and PR #7.\n").returncode == 0
+
+
+def test_the_squash_suffix_is_not_demanded_as_a_claim(repo: Path) -> None:
+    """The old reading took every `#N` after the BACKLOG token, so `(BACKLOG #42) (#1503)` also
+    demanded a claim on 1503 -- a pull request, not an item. The control is the claim on 42 alone:
+    this passes only if 1503 is read as the suffix it is."""
+    _write_claim(repo, "42")
+    _git(repo, "add", "code.py")
+    r = _run(repo, "feat(x): build it (BACKLOG #42) (#1503)")
+    assert r.returncode == 0, r.stderr
+
+
+def test_a_labelled_pull_request_inside_the_group_is_not_demanded_as_a_claim(repo: Path) -> None:
+    _write_claim(repo, "42")
+    _git(repo, "add", "code.py")
+    assert _run(repo, "feat(x): build it (BACKLOG #42, PR #7)").returncode == 0
+
+
+def test_the_suffix_exception_is_ONE_trailing_group_not_any_parenthesised_number(
+    repo: Path,
+) -> None:
+    """The control for the arm above: a lone `(#N)` in the MIDDLE of a subject is not a squash
+    suffix, and neither is a two-number trailing group."""
+    _git(repo, "add", "docs/BACKLOG.md")
+    assert _run(repo, "docs: file (#1401) before the rest").returncode == 1
+    assert _run(repo, "docs: file both (#1401) (#1402)").returncode == 1
+
+
+def test_a_revert_of_a_squash_merged_commit_passes_on_a_code_diff(repo: Path) -> None:
+    """The subject `git revert` writes for a squash-merged commit keeps the suffix inside its closing
+    quote. On a code diff it must pass on the claim alone, with no claim demanded for the suffix."""
+    _write_claim(repo, "42")
+    _git(repo, "add", "code.py")
+    r = _run(repo, 'Revert "feat(x): build it (BACKLOG #42) (#1503)"')
+    assert r.returncode == 0, r.stderr
+
+
+def test_the_refusal_offers_the_body_for_an_item_only_mentioned(repo: Path) -> None:
+    """Rewriting `regression from #1318` to `(BACKLOG #1318)` would then demand a claim on an item
+    this commit does not build. The refusal must name the third way out."""
+    r = _run(repo, "fix(x): the regression introduced by #1318")
+    assert r.returncode == 1
+    assert "move it to the commit body" in r.stderr

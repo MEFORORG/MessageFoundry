@@ -182,6 +182,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # the engine legs AND unreached by the tooling gate, so it would run on ZERO legs for the one
         # change it exists to stop.
         "test_writer_txn_is_the_only_begin.py",
+        # Its sibling, same reason: an AST scan of messagefoundry/store/store.py, read off disk,
+        # that reds on any SQLite writer taking the lock bare instead of through `_writer_guard`
+        # (BACKLOG #1803). What it catches arrives as a store.py diff, which the tooling gate does
+        # not see, so listed as tooling it would run on no leg for the change it exists to stop.
+        "test_writer_guard_covers_every_short_writer.py",
         # The four below were WRONGLY LISTED as tooling in the first cut of the manifest and were
         # caught by adversarial review, not by any guard here. Each reads real engine source without
         # importing it, so the marker took them off every engine leg while the tooling job's path gate

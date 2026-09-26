@@ -84,8 +84,12 @@
         full oid. A squash leaves no ancestry on main, so this is the only merge evidence this arm
         accepts. A pull request merged into any other base proves nothing about main;
       * that pull request names the claim's key in the house form, `BACKLOG #<key>`, where any `#N`
-        after a BACKLOG token on the same line counts (claim_check.py reads commit subjects the same
-        way). A bare `#N` is not enough: on the engine repository it is as often a pull request number.
+        after a BACKLOG token on the same line counts. claim_check.py reads a commit subject more
+        narrowly since BACKLOG #1347: its token is `BACKLOG #` rather than the word, a parenthesis
+        ends what a token governs, and `PR #N` is never an item. This reading was NOT narrowed with
+        it, so a pull request can name a key here that the gate would not count; narrowing it is a
+        separate change. A bare `#N` is not enough: on the engine repository it is as often a pull
+        request number.
         A tip is evidence about a branch, and a branch is not the unit a claim is about. One worktree
         can hold several keys, and a worktree stacked on another builder's tip carries that builder's
         merged tip before it does any work of its own. When several merged pull requests carry the
@@ -291,8 +295,8 @@ function New-PrEvidence($Pr, [string]$As) {
 }
 
 # Does the pull request name this claim's key in the house form? claim_check.py's reading of a commit
-# subject, applied per line: a BACKLOG token, then any `#N` after it on the same line, so
-# "(BACKLOG #1927, #1928)" names both. A bare `#N` does not count -- on the engine repository it is as
+# subject BEFORE BACKLOG #1347 narrowed it (see .DESCRIPTION), applied per line: a BACKLOG token, then any
+# `#N` after it on the same line, so "(BACKLOG #1927, #1928)" names both. A bare `#N` does not count -- on the engine repository it is as
 # often a pull request number. A free-text key can never be named, and returns $false.
 function Test-PullRequestNamesKey([string]$Key, [string]$Text) {
     if ($Key -notmatch '^\d+$' -or -not $Text) { return $false }

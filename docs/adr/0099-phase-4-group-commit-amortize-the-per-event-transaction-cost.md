@@ -15,7 +15,7 @@
 > F2 or F3.** This ADR's *decision* (withdraw group-commit, ratify 0069, gate the survivor) stands and was vindicated —
 > the gate is exactly what stopped the wrong build.
 
-> ⚠️ **The allocated filename reads *"Phase-4 group commit — amortize the per-event transaction cost."* That was the
+> **WARNING:** the allocated filename reads *"Phase-4 group commit — amortize the per-event transaction cost."* That was the
 > title I allocated before reading the ledger. **It is wrong.** Group-commit is not being built — it is being
 > **withdrawn**. The filename is retained because the ledger gate keys on the *number*; **the H1 above is the
 > authoritative title.**

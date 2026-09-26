@@ -662,6 +662,78 @@ async def test_ac3_a_binding_on_a_local_row_is_refused(
         await store.close()
 
 
+async def test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_name(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2027, the remainder of ADR 0184 AC-5 that slice C's bind refusal does not reach.
+
+    ``jdoe`` carries no ``directory_object_id`` and is bound anyway, as a binding made before slice
+    C would be; it is planted through the store because the bind now refuses it. The directory
+    returns no objectGUID and has reissued the name ``jdoe`` to a different person. Resolved by
+    name, the login would hand the pair's holder that person's groups. It is refused before the
+    directory is consulted, with no session, a generic error, and the precise reason on the audit
+    row.
+
+    The control, in the same service: an id-bearing bound row still signs in, so the refusal keys
+    on the missing id and not on the binding.
+    """
+    from messagefoundry_webconsole.routes.oidc import _REASON_TO_CODE
+
+    store = await MessageStore.open(":memory:")
+    try:
+        reissued = AdPrincipal(
+            username="jdoe",
+            display_name="Someone Else",
+            email="else@corp.example",
+            dn="CN=jdoe,OU=New,DC=corp,DC=example",
+            groups=PRINCIPAL.groups,
+            directory_object_id=None,
+        )
+        asmith = AdPrincipal(
+            username="asmith",
+            display_name="A Smith",
+            email="a@corp.example",
+            dn="CN=asmith,DC=corp,DC=example",
+            groups=PRINCIPAL.groups,
+            directory_object_id=_oid("asmith"),
+        )
+        ldap = _FakeLdap(by_username={"jdoe": reissued, "asmith": asmith})
+        service = await _service(store, rsa_key, ldap=ldap, bind=None)
+        legacy_id = uuid4().hex
+        await store.create_user(user_id=legacy_id, username="jdoe", auth_provider="ad")
+        with pytest.raises(ValueError, match="directory_object_id_missing"):
+            await service.bind_federated_subject(legacy_id, "S-1-legacy", actor="admin")
+        assert await store.set_user_federated_subject(
+            legacy_id, "https://idp.example", "S-1-legacy"
+        )
+        asmith_id = await _bind(service, store, "S-1-asmith", username="asmith")
+
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-legacy")
+
+        assert not out.ok and out.token is None
+        assert out.reason == "directory_object_id_missing"
+        assert out.error == "federated sign-in failed"
+        assert ldap.resolved == [], "the id-less bound row was re-resolved by name"
+        assert await store.list_sessions(legacy_id) == []
+        assert await _audit_rows(store, "auth.login_success") == []
+        refused = await _audit_rows(store, "auth.login_failed")
+        assert [(r["actor"], json.loads(r["detail"])) for r in refused] == [
+            ("jdoe", {"provider": "ad", "mech": "oidc", "reason": "directory_object_id_missing"})
+        ]
+        # The binding is refused, never cleared: clearing is the audited admin unbind's act.
+        still = await store.get_user(legacy_id)
+        assert still is not None and still.oidc_subject == "S-1-legacy"
+        # The login page shows the generic code for it, as for `disabled` and `locked`.
+        assert "directory_object_id_missing" not in _REASON_TO_CODE
+
+        # CONTROL: an id-bearing bound row signs in, re-resolved by its own entry.
+        ok = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-asmith")
+        assert ok.ok and ok.identity is not None and ok.identity.user_id == asmith_id
+        assert ldap.resolved == ["asmith"]
+    finally:
+        await store.close()
+
+
 async def test_a_reassigned_username_presenting_a_new_subject_is_refused(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:

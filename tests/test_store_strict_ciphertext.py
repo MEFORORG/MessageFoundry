@@ -162,7 +162,9 @@ async def test_legacy_plaintext_on_an_unsealed_surface_is_sealed(tmp_path: Path)
     try:
         for i, mid in enumerate(ids):
             at_rest = _raw_at_rest(db, mid) or ""
-            assert at_rest.startswith(MARKER_PREFIX) and "DOE" not in at_rest
+            # '^' is outside the base64 alphabet, so this fails only on real plaintext (the rule in
+            # tests/test_store_encryption.py); a bare "DOE" turns up in random ciphertext by chance.
+            assert at_rest.startswith(MARKER_PREFIX) and "DOE^JANE" not in at_rest
             assert (await store.get_message(mid) or {})["raw"] == _RAW.format(i=i)
     finally:
         await store.close()

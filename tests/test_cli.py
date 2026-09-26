@@ -1170,7 +1170,13 @@ def _expose_toml(
 _SECURE_RETENTION = (
     "security.delete_message_bodies_after_days = 30\n[retention]\ndead_letter_days = 30\n"
 )
-_SECURE_ALERTS = '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+# Host + sender satisfy the per-user security-notice channel; email_to is the [alerts] recipient the
+# credential reminders need (BACKLOG #2008). _SECURE_ALERTS_NO_RECIPIENT is the smallest config that
+# passes the first gate and fails the second.
+_SECURE_ALERTS_NO_RECIPIENT = (
+    '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+)
+_SECURE_ALERTS = _SECURE_ALERTS_NO_RECIPIENT + 'email_to = ["ops@example.org"]\n'
 
 
 def _run_secure_serve(
@@ -1915,6 +1921,7 @@ _EXPOSURE_PRELUDE = (
 _EXPOSURE_TAIL = (
     "[retention]\ndead_letter_days = 30\n"
     '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+    'email_to = ["ops@example.org"]\n'
 )
 _DECLARED_PROXY = (
     '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
@@ -2589,6 +2596,131 @@ def test_serve_notify_quiet_in_synthetic_dev(
     )
     assert rc == 0
     assert "security-notification" not in capsys.readouterr().err
+
+
+# --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need an [alerts] RECIPIENT -------------
+
+
+def test_serve_refuses_a_relay_with_no_reminder_recipient_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # SMTP host + sender pass the per-user channel gate, but with no email_to and no webhook_url the
+    # [alerts] notifier is never built, so every credential reminder would reach only the log.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS_NO_RECIPIENT,
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "no out-of-band security-notification channel" not in err  # the first gate passed
+    assert "no [alerts] recipient is configured" in err and "refusing to start" in err
+    assert "sec@example.org" not in err  # names the keys, never the configured addresses
+
+
+def test_serve_warns_on_no_reminder_recipient_under_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n'
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS_NO_RECIPIENT,
+        env="staging",
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "no [alerts] recipient is configured" in err
+    assert "refusing to start" not in err
+
+
+@pytest.mark.parametrize(
+    "alerts",
+    [
+        pytest.param(_SECURE_ALERTS, id="email-recipient"),
+        pytest.param(
+            _SECURE_ALERTS_NO_RECIPIENT + 'webhook_url = "https://hooks.example.org/mf"\n',
+            id="webhook-recipient",
+        ),
+    ],
+)
+def test_serve_starts_with_a_reminder_recipient_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], alerts: str
+) -> None:
+    # The control: either transport notifier_from_settings builds is a recipient.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n" + _SECURE_RETENTION + alerts,
+    )
+    assert rc == 0
+    assert "no [alerts] recipient" not in capsys.readouterr().err
+
+
+def test_serve_reminder_recipient_gate_is_quiet_when_no_reminder_can_fire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Both reminders off: no temporary-password deadline and no cert monitor, so nothing needs a
+    # recipient and the gate does not fire.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + "[cert_monitor]\nwarn_days = 0\n"
+        + "[auth]\ninitial_password_expiry_hours = 0\n"
+        + _SECURE_ALERTS_NO_RECIPIENT,
+    )
+    assert "no [alerts] recipient" not in capsys.readouterr().err
+    assert rc == 0
+
+
+@pytest.mark.parametrize(
+    "reminder_on",
+    [
+        pytest.param("[cert_monitor]\nwarn_days = 0\n", id="temporary-password-reminder-only"),
+        pytest.param("[auth]\ninitial_password_expiry_hours = 0\n", id="cert-reminder-only"),
+    ],
+)
+def test_serve_either_reminder_alone_needs_a_recipient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reminder_on: str,
+) -> None:
+    # Each half of the "can a reminder fire" test is sufficient by itself: turning off one reminder
+    # still leaves the other needing a recipient.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + reminder_on
+        + _SECURE_ALERTS_NO_RECIPIENT,
+    )
+    assert rc == 2
+    assert "no [alerts] recipient is configured" in capsys.readouterr().err
+
+
+def test_serve_reminder_recipient_gate_honours_the_audited_waiver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS_NO_RECIPIENT
+        + "security_notifications_required = false\n",
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "refusing to start" not in err
+    # The waiver starts the engine but is said out loud, not silently accepted.
+    assert "no [alerts] recipient on a production PHI instance" in err
 
 
 def test_serve_require_encryption_starts_with_configured_key(

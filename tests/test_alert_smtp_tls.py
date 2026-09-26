@@ -329,7 +329,7 @@ def _prod_phi_toml(*, alerts_lines: str = "", security_lines: str = "") -> str:
         + security_lines
         + "[retention]\ndead_letter_days = 30\n"
         + '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
-        + alerts_lines
+        'email_to = ["ops@example.org"]\n' + alerts_lines
     )
 
 

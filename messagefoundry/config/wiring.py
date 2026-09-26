@@ -1543,8 +1543,9 @@ def MLLP(
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
     accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
     ``message_burst`` sizes the allowance above that sustained rate; ``None`` **and** ``0`` both mean
-    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. The connector
-    reads it as ``message_burst or rate``, so any falsy value takes the rate. Both keys reach the
+    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. ``None`` or
+    ``0`` in any spelling, including the text ``"0"``, takes the rate, and a negative is refused at
+    build (BACKLOG #1872). Both keys reach the
     connector from here or from a ``connections.toml`` inbound entry, which desugars through this same
     factory.
 
@@ -1869,7 +1870,8 @@ def Http(
     port: int | EnvRef,
     # INBOUND only — the bind interface is a service setting ([inbound].bind_host), so there is no host.
     encoding: str = "utf-8",  # charset the POSTed body is decoded with (non-binary content types)
-    # DoS guards (HTTP analogs of the MLLP frame/connection/idle caps; pass None/0 to disable):
+    # DoS guards (HTTP analogs of the MLLP frame/connection/idle caps; pass None/0 to disable, except
+    # max_header_bytes, which cannot be disabled: None takes its default and 0 is refused):
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float
     | None = 60.0,  # bound the whole-request read (slow-loris guard), seconds

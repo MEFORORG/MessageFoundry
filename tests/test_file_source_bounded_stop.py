@@ -123,6 +123,8 @@ async def test_a_stop_between_batch_hand_offs_leaves_the_file_to_be_re_read(
         return None
 
     source._handler = handler
+    await source._scan_once()  # the settle poll (BACKLOG #1811): records the stat, reads nothing
+    assert handed_off == []
     await source._scan_once()
 
     assert len(handed_off) == 1

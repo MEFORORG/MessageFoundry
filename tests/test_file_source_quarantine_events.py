@@ -45,6 +45,12 @@ def _reject(_raw: bytes, _source: str) -> None:
     raise ScanRejected(f"EICAR test signature in {_NAME}")
 
 
+async def _settle(source: FileSource) -> None:
+    """Take the settle poll (BACKLOG #1811). A file's first sighting only records its stat and reaches
+    no quarantine arm, so the scan after this one is the one these tests measure."""
+    await source._scan_once()
+
+
 # (kind, extra settings, file bytes, install the rejecting scan hook)
 _ARMS: list[tuple[str, dict[str, Any], bytes, bool]] = [
     ("file_oversize", {"max_file_bytes": 10}, _HL7, False),
@@ -81,6 +87,8 @@ async def test_each_quarantine_arm_records_one_event_without_the_file_name(
     if scan_rejects:
         set_scan_hook(_reject)
 
+    await _settle(source)
+    assert sink.events == [], "the settle poll quarantines nothing"
     await source._scan_once()
 
     assert handed_off == [], "a quarantined drop must never reach the pipeline"
@@ -112,6 +120,7 @@ async def test_a_failing_sink_never_stops_the_quarantine(tmp_path: Path) -> None
     source._handler = handler
     source._prepare_subdirs()
 
+    await _settle(source)
     await source._scan_once()
 
     assert (inbox / ".error" / _NAME).exists()
@@ -138,9 +147,17 @@ async def test_a_quarantine_whose_move_failed_records_nothing(
         return None
 
     source._handler = handler
-    monkeypatch.setattr(FileSource, "_move", staticmethod(lambda _path, _dest: False))
+    moves: list[Path] = []
 
+    def failed_move(path: Path, _dest: Path) -> bool:
+        moves.append(path)
+        return False
+
+    monkeypatch.setattr(FileSource, "_move", staticmethod(failed_move))
+
+    await _settle(source)
     await source._scan_once()
 
+    assert moves == [inbox / _NAME], "the oversize arm really tried the move (not a vacuous pass)"
     assert sink.events == []
     assert (inbox / _NAME).exists()
