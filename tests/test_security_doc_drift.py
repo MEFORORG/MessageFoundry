@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from _ast_sites import call_sites, named_func
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from pydantic import BaseModel
 
@@ -1355,6 +1356,188 @@ def test_gate_wrapper_table_counts_match_the_route_walk() -> None:
     assert documented == derived, (
         "the gate-wrapper table drifted from the live app (gate: doc -> code): "
         f"{ {k: (documented.get(k), derived.get(k)) for k in set(documented) | set(derived) if documented.get(k) != derived.get(k)} }"
+    )
+
+
+_WS_GATES = ("ui_ws_authorize", "authorize_ws")
+
+
+def _ws_stats_gate_order(source: str) -> list[str]:
+    """The gates ``ws_stats`` calls, in source order, read by an AST walk of ``api/app.py``.
+
+    Only two names count: ``ui_ws_authorize`` (the web console's hook, fetched from ``app.state``) and
+    ``authorize_ws`` (the engine's header path). A substring scan cannot do this job: both names also
+    sit in the handler's own comments, so a refactor that deleted a call and kept the comment would
+    still read as present. ``scripts/security/route_gates.py`` cannot either, because it hard-codes the
+    WebSocket row's gate as ``authorize_ws`` without reading the body (its module docstring says so).
+    Sorted by line AND column, so two calls on one line keep their written order.
+    """
+    handler = named_func(ast.parse(source), "ws_stats")
+    calls = [
+        (call.lineno, call.col_offset, name)
+        for name in _WS_GATES
+        for call in call_sites(handler, name, bare_only=True)
+    ]
+    return [name for _line, _col, name in sorted(calls)]
+
+
+def _ws_header_gate_is_fallback(source: str) -> bool:
+    """Whether every ``authorize_ws`` call in ``ws_stats`` sits under ``if identity is None:``.
+
+    That condition is what makes the header gate a FALLBACK. Without it the header gate would run
+    after a cookie success too and overwrite the identity, and the doc's "step 2 runs only when step
+    1 yields no identity" would be false while the call order stayed the same.
+    """
+    handler = named_func(ast.parse(source), "ws_stats")
+    header_calls = {id(call) for call in call_sites(handler, "authorize_ws", bare_only=True)}
+    guarded: set[int] = set()
+    for node in ast.walk(handler):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "identity"
+            and [type(op) for op in test.ops] == [ast.Is]
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value is None
+        ):
+            continue
+        for stmt in node.body:
+            guarded |= {id(call) for call in call_sites(stmt, "authorize_ws", bare_only=True)}
+    return bool(header_calls) and header_calls <= guarded
+
+
+def _mount_installs_ui_ws_hook(source: str) -> bool:
+    """Whether ``mount.py`` assigns ``app.state.ui_ws_authorize = _auth.authorize_ui_ws`` (AST).
+
+    The target must be the ``ui_ws_authorize`` attribute OF ``app.state``, and the value must be the
+    ``authorize_ui_ws`` attribute, so a hook assigned to the wrong slot does not count."""
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Attribute):
+            continue
+        if node.value.attr != "authorize_ui_ws":
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == "ui_ws_authorize"
+                and isinstance(target.value, ast.Attribute)
+                and target.value.attr == "state"
+            ):
+                return True
+    return False
+
+
+def test_ws_stats_gate_order_is_derived_and_documented() -> None:
+    """``/ws/stats`` tries the web console's cookie gate first, then the header gate (BACKLOG #1959).
+
+    RULE: the route map row and the WebSocket note under the gate table must name both gates in the
+    order the handler calls them. The doc used to describe ``authorize_ws`` alone, with
+    ``[api].ws_allowed_origins`` as THE browser control, while a same-origin browser actually passed
+    through ``authorize_ui_ws`` and its session cookie. A reviewer reading that text would have
+    assessed the wrong control for every browser.
+    """
+    app_source = (_ROOT / "messagefoundry" / "api" / "app.py").read_text(encoding="utf-8")
+    order = _ws_stats_gate_order(app_source)
+    assert order == ["ui_ws_authorize", "authorize_ws"], (
+        f"ws_stats now calls its gates as {order}; rewrite the /ws/stats route row, the WebSocket "
+        "note under the gate table and the Table A Origin row, then this pin."
+    )
+    assert _ws_header_gate_is_fallback(app_source), (
+        "ws_stats no longer calls authorize_ws only under `if identity is None:`, so the header gate "
+        "is not a fallback any more. The doc's step 2 condition is now false; rewrite it."
+    )
+    mount = _ROOT / "messagefoundry_webconsole" / "mount.py"
+    assert _mount_installs_ui_ws_hook(mount.read_text(encoding="utf-8")), (
+        "mount_ui no longer installs authorize_ui_ws as app.state.ui_ws_authorize, so the cookie path "
+        "the doc describes does not run. Rewrite the /ws/stats prose."
+    )
+
+    rows = [
+        row
+        for table in _tables(_json_route_map_block())
+        for row in table
+        if len(row) > 3 and "`/ws/stats`" in row[1]
+    ]
+    assert len(rows) == 1, f"expected one /ws/stats route row, found {len(rows)}"
+    gate_cell = rows[0][3]
+    assert "authorize_ui_ws" in gate_cell and "authorize_ws" in gate_cell, gate_cell
+    assert gate_cell.index("authorize_ui_ws") < gate_cell.index("authorize_ws"), (
+        "the /ws/stats row must name the cookie gate before the header gate, as the handler runs them"
+    )
+    assert "ws_allowed_origins" in gate_cell and "session cookie" in gate_cell, gate_cell
+
+    text = _doc_text()
+    design = _section(text, _H_DESIGN)
+    ui_step = design.find("1. **`authorize_ui_ws`")
+    header_step = design.find("2. **`authorize_ws`, when step 1 yields no identity")
+    assert 0 <= ui_step < header_step, (
+        "the WebSocket note under the gate table must list authorize_ui_ws as step 1 and "
+        "authorize_ws as step 2, the fallback when step 1 yields no identity"
+    )
+    assert "cookie first and header token second" in design, (
+        "the plane-selection item must say /ws/stats accepts the cookie first and the header second"
+    )
+    assert "`/ui`-confined" not in text and "they never cross" not in text, (
+        "the session cookie is Path=/ and /ws/stats reads it, so it is neither /ui-confined nor on "
+        "a plane that never crosses the header-token plane"
+    )
+
+    rows_a, _rows_b = _contextual_table_rows()
+    origin_rows = [r for r in rows_a if r[0].startswith("Browser `Origin` at the WebSocket")]
+    assert len(origin_rows) == 1, "fixture drifted: the WebSocket Origin row moved or split"
+    origin_row = " ".join(origin_rows[0])
+    for needed in ("session-cookie path", "web_console_public_address", "ws_allowed_origins"):
+        assert needed in origin_row, (
+            f"the Table A WebSocket Origin row no longer names {needed!r}; it must describe both "
+            "paths, or a reviewer reads ws_allowed_origins as the only browser control"
+        )
+
+
+def test_ws_stats_gate_order_reader_detects_a_planted_reorder() -> None:
+    """Proves the three AST readers can fail. A hook named only in a comment, or called second, must
+    read differently from the shipped order; two calls on one line keep their written order; an
+    unguarded header call is not a fallback; and a hook assigned to the wrong slot does not count."""
+    header_only = (
+        "async def ws_stats(websocket):\n"
+        "    # ui_ws_authorize(websocket) is only mentioned here\n"
+        "    identity = await authorize_ws(websocket)\n"
+    )
+    assert _ws_stats_gate_order(header_only) == ["authorize_ws"]
+    reordered = (
+        "async def ws_stats(websocket):\n"
+        "    identity = await authorize_ws(websocket)\n"
+        "    identity, token = await ui_ws_authorize(websocket)\n"
+    )
+    assert _ws_stats_gate_order(reordered) == ["authorize_ws", "ui_ws_authorize"]
+    one_line = (
+        "async def ws_stats(websocket):\n"
+        "    identity = await ui_ws_authorize(websocket) or await authorize_ws(websocket)\n"
+    )
+    assert _ws_stats_gate_order(one_line) == ["ui_ws_authorize", "authorize_ws"]
+
+    guarded = (
+        "async def ws_stats(websocket):\n"
+        "    identity = await ui_ws_authorize(websocket)\n"
+        "    if identity is None:\n"
+        "        identity = await authorize_ws(websocket)\n"
+    )
+    assert _ws_header_gate_is_fallback(guarded)
+    unguarded = (
+        "async def ws_stats(websocket):\n"
+        "    identity = await ui_ws_authorize(websocket)\n"
+        "    identity = await authorize_ws(websocket)\n"
+    )
+    assert not _ws_header_gate_is_fallback(unguarded)
+
+    assert _mount_installs_ui_ws_hook("app.state.ui_ws_authorize = _auth.authorize_ui_ws\n")
+    assert not _mount_installs_ui_ws_hook(
+        "app.state.ui_connections_render = _auth.authorize_ui_ws\n"
+    ), "the hook assigned to the wrong slot must not count"
+    assert not _mount_installs_ui_ws_hook("other.ui_ws_authorize = _auth.authorize_ui_ws\n"), (
+        "a target that is not app.state must not count"
     )
 
 

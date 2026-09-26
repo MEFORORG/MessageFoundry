@@ -26,7 +26,7 @@ crypto params, length caps) and needs no operator action.
 
 | Setting / env | Default | Purpose (ASVS) |
 |---|---|---|
-| `[api].ws_allowed_origins` | empty | Browser Origins permitted to open `/ws/stats`. Empty ⇒ only no-Origin (native) clients. Env: `MEFOR_API_WS_ALLOWED_ORIGINS` (path-sep list). (4.4.2) |
+| `[api].ws_allowed_origins` | empty | Browser Origins permitted to open `/ws/stats`. Empty ⇒ only no-Origin (native) clients on the header-token path; the `/ui` console's same-origin cookie path runs ahead of it (see *Browser WebSocket Origins rejected* above). Env: `MEFOR_API_WS_ALLOWED_ORIGINS` (path-sep list). (4.4.2) |
 | `[alerts].webhook_allowed_hosts` | empty | Optional egress allow-list for the alert webhook host. Empty ⇒ any host (the URL is operator-set). Env: `MEFOR_ALERTS_WEBHOOK_ALLOWED_HOSTS` (comma list). (1.3.6) |
 | `MEFOR_ALLOW_INSECURE_TLS` (env only) | unset | Truthy (`1`/`true`/`yes`/`on`) explicitly permits the MITM-able TLS overrides above for a trusted-network dev/test bind. **Never set in production.** (12.3.2) |
 
