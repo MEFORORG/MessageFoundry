@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+import messagefoundry.store.sqlserver as sqlserver_module
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.store.sqlserver import SqlServerStore
 
@@ -70,20 +71,34 @@ class _ProbeConn:
         self.closed = True
 
 
+@pytest.fixture(autouse=True)
+def _no_reread_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The re-read after a failed ALTER sleeps between attempts; the tests need no real clock."""
+    monkeypatch.setattr(sqlserver_module, "_RCSI_REREAD_DELAY_S", 0.0)
+
+
 def _install(
     monkeypatch: pytest.MonkeyPatch,
     *,
     row: tuple[int, int] | None,
     denied: frozenset[str] = frozenset(),
     connect_fails: bool = False,
+    later_row: tuple[int, int] | None = None,
 ) -> tuple[_ProbeCursor, _ProbeConn, list[dict[str, Any]]]:
+    """``later_row``, when given, is what every connection AFTER the first reads: the state a
+    concurrent opener's ALTER left behind."""
     cursor = _ProbeCursor(row, set(denied))
     conn = _ProbeConn(cursor)
     pools: list[dict[str, Any]] = []
+    connects = 0
 
     async def _connect(**kwargs: Any) -> _ProbeConn:
+        nonlocal connects
+        connects += 1
         if connect_fails:
             raise RuntimeError("login timeout expired")
+        if connects > 1 and later_row is not None:
+            return _ProbeConn(_ProbeCursor(later_row, set(denied)))
         return conn
 
     async def _create_pool(**kwargs: Any) -> Any:
@@ -110,7 +125,25 @@ async def test_rcsi_off_and_alter_denied_refuses_the_open(monkeypatch: pytest.Mo
     )
     assert pools == []  # refused BEFORE any pool (or its executor) exists
     assert _ALTER_RCSI in cursor.executed
+    # It re-read the state (a peer might have won the ALTER) before refusing.
+    rereads = [sql for sql in cursor.executed if "is_read_committed_snapshot_on FROM" in sql]
+    assert len(rereads) == sqlserver_module._RCSI_REREADS
     assert conn.closed
+
+
+async def test_a_concurrent_opener_that_enabled_rcsi_lets_the_open_proceed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Engine shards and cluster nodes open at once. On a greenfield database a peer's ALTER ...
+    WITH ROLLBACK IMMEDIATE can make OURS fail while RCSI still ends up ON. That is not a denial, so
+    the open must re-read and carry on rather than refuse a store that is correctly configured."""
+    cursor, _conn, pools = _install(
+        monkeypatch, row=(0, 1), denied=frozenset({_ALTER_RCSI}), later_row=(1, 1)
+    )
+    with pytest.raises(_PoolCreated):
+        await SqlServerStore.open(_settings())
+    assert len(pools) == 1
+    assert _ALTER_RCSI in cursor.executed
 
 
 async def test_unreadable_rcsi_state_refuses_the_open(monkeypatch: pytest.MonkeyPatch) -> None:

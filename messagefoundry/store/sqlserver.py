@@ -434,6 +434,24 @@ _SQL_STATE_MERGE: Final[str] = (
 )
 
 
+# BACKLOG #1628: how many times, and how far apart, the open-time RCSI check re-reads the state after
+# its own ALTER failed. Engine shards and cluster nodes open concurrently, so on a greenfield database
+# a peer's ALTER ... WITH ROLLBACK IMMEDIATE can kill ours or hold the lock ours needs, while RCSI ends
+# up ON all the same. A few spaced re-reads on a fresh connection tell that race from a real denial.
+_RCSI_REREADS: Final[int] = 3
+_RCSI_REREAD_DELAY_S: Final[float] = 1.0
+
+
+def _rcsi_remedy(database: str | None) -> str:
+    """The one statement a DBA runs to enable RCSI, with the name bracket-escaped (``]`` doubled) so
+    a database name containing ``]`` still yields a statement that runs."""
+    name = (database or "").replace("]", "]]")
+    return (
+        f"a DBA must run once: ALTER DATABASE [{name}] SET READ_COMMITTED_SNAPSHOT ON"
+        " WITH ROLLBACK IMMEDIATE"
+    )
+
+
 def _applock_timeout_ms(command_timeout: int) -> int:
     """``@LockTimeout`` (ms) for :data:`_SQL_APPLOCK`: ``command_timeout*1000`` when set, else ``-1``
     (wait forever, the pyodbc query timeout backstops). ``0`` -> ``-1`` is why the SYNC handoff pool
@@ -3058,10 +3076,35 @@ class SqlServerStore:
         import aioodbc
 
         db = settings.database
-        remedy = (
-            f"a DBA must run once: ALTER DATABASE [{(db or '').replace(']', ']]')}] SET"
-            " READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
-        )
+        remedy = _rcsi_remedy(db)
+        dsn = connection_string(settings, posture=posture)
+
+        async def _rcsi_on_after_a_peer() -> bool:
+            """Re-read RCSI on FRESH connections after our ALTER failed: a concurrent opener's ALTER
+            may have killed our session yet turned RCSI on. Any failure to read counts as OFF."""
+            for attempt in range(_RCSI_REREADS):
+                if attempt:
+                    await asyncio.sleep(_RCSI_REREAD_DELAY_S)
+                try:
+                    probe = await aioodbc.connect(
+                        dsn=dsn, autocommit=True, timeout=settings.connect_timeout
+                    )
+                    try:
+                        pcur = await probe.cursor()
+                        await pcur.execute(
+                            "SELECT is_read_committed_snapshot_on FROM sys.databases"
+                            " WHERE name = DB_NAME()"
+                        )
+                        prow = await pcur.fetchone()
+                    finally:
+                        await probe.close()
+                except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
+                    log.debug("RCSI re-read on %r failed", db, exc_info=True)
+                    continue
+                if prow is not None and prow[0]:
+                    return True
+            return False
+
         try:
             conn = await aioodbc.connect(
                 dsn=connection_string(settings, posture=posture), autocommit=True
@@ -3096,11 +3139,17 @@ class SqlServerStore:
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
                 except Exception as exc:
-                    raise RuntimeError(
-                        f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could not"
-                        f" enable it ({exc}); {remedy} -- refusing to open the store, because under"
-                        " locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
-                    ) from exc
+                    if not await _rcsi_on_after_a_peer():
+                        raise RuntimeError(
+                            f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
+                            f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
+                            " under locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
+                        ) from exc
+                    log.info(
+                        "READ_COMMITTED_SNAPSHOT on %r was enabled by a concurrent opener (%s)",
+                        db,
+                        exc,
+                    )
             if not snapshot_on:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
@@ -3108,7 +3157,10 @@ class SqlServerStore:
                 except Exception as exc:  # noqa: BLE001 - non-fatal
                     log.warning("could not enable ALLOW_SNAPSHOT_ISOLATION on %r: %s", db, exc)
         finally:
-            await conn.close()
+            try:
+                await conn.close()
+            except Exception:  # noqa: BLE001 - a peer's ROLLBACK IMMEDIATE may have killed it
+                log.debug("RCSI probe connection close failed", exc_info=True)
 
     async def require_rcsi_for_pooled(self) -> None:
         """Hard-verify READ_COMMITTED_SNAPSHOT is ON — the pooled claim mode's startup gate (ADR 0066
@@ -3130,8 +3182,7 @@ class SqlServerStore:
             db = self._settings.database
             raise RuntimeError(
                 f"pooled claim mode requires READ_COMMITTED_SNAPSHOT on database {db!r} and it is"
-                f" OFF; a DBA must run once: ALTER DATABASE [{db}] SET READ_COMMITTED_SNAPSHOT ON"
-                " WITH ROLLBACK IMMEDIATE — refusing to start pooled claimers (fail closed)"
+                f" OFF; {_rcsi_remedy(db)} — refusing to start pooled claimers (fail closed)"
             )
 
     async def probe_principal_privileges(self) -> StorePrivilegeReport:

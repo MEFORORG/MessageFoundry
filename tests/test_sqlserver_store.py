@@ -4929,11 +4929,13 @@ async def test_open_refuses_a_least_privilege_login_on_an_rcsi_off_database() ->
         assert await _rcsi_state() == 1
         await SqlServerStore._ensure_database_options(least)
     finally:
-        with contextlib.suppress(Exception):  # teardown is best-effort
+        # Two separate best-effort drops, so a failed DROP DATABASE never strands the login.
+        with contextlib.suppress(Exception):
             await _admin(
                 "master",
                 f"IF DB_ID('{db}') IS NOT NULL BEGIN"
                 f" ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;"
                 f" DROP DATABASE [{db}]; END",
-                f"IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]",
             )
+        with contextlib.suppress(Exception):
+            await _admin("master", f"IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]")
