@@ -1322,16 +1322,22 @@ def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[str, str, int]:
             if table not in tables:
                 continue  # an older snapshot predating the table — not a verify failure
             names = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}  # constant table
-            if column not in names or not names.issuperset(spec.aad_columns):
+            needed = {column, *spec.aad_columns, *spec.locator} - {"rowid"}
+            if not names.issuperset(needed):
                 continue
             # table/column/key names are declared constants; only the marker prefix is a parameter.
-            keys = ", ".join(spec.aad_columns)
+            picked = ", ".join((*spec.locator, *spec.aad_columns, column))
             rows = conn.execute(
-                f"SELECT {spec.locator}, {keys}, {column} FROM {table} WHERE {column} LIKE ?",
-                (f"{MARKER_PREFIX}%",),
+                f"SELECT {picked} FROM {table} WHERE {column} LIKE ?", (f"{MARKER_PREFIX}%",)
             )
-            for locator, *key, stored in rows:
+            width = len(spec.locator)
+            for *row, stored in rows:
+                where, key = row[:width], row[width:]
                 if keyless:
+                    # LIKE is case-insensitive; the marker is not. A keyless store's plaintext that
+                    # merely resembles it (``MFENC:...``) is not a sealed cell.
+                    if not cipher.is_encrypted(str(stored)):
+                        continue
                     # The #241 F2 keyless-open trap: the snapshot holds sealed cells and these settings
                     # resolved no key for them. Nothing could have opened them, so the keyring is
                     # unambiguously the cause.
@@ -1350,7 +1356,7 @@ def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[str, str, int]:
                     # the reading that must not be talked down.
                     return (
                         "FAIL",
-                        f"{table}.{column} {spec.locator}={locator} did not decrypt: {safe_exc(exc)}",
+                        f"{table}.{column} {spec.locate(*where)} did not decrypt: {safe_exc(exc)}",
                         cells,
                     )
                 cells += 1

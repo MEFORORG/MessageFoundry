@@ -6,8 +6,10 @@
 rest bind to a composite or natural key, so each has its own migration and rotation pass inside the
 store, and until this module no caller outside it could read them back. This module names those cells
 and the columns each writer binds into ``cell_aad``, in the order it binds them, and joins both kinds
-into :data:`SQLITE_CIPHER_CELLS`. The full restore-verify reads every one back through the cipher, so a
-corrupted value fails the verify instead of surfacing at first use.
+into :data:`SQLITE_CIPHER_CELLS`. The full restore-verify reads every sealed value in them back
+through the cipher, so a ciphertext whose tag no longer authenticates fails the verify instead of
+surfacing at first use. It selects values by their marker, so a value whose marker itself is damaged
+is not reached by that pass.
 
 It is READ-ONLY: nothing here writes a cell, and the store's own passes do not consume it. Driving
 every pass from one declaration is BACKLOG #1169's scope, not this one's. Until then two guards keep
@@ -30,31 +32,36 @@ __all__ = ["COMPOSITE_CIPHER_CELLS", "SQLITE_CIPHER_CELLS", "CipherCell"]
 class CipherCell:
     """One cipher-covered cell: its table, its column, and the columns its AAD binds, in bind order.
 
-    ``locator`` is the column a failure message may name to point an operator at the row: a synthetic
-    id where the table has one. Otherwise it is the snapshot's own ``rowid``, which a VACUUM may have
-    renumbered, so it locates the row in the snapshot and not necessarily in the live store. A key
-    column is never the locator when it can itself be PHI: a ``state`` or ``reference`` key is
-    whatever the transform chose, and ``shared_body.hash`` and ``attachment_chunk.attachment_id``
-    are digests of the plaintext."""
+    ``locator`` is the columns a failure message may name to point an operator at the row: a
+    synthetic id, or a key made only of ids, names and counters. Otherwise it is the snapshot's own
+    ``rowid``, which a VACUUM may have renumbered, so it locates the row in the snapshot and not
+    necessarily in the live store. A key column is never a locator when it can itself be PHI: a
+    ``state`` or ``reference`` key is whatever the transform chose, and ``shared_body.hash`` and
+    ``attachment_chunk.attachment_id`` are digests of the plaintext."""
 
     table: str
     column: str
     aad_columns: tuple[str, ...]
-    locator: str = "rowid"
+    locator: tuple[str, ...] = ("rowid",)
 
     def aad(self, *key: object) -> bytes:
         """The AAD the writer bound for this cell, given the ``aad_columns`` values in order."""
         return cell_aad(self.table, self.column, *key)
 
+    def locate(self, *values: object) -> str:
+        """The row's ``locator`` values as ``column=value`` pairs, for a PHI-free failure message."""
+        return " ".join(f"{c}={v}" for c, v in zip(self.locator, values, strict=True))
+
 
 _RESPONSE_KEY = ("message_id", "destination_name", "response_seq")
 
-#: Every cipher-covered cell in ``store.py`` that ``_CIPHER_COLUMNS`` does not carry. The AAD columns
+#: Every literal ``cell_aad`` cell in ``store.py`` that ``_CIPHER_COLUMNS`` does not carry. The AAD columns
 #: are copied from each cell's writer, and the round-trip test proves they match it.
 COMPOSITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
-    CipherCell("response", "body", _RESPONSE_KEY, locator="message_id"),
-    CipherCell("response", "detail", _RESPONSE_KEY, locator="message_id"),
-    CipherCell("response", "resp_headers", _RESPONSE_KEY, locator="message_id"),
+    # A message id, a connection name and a counter: nothing in this key is PHI, so it is the locator.
+    CipherCell("response", "body", _RESPONSE_KEY, locator=_RESPONSE_KEY),
+    CipherCell("response", "detail", _RESPONSE_KEY, locator=_RESPONSE_KEY),
+    CipherCell("response", "resp_headers", _RESPONSE_KEY, locator=_RESPONSE_KEY),
     CipherCell("state", "value", ("namespace", "key")),
     CipherCell("reference", "value", ("name", "version", "key")),
     CipherCell("shared_body", "body", ("hash",)),
@@ -62,14 +69,14 @@ COMPOSITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
     # These three have an AUTOINCREMENT id the encrypting INSERT cannot know, so their AAD binds the
     # natural columns the writer has in hand instead. alert_instance binds only its de-dup grain, which
     # its resolved and open rows can share, so a reason moved between those rows still opens.
-    CipherCell("message_events", "detail", ("message_id", "ts", "event"), locator="id"),
-    CipherCell("connection_event", "reason", ("connection", "ts", "kind"), locator="id"),
-    CipherCell("alert_instance", "reason", ("event_type", "connection"), locator="id"),
+    CipherCell("message_events", "detail", ("message_id", "ts", "event"), locator=("id",)),
+    CipherCell("connection_event", "reason", ("connection", "ts", "kind"), locator=("id",)),
+    CipherCell("alert_instance", "reason", ("event_type", "connection"), locator=("id",)),
 )
 
 #: Every cipher-covered cell of the SQLite store: the id-keyed ones from the store's own tuple, then
 #: the composite ones above.
 SQLITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
-    *(CipherCell(t, c, ("id",), locator="id") for t, c in MessageStore._CIPHER_COLUMNS),
+    *(CipherCell(t, c, ("id",), locator=("id",)) for t, c in MessageStore._CIPHER_COLUMNS),
     *COMPOSITE_CIPHER_CELLS,
 )

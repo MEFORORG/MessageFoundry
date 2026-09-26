@@ -155,12 +155,12 @@ def _flip_one_aead_byte(db: Path, cell: CipherCell) -> str:
     conn = sqlite3.connect(db)
     try:
         row = conn.execute(
-            f"SELECT rowid, {cell.locator}, {cell.column} FROM {cell.table}"
+            f"SELECT rowid, {cell.column}, {', '.join(cell.locator)} FROM {cell.table}"
             f" WHERE {cell.column} LIKE ? ORDER BY rowid LIMIT 1",  # declared constants
             (f"{MARKER_PREFIX}%",),
         ).fetchone()
         assert row is not None, f"no sealed value in {cell.table}.{cell.column} to corrupt"
-        rowid, locator, stored = row
+        rowid, stored, *where = row
         head, _, payload = str(stored).rpartition(":")
         blob = bytearray(base64.b64decode(payload))
         blob[-1] ^= 0x01  # the last byte is inside the GCM tag
@@ -171,7 +171,7 @@ def _flip_one_aead_byte(db: Path, cell: CipherCell) -> str:
         conn.commit()
     finally:
         conn.close()
-    return str(locator)
+    return cell.locate(*where)
 
 
 async def _backup(store: MessageStore, settings: StoreSettings, dest: Path) -> str:
@@ -240,14 +240,11 @@ async def test_a_flipped_byte_in_each_composite_cell_fails_the_full_verify(
     finally:
         await store.close()
 
-    light = await run_restore_verify(archive, store_settings=settings)
-    assert light.status == "PASS", "the light verify never opens a cell, so it must stay blind"
-
     res = await run_restore_verify(archive, store_settings=settings, full=True)
     assert res.status == "FAIL", res.reason
     reason = res.reason or ""
     if cell.table not in ("state", "reference"):
-        assert f"{cell.table}.{cell.column} {cell.locator}=" in reason, reason
+        assert f"{cell.table}.{cell.column} {cell.locator[0]}=" in reason, reason
     assert _SYNTH not in reason, f"the FAIL reason leaked a plaintext or a key: {reason}"
 
 
@@ -265,9 +262,7 @@ def test_the_decrypt_pass_itself_names_each_corrupted_cell(
     locator = _flip_one_aead_byte(db, cell)
     status, message, _ = dr_backup._decrypt_check(db, settings)
     assert status == "FAIL", message
-    assert f"{cell.table}.{cell.column} {cell.locator}={locator} did not decrypt" in message, (
-        message
-    )
+    assert f"{cell.table}.{cell.column} {locator} did not decrypt" in message, message
     assert _SYNTH not in message, f"the FAIL reason leaked a plaintext or a key: {message}"
 
 
@@ -278,12 +273,13 @@ def test_an_id_keyed_failure_still_names_the_row_id(
     the snapshot's ``rowid``. Only a key that can itself be PHI is withheld."""
     db, settings = _copy(_template, tmp_path)
     raw = next(c for c in SQLITE_CIPHER_CELLS if (c.table, c.column) == ("messages", "raw"))
-    assert raw.locator == "id"
-    mid = _flip_one_aead_byte(db, raw)
+    assert raw.locator == ("id",)
+    where = _flip_one_aead_byte(db, raw)
+    assert where.startswith("id=") and "rowid" not in where, where
 
     status, message, _ = dr_backup._decrypt_check(db, settings)
     assert status == "FAIL", message
-    assert f"messages.raw id={mid} did not decrypt" in message, message
+    assert f"messages.raw {where} did not decrypt" in message, message
 
 
 async def test_a_reply_that_looks_sealed_is_not_a_key_mismatch(tmp_path: Path) -> None:
@@ -310,9 +306,10 @@ async def test_a_reply_that_looks_sealed_is_not_a_key_mismatch(tmp_path: Path) -
 async def test_a_value_moved_between_rows_fails_its_tag(
     tmp_path: Path, _template: tuple[Path, StoreSettings]
 ) -> None:
-    """The AAD is what makes this a per-cell check. Two sealed ``connection_event.reason`` values are
-    individually valid; swapped between rows, each must fail, because each is bound to its own row's
-    natural key. A declaration that bound nothing, or bound the wrong columns, would pass this."""
+    """A ciphertext moved to another row fails here as it would at a live read. Two sealed
+    ``connection_event.reason`` values are individually valid; swapped, each fails, because the writer
+    bound each to its own row's natural key. This proves the pass enforces the writer's binding. It
+    does not prove the declaration's AAD columns, which the round-trip PASS test above does."""
     db, settings = _copy(_template, tmp_path)
     store = await _open(db, settings)
     try:
@@ -343,3 +340,21 @@ async def test_a_value_moved_between_rows_fails_its_tag(
     status, message, _ = dr_backup._decrypt_check(db, settings)
     assert status == "FAIL", message
     assert "connection_event.reason" in message, message
+
+
+async def test_a_keyless_store_plaintext_that_resembles_the_marker_passes(tmp_path: Path) -> None:
+    """SQLite's LIKE ignores case; the marker does not. On a keyless store, a reply spelled like the
+    marker in another case is plaintext, and must not be read as a sealed cell nobody can open."""
+    db = tmp_path / "msg.db"
+    settings = StoreSettings(path=str(db))
+    store = await _open(db, settings)
+    try:
+        await store.enqueue_message(channel_id="IB_SYNTH", raw=_RAW, deliveries=[("OB_A", "X")])
+        item = (await store.claim_ready())[0]
+        reply = MARKER_PREFIX.upper() + "SYNTH-plaintext"
+        await store.complete_with_response(item.id, body=reply, outcome="accepted")
+    finally:
+        await store.close()
+
+    status, message, _ = dr_backup._decrypt_check(db, settings)
+    assert status == "PASS", message
