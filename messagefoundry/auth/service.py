@@ -726,7 +726,7 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
 _IDP_WAYS_ACROSS = (
     "Set [auth].oidc_tls_crl_file to a PEM file holding a CRL from each CA that issues the token "
     "and JWKS endpoint certificates, so the engine checks revocation on both legs. Put only CRLs "
-    "in it: a certificate in that file becomes a trusted root for this hop."
+    "in it: a certificate in that file that the hop does not already trust refuses start."
 )
 
 #: Stands in for a URL with no host. NOT the empty string: `is_loopback_hop_host("")` is True, so an

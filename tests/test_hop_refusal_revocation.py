@@ -656,7 +656,9 @@ def test_email_cleartext_refuses_via_settings_not_revocation(
 
 @pytest.fixture(scope="module")
 def crl_bundle(tmp_path_factory: pytest.TempPathFactory) -> str:
-    """A throwaway CA bundled with its own fresh CRL -- the shape harden_crl_check loads. Synthetic."""
+    """A throwaway CA's fresh CRL, BARE -- the shape the docs prescribe. Synthetic. The fixture keeps
+    its old name: until BACKLOG #1890 this file also carried the CA, and harden_crl_check now refuses
+    that on a context that does not already trust the CA, which is every outbound hop here."""
     import datetime
 
     from cryptography import x509
@@ -687,10 +689,8 @@ def crl_bundle(tmp_path_factory: pytest.TempPathFactory) -> str:
         .sign(key, hashes.SHA256())
     )
     directory = tmp_path_factory.mktemp("crl299")
-    path = directory / "ca_and_crl.pem"
-    path.write_bytes(
-        ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
-    )
+    path = directory / "crl.pem"
+    path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
     # The SAME CA with NO CRL appended, written beside it. A test that needs a trust anchor and a CRL
     # in two different arguments must not pass one file for both: that cannot tell the arguments
     # apart, so an argument-swap bug reads as a pass. Measured -- `create_default_context(cafile=<the
