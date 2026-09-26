@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -19,7 +21,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.approvals import ApprovalGate
+from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
@@ -212,8 +214,8 @@ async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_pat
     # Findings #1/#4/#11 — the LOAD-BEARING dual-control guard. A purge held while the outbound was
     # stopped, then RELEASED after the operator re-started the outbound, must cancel NOTHING: the
     # require-quiesced re-check lives inside the `_purge` approval executor (ApprovalGate.approve runs it
-    # directly and has already flipped the row to 'approved', so it returns a fail-closed SKIP rather
-    # than raising, which would strand the row approved-but-unexecuted).
+    # directly and has already claimed the row as 'executing', so it returns a fail-closed SKIP rather
+    # than raising, which would record a retryable precondition miss as a failed operation).
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     await _add(service, "approver", Role.ADMINISTRATOR)
@@ -385,10 +387,10 @@ async def test_a_pending_replay_with_no_captured_requester_still_releases(engine
 
 # --- ASVS 2.3.3: the released-but-unexecuted compensating transition ---------------------------
 #
-# approve() moves the row to 'approved' BEFORE running the executor, and that ordering is
-# load-bearing (it guards the double-approve race). The gap this closes is what happens when the
-# executor then raises: without compensation the row is left asserting an operation that never
-# happened, AND no approval.approved row is written either, so the store carries a released
+# approve() claims the row ('executing' since BACKLOG #1562) BEFORE running the executor, and that
+# ordering is load-bearing (it guards the double-approve race). The gap this closes is what happens
+# when the executor then raises: without compensation the row is left claimed for an operation that
+# never happened, AND no approval.approved row is written either, so the store carries a released
 # approval with no recorded outcome at all.
 
 
@@ -412,8 +414,8 @@ async def _gate_with_failing_op(engine: Engine) -> tuple[ApprovalGate, RuntimeEr
     return gate, boom, maker_id
 
 
-async def test_raising_executor_rolls_the_row_out_of_approved(engine: Engine) -> None:
-    """The row must NOT be left at 'approved' for an operation that did not run."""
+async def test_raising_executor_rolls_the_row_to_failed(engine: Engine) -> None:
+    """The row must NOT be left claimed for an operation that did not run."""
     gate, boom, maker_id = await _gate_with_failing_op(engine)
     approval_id = await gate.guard(
         "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
@@ -453,6 +455,7 @@ async def test_raising_executor_audits_the_failure_against_both_identities(
     assert detail["operation"] == "dead_letter_replay"
     assert detail["requester"] == "maker"
     assert detail["compensated"] is True
+    assert detail["stage"] == "execute"  # the executor ran and raised (BACKLOG #1562)
     # The exception TYPE is recorded, never its message: executor text can carry connection names,
     # paths or params, and the audit log is not a PHI sink.
     assert detail["error"] == "RuntimeError"
@@ -460,8 +463,8 @@ async def test_raising_executor_audits_the_failure_against_both_identities(
 
 
 async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engine) -> None:
-    """The compensating transition is guarded on 'approved', so it can only ever move a row this
-    gate itself released -- never one another caller rejected or expired."""
+    """The compensating transition is guarded on 'executing' (BACKLOG #1562), so it can only ever
+    move a row this gate itself claimed -- never one another caller rejected or expired."""
     gate, _, maker_id = await _gate_with_failing_op(engine)
     approval_id = await gate.guard(
         "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
@@ -474,12 +477,204 @@ async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engin
         status="failed",
         approver="checker",
         decided_at=0.0,
-        from_status="approved",
+        from_status="executing",
     )
     assert moved is False
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None
     assert str(row["status"]) == "rejected"
+
+
+# --- BACKLOG #1940: the audit row and the executed operation must agree ---------------------------
+#
+# approval.approved was written only AFTER the executor ran, outside its try. An audit log that
+# refused writes let the operation complete with no record of the release and handed the approver a
+# 500. The executors had the mirror defect: their own trailing audit row raised after the action ran,
+# and the gate compensated an operation that DID run to 'failed'. The fault is injected per action
+# name, so every other audit write (the login, the request) still lands.
+
+
+def _fail_audit_for(monkeypatch: pytest.MonkeyPatch, engine: Engine, *actions: str) -> None:
+    real = engine.store.record_audit
+
+    async def _record(action: str, **kwargs: Any) -> None:
+        if action in actions:
+            raise sqlite3.OperationalError("disk I/O error")
+        await real(action, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", _record)
+
+
+async def _gate_with_spy_op(engine: Engine) -> tuple[ApprovalGate, list[Mapping[str, Any]], str]:
+    service = await _service(engine)
+    maker_id = await _add(service, "maker", Role.OPERATOR)
+    gate = ApprovalGate(engine.store, ON, resolve_identity=service.identity_for_user_id)
+    calls: list[Mapping[str, Any]] = []
+
+    async def _spy(p: Mapping[str, Any]) -> dict[str, Any]:
+        calls.append(p)
+        return {"requeued": 3}
+
+    gate.register(
+        "dead_letter_replay",
+        "Replay dead-lettered deliveries",
+        _spy,
+        permission=Permission.MESSAGES_REPLAY,
+    )
+    return gate, calls, maker_id
+
+
+async def test_an_audit_log_that_refuses_the_release_stops_the_operation(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-fix the executor ran first and the audit write raised after it, so the operation
+    completed with no approval row. Now the release row is written first, and its failure stops
+    the approve before anything moves."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    _fail_audit_for(monkeypatch, engine, "approval.release_attempted", "approval.approved")
+
+    with pytest.raises(ApprovalError) as caught:
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert caught.value.status == 503
+    assert "did not run" in caught.value.detail
+    assert calls == []  # pre-fix: the operation ran
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "pending"  # retryable, not stranded
+
+    # Once the audit log accepts writes again, the same request releases normally.
+    monkeypatch.undo()
+    outcome = await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert outcome["result"] == {"requeued": 3} and len(calls) == 1
+
+
+async def test_the_refused_release_is_a_503_at_the_route(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route maps the refusal to a clear 503, not a 500, and the replay does not run."""
+    await _dead_letter(engine)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        admin = await _token(c, "approver")
+        _fail_audit_for(monkeypatch, engine, "approval.release_attempted", "approval.approved")
+        r = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+        assert r.status_code == 503
+        assert "still pending" in r.json()["detail"]
+    # The dead letter was not re-queued: nothing ran, and the request did not move.
+    assert len(await engine.store.list_dead(limit=10)) == 1
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "pending"
+    assert await engine.store.list_audit(action="approval.release_attempted") == []
+
+
+async def test_a_release_that_loses_to_a_reject_runs_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented cost of writing the release row first. A reject that lands between that row
+    and the transition wins: the approve is refused, nothing runs, and the release row stands
+    alone with no approved or failed row after it."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    real = engine.store.record_audit
+
+    async def _reject_right_after_the_release_row(action: str, **kwargs: Any) -> None:
+        await real(action, **kwargs)
+        if action == "approval.release_attempted":
+            monkeypatch.undo()  # so the reject's own audit write goes straight through
+            await gate.reject(approval_id, approver="other-checker")
+
+    monkeypatch.setattr(engine.store, "record_audit", _reject_right_after_the_release_row)
+    with pytest.raises(ApprovalError) as caught:
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert caught.value.status == 409
+    assert calls == []
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "rejected"
+    actions = [str(r["action"]) for r in await engine.store.list_audit(limit=50)]
+    assert actions.count("approval.release_attempted") == 1
+    assert "approval.approved" not in actions and "approval.failed" not in actions
+
+
+async def test_a_failed_approved_row_after_the_operation_ran_still_reports_success(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The operation has run, so a 500 would invite a second, duplicate request. The release row
+    written before it already names both identities."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    _fail_audit_for(monkeypatch, engine, "approval.approved")
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        outcome = await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert outcome["result"] == {"requeued": 3} and len(calls) == 1
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "approved"
+    released = await engine.store.list_audit(action="approval.release_attempted")
+    assert len(released) == 1 and str(released[0]["actor"]) == "checker"
+    assert json.loads(str(released[0]["detail"]))["requester"] == "maker"
+    assert any(
+        r.levelno == logging.ERROR and "approval.approved audit row failed" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_a_failed_replay_audit_row_is_not_compensated_to_failed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The executor's own dead_letter_replay row fails AFTER the deliveries were re-queued. Pre-fix
+    the raise reached the gate's compensation and the row read 'failed' for a replay that ran."""
+    await _dead_letter(engine)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        admin = await _token(c, "approver")
+        _fail_audit_for(monkeypatch, engine, "dead_letter_replay")
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+            ok = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+        assert ok.status_code == 200
+        assert ok.json()["result"] == {"requeued": 1}  # the replay really ran
+
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "approved"
+    assert await engine.store.list_audit(action="approval.failed") == []
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+    assert any(
+        r.levelno == logging.ERROR and "dead_letter_replay audit row failed" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_a_normal_release_writes_one_release_row_and_one_approved_row(
+    engine: Engine,
+) -> None:
+    """CONTROL for the fault tests above: with a healthy audit log, one release runs the operation
+    once and writes each approval row once, in order."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert len(calls) == 1
+    actions = [str(r["action"]) for r in await engine.store.list_audit(limit=50)]
+    assert actions.count("approval.release_attempted") == 1
+    assert actions.count("approval.approved") == 1
+    # list_audit is newest-first: the release row precedes the approved row in the chain.
+    assert actions.index("approval.approved") < actions.index("approval.release_attempted")
 
 
 async def test_pending_approval_store_contract(engine: Engine) -> None:
@@ -490,6 +685,241 @@ async def test_pending_approval_store_contract(engine: Engine) -> None:
     from tests._pending_approval_store_contract import _assert_pending_approval_contract
 
     await _assert_pending_approval_contract(engine.store)
+
+
+# --- BACKLOG #1562: a release is 'executing' until its outcome is known ---------------------------
+# The SQLite legs of the shared release-outcome contract. The same bodies run against live
+# PostgreSQL and SQL Server, because the settling transitions are each backend's own SQL.
+
+
+async def test_release_reads_executing_while_it_runs_then_approved(engine: Engine) -> None:
+    from tests._pending_approval_store_contract import _assert_release_success_contract
+
+    await _assert_release_success_contract(engine.store)
+
+
+async def test_raising_release_ends_failed_not_executing(engine: Engine) -> None:
+    from tests._pending_approval_store_contract import _assert_release_failure_contract
+
+    await _assert_release_failure_contract(engine.store)
+
+
+async def test_cancelled_release_ends_interrupted_with_its_own_audit_row(engine: Engine) -> None:
+    from tests._pending_approval_store_contract import _assert_release_cancel_contract
+
+    await _assert_release_cancel_contract(engine.store)
+
+
+# The cancel WINDOWS. Each test below holds one store write open, cancels the approve inside it, then
+# lets the write finish. The row must still end in the outcome that actually happened.
+
+_WAIT_S = 10.0
+
+
+async def _eventually(check: Any) -> None:
+    """Wait, bounded, for a shielded write that finishes after its caller was cancelled."""
+    deadline = time.monotonic() + _WAIT_S
+    while not await check():
+        assert time.monotonic() < deadline, "the shielded write never finished"
+        await asyncio.sleep(0.01)
+
+
+def _held_store(engine: Engine, action: str, *, approver_changed: bool = False) -> Any:
+    """The real store, with the FIRST call matching ``action`` held open until ``release`` is set.
+
+    ``action`` is an audit action name, or ``decide:<status>`` for a status write. With
+    ``approver_changed`` the approver account reads as created after the request, so the release
+    is flagged (BACKLOG #315) and the provenance write runs in approve()'s ``finally``."""
+    from tests._pending_approval_store_contract import _StandingStore
+
+    class _Held(_StandingStore):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _hold(self, name: str) -> None:
+            if name == action and not self.entered.is_set():
+                self.entered.set()
+                await self.release.wait()
+
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            await self._hold(f"decide:{kw['status']}")
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+        async def record_audit(self, audit_action: str, **kw: Any) -> Any:
+            await self._hold(audit_action)
+            return await self._store.record_audit(audit_action, **kw)
+
+        async def get_user(self, _user_id: str) -> Any:
+            user = await super().get_user(_user_id)
+            if approver_changed:
+                user.created_at = time.time() + 3600.0
+            return user
+
+    return _Held(engine.store)
+
+
+async def _cancel_inside(store: Any, execute: Any) -> tuple[str, list[str]]:
+    """Run approve() over ``store``, cancel it once the held write is entered, release the write,
+    and return the approval id plus whether the executor started."""
+    from tests._pending_approval_store_contract import _resolve
+
+    ran: list[str] = []
+
+    async def _wrapped(p: Mapping[str, Any]) -> dict[str, Any]:
+        ran.append("started")
+        return dict(await execute(p))
+
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
+    gate.register("dead_letter_replay", "op", _wrapped, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    task = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+    await asyncio.wait_for(store.entered.wait(), _WAIT_S)
+    # cancel() cancels the shield the task is parked on at once, so releasing the held write straight
+    # after still lands the cancellation inside it. Released BEFORE awaiting the task, because a
+    # cancel during the claim makes approve() wait for the claim to land before it re-raises.
+    task.cancel()
+    store.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _WAIT_S)
+    return approval_id, ran
+
+
+async def _status_of(engine: Engine, approval_id: str) -> str:
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None
+    return str(row["status"])
+
+
+async def _runs(_p: Mapping[str, Any]) -> dict[str, Any]:
+    return {"ran": True}
+
+
+async def test_cancel_while_recording_success_still_records_approved(engine: Engine) -> None:
+    """The executor RETURNED, so the operation ran; a cancel that lands while that outcome is being
+    written must not strand the row in 'executing'. The caller still sees the cancellation."""
+    store = _held_store(engine, "decide:approved")
+    approval_id, _ = await _cancel_inside(store, _runs)
+
+    async def _settled() -> bool:
+        return bool(await engine.store.list_audit(action="approval.approved"))
+
+    await _eventually(_settled)
+    assert await _status_of(engine, approval_id) == "approved"
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+    assert await engine.store.list_audit(action="approval.interrupted") == []
+
+
+async def test_cancel_in_the_provenance_write_still_records_approved(engine: Engine) -> None:
+    """A FLAGGED release (BACKLOG #315) writes its provenance row in approve()'s ``finally``. A
+    cancel landing there must not skip the settle: the operation ran, so the row ends 'approved'."""
+    store = _held_store(engine, "approval.approver_provenance", approver_changed=True)
+    approval_id, ran = await _cancel_inside(store, _runs)
+    assert ran == ["started"]
+
+    async def _flagged() -> bool:
+        return bool(await engine.store.list_audit(action="approval.approver_provenance"))
+
+    await _eventually(_flagged)
+    assert await _status_of(engine, approval_id) == "approved"
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+
+
+async def test_a_second_cancel_cannot_cancel_the_interrupted_record(engine: Engine) -> None:
+    """A cancellation re-delivered while 'interrupted' is being written (a request timeout inside a
+    middleware task group can do this) must not cancel the record of the first one."""
+    store = _held_store(engine, "decide:interrupted")
+    never = asyncio.Event()
+
+    async def _hangs(_p: Mapping[str, Any]) -> dict[str, Any]:
+        await never.wait()
+        return {"ran": True}
+
+    # The first cancel lands in the executor; the second while the interrupted write is held.
+    from tests._pending_approval_store_contract import _resolve
+
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
+    gate.register("dead_letter_replay", "op", _hangs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    task = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+
+    async def _executing() -> bool:
+        return await _status_of(engine, approval_id) == "executing"
+
+    await _eventually(_executing)
+    task.cancel()
+    await asyncio.wait_for(store.entered.wait(), _WAIT_S)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _WAIT_S)
+    store.release.set()
+
+    async def _recorded() -> bool:
+        return bool(await engine.store.list_audit(action="approval.interrupted"))
+
+    await _eventually(_recorded)
+    assert await _status_of(engine, approval_id) == "interrupted"
+
+
+async def test_cancel_during_the_claim_settles_to_failed_and_never_runs(engine: Engine) -> None:
+    """Cancelled while claiming. The claim still commits, and nothing ran, so the known outcome is
+    'failed' -- not a row stranded in 'executing' that nobody can reject or release."""
+    store = _held_store(engine, "decide:executing")
+    approval_id, ran = await _cancel_inside(store, _runs)
+
+    async def _failed() -> bool:
+        return bool(await engine.store.list_audit(action="approval.failed"))
+
+    await _eventually(_failed)
+    assert ran == []  # the executor never started
+    assert await _status_of(engine, approval_id) == "failed"
+    failed = json.loads(str((await engine.store.list_audit(action="approval.failed"))[0]["detail"]))
+    assert failed["error"] == "CancelledError" and failed["stage"] == "claim"
+    assert await engine.store.list_audit(action="approval.approved") == []
+
+
+async def test_a_failed_approved_write_still_writes_the_audit_row(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The operation RAN. If moving the row to 'approved' fails, approval.approved is still written,
+    the failure is logged at ERROR, and the approver still gets success: a 500 would invite a new
+    request that runs the operation twice (BACKLOG #1940's reasoning, applied to the status write).
+    The row is left 'executing', never 'failed'."""
+    from tests._pending_approval_store_contract import _resolve, _StandingStore
+
+    class _SettleFails(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw["status"] == "approved":
+                raise OSError("store unreachable")
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    gate = ApprovalGate(_SettleFails(engine.store), ON, resolve_identity=_resolve)
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        outcome = await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert outcome["result"] == {"ran": True}
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+    assert await engine.store.list_audit(action="approval.failed") == []
+    assert await _status_of(engine, approval_id) == "executing"
+    assert any(
+        r.levelno == logging.ERROR
+        and approval_id in r.getMessage()
+        and "moving the row to 'approved' failed" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # --- BACKLOG #1540: the self-approval refusal keys on users.id, not on the username --------

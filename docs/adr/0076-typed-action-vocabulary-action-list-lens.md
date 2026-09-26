@@ -529,7 +529,7 @@ change (module resolution, multi-file byte-stable rewrite, multi-file dirty-buff
    ADR's queue, and the phase it jumps is the one that determines how editable helper bodies are.
 
 Additionally: ADR 0089 §6 requires Phase D to "clear the same **3-breaker byte-stability bar** the
-structural edits did". ⚠️ **That term appears exactly once across the entire ADR set and is defined
+structural edits did". **WARNING: that term appears exactly once across the entire ADR set and is defined
 nowhere** — presumably ADR 0076 §6 gates 1/2/3, but an implementer would be guessing. **It must be
 defined before it can be a gate.**
 

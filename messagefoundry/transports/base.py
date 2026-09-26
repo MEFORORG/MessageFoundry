@@ -64,6 +64,8 @@ __all__ = [
     "peer_ip_allowed",
     "probe_tcp_reachable",
     "DEFAULT_MAX_ITEMS_PER_POLL",
+    "cap_setting",
+    "positive_cap",
     "resolve_poll_ceiling",
 ]
 
@@ -71,7 +73,7 @@ __all__ = [
 #: exactly the sources that set :attr:`SourceConnector.polls_shared_resource`. **It ships ON.** One
 #: tick hands at most this many items to the pipeline and leaves the rest where they are; the next
 #: tick takes the next batch. Each connector exposes it as its own setting (``poll_max_files`` on the
-#: two file sources, ``poll_max_rows`` on the database poll), and a falsy value (None/0) disables it.
+#: two file sources, ``poll_max_rows`` on the database poll), and None/0 (in any spelling) disables it.
 #:
 #: **Why a poll source may default this ON while the MLLP message pacer deliberately ships OFF**
 #: (``transports/mllp.py`` ``DEFAULT_MAX_MESSAGES_PER_SECOND``, ruled 2026-08-11). Here a ceiling is a
@@ -96,9 +98,71 @@ __all__ = [
 DEFAULT_MAX_ITEMS_PER_POLL = 500
 
 
+def cap_setting[NumT: (int, float)](value: Any, convert: Callable[[Any], NumT]) -> NumT | None:
+    """Read one connector cap: a number, or ``None`` for the documented ``None``/``0`` disable.
+
+    **Decide "off" on the NUMBER, not on Python truthiness.** The older idiom ``int(v) if v else
+    None`` tests the RAW settings value, and a raw ``"0"`` is a non-empty string — truthy — so it
+    survives that test and becomes a live cap of zero. That spelling is reachable rather than
+    contrived: a ``connections.toml`` ``env()`` reference without a ``cast`` hands the connector the
+    environment's TEXT (``docs/CONNECTIONS.md``), so an operator disabling a cap through the environment
+    writes ``"0"`` and gets the opposite of what they asked for — a listener that refuses every
+    connection, rejects every frame, or closes every socket the instant it opens, depending on which cap
+    it was. Engine PR 1309 fixed that on the MLLP listener; BACKLOG #1872 moved this helper here so every
+    connector reads its caps by one rule.
+
+    ``None`` and ``""`` short-circuit before either conversion, and both are needed: a key may be
+    absent, and ``resolve_env_settings`` tests membership rather than truthiness, so an env var that
+    is SET but empty arrives as ``""`` — which ``int()``/``float()`` would raise on.
+
+    **The zero test reads a ``float`` view, and the cap is built with the caller's own ``convert``.**
+    Testing the CONVERTED value instead would read anything that truncates to zero as "off": with
+    ``convert=int``, a ``max_connections_per_host`` of ``-0.5`` would silently disable a security cap
+    that the guard is supposed to refuse at build. A float view answers "did the operator write zero",
+    which is the actual question, and leaves every sub-1 value to the caller's own guard.
+
+    A negative value is therefore returned as-is, for the callers that refuse one at build with a
+    message naming their own key; :func:`positive_cap` is that caller for most sites. It is a different
+    mistake with a different answer, and folding it into "off" here would swallow the typo.
+    """
+    if value is None or value == "":
+        return None
+    if float(value) == 0:  # at least 0, 0.0, -0.0, False, "0", "0.0" and " 0 " reach this as off
+        return None
+    return convert(value)
+
+
+def positive_cap[NumT: (int, float)](
+    value: Any, convert: Callable[[Any], NumT], *, knob: str, transport: str
+) -> NumT | None:
+    """:func:`cap_setting`, then refuse at build whatever is left that is not above zero (BACKLOG #1872).
+
+    After zero has been read as "off", what reaches the check is a negative, a NaN, or an ``int`` cap
+    that truncated to zero (a TOML ``0.5``). Each one is a cap that refuses all traffic, or, for a
+    timeout, closes every peer the moment it connects, and nobody writes one on purpose. Refused here,
+    the typo surfaces at wiring and in ``messagefoundry check``, not as a connection that reports
+    running and accepts nothing. Written ``not cap > 0`` rather than ``cap <= 0`` so a NaN float cap is
+    refused too: every comparison with NaN is false, so ``cap_setting`` cannot read it as off either.
+    A value the conversion itself rejects (NaN or ``"1e3"`` on an ``int`` cap, or text that is not a
+    number) is re-raised naming the setting, so every refusal says which key to fix."""
+    try:
+        cap = cap_setting(value, convert)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{transport} {knob}={value!r} is not a valid {convert.__name__} value"
+        ) from exc
+    if cap is not None and not cap > 0:
+        raise ValueError(
+            f"{transport} {knob}={value!r} must be above zero (use None or 0 to disable it)"
+        )
+    return cap
+
+
 def resolve_poll_ceiling(value: Any, *, knob: str, transport: str) -> int | None:
     """Read one poll source's per-tick ceiling from its settings: a positive count, or ``None`` for the
-    documented unlimited opt-out (a falsy ``0``/``None``).
+    documented unlimited opt-out (``None``/``0`` in any spelling, including the string ``"0"`` an uncast
+    ``env()`` reference yields — BACKLOG #1872; before it, ``"0"`` raised while a TOML ``0`` meant
+    unlimited).
 
     A **negative** value is refused at construction rather than clamped or accepted. Accepted, it would
     stop the source ingesting anything at all while the connection still reported running — the worst
@@ -106,13 +170,16 @@ def resolve_poll_ceiling(value: Any, *, knob: str, transport: str) -> int | None
     Clamping it to 1 would instead silently ingest at a rate nobody asked for. The connector already
     raises a :class:`ValueError` for a bad ``after_read``, so a bad number surfaces the same way: at
     wiring / ``messagefoundry check``, before the connection ever starts."""
-    if not value:
-        return None
     # A non-numeric setting raises here, which is the same build-time refusal a bad value gets below.
     # ``value`` is typed Any rather than object because every call site reads it out of an untyped
     # settings mapping; object would need a `type: ignore` on this line, and a suppression a reader
     # has to decide whether to trust is worse than the honest Any.
-    ceiling: int = int(value)
+    try:
+        ceiling = cap_setting(value, int)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{transport} {knob}={value!r} is not a valid int value") from exc
+    if ceiling is None:
+        return None
     if ceiling < 1:
         raise ValueError(
             f"{transport} {knob}={value!r} must be a positive number of items per poll "
@@ -378,9 +445,9 @@ def encode_wire_body(payload: str, encoding: str, *, transport: str) -> bytes:
     the handler (keeping just the index in a local) leaves **both** chains empty.
 
     **Permanent** because it is: the same bytes will never encode on a retry, so it dead-letters
-    rather than looping the lane forever. (``direct.py`` already had the right instinct — it catches
-    ``ValueError`` around its encode and reports ``type(exc).__name__`` only — but it maps to a
-    *transient* error, so an un-encodable body retries there instead of dead-lettering.)"""
+    rather than looping the lane forever. (``direct.py`` once mapped this to a *transient* error, so
+    an un-encodable body retried there instead of dead-lettering; it calls this helper now, BACKLOG
+    #1919/#1920.)"""
     try:
         return payload.encode(encoding)
     except UnicodeEncodeError as exc:

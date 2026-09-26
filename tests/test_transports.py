@@ -1988,6 +1988,7 @@ async def test_file_source_oversize_reject_never_logs_the_partner_chosen_name(
     src = _file_source_for(inbox, max_file_bytes=4)
     src._handler = _noop_handler
     with filtered_sink(_FILE_LOGGER) as sink:
+        await src._scan_once()  # the settle poll (BACKLOG #1811): records the stat, reads nothing
         await src._scan_once()
     assert (inbox / ".error" / name).exists()  # the arm really ran (not a vacuous pass)
     assert "exceeds max_file_bytes" in sink.text

@@ -38,8 +38,20 @@ async def _service(engine: Engine, **kw: object) -> AuthService:
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
+#: httpx's own ASGITransport default peer, named rather than left implicit so no call site here can
+#: fall to a None client (tests/test_api_auth.py ``_client`` states why, BACKLOG #1644).
+_DEFAULT_PEER = ("127.0.0.1", 123)
+
+#: A named, non-loopback peer (TEST-NET-2) for the tests whose subject is the audited ADDRESS.
+_PEER = ("198.51.100.23", 40123)
+
+
+def _client(
+    engine: Engine, service: AuthService, *, peer: tuple[str, int] = _DEFAULT_PEER
+) -> httpx.AsyncClient:
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, serve_ui=True), client=peer
+    )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -176,6 +188,51 @@ async def test_the_console_uses_the_engines_own_action_name(engine: Engine, path
 
     actions = {str(r["action"]) for r in await engine.store.list_audit(limit=200)}
     assert _ACTION in actions, f"no {_ACTION} row; the console wrote {sorted(actions)}"
+
+
+# --- the client address (ADR 0150, BACKLOG #1644) ----------------------------------------------------
+#
+# A NULL client on an audit row asserts "no client was in scope" (docs/PHI.md section 6), and these
+# rows are only ever written FROM a request. The engine's gates stamp the address since PR 1303; the
+# two below pin the console's HTTP gate. Its WebSocket twin is pinned in test_webui.py.
+
+
+async def test_the_mfa_denial_row_carries_the_client_address(engine: Engine) -> None:
+    """RED when: ``client=`` is dropped from require_ui's ``audit_mfa_denied`` call."""
+    service = await _service(engine, require_mfa=True)
+    await _add(service, "op", Role.OPERATOR)
+
+    async with _client(engine, service, peer=_PEER) as c:
+        assert (await _login(c)).status_code == 303
+        r = await c.get("/ui/messages")
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+
+    rows = await _mfa_denials(engine)
+    assert len(rows) == 1, f"expected exactly one {_ACTION} row for one refusal, got {len(rows)}"
+    assert rows[0]["client"] == _PEER[0], rows[0]["client"]
+
+
+async def test_a_permission_denial_row_carries_the_client_address(engine: Engine) -> None:
+    """RED when: ``client=`` is dropped from require_ui's ``audit_permission_denied`` call.
+
+    A VIEWER holds no ``users:read``, and ``/ui/users`` is a plain ``require_ui`` route, so the
+    permission loop is what refuses. ``require_mfa=False`` keeps the MFA gate from refusing first.
+    """
+    service = await _service(engine, require_mfa=False)
+    await _add(service, "vw", Role.VIEWER)
+
+    async with _client(engine, service, peer=_PEER) as c:
+        assert (await _login(c, "vw")).status_code == 303
+        assert (await c.get("/ui/users")).status_code == 403
+
+    rows = [
+        r
+        for r in await engine.store.list_audit(limit=200)
+        if r["action"] == "auth.permission_denied"
+    ]
+    assert len(rows) == 1, f"expected one auth.permission_denied row, got {len(rows)}"
+    assert rows[0]["actor"] == "vw"
+    assert rows[0]["client"] == _PEER[0], rows[0]["client"]
 
 
 # --- the step-up factories --------------------------------------------------------------------------
