@@ -358,6 +358,7 @@ def test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder(
     assert minted.exists()
     pinned = ssl.create_default_context(cafile=str(minted))
     pinned.minimum_version = ssl.TLSVersion.TLSv1_2  # pinned floor -- see _verifying_client_ctx
+    # "0.0.0.0" verifies only because ensure_api_tls_material mints with the bind host in the SAN.
     assert _handshake(server, pinned, client_cert=None, server_hostname="0.0.0.0")  # claim 1
 
     stock = ssl.create_default_context()
