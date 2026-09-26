@@ -450,7 +450,9 @@ This amends §3.3's RCSI paragraph and §11 item 6. It supersedes nothing and ta
 when RCSI is off and the login cannot enable it. The error names the one statement a DBA runs. It
 also refuses when the probe cannot connect or cannot read the state, since RCSI is then unverified.
 After a failed `ALTER` it re-reads the state on fresh connections, so a concurrent opener (an engine
-shard, a cluster node) whose `ALTER ... WITH ROLLBACK IMMEDIATE` won does not fail this open.
+shard, a cluster node) whose `ALTER ... WITH ROLLBACK IMMEDIATE` won does not fail this open. One
+window stays: if the peer's `ROLLBACK IMMEDIATE` lands on this open's first connect or state read,
+this open still fails, and a restart recovers it. Pre-enabling RCSI closes that window.
 `ALLOW_SNAPSHOT_ISOLATION` still only warns: no store path runs at SNAPSHOT isolation.
 
 **Why the §11 item 6 premise no longer holds.** That item kept the RCSI gate on pooled mode only,
@@ -470,12 +472,15 @@ sequences ADR 0075 pins. Refusing the mode keeps one invariant in one place, and
 correctness argument in the store already assumes RCSI on. P4-05 names refusal as the simpler
 correct end state. With no deployments (CLAUDE.md §0), refusing costs nothing to migrate.
 
-**What `[pipeline].require_rcsi_for_pooled` does now.** It is not quite dead. The pooled runner
-still calls `require_rcsi_for_pooled()` at start, and the store stays open across a runner restart,
-a reload or an HA promotion. So the gate now fires only when RCSI was switched off **after** the
-store opened. With the default `true`, that pooled start fails closed. With `false`, the runner
-starts degraded, with a warning, the `/stats` `rcsi_off_degraded` gauge and an AlertSink event,
-and it then runs in the mode P4-05 measured deadlocking. `false` can no longer open a store without
+**What `[pipeline].require_rcsi_for_pooled` does now.** It is not quite dead. The gate runs only
+when a pooled `RegistryRunner` starts. The store can stay open across a runner start, for example
+an HA promotion, so the gate now fires only when RCSI was switched off **after** the store opened
+and **before** that start. A `reload()` of a running graph does not re-run it, and nothing
+re-checks while the graph runs. With the default `true`, that pooled start fails closed. With
+`false`, the runner starts degraded, with a warning log and an AlertSink `rcsi_off_degraded` event,
+and it then runs in the mode P4-05 measured deadlocking. The runner also sets a private
+`_rcsi_off_degraded` flag, but nothing reads it: the `/stats` gauge that §3.3, §11 item 6 and
+`config/settings.py` describe does not exist. `false` can no longer open a store without
 RCSI, and it no longer has a legitimate use.
 
 **Decided end state, not built in this change:** retire the key. It should be **refused at load**
@@ -487,7 +492,8 @@ engine and runner plumbing, the `rcsi_off_degraded` alert type and the tests tha
 runner with the knob, so it ships as its own change.
 
 **Tests.** `tests/test_sqlserver_rcsi_fail_closed.py` drives the real `open()` against a recording
-`aioodbc` stand-in, and three of its tests are red on the pre-change code. The gated
+`aioodbc` stand-in. Three of its tests fail on the pre-change behaviour: the denied `ALTER`, the
+unreadable state and the failed probe connect. The gated
 `test_open_refuses_a_least_privilege_login_on_an_rcsi_off_database` in
 `tests/test_sqlserver_store.py` runs on the SQL Server CI legs. It creates a scratch database with
 RCSI off and a login holding only the §1.1 grant, asserts the open is refused, then enables RCSI
