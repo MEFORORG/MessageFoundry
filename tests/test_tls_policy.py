@@ -116,8 +116,17 @@ def test_validate_accepts_ecdhe_string() -> None:
 
 
 def test_validate_accepts_ecdhe_family_alias() -> None:
-    # OpenSSL family aliases resolve to ECDHE suites (plus the always-on TLS 1.3 suites).
-    assert validate_tls_ciphers("ECDHE+AESGCM") == "ECDHE+AESGCM"
+    # OpenSSL family aliases resolve to ECDHE suites (plus the always-on TLS 1.3 suites). This used
+    # "ECDHE+AESGCM" until owner ruling R4 of 2026-09-26 (BACKLOG #2042): that alias also reaches the
+    # AES-128-GCM suites, which the allow-list now refuses. The test below pins the refusal.
+    alias = "ECDHE+AESGCM+AES256:ECDHE+CHACHA20"
+    assert validate_tls_ciphers(alias) == alias
+
+
+def test_validate_refuses_an_alias_that_reaches_aes128_gcm() -> None:
+    # BACKLOG #2042: the 0.4.0 migration note recommended this string, and it now refuses at load.
+    with pytest.raises(ValueError, match="AES128-GCM"):
+        validate_tls_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20")
 
 
 def test_validate_rejects_unparseable() -> None:

@@ -3,6 +3,9 @@
 - **Status:** Accepted (2026-09-14) — built. **Amended 2026-09-23 (BACKLOG #300):** unset now narrows to the
   approved suites on all four seams, and the approved list is the default on every context the engine
   builds, with recorded exceptions. See the amendment at the end; it supersedes AC-4, AC-5 and AC-6 below.
+  **Amended 2026-09-26 (BACKLOG #2042, owner ruling R4):** the three AES-128-GCM suites leave the
+  approved list, and TLS 1.3's `TLS_AES_128_GCM_SHA256` goes wherever the interpreter can remove it.
+  See the second amendment at the end.
 - **Date:** 2026-09-14
 - **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (WP-13b MLLP-over-TLS) · [ADR 0025](0025-dicom-codec-store-connectors.md) (DICOM C-STORE connectors) · [ADR 0094](0094-granular-expiry-only-tls-relaxation.md) (the per-connection TLS opt-in this copies) · [ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md) (the engine always serves TLS) · CLAUDE.md §9 (PHI on the wire)
 
@@ -184,7 +187,7 @@ allow it, one for each half, and this section is the in-repo record of both.
 ### What changed
 
 A new function, `tls_policy.narrow_to_approved_suites(ctx)`, calls `set_ciphers` with the eight
-TLS 1.2 names in `APPROVED_TLS12_SUITES`, in order. Every engine-built seam calls it before its
+(five since the 2026-09-26 amendment below) TLS 1.2 names in `APPROVED_TLS12_SUITES`, in order. Every engine-built seam calls it before its
 `harden_cipher_suites` assertion. On the four seams this ADR covers, `apply_connection_tls_ciphers`
 calls it when `tls_ciphers` is unset, so those seams still read as the three calls shown above.
 
@@ -251,7 +254,8 @@ And for the engine-wide default, in `tests/test_tls_default_suites.py`:
   → `test_client_hop_refuses_a_cbc_only_server`, `test_server_hop_refuses_a_cbc_only_client` and
   their `accepts` pairs
 - **AC-8** — Every engine-built hop SHALL offer `APPROVED_TLS12_SUITES` in order, and that order SHALL
-  follow the stated rule: ECDHE before DHE, then AES-256-GCM, AES-128-GCM, ChaCha20.
+  follow the stated rule: ECDHE before DHE, then AES-256-GCM, ChaCha20. (It read "AES-256-GCM,
+  AES-128-GCM, ChaCha20" until the 2026-09-26 amendment below removed AES-128-GCM.)
   → `test_every_hop_offers_the_approved_list_in_order`, `test_the_approved_order_follows_the_stated_rule`
 - **AC-9** — Every engine module other than `tls_policy.py` that calls `harden_cipher_suites` SHALL
   make at least as many narrowing calls. This is a per-module count: it cannot see a narrowing placed
@@ -265,3 +269,58 @@ call-site guard still sees it by name at every seam. It also asserts on library-
 the engine cannot narrow, which is why it must not apply the list itself. Key-exchange groups are not
 touched: Python 3.14 cannot set them, so every hop still inherits OpenSSL's group list, which accepts
 `ffdhe2048` (see `harden_kex_groups`). Counterparty key floors and the OpenSSL security level are out of scope.
+
+---
+
+## Amendment (2026-09-26): no AES-128 suite by default (BACKLOG #2042, owner ruling R4)
+
+**The approved list no longer holds any AES-128 suite at TLS 1.2, and TLS 1.3 drops
+`TLS_AES_128_GCM_SHA256` wherever the interpreter can.** The owner ruled option A of BACKLOG #2042
+on 2026-09-26, on an adversarial review's recommendation, and did not ratify the alternative D1.
+
+### What changed
+
+`APPROVED_TLS12_SUITES` loses three suites: `ECDHE-ECDSA-AES128-GCM-SHA256`,
+`ECDHE-RSA-AES128-GCM-SHA256` and `DHE-RSA-AES128-GCM-SHA256`. Five remain, in the interpreter's own
+order. The apiclient and IDE copies lose the same three.
+
+TLS 1.3 is out of reach of `set_ciphers`. A new `tls_policy.narrow_tls13_suites(ctx)` calls
+`SSLContext.set_ciphersuites` with `APPROVED_TLS13_SUITES` where the method exists, and returns
+whether it did. `narrow_to_approved_suites` calls it, and so does each branch that applies an
+operator `tls_ciphers` string.
+
+| Where | TLS 1.2 | TLS 1.3 |
+|---|---|---|
+| Every engine-built hop in the first amendment's table, and the apiclient | 5 suites, no AES-128 | CPython 3.14: all three suites, `TLS_AES_128_GCM_SHA256` included. **A recorded gap, not an override.** CPython 3.15: 2 suites, with no code change |
+| IDE extension client (Node) | 5 suites, no AES-128 | 2 suites now: Node's `ciphers` option reaches TLS 1.3 |
+| The library-built hops the first amendment lists as unchanged | unchanged | unchanged |
+
+**The CPython 3.14 residual is recorded, not accepted by override.** CPython 3.14 has no
+`set_ciphersuites`, so no engine code can remove the TLS 1.3 AES-128 suite there. The allow-list
+admits `TLS_AES_128_GCM_SHA256` only on an interpreter without that method, because a string the
+operator cannot change must not fail validation. On 3.15 the admission and the suite leave together.
+
+**A legacy peer that needs AES-128 is served by a reviewed change that widens the allow-list**, as
+the 2026-09-23 CBC ruling already provides. There is no setting. `tls_ciphers` cannot select an
+AES-128 suite, because the allow-list refuses it, so an operator string such as `ECDHE+AESGCM` now
+refuses at load. `ECDHE+AESGCM+AES256:ECDHE+CHACHA20` is the equivalent that passes.
+
+The same ruling covers `aes128-gcm@openssh.com` on SFTP and `aes128-gcm96` on Vault Transit. Those
+are separate changes and are not recorded here.
+
+### Acceptance criteria
+
+In `tests/test_tls_default_suites.py`:
+
+- **AC-10** -- WHEN any engine-built hop meets a TLS 1.2 peer offering only
+  `ECDHE-ECDSA-AES128-GCM-SHA256`, THE SYSTEM SHALL fail the handshake. A stock context of the same
+  shape completes against the same peer, as the control.
+  -> `test_client_hop_refuses_an_aes128_gcm_only_server`,
+  `test_server_hop_refuses_an_aes128_gcm_only_client` and the two `test_control_a_stock_*_aes128_*`
+- **AC-11** -- WHERE the context has `set_ciphersuites`, THE SYSTEM SHALL set it to
+  `APPROVED_TLS13_SUITES`; WHERE it does not, the call SHALL report that it did nothing.
+  -> `test_narrow_tls13_suites_applies_the_approved_tls13_list_where_the_method_exists`,
+  `test_narrow_tls13_suites_reports_nothing_done_without_the_method`,
+  `test_the_tls13_aes128_residual_is_measured_as_the_recorded_gap`
+- **AC-12** -- Every branch that applies an operator `tls_ciphers` string SHALL also narrow TLS 1.3.
+  -> `test_every_operator_cipher_branch_narrows_tls13_too`

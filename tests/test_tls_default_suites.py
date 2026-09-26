@@ -22,6 +22,10 @@ What this file proves, per hop, and why each instrument is there:
   tuple, so each carries a copy, pinned here to it, order included.
 * **The call sites.** Every engine module that asserts a suite list must also narrow one, counted the
   same way ``tests/test_tls_policy.py`` counts the assertion against the key-exchange pin.
+* **No AES-128 (owner ruling R4 of 2026-09-26, BACKLOG #2042).** Each hop refuses a TLS 1.2 peer
+  offering only AES-128-GCM, against the same stock-context control. At TLS 1.3 the engine narrows
+  through ``set_ciphersuites`` where the interpreter has it; CPython 3.14 does not, so that branch
+  is driven here with a stand-in context, and the 3.14 residual is measured as a recorded gap.
 """
 
 from __future__ import annotations
@@ -46,11 +50,14 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.apiclient import client as apiclient
 from messagefoundry.auth.oidc_http import build_idp_opener
+from messagefoundry.config import tls_policy
 from messagefoundry.config.settings import ApiSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import (
     APPROVED_TLS12_SUITES,
+    APPROVED_TLS13_SUITES,
     TrustAnchor,
     build_smtp_tls_context,
+    narrow_tls13_suites,
     narrow_to_approved_suites,
     urllib_handler_context,
 )
@@ -68,8 +75,18 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 #: One CBC-SHA2 suite and one AEAD suite the ECDSA test certificate can serve. Both are in the
 #: interpreter's default list on every supported build, which is what makes the control meaningful.
+#: ``AEAD_ONLY`` was ``ECDHE-ECDSA-AES128-GCM-SHA256`` until owner ruling R4 of 2026-09-26 (BACKLOG
+#: #2042) took the AES-128-GCM suites out; that suite is now ``AES128_GCM_ONLY``, a peer to REFUSE.
 CBC_ONLY = "ECDHE-ECDSA-AES128-SHA256"
-AEAD_ONLY = "ECDHE-ECDSA-AES128-GCM-SHA256"
+AEAD_ONLY = "ECDHE-ECDSA-AES256-GCM-SHA384"
+AES128_GCM_ONLY = "ECDHE-ECDSA-AES128-GCM-SHA256"
+
+#: Whether this build's interpreter default offers the AES-128-GCM suite. The R4 controls need it,
+#: for the reason the CBC controls need ``_DEFAULT_OFFERS_MORE`` below.
+_needs_default_aes128 = pytest.mark.skipif(
+    AES128_GCM_ONLY not in {str(c["name"]) for c in ssl.create_default_context().get_ciphers()},
+    reason="this build's default does not offer the AES-128-GCM suite",
+)
 
 #: Whether this build's interpreter default offers anything beyond the approved list. The controls
 #: below need it to: on a build whose default is ALREADY the approved list, a stock context cannot
@@ -377,6 +394,137 @@ def test_server_hop_accepts_an_aead_client(hop: str, pki: _Pki) -> None:
     assert _handshake(_peer_client(pki, AEAD_ONLY), SERVER_HOPS[hop](pki)) == AEAD_ONLY
 
 
+# --- owner ruling R4 (BACKLOG #2042): a TLS 1.2 peer offering only AES-128-GCM is refused ---------
+
+
+@_needs_default_aes128
+def test_control_a_stock_client_context_handshakes_with_the_aes128_only_server(pki: _Pki) -> None:
+    """CONTROL for every AES-128 client refusal below. The untouched default still offers
+    ``AES128_GCM_ONLY``, so this completes. Without it a broken peer would explain each refusal."""
+    stock = ssl.create_default_context(cafile=pki.ca)
+    assert _handshake(stock, _peer_server(pki, AES128_GCM_ONLY)) == AES128_GCM_ONLY
+
+
+@_needs_default_aes128
+def test_control_a_stock_server_context_handshakes_with_the_aes128_only_client(pki: _Pki) -> None:
+    """CONTROL for every AES-128 server refusal below, the same argument from the other side."""
+    stock = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    stock.load_cert_chain(pki.cert, pki.key)
+    assert _handshake(_peer_client(pki, AES128_GCM_ONLY), stock) == AES128_GCM_ONLY
+
+
+@_needs_default_aes128
+@pytest.mark.parametrize("hop", sorted(CLIENT_HOPS))
+def test_client_hop_refuses_an_aes128_gcm_only_server(hop: str, pki: _Pki) -> None:
+    with pytest.raises(ssl.SSLError):
+        _handshake(CLIENT_HOPS[hop](pki), _peer_server(pki, AES128_GCM_ONLY))
+
+
+@_needs_default_aes128
+@pytest.mark.parametrize("hop", sorted(SERVER_HOPS))
+def test_server_hop_refuses_an_aes128_gcm_only_client(hop: str, pki: _Pki) -> None:
+    with pytest.raises(ssl.SSLError):
+        _handshake(_peer_client(pki, AES128_GCM_ONLY), SERVER_HOPS[hop](pki))
+
+
+def test_no_approved_suite_is_aes128_at_either_version() -> None:
+    """R4 as a list property, with a control that the pattern can match at all."""
+    pattern = re.compile(r"AES128|AES_128")
+    assert pattern.search(AES128_GCM_ONLY) and pattern.search("TLS_AES_128_GCM_SHA256"), "control"
+    offenders = [n for n in APPROVED_TLS12_SUITES + APPROVED_TLS13_SUITES if pattern.search(n)]
+    assert not offenders, offenders
+
+
+# --- TLS 1.3: narrowed where the interpreter allows it, a recorded gap where it does not ----------
+
+
+class _Tls13CapableContext(ssl.SSLContext):
+    """A stand-in for a CPython 3.15 context: a real context that also has ``set_ciphersuites``.
+    It records the argument instead of applying it, so the branch 3.14 cannot reach runs here."""
+
+    tls13_calls: list[str]
+
+    def set_ciphersuites(self, suites: str) -> None:
+        self.tls13_calls = [*getattr(self, "tls13_calls", []), suites]
+
+
+def test_narrow_tls13_suites_applies_the_approved_tls13_list_where_the_method_exists() -> None:
+    ctx = _Tls13CapableContext(ssl.PROTOCOL_TLS_CLIENT)
+    assert narrow_tls13_suites(ctx) is True
+    assert ctx.tls13_calls == ["TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"]
+
+
+def test_narrow_to_approved_suites_narrows_tls13_where_the_method_exists() -> None:
+    ctx = _Tls13CapableContext(ssl.PROTOCOL_TLS_SERVER)
+    narrow_to_approved_suites(ctx)
+    assert ctx.tls13_calls == [":".join(APPROVED_TLS13_SUITES)]
+    assert _tls12(ctx) == list(APPROVED_TLS12_SUITES), "the TLS 1.2 half still applies"
+
+
+def test_narrow_tls13_suites_reports_nothing_done_without_the_method() -> None:
+    """The 3.14 branch. ``False`` is the report: a no-op must never read back as a narrowing."""
+
+    class _NoMethod:
+        pass
+
+    assert narrow_tls13_suites(_NoMethod()) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(
+    hasattr(ssl.SSLContext, "set_ciphersuites"),
+    reason="this interpreter can narrow TLS 1.3, so the R4 gap is closed here",
+)
+def test_the_tls13_aes128_residual_is_measured_as_the_recorded_gap() -> None:
+    """RECORDED GAP of ruling R4, measured rather than restated. On an interpreter without
+    ``set_ciphersuites`` a narrowed context still offers ``TLS_AES_128_GCM_SHA256``, and the
+    allow-list admits it for that reason alone. The day that changes, this test skips."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    narrow_to_approved_suites(ctx)
+    tls13 = [str(c["name"]) for c in ctx.get_ciphers() if c["protocol"] == "TLSv1.3"]
+    assert "TLS_AES_128_GCM_SHA256" in tls13
+    assert "TLS_AES_128_GCM_SHA256" in tls_policy._APPROVED_TLS_SUITES
+
+
+def test_the_allow_list_admits_tls13_aes128_only_where_it_cannot_be_removed() -> None:
+    """The admission is tied to the missing method, so 3.15 drops it with no code change."""
+    removable = hasattr(ssl.SSLContext, "set_ciphersuites")
+    assert ("TLS_AES_128_GCM_SHA256" in tls_policy._APPROVED_TLS_SUITES) is (not removable)
+    assert set(APPROVED_TLS13_SUITES) <= tls_policy._APPROVED_TLS_SUITES
+
+
+def test_every_operator_cipher_branch_narrows_tls13_too(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator string reaches TLS 1.2 only, so each place that applies one must also call
+    ``narrow_tls13_suites``: the API listener, a connection's ``tls_ciphers``, and the validator's
+    probe, which models an engine context."""
+    import messagefoundry.api.tls as api_tls
+
+    seen: list[str] = []
+
+    def spy(where: str) -> Callable[[ssl.SSLContext], bool]:
+        def _spy(ctx: ssl.SSLContext) -> bool:
+            seen.append(where)
+            return False
+
+        return _spy
+
+    monkeypatch.setattr(api_tls, "narrow_tls13_suites", spy("api"))
+    monkeypatch.setattr(tls_policy, "narrow_tls13_suites", spy("policy"))
+    one = "ECDHE-ECDSA-AES256-GCM-SHA384"
+    api = ApiSettings(tls_cert_file=pki.cert, tls_key_file=pki.key, tls_ciphers=one)
+    seen.clear()  # constructing the settings may run the validator; only the build is measured
+    build_api_ssl_context(api)
+    assert seen == ["api"], seen
+    seen.clear()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    tls_policy.apply_connection_tls_ciphers(ctx, {"tls_ciphers": one}, connector="MLLP test")
+    assert seen == ["policy", "policy"], seen  # the validator's probe, then the connection ctx
+    seen.clear()
+    tls_policy.validate_tls_ciphers(one)
+    assert seen == ["policy"], seen
+
+
 @pytest.mark.parametrize("hop", sorted(CLIENT_HOPS | SERVER_HOPS))
 def test_every_hop_offers_the_approved_list_in_order(hop: str, pki: _Pki) -> None:
     """The ORDER check (BACKLOG #300). A list comparison, so a reordered default fails here even
@@ -414,9 +562,10 @@ def test_an_operator_api_tls_ciphers_still_wins_over_the_default(pki: _Pki) -> N
 
 
 def _rank(name: str) -> tuple[int, int]:
-    """ECDHE before DHE; within one key exchange AES-256-GCM, then AES-128-GCM, then ChaCha20."""
+    """ECDHE before DHE; within one key exchange AES-256-GCM, then ChaCha20. AES-128-GCM sat
+    between the two until owner ruling R4 of 2026-09-26 removed it."""
     kx = 0 if name.startswith("ECDHE-") else 1
-    cipher = 0 if "AES256-GCM" in name else 1 if "AES128-GCM" in name else 2
+    cipher = 0 if "AES256-GCM" in name else 1
     return kx, cipher
 
 
@@ -474,6 +623,34 @@ def test_the_ide_copy_matches_the_engine_tuple() -> None:
     assert match, "TLS_12_SUITES array literal not found in ide/src/engineClient.ts"
     names = re.findall(r'"([^"]+)"', match.group(1))
     assert tuple(names) == APPROVED_TLS12_SUITES
+
+
+def test_the_tls13_copies_match_the_engine_tuple() -> None:
+    """Ruling R4 gave the engine a TLS 1.3 tuple, and both clients carry a copy of it. The IDE's
+    is live today: Node can restrict TLS 1.3 through ``ciphers``, which CPython 3.14 cannot."""
+    assert apiclient._APPROVED_TLS13_SUITES == APPROVED_TLS13_SUITES
+    text = (_ROOT / "ide" / "src" / "engineClient.ts").read_text(encoding="utf-8")
+    match = re.search(r"export const TLS_13_SUITES: readonly string\[\] = \[(.*?)\];", text, re.S)
+    assert match, "TLS_13_SUITES array literal not found in ide/src/engineClient.ts"
+    assert tuple(re.findall(r'"([^"]+)"', match.group(1))) == APPROVED_TLS13_SUITES
+
+
+def test_the_apiclient_narrows_tls13_where_the_method_exists(
+    monkeypatch: pytest.MonkeyPatch, pki: _Pki
+) -> None:
+    """The apiclient cannot import ``narrow_tls13_suites``, so its own ``getattr`` branch is driven
+    here with the stand-in context, on the pinned-``cacert`` branch."""
+    made: list[_Tls13CapableContext] = []
+
+    def fake_default_context(*, cafile: str) -> ssl.SSLContext:
+        ctx = _Tls13CapableContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cafile)
+        made.append(ctx)
+        return ctx
+
+    monkeypatch.setattr(ssl, "create_default_context", fake_default_context)
+    apiclient._build_verify_context(pki.ca, None, None)
+    assert [c.tls13_calls for c in made] == [[":".join(APPROVED_TLS13_SUITES)]]
 
 
 # --- the call-site count: every engine module that asserts a suite list narrows one -----------------

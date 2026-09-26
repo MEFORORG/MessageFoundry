@@ -679,6 +679,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   2048-bit floor. **Migration:** generate an RSA key of at least 3072 bits, or an EC key for
   ES256 / ES384, and register its public half with the counterparty.
   ([BACKLOG #300](docs/BACKLOG.md))
+- **BREAKING: the default TLS suites no longer include AES-128.** The engine, the apiclient and
+  the IDE client drop `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-RSA-AES128-GCM-SHA256` and
+  `DHE-RSA-AES128-GCM-SHA256`. Five TLS 1.2 suites remain: AES-256-GCM and ChaCha20. A TLS 1.2 peer
+  that offers only AES-128-GCM now fails the handshake. At TLS 1.3 the IDE client drops
+  `TLS_AES_128_GCM_SHA256` now. The engine drops it on Python 3.15, which adds
+  `SSLContext.set_ciphersuites`. On Python 3.14 the engine still offers it, a gap the owner's
+  2026-09-26 ruling records rather than overrides. A `tls_ciphers` or `[api].tls_ciphers` string
+  that reaches an AES-128 suite now refuses at load. That includes `ECDHE+AESGCM:ECDHE+CHACHA20`,
+  the string the 0.4.0 migration note below recommends. **Migration:** use
+  `ECDHE+AESGCM+AES256:ECDHE+CHACHA20`, or leave `tls_ciphers` unset. There is no setting that
+  re-admits AES-128; a legacy peer that needs it is served by a reviewed code change that widens
+  the allow-list. The ADR 0188 amendment of 2026-09-26 records the ruling.
+  ([BACKLOG #2042](docs/BACKLOG.md))
 - **BREAKING: a trust anchor that another account can replace through its folder now refuses to
   start.** This covers `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and
   `[api].tls_client_ca_file`. 0.4.0 checked only the anchor file's own permissions. An account with
