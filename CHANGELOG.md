@@ -45,6 +45,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING — `length_of_stay` needs a zone for admit and discharge times that carry no offset.**
+  It used to subtract the two wall clocks. A stay spanning a daylight-saving change came back an hour
+  wrong, with no error: 48 hours for a 47-hour stay across the March change, 48 for a 49-hour stay
+  across the November one. `length_of_stay` and `Message.length_of_stay` now take an optional
+  `zone`, an IANA name such as `America/Chicago`. They read each offset-free stamp in that zone and
+  subtract in UTC. With no `zone`, they refuse with `ValueError` a pair where only one stamp has an
+  offset, and a pair with no offsets where either stamp has a time of day. A pair of date-only stamps
+  with no offsets still needs no zone and stays a whole number of days. A stamp on a daylight-saving
+  edge of the zone is refused as `convert_hl7_timestamp` refuses it, unless `on_dst_edge` names a
+  resolution. (`BACKLOG #1770`)
 - **BREAKING — the engine no longer creates an account on its own.** A `serve` on a store with no
   users used to create an enabled Administrator named `admin` and write its one-time password to
   `bootstrap-admin.txt` beside the store. It now creates no account and writes no file. Create the
@@ -151,6 +161,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **Startup attestation now checks the web console, not just the engine.** The console ships as its
+  own wheel, `messagefoundry-webconsole`, and runs inside the engine process. Attestation compared
+  only the engine wheel's files, so a console file edited, added or deleted in place went unseen.
+  When the engine has loaded the console, it now checks every console file against the console
+  wheel's own `RECORD`, under the same `[integrity]` rules. A console the engine has not loaded is
+  skipped. The engine's own operator-facing messages are unchanged. Subjects and details are in
+  [CONFIGURATION.md](docs/CONFIGURATION.md) under `[integrity]`. (`BACKLOG #1802`)
 - **BREAKING: a CRL file can no longer add trust anchors.** Each CRL setting loaded its file as
   a CA file, so any certificate in it became a trusted CA for the hop. That CA skipped the hop's
   pin and permission checks. It covers at least `[api].tls_client_crl_file`, an inbound

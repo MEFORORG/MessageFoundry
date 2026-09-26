@@ -169,10 +169,11 @@ async def test_scu_refuses_a_bomb_behind_a_malformed_meta(mutate: Callable[[byte
     assert exc.value.permanent is True
 
 
-async def test_scu_still_dead_letters_a_header_pydicom_rejects_outside_the_parse_errors() -> None:
-    # An unknown VR on (0002,0010) makes pydicom raise NotImplementedError, which is not one of the
-    # codec's parse-error types. The guard's header replay meets it before dcmread does, so this
-    # drives the SCU's except around the guard: a permanent bad-object, never an internal error.
+async def test_scu_still_dead_letters_a_header_pydicom_rejects_in_the_guard_replay() -> None:
+    # An unknown VR on (0002,0010) makes pydicom raise NotImplementedError. The codec's parse-error
+    # types did not name it when this test was written; they do since BACKLOG #1893. The SCU does not
+    # use that tuple: the guard's header replay meets the error before dcmread does, so this drives
+    # the SCU's broad except around the guard: a permanent bad-object, never an internal error.
     from messagefoundry.transports.base import NegativeAckError
 
     obj = make_sr_part10()
