@@ -119,6 +119,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **`Direct(...)` now refuses at construction what used to fail every send, and a message that cannot
+  be built dead-letters at once with no body left on the error.** A `recipient_cert` whose key is not
+  RSA is refused, because the S/MIME envelope supports RSA key transport only. This reverses the EC
+  recipient allowance, and an EC `signing_key` or `trust_anchor` is still accepted. Construction also
+  signs and encrypts one synthetic body, so a crypto library that refuses the algorithms, a line break
+  inside `subject`, or an unknown `encoding` fails `check`. At send time, a body the `encoding` cannot
+  represent, or a build failure that began after construction, is a permanent rejection. It was a
+  retried transport error. The raised error keeps only the failure class, or the codec and position.
+  The old one chained the encode error, whose `.object` is the whole body. `UnsupportedAlgorithm` is
+  now mapped too. It was reported under a FIPS-enabled OpenSSL, and that case was not reproduced.
+  (`BACKLOG #1918`, `#1919`, `#1920`, `#1921`)
 - **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
   stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
   stage stopped draining while intake kept acknowledging, and the engine still read healthy. The

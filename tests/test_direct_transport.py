@@ -38,7 +38,7 @@ import pytest
 from cryptography import x509
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
@@ -466,6 +466,7 @@ async def test_crypto_build_failure_is_permanent_and_content_free(
     assert exc.credential_fault is False
     assert "TypeError" in str(exc)
     assert exc.__cause__ is None and exc.__context__ is None  # the #1920 shape holds here too
+    assert "SYN123" not in "".join(traceback.format_exception(exc))  # no body content
     assert _FakeSMTP.instances == []
 
 
@@ -493,6 +494,38 @@ async def test_unsupported_algorithm_from_the_envelope_build_is_permanent(
     assert "ZZLIBDETAIL" not in "".join(traceback.format_exception(exc))
     assert exc.__cause__ is None and exc.__context__ is None
     assert _FakeSMTP.instances == []
+
+
+# The construction probe (code review of #1918-#1921). Every build input except the body is fixed at
+# construction, so a fault in one of them would fail every send. The send-time arm dead-letters such
+# a failure message by message, so each of these must fail at check/dry-run/start instead.
+
+
+def test_construction_probe_refuses_an_unsupported_algorithm(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    # The #1921 FIPS shape, one step earlier: a builder that refuses at every call refuses here too.
+    def _fips_refusal() -> Any:
+        raise UnsupportedAlgorithm("synthetic FIPS refusal")
+
+    monkeypatch.setattr(
+        "messagefoundry.transports.direct.pkcs7.PKCS7EnvelopeBuilder", _fips_refusal
+    )
+    with pytest.raises(ValueError, match="could not build an S/MIME message.*UnsupportedAlgorithm"):
+        DirectDestination(_dest(pki))
+
+
+def test_construction_probe_refuses_a_subject_with_a_line_break(pki: dict[str, Any]) -> None:
+    # email.message refuses a header value with CR or LF INSIDE it, on every build. A single trailing
+    # newline is stripped and accepted, so the break here is embedded (header injection shape).
+    with pytest.raises(ValueError, match="could not build an S/MIME message.*ValueError"):
+        DirectDestination(_dest(pki, subject="Referral\nBcc: someone@hisp.example"))
+
+
+def test_construction_probe_refuses_an_unknown_encoding(pki: dict[str, Any]) -> None:
+    # An unknown codec name raises LookupError, which no send-time arm catches.
+    with pytest.raises(ValueError, match="could not build an S/MIME message.*LookupError"):
+        DirectDestination(_dest(pki, encoding="not-a-codec"))
 
 
 # --- test_connection probe: connect + EHLO + NOOP only, no MAIL FROM / DATA --------------------------
@@ -914,9 +947,29 @@ def test_an_ec_recipient_cert_is_refused_at_construction(
         DirectDestination(_dest(pki, recipient_cert=_ec_recipient(pki, tmp_path)))
 
 
-def test_pkcs7_envelope_builder_still_refuses_an_ec_recipient(
+def test_a_non_ec_non_rsa_recipient_cert_is_refused_too(
     pki: dict[str, Any], tmp_path: Path
 ) -> None:
+    # The fallback label, on a key type the curve list never sees: Ed25519.
+    key = ed25519.Ed25519PrivateKey.generate()
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ed25519-recip")]))
+        .issuer_name(pki["ca_cert"].subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(pki["ca_key"], hashes.SHA256())
+    )
+    path = tmp_path / "ed25519_recip.crt"
+    _write_pem(path, cert)
+    with pytest.raises(ValueError, match="recipient_cert' key type is not RSA"):
+        DirectDestination(_dest(pki, recipient_cert=str(path)))
+
+
+def test_pkcs7_envelope_builder_still_refuses_an_ec_recipient(pki: dict[str, Any]) -> None:
     """Library-drift tripwire for the refusal above. If a later cryptography envelopes to an EC
     recipient, this fails, and the construction refusal is refusing a partner the library could now
     serve -- re-read BACKLOG #1918 before widening it."""

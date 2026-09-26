@@ -1823,7 +1823,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `signing_cert` | — (required) | path to the sender's PEM/DER signing **certificate** |
 | `signing_key` | — (required) | path to the sender's PEM/DER signing **private key** |
 | `signing_key_password` | — | passphrase for an encrypted `signing_key` — a **secret**, via `env()` |
-| `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target). Must carry an **RSA** key: the S/MIME envelope supports RSA key transport only, so an EC certificate is refused at construction |
+| `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target). Must carry an **RSA** key: the S/MIME envelope supports RSA key transport only, so any other key type (EC included) is refused at construction |
 | `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to |
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
 | `subject` | `""` | static `Subject` |
@@ -1836,7 +1836,9 @@ these messages, and the SMTP relay accepts them before anyone tries.
 is built — so `messagefoundry check` / dry-run / start catches it, never the first message: a malformed
 key/cert, a `signing_key` whose public half **does not match** `signing_cert`, a `recipient_cert` whose key
 is **not RSA**, and a `recipient_cert` **not issued by** any supplied `trust_anchor` (PHI is never encrypted
-to a certificate from an untrusted issuer).
+to a certificate from an untrusted issuer). The connector then signs and encrypts one fixed synthetic body,
+so anything else that would fail every send also fails here: a crypto library or OpenSSL build that refuses
+the algorithms, a line break inside `subject`, or an unknown `encoding` name.
 The trust check is deliberately **one level** (the recipient cert chains directly to a supplied anchor, or is
 a self-signed correspondent cert pinned as its own anchor) — full multi-level path building is deferred. No
 hostname/SAN match is done: a Direct address is an email, not a TLS SNI. Errors name the *setting* only,
@@ -1845,9 +1847,10 @@ never the material or a cert subject (which can identify a patient's provider).
 **Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
 `allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. An SMTP
 failure raises `DeliveryError`, so the lane **retries** per its `RetryPolicy`. A message that cannot be
-**built** (a body the `encoding` cannot represent, or a crypto failure while signing or encrypting) raises a
-**permanent** `NegativeAckError` and dead-letters on the first attempt, because a retry would fail the same
-way. Its error names the failure class, or the codec and character position, and never the body. Delivery is **at-least-once** and a Direct mailbox has no idempotency key, so a rare duplicate
+**built** raises a **permanent** `NegativeAckError` and dead-letters on the first attempt, because a retry
+would fail the same way. That is a body the `encoding` cannot represent, or a crypto failure that began
+after construction. Its error names the failure class, or the codec and character position, and never the
+body. Delivery is **at-least-once** and a Direct mailbox has no idempotency key, so a rare duplicate
 is possible and **accepted by design** (a duplicate beats a drop), exactly as with `Email(...)`.
 `test_connection` does connect / STARTTLS / EHLO / optional login / NOOP — never `MAIL FROM` or `DATA`.
 
