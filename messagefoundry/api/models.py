@@ -641,9 +641,9 @@ class StatsResponse(BaseModel):
     committed_txns: int = 0
     body_copies: int = 0
     # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres and SQL
-    # Server; 0 on SQLite). Non-zero == a superseded ex-leader was stopped mid-write. MUST be declared
-    # here: this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped
-    # SILENTLY and /stats would never grow the field.
+    # Server; 0 on SQLite). Non-zero == a superseded ex-leader was stopped mid-write. MUST be here:
+    # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
+    # and /stats would never grow the field.
     fenced_writes: int = 0
     # #122 (ADR 0189): OUTBOUND rows the pooled claim gate refused while the delivery tier was halted.
     # The runner property of the same name owns the reading rule; the two things an operator must not

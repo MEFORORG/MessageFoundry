@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import pytest
@@ -321,7 +321,15 @@ def _force_nocount(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     async def nocount_cursor(conn: Any) -> AsyncIterator[Any]:
         async with real_cursor(conn) as cur:
             await cur.execute("SET NOCOUNT ON;")
-            yield cur
+            try:
+                yield cur
+            finally:
+                # Put the session back. Without this, NOCOUNT outlived this store: a LATER test's
+                # freshly opened store read reset_stale_inflight() as -4 (-1 per stage) on both
+                # SQL Server legs, consistent with the ODBC driver manager handing the same
+                # physical connection, session options intact, to the next pool.
+                with suppress(Exception):
+                    await cur.execute("SET NOCOUNT OFF;")
 
     monkeypatch.setattr(store, "_cursor", nocount_cursor)
 
@@ -438,10 +446,13 @@ async def test_a_failed_repend_is_collected_by_the_successors_promotion_reset(
     try:
         successor.set_leader_epoch(6, lease_key=_LEASE_KEY)
         # What promotion runs on SQL Server. now= is explicit because the reset stamps
-        # next_attempt_at=now, and the claim below runs on the fixed test clock.
-        assert await successor.reset_stale_inflight(now=250.0) >= 1
+        # next_attempt_at=now, and the claim below runs on the fixed test clock. The proof is the
+        # ROW STATE, not the returned count: that count is built from cursor.rowcount, which reads
+        # -1 per stage whenever the session has NOCOUNT on (see the report on PR 1576).
+        await successor.reset_stale_inflight(now=250.0)
+        assert (await successor.outbox_for(mid))[0]["status"] == OutboxStatus.PENDING.value
         taken = await successor.claim_next_fifo("OB1", now=300.0)
-        assert taken is not None
+        assert taken is not None and taken.id == claimed.id
         await successor.mark_done(taken.id)
         assert await _ledger_count(store, taken.id) == 1
     finally:
