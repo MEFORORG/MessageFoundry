@@ -167,14 +167,20 @@ class DicomDataset:
 
 
 def _walk_num(content_sequence: Any) -> Iterator[SrMeasurement]:
-    if not content_sequence:
-        return
-    for item in content_sequence:
-        if str_or_none(getattr(item, "ValueType", None)) == "NUM":
-            yield _measurement_from(item)
-        nested = getattr(item, "ContentSequence", None)
-        if nested:
-            yield from _walk_num(nested)
+    # Depth-first, pre-order, with an explicit stack of sibling iterators rather than recursion: the
+    # nesting depth is the sender's choice, so a recursive walk would raise RecursionError on an
+    # object nested past the interpreter's limit (BACKLOG #1599).
+    stack: list[Iterator[Any]] = [iter(content_sequence or ())]
+    while stack:
+        for item in stack[-1]:
+            if str_or_none(getattr(item, "ValueType", None)) == "NUM":
+                yield _measurement_from(item)
+            nested = getattr(item, "ContentSequence", None)
+            if nested:
+                stack.append(iter(nested))  # descend; this level resumes after the subtree
+                break
+        else:
+            stack.pop()
 
 
 def _measurement_from(item: Any) -> SrMeasurement:

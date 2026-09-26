@@ -73,7 +73,10 @@ def parse_error_types() -> tuple[type[BaseException], ...]:
     named. Neither class in ``pydicom.errors`` is a ``ValueError``: ``InvalidDicomError`` and
     ``BytesLengthException`` both descend straight from ``Exception``, and
     ``tests/test_dicom_parse_error_contract.py`` fails if that module grows a third one the tuple
-    misses. pydicom also raises ``NotImplementedError`` for an unknown VR (``values.py``). Enumerated
+    misses. pydicom also raises ``NotImplementedError`` for an unknown VR (``values.py``), and its
+    sequence reader recurses once per nesting level, so a deeply nested ``SQ`` raises
+    ``RecursionError`` (BACKLOG #1599; the stack has unwound to the parse method's handler by the
+    time it runs, so wrapping it cannot re-trip the limit). Enumerated
     at pydicom 3.0.2, and "at least": the list covers what was found, not everything a later pydicom
     can raise. The stdlib members cover the truncation and garbage decode paths. The accessors on a
     parsed :class:`~messagefoundry.parsing.dicom.dataset.DicomDataset` read values after ``parse``
@@ -81,8 +84,9 @@ def parse_error_types() -> tuple[type[BaseException], ...]:
 
     Never add bare ``RuntimeError`` or ``Exception``. :func:`load_dcmread` and
     :func:`load_header_readers` raise ``RuntimeError`` for a missing or broken ``[dicom]`` extra, a
-    deploy error that must not dead-letter every message as bad data. ``NotImplementedError`` is a
-    ``RuntimeError``, but not the other way round, so naming it does not catch those. Imported lazily
+    deploy error that must not dead-letter every message as bad data. ``NotImplementedError`` and
+    ``RecursionError`` are each a ``RuntimeError``, but not the other way round, so naming them does
+    not catch those. Imported lazily
     to preserve no-extra purity."""
     from pydicom.errors import BytesLengthException, InvalidDicomError
 
@@ -90,6 +94,7 @@ def parse_error_types() -> tuple[type[BaseException], ...]:
         InvalidDicomError,
         BytesLengthException,
         NotImplementedError,
+        RecursionError,
         ValueError,
         EOFError,
         OSError,
