@@ -5463,8 +5463,9 @@ def security_loosenings(
         out.append(
             (
                 "require_encryption_for_remote",
-                "off-machine access is permitted WITHOUT TLS — bearer tokens and PHI would cross the network "
-                "in cleartext (still refused on a production-PHI bind)",
+                "off-machine access is permitted with no operator certificate — the API serves "
+                "on its self-signed placeholder, which no trust store vouches for, and inbound "
+                "listeners without tls bind in cleartext (still refused under enforcement=enforce)",
             )
         )
     if not sec.external_link_interstitial:
