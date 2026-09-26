@@ -86,13 +86,19 @@ DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB — matches the MLLP frame c
 # ledger.is_processed(), so eviction never causes a false re-ingest. Shared by RemoteFileSource.
 LEAVE_SEEN_CACHE_MAX = 100_000
 
-# Bound the settle gate's poll-to-poll memory (BACKLOG #1811). Each scan also prunes it to the files still
-# listed, so in practice it holds one entry per unsettled file in the drop directory; this cap only
-# matters for a directory with more unsettled files than this. At the cap a NEW file is not recorded, so
-# it waits; nothing already recorded is evicted. Evicting would let unsettled files push each other out
-# on every scan so that none of them ever settled, while refusing new entries lets the recorded ones
-# settle, be admitted and make room.
+# Bound the settle gate's poll-to-poll memory (BACKLOG #1811). Each scan also forgets files it has not
+# listed for SETTLE_MISS_LIMIT scans in a row, so in practice it holds one entry per unsettled file in
+# the drop directory; this cap only matters for a directory with more unsettled files than this. At the
+# cap a NEW file is not recorded, so it waits; nothing already recorded is evicted. Evicting would let
+# unsettled files push each other out on every scan so that none of them ever settled, while refusing
+# new entries lets the recorded ones settle, be admitted and make room.
 SETTLE_SEEN_MAX = 100_000
+
+# How many scans in a row may fail to list a file before the settle gate forgets it. More than one, so a
+# listing that fails now and then (a share that drops out, a recursive subtree that is briefly
+# unreadable, a transient stat error that makes is_file() False) does not wipe a sighting and restart
+# the wait; a failed listing returns no candidates rather than raising.
+SETTLE_MISS_LIMIT = 3
 
 # When `decompress=` is set, this bounds the *decompressed* output (ADR 0123): `max_file_bytes` only
 # caps the COMPRESSED input (`st_size`), so a small gzip can expand to gigabytes (a decompression bomb).
@@ -410,8 +416,9 @@ class FileSource(SourceConnector):
         # is_processed() read, so an eviction never causes a false re-ingest.
         self._processed_seen: OrderedDict[str, None] = OrderedDict()
         # BACKLOG #1811 settle gate: the (size, mtime_ns) each not-yet-admitted file showed at the poll
-        # that last saw it, keyed by path. In memory only and never logged. See _settled.
-        self._settle_seen: dict[str, _FileSig] = {}
+        # that last saw it, and how many scans in a row have since failed to list it, keyed by path. In
+        # memory only and never logged. See _settled.
+        self._settle_seen: dict[str, tuple[_FileSig, int]] = {}
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (a missing dir is logged-and-retried each poll, never fails start).
         self.validate_directory: bool = bool(s.get("validate_directory", False))
@@ -581,13 +588,7 @@ class FileSource(SourceConnector):
             0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
         )
         candidates = await self._run_fs(self._candidates)
-        if candidates:
-            # Not on an empty listing: _candidates also returns [] when the listing FAILED, and pruning
-            # then would wipe every sighting, so a share whose listing fails every other poll would
-            # never let a file settle. A really empty directory keeps its few stale entries until the
-            # next non-empty listing prunes them. A stale entry can only admit a new file at the same
-            # path whose size and mtime both match it exactly.
-            self._prune_settle(candidates)
+        self._prune_settle(candidates)
         disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, path in enumerate(candidates):
             if self._stop.is_set():
@@ -849,15 +850,17 @@ class FileSource(SourceConnector):
 
         An admitted file leaves the map. If it is then left in place for a retry, it settles again
         before the next attempt, which is the safe reading of a file nobody finished with. It also
-        means each retry waits one extra poll."""
+        means a retry after a read, scan-hook or hand-off failure waits one extra poll. A file that
+        changed during the read (#116) is re-recorded from its post-read stat instead, so it can be
+        admitted on the very next poll."""
         key = str(path)
-        if self._settle_seen.get(key) == sig:
+        seen = self._settle_seen.get(key)
+        if seen is not None and seen[0] == sig:
             del self._settle_seen[key]
             return True
         recorded = self._remember_sig(path, sig)
-        if logger.isEnabledFor(
-            logging.DEBUG
-        ):  # safe_name hashes; skip it when nobody reads the line
+        # safe_name hashes the name, so skip it when nobody reads the line.
+        if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "file source %s: %s not yet settled (%d bytes); %s",
                 self.directory,
@@ -875,18 +878,26 @@ class FileSource(SourceConnector):
         constant for why this is not eviction)."""
         key = str(path)
         if key in self._settle_seen or len(self._settle_seen) < SETTLE_SEEN_MAX:
-            self._settle_seen[key] = sig
+            self._settle_seen[key] = (sig, 0)
             return True
         return False
 
     def _prune_settle(self, candidates: list[Path]) -> None:
-        """Forget files that are no longer listed (moved, deleted, renamed away), so the settle map is
-        bounded by the drop directory rather than by every name it ever held."""
+        """Forget a file once ``SETTLE_MISS_LIMIT`` scans in a row have not listed it (moved, deleted,
+        renamed away), so the settle map is bounded by the drop directory rather than by every name it
+        ever held. A file listed again has its count reset. Waiting for several misses, rather than
+        forgetting on the first, keeps a listing that fails now and then from restarting every wait."""
         if not self._settle_seen:
             return
         listed = {str(p) for p in candidates}
-        for key in [k for k in self._settle_seen if k not in listed]:
-            del self._settle_seen[key]
+        for key, (sig, missed) in list(self._settle_seen.items()):
+            if key in listed:
+                if missed:
+                    self._settle_seen[key] = (sig, 0)
+            elif missed + 1 >= SETTLE_MISS_LIMIT:
+                del self._settle_seen[key]
+            else:
+                self._settle_seen[key] = (sig, missed + 1)
 
     async def _leave_already_ingested(self, file_key: str) -> bool:
         """True if this leave-in-place file was already ingested — the bounded in-process cache first (no

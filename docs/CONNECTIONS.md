@@ -959,11 +959,12 @@ its own policy block below):
   place to retry** next scan — never an accept-and-drop. A local File source reads a file only once its
   size and modification time are **unchanged since the last poll that saw it** (the settle gate,
   BACKLOG #1811), so a partner that pauses between writes for less than `poll_seconds` is waited out. It
-  is always on. The cost is one poll of latency per file, and one more poll before each retry of a file
-  left in place. It cannot see a partner that pauses for longer than `poll_seconds`, or a copier that
-  sets the final size first and holds the modification time fixed while it fills the file in. For
-  those, use the partner's write-then-rename, or for the first a `min_age_seconds` longer than its
-  pause. The SFTP/FTP source has no settle gate yet. As a backstop, the source also compares a file's
+  is always on. The cost is one poll of latency per file, and one more poll before a retry of a file
+  left in place after a read, scan-hook or hand-off failure. It cannot see at least these: a partner
+  that pauses for longer than `poll_seconds`, a same-length rewrite inside the share's modification-time
+  resolution, and a copier that sets the final size first and holds the modification time fixed while
+  it fills the file in. For those, use the partner's write-then-rename, or for the first a
+  `min_age_seconds` longer than its pause. The SFTP/FTP source has no settle gate yet. As a backstop, the source also compares a file's
   size and modification time on each side of the
   read (BACKLOG #116). A file that changes **during** the read is not emitted that scan. One that
   changes **after** it is not moved or deleted, so the next scan reads it whole, and a WARNING says the

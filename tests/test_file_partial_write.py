@@ -17,6 +17,7 @@ string, not a handle on the stored row. The WARNING is what makes that visible. 
 from __future__ import annotations
 
 import ftplib  # nosec B402 - a stub's error type only; nothing here opens a connection
+import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -307,10 +308,15 @@ async def test_a_same_length_rewrite_between_polls_waits_on_the_mtime(tmp_path: 
     assert handler.got == [_WHOLE]
 
 
-async def test_the_settle_memory_forgets_files_that_left(tmp_path: Path) -> None:
-    """The poll-to-poll map is pruned to the files still listed, so it is bounded by the directory.
+async def test_the_settle_memory_forgets_a_file_after_it_is_missing_for_several_scans(
+    tmp_path: Path,
+) -> None:
+    """The poll-to-poll map forgets a file once ``SETTLE_MISS_LIMIT`` scans in a row have not listed
+    it, so it is bounded by the directory rather than by every name it ever held.
 
-    Red mutation: delete the ``_prune_settle`` call. The removed file's entry survives the next scan."""
+    Red mutation: delete the ``_prune_settle`` call. The removed file's entry is never forgotten."""
+    from messagefoundry.transports.file import SETTLE_MISS_LIMIT
+
     inbox = tmp_path / "in"
     inbox.mkdir()
     for n in range(3):
@@ -320,19 +326,20 @@ async def test_the_settle_memory_forgets_files_that_left(tmp_path: Path) -> None
     await src._scan_once()
     assert sorted(Path(k).name for k in src._settle_seen) == ["m0.hl7", "m1.hl7", "m2.hl7"]
     (inbox / "m1.hl7").unlink()  # renamed away or taken by someone else before it settled
-    (inbox / "m3.hl7").write_bytes(_WHOLE)
-    await src._scan_once()  # m0 and m2 are admitted and leave the map; m3 is first seen
-    assert sorted(Path(k).name for k in src._settle_seen) == ["m3.hl7"]
+    for _ in range(SETTLE_MISS_LIMIT - 1):
+        await src._scan_once()
+        assert "m1.hl7" in [Path(k).name for k in src._settle_seen]  # one miss is not enough
+    await src._scan_once()
+    assert src._settle_seen == {}  # m1 forgotten; m0 and m2 were admitted and left on their own
 
 
-async def test_a_failed_listing_keeps_the_settle_memory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A listing that fails returns no candidates. Pruning on it would wipe every sighting, and a share
-    whose listing failed every other poll would then never let a file settle.
+async def test_a_failed_listing_does_not_restart_the_wait(tmp_path: Path) -> None:
+    """A listing that fails returns no candidates rather than raising (a missing directory globs to
+    nothing). Forgetting on that would wipe every sighting, and a share whose listing failed every
+    other poll would never let a file settle.
 
-    Red mutation: prune on an empty candidate list. The sighting is gone and the next poll re-records it
-    instead of admitting the file."""
+    Red mutation: set ``SETTLE_MISS_LIMIT`` to 1. The sighting is gone after the outage and the next
+    poll re-records the file instead of admitting it."""
     inbox = tmp_path / "in"
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(_WHOLE)
@@ -340,14 +347,10 @@ async def test_a_failed_listing_keeps_the_settle_memory(
     handler = _Recorder()
     src._handler = handler
     await src._scan_once()
-    real_glob = Path.glob
-
-    def failing_glob(self: Path, pattern: str) -> Any:
-        raise OSError("share unreachable")
-
-    monkeypatch.setattr(Path, "glob", failing_glob)
-    await src._scan_once()  # the listing fails; nothing is read and nothing is forgotten
-    monkeypatch.setattr(Path, "glob", real_glob)
+    away = tmp_path / "away"
+    inbox.rename(away)  # the share drops out for one poll
+    await src._scan_once()
+    away.rename(inbox)
     assert [Path(k).name for k in src._settle_seen] == ["a.hl7"]
     await src._scan_once()
     assert handler.got == [_WHOLE]
@@ -374,7 +377,7 @@ async def test_a_left_file_already_ingested_never_enters_the_settle_memory(tmp_p
 
 
 async def test_the_settle_memory_cap_makes_new_files_wait_rather_than_evicting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """At the cap a new file is not recorded, and every file still settles in turn.
 
@@ -390,8 +393,10 @@ async def test_the_settle_memory_cap_makes_new_files_wait_rather_than_evicting(
     src = _local(inbox)
     handler = _Recorder()
     src._handler = handler
-    await src._scan_once()
+    with caplog.at_level(logging.DEBUG, logger=_FILE_LOGGER):
+        await src._scan_once()
     assert [Path(k).name for k in src._settle_seen] == ["a.hl7"]  # b waits for room
+    assert "settle memory is full" in caplog.text  # and the log does not promise the next poll
     await src._scan_once()  # a is admitted, which makes room for b's first sighting
     assert handler.got == [_WHOLE]
     await src._scan_once()
