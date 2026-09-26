@@ -16,6 +16,7 @@ No row is deleted and no figure changes meaning; retention is out of scope here.
 from __future__ import annotations
 
 import random
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -63,71 +64,62 @@ async def _seed(store: MessageStore, n: int = 240) -> None:
     (channel, destination) pair holding only cancelled rows.
     """
     rnd = random.Random(1726)
-    db = store._db
+    messages: list[tuple[Any, ...]] = []
+    events: list[tuple[Any, ...]] = []
+    queue: list[tuple[Any, ...]] = []
     for i in range(n):
         mid = f"m{i:04d}"
         channel = _CHANNELS[i % len(_CHANNELS)]
         received_at = 100.0 + (i // 3)  # three messages share each timestamp
         status = "error" if i % 7 == 0 else "processed"
-        await db.execute(
-            "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
-            " message_type, raw, status) VALUES (?,?,?,?,?,?,?,?)",
-            (mid, channel, received_at, "mllp", f"C{i}", "ADT^A01", "MSH|x", status),
-        )
+        messages.append((mid, channel, received_at, status))
         # 0 to 3 events; ts DEcreasing with id, so the ts order and the id order disagree.
-        for k in range(i % 4):
-            await db.execute(
-                "INSERT INTO message_events (message_id, ts, event) VALUES (?,?,?)",
-                (mid, received_at + 10.0 - k, f"ev{k}"),
-            )
+        events += [(mid, received_at + 10.0 - k, f"ev{k}") for k in range(i % 4)]
         for dest in rnd.sample(_DESTS, 2):
             q_status = _STATUSES[rnd.randrange(len(_STATUSES))]
             created = received_at + rnd.random()
-            await db.execute(
-                "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, payload,"
-                " status, attempts, next_attempt_at, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            updated = created + rnd.random() * 20.0
+            queue.append(
                 (
                     f"q{i:04d}{dest}",
                     mid,
                     Stage.OUTBOUND.value,
                     channel,
                     dest,
-                    "p",
                     q_status,
-                    0,
                     created,
-                    created,
-                    created + rnd.random() * 20.0,
-                ),
+                    updated,
+                )
             )
-        # Ingress and routed rows the outbound aggregate must ignore.
-        await db.execute(
-            "INSERT INTO queue (id, message_id, stage, channel_id, payload, status, attempts,"
-            " next_attempt_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (f"i{i:04d}", mid, Stage.INGRESS.value, channel, "r", "done", 0, 0.0, 0.0, 0.0),
-        )
+        # An ingress row the outbound aggregate must ignore.
+        queue.append((f"i{i:04d}", mid, Stage.INGRESS.value, channel, None, "done", 0.0, 0.0))
     # A pair with only cancelled rows: it must still appear, with every figure zero or None.
-    await db.execute(
-        "INSERT INTO messages (id, channel_id, received_at, raw, status) VALUES (?,?,?,?,?)",
-        ("m_cancel", "IB_ONLY_CANCELLED", 50.0, "MSH|x", "processed"),
-    )
-    await db.execute(
-        "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, payload, status,"
-        " attempts, next_attempt_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    messages.append(("m_cancel", "IB_ONLY_CANCELLED", 50.0, "processed"))
+    queue.append(
         (
             "q_cancel",
             "m_cancel",
             Stage.OUTBOUND.value,
             "IB_ONLY_CANCELLED",
             "OB_Q",
-            "p",
             OutboxStatus.CANCELLED.value,
-            0,
-            50.0,
             50.0,
             51.0,
-        ),
+        )
+    )
+    db = store._db
+    await db.executemany(
+        "INSERT INTO messages (id, channel_id, received_at, raw, status) VALUES (?,?,?,'MSH|x',?)",
+        messages,
+    )
+    await db.executemany(
+        "INSERT INTO message_events (message_id, ts, event) VALUES (?,?,?)", events
+    )
+    await db.executemany(
+        "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, status,"
+        " created_at, updated_at, payload, attempts, next_attempt_at)"
+        " VALUES (?,?,?,?,?,?,?,?,'p',0,0.0)",
+        queue,
     )
     await db.commit()
 
@@ -204,26 +196,33 @@ _FILTERS: tuple[tuple[Any, ...], ...] = (
 )
 
 
+_PAGES = ((50, 0), (50, 50), (7, 13), (500, 0), (50, 10_000))
+
+
+async def _every_page(
+    store: MessageStore, sql_for: Callable[[str], str]
+) -> dict[tuple[int, int, int], list[tuple[Any, ...]]]:
+    """Every filter in _FILTERS times every page in _PAGES, keyed (filter no, limit, offset)."""
+    out: dict[tuple[int, int, int], list[tuple[Any, ...]]] = {}
+    for f_no, f in enumerate(_FILTERS):
+        where, params = MessageStore._message_filter(*f)
+        for limit, offset in _PAGES:
+            out[(f_no, limit, offset)] = await _rows(
+                store, sql_for(where), (*params, limit, offset)
+            )
+    return out
+
+
 async def test_list_messages_old_and_new_return_the_same_rows(store: MessageStore) -> None:
     """Differential: the pre-#1726 world (old SQL, no index) against the new one (new SQL, index)
     on one store, for several filters and pages, including an offset past the end."""
     await _seed(store)
-    pages = ((50, 0), (50, 50), (7, 13), (500, 0), (50, 10_000))
-    new: dict[tuple[int, int, int], list[tuple[Any, ...]]] = {}
-    for f_no, f in enumerate(_FILTERS):
-        where, params = MessageStore._message_filter(*f)
-        for limit, offset in pages:
-            new[(f_no, limit, offset)] = await _rows(
-                store, MessageStore._list_messages_sql(where), (*params, limit, offset)
-            )
+    new = await _every_page(store, MessageStore._list_messages_sql)
     await _drop_index(store)
-    for f_no, f in enumerate(_FILTERS):
-        where, params = MessageStore._message_filter(*f)
-        for limit, offset in pages:
-            old = await _rows(store, _OLD_LIST_SQL.format(where=where), (*params, limit, offset))
-            assert old == new[(f_no, limit, offset)], (f, limit, offset)
+    old = await _every_page(store, lambda where: _OLD_LIST_SQL.format(where=where))
+    assert old == new
     # The seed must exercise what the comparison is about, or equality proves nothing.
-    everything = new[(0, 500, 0)]
+    everything = new[(0, 500, 0)]  # no filter, one page holding every row
     assert len(everything) == 241
     last_events = {r[0]: r[-1] for r in everything}
     assert last_events["m0001"] == "ev0"  # one event
