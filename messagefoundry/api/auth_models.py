@@ -90,6 +90,12 @@ class UserSummary(BaseModel):
     #: Per-channel RBAC, as STORED: the allowed connection names, ``["*"]`` for the explicit
     #: all-channels grant, or ``None`` when nobody has set a scope — which denies (BACKLOG #1152).
     channel_scope: list[str] | None = None
+    #: Who last wrote ``channel_scope`` (BACKLOG #1958): ``"ad"`` for the AD login sync,
+    #: ``"manual"`` for an administrator, ``None`` when no scope writer has run. The rule it decides
+    #: is on ``UserRecord.channel_scope_source``. Without it an administrator cannot see that saving
+    #: a directory scope makes it manual. Typed ``str`` rather than the store's ``Literal`` so an
+    #: older client reading a newer engine tolerates a value it has not learned yet.
+    channel_scope_source: str | None = None
     #: BACKLOG #1141 (ASVS 6.4.5): while the account still holds an admin-issued must-change
     #: credential, the Unix instant it stops working. The create-user response and the console's
     #: user page carry it, both behind users:manage, so the administrator who conveys the initial

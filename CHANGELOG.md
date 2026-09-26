@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The admin API and the web console now show who last wrote each channel scope.** `UserSummary`
+  (from `GET /users`) carries `channel_scope_source`: `"ad"` for the AD login sync, `"manual"` for an
+  administrator, `null` when no scope writer has run. The console's user list has a Scope source
+  column, and the user page states the source beside the scope. Saving a directory scope, even
+  unchanged, marks it manual. Since BACKLOG #1927 a sign-in that matches no mapped AD group leaves a
+  manual scope in place, so that save quietly kept a grant the directory would have withdrawn. The
+  console now warns on such a scope and refuses the save until the administrator ticks "Make this
+  scope manual". The sync rule and the JSON `PUT /users/{id}/channel-scope` are unchanged. The web
+  console seam moves to `48ba7fb78ed04d7a`. (`BACKLOG #1958`)
 - **A DAST pass now sends hostile bytes to live MLLP, raw-TCP and X12 listeners and checks the
   engine's ingress rules.** `scripts/security/dast_ingress_sweep.py` runs a real engine on loopback.
   It sends broken framing, hostile HL7 and seeded mutations. Six detectors check each case: one reply
