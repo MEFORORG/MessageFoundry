@@ -188,7 +188,7 @@ def test_executor_requires_server_and_database() -> None:
         DatabaseLookupExecutor({"bad": {"server": "db.local"}})
 
 
-# --- read-only enforcement (SEC-009 / ADR 0010) ------------------------------
+# --- read-only statement gate, defence in depth (SEC-009 / ADR 0010) ---------
 
 
 async def test_insert_lookup_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -408,10 +408,12 @@ def test_dry_run_raises_when_handler_calls_db_lookup() -> None:
 
 # --- S12 audit anchors (ADDED-4): HL7-as-untrusted-input at db_lookup ----------
 # The S12 audit verdict for the db_lookup boundary is CONFORMING (PHI-2/REL-2/NET-2/PROC-1). These pin
-# the load-bearing invariants. NOTE — write/read-only is enforced by *parameterization* (a value can
-# never inject a write) + the documented read-only contract + the autocommit pool; there is no
-# statement-keyword write-blocker. So a Handler AUTHOR could still pass a literal write statement: that
-# is the author's contract, not an attacker-influenceable path. See the audit memo + backlog note S12-1.
+# the load-bearing invariants. NOTE — *parameterization* keeps a hostile VALUE from injecting a write.
+# Read-only for the STATEMENT itself rests on the privilege of the account the lookup dials; the
+# `_require_read_only` statement gate and ApplicationIntent=ReadOnly are defence in depth only, and the
+# autocommit pool adds no read-only property (BACKLOG #1574, #1791; docs/CONNECTIONS.md). A Handler
+# AUTHOR's literal statement is the author's contract, not an attacker-influenceable path. See the
+# audit memo + backlog note S12-1.
 
 
 async def test_audit_attacker_value_cannot_inject_a_write(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -431,9 +433,10 @@ async def test_audit_attacker_value_cannot_inject_a_write(monkeypatch: pytest.Mo
 async def test_audit_query_runs_via_autocommit_readonly_pool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Read-only posture: the lookup pool is opened with autocommit=True (each query is its own implicit,
-    # uncommitted-state-free transaction — nothing here issues a write/commit path). Pin the pool flag so
-    # a refactor can't silently open a writable transactional pool for live lookups.
+    # Pins autocommit=True, the pool mode ADR 0010 chose: each lookup is one self-contained read. The
+    # flag gives NO read-only property. A write the statement gate admitted would commit at once, so
+    # read-only rests on the lookup account's privilege (BACKLOG #1791; docs/CONNECTIONS.md). The test
+    # name predates that correction and is kept.
     seen: dict[str, bool] = {}
     real_pool = _patch_pool(monkeypatch, rows=[], columns=["npi"])
 

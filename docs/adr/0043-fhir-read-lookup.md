@@ -115,6 +115,14 @@ Mirror ADR 0010's split **exactly**: a declared, pooled, env()-resolvable **conn
 > `db_lookup` executor's "neither commits nor exposes a write path", ADR 0010, applied to HTTP). FHIR **writes** stay
 > on the `FhirDestination` outbound, where they belong (past the staged-queue boundary, idempotent, retried).
 
+> **CORRECTION 2026-09-25 (BACKLOG #1791). The `db_lookup` comparison above is a CONTRAST.** The
+> paragraph above is kept as authored. The ADR 0010 phrase it quotes is false: the `db_lookup` pool is
+> autocommit, so a write that got past its statement gate would commit. `fhir_lookup` is GET-only by
+> structure, because it has no path that builds any other request. `db_lookup` runs a caller-supplied
+> statement. The privilege of the account it dials bounds it, and its in-process layers are defence in
+> depth only. See ADR 0010's correction under *Scope* and
+> [`docs/CONNECTIONS.md`](../CONNECTIONS.md#give-db_lookup-a-read-only-login).
+
 ### D2 — Reuse the off-loop runner machinery + the SMART bearer (no new mechanism)
 
 The `RegistryRunner` **already** runs the handler off the loop and activates a lookup runner when the graph declares ≥1
