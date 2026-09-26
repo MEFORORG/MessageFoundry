@@ -159,6 +159,21 @@ def test_a_module_with_a_coding_cookie_is_scanned_not_skipped(tmp_path: Path) ->
     assert "latin.py:" in checks._check_raise_fstring(cfg).detail
 
 
+def test_a_module_with_a_utf8_bom_is_scanned_not_skipped(tmp_path: Path) -> None:
+    """A BOM is invalid in a ``str`` handed to ``ast.parse``, so the old text path skipped the module
+    unscanned. The loader strips it, so the module loads and runs; parsing bytes strips it too."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    path = cfg / "bom.py"
+    path.write_bytes(b"\xef\xbb\xbf" + _LATIN1_HANDLER.split(b"\n", 1)[1].replace(b"\xe9", b"e"))
+    with pytest.raises(SyntaxError):  # control: the old read-then-parse path refuses a BOM
+        ast.parse(path.read_text(encoding="utf-8"))
+    report = checks.run_checks(cfg, run_lint=False)
+    assert next(r for r in report.results if r.name == "validate").ok
+    strict = checks._check_handler_security(cfg, strict=True)
+    assert not strict.ok and "bom.py:" in strict.detail, strict.detail
+
+
 @pytest.mark.parametrize("case", ["syntax-error", *_REFUSALS])
 def test_check_reports_the_refused_module_through_validate_instead_of_crashing(
     tmp_path: Path, case: str
@@ -235,7 +250,7 @@ def _widest_parseable_unary_chain() -> str:
         mid = (low + high) // 2
         try:
             ast.parse("-" * mid + "1", mode="eval")
-        except MemoryError:
+        except (MemoryError, RecursionError):  # either wall, so a build that moves it still bisects
             high = mid
         else:
             low = mid
