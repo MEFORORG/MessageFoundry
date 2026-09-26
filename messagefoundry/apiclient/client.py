@@ -413,13 +413,19 @@ def _read_pin(cacert: str) -> bytes | None:
 
 
 def _is_cert_verification_failure(exc: BaseException) -> bool:
-    """True when ``exc`` is, or wraps, a failure to verify the peer's certificate.
+    """True when ``exc`` is a CONNECT failure caused by failing to verify the peer's certificate.
 
     httpx raises its own ``ConnectError`` over httpcore's, over the stdlib
     ``SSLCertVerificationError`` (measured on httpx 0.28.1 / httpcore 1.0.9), so the chain is walked
     through both ``__cause__`` and ``__context__``. A refused connection, a timeout or a reset reads
     as False, and so does a chain that loops back on itself.
+
+    Only a ``ConnectError`` qualifies. That is what makes the caller's retry safe: the connection
+    never opened, so no byte of the request was written. Any later error is refused even if a
+    verification failure is somewhere in its chain.
     """
+    if not isinstance(exc, httpx.ConnectError):
+        return False
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
@@ -501,11 +507,16 @@ class EngineClient:
         self._pin_pem: bytes | None = None
         #: The last changed pin bytes that would not load, so a file that stays broken logs once.
         self._pin_refused: bytes | None = None
-        self._follows_pin = False
-        #: Serialises a rebuild between threads sharing a poll client.
+        #: The TLS material a rebuild reloads, as ABSOLUTE paths fixed now: (pin, client cert, client
+        #: key). A relative path re-read later would resolve against whatever the working directory
+        #: is then, and could pin a different file. None when there is no pin to follow.
+        self._pin_paths: tuple[str, str | None, str | None] | None = None
+        #: Serialises a rebuild, and close(), between threads sharing a poll client.
         self._pin_lock = threading.Lock()
+        self._closed = False
         #: Transports replaced by a renewal. Kept open until close(): another thread may still be
-        #: mid-request on one, and closing it under that thread raises a bare RuntimeError.
+        #: mid-request on one, and closing it under that thread raises a bare RuntimeError. One is
+        #: added per renewal, and a renewal needs an engine restart, so the list stays short.
         self._retired_http: list[httpx.Client] = []
         if self.base_url.lower().startswith("https"):
             before = _read_pin(cacert) if cacert is not None else None
@@ -516,7 +527,11 @@ class EngineClient:
                 # caller already handles rather than as a traceback out of a GUI slot or a CLI run.
                 raise ApiError(f"cannot load TLS material for {self.base_url}: {exc}") from exc
             if cacert is not None:
-                self._follows_pin = True
+                self._pin_paths = (
+                    str(Path(cacert).absolute()),
+                    None if tls_client_cert is None else str(Path(tls_client_cert).absolute()),
+                    None if tls_client_key is None else str(Path(tls_client_key).absolute()),
+                )
                 # Read on both sides of the build, so the recorded bytes are the ones the context
                 # holds. A rewrite in between leaves them unknown, and the next verification
                 # failure then follows whatever loadable file is there.
@@ -560,11 +575,14 @@ class EngineClient:
         self.close()
 
     def close(self) -> None:
+        # Under the lock, so a rebuild racing close() cannot retire or open a transport after the
+        # list was taken; _follow_renewed_pin refuses once _closed is set.
         with self._pin_lock:
-            retired, self._retired_http = self._retired_http, []
-        for transport in retired:
+            self._closed = True
+            transports = [*self._retired_http, self._http]
+            self._retired_http = []
+        for transport in transports:
             transport.close()
-        self._http.close()
 
     def _open_transport(self, verify: ssl.SSLContext | bool) -> httpx.Client:
         return httpx.Client(base_url=self.base_url, timeout=self._timeout, verify=verify)
@@ -599,36 +617,40 @@ class EngineClient:
         A thread that failed on a transport another thread has already replaced retries on the
         replacement without reloading.
         """
-        if not self._follows_pin or self._cacert is None:
+        if self._pin_paths is None:
             return False
+        pin, client_cert, client_key = self._pin_paths
         with self._pin_lock:
+            if self._closed:
+                return False
             if self._http is not failed:
                 return True
-            current = _read_pin(self._cacert)
+            current = _read_pin(pin)
             if current is None or current == self._pin_pem:
                 return False
+            reason = "the file changed while it loaded"
             try:
-                context: ssl.SSLContext | None = _build_verify_context(
-                    self._cacert, self._tls_client_cert, self._tls_client_key
-                )
-            except OSError:  # ssl.SSLError is an OSError: empty, half-written, not a certificate
-                context = None
+                context: ssl.SSLContext | None = _build_verify_context(pin, client_cert, client_key)
+            except OSError as exc:  # ssl.SSLError is an OSError: empty, half-written, not a cert
+                context, reason = None, str(exc)
             # A rewrite during the load leaves the context's bytes unknown; try again next time.
-            if context is None or _read_pin(self._cacert) != current:
+            if context is None or _read_pin(pin) != current:
                 if current != self._pin_refused:
                     self._pin_refused = current
+                    # The reason names which file failed: the pin, or an mTLS client cert or key
+                    # that a rebuild reloads too.
                     _log.info(
-                        "engine certificate %s changed but does not load; keeping the current pin",
-                        self._cacert,
+                        "engine certificate %s changed but the TLS material does not load (%s); "
+                        "keeping the current pin",
+                        pin,
+                        reason,
                     )
                 return False
             self._retired_http.append(self._http)
             self._http = self._open_transport(context)
             self._pin_pem = current
             self._pin_refused = None
-        _log.info(
-            "engine certificate %s has changed; now trusting the renewed certificate", self._cacert
-        )
+        _log.info("engine certificate %s has changed; now trusting the renewed certificate", pin)
         return True
 
     def for_polling(self) -> EngineClient:

@@ -41,12 +41,15 @@ class _RenewableEngine:
         self._dir = directory
         self._minted = 0
         self.answered: list[str] = []
+        #: Response headers for ONE 403 challenge (MFA or step-up) the next request receives.
+        self.challenges: list[str] = []
         self.pin = directory / "api-generated-cert.pem"
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         self.serve(self.renew_pin())
         body = json.dumps({"status": "ok", "version": None, "observed_client": None}).encode()
         answered = self.answered
+        challenges = self.challenges
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def _answer(self) -> None:
@@ -54,6 +57,15 @@ class _RenewableEngine:
                 length = int(self.headers.get("Content-Length") or 0)
                 if length:
                     self.rfile.read(length)
+                if challenges:
+                    refusal = b'{"detail": "challenge"}'
+                    self.send_response(403)
+                    self.send_header(challenges.pop(0), "true")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(refusal)))
+                    self.end_headers()
+                    self.wfile.write(refusal)
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -124,23 +136,43 @@ def builds(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
     return seen
 
 
+#: Every transport a client opens in this module, mapped to the ``verify`` it was opened with.
+_OPENED: dict[int, ssl.SSLContext | bool] = {}
+
+
+@pytest.fixture(autouse=True)
+def _record_transports(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Record what each transport verifies with, through the client's own seam rather than httpx's
+    private attributes."""
+    real = EngineClient._open_transport
+
+    def recording(self: EngineClient, verify: ssl.SSLContext | bool) -> httpx.Client:
+        transport = real(self, verify)
+        _OPENED[id(transport)] = verify
+        return transport
+
+    monkeypatch.setattr(EngineClient, "_open_transport", recording)
+    yield
+    _OPENED.clear()
+
+
 def _pinned(engine: _RenewableEngine) -> EngineClient:
     return EngineClient(engine.url, cacert=str(engine.pin))
 
 
-def _live_context(client: EngineClient) -> ssl.SSLContext:
-    """The context the client's CURRENT transport verifies with (httpx 0.28 / httpcore 1.x)."""
-    ctx = client._http._transport._pool._ssl_context  # type: ignore[attr-defined]
-    assert isinstance(ctx, ssl.SSLContext)
-    return ctx
+def _assert_pinned(client: EngineClient) -> None:
+    """The CURRENT transport verifies, and its store holds exactly one certificate: the pin.
 
-
-def _assert_still_pinned(client: EngineClient) -> None:
-    """The live context verifies, and it is the stdlib pin context rather than the OS store."""
-    ctx = _live_context(client)
+    Counting the store catches a widened trust (the pin plus the OS roots, measured at 91
+    certificates on the dev box) as well as a dropped one, which a type or verify-mode check alone
+    would not. The stdlib lists only CA certificates by content, and the engine's minted
+    certificate is a leaf, so WHICH certificate is pinned is shown by the requests that succeed or
+    fail around each call."""
+    ctx = _OPENED[id(client._http)]
+    assert isinstance(ctx, ssl.SSLContext), "the transport does not verify with a pinned context"
     assert ctx.verify_mode == ssl.CERT_REQUIRED
     assert ctx.check_hostname is True
-    assert type(ctx) is ssl.SSLContext, "the pin was swapped for another trust store"
+    assert ctx.cert_store_stats() == {"x509": 1, "crl": 0, "x509_ca": 0}
 
 
 def test_a_renewed_certificate_is_followed_without_a_new_client(engine: _RenewableEngine) -> None:
@@ -153,7 +185,7 @@ def test_a_renewed_certificate_is_followed_without_a_new_client(engine: _Renewab
         assert client.health().status == "ok"
         engine.serve(engine.renew_pin())
         assert client.health().status == "ok"
-        _assert_still_pinned(client)
+        _assert_pinned(client)
 
 
 def test_a_poll_clone_follows_a_renewal_too(engine: _RenewableEngine) -> None:
@@ -165,14 +197,35 @@ def test_a_poll_clone_follows_a_renewal_too(engine: _RenewableEngine) -> None:
         assert client.health().status == "ok"
 
 
-def test_a_retried_request_reaches_the_engine_once(engine: _RenewableEngine) -> None:
-    """The retry is safe for a POST: verification fails in the handshake, before any byte of the
-    request is written, so the engine sees the request exactly once."""
+def test_a_retried_post_is_delivered_exactly_once(engine: _RenewableEngine) -> None:
+    """The retry delivers a POST once: not zero times (the retry works for a body-carrying method)
+    and not twice. Verification fails in the handshake, before any byte of the request is written,
+    which is why the retry is limited to a connect failure."""
     with _pinned(engine) as client:
         engine.serve(engine.renew_pin())
         engine.answered.clear()
         client._request("POST", "/probe", json={"n": 1})
         assert engine.answered == ["POST /probe"]
+
+
+@pytest.mark.parametrize("challenge", ["X-MFA-Required", "X-Step-Up-Required"])
+def test_a_request_retried_after_a_prompt_may_follow_a_renewal(
+    engine: _RenewableEngine, challenge: str
+) -> None:
+    """The MFA and step-up retries are new attempts, so they re-arm the follow. Here the engine
+    restarts onto a renewed pair while the operator answers the prompt."""
+    with _pinned(engine) as client:
+
+        def answer_the_prompt() -> bool:
+            engine.serve(engine.renew_pin())
+            return True
+
+        if challenge == "X-MFA-Required":
+            client.set_mfa_handler(answer_the_prompt)
+        else:
+            client.set_step_up_handler(answer_the_prompt)
+        engine.challenges.append(challenge)
+        assert client.health().status == "ok"
 
 
 def test_an_unchanged_pin_never_rebuilds(
@@ -219,7 +272,7 @@ def test_a_renewed_pin_that_is_not_the_served_certificate_still_fails(
         with pytest.raises(ApiError, match="CERTIFICATE_VERIFY_FAILED"):
             client.health()
         assert client._http is not first, "the changed, loadable pin should have been followed"
-        _assert_still_pinned(client)
+        _assert_pinned(client)
         with pytest.raises(ApiError, match="CERTIFICATE_VERIFY_FAILED"):
             client.health()
 
@@ -247,9 +300,10 @@ def test_a_pin_caught_mid_renewal_keeps_the_current_context(
         with pytest.raises(ApiError, match="CERTIFICATE_VERIFY_FAILED"):
             client.health()
         assert client._http is transport
-        _assert_still_pinned(client)
+        _assert_pinned(client)
         engine.pin.write_bytes(cert)
         assert client.health().status == "ok"
+        _assert_pinned(client)
 
 
 def test_a_refused_pin_is_logged_once_per_distinct_bytes(
@@ -268,20 +322,65 @@ def test_a_refused_pin_is_logged_once_per_distinct_bytes(
         assert len(refused) == 1
 
 
-def test_a_transport_another_thread_already_replaced_is_retried_without_a_reload(
+def test_a_transport_already_replaced_is_retried_without_a_reload(
     engine: _RenewableEngine, builds: list[str | None]
 ) -> None:
-    """Two threads share a poll client. The first to fail follows the renewal; the second, which
-    failed on the transport the first one retired, retries on the new one instead of reloading or
-    giving up."""
+    """A caller that failed on a transport another caller has already replaced retries on the
+    replacement instead of reloading or giving up. Sequential, so the identity check is what is
+    tested; the concurrent case is the next test."""
     with _pinned(engine) as client:
         stale = client._http
         engine.serve(engine.renew_pin())
         assert client._follow_renewed_pin(stale) is True
         assert len(builds) == 2
-        assert client._follow_renewed_pin(stale) is True  # the second thread's view
+        assert client._follow_renewed_pin(stale) is True  # the second caller's view
         assert len(builds) == 2, "a transport already replaced must not be rebuilt again"
         assert client.health().status == "ok"
+
+
+def test_two_threads_failing_together_rebuild_once(
+    engine: _RenewableEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two threads share one poll client and both fail on the old transport at once. Exactly one
+    rebuild happens and both requests succeed. The build is slowed so the second thread arrives
+    while the first is still inside it; without the lock both would rebuild."""
+    real = client_module._build_verify_context
+    built: list[str | None] = []
+    both_failed = threading.Barrier(2)
+
+    def slow(cacert: str | None, client_cert: str | None, client_key: str | None) -> ssl.SSLContext:
+        built.append(cacert)
+        if len(built) > 1:
+            threading.Event().wait(0.3)
+        return real(cacert, client_cert, client_key)
+
+    monkeypatch.setattr(client_module, "_build_verify_context", slow)
+    real_follow = EngineClient._follow_renewed_pin
+
+    def meet_then_follow(self: EngineClient, failed: httpx.Client) -> bool:
+        both_failed.wait(timeout=10)
+        return real_follow(self, failed)
+
+    monkeypatch.setattr(EngineClient, "_follow_renewed_pin", meet_then_follow)
+    with _pinned(engine) as client:
+        engine.serve(engine.renew_pin())
+        results: list[str] = []
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                results.append(client.health().status)
+            except BaseException as exc:  # surfaced below, on the test thread
+                errors.append(exc)
+
+        threads = [threading.Thread(target=poll) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert not errors
+        assert results == ["ok", "ok"]
+        assert len(built) == 2, "the constructor plus exactly one rebuild"
 
 
 def test_close_releases_every_transport_the_client_opened(engine: _RenewableEngine) -> None:
@@ -296,6 +395,50 @@ def test_close_releases_every_transport_the_client_opened(engine: _RenewableEngi
     client.close()
     assert first.is_closed
     assert client._http.is_closed
+
+
+def test_a_closed_client_never_rebuilds(engine: _RenewableEngine, builds: list[str | None]) -> None:
+    """A rebuild after close would open a transport nothing ever closes."""
+    client = _pinned(engine)
+    stale = client._http
+    engine.serve(engine.renew_pin())
+    client.close()
+    assert client._follow_renewed_pin(stale) is False
+    assert client._http is stale
+    assert builds == [str(engine.pin)]
+
+
+def test_a_relative_pin_is_followed_at_the_path_it_was_given(
+    engine: _RenewableEngine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A relative ``cacert`` names a file relative to the working directory at construction. A
+    later change of directory must not make the follow read, and pin, some other file."""
+    monkeypatch.chdir(engine.pin.parent)
+    client = EngineClient(engine.url, cacert=engine.pin.name)
+    try:
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        decoy, _ = engine.mint()
+        (elsewhere / engine.pin.name).write_bytes(decoy)
+        monkeypatch.chdir(elsewhere)
+        engine.serve(engine.renew_pin())
+        assert client.health().status == "ok"
+        _assert_pinned(client)
+    finally:
+        client.close()
+
+
+def test_the_constructor_records_the_pin_only_when_both_reads_agree(
+    engine: _RenewableEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bytes recorded at construction must be the bytes the context loaded. A file rewritten
+    during the build leaves them unknown, so the next verification failure follows the file."""
+    with _pinned(engine) as steady:
+        assert steady._pin_pem == engine.pin.read_bytes()
+    reads = iter([b"before", b"after"])
+    monkeypatch.setattr(client_module, "_read_pin", lambda _p: next(reads))
+    with _pinned(engine) as racing:
+        assert racing._pin_pem is None
 
 
 def test_a_client_without_a_pin_never_follows(
@@ -330,7 +473,8 @@ def test_a_transport_error_that_is_not_verification_does_not_reload(
 
 def test_the_verification_failure_is_found_through_the_httpx_wrapping() -> None:
     """httpx wraps the handshake failure twice (its own ConnectError over httpcore's). The detector
-    walks the chain; an unrelated error and a cyclic chain both read as not-verification."""
+    walks the chain. An unrelated connect error, a cyclic chain, and a NON-connect error carrying a
+    verification failure (the request may already be on the wire) all read as False."""
     inner = ssl.SSLCertVerificationError(1, "certificate verify failed")
     middle = RuntimeError("httpcore")
     middle.__context__ = inner
@@ -338,8 +482,11 @@ def test_the_verification_failure_is_found_through_the_httpx_wrapping() -> None:
     wrapped.__cause__ = middle
     assert client_module._is_cert_verification_failure(wrapped)
     assert not client_module._is_cert_verification_failure(httpx.ConnectError("refused"))
+    after_send = httpx.ReadError("mid-reply")
+    after_send.__cause__ = inner
+    assert not client_module._is_cert_verification_failure(after_send)
     cyclic = httpx.ConnectError("a")
-    other = httpx.ReadError("b")
+    other = httpx.ConnectError("b")
     cyclic.__context__ = other
     other.__context__ = cyclic
     assert not client_module._is_cert_verification_failure(cyclic)
