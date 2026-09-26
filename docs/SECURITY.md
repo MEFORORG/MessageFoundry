@@ -188,17 +188,19 @@ until it is `[approvals].min_dwell_seconds` old (default 2 s). It is described, 
 comes from, under [Dual-control approval for high-value
 actions](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235).
 
-**Authorization-decision audit (ASVS 16.3.2).** **Every** authorization grant is audited
-(`auth.permission_granted`), the twin of the existing `auth.permission_denied` (BACKLOG #195a). PHI-view
-grants are the one standing exclusion, because the PHI-access audit path already records those accesses
-(no double-audit).
+**Authorization-decision audit (ASVS 16.3.2).** **Every** authorization grant on the engine's own
+gates is audited (`auth.permission_granted`), the twin of the existing `auth.permission_denied` (BACKLOG
+#195a). PHI-view grants are the one standing exclusion, because the PHI-access audit path already
+records those accesses (no double-audit). The web console's gates write no grant row, and that includes
+`authorize_ui_ws`, which every same-origin browser `/ws/stats` handshake passes through. BACKLOG #1197
+tracks that gap.
 
 That is the shipped default as of BACKLOG #1277 (2026-09-02). Until then the grant audit was **scoped**
 to the sensitive / state-changing / config / user-mgmt permission set (`_GRANT_AUDIT_PERMISSIONS` in
 `api/security.py`) on non-GET requests only, on the ground that console polling and the `/ws/stats` feed
 would flood the hash-chained audit log. **The console never traverses `require()`** — it is
-server-rendered in-process and gates on its own cookie-world check — and `authorize_ws` fires once per
-*connection*. Setting `[security].audit_all_authorization_decisions = false` restores the scoped
+server-rendered in-process and gates on its own cookie-world check — and on `/ws/stats` the header
+gate `authorize_ws` fires once per *handshake*. Setting `[security].audit_all_authorization_decisions = false` restores the scoped
 behaviour and is reported as a loosening; the volume it trades away is one row per authenticated request
 per `require()`-gated route, on the JSON API.
 
@@ -271,8 +273,8 @@ route handler only when all of them pass.
    `Authorization` header serves the JSON API and native WebSocket clients. A verified **mTLS client
    certificate** serves only `GET /service/identity`. The web console's `SameSite=Strict` **session
    cookie** serves the `/ui` routes and a same-origin browser's `/ws/stats` handshake. The JSON API's
-   `require*()` gates never read the cookie. `/ws/stats` is the one route that accepts two planes,
-   cookie first and header token second; the WebSocket note under the gate table below has the order.
+   `require*()` gates never read the cookie. `/ws/stats` accepts two planes, cookie first and
+   header token second; the WebSocket note under the gate table below has the order.
 3. **The `require*()` deny-by-default ladder**, in this order: **503** `authentication is not configured`
    when no enabled `AuthService` is attached and `allow_no_auth` was not set (the fail-closed embedding
    guard, SYS-1) → **401** when the bearer token resolves to no identity → **403** `password change
@@ -324,16 +326,18 @@ The one WebSocket route, `/ws/stats`, runs up to two gates in turn, all **before
    notification address and the permission.
 2. **`authorize_ws`, when step 1 yields no identity or the console is not mounted.** It checks any
    `Origin` against `[api].ws_allowed_origins`, whose default `[]` refuses every browser. Then it
-   reads the bearer token from the `Authorization` header only, and runs the same four checks.
+   reads the bearer token from the `Authorization` header only, and runs the same four checks. With
+   authentication off (the `allow_no_auth` embedding case), it skips the token and admits any
+   handshake whose `Origin` it accepted.
 
 A native client sends no `Origin`, so it always takes step 2. A browser whose `Origin` matches takes
-step 1. If its cookie yields no identity, it falls to step 2 and is refused there, since a browser
-cannot set a header on a WebSocket. Under the default `[]`, a cross-origin browser is refused at step
-2's `Origin` check.
+step 1. If its cookie yields no identity, it falls to step 2. Under the default `[]`, step 2 refuses
+its `Origin`, as it refuses a cross-origin browser's. Listing that `Origin` does not help while
+authentication is on, because a browser cannot set the `Authorization` header on a WebSocket.
 
 The two gates audit differently. Under the default audit setting, `authorize_ws` writes one
-`auth.permission_granted` row per connection. `authorize_ui_ws` writes no grant row, and its denial
-rows carry no client address.
+`auth.permission_granted` row per authorized handshake, before the route's connection-cap check.
+`authorize_ui_ws` writes no grant row, and its denial rows carry no client address.
 
 ### Permission catalogue (29)
 
@@ -1601,7 +1605,7 @@ slack.
 | Time since the IdP authentication event | the `auth_time` of a **signature-verified** `id_token`, requested by the `max_age` the engine sends on **every** authorization request (OIDC Core makes `auth_time` REQUIRED once `max_age` is sent) | `auth_time` absent or null; or older than `[auth].oidc_max_age_seconds` (no clock-skew grace on this side, so no session is minted already dead); or further in the future than the clock skew. A conforming IdP re-authenticates only when its own sign-in is older than `max_age`, so single sign-on is untouched for every user inside the window | **DENY** the sign-in — `ClaimsError("auth_time_missing")` / `("auth_time_stale")` (a future value is `issued_in_future`). An accepted sign-in is also capped: the session ends at `auth_time + oidc_max_age_seconds` if that is sooner than `id_token.exp` and the absolute cap. There is **no off switch**: `0` and any value outside the documented range ([CONFIGURATION.md](CONFIGURATION.md)) are refused at load, and omitting the key gives the default. An IdP that does not return `auth_time` refuses **every** federated sign-in. `auth_time` is IdP wall clock, so the bound is only as good as the IdP's clock | 43200 s (12 h) | `[auth].oidc_max_age_seconds` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
 | Bootstrap-admin claim state × age × admin population | `users.password_claimed_at` and `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`password_claimed_at` unset — only the holder's own self-service rotation stamps it, and nothing clears it) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* bootstrap account is never touched, and an admin password reset does not un-claim it (ADR 0164) | 72 h | `[auth].bootstrap_expiry_hours` |
-| Browser `Origin` at the WebSocket handshake | the `Origin` header on the `/ws/stats` upgrade | absent (a native client) → allowed onto the header-token path. Present, with the web console mounted → an `Origin` matching ours goes to the session-cookie path (`[security].web_console_public_address` when set, else host and port against `Host`). Any other `Origin` goes to the header-token path. So does a matching one whose cookie yields no identity. There it must be an exact member of `ws_allowed_origins`, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins`, `[security].web_console_public_address` |
+| Browser `Origin` at the WebSocket handshake | the `Origin` header on the `/ws/stats` upgrade | absent (a native client) → allowed onto the header-token path. Present, with the web console mounted → an `Origin` matching ours goes to the session-cookie path (the match rule is in the WebSocket note under the gate table). Any other `Origin` goes to the header-token path. So does a matching one whose cookie yields no identity. There it must be an exact member of `ws_allowed_origins`, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins`, `[security].web_console_public_address` |
 | Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[security].web_console_public_address` |
 | Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
 
