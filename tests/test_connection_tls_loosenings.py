@@ -151,7 +151,7 @@ def _write_config(tmp_path: Path, *, clean: bool = False, module: str | None = N
     return cfg
 
 
-def _result(report: object, name: str):  # type: ignore[no-untyped-def]
+def _result(report: object, name: str):
     return next(r for r in report.results if r.name == name)  # type: ignore[attr-defined]
 
 
@@ -230,7 +230,7 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
 
 
 @pytest.fixture
-async def engine(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def engine(tmp_path: Path):
     eng = await Engine.create(tmp_path / "posture.db", poll_interval=0.02)
     yield eng
     await eng.stop()

@@ -443,7 +443,7 @@ async def test_the_ui_sso_route_inherits_the_deadline(
     service = _sso_service(engine)
     await service.initialize()
     monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "stranger")
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))  # type: ignore[arg-type]
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.get(
             "/ui/sso",
@@ -468,7 +468,7 @@ async def test_route_local_rejects_are_deliberately_not_padded(
     """
     service = _sso_service(engine)
     await service.initialize()
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))  # type: ignore[arg-type]
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.get("/ui/sso", headers={"Authorization": "Negotiate !!!not-base64!!!"})
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=sso_failed"

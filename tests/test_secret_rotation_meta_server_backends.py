@@ -37,7 +37,7 @@ _ROT_MEMBERS = (
 
 
 def _store_class(module: str, name: str) -> type[Any]:
-    return getattr(importlib.import_module(module), name)  # type: ignore[no-any-return]
+    return getattr(importlib.import_module(module), name)
 
 
 # --- structural conformance (no DB; runs locally) ---------------------------

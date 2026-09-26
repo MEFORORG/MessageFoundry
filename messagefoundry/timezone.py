@@ -28,9 +28,9 @@ year a local time happens *twice* (the fall-back overlap) or *never* (the spring
 there is no instant in the input to choose between them. :func:`convert_hl7_timestamp` raises
 :class:`AmbiguousLocalTimeError` / :class:`NonExistentLocalTimeError` on those rather than resolving
 to a plausible, well-formed, possibly hour-wrong timestamp; a caller that wants one resolved anyway
-names the rule with ``on_dst_edge``. This covers the one place the module marries a naive wall clock
-to a named zone — it is **not** a module-wide guarantee, and :func:`length_of_stay` documents its own
-naive-pair limit separately.
+names the rule with ``on_dst_edge``. The same refusal covers :func:`length_of_stay` when it reads
+offset-free stamps through its ``zone`` — the two places the module marries a naive wall clock to a
+named zone. It is **not** a module-wide guarantee.
 """
 
 from __future__ import annotations
@@ -477,34 +477,138 @@ def _coerce_date(asof: str | date | datetime | None) -> date:
     return _parse_hl7_timestamp(asof)[0].date()
 
 
-def length_of_stay(admit_ts: str, discharge_ts: str) -> timedelta:
+def length_of_stay(
+    admit_ts: str,
+    discharge_ts: str,
+    *,
+    zone: str | None = None,
+    on_dst_edge: DstEdgePolicy = "raise",
+) -> timedelta:
     """The elapsed time between an admit and a discharge HL7 timestamp, as a :class:`timedelta`.
 
     A :class:`~datetime.timedelta` is returned (not a bare day count) so the caller keeps full
     resolution and chooses how to express it — ``.days`` for whole inpatient days,
     ``.total_seconds() / 3600`` for hours, etc. Both timestamps are parsed at whatever precision they
-    carry; if **both** bear an embedded offset the difference is the true elapsed time across any DST/
-    zone change, and if neither does it is the naive wall-clock difference. A **mixed** pair (one
-    offset, one not) is rejected — the elapsed time would be ambiguous.
+    carry.
+
+    **An offset-free time of day is not an instant, so it cannot be measured without a zone.**
+    Subtracting two bare wall clocks would report any stay that spans a daylight-saving change as an
+    hour longer or shorter than the patient stayed — 48 hours for a 47-hour stay across the March
+    spring-forward, 48 for a 49-hour stay across the November fall-back — with no error. So:
+
+    - A stamp that carries an offset (``...-0500``) is read at that offset.
+    - A stamp without one is read as a wall clock in ``zone`` (an IANA name such as
+      ``"America/Chicago"``). Both instants are converted to UTC before subtracting, so the result is
+      true elapsed time.
+    - With no ``zone``, two kinds of pair are refused. One is a mixed pair, where one stamp has an
+      offset and the other does not, at any precision. The other is a pair with no offset on either
+      side where **either** stamp has a time of day.
+    - A pair of offset-free **date-only** stamps (``YYYYMMDD`` or coarser) is always allowed, and is
+      the calendar difference whether or not ``zone`` is given. It has no hour to be wrong, and reading
+      its two midnights through a zone would turn a two-day stay across spring-forward into one day
+      23 hours, so ``.days`` would lose a day. This rule needs **both** stamps date-only and
+      offset-free. A date-only stamp paired with anything else is read as midnight in ``zone``, so
+      ``("20260307", "2026030900")`` in ``America/New_York`` is 1 day 23 hours.
+
+    Args:
+        admit_ts: the admit HL7 timestamp (conventionally PV1-44).
+        discharge_ts: the discharge HL7 timestamp (conventionally PV1-45).
+        zone: IANA zone name to read any offset-free stamp in. Not consulted for a stamp that carries
+            its own offset.
+        on_dst_edge: what to do when an offset-free stamp falls on a daylight-saving edge of ``zone``
+            (a wall time that happens twice, or never). ``"raise"`` (the default) refuses; see
+            :func:`convert_hl7_timestamp` for ``"earlier"``/``"later"``. One policy governs **both**
+            stamps. So a stay whose admit and discharge both fall in the repeated fall-back hour, with
+            the admit in the first pass and the discharge in the second, cannot be expressed: it is
+            measured as if both were in one pass, or refused as a negative stay. Supply the sender's
+            offsets for such a stay.
 
     Raises:
-        ValueError: either timestamp is malformed, exactly one carries an offset, or the discharge is
-            **before** the admit (a negative stay — a data error, surfaced rather than returned).
+        AmbiguousLocalTimeError: an offset-free stamp with a time of day occurs twice in ``zone`` and
+            ``on_dst_edge`` is ``"raise"``.
+        NonExistentLocalTimeError: an offset-free stamp with a time of day never occurs in ``zone`` and
+            ``on_dst_edge`` is ``"raise"``.
+        ValueError: either timestamp is malformed; ``on_dst_edge`` is not one of the three policies; no
+            ``zone`` was given for a pair that needs one (above); or the discharge is **before** the
+            admit (a negative stay — a data error, surfaced rather than returned). The two errors
+            above are ``ValueError``s too.
+        zoneinfo.ZoneInfoNotFoundError: ``zone`` is unknown (on Windows, also if ``tzdata`` is
+            missing).
     """
-    admit_dt, _ap, admit_off = _parse_hl7_timestamp(admit_ts)
-    discharge_dt, _dp, discharge_off = _parse_hl7_timestamp(discharge_ts)
-    if (admit_off is None) != (discharge_off is None):
-        raise ValueError(
-            "length_of_stay needs both timestamps with an offset or both without; "
-            f"got admit offset {admit_off!r} and discharge offset {discharge_off!r}"
+    _check_los_options(zone, on_dst_edge)
+    admit_naive, admit_prec, admit_off = _parse_hl7_timestamp(admit_ts)
+    discharge_naive, discharge_prec, discharge_off = _parse_hl7_timestamp(discharge_ts)
+
+    if (
+        admit_off is None
+        and discharge_off is None
+        and admit_prec not in _TIME_PRECISIONS
+        and discharge_prec not in _TIME_PRECISIONS
+    ):
+        delta = discharge_naive - admit_naive
+    else:
+        if zone is None and (admit_off is None or discharge_off is None):
+            if admit_off is None and discharge_off is None:
+                raise ValueError(
+                    "length_of_stay needs a zone to measure offset-free timestamps that carry a "
+                    "time of day: without one, a stay spanning a daylight-saving change would be an "
+                    f"hour off. Got admit {admit_ts.strip()!r} and discharge "
+                    f"{discharge_ts.strip()!r}; pass zone='<IANA name>', e.g. 'America/Chicago'."
+                )
+            raise ValueError(
+                "length_of_stay needs both timestamps with an offset, or a zone to read the one "
+                f"without; got admit offset {admit_off!r} and discharge offset {discharge_off!r}"
+            )
+        admit_utc = _instant_utc(
+            admit_ts, admit_naive, admit_prec, admit_off, zone=zone, on_dst_edge=on_dst_edge
         )
-    if admit_off is not None and discharge_off is not None:
-        admit_dt = admit_dt.replace(tzinfo=timezone(_offset_to_timedelta(admit_off)))
-        discharge_dt = discharge_dt.replace(tzinfo=timezone(_offset_to_timedelta(discharge_off)))
-    delta = discharge_dt - admit_dt
+        discharge_utc = _instant_utc(
+            discharge_ts,
+            discharge_naive,
+            discharge_prec,
+            discharge_off,
+            zone=zone,
+            on_dst_edge=on_dst_edge,
+        )
+        # Explicitly UTC: two datetimes sharing one ZoneInfo subtract as WALL-CLOCK time in Python,
+        # which is the very hour-wrong answer this function exists to avoid.
+        delta = discharge_utc - admit_utc
     if delta < timedelta(0):
         raise ValueError(
             f"discharge {discharge_ts.strip()!r} is before admit {admit_ts.strip()!r} "
             "(negative length of stay)"
         )
     return delta
+
+
+def _check_los_options(zone: str | None, on_dst_edge: DstEdgePolicy) -> None:
+    """Refuse a bad ``on_dst_edge`` or an unknown ``zone`` before any stamp is read.
+
+    Shared with :meth:`Message.length_of_stay`, which calls it before its open-encounter ``None``
+    return, so a misspelt zone fails on the first message rather than the first discharge.
+    """
+    if on_dst_edge not in _DST_EDGE_POLICIES:
+        raise ValueError(f"on_dst_edge must be one of {_DST_EDGE_POLICIES}, got {on_dst_edge!r}")
+    if zone is not None:
+        ZoneInfo(zone)
+
+
+def _instant_utc(
+    ts: str,
+    naive: datetime,
+    precision: str,
+    offset: str | None,
+    *,
+    zone: str | None,
+    on_dst_edge: DstEdgePolicy,
+) -> datetime:
+    """Pin one parsed stamp to a UTC instant: its own offset if it has one, else ``zone``."""
+    if offset is not None:
+        aware = naive.replace(tzinfo=timezone(_offset_to_timedelta(offset)))
+    elif zone is not None:
+        aware = _attach_source_zone(
+            naive, zone, ts=ts, on_dst_edge=on_dst_edge, precision=precision
+        )
+    else:  # pragma: no cover - length_of_stay refuses this pair before calling
+        raise ValueError(f"HL7 timestamp {ts.strip()!r} has no offset and no zone was given")
+    return aware.astimezone(UTC)

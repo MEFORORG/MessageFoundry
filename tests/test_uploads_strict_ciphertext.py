@@ -50,8 +50,8 @@ _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HO
 _PHI_NAME = "DOE_JOHN_MRN123.hl7"
 
 
-def _keyed(key: str, **kw: bool) -> AesGcmCipher:
-    cipher = make_cipher(key, write_v2=True, **kw)
+def _keyed(key: str, *, allow_unmarked: bool = False) -> AesGcmCipher:
+    cipher = make_cipher(key, write_v2=True, allow_unmarked=allow_unmarked)
     assert isinstance(cipher, AesGcmCipher)
     return cipher
 

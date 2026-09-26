@@ -176,8 +176,8 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, directory: _Directory) -
         def __enter__(self) -> FakeConnection:
             return self
 
-        def __exit__(self, *exc: object) -> bool:
-            return False
+        def __exit__(self, *exc: object) -> None:
+            return None
 
         def search(self, **kwargs: Any) -> bool:
             self.entries = directory.lookup(str(kwargs["search_filter"]))
@@ -250,6 +250,7 @@ async def _signed_in_estate(
             principal = auth.resolve_principal(name)
             assert principal is not None
             login = await service._complete_ad_login(principal, None, mfa_verified=True)
+            assert login.token is not None, f"{name}'s AD login issued no session token"
             tokens[name] = login.token
         yield directory, service, store, tokens
     finally:

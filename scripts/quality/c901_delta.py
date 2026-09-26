@@ -20,7 +20,7 @@ summary only, so an improvement is visible without spending an annotation on it.
 
 Usage:
     python3 scripts/quality/c901_delta.py --base c901-base.json --head c901-head.json \
-        --repo-root . --summary-file "$GITHUB_STEP_SUMMARY"
+        --repo-root . --base-root base-tree --summary-file "$GITHUB_STEP_SUMMARY"
 """
 
 import argparse
@@ -83,26 +83,29 @@ def _normalise_path(filename: str, repo_root: str, scan_root: str) -> str:
     anchor = f"{scan_root}/"
 
     # Windows paths are case-insensitive; comparing casefolded avoids a C:/ vs c:/ miss.
-    stripped: str | None = None
     if root and normalised.casefold().startswith(f"{root.casefold()}/"):
         stripped = normalised[len(root) + 1 :]
         if stripped.startswith(anchor):
             return stripped
+        # An intervening directory UNDER the root (the base tree, when no --base-root names it).
+        # Search the STRIPPED path only: searching the whole one takes a checkout directory that is
+        # itself named after the package as the anchor, and keys every file wrongly.
+        index = stripped.rfind(f"/{anchor}")
+        if index != -1:
+            return stripped[index + 1 :]
+        # A widened scope reporting a file outside the package: the root strip IS the key. The raw
+        # absolute path would give the base tree and HEAD different keys and flood every finding.
+        return stripped.removeprefix("./")
 
-    # Either a different checkout root, or an intervening directory (the base tree). Cut at the LAST
-    # occurrence of the scanned package so a nested copy resolves to the inner one.
+    # A different checkout root. Cut at the LAST occurrence of the scanned package so a nested copy
+    # resolves to the inner one.
     index = normalised.rfind(f"/{anchor}")
     if index != -1:
         return normalised[index + 1 :]
 
-    # No scan-root anchor -- e.g. a widened scope that reports a file outside the package. Prefer the
-    # successful root strip over the raw absolute path: returning the latter would give the base tree
-    # and HEAD different keys for the same file, and every such finding would flood as new.
-    if stripped is not None:
-        return stripped.lstrip("./")
-
     # Already relative, or a shape we cannot anchor. Return it normalised rather than guessing.
-    return normalised.lstrip("./")
+    # removeprefix, not lstrip: lstrip removes a character SET, so `.github/x.py` became `github/`.
+    return normalised.removeprefix("./")
 
 
 def _parse_message(message: str, filename: str) -> tuple[str, int, int]:
@@ -286,7 +289,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", required=True, help="ruff C901 JSON from the merge base")
     parser.add_argument("--head", required=True, help="ruff C901 JSON from HEAD")
     parser.add_argument("--repo-root", default=".", help="checkout root, for relative paths")
-    parser.add_argument("--scan-root", default="messagefoundry", help="scanned package name")
+    # The merge-base checkout's own root. Without it a base path is keyed from --repo-root, which
+    # works only for files under --scan-root (the anchor cut): anything else in a WHOLE-REPO scan
+    # kept a `base-tree/` prefix, so a web console or test function that changed complexity and
+    # stayed over the threshold was reported as NEW (BACKLOG #1093 widened the scan to the repo).
+    parser.add_argument(
+        "--base-root", default=None, help="merge-base checkout root (default: --repo-root)"
+    )
+    parser.add_argument(
+        "--scan-root",
+        default="messagefoundry",
+        help="package used as the path anchor when a root strip fails (the scan itself is whole-repo)",
+    )
     # Non-negative: a negative cap would slice from the END of the list (reporting the wrong findings)
     # and print a nonsense "further change(s)" count.
     parser.add_argument(
@@ -298,7 +312,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = os.path.abspath(args.repo_root)
-    base = _parse_findings(args.base, repo_root, args.scan_root)
+    base_root = os.path.abspath(args.base_root) if args.base_root else repo_root
+    base = _parse_findings(args.base, base_root, args.scan_root)
     head = _parse_findings(args.head, repo_root, args.scan_root)
 
     # A PR that TIGHTENS ruff's max-complexity makes every function between the old and new thresholds

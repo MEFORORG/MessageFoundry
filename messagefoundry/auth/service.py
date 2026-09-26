@@ -34,6 +34,7 @@ from messagefoundry.auth import oidc, reconcile, totp, webauthn
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError, kerberos_principal
 from messagefoundry.auth.notifications import (
+    ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
@@ -86,6 +87,7 @@ from messagefoundry.store.store import (
     UserRecord,
     WebAuthnCredential,
     require_notify_email,
+    seed_notify_email,
 )
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -4843,9 +4845,17 @@ class AuthService:
         email: str | None,
         roles: Sequence[str],
         actor: str,
+        client: str | None = None,
     ) -> str:
-        """Create a local account. Raises :class:`UsernameTaken` when a concurrent create took
-        ``username`` after the caller's own check (BACKLOG #1808)."""
+        """Create a local account with an admin-set, must-change initial password.
+
+        ``client`` is the creating administrator's address. It lands on the ``user.created`` row
+        (ADR 0150, BACKLOG #315), so the step that can mint a second dual-control approver is
+        attributed to a host like the approval rows are. The new account's notification address is
+        told it was created (``ACCOUNT_CREATED``).
+
+        Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
+        own check (BACKLOG #1808)."""
         user_id = uuid4().hex
         # Hashed before the insert so the handler below covers the store call alone.
         password_hash = await self._argon2(hash_password, password)
@@ -4871,8 +4881,23 @@ class AuthService:
             raise UsernameTaken(USERNAME_TAKEN) from exc
         await self._store.set_user_roles(user_id, roles, assigned_by=actor)
         await self._audit(
-            "user.created", actor=actor, detail=_json({"username": username, "roles": list(roles)})
+            "user.created",
+            actor=actor,
+            detail=_json({"username": username, "roles": list(roles)}),
+            client=client,
         )
+        # The address create_user seeded. None means nobody to tell yet: the holder is asked for one
+        # at first sign-in (the NOTIFY_EMAIL_SET path) rather than told about this afterwards.
+        notify = seed_notify_email(email)
+        if notify:
+            await self._notify_security(
+                ACCOUNT_CREATED,
+                username=username,
+                email=notify,
+                # No `client`: the address is admin-typed and unverified, and no other admin-initiated
+                # notice sends the administrator's address to the account's mailbox.
+                detail={"roles": list(roles)},
+            )
         return user_id
 
     async def update_user(

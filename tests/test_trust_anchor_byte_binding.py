@@ -28,7 +28,7 @@ import datetime
 import hashlib
 import ssl
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,6 +47,7 @@ from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, anch
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import ApiSettings, ServiceSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture, urllib_handler_context
+from messagefoundry.store.base import Row
 from messagefoundry.transports.dicom import _server_ssl_context
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import MLLPSource, _mllp_ssl_context
@@ -761,7 +762,7 @@ def test_the_inbound_sources_name_their_ca_after_the_connection(
 
 async def _post_test(
     tmp_path: Path, settings: dict[str, Any], *, enforcing: bool
-) -> tuple[Any, list[dict[str, Any]]]:
+) -> tuple[Any, Sequence[Row]]:
     """POST /connections/IB/test on an engine at the given dial. Returns the response and the
     connection_test audit rows."""
     import httpx

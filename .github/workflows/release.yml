@@ -3,10 +3,11 @@
 #
 # Cut a release:  git tag v0.1.0 && git push origin v0.1.0   (on a commit that already passed CI on main).
 # Dry-run:        run this workflow manually (workflow_dispatch) — it builds + SBOMs + signs and uploads
-#                 the artifacts for inspection. It does NOT create a GitHub release and does NOT publish
-#                 to PyPI, so the dry-run validates build/SBOM/sign/upload ONLY. The first live PyPI
-#                 publish is the first real tag; validate it with a `vX.Y.Z-rc1` pre-release tag (also
-#                 matched below) once Trusted Publishing is configured.
+#                 the artifacts for inspection. It does NOT create a GitHub release, does NOT publish
+#                 to PyPI and does NOT write an SLSA attestation, so the dry-run validates
+#                 build/SBOM/sign/upload ONLY. The first live PyPI publish is the first real tag;
+#                 validate it with a `vX.Y.Z-rc1` pre-release tag (also matched below) once Trusted
+#                 Publishing is configured.
 #
 #                 EVERY STEP THAT PUBLISHES A RELEASE ARTIFACT TESTS THE EVENT AS WELL AS THE REF —
 #                 `github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')` (BACKLOG
@@ -17,18 +18,25 @@
 #                 "run it manually to dry-run it" invites an operator to do. Reading the old guard as
 #                 "a branch ref isn't `refs/tags/...`" is what hid this: a true sentence about the
 #                 wrong half of the trigger. The steps carrying the pair are at least the three PyPI
-#                 publishes and the three GitHub-release mutations; the COUNT is pinned in
+#                 publishes, the three GitHub-release mutations, and the SLSA build-provenance
+#                 attestation (BACKLOG #1805; the step's own comment says why). The COUNT is pinned in
 #                 tests/test_release_pipeline.py, which is its one authority — do not restate a
 #                 number here that nothing keeps in sync with that test.
 #
 #                 THE DRY-RUN IS NOT SILENT, AND THE SENTENCE ABOVE IS DELIBERATELY NARROWER THAN
-#                 "every mutating step". Two steps below write to public, append-only sinks on a
-#                 dispatch and carry NEITHER half of that pair: `python -m sigstore sign` is
+#                 "every mutating step". At least one step below writes to a public, append-only sink
+#                 on a dispatch and carries NEITHER half of that pair: `python -m sigstore sign` is
 #                 unconditional and, being keyless, appends an entry to the public Rekor transparency
-#                 log; `actions/attest-build-provenance` is gated on `!github.event.repository.private`
-#                 alone. Both predate #1584 — a dispatch against a BRANCH already reached them — and
-#                 both are filed as BACKLOG #1805. The promise this file keeps today is that a manual
-#                 run publishes no release ARTIFACT, not that it writes nothing public.
+#                 log. It stays on a dispatch because validating signing is what the dry-run is for.
+#                 Its certificate names the ref it ran on. The install guides' Sigstore check pins
+#                 `release.yml@refs/tags/v<version>`, so a signature from a BRANCH dispatch fails it.
+#                 A TAG dispatch's signature passes it. The promise this file keeps is that a manual
+#                 run publishes and attests no release ARTIFACT, not that it writes nothing public.
+#
+#                 EVERY PROMISE HERE BINDS ONLY A REF THAT CARRIES THIS COPY OF THE FILE. A dispatch
+#                 runs the release.yml at the ref it is pointed at, so an older tag or branch runs its
+#                 own guards: the visibility-only attestation guard before BACKLOG #1805, and the
+#                 ref-only publish guards before #1584.
 #
 # PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
 # tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
@@ -556,18 +564,32 @@ jobs:
       # builder workflow identity, transparency-logged via the OIDC identity above. This is the
       # GitHub-native artifact attestation for the GitHub release assets, COMPLEMENTING the PyPI-side
       # PEP 740 attestations emitted by the publish step below (dist-pub/ is a byte-identical copy, so
-      # the digests match either source). Runs on a tag push AND the workflow_dispatch dry-run, so the
-      # attestation path is validated before the real tag. Verify a downloaded artifact with:
+      # the digests match either source). Verify a downloaded artifact with:
       #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry
-      # GATED to PUBLIC repos: the GitHub attestation API (actions/attest-build-provenance) is "not
-      # available for user-owned private repositories" and FAILS there, aborting the job BEFORE the PyPI
-      # publish below. THIS repo is public since the cutover, so the step now RUNS and every release
-      # carries SLSA provenance. The gate remains for a private fork, where it SKIPS rather than fails
-      # (skip != fail, so the release proceeds) and provenance is still covered by the Sigstore bundle
-      # above plus the PyPI-side PEP 740 attestations from the publish step.
-      # `github.event.repository.private` is populated on the tag-push event.
+      #
+      # THE GUARD HAS TWO PARTS, AND EACH ANSWERS A DIFFERENT QUESTION.
+      #
+      # 1. The event-and-ref pair, the same one every publish step below carries (BACKLOG #1805). The
+      #    verify command above does NOT check the ref or the workflow: it accepts an attestation
+      #    signed by any workflow in this repository, from any ref. So an attestation a dispatch wrote
+      #    for an unreviewed branch would verify exactly like a release's. This step used to run on
+      #    the dispatch dry-run too, to validate the attestation path before a tag. The pair gives
+      #    that up on purpose; a tag push is now the only run that reaches this step. At least one
+      #    dispatch attestation already exists: run 35960146347, against `main` on 2026-09-24. This
+      #    guard stops new ones only from a ref that carries it (see the header), and it cannot
+      #    retract that one.
+      #
+      # 2. Visibility. The GitHub attestation API is "not available for user-owned private
+      #    repositories" and FAILS there, aborting the job BEFORE the PyPI publish below. THIS repo is
+      #    public since the cutover, so on a tag push the step RUNS and every release carries SLSA
+      #    provenance. A fork never gets here, because the job's own `if:` names this repository.
+      #    The test is kept for the day this repository is private again: the step then SKIPS rather
+      #    than fails (skip != fail, so the release proceeds). Provenance is then still covered by
+      #    the Sigstore bundle above plus the PyPI-side PEP 740 attestations from the publish step.
+      #    `github.event.repository.private` is populated on a tag push, and on a dispatch too, which
+      #    is why visibility alone never kept a dispatch out.
       - name: Attest build provenance (SLSA) for sdist + wheel
-        if: ${{ !github.event.repository.private }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && !github.event.repository.private }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: "dist/*.tar.gz, dist/*.whl, messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"

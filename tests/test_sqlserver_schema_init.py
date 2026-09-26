@@ -85,7 +85,7 @@ class _FakePool:
 
 def _make_store(conn: _FakeConn) -> SqlServerStore:
     store = SqlServerStore.__new__(SqlServerStore)
-    store._pool = _FakePool(conn)  # type: ignore[assignment]
+    store._pool = _FakePool(conn)
     store._settings = types.SimpleNamespace(  # type: ignore[assignment]
         command_timeout=0, acquire_timeout=30.0
     )
@@ -119,7 +119,7 @@ async def test_ensure_schema_takes_applock_before_any_create() -> None:
     # The applock names the cross-node resource, and nothing but the read-only probe precedes it...
     lock_i = _applock_index(executed)
     params_lock = executed[lock_i][1]
-    assert params_lock is not None and _SCHEMA_LOCK in params_lock
+    assert isinstance(params_lock, tuple | list) and _SCHEMA_LOCK in params_lock
     # ...and it precedes every CREATE TABLE (so two virgin-DB nodes serialize rather than race to 2714).
     first_create = next(i for i, (sql, _) in enumerate(executed) if "CREATE TABLE" in sql)
     assert first_create > lock_i

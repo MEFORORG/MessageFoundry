@@ -190,6 +190,30 @@ class AlertSink(Protocol):
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""
         ...
 
+    def approval_approver_provenance(
+        self, name: str, *, operation: str, changed: tuple[str, ...]
+    ) -> None:
+        """A held dual-control request was RELEASED by an approver whose account changed after the
+        request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``). The release
+        went ahead: this flags it and refuses nothing. ``name`` is ``approval:<approval id>``. The
+        colon is outside the connection-name grammar, so a rule's ``control_action`` can never land
+        on a real connection through it (BACKLOG #1898). ``changed`` holds one or more of
+        ``account_created``, ``password_changed`` and ``totp_enrolled``. Carries the key, the
+        operation key and the slugs only: no username, no params, no PHI. The
+        ``approval.approver_provenance`` audit row is the durable record. Emitted by
+        :class:`~messagefoundry.api.approvals.ApprovalGate`."""
+        ...
+
+    def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        """The built-in Administrator role was granted through the console API (BACKLOG #315). Every
+        approver is an Administrator, so this is how a second approver gets minted. ``via`` is
+        ``account_created`` or ``roles_changed`` with ``name`` = ``user:<username>``, or
+        ``ad_group_map`` with ``name`` = ``ad-group:<group>`` when a group newly maps to the role.
+        Both keys are outside the connection-name grammar for the same reason as
+        :meth:`approval_approver_provenance`. ``granted_by`` is the acting administrator's username.
+        No PHI. Emitted by the API's user-administration routes, never from ``auth/``."""
+        ...
+
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         """A directory reconciliation pass tripped the mass-revoke circuit breaker and revoked
         NOTHING (ADR 0079 mechanism 2). The same event as the ``auth.ad_reconcile_aborted`` audit
@@ -224,7 +248,9 @@ class AlertSink(Protocol):
     def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
         """Startup self-attestation found loaded engine module(s) that do not match the installed
         wheel ``RECORD`` baseline — a runtime in-place tamper tripwire (ADR 0041 D3, #54). ``name``
-        labels the source (``"engine-integrity"``); ``reason`` is a PHI-free summary string;
+        labels the source; startup attestation uses at least ``"engine-integrity"``, and
+        :mod:`messagefoundry.integrity` defines its other subjects, including the web console's
+        (BACKLOG #1802). ``reason`` is a PHI-free summary string;
         ``drift_count`` is how many module files drifted. Carries no file content (no PHI, nothing
         sensitive). Emitted by :func:`~messagefoundry.integrity.run_startup_attestation`. Dedicated
         rather than reusing :meth:`connection_stopped` so an operator can route/triage a tamper signal
@@ -469,6 +495,25 @@ class LoggingAlertSink:
             operation,
             approval_id,
             reason,
+        )
+
+    def approval_approver_provenance(
+        self, name: str, *, operation: str, changed: tuple[str, ...]
+    ) -> None:
+        log.warning(
+            "ALERT approval_approver_provenance: %s request %r was released by an approver whose "
+            "account changed after the request (%s)",
+            operation,
+            name,
+            ", ".join(changed),
+        )
+
+    def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        log.warning(
+            "ALERT administrator_granted: %r was given the Administrator role (%s) by %r",
+            name,
+            via,
+            granted_by,
         )
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:

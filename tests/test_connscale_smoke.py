@@ -160,7 +160,8 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
 
     Four properties, and none is weaker than the old assertion wherever the probe worked:
 
-    1. Where the probe READ, the count must be positive — the wall exists. Unchanged.
+    1. Where the probe READ, the count must be positive — the wall exists — and the record must name
+       the PIDs the peak was summed over and the PID the walk started from (BACKLOG #1210).
     2. Where it did not, the record must NAME a cause. An unattributable gap FAILS. A tolerance that
        swallowed it would buy a green by destroying the only evidence of what went wrong, which is the
        failure mode this whole change exists to remove.
@@ -173,6 +174,19 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
     for r in records:
         if r.fd_count_peak is not None:
             assert r.fd_count_peak > 0, r
+            # BACKLOG #1210 arm 2: a measured peak names the processes it summed, and the walk's
+            # starting PID that anchors them. A number with no covering set is the anonymous reading
+            # that let a stale-ppid adoption stand as the engine's FD count. WHAT THIS GUARDS, AND WHAT
+            # IT DOES NOT: the probe always fills the set when it reads a peak, so this fails when the
+            # provenance is DROPPED between the probe and the record -- a runner or report change that
+            # stops threading it. It does not detect an adoption; that needs a reader comparing the
+            # members against the expected tree, and the walk's validation is what prevents one.
+            assert r.fd_count_peak_pids and r.fd_probe_root_pid is not None, (
+                f"UNATTRIBUTED PEAK -- wall #4 read {r.fd_count_peak} at {r.sweep_mode}@N={r.count} "
+                f"and the record does not say which processes that sum covered "
+                f"(fd_count_peak_pids={r.fd_count_peak_pids!r}, "
+                f"fd_probe_root_pid={r.fd_probe_root_pid!r}). Record: {r}"
+            )
             continue
         causes = tuple(r.fd_probe_degraded)
         scope = f"{r.fd_probe_degraded_ticks} of {r.fd_probe_ticks} probe tick(s) degraded"

@@ -140,7 +140,7 @@ class _FakePool:
 
 def _make_store(conn: _FakeConn, ops: list[str]) -> SqlServerStore:
     store = SqlServerStore.__new__(SqlServerStore)
-    store._pool = _FakePool(conn, ops)  # type: ignore[assignment]
+    store._pool = _FakePool(conn, ops)
     store._settings = types.SimpleNamespace(  # type: ignore[assignment]
         command_timeout=0, acquire_timeout=30.0
     )
@@ -157,9 +157,9 @@ async def _cancel_inside(
     task: asyncio.Task = asyncio.create_task(getattr(store, method)(**kwargs))
     for _ in range(200):  # let the task reach the gated execute
         await asyncio.sleep(0)
-        if "execute" in store._pool.ops:  # type: ignore[attr-defined]
+        if "execute" in store._pool.ops:
             break
-    assert "execute" in store._pool.ops, "never reached the gated execute"  # type: ignore[attr-defined]
+    assert "execute" in store._pool.ops, "never reached the gated execute"
     task.cancel()
     return task
 
@@ -174,7 +174,7 @@ async def test_cancelled_call_never_returns_a_dirty_connection_to_the_pool(
     ops: list[str] = []
     conn = _FakeConn(ops, gate=asyncio.Event())
     store = _make_store(conn, ops)
-    pool = store._pool  # type: ignore[attr-defined]
+    pool = store._pool
 
     task = await _cancel_inside(store, method, kwargs)
     with pytest.raises(asyncio.CancelledError):
@@ -203,7 +203,7 @@ async def test_second_cancellation_cannot_defeat_the_quarantine(
     hold = threading.Event()
     conn._conn.release_close = hold  # block the raw close mid-flight
     store = _make_store(conn, ops)
-    pool = store._pool  # type: ignore[attr-defined]
+    pool = store._pool
 
     task = await _cancel_inside(store, method, kwargs)
     for _ in range(50):  # let the cleanup start while the raw close is held open
@@ -229,13 +229,13 @@ async def test_ordinary_exception_still_rolls_back_and_recycles(
     ops: list[str] = []
     conn = _FakeConn(ops, gate=None)
     store = _make_store(conn, ops)
-    pool = store._pool  # type: ignore[attr-defined]
+    pool = store._pool
 
     async def boom(sql: str, params: object = None) -> None:
         ops.append("execute")
         raise RuntimeError("execute boom")
 
-    conn.cursor_obj.execute = boom  # type: ignore[assignment]
+    conn.cursor_obj.execute = boom  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeError, match="execute boom"):
         await getattr(store, method)(**kwargs)
@@ -254,7 +254,7 @@ async def test_success_path_unchanged(method: str, kwargs: dict[str, Any]) -> No
     ops: list[str] = []
     conn = _FakeConn(ops, gate=None)
     store = _make_store(conn, ops)
-    pool = store._pool  # type: ignore[attr-defined]
+    pool = store._pool
 
     await getattr(store, method)(**kwargs)
 

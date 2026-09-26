@@ -165,6 +165,23 @@ The installer **refuses to run when `$env:CLAUDECODE` is set**: a session that c
 also remove it, so installation stays a human act. After installing, run `install-gate.ps1 -Status` to
 confirm every config dir shows hook entries.
 
+The installer also **refuses when this checkout's gate differs from the gate on `origin/main`**, or when
+`origin/main` cannot be read (BACKLOG #1878). It copies its bytes from the checkout you run it in, so a
+stale checkout would ship a stale gate to every session on the box. It never fetches, so fetch first.
+Pass `-AllowStaleSource` only to install an older or unmerged gate on purpose. `-Status` grades the
+installed gate against `origin/main` too. The comparison is of the gate file's content, not of commit
+position, so a checkout many commits behind with an unchanged gate still passes.
+
+| Verdict | Means |
+|---|---|
+| `IN SYNC` | The installed gate matches this checkout's gate **and** the one on `origin/main`. |
+| `NOT CURRENT` | The installed gate matches this checkout's gate, and that gate differs from `origin/main`'s. |
+| `CURRENT` | The installed gate matches `origin/main`'s; this checkout's gate differs, so do not install from it. |
+| `STALE` | The installed gate differs from this checkout's, and does not match `origin/main`'s either. |
+| `UNVERIFIED` | The installed gate matches this checkout's gate, but `origin/main` could not be read. |
+
+`-UpstreamRef` names a different yardstick.
+
 Two structural choices worth understanding:
 
 - **Every config dir, not just `~/.claude`.** The hook is registered into `~/.claude/settings.json` **and**

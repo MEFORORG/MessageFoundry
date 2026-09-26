@@ -34,6 +34,7 @@ from pathlib import (
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry import __version__
+from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
     LogFile,
@@ -84,16 +85,9 @@ def main(argv: list[str] | None = None) -> int:
     # --help/usage printer and runtime log/print() lines bypass _safe_print, so a non-cp1252 char
     # (an arrow or other symbol in a help string or log line) would otherwise abort with
     # UnicodeEncodeError. errors="replace" is lossy for such chars, but the machine-read JSON
-    # subcommands stay ASCII (json.dumps ensure_ascii=True). Guarded: some stream wrappers
-    # (PYTHONLEGACYWINDOWSSTDIO, pytest capture) lack reconfigure or reject it, and the hardening
-    # must never itself crash the CLI.
-    for _stream in (sys.stdout, sys.stderr):
-        _reconfigure = getattr(_stream, "reconfigure", None)
-        if _reconfigure is not None:
-            try:  # noqa: SIM105
-                _reconfigure(errors="replace")
-            except (ValueError, OSError):
-                pass
+    # subcommands stay ASCII (json.dumps ensure_ascii=True), so this keeps the stream's codec. The
+    # shared helper is the one chokepoint every console entry point calls (BACKLOG #1875).
+    harden_console_streams()
 
     # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
     # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled

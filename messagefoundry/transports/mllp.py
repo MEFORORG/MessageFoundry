@@ -214,7 +214,8 @@ _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
 #: consumers of it are a log line, a dead-letter row's ``last_error`` and an alert, each of which
 #: redacts and then truncates to :data:`~messagefoundry.redaction._DEFAULT_LIMIT` (200) anyway. Five
-#: times that is room for a peer to name the offending segment and then some.
+#: times that is room for a peer to name the offending segment and then some. MSA-1 and MSA-2 share
+#: the bound through :func:`_bounded_ack_field`; MSA-3 is the field it was sized for.
 #:
 #: **The bound belongs here rather than only downstream because the length is the PEER's to choose.**
 #: ``receive_max_bytes`` caps the ACK frame, not this field inside it, so MSA-3 arrives sized to the
@@ -226,10 +227,11 @@ _MAX_NAK_DETAIL_CHARS = 1024
 
 def _bounded_ack_field(value: str | None) -> str:
     """A peer-chosen ACK field, bounded for the exception message it is about to be written into
-    (BACKLOG #1576).
+    (BACKLOG #1576, #1847).
 
-    One helper for both fields that reach a raise, so the two cannot drift: adding the bound to MSA-3
-    and leaving MSA-2 beside it is the shape this fix arrived in, and the shape a review caught.
+    One helper for every peer-sized field that reaches a raise (MSA-1, MSA-2 and MSA-3 today), so
+    they cannot drift: adding the bound to MSA-3 and leaving MSA-2 beside it is the shape #1576
+    arrived in, and MSA-1 was the one left after that (#1847).
     ``clamp_untrusted`` and not a slice -- cutting at an arbitrary offset strands a fragment under the
     redactor's thresholds and walks the identifier into the log downstream."""
     return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
@@ -1451,6 +1453,8 @@ class MLLPDestination(DestinationConnector):
                         f"!= sent MSH-10={sent_control_id!r}"
                     )
             if self.capture_response:
+                # Unbounded on purpose: this branch runs only when msa1 is exactly AA or CA, so the
+                # peer cannot size it here (BACKLOG #1847 bounds the one that can, below).
                 return DeliveryResponse(
                     body=ack_bytes.decode(self.encoding, errors="replace"),
                     outcome="accepted",
@@ -1476,8 +1480,15 @@ class MLLPDestination(DestinationConnector):
         # capture. AR/CR (reject) is permanent (fail-fast); AE/CE (error) and any unrecognized negative
         # code are treated as transient (retry), the conservative choice when the intent is unclear.
         code, permanent = ("AR", True) if msa1 in ("AR", "CR") else ("AE", False)
+        # BACKLOG #1847, the sibling of MSA-2 and MSA-3 above: every code that is not AA/CA lands
+        # here, so the peer sizes MSA-1 in this message too. Bounded for the TEXT only, after the
+        # comparisons: they must see the code the peer actually sent, or a clamp that rewrote it could
+        # move a reply from one branch to another. str() keeps an absent MSA-1 rendering as "None",
+        # as it did before, where the helper alone would print it as an empty field.
         raise NegativeAckError(
-            f"negative ACK (MSA-1={msa1}): {detail}".rstrip(": "), code=code, permanent=permanent
+            f"negative ACK (MSA-1={_bounded_ack_field(str(msa1))}): {detail}".rstrip(": "),
+            code=code,
+            permanent=permanent,
         )
 
 

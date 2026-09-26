@@ -154,7 +154,8 @@ def test_every_offender_is_named_and_the_static_items_beside_them_are_not() -> N
         messagefoundry.Rest(
             url="https://example.invalid/x",
             capture_response_headers=[NESTED_SHAPES["code-first"](), "x-static"],
-            proxy_no_proxy=["a.example.invalid", "b.example.invalid", {"env": "np"}],
+            # A nested env-ref marker where a str belongs IS the input under test.
+            proxy_no_proxy=["a.example.invalid", "b.example.invalid", {"env": "np"}],  # type: ignore[list-item]
         )
     message = str(excinfo.value)
     assert "capture_response_headers item 0" in message, message
@@ -168,7 +169,8 @@ def test_a_reference_one_level_deeper_in_an_item_is_refused_too() -> None:
     with pytest.raises(WiringError) as excinfo:
         messagefoundry.Rest(
             url="https://example.invalid/x",
-            capture_response_headers=[["x-a", NESTED_SHAPES["connections.toml"]()]],
+            # A list nested inside the list IS the input under test.
+            capture_response_headers=[["x-a", NESTED_SHAPES["connections.toml"]()]],  # type: ignore[list-item]
         )
     assert "capture_response_headers item 0" in str(excinfo.value)
     assert SENTINEL not in str(excinfo.value)
@@ -180,7 +182,9 @@ def test_a_reference_inside_a_whole_setting_env_default_is_refused_too(shape: st
     would reach the connector the same way a list item written directly does."""
     whole = messagefoundry.env("capture_list", default=["x-a", NESTED_SHAPES[shape]()])
     with pytest.raises(WiringError) as excinfo:
-        messagefoundry.Rest(url="https://example.invalid/x", capture_response_headers=whole)
+        # Rest() annotates this setting `list[str] | None`, yet the wiring layer resolves a whole
+        # env() here (the TOML test below shows it). The annotation is narrower than the behaviour.
+        messagefoundry.Rest(url="https://example.invalid/x", capture_response_headers=whole)  # type: ignore[arg-type]
     assert "capture_response_headers env() default item 1" in str(excinfo.value)
     assert SENTINEL not in str(excinfo.value)
 
@@ -290,7 +294,8 @@ def test_a_table_that_only_looks_like_an_env_ref_is_left_alone() -> None:
     firing on it would refuse ordinary data with a message about a reference nobody wrote."""
     lookalike = {"env": "partner_value", "not_an_envref_key": 1}
     spec = messagefoundry.Rest(
-        url="https://example.invalid/x", capture_response_headers=["x-a", lookalike]
+        url="https://example.invalid/x",
+        capture_response_headers=["x-a", lookalike],  # type: ignore[list-item]  # the near-miss IS the input
     )
     assert spec.settings["capture_response_headers"][1] == lookalike
 

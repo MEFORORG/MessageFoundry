@@ -640,7 +640,7 @@ def Reference(
 
 
 # --- live lookup connections (handler-callable db_lookup, ADR 0010) -----------
-# A DatabaseLookup declares a NAMED, read-only database connection a Handler queries LIVE at run time via
+# A DatabaseLookup declares a NAMED database connection for read-only use that a Handler queries LIVE via
 # db_lookup(name, statement, params) (the read accessor lives in messagefoundry.config.db_lookup). Unlike
 # a reference set (a synced snapshot read purely), there is no statement or cadence here — only the
 # connection; each call supplies its own statement. The engine builds one pooled executor from these.
@@ -675,8 +675,8 @@ def DatabaseLookup(
 ) -> None:
     """Declare a named live-lookup database connection (SQL Server via the ``[sqlserver]`` extra + ODBC
     Driver 18 — **production / supported**, like the DATABASE connector). A Handler queries it at run time with
-    ``db_lookup(name, statement, params)`` (a read-only ``SELECT``/proc); the rows come back as
-    ``{column: value}`` dicts. Side-effecting, like :func:`Reference`/:func:`inbound`.
+    ``db_lookup(name, statement, params)`` (a ``SELECT``/``WITH`` read; ``EXEC`` is refused); the rows
+    come back as ``{column: value}`` dicts. Side-effecting, like :func:`Reference`/:func:`inbound`.
 
     Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
     ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
