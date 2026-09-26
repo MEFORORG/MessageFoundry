@@ -628,7 +628,7 @@ This section is kept rather than deleted, because the claim it used to make is t
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
 
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
-> **Connection-scoped**, and unlike the two above it is not a flag anyone sets — it is the *absence* of a
+> **Connection-scoped**, and unlike the flag entries above it is not a flag anyone sets — it is the *absence* of a
 > verifying keyword. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
 > `dialect='generic'`. [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 > (2026-07-12 amendment).

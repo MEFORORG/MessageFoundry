@@ -447,7 +447,7 @@ def test_every_per_connection_tls_parameter_is_reported_or_exempt() -> None:
 
 
 def test_the_reported_connection_deviations_are_actually_wired() -> None:
-    """The other half of the floor: the map above claims two parameters are REPORTED, and a claim that
+    """The other half of the floor: the map above claims parameters are REPORTED, and a claim that
     nothing executes is exactly what this lane exists to prevent. Drive each through its reader AND
     through `security_loosenings`, so "reported" means reported."""
     from messagefoundry.config.models import ConnectorType
@@ -499,7 +499,7 @@ def test_the_reported_connection_deviations_are_actually_wired() -> None:
 
 
 def test_the_revocation_attestation_is_actually_wired() -> None:
-    """The third REPORTED entry, driven the same way as the two above: through its reader AND through
+    """Another REPORTED entry, driven the same way as the ones above: through its reader AND through
     `security_loosenings`. ADR 0173 made the pair authorable on an outbound, so the reader must see it
     there and the registry must name it."""
     from messagefoundry.config.models import ConnectorType
