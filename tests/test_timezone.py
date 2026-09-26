@@ -12,6 +12,7 @@ All data here is synthetic (fabricated timestamps), never PHI.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfoNotFoundError
 
 import pytest
 
@@ -420,14 +421,62 @@ def test_age_malformed_dob_raises() -> None:
 # --- length_of_stay ---------------------------------------------------------
 
 
-def test_los_naive_pair_returns_wall_clock_delta() -> None:
-    los = length_of_stay("20260101080000", "20260104120000")
+def test_los_naive_time_pair_without_zone_is_refused() -> None:
+    """BACKLOG #1770: a bare wall-clock difference is an hour wrong across a DST change, so an
+    offset-free pair with a time of day is refused rather than measured. (This pair once returned
+    3 days 4 hours; the zoned form below still does, because no transition falls inside it.)"""
+    with pytest.raises(ValueError, match="needs a zone"):
+        length_of_stay("20260101080000", "20260104120000")
+
+
+def test_los_naive_time_pair_with_zone_returns_elapsed_time() -> None:
+    los = length_of_stay("20260101080000", "20260104120000", zone=EASTERN)
     assert los == timedelta(days=3, hours=4)
     assert los.days == 3
 
 
+def test_los_naive_pair_spanning_spring_forward_is_elapsed_not_wall_clock() -> None:
+    """The row's first measured pair. Wall clock says 48 h; the clocks sprang forward on 2026-03-08,
+    so the patient stayed 47 h. Two datetimes sharing one ZoneInfo would subtract as wall clock, so
+    this pins that the function goes through UTC."""
+    los = length_of_stay("202603071200", "202603091200", zone=EASTERN)
+    assert los == timedelta(hours=47)
+    # Agrees with the same stay stamped with its offsets.
+    assert length_of_stay("202603071200-0500", "202603091200-0400") == timedelta(hours=47)
+
+
+def test_los_naive_pair_spanning_fall_back_is_elapsed_not_wall_clock() -> None:
+    """The row's second measured pair: 48 h of wall clock across the 2026-11-01 fall-back is 49 h."""
+    los = length_of_stay("202610311200", "202611021200", zone=EASTERN)
+    assert los == timedelta(hours=49)
+    assert length_of_stay("202610311200-0400", "202611021200-0500") == timedelta(hours=49)
+
+
+def test_los_naive_time_pair_spanning_dst_without_zone_is_refused() -> None:
+    for admit, discharge in (
+        ("202603071200", "202603091200"),
+        ("202610311200", "202611021200"),
+    ):
+        with pytest.raises(ValueError, match="needs a zone"):
+            length_of_stay(admit, discharge)
+
+
+def test_los_date_only_and_time_pair_without_zone_is_refused() -> None:
+    # One stamp with a time of day is enough: the date-only one's midnight is module filler.
+    with pytest.raises(ValueError, match="needs a zone"):
+        length_of_stay("20260307", "202603091200")
+
+
 def test_los_partial_precision_day_pair() -> None:
     assert length_of_stay("20260101", "20260105") == timedelta(days=4)
+
+
+def test_los_date_only_pair_across_dst_stays_whole_days_with_or_without_zone() -> None:
+    """A date-only pair has no hour to be wrong. Reading its midnights through a zone would make a
+    two-day stay across spring-forward 1 day 23 hours, so the zone is not consulted for it."""
+    assert length_of_stay("20260307", "20260309") == timedelta(days=2)
+    assert length_of_stay("20260307", "20260309", zone=EASTERN) == timedelta(days=2)
+    assert length_of_stay("20261031", "20261102", zone=EASTERN).days == 2
 
 
 def test_los_offset_pair_accounts_for_zone_difference() -> None:
@@ -436,15 +485,53 @@ def test_los_offset_pair_accounts_for_zone_difference() -> None:
     assert los == timedelta(hours=5)
 
 
+def test_los_offset_pair_ignores_zone() -> None:
+    los = length_of_stay("20260101120000+0000", "20260101120000-0500", zone=CENTRAL)
+    assert los == timedelta(hours=5)
+
+
 def test_los_mixed_offset_pair_raises() -> None:
     with pytest.raises(ValueError, match="both"):
         length_of_stay("20260101120000+0000", "20260104120000")
 
 
+def test_los_mixed_offset_pair_resolves_the_naive_stamp_in_the_zone() -> None:
+    # Admit pinned at -0500 (EST); discharge is bare 12:00 on 2026-03-09, read in Eastern as EDT.
+    los = length_of_stay("202603071200-0500", "202603091200", zone=EASTERN)
+    assert los == timedelta(hours=47)
+    # And the other way round.
+    los = length_of_stay("202603071200", "202603091200-0400", zone=EASTERN)
+    assert los == timedelta(hours=47)
+
+
+def test_los_naive_stamp_on_a_dst_edge_is_refused() -> None:
+    """The #1686 refusal applies: 02:30 never happens in Eastern on 2026-03-08, and 01:30 happens
+    twice on 2026-11-01."""
+    with pytest.raises(NonExistentLocalTimeError):
+        length_of_stay("202603080230", "202603091200", zone=EASTERN)
+    with pytest.raises(AmbiguousLocalTimeError):
+        length_of_stay("202610310000", "202611010130", zone=EASTERN)
+
+
+def test_los_dst_edge_resolved_by_explicit_policy() -> None:
+    # 01:30 on the fall-back day: "earlier" is the first occurrence (EDT), "later" the second (EST).
+    first = length_of_stay("202611010000", "202611010130", zone=EASTERN, on_dst_edge="earlier")
+    second = length_of_stay("202611010000", "202611010130", zone=EASTERN, on_dst_edge="later")
+    assert first == timedelta(hours=1, minutes=30)
+    assert second == timedelta(hours=2, minutes=30)
+
+
+def test_los_bad_policy_and_unknown_zone_raise() -> None:
+    with pytest.raises(ValueError, match="on_dst_edge"):
+        length_of_stay("20260101", "20260105", on_dst_edge="nearest")  # type: ignore[arg-type]
+    with pytest.raises(ZoneInfoNotFoundError):
+        length_of_stay("20260101120000+0000", "20260102120000+0000", zone="Not/AZone")
+
+
 def test_los_negative_raises() -> None:
     with pytest.raises(ValueError, match="before admit"):
-        length_of_stay("20260104120000", "20260101120000")
+        length_of_stay("20260104120000", "20260101120000", zone=EASTERN)
 
 
 def test_los_zero_length_is_allowed() -> None:
-    assert length_of_stay("20260101120000", "20260101120000") == timedelta(0)
+    assert length_of_stay("20260101120000", "20260101120000", zone=EASTERN) == timedelta(0)

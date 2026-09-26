@@ -153,9 +153,11 @@
   "MEFOR compute length of stay": {
     "prefix": "meforlos",
     "body": [
-      "${1:stay} = msg.length_of_stay()  # PV1-44/PV1-45 by default; None if not yet discharged",
+      "# zone reads PV1-44/PV1-45 stamps that carry no offset; without it such a pair is refused,",
+      "# because a bare wall-clock difference is an hour off across a daylight-saving change.",
+      "${1:stay} = msg.length_of_stay(zone=\"${2:America/Chicago}\")  # None if not yet discharged",
       "if ${1:stay} is not None:",
-      "\t${2:days} = ${1:stay}.days"
+      "\t${3:days} = ${1:stay}.days"
     ],
     "description": "Date · Compute the encounter length of stay"
   },

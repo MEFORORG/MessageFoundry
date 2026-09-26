@@ -41,7 +41,7 @@ from messagefoundry.parsing.peek import (
     normalize,
     parse_path,
 )
-from messagefoundry.timezone import age_from_dob, length_of_stay
+from messagefoundry.timezone import DstEdgePolicy, age_from_dob, length_of_stay
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +234,8 @@ class Message:
         admit_path: str = "PV1-44",
         discharge_path: str = "PV1-45",
         occurrence: int = 1,
+        zone: str | None = None,
+        on_dst_edge: DstEdgePolicy = "raise",
     ) -> timedelta | None:
         """The encounter length of stay as a :class:`~datetime.timedelta`, from the admit and discharge
         timestamps (default PV1-44 / PV1-45).
@@ -242,9 +244,17 @@ class Message:
         the elapsed time (use ``.days`` for whole inpatient days). Returns None if **either** timestamp
         is absent/empty (an open, not-yet-discharged encounter). ``occurrence`` selects the segment.
 
+        **Pass ``zone`` (an IANA name such as ``"America/Chicago"``) for any feed whose PV1-44/PV1-45
+        carry a time of day without an offset.** Without it such a pair is refused, because a bare
+        wall-clock difference reports a stay spanning a daylight-saving change as an hour too long or
+        too short. Date-only pairs need no zone. The rules are in
+        :func:`messagefoundry.timezone.length_of_stay`, which this wraps.
+
         Raises:
-            ValueError: a timestamp is malformed, exactly one carries a zone offset, or the discharge
-                precedes the admit.
+            ValueError: a timestamp is malformed, no ``zone`` was given for a pair that needs one, or
+                the discharge precedes the admit. A stamp on a daylight-saving edge of ``zone`` raises
+                a :class:`~messagefoundry.timezone.DstTransitionError` subclass (also a
+                ``ValueError``) unless ``on_dst_edge`` names a resolution.
         """
         admit = self.field(f"{admit_path}.1", occurrence=occurrence) or self.field(
             admit_path, occurrence=occurrence
@@ -254,7 +264,7 @@ class Message:
         )
         if not admit or not discharge:
             return None
-        return length_of_stay(admit, discharge)
+        return length_of_stay(admit, discharge, zone=zone, on_dst_edge=on_dst_edge)
 
     # --- mutate --------------------------------------------------------------
 
