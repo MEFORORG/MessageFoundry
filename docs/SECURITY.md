@@ -35,10 +35,10 @@ attached it denies every protected route (503) unless the caller explicitly opts
 path runs auth-enabled by default; if `[security] require_sign_in = false` it sets that opt-in itself, and
 `__main__` refuses to serve auth-off on an exposed instance — a non-loopback host, or a loopback host
 behind a declared TLS terminator — and, even with auth enabled, a
-non-loopback bind requires **TLS**: in-process (`[api].tls_cert_file`, WP-13a) or terminated at a
-trusted upstream proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15), or — as a dev override —
-an explicit `serve --allow-insecure-bind` (without any of these, bearer tokens + PHI would cross the
-network in cleartext, so it's refused). So there is no way to be accidentally served with silent,
+non-loopback bind requires an **operator certificate**: in-process (`[api].tls_cert_file`, WP-13a) or
+TLS terminated at a trusted upstream proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15). With
+neither, `serve` refuses: the only certificate left is the engine's self-signed placeholder (ADR 0172), which no trust
+store vouches for. `serve --allow-insecure-bind` accepts it only under `[security].enforcement = warn` (ADR 0092). So there is no way to be accidentally served with silent,
 unauthenticated full access — or to silently void the loopback assumption by changing
 `[security].local_access_only` / `listen_address` (SYS-1).
 
@@ -1374,7 +1374,7 @@ alone:
    one-shot monoculture tripwire (≥50 observations, all the same loopback address, no proxy declared)
    only *detects* it, surfacing as `client_address_monoculture` on `GET /security/posture`.
 2. **Network-location / exposed-gate** — the API binds `127.0.0.1` by default, and a non-loopback
-   *plaintext* bind is refused at startup unless `serve --allow-insecure-bind` (ADR 0002 §0). One layer,
+   bind with neither an operator certificate nor a declared TLS terminator is refused at startup (ADR 0002 §0); `serve --allow-insecure-bind` relaxes that only under `[security].enforcement = warn`. One layer,
    not the sole factor.
 3. **Deny-by-default per-route RBAC** — every admin route asserts an explicit permission over an opaque
    Bearer token; a denial is audited (`require()`, ASVS 8.2.x).
