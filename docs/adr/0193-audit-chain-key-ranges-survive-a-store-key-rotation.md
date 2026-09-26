@@ -129,9 +129,12 @@ versioning is outside this ADR.
 
 Five residuals are recorded rather than solved:
 
-- **`rotate-key` is offline-only, and nothing enforces it.** Another process keeps the range it read
-  at open, so an engine left running would append under the old key after the range row and break
-  the chain. The command's help and PHI.md already say to stop the engine.
+- **`rotate-key` is offline-only, and only partly enforced.** Another process keeps the range it
+  read at open, so an engine left running would append under the old key after the range row and
+  break the chain. The command's help and PHI.md already say to stop the engine. *Amended for
+  BACKLOG #1915:* on SQLite the command now refuses to start while another connection holds the
+  store. It does not see an engine started after that check, and on PostgreSQL or SQL Server it
+  checks nothing and prints a note saying so.
 - **A broken chain cannot be rolled.** The roll refuses rather than certify tampered rows with a
   closing digest, so new rows stay under the old key until the break is dealt with. Whether an
   operator may roll over a known break (recording it as unverified) is a policy question left open.

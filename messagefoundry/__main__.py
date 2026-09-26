@@ -5815,12 +5815,47 @@ def _rekey_audit(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _sqlite_store_held_elsewhere(path: str) -> bool:
+    """True when another connection has the SQLite store at ``path`` open (BACKLOG #1915).
+
+    It reads the lock SQLite already keeps. In WAL mode, which every store open sets, a connection
+    holds a SHARED lock on the database file from its first read until it closes, so a serving engine
+    holds one for as long as it runs. A connection in EXCLUSIVE locking mode needs an EXCLUSIVE lock
+    to read, and with ``timeout=0`` it fails at once with SQLITE_BUSY while any other is open.
+
+    Opened ``mode=rw``, so a missing path is never created; any failure other than SQLITE_BUSY
+    returns False and the store open that follows reports it."""
+    from pathlib import Path
+
+    uri = Path(path).resolve().as_uri() + "?mode=rw"
+    try:
+        probe = sqlite3.connect(uri, uri=True, timeout=0, isolation_level=None)
+    except sqlite3.Error:
+        return False
+    try:
+        probe.execute("PRAGMA locking_mode=EXCLUSIVE")
+        probe.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.Error as exc:
+        return exc.sqlite_errorcode == sqlite3.SQLITE_BUSY
+    finally:
+        probe.close()
+    return False
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
     Run **offline** (engine stopped): set ``MEFOR_STORE_ENCRYPTION_KEY`` to the NEW active key and keep
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
     rotate. After it finishes, the retired key can be removed.
+
+    **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
+    a store another connection holds, which is how a serving engine holds it; see
+    :func:`_sqlite_store_held_elsewhere`. Two gaps remain. An engine started AFTER that check is not
+    seen, since the command's own connections hold the same lock from then on; the audit roll's head
+    check refuses an audit row that lands inside its read, and nothing refuses a data write. And a
+    PostgreSQL or SQL Server store exposes no such lock to a single node, so there it is not checked
+    and the command says so.
 
     **Invocation bound (ASVS 11.3.4).** ``key_id`` is a one-way SHA-256 fingerprint of the DEK, so the
     NEW key has no ``cipher_meta`` row and its persisted AES-GCM invocation count starts at zero for
@@ -5874,6 +5909,22 @@ def _rotate_key(args: argparse.Namespace) -> int:
             f"error: no store at {settings.store.path} (check --db / [store].path)", file=sys.stderr
         )
         return 2
+    if settings.store.backend == StoreBackend.SQLITE:
+        if _sqlite_store_held_elsewhere(settings.store.path):
+            print(
+                f"error: the store at {settings.store.path} is open in another process -- a running "
+                "engine, or another command. rotate-key runs offline: stop the engine and anything "
+                "else using the store, then re-run. Nothing was changed.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        print(
+            f"note: rotate-key cannot detect a running engine on a {settings.store.backend.value} "
+            "store. Confirm every engine using it is stopped: a live engine keeps writing under "
+            "the old key.",
+            file=sys.stderr,
+        )
 
     async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
