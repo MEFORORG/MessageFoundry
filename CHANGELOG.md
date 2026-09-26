@@ -136,6 +136,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
+  re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
+  binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on
+  first deployment. The step now runs the listeners' size check. It counts the bytes that binary
+  carriage holds and the characters of any other reply. The engine records an oversize reply as one
+  `ERROR` message with the listeners' wording and does not route it. The step gains the size check
+  only; the listeners' NUL and declared-type checks still do not run there. An HL7 loopback keeps
+  its peek check and its wording. SQL Server now also encrypts the error text of a re-ingress
+  `ERROR` message, as it does every other message error. (`BACKLOG #1914`)
 - **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
   is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
   handle still open on the extracted store, such as a scanner's, made the removal fail. The

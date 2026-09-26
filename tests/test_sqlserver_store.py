@@ -1934,6 +1934,33 @@ async def test_reingress_peek_failed_errors_child_and_skips_ingress(store) -> No
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
+async def test_reingress_peek_error_is_the_recorded_reason(store) -> None:
+    # BACKLOG #1914: the oversize refusal passes its own reason in place of the HL7-peek wording.
+    from messagefoundry.store.store import MessageStore
+
+    mid, item = await _delivered_outbound(store)
+    await store.complete_with_response(
+        item.id, body="big-body", outcome="ok", reingress_to="LOOP", now=110.0
+    )
+    token = await store.claim_next_fifo("LOOP", stage=Stage.RESPONSE.value, now=110.0)
+    reason = "ingress exceeds max size (9 > 8 bytes)"
+    assert await store.ingress_handoff(
+        response_row_id=token.id,
+        loopback_channel_id="LOOP",
+        correlation_depth_cap=10,
+        control_id=None,
+        message_type="json",
+        summary=None,
+        peek_failed=True,
+        peek_error=reason,
+        now=110.0,
+    )
+    child = await store.get_message(MessageStore._reingress_message_id(mid, "OB", 1, "big-body"))
+    assert child is not None and child["status"] == MessageStatus.ERROR.value
+    assert child["error"] == reason
+    assert await store.claim_next_fifo("LOOP", stage=Stage.INGRESS.value, now=110.0) is None
+
+
 async def test_reencrypt_skips_null_response_detail(store) -> None:
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.crypto import AesGcmCipher, _fingerprint

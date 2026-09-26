@@ -5884,6 +5884,7 @@ class SqlServerStore:
         message_type: str | None,
         summary: str | None,
         peek_failed: bool = False,
+        peek_error: str | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
@@ -6029,7 +6030,13 @@ class SqlServerStore:
                             MessageStatus.ERROR.value
                             if peek_failed
                             else MessageStatus.RECEIVED.value,
-                            "re-ingress body failed HL7 peek" if peek_failed else None,
+                            # Ciphered like every other messages.error writer (EF-3).
+                            self._enc(
+                                (peek_error or "re-ingress body failed HL7 peek")
+                                if peek_failed
+                                else None,
+                                aad=cell_aad("messages", "error", new_mid),
+                            ),
                             # EF-3: MRN/name is PHI — ciphered at rest
                             self._enc(summary, aad=cell_aad("messages", "summary", new_mid)),
                             self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),

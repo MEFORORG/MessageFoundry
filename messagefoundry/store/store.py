@@ -7739,6 +7739,7 @@ class MessageStore:
         message_type: str | None,
         summary: str | None,
         peek_failed: bool = False,
+        peek_error: str | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one INFLIGHT ``Stage.RESPONSE`` work-row and produce the re-ingressed message+ingress
@@ -7860,7 +7861,8 @@ class MessageStore:
             cur = await self._db.execute("SELECT 1 FROM messages WHERE id=?", (new_mid,))
             already = await cur.fetchone() is not None
             if not already:
-                # 5. The re-ingressed message (RECEIVED, or RECEIVED→ERROR on a non-peekable HL7 body).
+                # 5. The re-ingressed message (RECEIVED, or RECEIVED→ERROR on a body the worker refused:
+                #    a non-peekable HL7 body, or an oversize body of any type, BACKLOG #1914).
                 child_meta = json.dumps(
                     {
                         "correlation_id": origin_id,
@@ -7881,7 +7883,9 @@ class MessageStore:
                     source_type="reingress",
                     summary=summary,
                     metadata=child_meta,
-                    error="re-ingress body failed HL7 peek" if peek_failed else None,
+                    error=(
+                        (peek_error or "re-ingress body failed HL7 peek") if peek_failed else None
+                    ),
                     now=now,
                 )
                 # 6. The ingress queue row — UNLESS peek_failed (an ERROR message owes no work).
