@@ -7450,8 +7450,6 @@ def create_managed_app(
                         secret_provider=secret_provider,
                         trust_anchor_policy=tls_settings.policy() if tls_settings else None,
                     )
-                    if security_notifier is not None:
-                        security_notifier.start()
                 auth = AuthService(
                     store,
                     auth_settings,
@@ -7467,6 +7465,9 @@ def create_managed_app(
                     # connector-construction gate, so the clamp is inert unless the posture arrives here).
                     hop_posture=_hop_posture,
                 )
+                # Started only once the service is built, so a constructor refusal starts no task.
+                if security_notifier is not None:
+                    security_notifier.start()
             await engine.start()
             # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
             # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;

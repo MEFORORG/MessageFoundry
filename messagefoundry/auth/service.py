@@ -790,7 +790,7 @@ def idp_revocation_guards(
 ) -> tuple[RevocationHopGuard, ...]:
     """Capture the #201 revocation guard for each OIDC leg, token endpoint first (BACKLOG #1887).
 
-    Pure: it decides nothing and logs nothing. :func:`refuse_idp_revocation` enforces what it
+    Pure: it decides nothing and logs nothing. :func:`_refuse_idp_revocation` enforces what it
     returns, and ``messagefoundry verify`` reads each guard's
     :meth:`~messagefoundry.config.tls_policy.RevocationHopGuard.disposition` (BACKLOG #1923), so the
     report and the engine read one rule rather than two copies of it."""
@@ -820,7 +820,7 @@ def idp_revocation_guards(
     )
 
 
-def refuse_idp_revocation(
+def _refuse_idp_revocation(
     settings: AuthSettings, opener: urllib.request.OpenerDirector, posture: HopPosture | None
 ) -> None:
     """Apply the #201 posture-keyed revocation guard to BOTH OIDC legs (BACKLOG #1887, ADR 0173 §4.3).
@@ -1021,7 +1021,7 @@ class AuthService:
                 crl_file=settings.oidc_tls_crl_file,
             )
             # BACKLOG #1887: must follow the opener, whose finished context it reads.
-            refuse_idp_revocation(settings, self._oidc_opener, hop_posture)
+            _refuse_idp_revocation(settings, self._oidc_opener, hop_posture)
             self._oidc_jwks = oidc.JwksCache(
                 jwks_fetcher(settings.oidc_jwks_uri or "", self._oidc_opener),
                 ttl_seconds=settings.oidc_jwks_ttl_seconds,

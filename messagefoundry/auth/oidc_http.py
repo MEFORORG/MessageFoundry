@@ -112,7 +112,7 @@ def build_idp_opener(
     revoked-but-unexpired IdP cert would be an authentication-material exposure.
 
     **One CRL file serves both legs, and a CRL that misses one leg's issuer fails that leg CLOSED
-    (BACKLOG #1925).** The revocation guard reads ``VERIFY_CRL_CHECK_LEAF`` off this one context, so
+    (BACKLOG #1925).** This is the source of record for that finding. The revocation guard reads ``VERIFY_CRL_CHECK_LEAF`` off this one context, so
     a CRL from the token leg's CA alone marks the JWKS leg checked too. That does not let the JWKS leg
     cross unchecked: OpenSSL refuses a leaf whose issuer has no CRL in the store, with ``unable to get
     certificate CRL``. Measured on CPython 3.14.6 / OpenSSL 3.5.7, and pinned by

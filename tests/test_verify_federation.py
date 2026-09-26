@@ -25,11 +25,6 @@ from messagefoundry.transports.signing import CompactJwtSigner
 from messagefoundry.verify.federation import run_federation_checks
 from messagefoundry.verify.model import CheckResult, Status
 from messagefoundry.verify.runner import ALL_SECTIONS
-from tests.test_hop_refusal_revocation import (  # noqa: F401 -- fixtures, used by name
-    _record_guard_warnings,
-    bare_crl,
-    crl_bundle,
-)
 
 NONCE = "n-verify-1"
 
@@ -412,6 +407,30 @@ _LOOPBACK_LEGS: dict[str, Any] = {
 }
 
 
+@pytest.fixture(scope="module")
+def bare_crl(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A fresh CRL with no certificate in the file: the shape harden_crl_check loads. Synthetic.
+    Local rather than imported from another test module, so the two suites stay independent."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.datetime.now(datetime.UTC)
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-1923-ca")]))
+        .last_update(now - datetime.timedelta(days=1))
+        .next_update(now + datetime.timedelta(days=30))
+        .sign(ec.generate_private_key(ec.SECP256R1()), hashes.SHA256())
+    )
+    path = tmp_path_factory.mktemp("crl1923") / "crl.pem"
+    path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+    return str(path)
+
+
 def _revocation_result(settings: ServiceSettings) -> CheckResult:
     return _by_id(run_federation_checks(settings))["fed.idp_revocation"]
 
@@ -464,9 +483,12 @@ def test_an_off_box_jwks_leg_alone_still_fails() -> None:
     assert "OIDC JWKS endpoint" in row.detail
 
 
-def test_a_loaded_crl_passes(bare_crl: str) -> None:  # noqa: F811 -- the imported fixture
+def test_a_loaded_crl_is_manual_because_its_coverage_cannot_be_read(bare_crl: str) -> None:
+    """The engine lets both legs cross on a loaded CRL. Whether that CRL covers each leg's CA is
+    not knowable offline (BACKLOG #1925): this CRL covers neither leg, and a PASS would hide that
+    every login would then fail. So a person must confirm it."""
     row = _revocation_result(_settings(oidc_tls_crl_file=bare_crl))
-    assert row.status is Status.PASS
+    assert row.status is Status.MANUAL
     assert row.detail.count("against [auth].oidc_tls_crl_file") == 2
     # BACKLOG #1925: a PASS on a loaded CRL must not read as "each leg's CA is covered".
     assert row.detail.count("unable to get certificate CRL") == 2
@@ -476,7 +498,14 @@ def test_a_warn_posture_is_manual_and_logs_nothing(monkeypatch: pytest.MonkeyPat
     """Under warn the engine starts, so FAIL would be wrong. The off-box legs still cross with no
     revocation check, so PASS would be wrong too. The row reads the decision without acting on it,
     so the engine's warning is not added to the verify output."""
-    warned = _record_guard_warnings(monkeypatch)
+    from messagefoundry.config import tls_policy
+
+    # Recorded on the module logger, not through caplog: see _record_guard_warnings in
+    # tests/test_hop_refusal_revocation.py for why caplog is not used for this logger.
+    warned: list[str] = []
+    monkeypatch.setattr(
+        tls_policy.logger, "warning", lambda msg, *args: warned.append(msg % args if args else msg)
+    )
     row = _revocation_result(_warn(_settings()))
     assert row.status is Status.MANUAL
     assert row.detail.count("NO certificate revocation checking") == 2

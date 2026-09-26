@@ -1352,14 +1352,8 @@ async def test_the_oidc_refusal_names_a_lever_that_exists_for_it() -> None:
 
 # --- BACKLOG #1925: one CRL on the shared context, two legs whose CAs differ ----------------------
 #
-# Both OIDC legs share ONE context, and each guard reads VERIFY_CRL_CHECK_LEAF off it. That flag says
-# a CRL loaded, not that the CRL covers each leg's issuer, so a CRL from one CA marks both legs
-# checked. The item asked whether that lets the other leg cross unchecked. Measured here through a
-# real handshake on the context build_idp_opener returns: it does not. OpenSSL refuses a leaf whose
-# issuer has no CRL in the store ("unable to get certificate CRL"), so the uncovered leg fails closed
-# at its first handshake instead of crossing. The cost is availability, found at first login rather
-# than at start, and not a revocation bypass. These arms pin the OpenSSL behaviour the guard's
-# presence test relies on.
+# The finding is recorded once, in the build_idp_opener docstring. These arms pin the OpenSSL
+# behaviour it rests on, through a real handshake on the context that function returns.
 
 
 def _crl_coverage_ca(cn: str) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
