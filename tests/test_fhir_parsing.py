@@ -8,10 +8,11 @@ FhirPeek.evaluate, which need the extra) lives in tests/test_fhir_resource.py be
 
 from __future__ import annotations
 
-import importlib
 import json
 import subprocess
 import sys
+import traceback
+import uuid
 from collections.abc import Callable
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from _fhir_fixtures import (
     as_json,
 )
 
+from messagefoundry import redaction
 from messagefoundry.parsing import FhirPeek, FhirPeekError, FhirResource
 from messagefoundry.parsing.fhir import FhirError, FhirValidationError
 
@@ -71,32 +73,66 @@ def test_peek_rejects_unparseable_or_non_object(body: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("module_name", "parse", "wrapper"),
+    ("parse", "wrapper"),
     [
-        pytest.param("peek", FhirPeek.parse, FhirPeekError, id="FhirPeek"),
+        pytest.param(FhirPeek.parse, FhirPeekError, id="FhirPeek"),
         # The JSON decode runs before FhirResource loads the [fhir] extra, so this needs no extra.
-        pytest.param("resource", FhirResource.parse, FhirValidationError, id="FhirResource"),
+        pytest.param(FhirResource.parse, FhirValidationError, id="FhirResource"),
     ],
 )
 def test_too_deep_json_is_the_typed_error(
     monkeypatch: pytest.MonkeyPatch,
-    module_name: str,
     parse: Callable[[str], object],
     wrapper: type[FhirError],
 ) -> None:
     """json's depth limit is a ``RecursionError``, a ``RuntimeError`` the ``ValueError`` arm does not
     reach (BACKLOG #1600). The trigger is a raised ``RecursionError``, not a deep body, because the
-    depth where json's C decoder gives out is a property of the runner (BACKLOG #1222)."""
-    module = importlib.import_module(f"messagefoundry.parsing.fhir.{module_name}")
+    depth where json's C decoder gives out is a property of the runner (BACKLOG #1222). Both parsers
+    decode through ``redaction.json_loads_or_refusal`` (BACKLOG #2048), so json is patched there."""
 
     def _recursing_loads(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")
 
     stand_in = SimpleNamespace(loads=_recursing_loads, JSONDecodeError=json.JSONDecodeError)
-    monkeypatch.setattr(module, "json", stand_in)
-    with pytest.raises(wrapper, match="not parseable FHIR JSON") as excinfo:
+    monkeypatch.setattr(redaction, "json", stand_in)
+    with pytest.raises(wrapper, match=r"not parseable FHIR JSON \(RecursionError\)") as excinfo:
         parse(as_json(PATIENT_R4B))
-    assert isinstance(excinfo.value.__cause__, RecursionError)
+    # The class name survives in the message; the chain does not (BACKLOG #2048).
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("parse", "wrapper"),
+    [
+        pytest.param(FhirPeek.parse, FhirPeekError, id="FhirPeek"),
+        pytest.param(FhirResource.parse, FhirValidationError, id="FhirResource"),
+    ],
+)
+def test_unparseable_json_leaves_the_body_off_the_exception_chain(
+    parse: Callable[[str], object], wrapper: type[FhirError]
+) -> None:
+    """A JSON refusal must not carry the body on the raised error's chain (BACKLOG #2048).
+
+    ``json.JSONDecodeError.doc`` is the WHOLE input. Chaining it with ``from exc`` put the FHIR body
+    on ``__cause__``, and ``from None`` would still leave it on ``__context__``. The default
+    traceback printer renders only the chained error's position-only ``str``, so it hid this; a
+    chain walker that reads the attribute would have written the body to a log on first
+    deployment. The marker is built at run time: a literal would sit in this file's source, and
+    ``traceback`` echoes source lines, so the rendering check could not fail.
+
+    The chain asserts are the ones that discriminate: the default printer renders a chained
+    JSONDecodeError position-only, so the rendering check passes against ``from exc`` too. It stays
+    as the guard against a message that interpolates the body. Frame locals are out of scope: the
+    raised error's traceback still holds ``parse``'s frame and its ``raw``."""
+    marker = "SYNTH" + uuid.uuid4().hex
+    malformed = '{"resourceType": "Patient", "name": ' + marker  # unquoted token: invalid JSON
+    with pytest.raises(wrapper, match="not parseable FHIR JSON") as excinfo:
+        parse(malformed)
+    err = excinfo.value
+    assert err.__cause__ is None
+    assert err.__context__ is None, "the JSONDecodeError (and its .doc) is still on __context__"
+    assert "line 1, column" in str(err), "the content-free position hint should survive"
+    assert marker not in "".join(traceback.format_exception(err))
 
 
 def test_peek_xml_is_deferred() -> None:
@@ -122,9 +158,8 @@ def test_peek_error_never_leaks_the_body() -> None:
         FhirPeek.parse(malformed)
     exc = excinfo.value
     assert PHI_CANARY not in str(exc)
-    assert PHI_CANARY not in str(
-        exc.__cause__ or ""
-    )  # the chained JSONDecodeError is position-only
+    # No chain at all: a chained JSONDecodeError renders position-only, but its `.doc` is the body.
+    assert exc.__cause__ is None and exc.__context__ is None
 
 
 # --- console carve-out: import purity (mirrors tests/test_x12_parsing.py) ----

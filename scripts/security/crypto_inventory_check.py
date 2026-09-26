@@ -719,6 +719,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/ai_broker.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/database.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/http_auth.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # BACKLOG #1923: the fed.idp_revocation row reads the OIDC legs' revocation-guard decisions
+    # (HopDisposition, is_loopback_hop_host) and catches the engine's InsecureHopRefused. It builds
+    # no context of its own; the opener it reads is the one fed.idp_tls built.
+    "messagefoundry/verify/federation.py": frozenset({"messagefoundry.config.tls_policy"}),
 }
 
 # --------------------------------------------------------------------------------------------
@@ -851,7 +855,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:truststore.SSLContext",
         }
     ),
-    "messagefoundry/auth/ldap.py": frozenset({"tls_context:via messagefoundry.config.tls_policy"}),
+    # BACKLOG #2034: the AD CA anchor is checked (its SHA-256 pinned) at construction, and the bind
+    # loads those checked bytes, as auth/oidc_http.py does for the IdP anchor.
+    "messagefoundry/auth/ldap.py": frozenset(
+        {
+            "hash:via messagefoundry.auth.trust_anchors",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
     "messagefoundry/auth/oidc/claims.py": frozenset(
         {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}
     ),
@@ -1235,6 +1246,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry_webconsole/_security.py": frozenset({"csprng:secrets.token_urlsafe"}),
     "scripts/asvs/anchor_report.py": frozenset({"hash:hashlib.sha256"}),
     "scripts/asvs/prove_report.py": frozenset({"hash:hashlib.sha256"}),
+    # BACKLOG #1396: the restatement report's header reuses anchor_report.provenance, the same
+    # truncated SHA-256 of the scorecard file. An identifier in a log line, nothing secret.
+    "scripts/asvs/restatement_report.py": frozenset({"hash:via scripts.asvs.anchor_report"}),
     "scripts/asvs/scorecard.py": frozenset({"hash:hashlib.sha256"}),
     "scripts/security/build_cla_action_provenance.py": frozenset(
         {"hash:hashlib.sha1", "hash:hashlib.sha256"}

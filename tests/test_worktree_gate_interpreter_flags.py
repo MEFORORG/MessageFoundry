@@ -39,8 +39,9 @@ execution. Known and deliberately uncovered, each recorded in the gate beside th
 cluster with letters AFTER the command letter (``bash -cl``, measured to run); a base64
 ``-EncodedCommand`` payload, which recursion reaches but no rule can read; ``pwsh -File <script>``, whose
 code is not in the command at all; more than one level of nesting, which the function has never done;
-and a quoted argument that SPANS LINES, matched by neither the old list nor the new rule (see
-:func:`test_a_multi_line_interpreter_argument_still_denies`).
+and a quoted argument that SPANS LINES, which the per-line view never matches. Since BACKLOG #1429 a
+second view over LOGICAL lines does match it (see
+:func:`test_a_multi_line_interpreter_argument_is_recursed_into`).
 """
 
 from __future__ import annotations
@@ -303,15 +304,33 @@ def test_a_multi_line_interpreter_argument_still_denies(
 ) -> None:
     """A REGRESSION PIN, and NOT evidence about the recursion.
 
-    ``Get-ScannableSegments`` splits per line before it looks for an interpreter flag, so a quoted
-    argument spanning lines is matched by neither the old list nor the new rule. Both forms below deny
-    anyway, because every line of such a span reaches the scanner RAW and the payload line carries the
-    git token and the verb by itself. That is an accident of the raw scan, it is load-bearing, and a
-    change that blanks message bodies would remove it (BACKLOG #1086). This pins the verdict so such a
-    change cannot flip it silently. It cannot tell you WHICH mechanism produced the verdict -- and on
-    this gate no test can, which is why the multi-line form was left alone here instead of being
-    "fixed" against a green nobody could have seen fail."""
+    The per-line view splits before it looks for an interpreter flag, so it never matches a quoted
+    argument spanning lines. Both forms below deny through TWO mechanisms now: every line of the span
+    reaches the per-line scan RAW, and since BACKLOG #1429 the logical-line view extracts the whole
+    argument and recurses into it. This row cannot tell the two apart. The row below can, because its
+    payload line is blanked by a straddle in the per-line view and only the recursion sees it."""
     command = f'pwsh -NoProfile {flag} "\n{PAYLOAD}\n"'
+    assert_denied(run_gate(shell(command, cwd=primary), repos_file))
+
+
+@pytest.mark.parametrize("flag", ["-Command", "-Com"])
+def test_a_multi_line_interpreter_argument_is_recursed_into(
+    primary: Path, repos_file: Path, flag: str
+) -> None:
+    """The recursion reaches an argument spanning lines, and only the recursion can (BACKLOG #1429).
+
+    The payload is PowerShell code whose own quoted spans cross newlines, with the gated command
+    between them. In the per-line view its middle line carries a closing and an opening quote, which
+    pair across the gated command and blank it -- so the raw-line accident the row above relies on is
+    GONE here, and the gate before #1429 ALLOWED this. The logical-line view extracts the whole
+    argument and hands it to Get-FlagOwner, and the recursion into it is what denies: each span in
+    the payload is blanked whole and the gated command is visible. Measured: the middle statement
+    runs. (The payload's own logical-line split is not load-bearing here; the straddle suite's
+    ``inside_a_multi_line_payload_after_a_comment`` row is the one that needs it.)
+    """
+    command = (
+        f"pwsh -NoProfile {flag} \"\nWrite-Output 'a\nb' ; {PAYLOAD} ; Write-Output 'c\nd'\n\""
+    )
     assert_denied(run_gate(shell(command, cwd=primary), repos_file))
 
 

@@ -149,10 +149,13 @@ async def test_a_prior_session_of_another_user_is_ended_under_its_owner(
 async def test_a_lapsed_prior_at_the_cap_is_still_revoked_so_no_device_is_evicted(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Round-2 finding: a prior session over its idle limit but not yet lazily revoked still counts
-    # toward the cap. Skipping it would let the cap evict a LIVE device in its place. The device
-    # must be OLDER than the lapsed session and still live, or the cap would pick the lapsed row
-    # anyway and the test could not fail.
+    # Round-2 finding: a prior session over its idle limit but not yet lazily revoked used to count
+    # toward the cap, so leaving it unrevoked let the cap evict a LIVE device in its place. Since
+    # BACKLOG #1900 the cap counts only live rows and revokes lapsed ones itself, so this now pins
+    # the joint outcome rather than supersession alone. Supersession's own halves are measured by
+    # test_a_lapsed_prior_is_revoked_by_supersession_itself (the revoke) and
+    # test_a_session_already_over_is_not_recorded_as_superseded (no audit row). The device
+    # must be OLDER than the lapsed session and still live, or the test could not fail.
     service = await _service(store, max_sessions_per_user=3, session_idle_timeout_minutes=30)
     clock = {"offset": 0.0}
     real = time.time
@@ -167,6 +170,22 @@ async def test_a_lapsed_prior_at_the_cap_is_still_revoked_so_no_device_is_evicte
     assert [await _live(service, t) for t in (device, second)] == [True, True], (
         "the cap evicted a live device"
     )
+    record = await store.get_session(hash_token(browser))
+    assert record is not None and record.revoked_at is not None
+    assert await _superseded(store) == [], "a lapsed session was recorded as superseded"
+
+
+async def test_a_lapsed_prior_is_revoked_by_supersession_itself(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The test above now passes on the cap alone, which revokes the user's lapsed rows since BACKLOG
+    # #1900. With the cap off, supersession is the only thing that ends a lapsed presented token.
+    # Left unrevoked, the row would validate again if the idle setting were later raised.
+    service = await _service(store, max_sessions_per_user=0, session_idle_timeout_minutes=30)
+    browser = await _token(service)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 40 * 60)  # browser idle 40 min: lapsed
+    await _token(service, supersedes=browser)
     record = await store.get_session(hash_token(browser))
     assert record is not None and record.revoked_at is not None
     assert await _superseded(store) == [], "a lapsed session was recorded as superseded"

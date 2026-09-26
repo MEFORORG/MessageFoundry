@@ -18,9 +18,8 @@ wrapped too.
 leg, so this test stands a recording module in for it -- the lazy ``import aioodbc`` inside ``open()``
 resolves it via ``sys.modules`` -- and drives the real ``SqlServerStore.open()`` code path end to end,
 no real SQL Server involved. ``_ensure_database_options`` (run before the pool exists) makes its own
-standalone ``aioodbc.connect()``, which this fake module does not provide; that failure is caught and
-degraded to a log warning inside ``_ensure_database_options`` itself (a pre-existing, unrelated
-behavior), so it never reaches this test.
+standalone ``aioodbc.connect()``; the fake answers it with RCSI already ON, because since BACKLOG #1628
+that probe FAILS the open when it cannot verify RCSI, and this test is about what happens after it.
 """
 
 from __future__ import annotations
@@ -65,11 +64,34 @@ class _FakeExecutor:
         self.shutdown_calls.append(wait)
 
 
+class _RcsiOnCursor:
+    """Answers the open-time RCSI probe with RCSI and snapshot isolation both ON."""
+
+    async def execute(self, sql: str, *params: Any) -> None:
+        return None
+
+    async def fetchone(self) -> tuple[int, int]:
+        return (1, 1)
+
+
+class _RcsiOnConn:
+    async def cursor(self) -> _RcsiOnCursor:
+        return _RcsiOnCursor()
+
+    async def close(self) -> None:
+        return None
+
+
+async def _connect_rcsi_on(**kwargs: Any) -> _RcsiOnConn:
+    return _RcsiOnConn()
+
+
 def _install_fake_aioodbc(monkeypatch: pytest.MonkeyPatch, pool: _FakePool) -> None:
     async def _create_pool(**kwargs: Any) -> _FakePool:
         return pool
 
     module = types.ModuleType("aioodbc")
+    module.connect = _connect_rcsi_on  # type: ignore[attr-defined]
     module.create_pool = _create_pool  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "aioodbc", module)
 
@@ -81,6 +103,7 @@ def _install_fake_aioodbc_that_never_connects(monkeypatch: pytest.MonkeyPatch) -
         raise RuntimeError("connect boom")
 
     module = types.ModuleType("aioodbc")
+    module.connect = _connect_rcsi_on  # type: ignore[attr-defined]
     module.create_pool = _create_pool  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "aioodbc", module)
 

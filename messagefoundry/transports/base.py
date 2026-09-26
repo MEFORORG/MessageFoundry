@@ -445,9 +445,9 @@ def encode_wire_body(payload: str, encoding: str, *, transport: str) -> bytes:
     the handler (keeping just the index in a local) leaves **both** chains empty.
 
     **Permanent** because it is: the same bytes will never encode on a retry, so it dead-letters
-    rather than looping the lane forever. (``direct.py`` already had the right instinct — it catches
-    ``ValueError`` around its encode and reports ``type(exc).__name__`` only — but it maps to a
-    *transient* error, so an un-encodable body retries there instead of dead-lettering.)"""
+    rather than looping the lane forever. (``direct.py`` once mapped this to a *transient* error, so
+    an un-encodable body retried there instead of dead-lettering; it calls this helper now, BACKLOG
+    #1919/#1920.)"""
     try:
         return payload.encode(encoding)
     except UnicodeEncodeError as exc:

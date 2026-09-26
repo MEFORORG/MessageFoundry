@@ -547,6 +547,12 @@ Prevention is a **depth cap**, deliberately **coarse** — it bounds *total work
   - **Any other non-HL7 loopback** (`TEXT`/`json`/…): identical to the X12 case — verbatim body,
     `control_id=NULL`, `message_type=<content_type>`, `summary=NULL` — matching `_handle_inbound`'s non-HL7
     branch ([pipeline/wiring_runner.py:634](../../messagefoundry/pipeline/wiring_runner.py)).
+  - **Amendment (2026-09-26, BACKLOG #1914) -- a non-HL7 loopback can now pass `peek_failed=True`.** The
+    two bullets above still hold for a body under the engine ingress ceiling. Before the peek, the worker
+    now holds every non-HL7 body to that ceiling (`ingress_guards.reingress_size_error`). An oversize body
+    is handed off with `peek_failed=True` and a new `peek_error` argument carrying the listeners' size
+    reason. Its child is recorded `ERROR` with that reason and gets no ingress row. The `peek_failed`
+    comment in the `ingress_handoff` signature above predates this. An HL7 loopback is unchanged.
 - **Strict hl7apy validation is *not* re-run on re-ingress.** Strict validation is the **untrusted-socket**
   intake gate; a captured reply is internal state we already stored, and a `Loopback()` inbound declares no
   `strict` (rejected at wiring, Q1). Re-running it would add CPU on a hot path and could dead-letter a

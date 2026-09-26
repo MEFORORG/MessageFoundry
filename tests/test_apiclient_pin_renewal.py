@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import logging
 import ssl
 import threading
 from collections.abc import Iterator
@@ -41,6 +42,8 @@ class _RenewableEngine:
         self._dir = directory
         self._minted = 0
         self.answered: list[str] = []
+        #: The Authorization header of each answered request, in step with ``answered``.
+        self.bearers: list[str | None] = []
         #: Response headers for ONE 403 challenge (MFA or step-up) the next request receives.
         self.challenges: list[str] = []
         self.pin = directory / "api-generated-cert.pem"
@@ -49,11 +52,13 @@ class _RenewableEngine:
         self.serve(self.renew_pin())
         body = json.dumps({"status": "ok", "version": None, "observed_client": None}).encode()
         answered = self.answered
+        bearers = self.bearers
         challenges = self.challenges
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def _answer(self) -> None:
                 answered.append(f"{self.command} {self.path}")
+                bearers.append(self.headers.get("Authorization"))
                 length = int(self.headers.get("Content-Length") or 0)
                 if length:
                     self.rfile.read(length)
@@ -206,6 +211,30 @@ def test_a_retried_post_is_delivered_exactly_once(engine: _RenewableEngine) -> N
         engine.answered.clear()
         client._request("POST", "/probe", json={"n": 1})
         assert engine.answered == ["POST /probe"]
+
+
+def test_the_revoke_of_a_replaced_session_follows_a_renewal_with_the_replaced_token(
+    engine: _RenewableEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The login revoke (BACKLOG #1901) keeps the renewal follow (BACKLOG #1276), and its retry
+    still presents the REPLACED token.
+
+    Red when: the certificate retry drops ``_bearer`` and falls back to the held token. That retry
+    would end the NEW session, which the client has just adopted, and leave the old one live.
+    Red too when the revoke is sent with the follow disarmed: it then fails verification against
+    the renewed engine and the replaced session survives, logged as a WARNING."""
+    with _pinned(engine) as client:
+        client._token = "tok-new"
+        engine.serve(engine.renew_pin())
+        engine.answered.clear()
+        engine.bearers.clear()
+        with caplog.at_level(logging.INFO, logger="messagefoundry.apiclient.client"):
+            client._end_replaced_session("tok-old")
+        assert engine.answered == ["POST /auth/logout"]
+        assert engine.bearers == ["Bearer tok-old"]
+        assert client.token == "tok-new"
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        _assert_pinned(client)
 
 
 @pytest.mark.parametrize("challenge", ["X-MFA-Required", "X-Step-Up-Required"])

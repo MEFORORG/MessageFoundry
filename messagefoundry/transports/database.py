@@ -1587,10 +1587,15 @@ def _lookup_max_rows(value: Any, connection: str) -> int | None:
     whole = f"DatabaseLookup {connection!r} max_rows must be a whole number (value withheld)"
     if isinstance(value, bool):
         raise ValueError(whole)
+    # Raised after the handler ends: int()'s ValueError quotes the value, and ``from None`` would
+    # leave it on ``__context__`` (BACKLOG #1796).
+    ceiling: int | None
     try:
         ceiling = int(value)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(whole) from None
+        ceiling = None
+    if ceiling is None:
+        raise ValueError(whole)
     if not isinstance(value, str) and ceiling != value:  # 2.5 or Decimal("2.5"), not truncated
         raise ValueError(whole)
     if ceiling < 0:

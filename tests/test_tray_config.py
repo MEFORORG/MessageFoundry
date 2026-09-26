@@ -239,6 +239,16 @@ def test_compose_toml_overrides_registry() -> None:
     assert cfg.poll_seconds == 10.0
 
 
+def test_compose_strips_outer_whitespace_from_engine_url() -> None:
+    # httpx strips it when it probes, and Open Console refuses a URL that still carries it
+    # (BACKLOG #1993), so the two would otherwise disagree about the same tray.toml value.
+    cfg = compose_config({"engine_url": " https://127.0.0.1:8765/ \n"}, None)
+    assert cfg.engine_url == "https://127.0.0.1:8765"
+    assert compose_config({"engine_url": "https://127.0.0.1:8765 /"}, None).engine_url == (
+        "https://127.0.0.1:8765"
+    )
+
+
 def test_compose_rejects_unsafe_service_name() -> None:
     cfg = compose_config({"service_name": "evil & name | rm"}, None)
     assert cfg.service_name == DEFAULT_SERVICE_NAME

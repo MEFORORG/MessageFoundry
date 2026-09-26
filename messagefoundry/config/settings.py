@@ -248,6 +248,23 @@ def refuse_a_blank_anchor_pin(value: str | None, setting: str) -> str | None:
     return value
 
 
+def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
+    """Refuse a CRL path that names no file, at load, naming ``setting`` (BACKLOG #1997).
+
+    ``harden_crl_check`` would catch it when the hop's context is built, but its refusals hard-code
+    the prefix ``[tls] crl file`` for every call site, so a bad path on any other CRL knob would be
+    reported against the wrong config section. A path, not a secret.
+
+    A blank value is refused too, as ``refuse_a_blank_anchor_pin`` refuses a blank pin. ``None`` is
+    the only spelling of "no CRL": some consumers test ``is not None`` and would hand ``""`` to
+    ``harden_crl_check``, while others test truthiness and would silently read it as unset."""
+    if value is not None and not value.strip():
+        raise ValueError(f"{setting} is set but empty. Remove it for no CRL, or name a CRL file")
+    if value is not None and not Path(value).is_file():
+        raise ValueError(f"{setting} path does not exist or is not a file: {value!r}")
+    return value
+
+
 class _Section(BaseModel):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
     # (_reject_unknown_file_keys). A model-level extra="forbid" would refuse the engine's OWN writes:
@@ -346,7 +363,9 @@ def insecure_config_source_allowed() -> bool:
     The config loader executes config Python as the engine's service account (which holds PHI + DB
     credentials), so a directory a low-privileged user can write is a local code-execution vector and
     is **refused** at load time (SEC-003, CWE-732). A production deployment locks the config dir (the
-    installer does — see docs/SERVICE.md), so it never trips. This escape downgrades the refusal to a
+    installer does — see docs/SERVICE.md), so the permission arms do not trip. A Windows read that
+    cannot finish still refuses (ADR 0036 Amendment B); fix the read rather than set this. This escape
+    downgrades the refusal to a
     loud warning for a dev/CI checkout that is intentionally user-writable (e.g. the default ACL on a
     Windows runner grants ``BUILTIN\\Users`` write); it must never be set in production, mirroring
     ``MEFOR_ALLOW_INSECURE_TLS``."""
@@ -492,7 +511,9 @@ class StoreSettings(_Section):
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
     # single built-in source; `aws_kms`|`azure_kv`|`gcp_kms`|`vault`|`pkcs11` are external HSM/KMS/Vault
-    # envelope-decrypt providers (lazy, optional extras — not built yet, fail closed if selected). This
+    # envelope-decrypt providers (lazy, optional extras; `vault` ships in store/keyprovider_vault.py, the
+    # rest are not built yet and fail closed if selected). Every external provider counts as a
+    # configured key for the keyless at-rest gate, before it resolves (BACKLOG #1998). This
     # names a *provider*, not key material, so it is NOT a secret — it must never be added to
     # `_FILE_SECRET_KEYS`. Unknown/unresolvable values fail closed at `open_store` (store/keyprovider.py).
     key_provider: str = "auto"
@@ -832,17 +853,8 @@ class StoreSettings(_Section):
     @field_validator("ssl_crl_file")
     @classmethod
     def _ssl_crl_file_exists(cls, value: str | None) -> str | None:
-        """Fail loud at load if the CRL path is missing, the ``_ssl_root_cert_exists`` shape (#299).
-
-        ``harden_crl_check`` would catch it at store open, but its three refusals hard-code the
-        prefix ``[tls] crl file`` for every call site, so a bad ``[store].ssl_crl_file`` would be
-        reported against the wrong config section. Statting it here names the setting the operator
-        actually set. A path, not a secret."""
-        if value and not Path(value).is_file():
-            raise ValueError(
-                f"[store].ssl_crl_file path does not exist or is not a file: {value!r}"
-            )
-        return value
+        """Fail loud at load if the CRL path is missing or blank (#299); why is on the helper."""
+        return _refuse_a_missing_crl_file(value, "[store].ssl_crl_file")
 
     @model_validator(mode="after")
     def _ssl_crl_file_reachable(self) -> StoreSettings:
@@ -917,12 +929,6 @@ class ApiSettings(_Section):
     # HttpOnly session cookie CONFINED to /ui (the JSON API stays Authorization-header-only). Off a
     # loopback host it requires exposure_protected (see serve gate) — the UI is a stricter surface.
     serve_ui: bool = True
-    # ADR 0143 soft-degrade signal — INTERNAL plumbing, set by _desugar_security (NOT a user knob). True
-    # only when [security].serve_web_console was EXPLICITLY provided, so the serve path can tell an
-    # explicit serve_web_console=true (console package absent -> HARD refuse) from the default-on posture
-    # (package absent -> JSON-only serve + WARNING, never a start failure). Absent-[security] leaves it
-    # False = default-on.
-    serve_ui_explicit: bool = False
     # The browser-facing external origin of the /ui dashboard when it is reached OFF-loopback through a
     # reverse proxy that does NOT preserve the Host header (ADR 0065). The same-origin CSRF + CSWSH checks
     # normally compare the browser's Origin to the request Host; behind such a proxy the Host is the
@@ -1139,6 +1145,11 @@ class ApiSettings(_Section):
     def _refuse_a_blank_client_ca_pin(cls, v: str | None) -> str | None:
         return refuse_a_blank_anchor_pin(v, "[api].tls_client_ca_pin")
 
+    @field_validator("tls_client_crl_file")
+    @classmethod
+    def _tls_client_crl_file_exists(cls, v: str | None) -> str | None:
+        return _refuse_a_missing_crl_file(v, "[api].tls_client_crl_file")
+
     @field_validator("tls_min_version")
     @classmethod
     def _check_tls_min_version(cls, v: str) -> str:
@@ -1250,6 +1261,13 @@ class TlsSettings(_Section):
     # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
     # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
     crl_file: str | None = None
+
+    @field_validator("crl_file")
+    @classmethod
+    def _crl_file_exists(cls, v: str | None) -> str | None:
+        # Only the first hop to resolve a trust anchor would otherwise stat this path, so a typo
+        # would surface at that hop's construction rather than at load.
+        return _refuse_a_missing_crl_file(v, "[tls].crl_file")
 
     @model_validator(mode="after")
     def _check_pinned_requires_internal_ca(self) -> TlsSettings:
@@ -1882,6 +1900,11 @@ class LoggingSettings(_Section):
             raise ValueError("[logging].forward_port must be between 1 and 65535")
         return value
 
+    @field_validator("forward_tls_crl_file")
+    @classmethod
+    def _forward_tls_crl_file_exists(cls, value: str | None) -> str | None:
+        return _refuse_a_missing_crl_file(value, "[logging].forward_tls_crl_file")
+
     @field_validator("time_sync_max_skew_seconds")
     @classmethod
     def _check_skew_threshold(cls, value: float) -> float:
@@ -2196,7 +2219,8 @@ class AuthSettings(_Section):
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
-    # active session. 0 = unlimited. Default 5 (WP-10): generous for a few devices/console instances.
+    # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). 0 = unlimited.
+    # Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
     # re-verified its credential -- at login, via POST /me/reauth, or with a code at
@@ -2545,6 +2569,11 @@ class AuthSettings(_Section):
     @classmethod
     def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
         return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
+
+    @field_validator("oidc_tls_crl_file")
+    @classmethod
+    def _oidc_tls_crl_file_exists(cls, v: str | None) -> str | None:
+        return _refuse_a_missing_crl_file(v, "[auth].oidc_tls_crl_file")
 
     @field_validator("kerberos_spn")
     @classmethod
@@ -4879,6 +4908,19 @@ class SecuritySettings(_Section):
         is unchanged."""
         return tuple(self.allowed_client_networks)
 
+    @property
+    def serve_web_console_explicit(self) -> bool:
+        """Whether ``serve_web_console`` was PROVIDED, at either value (BACKLOG #2000).
+
+        ``serve`` reads it to tell an explicit console request from the default-on posture; ADR 0143
+        says what each one does. Read from ``model_fields_set`` rather than stored, so only the
+        switch itself can set it. It replaced ``[api].serve_ui_explicit``, a field an operator could
+        write too. A plain property, so ``model_dump()`` is unchanged.
+
+        It holds for the model the loader validated. A copy rebuilt from ``model_dump()`` marks
+        every field set, so it reads True there."""
+        return "serve_web_console" in self.model_fields_set
+
 
 class ServiceSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")  # tolerate forward-looking/unknown sections
@@ -5199,6 +5241,14 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "[security].handles_real_patient_data under ADR 0118, and that key is retired too — delete "
         "this line"
     ),
+    # BACKLOG #2000. It was loader plumbing that an operator could also set, and setting it changed
+    # startup while [security] reported no choice. `serve` now reads the same fact from what
+    # [security] was given (SecuritySettings.serve_web_console_explicit), so nothing writes this key.
+    ("api", "serve_ui_explicit"): (
+        "it was an internal marker the loader set, never an operator setting (BACKLOG #2000). "
+        "Remove it from the config file, or unset MEFOR_API_SERVE_UI_EXPLICIT if the environment "
+        "sets it. To request the web console explicitly, set [security].serve_web_console"
+    ),
 }
 
 #: ``[security]`` key → ``(section, field)`` for the switches that map 1:1 onto a settable internal field.
@@ -5297,13 +5347,6 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
     for skey, section, field in _SECURITY_PASSTHROUGH:
         if skey in provided:
             _set(section, field, getattr(sec, skey))
-
-    # ADR 0143: mark serve_ui EXPLICITLY requested (serve_web_console was provided, at either value) so
-    # the serve path can tell an explicit serve_web_console=true (console package absent -> HARD refuse)
-    # from the default-on posture (package absent -> JSON-only + WARNING soft-degrade). Irrelevant when
-    # serve_web_console=false (serve_ui is then off — no console to degrade).
-    if "serve_web_console" in provided:
-        _set("api", "serve_ui_explicit", True)
 
     # Network host: local_access_only forces loopback; a contradictory non-loopback listen_address with
     # local_access_only=true REFUSES (AC-3) rather than silently overriding.

@@ -451,13 +451,18 @@ def refuse_url_credentials(
             f"{setting} must not carry credentials in the URL (the user:password@ part); "
             f"set them in {use} instead"
         )
+    # Raised after the handler ends: the port's ValueError quotes the port field, which is the
+    # password in ``https://svc:PW/path``, and ``from None`` would leave it on ``__context__`` (#1796).
+    numeric_port = True
     try:
         p.port  # noqa: B018 - evaluated only for the ValueError a non-numeric port raises
     except ValueError:
+        numeric_port = False
+    if not numeric_port:
         raise error(
             f"{setting} has a port that is not a number from 0 to 65535. A password written "
             f"into the URL can cause this; set credentials in {use} instead"
-        ) from None
+        )
 
 
 # --- posture-keyed insecure-hop enforcement (#200, ADR 0092) -----------------------------------

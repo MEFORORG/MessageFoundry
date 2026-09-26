@@ -450,6 +450,16 @@ stayed green. Reading the source is not sufficient evidence of scope.*
   rule that a client may import `parsing/` and `apiclient/` but no other engine package — has **no
   instrument at all**, and an unqualified "machine-checked in CI" read as though it did.
 
+> **Correction, 2026-09-26 (BACKLOG #1697).** The "no instrument at all" clause is now false for
+> part of the rule. PR 1570 added a static client walk to `tests/test_dependency_boundaries.py`. It
+> opens every `.py` file under `harness/`, `tee/`, `samples/` and `messagefoundry_webconsole/`. It
+> forbids direct imports of `config`, `pipeline`, `store` and `transports`, except where an
+> `_CLIENT_ALLOWED` entry excuses a named package on a named path. Other engine packages such as
+> `auth` and `apiclient` pass it, and so do lazy root exports and transitive loads. So "The gate never
+> opens those files" above is now false for `harness/` and `tee/`, but a planted `import fastapi`
+> there still ships, because the client walk does not look for it. This register did not re-measure
+> the walk's scope.
+
 | Other claims | Instrument | Measured scope | Beyond that scope |
 |----|----|----|----|
 | Signal 2 — "strict typing" | `mypy` strict, three legs: `mypy messagefoundry messagefoundry_webconsole --exclude 'messagefoundry/tray/'`, `mypy --platform win32 messagefoundry`, and `mypy --explicit-package-bases tests` (BACKLOG #1799) | `messagefoundry/` (less `tray/`) + `messagefoundry_webconsole/`, strict. `tests/` under the tests profile and exemptions that `pyproject.toml`'s `[tool.mypy]` comments define | At least `harness/`, `tee/`, `scripts/`, `samples/`, `docker/`, `fuzz/`, `docs/**/*.py`, `packaging/messagefoundry-webconsole/tests/` and the ratchet-listed test modules are **not** type-checked in CI. "No blanket ignores" was re-measured 2026-09-25 over `messagefoundry/`, `messagefoundry_webconsole/` and `tests/`: no bare `# type: ignore` and no `# mypy: ignore-errors`. The ratchet list is a per-module suppression by another name, and this row counts it as the scope limit it is |

@@ -93,7 +93,7 @@ from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -111,7 +111,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
+from messagefoundry.store.gcm_bound import (
+    bounded_cipher,
+    checkpoint_invocations,
+    reserve_invocations_ahead,
+)
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -120,6 +124,7 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport
+from messagefoundry.store.schema_verify import verify_live_schema
 
 log = logging.getLogger(__name__)
 
@@ -1110,6 +1115,22 @@ _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
     " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)"
 )
+
+
+# The session-cap predicates, in the `?` dialect SQLite and SQL Server share (BACKLOG #1900). Each
+# clause is one of AuthService.identity_for_token's rejections, negated with the SAME comparison, so
+# the cap and the validator cannot disagree at a boundary. See AuthStore.enforce_session_cap.
+#
+# A row whose stamps are not ahead of `now` (the validator's two clock-step tests). Bind (now, now).
+_SESSION_NOT_AHEAD_SQL: Final = "created_at <= ? AND last_used_at <= ?"
+# A row the validator would accept: not ahead, not past its absolute expiry, inside the idle window.
+# Bind with :func:`_session_live_params`.
+_SESSION_LIVE_SQL: Final = _SESSION_NOT_AHEAD_SQL + " AND expires_at >= ? AND ? - last_used_at <= ?"
+
+
+def _session_live_params(now: float, idle_seconds: float) -> tuple[float, ...]:
+    """The five parameters :data:`_SESSION_LIVE_SQL` binds, in order."""
+    return (now, now, now, now, float(idle_seconds))
 
 
 # The one connection_event INSERT, shared by MessageStore's singular and burst writers.
@@ -2530,7 +2551,8 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     only, and a row that broke that rule would never verify. Then appends ONE range row, MAC'd under
     the active key, carrying the closed range's digest and the outgoing key's handover tag. It rewrites
     no existing row, so the off-box tee and every recorded anchor stay valid. A no-op when the current
-    range is already under the active key.
+    range is already under the active key, though it still verifies the chain first and refuses when
+    the key the chain names for that range is not configured (BACKLOG #1945).
 
     OFFLINE ONLY, like ``rekey-audit``: another process keeps the range it read at open, so an engine
     left running would go on appending under the old key after the range row and break the chain."""
@@ -2550,21 +2572,31 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     current, current_from = host._audit_range_key_id, host._audit_range_from
     if current is None or current_from is None:
         return False, "the audit chain does not record which key its current range is under"
-    if current == active_id:
-        return True, f"audit chain already under the active key (range from id={current_from})"
-    if active_id in host._audit_range_keys:
+    # BACKLOG #1945: `current` is where NEW rows go, and settle_audit_ranges moves that to the active
+    # key when the chain's own current range is under a key that is not configured. Read as the
+    # chain's state, a dropped key looked like "already under the active key", and this reported OK
+    # over a chain audit-verify calls broken. The chain's own answer is the last key its ranges name.
+    # Settle leaves that list non-empty on a trusted chain; the fallback covers a host it never ran on.
+    # Past the check below the two names agree, since settle moves `current` only off a missing key.
+    recorded = host._audit_range_keys[-1] if host._audit_range_keys else current
+    out_secret = _audit_secret_for(recorded, host._audit_mac_keys, host._audit_mac_fn)
+    if out_secret is None:
+        # Worded for an empty range too, which audit-verify still passes: the range cannot be closed,
+        # and the first row added to it will not verify.
+        return False, (
+            f"the audit chain's current range (from id={current_from}) is keyed under audit key "
+            f"{recorded!r}, which is not configured, so the range cannot be closed and rows added to "
+            "it do not verify. Configure that key again (a store key goes back in "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED) and re-run"
+        )
+    if current != active_id and active_id in host._audit_range_keys:
         return False, (
             "the active store key already keyed an earlier audit range, and a key opens one range "
             "only; rotate to a NEW key rather than back to a previous one"
         )
-    out_secret = _audit_secret_for(current, host._audit_mac_keys, host._audit_mac_fn)
-    if out_secret is None:
-        return False, (
-            f"the audit chain's current range is keyed under audit key {current!r}, which is not "
-            "configured; restore it to MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run"
-        )
     # ONE read, verified and sealed from the same rows, so the closing record cannot describe a
-    # different chain from the one the verify passed.
+    # different chain from the one the verify passed. The no-op below verifies too: its OK is read
+    # as "the rotation is done", so it must not stand over a chain audit-verify fails (#1945).
     rows = await host._audit_rows(AUDIT_ALL_ROWS)
     ok, msg = verify_audit_rows(
         rows,
@@ -2575,11 +2607,15 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         capable=host._audit_mac_key is not None or host._audit_mac_fn is not None,
     )
     if not ok:
+        if current == active_id:
+            return False, f"the audit chain is under the active key but does not verify: {msg}"
         return False, f"refusing to roll a broken audit chain: {msg}"
+    if current == active_id:
+        return True, f"audit chain already under the active key (range from id={current_from})"
     split = bisect.bisect_left([int(r["id"]) for r in rows], current_from)
     closes = audit_range_closing(
         rows[split:],
-        key_id=current,
+        key_id=recorded,
         from_id=current_from,
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
@@ -3406,6 +3442,19 @@ def seed_notify_email(email: str | None) -> str | None:
     return email.strip() or None if email is not None else None
 
 
+def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
+    """The ``users.notify_email`` a ``create_user`` INSERT binds, on all three backends.
+
+    ``typed`` wins when given: an administrator's address for a directory account whose ``mail``
+    was not adopted (BACKLOG #2021), bound in the same INSERT so no crash can leave the row with
+    none. The caller has already checked it. Otherwise ``email`` is seeded (:func:`seed_notify_email`)
+    unless ``adopt`` is ``False`` (BACKLOG #2014).
+    """
+    if typed is not None:
+        return typed
+    return seed_notify_email(email) if adopt else None
+
+
 def require_notify_email(email: str) -> str:
     """Validate a new ``users.notify_email`` value — shared by all three backends (BACKLOG #1139).
 
@@ -3550,6 +3599,10 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS ix_messages_channel  ON messages(channel_id, received_at);
 CREATE INDEX IF NOT EXISTS ix_messages_control  ON messages(channel_id, control_id);
+-- BACKLOG #1726: serves the tracking view's newest-first page (ORDER BY received_at DESC, id DESC, so
+-- no sort of every row) and its received_at filter. Here, not in _migrate: both columns date from the
+-- first release and this batch runs on every open, so an existing store builds it on its next open.
+CREATE INDEX IF NOT EXISTS ix_messages_received ON messages(received_at, id);
 
 -- Generic staged-queue table (staged pipeline, ADR 0001). One table for every stage; the `stage`
 -- column discriminates ingress | routed | outbound rows. Supersedes the original `outbox` table
@@ -3908,9 +3961,15 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     -- why, and ApprovalGate.approve is what enforces it.
     requester_user_id TEXT,
     requested_at REAL NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired | failed
-                                       -- 'failed': the gate released it but the executor raised, so
-                                       -- the operation did NOT happen (ASVS 2.3.3 compensation)
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | executing | approved | rejected
+                                       -- | expired | failed | interrupted (BACKLOG #1562)
+                                       -- 'executing': released and claimed, the executor is running;
+                                       -- 'approved' is written only after the executor returns
+                                       -- 'failed': the executor raised, or the release was cancelled
+                                       -- before it started, so the operation did NOT complete
+                                       -- (ASVS 2.3.3 compensation)
+                                       -- 'interrupted': cancelled mid-execution; the outcome is
+                                       -- UNKNOWN, and nothing retries it
     approver     TEXT,                 -- the distinct second user who released/declined it
     decided_at   REAL,
     expires_at   REAL                  -- NULL = never; past this a pending request can't be approved
@@ -4044,6 +4103,16 @@ CREATE TABLE IF NOT EXISTS secret_rotation_meta (
     last_rotated  TEXT NOT NULL       -- ISO YYYY-MM-DD the fingerprint last changed (auto-detected rotation)
 );
 """
+
+# The latest event of each listed message, for the tracking view (list_messages, search_messages).
+# BACKLOG #1726: MAX(id) reads ix_events_message as a covering scan and fetches one row by primary key,
+# where an ORDER BY id sorted each message's events in a temp B-tree (that index orders by ts, not id).
+# A message with no events yields NULL. It correlates on `messages.id`, so use it only where the query
+# names `messages` without an alias.
+_LAST_EVENT_COLUMN = (
+    "(SELECT event FROM message_events e WHERE e.id ="
+    " (SELECT MAX(e2.id) FROM message_events e2 WHERE e2.message_id = messages.id)) AS last_event"
+)
 
 # Columns added after the initial release; ALTER-ed in on open for existing DBs.
 # `documents_pruned` (#47, ADR 0042): a nullable epoch timestamp set when retention strips an embedded
@@ -4367,6 +4436,16 @@ class MessageStore:
             # can reach this connection yet.
             async with _writer_txn(db, asyncio.Lock()):
                 await cls._migrate(db)
+                # BACKLOG #1720: every CREATE is IF NOT EXISTS and every migration is additive, so an
+                # object an incompatible version left under an expected name was skipped, not fixed.
+                # Checked before the commit, so a refusal rolls the migrations back.
+                await verify_live_schema(
+                    db,
+                    schema=_SCHEMA,
+                    migrate=cls._migrate,
+                    path=path,
+                    keyed=bounded_cipher(cipher) is not None,
+                )
                 await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
             # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
@@ -7688,6 +7767,7 @@ class MessageStore:
         message_type: str | None,
         summary: str | None,
         peek_failed: bool = False,
+        peek_error: str | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one INFLIGHT ``Stage.RESPONSE`` work-row and produce the re-ingressed message+ingress
@@ -7809,7 +7889,8 @@ class MessageStore:
             cur = await self._db.execute("SELECT 1 FROM messages WHERE id=?", (new_mid,))
             already = await cur.fetchone() is not None
             if not already:
-                # 5. The re-ingressed message (RECEIVED, or RECEIVED→ERROR on a non-peekable HL7 body).
+                # 5. The re-ingressed message (RECEIVED, or RECEIVED→ERROR on a body the worker refused:
+                #    a non-peekable HL7 body, or an oversize body of any type, BACKLOG #1914).
                 child_meta = json.dumps(
                     {
                         "correlation_id": origin_id,
@@ -7830,7 +7911,9 @@ class MessageStore:
                     source_type="reingress",
                     summary=summary,
                     metadata=child_meta,
-                    error="re-ingress body failed HL7 peek" if peek_failed else None,
+                    error=(
+                        (peek_error or "re-ingress body failed HL7 peek") if peek_failed else None
+                    ),
                     now=now,
                 )
                 # 6. The ingress queue row — UNLESS peek_failed (an ERROR message owes no work).
@@ -9119,9 +9202,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
-                " status, error, summary, metadata,"
-                " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
-                "  ORDER BY e.id DESC LIMIT 1) AS last_event"
+                f" status, error, summary, metadata, {_LAST_EVENT_COLUMN}"
                 f" FROM messages{where}"
                 " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
@@ -9176,23 +9257,28 @@ class MessageStore:
         any decrypt; rows are walked newest-first and decrypt+match runs **off the event loop** (the
         per-row AES-GCM decrypt + HL7 parse is CPU work). The scan stops after ``spec.scan_limit``
         decrypts (``truncated=True``) or ``limit`` matches, whichever first — the hard cost ceiling that
-        keeps this slow-by-construction read safe to expose."""
+        keeps this slow-by-construction read safe to expose.
+
+        The candidate ``SELECT`` returns at most ``spec.fetch_limit`` rows, so the cap bounds the rows
+        and bodies held in memory, not only the decrypts (BACKLOG #2068). It does not bound the
+        database's own work: choosing those rows may still examine every candidate (a multi-channel
+        scope sorts them all, and a ``status`` filter on SQLite reads past ``raw`` to reach it)."""
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
-        # Stream candidates newest-first under one read snapshot; decrypt+match each off the loop. We
-        # select only id + the two cipher-covered columns we match on — never a whole detail row.
+        # Read candidates under one read snapshot; decrypt+match each off the loop. The inner SELECT
+        # picks the newest `fetch_limit` ids without selecting `raw`; only those rows are read whole.
+        # A LIMIT on the outer SELECT alone is not enough: a multi-channel RBAC scope sorts in a temp
+        # B-tree, which evaluated every candidate's body and last event before the LIMIT (#2068).
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
-                " status, error, summary, metadata, raw,"
-                " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
-                "  ORDER BY e.id DESC LIMIT 1) AS last_event"
-                f" FROM messages{where}"
-                " ORDER BY received_at DESC, id DESC",
-                params,
+                f" status, error, summary, metadata, raw, {_LAST_EVENT_COLUMN}"
+                " FROM messages WHERE id IN"
+                f" (SELECT id FROM messages{where} ORDER BY received_at DESC, id DESC LIMIT ?)",
+                (*params, spec.fetch_limit),
             )
-            candidates = list(await cur.fetchall())
+            candidates = newest_first(await cur.fetchall())
         return await asyncio.to_thread(self._scan_rows, spec, candidates, limit)
 
     def _scan_rows(
@@ -9973,10 +10059,11 @@ class MessageStore:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
 
-        ``from_status`` defaults to ``pending`` (the request/decide path: approved/rejected/expired).
-        The approval gate also uses it for the ASVS 2.3.3 compensating transition ``approved`` ->
-        ``failed``, which must NOT be able to move a row some other caller already rejected or
-        expired — hence the guard is a parameter rather than a hardcoded literal."""
+        ``from_status`` defaults to ``pending`` (the request/decide path: executing/rejected/expired).
+        The approval gate also uses it to settle a claimed row out of ``executing`` -- to
+        ``approved``, to ``failed`` (the ASVS 2.3.3 compensation) or to ``interrupted`` (BACKLOG
+        #1562) -- none of which may move a row some other caller already rejected or expired, hence
+        the guard is a parameter rather than a hardcoded literal."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
@@ -10199,6 +10286,8 @@ class MessageStore:
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
+        adopt_notify_email: bool = True,
+        notify_email: str | None = None,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
@@ -10213,7 +10302,7 @@ class MessageStore:
                     auth_provider,
                     display_name,
                     email,
-                    seed_notify_email(email),
+                    birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
                     now,
                     now,
                     password_hash,
@@ -11122,20 +11211,23 @@ class MessageStore:
             return int(cur.rowcount)
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, now: float | None = None
+        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
     ) -> None:
-        """Revoke a user's active sessions beyond the ``keep`` most recently created (AUTH-SESS-CAP)."""
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
+        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+                f" AND {_SESSION_NOT_AHEAD_SQL}"
                 " AND token_hash NOT IN ("
                 "  SELECT token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+                f"  AND {_SESSION_LIVE_SQL}"
                 "  ORDER BY created_at DESC, token_hash DESC LIMIT ?"
                 ")",
-                (now, user_id, user_id, keep),
+                (now, user_id, now, now, user_id, *_session_live_params(now, idle_seconds), keep),
             )
             await self._commit()
 
@@ -11832,6 +11924,8 @@ class MessageStore:
         for cid, (read, errored) in counts.items():  # since-window rows w/o an all-time row
             inbound[cid] = InboundMetrics(read=int(read), errored=int(errored or 0), last_at=None)
 
+        # Reads every outbound row the store holds (BACKLOG #1726, left open): no queue index carries
+        # updated_at or the (channel, destination) pair, so no rewrite over the existing indexes helps.
         cur = await db.execute(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN (?,?) THEN 1 ELSE 0 END) AS queue_depth,"

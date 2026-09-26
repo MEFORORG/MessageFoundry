@@ -86,25 +86,6 @@ _UPLOAD_MISS = (
 
 #: One entry per (site key, count). Read the module docstring before adding one.
 _ALLOWED: tuple[_Allowed, ...] = (
-    # ---- UNSAFE: the suppressed exception carries payload or a secret. Fix, then delete the entry.
-    _Allowed(
-        "messagefoundry/api/app.py::_guard_resubmission::IngressGuardError" + _HTTP,
-        _UNSAFE + "the caught IngressGuardError is raised `from exc` in ingress_guards, so its own "
-        "__cause__ can be the UnicodeEncodeError whose .object is the whole resubmitted body "
-        "(measured) or an HL7PeekError over the body; raise the 4xx outside this handler, and "
-        "stop ingress_guards chaining the body",
-    ),
-    _Allowed(
-        "messagefoundry/transports/database.py::_lookup_max_rows::"
-        "(TypeError, ValueError, OverflowError)::ValueError",
-        _UNSAFE + "int(value)'s ValueError quotes the env()-resolved max_rows value that the "
-        "message says it withholds (measured)",
-    ),
-    _Allowed(
-        "messagefoundry/transports/rest.py::refuse_url_credentials::ValueError::error",
-        _UNSAFE + "urlsplit().port's ValueError quotes the port field, which is the password "
-        "when a credential is written into the URL as host:password (measured)",
-    ),
     # ---- SAFE: the suppressed exception carries nothing the raised one does not already say.
     _Allowed(
         "messagefoundry/anon/rules.py::_coerce_kind::ValueError::RuleError",
@@ -408,7 +389,10 @@ def test_every_from_none_is_classified() -> None:
 
 
 def test_the_scan_is_armed() -> None:
-    """A walker that finds nothing makes the gate pass vacuously. The census on 2026-09-26 is 50."""
+    """A walker that finds nothing makes the gate pass vacuously.
+
+    The census on 2026-09-26 was 50, and 47 once the three UNSAFE sites were fixed. Those three are
+    driven, chain and all, by ``tests/test_refusals_carry_no_chain.py``."""
     found = _scan(_PKG, _ROOT)
     assert sum(found.values()) >= 40, found
 

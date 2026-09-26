@@ -193,6 +193,47 @@ async def test_respond_with_receipt_on_ingress(store: MessageStore) -> None:
     assert msg["status"] == MessageStatus.RECEIVED.value
 
 
+@pytest.mark.parametrize("cause", ["over_ingress_ceiling", "nul_in_body"])
+async def test_a_body_refused_at_ingress_is_422_with_one_error_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, cause: str
+) -> None:
+    """Owner ruling 2026-09-26 (BACKLOG #1960, the ADR 0154 amendment of that date).
+
+    The listener reads the body, then the runner's receipt handler refuses it: it records one ERROR
+    row and returns None. The receipt path used to answer that with "202 without a message_id",
+    telling the caller a refused body was accepted. It now answers the sync path's 422. Only the
+    answer changed: the ERROR row is still the count-and-log record, and no ingress row exists."""
+    from messagefoundry.pipeline import wiring_runner
+
+    body = JSON_BODY.encode("utf-8")
+    if cause == "over_ingress_ceiling":
+        # Under the listener's max_body_bytes, so the listener reads it and hands it on; over the
+        # engine's ingress ceiling, so the handler refuses it after reading.
+        monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 8)
+        assert 8 < len(body) < DEFAULT_MAX_BODY_BYTES
+    else:
+        body = b'{"mrn": "1\x0000"}'
+    ic = build_inbound_connection(
+        "IB_HTTP", Http(port=0), router="r", content_type=ContentType.JSON
+    )
+    events: list[tuple] = []
+    src = await _start_source(store, ic, events=events)
+    try:
+        resp = await _http(src.sockport, body=body)
+    finally:
+        await src.stop()
+    assert resp.status == 422
+    assert resp.body == b'{"error":"message was not accepted"}'
+    # A post-record refusal has no connection-event kind of its own, so the connection still closes
+    # normally in the log rather than being left open-ended.
+    assert [e[0] for e in events] == ["established", "closed"]
+    cur = await store._db.execute("SELECT status FROM messages")
+    rows = await cur.fetchall()
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue")
+    assert (await cur.fetchone())["n"] == 0, "a refused body reached the ingress stage"
+
+
 async def test_post_ingress_failure_does_not_change_http_status(store: MessageStore) -> None:
     """AC-3: the 202 is returned at ingress, BEFORE any routing/transform runs — no worker is draining
     here, so a downstream failure (which would happen later) cannot retroactively change the status."""

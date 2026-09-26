@@ -29,14 +29,16 @@ import datetime
 import inspect
 import smtplib
 import ssl
+import traceback
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
 import pytest
 from cryptography import x509
+from cryptography.exceptions import InternalError, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
@@ -44,7 +46,7 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.direct import DirectDestination
 
 # A synthetic (never-real-PHI) HL7 body for the crypto round-trip (CLAUDE.md §9).
@@ -397,6 +399,151 @@ async def test_delivery_error_is_phi_and_secret_safe(
     assert "s3cret" not in text  # never the password
     assert "recipient@hisp.example" not in text  # never a recipient
     assert "SYN123" not in text  # never the (synthetic) body content
+
+
+#: A synthetic body that cannot encode as ASCII. The marker stands in for PHI: it must not be
+#: reachable from the raised error by any route, printed or by attribute.
+_ENCODE_MARKER = "ZZSYNTHMARKER42"
+_UNENCODABLE_HL7 = (
+    "MSH|^~\\&|SEND|FAC|RECV|FAC|20260101||ADT^A01|1|P|2.5\r"
+    f"PID|1||{_ENCODE_MARKER}^^^FAC||MUÑOZ^ANA\r"
+)
+
+
+async def test_encode_failure_leaves_no_exception_chain(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    """BACKLOG #1920. A body the configured codec cannot encode raises ``UnicodeEncodeError``, whose
+    ``.object`` is the WHOLE payload. Chained onto the ``DeliveryError`` -- as ``__cause__`` by
+    ``from exc``, or as ``__context__`` by a raise inside the handler -- it would put the body in
+    front of any logger, serializer or crash reporter that walks the chain. Both links must be empty,
+    and neither the marker nor the offending character may appear in the formatted traceback."""
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki, encoding="ascii"))
+    with pytest.raises(DeliveryError) as ei:
+        await d.send(_UNENCODABLE_HL7)
+    exc = ei.value
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    rendered = "".join(traceback.format_exception(exc))
+    assert _ENCODE_MARKER not in rendered
+    assert "\\xd1" not in rendered and "Ñ" not in rendered  # the offending character
+    assert "ascii" in rendered  # still actionable: names the codec
+    assert _FakeSMTP.instances == []  # nothing dialled for a message that never built
+
+
+# BACKLOG #1919. A message that cannot be BUILT will not build on a retry either, so it must reach
+# the delivery worker as a permanent NegativeAckError, which it dead-letters on the first attempt. A
+# plain DeliveryError is the transient class: the worker retries it up to the attempt ceiling.
+
+
+async def test_encode_failure_is_permanent(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki, encoding="ascii"))
+    with pytest.raises(NegativeAckError) as ei:
+        await d.send(_UNENCODABLE_HL7)
+    assert ei.value.permanent is True
+    assert ei.value.credential_fault is False  # a bad message, not a bad credential
+
+
+async def test_crypto_build_failure_is_permanent_and_content_free(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    # A real library failure, not a stub: an EC recipient cert reaching the envelope builder raises
+    # `TypeError: Only RSA keys are supported at this time` on the pinned cryptography. Construction
+    # now refuses that cert (#1918), so it is swapped in afterwards -- the "slipped past construction"
+    # case the send-time arm exists for.
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki))
+    _, ec_cert = _mint_ec_leaf("ec-recipient@hisp.example", pki["ca_key"], pki["ca_cert"])
+    d._recipient_cert = ec_cert
+    with (
+        caplog.at_level("WARNING", logger="messagefoundry.transports.direct"),
+        pytest.raises(NegativeAckError) as ei,
+    ):
+        await d.send(_SYNTHETIC_HL7)
+    exc = ei.value
+    assert exc.permanent is True
+    assert exc.credential_fault is False
+    assert "TypeError" in str(exc)
+    assert exc.__cause__ is None and exc.__context__ is None  # the #1920 shape holds here too
+    assert "SYN123" not in "".join(traceback.format_exception(exc))  # no body content
+    assert _FakeSMTP.instances == []
+    # The dead-letter is logged, by type name only: neither the body nor the library's own text.
+    [record] = [r for r in caplog.records if "S/MIME build failed" in r.getMessage()]
+    assert "TypeError" in record.getMessage()
+    assert "SYN123" not in record.getMessage()
+    assert "Only RSA" not in record.getMessage()
+
+
+async def test_unsupported_algorithm_from_the_envelope_build_is_permanent(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    """BACKLOG #1921. Reported: under a FIPS-enabled OpenSSL, constructing PKCS7EnvelopeBuilder raises
+    UnsupportedAlgorithm, which subclasses Exception and not ValueError, so it escaped the build arm
+    and reached the delivery worker as an "internal error". NOT reproduced -- no FIPS OpenSSL here --
+    so this simulates the raise and pins the mapping: permanent, content-free, chain severed."""
+
+    def _fips_refusal() -> Any:
+        raise UnsupportedAlgorithm("synthetic FIPS refusal ZZLIBDETAIL")
+
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki))
+    monkeypatch.setattr(
+        "messagefoundry.transports.direct.pkcs7.PKCS7EnvelopeBuilder", _fips_refusal
+    )
+    with pytest.raises(NegativeAckError) as ei:
+        await d.send(_SYNTHETIC_HL7)
+    exc = ei.value
+    assert exc.permanent is True
+    assert "UnsupportedAlgorithm" in str(exc)
+    assert "ZZLIBDETAIL" not in "".join(traceback.format_exception(exc))
+    assert exc.__cause__ is None and exc.__context__ is None
+    assert _FakeSMTP.instances == []
+
+
+# The construction probe (code review of #1918-#1921). Every build input except the body is fixed at
+# construction, so a fault in one of them would fail every send. The send-time arm dead-letters such
+# a failure message by message, so each of these must fail at check/dry-run/start instead.
+
+
+def test_construction_probe_refuses_an_unsupported_algorithm(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    # The #1921 FIPS shape, one step earlier: a builder that refuses at every call refuses here too.
+    def _fips_refusal() -> Any:
+        raise UnsupportedAlgorithm("synthetic FIPS refusal")
+
+    monkeypatch.setattr(
+        "messagefoundry.transports.direct.pkcs7.PKCS7EnvelopeBuilder", _fips_refusal
+    )
+    with pytest.raises(ValueError, match="could not build an S/MIME message.*UnsupportedAlgorithm"):
+        DirectDestination(_dest(pki))
+
+
+def test_construction_probe_refuses_a_subject_with_a_line_break(pki: dict[str, Any]) -> None:
+    # email.message refuses a header value with CR or LF INSIDE it, on every build. A lone TRAILING
+    # newline is not refused (it is RFC 2047-encoded into the Subject), so the break here is embedded,
+    # which is the header-injection shape.
+    with pytest.raises(ValueError, match="could not build an S/MIME message.*ValueError"):
+        DirectDestination(_dest(pki, subject="Referral\nBcc: someone@hisp.example"))
+
+
+def test_construction_probe_refuses_a_cryptography_internal_error(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    # InternalError is how cryptography surfaces an OpenSSL error it does not map. Like
+    # UnsupportedAlgorithm it subclasses Exception, not ValueError. Simulated, not reproduced.
+    def _openssl_refusal() -> Any:
+        raise InternalError("synthetic unmapped OpenSSL error", [])
+
+    monkeypatch.setattr(
+        "messagefoundry.transports.direct.pkcs7.PKCS7EnvelopeBuilder", _openssl_refusal
+    )
+    with pytest.raises(ValueError, match="could not build an S/MIME message.*InternalError"):
+        DirectDestination(_dest(pki))
 
 
 # --- test_connection probe: connect + EHLO + NOOP only, no MAIL FROM / DATA --------------------------
@@ -794,6 +941,96 @@ def test_an_unapproved_ec_curve_is_refused(pki: dict[str, Any], tmp_path: Path) 
     )
     with pytest.raises(ValueError, match="secp192r1"):
         DirectDestination(_dest(pki, signing_cert=str(cert_p), signing_key=str(key_p)))
+
+
+# --- recipient key type: RSA only, refused at construction (BACKLOG #1918) ---------------------------
+#
+# The pinned cryptography's PKCS7EnvelopeBuilder does RSA key transport and nothing else. An EC
+# recipient cert used to pass construction (it clears the EC curve list) and then fail every send.
+# The refusal is scoped to the recipient: the signer and the trust anchor take EC, and are pinned so
+# below, because the library limit is on the ENVELOPE and not on the key type in general.
+
+
+def _ec_recipient(pki: dict[str, Any], tmp_path: Path) -> str:
+    _, cert = _mint_ec_leaf("ec-recipient@hisp.example", pki["ca_key"], pki["ca_cert"])
+    path = tmp_path / "ec_recip.crt"
+    _write_pem(path, cert)
+    return str(path)
+
+
+def test_an_ec_recipient_cert_is_refused_at_construction(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="recipient_cert.*RSA"):
+        DirectDestination(_dest(pki, recipient_cert=_ec_recipient(pki, tmp_path)))
+
+
+def test_a_non_ec_non_rsa_recipient_cert_is_refused_too(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # The fallback label, on a key type the curve list never sees: Ed25519.
+    key = ed25519.Ed25519PrivateKey.generate()
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ed25519-recip")]))
+        .issuer_name(pki["ca_cert"].subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(pki["ca_key"], hashes.SHA256())
+    )
+    path = tmp_path / "ed25519_recip.crt"
+    _write_pem(path, cert)
+    with pytest.raises(ValueError, match="recipient_cert' key type is not RSA"):
+        DirectDestination(_dest(pki, recipient_cert=str(path)))
+
+
+def test_pkcs7_envelope_builder_still_refuses_an_ec_recipient(pki: dict[str, Any]) -> None:
+    """Library-drift tripwire for the refusal above. If a later cryptography envelopes to an EC
+    recipient, this fails, and the construction refusal is refusing a partner the library could now
+    serve -- re-read BACKLOG #1918 before widening it."""
+    _, cert = _mint_ec_leaf("ec-recipient@hisp.example", pki["ca_key"], pki["ca_cert"])
+    with pytest.raises(TypeError, match="Only RSA"):
+        pkcs7.PKCS7EnvelopeBuilder().set_data(b"synthetic").add_recipient(cert)
+
+
+def test_an_ec_trust_anchor_issuing_an_rsa_recipient_still_constructs(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # POSITIVE CONTROL: the refusal is about the ENVELOPE target, not EC anywhere in the chain. An EC
+    # CA signing an RSA recipient verifies with verify_directly_issued_by on the pinned library.
+    ca_key = ec.generate_private_key(ec.SECP384R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "EC Direct CA")])
+    now = datetime.datetime.now(datetime.UTC)
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA384())
+    )
+    recip_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    recip_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "rsa-recip")]))
+        .issuer_name(ca_name)
+        .public_key(recip_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(ca_key, hashes.SHA384())
+    )
+    anchor_p = tmp_path / "ec_ca.crt"
+    recip_p = tmp_path / "rsa_recip_of_ec_ca.crt"
+    _write_pem(anchor_p, ca_cert)
+    _write_pem(recip_p, recip_cert)
+    DirectDestination(_dest(pki, recipient_cert=str(recip_p), trust_anchor=str(anchor_p)))
 
 
 # --- library-capability tripwire for BACKLOG #1168 --------------------------------------------------

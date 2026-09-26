@@ -240,6 +240,10 @@ diverge enough to warrant it; keep this root file general.
   library** (no engine state, I/O, or DB) — a client (e.g. the harness's rehomed Parse Tree view) **may**
   import it for client-side rendering. That is not "reaching into the engine"; importing any other engine
   package (`pipeline/`, `store/`, `transports/`, `config/`) from a client is still forbidden.
+  [`tests/test_dependency_boundaries.py`](tests/test_dependency_boundaries.py) enforces that ban
+  statically, for direct imports of those four packages, and the only exceptions are the paths its
+  `_CLIENT_ALLOWED` names, each for just the packages its entry lists; a client that needs MLLP
+  framing or `AckMode` imports the leaf `messagefoundry.mllpcodec`.
 - **Author config as modular Python.** Put shared helpers in `_`-prefixed files (the loader skips
   `_*`) and import them from siblings — don't copy-paste boilerplate. For a ported / non-trivial feed,
   split it by role — connections (`connections.toml`) / `@router` / `@handler` / `_<feed>_transforms.py`
@@ -347,7 +351,7 @@ directory, where a write lands unseen. A query also takes `-RecordRepo` with a v
 | **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
+| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **THE LANDER ROW'S DUTY WAS CORRECTED BY THE OWNER ON 2026-09-21, IN SESSION.** That cell read

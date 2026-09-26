@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -3648,6 +3649,7 @@ async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:
                 "username": "hostile",
                 "password": PW,
                 "display_name": "<script>alert(9)</script>",
+                "email": "hostile@x.org",
             },
             headers={"Sec-Fetch-Site": "same-origin"},
         )
@@ -3656,6 +3658,33 @@ async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:
             body = (await c.get(url)).text
             assert "<script>alert(9)</script>" not in body
             assert "&lt;script&gt;alert(9)&lt;/script&gt;" in body
+
+
+async def test_the_create_form_requires_a_notification_address(engine: Engine) -> None:
+    """BACKLOG #2018 (ASVS 6.3.7): the console refuses a create with no address, as the API does,
+    and re-renders the form with the service's reason. The control is the same form with one."""
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        form = await c.get("/ui/users/new")
+        [email_input] = re.findall(r'<input[^>]*name="email"[^>]*>', form.text)
+        assert "required" in email_input
+        for email in ("", "a@b.org, c@d.org"):
+            r = await c.post(
+                "/ui/users",
+                data={"username": "nomail", "password": PW, "email": email},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+            assert r.status_code == 400, email
+            assert "notification address" in r.text or "one email address" in r.text
+            assert await service.store.get_user_by_username("nomail") is None
+        r = await c.post(
+            "/ui/users",
+            data={"username": "nomail", "password": PW, "email": "nomail@x.org"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user_by_username("nomail")
+        assert user is not None and user.notify_email == "nomail@x.org"
 
 
 # --- L4a review-driven regressions (adversarial review PR2: 1 high, 1 medium, test gaps) -----------
@@ -6742,6 +6771,58 @@ async def test_oidc_login_link_tracks_availability(engine: Engine) -> None:
         assert r.headers["location"].startswith("https://idp.example/authorize?")
 
 
+@pytest.mark.parametrize(("status", "link_stays"), [(400, True), (401, True), (503, False)])
+async def test_a_bad_authorization_code_cannot_hide_the_oidc_link(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, status: int, link_stays: bool
+) -> None:
+    """BACKLOG #1948, driven as a signed-out caller would: start a flow, then call back with a code
+    the token endpoint refuses. The real ``exchange_code`` runs against an opener that answers
+    ``status``, so the sequence reaches the service the way it would live.
+
+    Any 4xx is the endpoint answering. A 400 is RFC 6749's ``invalid_grant``, the caller's own doing,
+    and the link and ``/auth/providers`` must survive it, or any visitor could switch federated
+    sign-in off. A 401 is the engine's own secret, and it is audited rather than hidden, so that no
+    body has to be read to tell the two apart. The 503 arm is the control: an IdP that is down must
+    still hide the link, so this test can fail."""
+    import io
+    import urllib.error
+
+    class _TokenEndpoint:
+        def open(self, req: object, timeout: float = 0.0) -> object:
+            raise urllib.error.HTTPError(
+                "https://idp.example/token",
+                status,
+                "refused",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(b'{"error":"invalid_grant"}'),
+            )
+
+    async def _no_pad(_deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_pad)
+    service = _oidc_service(engine)
+    await service.initialize()
+    service._oidc_opener = _TokenEndpoint()  # type: ignore[assignment]
+    async with _oidc_client(engine, service) as c:
+        start = await c.post("/ui/oidc/start", follow_redirects=False)
+        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        r = await c.get(
+            "/ui/oidc/callback",
+            params={"code": "not-a-code-the-idp-issued", "state": state},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+            },
+            follow_redirects=False,
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=oidc_failed"
+        assert ("/ui/oidc/start" in (await c.get("/ui/login")).text) is link_stays
+        assert (await c.get("/auth/providers")).json()["oidc"] is link_stays
+    assert service.oidc_available is link_stays
+
+
 async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: Engine) -> None:
     service = _oidc_service(engine)
     await service.initialize()
@@ -7166,7 +7247,9 @@ async def test_the_page_after_create_states_the_initial_password_deadline(engine
     # (a) The create POST lands on the user's page, which states the instant off the stored stamp.
     service = await _expiring_service(engine)
     async with _boss_client(engine, service) as c:
-        r = await _post_pairs(c, "/ui/users", [("username", "hana"), ("password", PW)])
+        r = await _post_pairs(
+            c, "/ui/users", [("username", "hana"), ("password", PW), ("email", "hana@x.org")]
+        )
         assert r.status_code == 303
         hana = await _uid(service, "hana")
         page = await c.get(r.headers["location"])

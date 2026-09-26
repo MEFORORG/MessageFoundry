@@ -1,6 +1,6 @@
 # 0180 — Asserting TLS suites on a library that exposes no SSLContext
 
-- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A)
+- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B)
 - **Date:** 2026-08-28
 - **Related:** BACKLOG #1317 · `messagefoundry/config/tls_policy.py` (`harden_cipher_suites`, `build_asserted_https_handler`, `assert_ldap3_tls_suites`, `assert_hvac_tls_suites`) · `messagefoundry/auth/ldap.py` · `messagefoundry/config/secretprovider_vault.py` · `messagefoundry/store/keyprovider_vault.py` · `messagefoundry/store/crypto_transit.py` · `tests/test_tls_cipher_assertion_sites.py` · `.github/workflows/ci.yml`
 
@@ -240,3 +240,15 @@ above SKIP, which a suite reports as green), and that both `_build_client` facto
 seven tests are exactly the ones that would not run.
 
 **ODBC Driver 18 is unchanged and stays OUT, permanently.** Nothing in this amendment bears on it.
+
+## Amendment B (2026-09-26) -- the AD bind passes `ca_certs_data`, and `ca_certs_file` is refused
+
+BACKLOG #2034 changed the `Tls` arguments the AD bind passes. `_tls_kwargs()` handed ldap3
+`ca_certs_file`, so every bind read the anchor file again, after the trust-anchor check had read and
+verified it. A file swapped after the check was trusted by every later bind. `LdapAuthenticator` now
+checks the anchor once, at construction, and hands ldap3 the checked bytes as `ca_certs_data`.
+
+So Decision 2's set is now `validate` and `ca_certs_data`. Decision 4 holds for `ca_certs_data`: it
+changes the trust anchors and not the suite list, which the equivalence test measures. `ca_certs_file`
+left the set on purpose. A path there would mean the bind reads the anchor again, so the assertion
+refuses it at construction, and `test_the_ldaps_assertion_refuses_a_ca_path` pins that.

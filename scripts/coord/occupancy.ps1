@@ -115,11 +115,12 @@ function Get-RepoWorktrees([string]$RepoHint) {
     foreach ($line in $porcelain) {
         if ($line -like "worktree *") {
             $cur = [pscustomobject]@{
-                Path = $line.Substring(9).Trim(); Branch = ""
+                Path = $line.Substring(9).Trim(); Branch = ""; Head = ""
                 Bare = $false; Detached = $false; Locked = $false; LockReason = ""; Prunable = ""
             }
             $out += $cur
         }
+        elseif ($line -like "HEAD *" -and $cur) { $cur.Head = $line.Substring(5).Trim() }
         elseif ($line -like "branch *" -and $cur) {
             $cur.Branch = ($line.Substring(7).Trim() -replace '^refs/heads/', '')
         }

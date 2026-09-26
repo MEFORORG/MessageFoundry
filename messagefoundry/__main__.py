@@ -31,7 +31,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import (
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from messagefoundry import __version__
 from messagefoundry.console_streams import harden_console_streams
@@ -47,6 +47,7 @@ from messagefoundry.logging_setup import (
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings
 
 
@@ -2544,7 +2545,7 @@ def _serve(args: argparse.Namespace) -> int:
         import importlib.util
 
         if importlib.util.find_spec(WEBCONSOLE_IMPORT_NAME) is None:
-            if settings.api.serve_ui_explicit:
+            if settings.security.serve_web_console_explicit:
                 # (b) [security].serve_web_console was EXPLICITLY set true but the optional wheel is
                 # absent — keep the HARD refuse (ADR 0143 soft-degrade contract): the operator asked
                 # for the console by name, so a silent JSON-only downgrade would be surprising.
@@ -2620,7 +2621,11 @@ def _serve(args: argparse.Namespace) -> int:
         or settings.api.tls_terminated_upstream
         or bool(settings.api.public_origin)
     )
-    if settings.api.serve_ui and not settings.api.serve_ui_explicit and console_exposed:
+    if (
+        settings.api.serve_ui
+        and not settings.security.serve_web_console_explicit
+        and console_exposed
+    ):
         print(
             "warning: the web console is on by default (ADR 0143) for LOCAL loopback binds only; this "
             "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, or "
@@ -5117,11 +5122,27 @@ class _KeylessProvisionRefused(RuntimeError):
 
 
 def _store_key_configured(settings: ServiceSettings) -> bool:
-    """Is a local store key configured? The at-rest gate's one test for "keyed" (a DPAPI key file counts;
-    ``open_store`` fails closed later if it is unreadable). It does not consult ``cipher_provider`` --
-    the documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` -- and keeping the test
-    here means that gap, when it is closed, is closed once for every command that applies the gate."""
-    return bool(settings.store.encryption_key or settings.store.encryption_key_file)
+    """Is a store key configured? The at-rest gate's one test for "keyed". A local key or a DPAPI key
+    file counts, and so does an external ``[store].key_provider`` such as ``vault`` (BACKLOG #1998).
+
+    The test reads what is CONFIGURED, not what resolves: the gate runs before ``open_store`` and must
+    not need the network. That is safe because a source that cannot resolve fails closed at
+    ``open_store`` -- an unreadable key file raises ``DpapiError``, and an external provider raises
+    ``KeyProviderError`` -- rather than opening under the identity cipher. (Under ``vault_transit`` the
+    store never resolves ``key_provider`` at all, and Transit encrypts.) The known exception is a
+    pinned built-in provider that ignores the configured source (``env`` with only a key file), which
+    ``provision-admin`` checks after opening (BACKLOG #1905). It does not consult
+    ``cipher_provider`` -- the documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` --
+    and keeping the test here means that gap, when it is closed, is closed once for every command that
+    applies the gate."""
+    from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS
+
+    store = settings.store
+    return bool(
+        store.encryption_key
+        or store.encryption_key_file
+        or store.key_provider in _EXTERNAL_PROVIDERS
+    )
 
 
 def _keyless_store_gate(settings: ServiceSettings, *, enforcing: bool) -> str | None:
@@ -5244,6 +5265,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # BACKLOG #2034: the [security].enforcement dial `serve` hands the lifespan as
+    # trust_anchors_enforcing, derived the same way. AuthService checks the OIDC and AD trust anchors
+    # when it is built, and it enforces when no dial is passed. Without this, a weak anchor that
+    # `serve` only warns about at `warn` would make this command refuse.
+    trust_anchors_enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+
     async def administrator_exists() -> bool:
         from messagefoundry.store.base import StoreNotFoundError
 
@@ -5257,16 +5284,20 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except StoreNotFoundError:
             return False
         try:
-            return await AuthService(store, settings.auth).has_enabled_administrator()
+            service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
+            return await service.has_enabled_administrator()
         finally:
             await store.close()
 
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.store.crypto import StoreKeylessError
 
     try:
         exists = run_guarded(administrator_exists())
     except StoreKeylessError as exc:
         return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
+    except TrustAnchorError as exc:
+        return _emit_trust_anchor_refusal(exc, as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if exists:
@@ -5312,7 +5343,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     "shell, so the store opened KEYLESS; refusing to provision. Make the key the "
                     "service runs with readable here and re-run."
                 )
-            outcome = await AuthService(store, settings.auth).provision_first_administrator(
+            service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
+            outcome = await service.provision_first_administrator(
                 username=args.username,
                 password=password,
                 display_name=args.display_name,
@@ -5335,6 +5367,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         outcome, store_path = run_guarded(run())
     except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
         return _emit_error(str(exc), as_json=args.json)
+    except TrustAnchorError as exc:
+        return _emit_trust_anchor_refusal(exc, as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
@@ -5566,10 +5600,17 @@ def _refuse_a_store_that_is_not_an_audit_log(
     if not is_sqlite:
         return None
 
-    tail = "(check --db / [store].path)"
-    if not Path(path).exists():
-        print(f"error: no audit database at {path} — {refusal} {tail}", file=sys.stderr)
+    def refuse(message: str) -> int:
+        # `_emit_error` for the stream and the shape, so all three of this guard's refusals honour
+        # `as_json` -- the unreadable-file one below already did through #1670's reporter; these
+        # two printed text to stderr whatever it said (BACKLOG #1922). Its exit 1 is overridden:
+        # 1 here would read as a BROKEN CHAIN, and this is "could not start", which is 2 (see
+        # `_emit_store_open_error`).
+        _emit_error(f"{message} — {refusal} (check --db / [store].path)", as_json=as_json)
         return 2
+
+    if not Path(path).exists():
+        return refuse(f"no audit database at {path}")
 
     try:
         # `as_uri()` percent-encodes, which SQLite decodes back -- a bare f-string would misread a
@@ -5587,11 +5628,7 @@ def _refuse_a_store_that_is_not_an_audit_log(
         return _emit_store_open_error(exc, path, as_json=as_json)
 
     if found is None:
-        print(
-            f"error: {path} is a SQLite database with no audit_log table — {refusal} {tail}",
-            file=sys.stderr,
-        )
-        return 2
+        return refuse(f"{path} is a SQLite database with no audit_log table")
     return None
 
 
@@ -5785,12 +5822,78 @@ def _rekey_audit(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+class _OfflineProbe(NamedTuple):
+    """What :func:`_sqlite_store_held_elsewhere` found. ``unchecked`` names why it could not answer."""
+
+    held: bool = False
+    unchecked: str | None = None
+    #: A readable SQLite file with no ``audit_log`` table, a zero-byte file included: opening it
+    #: would build and key a new store in it rather than rotate one.
+    not_a_store: bool = False
+
+
+def _sqlite_store_held_elsewhere(path: str) -> _OfflineProbe:
+    """Whether another connection has the SQLite store at ``path`` open (BACKLOG #1915).
+
+    It reads the lock SQLite already keeps. In WAL mode a connection holds a SHARED lock on the
+    database file from its first read until it closes, so a serving engine holds one for as long as
+    it runs. A connection in EXCLUSIVE locking mode needs an EXCLUSIVE lock to read, and with
+    ``timeout=0`` it fails at once with SQLITE_BUSY while any other is open. That holds only in WAL
+    mode: in a rollback journal an idle connection holds no lock, so a store the open could not put
+    in WAL is reported unchecked, not free.
+
+    Opened ``mode=rw``, so it never creates a missing file. The URI has no authority part and carries
+    the path percent-encoded, so a UNC or mapped-drive path reaches the file the store opens, which
+    ``Path.as_uri()`` does not. A file SQLite cannot read as a database is left to the store open that
+    follows, which reports it."""
+    import urllib.parse
+
+    uri = "file:" + urllib.parse.quote(path, safe="/\\:") + "?mode=rw"
+    try:
+        probe = sqlite3.connect(uri, uri=True, timeout=0, isolation_level=None)
+    except sqlite3.Error as exc:
+        return _OfflineProbe(unchecked=f"the probe could not open it ({exc})")
+    try:
+        probe.execute("PRAGMA locking_mode=EXCLUSIVE")
+        found = probe.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_log'"
+        ).fetchone()
+        mode = str(probe.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    except sqlite3.Error as exc:
+        # The low byte is the primary code, so an extended BUSY code counts as held too. A Python-side
+        # error carries no code at all.
+        code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+        if code == sqlite3.SQLITE_BUSY:
+            return _OfflineProbe(held=True)
+        if code == sqlite3.SQLITE_NOTADB:
+            return _OfflineProbe()  # the store open reports it, and nothing is rotated
+        return _OfflineProbe(unchecked=f"the probe could not read it ({exc})")
+    finally:
+        probe.close()
+    if found is None:
+        return _OfflineProbe(not_a_store=True)
+    if mode != "wal":
+        return _OfflineProbe(
+            unchecked=f"it is in journal mode {mode!r}, where an idle engine holds no lock"
+        )
+    return _OfflineProbe()
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
     Run **offline** (engine stopped): set ``MEFOR_STORE_ENCRYPTION_KEY`` to the NEW active key and keep
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
     rotate. After it finishes, the retired key can be removed.
+
+    **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
+    a store another connection holds, which is how a serving engine holds it; see
+    :func:`_sqlite_store_held_elsewhere`. At least these gaps remain. An engine started AFTER that
+    check is not seen, since the command's own connections hold the same lock from then on; the audit
+    roll's head check refuses an audit row that lands inside its read, and nothing refuses a data
+    write. A store the probe cannot read, or one not in WAL mode, is not checked, and the command
+    prints a note. And on PostgreSQL or SQL Server nothing is checked; the command prints a note
+    there too.
 
     **Invocation bound (ASVS 11.3.4).** ``key_id`` is a one-way SHA-256 fingerprint of the DEK, so the
     NEW key has no ``cipher_meta`` row and its persisted AES-GCM invocation count starts at zero for
@@ -5839,11 +5942,39 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
+    if settings.store.backend == StoreBackend.SQLITE:
+        if not Path(settings.store.path).exists():
+            print(
+                f"error: no store at {settings.store.path} (check --db / [store].path)",
+                file=sys.stderr,
+            )
+            return 2
+        probe = _sqlite_store_held_elsewhere(settings.store.path)
+        if probe.held:
+            print(
+                f"error: the store at {settings.store.path} is open in another process -- a running "
+                "engine, or another command. rotate-key runs offline: stop the engine and anything "
+                "else using the store, then re-run. Nothing was changed.",
+                file=sys.stderr,
+            )
+            return 2
+        if probe.not_a_store:
+            print(
+                f"error: {settings.store.path} is a SQLite database with no audit_log table, so it is "
+                "not a MessageFoundry store; refusing to build and key a new one in it "
+                "(check --db / [store].path)",
+                file=sys.stderr,
+            )
+            return 2
+        unchecked = probe.unchecked
+    else:
+        unchecked = f"it is a {settings.store.backend.value} store"
+    if unchecked is not None:
         print(
-            f"error: no store at {settings.store.path} (check --db / [store].path)", file=sys.stderr
+            f"note: rotate-key could not check for a running engine: {unchecked}. Confirm every "
+            "engine using this store is stopped: a live engine keeps writing under the old key.",
+            file=sys.stderr,
         )
-        return 2
 
     async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
@@ -5943,10 +6074,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if not rolled_ok:
-        # The data is rotated but the audit chain is not: its current range is still under the prior
-        # key, so dropping that key now would leave the newest range unverifiable. Say so, and fail.
+        # The data is rotated but the audit chain is not settled: its current range is still under
+        # the prior key, that range's key is missing, or the chain does not verify (BACKLOG #1945).
+        # Dropping a key now could leave the newest range unverifiable. Say so, and fail.
         print(
-            f"error: the audit chain was not rolled to the active key — {rolled_msg}. Do NOT remove "
+            f"error: the audit chain step did not complete — {rolled_msg}. Do NOT remove "
             "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until `messagefoundry rotate-key` completes "
             "without this error.",
             file=sys.stderr,
@@ -7053,6 +7185,20 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
     else:
         print(f"error: {message}", file=sys.stderr)
     return 2
+
+
+def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
+    """Report a trust anchor ``provision-admin`` refused, and return exit 1 (BACKLOG #2034).
+
+    ``AuthService`` checks the OIDC and AD anchors when it is built, so a command that builds one
+    refuses an anchor ``serve`` would refuse. The anchor's own text is kept whole: its later lines are
+    the commands that fix the file. Without this arm ``main``'s dispatch floor would report only the
+    exception type and a redacted message (BACKLOG #1863)."""
+    return _emit_error(
+        f"{exc}\nThis command applies the trust-anchor check `serve` applies, so it provisioned "
+        "nothing. Fix the anchor and re-run.",
+        as_json=as_json,
+    )
 
 
 class _OperatorJsonError(Exception):
