@@ -1300,6 +1300,180 @@ def test_fake_paramiko_algorithm_lists_match_the_installed_library() -> None:
     assert tuple(paramiko.Transport._preferred_ciphers) == _FakeTransport._preferred_ciphers
 
 
+def test_sftp_proposes_no_ctr_or_aes128_cipher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CTR and AES-128 are out of the cipher proposal (BACKLOG #2041 and #2044).
+
+    ASVS Appendix C gives CTR status D (disallowed), and owner ruling R4 of 2026-09-26 (BACKLOG
+    #2042) withdrew ``aes128-gcm@openssh.com``. What survives is ``aes256-gcm@openssh.com`` alone.
+
+    The controls come first, for the reason the CBC test above gives: the fixture must offer the
+    names for the subtraction to remove, and the surviving set must be non-empty.
+    """
+    offered = _FakeTransport._preferred_ciphers
+    disabled = _sftp_connect_kwargs(monkeypatch)["disabled_algorithms"]["ciphers"]
+    effective = [c for c in offered if c not in disabled]
+
+    # CONTROL 1: the fixture offers every name this test says is removed.
+    withdrawn = ["aes128-ctr", "aes192-ctr", "aes256-ctr", "aes128-gcm@openssh.com"]
+    assert set(withdrawn) <= set(offered), "restore the real paramiko cipher list in the fake"
+    # CONTROL 2: the connector still proposes something.
+    assert effective, f"every cipher was disabled; negotiation would fail. disabled={disabled}"
+
+    assert not [c for c in effective if c in withdrawn]
+    assert effective == ["aes256-gcm@openssh.com"]
+    # And the allow-list itself cannot take either back without this reddening.
+    assert not [c for c in _APPROVED_SFTP_CIPHERS if c.endswith("-ctr") or c.startswith("aes128")]
+
+
+# --- A real handshake, where the [sftp] extra is installed --------------------------------------
+#
+# The tests above prove the deny list the connector COMPUTES. These prove paramiko honours it on the
+# wire: a loopback paramiko server offers a chosen cipher list, and `_SftpClient._connect` -- the
+# production call, `disabled_algorithms` and all -- either negotiates or is refused. Each refusal has
+# a CONTROL: a stock paramiko client, with no deny list, that DOES negotiate against the same server.
+# Without that control a refusal could just as well be a broken test server.
+#
+# They SKIP where paramiko is absent, which is the default dev install and CI's test legs, the same
+# as `test_fake_paramiko_algorithm_lists_match_the_installed_library` above.
+
+
+def _real_paramiko() -> Any:
+    try:
+        import paramiko
+    except ImportError:
+        pytest.skip(
+            "the [sftp] extra is not installed, so no real SSH handshake can run here. Install "
+            "'messagefoundry[sftp]' to run it."
+        )
+    return paramiko
+
+
+def _sftp_server_offering(
+    paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path
+) -> tuple[int, Path, Any]:
+    """Start a one-connection loopback SSH server that offers only ``ciphers``.
+
+    Returns its port, a ``known_hosts`` file naming its host key (so the client's ``RejectPolicy``
+    stays on), and the thread, which the caller joins.
+    """
+    import socket
+    import threading
+
+    host_key = paramiko.ECDSAKey.generate()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    port = listener.getsockname()[1]
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text(
+        f"[127.0.0.1]:{port} {host_key.get_name()} {host_key.get_base64()}\n", encoding="ascii"
+    )
+
+    class _Server(paramiko.ServerInterface):  # type: ignore[misc]
+        def get_allowed_auths(self, username: str) -> str:
+            return "password"
+
+        def check_auth_password(self, username: str, password: str) -> int:
+            return int(paramiko.AUTH_SUCCESSFUL)
+
+    def serve() -> None:
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            listener.close()
+            return
+        transport = paramiko.Transport(conn)
+        try:
+            transport.add_server_key(host_key)
+            transport.get_security_options().ciphers = ciphers
+            try:
+                transport.start_server(server=_Server())
+            except (paramiko.SSHException, EOFError, OSError):
+                return  # the refusal cases end here, and the client side asserts them
+            # Hold the session open until the client has read what it negotiated and hung up.
+            while transport.is_active():
+                transport.join(0.05)
+        finally:
+            transport.close()
+            listener.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return port, known_hosts, thread
+
+
+def _connector_handshake(
+    paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> str:
+    """Run the production ``_SftpClient._connect`` against a server offering ``ciphers``.
+
+    Returns the cipher it negotiated, or raises what paramiko raised.
+    """
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: paramiko)
+    port, known_hosts, thread = _sftp_server_offering(paramiko, ciphers, tmp_path)
+    client = _SftpClient(
+        {
+            "host": "127.0.0.1",
+            "port": port,
+            "username": "u",
+            "password": "p",
+            "known_hosts": str(known_hosts),
+            "connect_timeout": 10,
+        }
+    )
+    try:
+        ssh = client._connect()
+        try:
+            return str(ssh.get_transport().remote_cipher)
+        finally:
+            ssh.close()
+    finally:
+        thread.join(10)
+
+
+def _stock_handshake(paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path) -> str:
+    """The CONTROL: a stock paramiko ``Transport`` with no deny list, against the same server."""
+    port, _known_hosts, thread = _sftp_server_offering(paramiko, ciphers, tmp_path)
+    transport = paramiko.Transport(("127.0.0.1", port))
+    try:
+        transport.start_client(timeout=10)
+        return str(transport.remote_cipher)
+    finally:
+        transport.close()
+        thread.join(10)
+
+
+def test_sftp_real_handshake_negotiates_aes256_gcm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one approved cipher still gets through, even from a server that lists CTR first."""
+    paramiko = _real_paramiko()
+    offered = ("aes128-ctr", "aes256-ctr", "aes128-gcm@openssh.com", "aes256-gcm@openssh.com")
+    negotiated = _connector_handshake(paramiko, offered, tmp_path, monkeypatch)
+    assert negotiated == "aes256-gcm@openssh.com"
+
+
+@pytest.mark.parametrize(
+    "offered",
+    [
+        pytest.param(("aes128-ctr", "aes192-ctr", "aes256-ctr"), id="ctr-only"),  # BACKLOG #2041
+        pytest.param(("aes128-gcm@openssh.com",), id="aes128-gcm-only"),  # BACKLOG #2044
+    ],
+)
+def test_sftp_real_handshake_refuses_ctr_only_and_aes128_only_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offered: tuple[str, ...]
+) -> None:
+    paramiko = _real_paramiko()
+    # CONTROL: a stock client negotiates with this very server, so the refusal below is the deny
+    # list's doing and not a server that cannot handshake at all.
+    assert _stock_handshake(paramiko, offered, tmp_path / "control") in offered
+    with pytest.raises(paramiko.SSHException, match="(?i)cipher"):
+        _connector_handshake(paramiko, offered, tmp_path, monkeypatch)
+
+
 # === egress allowlist ([egress].allowed_remote) ==============================
 
 

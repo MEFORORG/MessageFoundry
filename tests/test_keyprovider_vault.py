@@ -215,13 +215,39 @@ def test_kek_of_an_unusable_or_sub_128_bit_type_refuses_to_start(
     assert transit.calls == []
 
 
-@pytest.mark.parametrize("key_type", ["aes256-gcm96", "aes128-gcm96", "rsa-4096"])
+@pytest.mark.parametrize("key_type", ["aes256-gcm96", "rsa-4096"])
 def test_kek_of_a_supported_type_still_unwraps(
     monkeypatch: pytest.MonkeyPatch, key_type: str
 ) -> None:
     transit = _FakeTransit(KEY_A, key_type=key_type)
     assert _provider_on(monkeypatch, transit).active_key() == KEY_A
     assert transit.read_calls == [_TRANSIT_KEY]  # the one added round trip, on the startup path
+
+
+def test_an_aes128_kek_is_refused_with_the_steps_that_fix_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``aes128-gcm96`` was a supported KEK type until owner ruling R4 of 2026-09-26 (BACKLOG #2043).
+
+    An operator holding one followed our own earlier advice, so the refusal has to say what to do.
+    It names the key, its type, the replacement type and the knob, warns that a Vault rotate keeps
+    the type, and says how to carry the DEK across. The CONTROL is the ``aes256-gcm96`` case in
+    ``test_kek_of_a_supported_type_still_unwraps`` above: same fake, same wiring, and it unwraps.
+    """
+    withdrawn = "aes128-gcm96"
+    transit = _FakeTransit(KEY_A, key_type=withdrawn)
+    with pytest.raises(KeyProviderError) as excinfo:
+        _provider_on(monkeypatch, transit).active_key()
+    message = str(excinfo.value)
+    assert repr(_TRANSIT_KEY) in message  # the key, by name
+    assert "'aes128-gcm96'" in message  # its type
+    assert "'aes256-gcm96'" in message  # the type to create instead
+    assert "MEFOR_STORE_VAULT_TRANSIT_KEY" in message  # the knob to change
+    assert "rotating the key keeps its type" in message  # the fix that does not work
+    assert "MEFOR_STORE_VAULT_WRAPPED_DEK" in message  # how the DEK crosses to the new key
+    assert KEY_A not in message  # and no key material rides the refusal
+    # Refused BEFORE the unwrap: nothing was decrypted under the withdrawn key.
+    assert transit.calls == []
 
 
 def test_kek_type_that_cannot_be_read_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,3 +274,6 @@ def test_the_three_uses_have_distinct_allowed_type_sets() -> None:
     assert kek - data == {"rsa-3072", "rsa-4096"}
     assert "rsa-2048" not in (data | audit | kek)
     assert not any("ecdsa" in t or t == "ed25519" for t in data | audit | kek)
+    # Owner ruling R4 of 2026-09-26 (BACKLOG #2043): the audit and KEK sets inherit the data set,
+    # so dropping AES-128 there has to drop it from all three.
+    assert not [t for t in data | audit | kek if t.startswith("aes128")]
