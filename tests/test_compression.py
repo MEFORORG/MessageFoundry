@@ -13,13 +13,15 @@ import gzip
 import io
 import os
 import random
+import struct
 import threading
 import time
+import warnings
 import zipfile
 import zlib
 from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 import pytest
 
@@ -795,6 +797,163 @@ def test_zip_negative_seek_shape_still_breaks_zipfile() -> None:  # #1598, #1976
     zf = zipfile.ZipFile(io.BytesIO(_central_directory_offset_too_large()))
     with zf, pytest.raises(ValueError, match="negative seek value"):
         zf.read(zf.infolist()[0])
+
+
+def _assert_names_no_member(exc: pytest.ExceptionInfo[CompressionError]) -> None:
+    assert "SMITH" not in str(exc.value)
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+
+
+def _zip64_second_member_offset(offset: int | None) -> bytes:
+    """Two stored members; the SECOND one's central-directory entry gives its local-header offset
+    through a zip64 extra field, as ``offset``, or as its true offset when ``offset`` is None."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("ok.txt", b"first")
+        info = zipfile.ZipInfo(_PHI_NAME, date_time=(1980, 1, 1, 0, 0, 0))
+        # A placeholder extra of the zip64 field's size. zipfile strips a real zip64 field (0x0001)
+        # from what it writes, so the type is patched in afterwards.
+        info.extra = struct.pack("<HHQ", 0xCAFE, 8, 0)
+        zf.writestr(info, b"second")
+    blob = bytearray(buf.getvalue())
+    cd = blob.index(b"PK\x01\x02", blob.index(b"PK\x01\x02") + 1)
+    true_offset = int.from_bytes(blob[cd + 42 : cd + 46], "little")
+    extra_at = cd + 46 + int.from_bytes(blob[cd + 28 : cd + 30], "little")
+    assert blob[extra_at : extra_at + 2] == b"\xfe\xca"
+    value = true_offset if offset is None else offset
+    blob[extra_at : extra_at + 12] = struct.pack("<HHQ", 0x0001, 8, value)
+    blob[cd + 42 : cd + 46] = b"\xff\xff\xff\xff"  # "see the zip64 field"
+    return bytes(blob)
+
+
+def test_zip64_offset_helper_control_archive_still_decompresses() -> None:  # #1598
+    # Control: with its true offset in the zip64 field the archive reads, so the refusals below come
+    # from the offset's size, not from a helper that corrupts the archive.
+    assert zip_decompress(_zip64_second_member_offset(None), max_output_bytes=None) == {
+        "ok.txt": b"first",
+        _PHI_NAME: b"second",
+    }
+
+
+@pytest.mark.parametrize("offset", [2**63, 2**64 - 1], ids=["2**63", "2**64-1"])
+def test_zip64_offset_past_ssize_t_is_a_compression_error(offset: int) -> None:  # #1598
+    with pytest.raises(
+        CompressionError, match=r"^zip archive member 2 is corrupt or truncated \(OverflowError\)$"
+    ) as exc:
+        zip_decompress(_zip64_second_member_offset(offset), max_output_bytes=None)
+    _assert_names_no_member(exc)
+
+
+@pytest.mark.parametrize("offset", [2**63, 2**64 - 1], ids=["2**63", "2**64-1"])
+def test_zip64_offset_past_ssize_t_still_overflows_zipfile(offset: int) -> None:  # #1598
+    # Control: the shape is the one stdlib zipfile fails on with a raw OverflowError, so the test
+    # above pins the arm that catches it rather than some earlier refusal.
+    zf = zipfile.ZipFile(io.BytesIO(_zip64_second_member_offset(offset)))
+    with zf, pytest.raises(OverflowError):
+        zf.read(zf.infolist()[1])
+
+
+def _overlapped_archive(second: str) -> bytes:
+    """One stored member, with a second central-directory entry pointing at the SAME local header.
+
+    ``unicode-path``: the copy carries a Unicode path extra field (0x7075), so zipfile names it
+    ``other.txt`` and the duplicate-name check passes; both names expand one stored body.
+    ``dir-entry``: the copy is named as a directory, which zipfile never opens."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(zipfile.ZipInfo(_PHI_NAME, date_time=(1980, 1, 1, 0, 0, 0)), b"second")
+    blob = buf.getvalue()
+    cd, eocd = blob.index(b"PK\x01\x02"), blob.rindex(b"PK\x05\x06")
+    entry = blob[cd:eocd]
+    copy = bytearray(entry)
+    if second == "unicode-path":
+        path = b"\x01" + struct.pack("<L", zlib.crc32(_PHI_NAME.encode())) + b"other.txt"
+        extra = struct.pack("<HH", 0x7075, len(path)) + path
+        copy[30:32] = len(extra).to_bytes(2, "little")
+        copy += extra
+    else:
+        name = (_PHI_NAME + "/").encode()
+        copy[28:30] = len(name).to_bytes(2, "little")
+        copy[46 : 46 + len(_PHI_NAME)] = name
+    directory = entry + bytes(copy)
+    record = bytearray(blob[eocd:])
+    record[8:12] = struct.pack("<HH", 2, 2)
+    record[12:16] = len(directory).to_bytes(4, "little")
+    return blob[:cd] + directory + bytes(record)
+
+
+@pytest.mark.parametrize("second", ["unicode-path", "dir-entry"])
+def test_zip_overlapped_entries_are_refused_without_a_warning(second: str) -> None:  # #1598
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(
+            CompressionError,
+            match=r"^zip archive member 2 refused: it shares member 1's local header",
+        ) as exc:
+            zip_decompress(_overlapped_archive(second), max_output_bytes=None)
+    _assert_names_no_member(exc)
+    # zipfile's own warning for this shape prints the member name to stderr, and so to the service
+    # log. Nothing may reach the warnings machinery at all.
+    assert [str(w.message) for w in caught] == []
+
+
+@pytest.mark.parametrize("second", ["unicode-path", "dir-entry"])
+def test_zip_overlapped_shape_still_warns_with_the_name_in_zipfile(second: str) -> None:  # #1598
+    # Control: stdlib zipfile accepts the shape and warns with the member name, so the test above
+    # pins the refusal that pre-empts the warning, not an archive zipfile already rejects.
+    zf = zipfile.ZipFile(io.BytesIO(_overlapped_archive(second)))
+    with zf, pytest.warns(UserWarning, match=r"Overlapped entries: 'SMITH_JOHN_MRN123\.txt'"):
+        assert zf.read(zf.infolist()[0]) == b"second"
+
+
+def _second_member_at_central_directory() -> bytes:
+    # The second member's local-header offset is the central directory's own start. zipfile's
+    # overlap test reads that as a header ending where it starts, which is its warning condition.
+    blob = bytearray(_two_member_zip_with_second_patched())
+    eocd = blob.rindex(b"PK\x05\x06")
+    cd = blob.index(b"PK\x01\x02", blob.index(b"PK\x01\x02") + 1)
+    blob[cd + 42 : cd + 46] = blob[eocd + 16 : eocd + 20]
+    return bytes(blob)
+
+
+def test_zip_member_at_central_directory_fails_before_zipfile_warns() -> None:  # #1598
+    # _zip_overlap_reason's claim that no admitted archive reaches zipfile's warning rests on the
+    # header signature check running BEFORE the overlap test in ZipFile.open for this one shape. If a
+    # later CPython reorders them, the warning would print the member name and this test goes red.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(
+            CompressionError, match=r"^zip archive member 2 is corrupt or truncated \(BadZipFile\)$"
+        ) as exc:
+            zip_decompress(_second_member_at_central_directory(), max_output_bytes=None)
+    _assert_names_no_member(exc)
+    assert [str(w.message) for w in caught] == []
+
+
+@pytest.mark.parametrize(
+    ("patched", "where"),
+    [("open", "zip archive member 1"), ("_RealGetContents", "zip archive")],
+    ids=["reading-a-member", "reading-the-directory"],
+)
+def test_zip_recursion_error_is_labelled_as_recursion(
+    monkeypatch: pytest.MonkeyPatch, patched: str, where: str
+) -> None:  # #1598
+    # RecursionError is a RuntimeError, so the arm for unsupported zip features would catch it and
+    # blame the archive. It comes from the caller's stack depth, so it gets its own label.
+    def _deep(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    archive = zip_compress({"a.txt": b"x"})
+    monkeypatch.setattr(zipfile.ZipFile, patched, _deep)
+    with pytest.raises(
+        CompressionError,
+        match=rf"^{where} could not be read \(the interpreter recursion limit was reached\)$",
+    ) as exc:
+        zip_decompress(archive, max_output_bytes=None)
+    assert "does not support" not in str(exc.value)
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
 
 
 # --- #1977: one bounded-inflate primitive, two trailing rules ------------------------------------

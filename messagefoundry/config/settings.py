@@ -2158,6 +2158,36 @@ class RetentionSettings(_Section):
         return self._parse_clock(self.vacuum_at) if self.vacuum_at else None
 
 
+def split_kerberos_spn(spn: str) -> tuple[str, str]:
+    """Split ``[auth].kerberos_spn`` into ``(service, hostname)`` for pyspnego (BACKLOG #275).
+
+    pyspnego builds the acceptor SPN itself as ``"<service>/<hostname>"``, and its ``hostname``
+    defaults to ``"unspecified"``. So passing the whole ``HTTP/host`` value as ``service=`` yields
+    ``HTTP/host/unspecified``, which names no account. The value must be split once, here.
+
+    Accepts exactly ``SERVICE/host`` with both halves non-empty. A realm suffix (``HTTP/host@REALM``)
+    is refused rather than passed through: no lab has confirmed that form works on either provider,
+    and the host's own domain supplies the realm. The ``ValueError`` text never repeats the value.
+    """
+    if any(ch.isspace() or not ch.isprintable() for ch in spn):
+        raise ValueError(
+            "kerberos_spn must not contain whitespace or control characters; use the form "
+            "SERVICE/host"
+        )
+    if "@" in spn:
+        raise ValueError(
+            "kerberos_spn must not carry a realm suffix (@REALM); use the form SERVICE/host, "
+            "e.g. HTTP/host.example.com -- the host's own domain supplies the realm"
+        )
+    service, sep, hostname = spn.partition("/")
+    if not sep or not service or not hostname or "/" in hostname:
+        raise ValueError(
+            "kerberos_spn must be exactly SERVICE/host with one '/' and both parts non-empty, "
+            "e.g. HTTP/host.example.com"
+        )
+    return service, hostname
+
+
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
 
@@ -2372,7 +2402,11 @@ class AuthSettings(_Section):
     # Windows SSO (Kerberos/SPNEGO) — passwordless login from a domain-joined client.
     # Experimental; off by default. Not a supported v0.1 feature — hardening targeted for 0.2.
     kerberos_enabled: bool = False
-    kerberos_spn: str | None = None  # e.g. HTTP/host.example.com
+    # Exactly SERVICE/host, e.g. HTTP/host.example.com; no realm suffix. Refused at load otherwise.
+    # Unset or empty calls spnego.server() bare: GSSAPI then uses the default keytab, but SSPI
+    # (Windows) asks for the literal principal host/unspecified, so set it there. See
+    # split_kerberos_spn.
+    kerberos_spn: str | None = None
 
     # Federated SSO — OIDC authorization-code + PKCE relying party (ADR 0142, BACKLOG #274). A THIRD
     # login mechanism for an identity that ALREADY exists in on-prem AD: the id_token is verified, then
@@ -2511,6 +2545,14 @@ class AuthSettings(_Section):
     @classmethod
     def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
         return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
+
+    @field_validator("kerberos_spn")
+    @classmethod
+    def _check_kerberos_spn(cls, value: str | None) -> str | None:
+        # Refuse a malformed SPN at load, not at the first browser login (BACKLOG #275).
+        if value:
+            split_kerberos_spn(value)
+        return value
 
     @field_validator("oidc_clock_skew_seconds")
     @classmethod
@@ -3470,7 +3512,8 @@ class AlertsSettings(_Section):
     # push channel, not just the pull-only /me/security-events feed. That feed carries the user's own
     # events, not an administrator's change to their account (auth/notifications.py states the rule).
     # Set false to accept the pull-only feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
-    # messagefoundry/__main__.py.
+    # messagefoundry/__main__.py. BACKLOG #2008 (ASVS 6.4.5): the same gate also requires a credential-
+    # reminder RECIPIENT (webhook_url, or email_to beside host + sender), and false waives that too.
     security_notifications_required: bool = True
 
     # Operator alert rules (ADR 0014): refine severity / which transports fire / cooldown / suppression

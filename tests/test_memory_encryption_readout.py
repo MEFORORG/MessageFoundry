@@ -106,6 +106,7 @@ def exposed_prod_phi(*security_lines: str) -> str:
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
         '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n'
     )
 
 
@@ -411,7 +412,8 @@ def test_silent_on_a_loopback_phi_instance(
         "security.delete_message_bodies_after_days = 30\n"
         "security.block_unlisted_outbound = true\n"
         "[retention]\ndead_letter_days = 30\n"
-        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n',
+        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n',
         env="prod",
     )
     assert rc == 0
@@ -465,7 +467,8 @@ def test_the_recommended_loopback_behind_proxy_topology_still_starts(
         '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
-        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n',
+        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n',
         env="prod",
     )
     assert rc == 0

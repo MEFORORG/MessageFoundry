@@ -1919,7 +1919,14 @@ pass. That is why *renamed* is absent from the ambiguity list below: it used to 
 rename as an absence revoked the renamed person's sessions on every interval. A directory that returns
 no readable `objectGUID` still probes by name and keeps that ambiguity (BACKLOG #1471, #1532). Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
-BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5).
+BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
+row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and
+audits `auth.ad_reconcile_binding_unkeyed` with reason `directory_object_id_missing`, once per account
+per process, and a federated sign-in to it is refused with the same reason. That row is distinct from
+the outage's `auth.ad_reconcile_skipped` on purpose: it reports one account whose directory disable
+the pass will not enforce, which is not benign. **The cost:** a directory
+disable or demotion no longer ends that row's sessions within one interval, only at their expiry.
+Removing the binding (`DELETE /users/{user_id}/federated-identity`) returns the row to the pass.
 
 Three safety properties, because the lookup still returns one indistinguishable "not found" for
 *disabled*, *deleted*, *moved out of the search base* and *the search base was never right*:

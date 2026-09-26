@@ -644,7 +644,10 @@ def test_cert_identity_map_requires_client_ca() -> None:
 # require_mfa posture exactly. create_managed_app + uvicorn are mocked so no socket is opened. The keyless
 # gate is pre-satisfied with an encryption key so only the Posture-B posture decides prod refusals.
 
-_SECURE_ALERTS = '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+_SECURE_ALERTS = (
+    '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+    'email_to = ["ops@example.org"]\n'
+)
 
 
 def _posture_b_toml(
@@ -1052,6 +1055,7 @@ def test_serve_loopback_emits_no_new_stderr(
         # empty. Configuring the transport is the honest way past the gate and stays silent.
         'alerts.email_smtp_host = "smtp.example.org"\n'
         'alerts.email_from = "sec@example.org"\n'
+        'alerts.email_to = ["ops@example.org"]\n'
         "security.delete_message_bodies_after_days = 30\n"
         "retention.dead_letter_days = 30\n"
         "retention.reference_snapshot_days = 30\n"

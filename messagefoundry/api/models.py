@@ -650,8 +650,9 @@ class StatsResponse(BaseModel):
     # backend reports 0 (counting is wired on SQLite + SQL Server).
     committed_txns: int = 0
     body_copies: int = 0
-    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres only; 0
-    # elsewhere). Non-zero == a superseded ex-leader was stopped mid-write. MUST be declared here:
+    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres and SQL
+    # Server; 0 on SQLite). Non-zero == a superseded ex-leader was stopped mid-write. MUST be
+    # declared here, because
     # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
     # and /stats would never grow the field.
     fenced_writes: int = 0
