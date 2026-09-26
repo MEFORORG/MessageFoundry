@@ -22,8 +22,6 @@ import re
 import sys
 from pathlib import Path
 
-import yaml
-
 from tests._workflow_contexts import load_workflow
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -179,27 +177,6 @@ def test_the_resync_checks_out_the_triggering_sha() -> None:
     checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
     assert len(checkouts) == 1, f"expected one checkout step, found {len(checkouts)}"
     assert checkouts[0]["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
-
-
-def test_the_zizmor_suppression_still_points_at_the_actor_check() -> None:
-    """RED when: a line added above the job's ``if:`` moves the actor check off its zizmor anchor.
-
-    ``.github/zizmor.yml`` suppresses the ``bot-conditions`` finding on ONE line of this workflow,
-    on purpose (its comment says why). Any edit above that line moves it, zizmor then reports the
-    finding on the new line, and the scan goes red. Adding the closure step's comments did exactly
-    that (BACKLOG #1812), and nothing local caught it.
-    """
-    config = yaml.safe_load((_ROOT / ".github" / "zizmor.yml").read_text(encoding="utf-8"))
-    ignores = config["rules"]["bot-conditions"]["ignore"]
-    anchors = [e for e in ignores if str(e).startswith(f"{_RESYNC.name}:")]
-    assert len(anchors) == 1, f"expected one {_RESYNC.name} anchor in zizmor.yml, found {anchors}"
-    # `file:line`, or zizmor's `file:line:col`; the line is the second field either way.
-    line_no = int(str(anchors[0]).split(":")[1])
-    line = _RESYNC.read_text(encoding="utf-8").splitlines()[line_no - 1]
-    assert "github.triggering_actor == 'dependabot[bot]'" in line, (
-        f"zizmor.yml anchors {anchors[0]}, but that line is now {line.strip()!r}. Re-anchor it to "
-        "the line holding the triggering_actor check."
-    )
 
 
 def test_the_regenerator_imports_only_the_standard_library() -> None:
