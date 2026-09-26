@@ -3,7 +3,7 @@
 """Connector configuration models — the transport-level building blocks.
 
 A :class:`Source`/:class:`Destination` is a transport endpoint (type + free-form
-``settings`` validated by the connector plugin) plus delivery behaviour. The code-first
+``settings`` validated by the connector) plus delivery behaviour. The code-first
 wiring layer (:mod:`messagefoundry.config.wiring`) builds these from a connection's
 ``ConnectionSpec`` to resolve connectors via the registry; routing/filtering/transforming
 is done in code-first Router/Handler scripts, not here.
@@ -31,7 +31,7 @@ from messagefoundry.mllpcodec import AckMode as AckMode
 
 class ConnectorType(str, Enum):  # noqa: UP042
     """Built-in transport connectors. A closed set: a new transport is a new member here, and no
-    plugin can add a value at runtime. Whether to open it is BACKLOG #1624."""
+    plugin can add a value at runtime. Opening it to plugins would be new work."""
 
     MLLP = "mllp"
     TCP = "tcp"  # raw TCP with configurable delimiter framing (X12 over TCP, ADR 0003)

@@ -14,7 +14,7 @@ import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -50,6 +50,8 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import ApiSettings, AuthSettings, CertMonitorSettings
 from messagefoundry.config.tls_policy import validate_proxy_tls_posture
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, certs_from_registry
 
 SAMPLES_CONFIG = Path(__file__).resolve().parent.parent / "samples" / "config"
 
@@ -365,6 +367,119 @@ def test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder(
     stock.minimum_version = ssl.TLSVersion.TLSv1_2
     with pytest.raises(ssl.SSLError, match="self.signed|unable to get local issuer"):  # claim 2
         _handshake(server, stock, client_cert=None, server_hostname="0.0.0.0")
+
+
+# --- BACKLOG #1276: the certificate serve presents is the one the expiry monitor watches -----
+
+_SYNTHETIC_LOOPBACK_TOML = (
+    "security.block_unlisted_outbound = true\n"
+    "security.allow_unencrypted_phi = true\n"
+    "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+    "alerts.security_notifications_required = false\n"
+    "security.local_access_only = true\n"
+)
+
+
+def _serve_capturing_monitored_api_cert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str
+) -> tuple[str | None, dict[str, Any]]:
+    """Run ``serve`` and return the ``api_tls_cert_file`` it handed the app, plus uvicorn's kwargs.
+
+    That kwarg is the only route the ``[api]`` certificate takes to ``Engine._monitored_certs``,
+    which feeds ``CertExpiryRunner``. The real ``create_managed_app`` still runs, so nothing else
+    about the serve path changes under the spy.
+    """
+    import messagefoundry.api as api_pkg
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.store.crypto import generate_key
+
+    handed: dict[str, Any] = {}
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        handed.update(kwargs)
+        return create_managed_app(*args, **kwargs)
+
+    captured: dict[str, Any] = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
+    monkeypatch.setattr(api_pkg, "create_managed_app", _spy)
+    (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    assert "api_tls_cert_file" in handed  # the spy saw the call, so a None below is a real None
+    return handed["api_tls_cert_file"], captured
+
+
+def test_the_generated_api_certificate_is_watched_by_the_expiry_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no ``[api].tls_cert_file`` the engine serves a minted pair, and THAT cert is watched.
+
+    Before this fix serve passed the PRE-mint config value, which is None exactly when the engine
+    minted, so the monitored set was empty and an engine running past the placeholder's notAfter
+    served an expired certificate with no alarm, while ``ensure_api_tls_material``'s docstring
+    said the alarm existed.
+    """
+    monitored, captured = _serve_capturing_monitored_api_cert(
+        tmp_path, monkeypatch, _SYNTHETIC_LOOPBACK_TOML
+    )
+    minted = tmp_path / _GENERATED_CERT_NAME
+    assert "ssl_context_factory" in captured  # serve really did terminate TLS on the minted pair
+    assert minted.exists()
+    assert monitored is not None
+    assert Path(monitored).resolve() == minted.resolve()
+
+    # The runner's own path: certs_from_registry is what Engine._monitored_certs returns.
+    certs = certs_from_registry(None, monitored)
+    assert [c.label for c in certs] == ["api"]
+    not_after = x509.load_pem_x509_certificate(minted.read_bytes()).not_valid_after_utc.timestamp()
+    sink = _RecordingCertSink()
+    runner = CertExpiryRunner(
+        lambda: certs, CertMonitorSettings(warn_days=30), alert_sink=cast("AlertSink", sink)
+    )
+    runner.run_once(now=not_after - 40 * 86_400)
+    assert sink.events == []  # outside the window: the control, so the next alarm is attributable
+    runner.run_once(now=not_after + 86_400)
+    assert [(e["name"], e["days_remaining"]) for e in sink.events] == [("api", -1)]
+    assert Path(sink.events[0]["path"]).resolve() == minted.resolve()
+
+
+def test_an_operator_api_certificate_is_still_watched_by_the_expiry_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Control: the operator branch passes its configured path through, and nothing is minted.
+    cert, key = _self_signed(tmp_path)
+    monitored, _ = _serve_capturing_monitored_api_cert(
+        tmp_path,
+        monkeypatch,
+        _SYNTHETIC_LOOPBACK_TOML
+        + f'[api]\ntls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n',
+    )
+    assert monitored is not None
+    assert Path(monitored).resolve() == cert.resolve()
+    assert not (tmp_path / _GENERATED_CERT_NAME).exists()
+
+
+def test_an_upstream_terminated_api_has_no_certificate_to_watch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Control: behind a declared upstream terminator the engine serves no certificate, so there is
+    # nothing of its own to watch. The proxy's certificate is the proxy's to monitor.
+    monitored, captured = _serve_capturing_monitored_api_cert(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        "alerts.security_notifications_required = false\n"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        'security.enforcement = "warn"\n'
+        "[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\n"
+        'trusted_proxies = ["10.0.0.7"]\n'
+        'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
+    )
+    assert "ssl_context_factory" not in captured
+    assert monitored is None
+    assert certs_from_registry(None, monitored) == []
+    assert not (tmp_path / _GENERATED_CERT_NAME).exists()
 
 
 # --- WP-15: reverse-proxy / upstream TLS termination -------------------------

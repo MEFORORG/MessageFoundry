@@ -756,6 +756,41 @@ _REPLAYABLE_BODY_Q = _REPLAYABLE_BODY.replace("payload", "q.payload").replace(
     "body_ref", "q.body_ref"
 )
 
+#: The ``handler_name`` stamped on a pass-through COMPLETION MARKER (BACKLOG #1580). A marker is the
+#: already-terminal ``stage='outbound'`` row :meth:`MessageStore._insert_passthrough_marker` writes so
+#: the finalizer counts a ``Send`` into a pass-through inbound. It is bookkeeping, not work: its
+#: target is an INBOUND name, no delivery worker drains that name, and its body is empty.
+#:
+#: A real outbound row never carries a ``handler_name`` (the transform worker's handler name lives
+#: on routed rows), so an outbound row carrying THIS value is a marker and nothing else. The stamp
+#: is explicit on purpose. The marker's empty body cannot identify it, because a keyed store
+#: encrypts ``''`` into a real ``mfenc:`` cell, and a name comparison cannot either, because inbound
+#: and outbound names live in separate namespaces and may coincide. The server backends import this
+#: value for their own inserts.
+PASSTHROUGH_MARKER_HANDLER: Final = "@passthrough-marker"
+
+#: A queue row that is NOT a pass-through completion marker (BACKLOG #1580). Spliced beside
+#: :data:`_REPLAYABLE_BODY` into at least :meth:`QueueStore.replay`, :meth:`QueueStore.replay_dead`,
+#: the source read of :meth:`QueueStore.resend_to`, and (as :data:`_NOT_PT_MARKER_Q`) the attachment
+#: clean-up's live-holder check. A new reader that asks "can this row still be delivered?" needs it
+#: too. Re-pending a marker created work nothing can drain: the startup
+#: sweep would later dead-letter it and flip a delivered parent to ``ERROR``. A marker is also never a
+#: resend source, because it carries no body.
+#:
+#: Scoped to ``stage='outbound'`` so a ROUTED row whose real handler happens to share the reserved
+#: name is never caught. ``COALESCE`` keeps the test two-valued: a bare ``NOT (... = ...)`` over a
+#: NULL ``handler_name`` evaluates to NULL and would silently exclude EVERY ordinary outbound row.
+#: A plain literal, not built from the constants above, so the structural gate in
+#: ``tests/test_replay_erased_body_scope.py`` can read it off the AST;
+#: ``tests/test_passthrough.py`` pins that it names both.
+_NOT_PT_MARKER = "NOT (stage = 'outbound' AND COALESCE(handler_name, '') = '@passthrough-marker')"
+
+#: The same exclusion over an aliased ``queue q``, DERIVED so the two cannot drift. Used by the
+#: attachment clean-up's live-holder check, which must agree with replay about what can be re-queued.
+_NOT_PT_MARKER_Q = _NOT_PT_MARKER.replace("stage", "q.stage").replace(
+    "handler_name", "q.handler_name"
+)
+
 
 @dataclass(frozen=True)
 class ReingressOutcome:
@@ -776,7 +811,8 @@ class OutboxItem:
     """A unit of staged work: a raw message at the ingress stage, one handler assignment at the routed
     stage, or one message→destination delivery at the outbound stage. ``stage`` tells a generalized
     worker which it is. ``destination_name`` is set only on outbound rows; ``handler_name`` only on
-    routed rows (it names the handler the transform worker must run) — both ``None`` otherwise."""
+    routed rows (it names the handler the transform worker must run) — both ``None`` otherwise. (A
+    pass-through completion marker also carries ``handler_name``, but no claim ever returns one.)"""
 
     id: str
     message_id: str
@@ -3438,16 +3474,19 @@ CREATE INDEX IF NOT EXISTS ix_messages_control  ON messages(channel_id, control_
 -- Generic staged-queue table (staged pipeline, ADR 0001). One table for every stage; the `stage`
 -- column discriminates ingress | routed | outbound rows. Supersedes the original `outbox` table
 -- (legacy DBs migrate their rows in as stage='outbound' — see _migrate). `destination_name` is set
--- only on outbound rows; `handler_name` only on routed rows (the handler the transform worker runs).
--- Both are NULL otherwise. (The "set only on stage X" invariants are enforced in code — only the
--- stage's producer writes the column — not by a CHECK, which SQLite can't ADD to a live table.)
+-- only on outbound rows; `handler_name` only on routed rows (the handler the transform worker runs),
+-- plus the reserved PASSTHROUGH_MARKER_HANDLER stamp on a pass-through completion marker (BACKLOG
+-- #1580), an outbound-stage row no worker claims. Both are NULL otherwise. (The "set only on
+-- stage X" invariants are enforced in code — only the stage's producer writes the column — not by
+-- a CHECK, which SQLite can't ADD to a live table.)
 CREATE TABLE IF NOT EXISTS queue (
     id               TEXT PRIMARY KEY,
     message_id       TEXT NOT NULL REFERENCES messages(id),
     stage            TEXT NOT NULL,   -- 'ingress' | 'routed' | 'outbound'
     channel_id       TEXT NOT NULL,   -- inbound connection name
     destination_name TEXT,            -- outbound connection name; NULL for ingress/routed rows
-    handler_name     TEXT,            -- handler to run; set only on routed rows, NULL otherwise
+    handler_name     TEXT,            -- handler to run on routed rows; the PT marker stamp on a
+                                      -- pass-through completion marker (#1580); NULL otherwise
     payload          TEXT NOT NULL,   -- stage body (encoded): ingress/routed=raw, outbound=transformed
     body_ref         TEXT,            -- store-once-deliver-many: when set, the body lives ONCE in
                                       -- shared_body[body_ref] and payload is '' (deref'd at delivery);
@@ -5861,11 +5900,13 @@ class MessageStore:
 
         The replayability half is :data:`_REPLAYABLE_BODY`, shared with :meth:`replay` /
         :meth:`replay_dead` (BACKLOG #1560) so the attachment GC and the replay guard can never
-        disagree about which rows are still deliverable."""
+        disagree about which rows are still deliverable. A DEAD pass-through completion marker is not a
+        holder either (:data:`_NOT_PT_MARKER`, BACKLOG #1580): replay never re-queues one, and on a keyed
+        store its encrypted empty body would otherwise pin the parent's attachment forever."""
         return (
             "EXISTS (SELECT 1 FROM queue q WHERE q.message_id = "
             f"{msg_col} AND (q.status IN (?, ?) OR "
-            f"(q.status = ? AND ({_REPLAYABLE_BODY_Q}))))"
+            f"(q.status = ? AND ({_REPLAYABLE_BODY_Q}) AND {_NOT_PT_MARKER_Q})))"
         )
 
     async def release_message_attachments(self, message_id: str) -> None:
@@ -7535,7 +7576,10 @@ class MessageStore:
         and FIFO/ready claims take ``pending`` rows only — so it is inert work-wise; it exists solely so
         the single finalizer authority counts the Send's outcome. The payload is the empty-body sentinel
         (no real egress body); ``next_attempt_at`` is ``now`` (terminal, never due). A ``delivered``/
-        ``dead`` event mirrors a normal outbound's so the hop is visible in the per-message timeline."""
+        ``dead`` event mirrors a normal outbound's so the hop is visible in the per-message timeline.
+
+        ``handler_name`` carries :data:`PASSTHROUGH_MARKER_HANDLER`, which is how replay, dead-letter
+        replay, resend and the attachment clean-up tell this row from real outbound work (#1580)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
@@ -7552,7 +7596,7 @@ class MessageStore:
                 Stage.OUTBOUND.value,
                 pt_name,
                 pt_name,
-                None,
+                PASSTHROUGH_MARKER_HANDLER,
                 self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
                 status,
                 0,
@@ -8407,7 +8451,15 @@ class MessageStore:
         The ``stuck`` count deliberately does NOT carry the predicate. An unreplayable ``dead`` row
         still means something is stuck, so the message stays in RECOVER mode and this returns 0.
         Excluding it would fall through to RE-SEND and re-transmit the message's *delivered* siblings,
-        which the operator did not ask for — a worse outcome than doing nothing."""
+        which the operator did not ask for — a worse outcome than doing nothing.
+
+        **A pass-through completion marker is never re-queued either** (:data:`_NOT_PT_MARKER`,
+        BACKLOG #1580). It is bookkeeping on an inbound-only lane that no delivery worker drains, so a
+        re-pended marker held a delivered parent at ``ROUTED`` until the startup sweep flipped it to
+        ``ERROR``. Replay does not retransmit a pass-through ``Send``: the marker carries no body, and
+        the child it produced is its own message, replayable in its own right. The ``stuck`` count
+        leaves this predicate out for the same reason as the erased-body one: a depth-capped DEAD
+        marker is a real failure, so the parent stays in RECOVER mode and keeps its ``ERROR``."""
         now = time.time() if now is None else now
         async with self._lock:
             cur = await self._db.execute(
@@ -8433,13 +8485,14 @@ class MessageStore:
                 # is never going to run again (#1560).
                 await self._db.execute(
                     "DELETE FROM delivered_keys WHERE outbox_id IN"
-                    f" (SELECT id FROM queue WHERE message_id=? AND status=? AND ({_REPLAYABLE_BODY}))",
+                    " (SELECT id FROM queue WHERE message_id=? AND status=?"
+                    f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER})",
                     (message_id, OutboxStatus.DONE.value),
                 )
             cur = await self._db.execute(
                 "UPDATE queue SET status=?, attempts=0, next_attempt_at=?,"
                 f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})"
-                f" AND ({_REPLAYABLE_BODY})",
+                f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                 (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
             )
             if cur.rowcount:
@@ -8495,6 +8548,10 @@ class MessageStore:
         ``self._lock``, so this whole txn totally orders against every producer — commit-order ==
         rowid-order — and the resend can never be delivered ahead of an older in-flight row (the
         strict-FIFO writer-funnel; see the ADR for the Postgres/SQL Server mechanisms).
+
+        A pass-through completion marker is never a source (:data:`_NOT_PT_MARKER`, BACKLOG #1580): it
+        has no body, so counting it made a mixed parent read as ambiguous and a pass-through-only
+        parent read as purged.
 
         Rejects (raise, no mutation): :class:`ResendSourceNotFound` (no delivered source body),
         :class:`ResendSourceEmpty` (retention nulled the source body — must-fix #2),
@@ -8615,13 +8672,14 @@ class MessageStore:
                 outbox_id = await self._insert_outbound_row(child_mid, src_channel, to, body, now)
             else:
                 # Resolve the source + its stored body (deref a shared body via COALESCE, like
-                # outbox_payloads_for). ANY retained stage='outbound' row is an eligible source — the
+                # outbox_payloads_for). ANY retained stage='outbound' row except a pass-through
+                # completion marker (no body, BACKLOG #1580) is an eligible source — the
                 # transform already produced its body, so a `done`/`cancelled` body, a `dead` one
                 # (diverting a permanently-failed delivery to a standby is a marquee use case, ADR 0090
                 # §1), or a still-`pending`/`inflight` one all ship the same bytes. `from_destination`
                 # names the SOURCE LANE the bytes were produced for, not a claim that that lane
                 # delivered (review #123-3: the eligibility contract is retained-body, not delivered).
-                src_where = "message_id=? AND stage=?"
+                src_where = f"message_id=? AND stage=? AND {_NOT_PT_MARKER}"
                 src_params: list[object] = [message_id, Stage.OUTBOUND.value]
                 if from_ is not None:
                     src_where += " AND destination_name=?"
@@ -8870,9 +8928,13 @@ class MessageStore:
         before the UPDATE, so guarding only the write would revert a purged message from ``ERROR`` to
         ``ROUTED`` with nothing actually re-queued — a NEW false disposition, worse than the zero-byte
         send it replaced, and invisible to a ``rowcount`` check. A mixed batch replays the rows that
-        still have a body and leaves the rest dead."""
+        still have a body and leaves the rest dead.
+
+        **A depth-capped pass-through marker is excluded the same way** (:data:`_NOT_PT_MARKER`,
+        BACKLOG #1580), through the same shared ``clause``: no worker drains its inbound-only lane, and
+        its parent must keep the ``ERROR`` the breach earned rather than revert to ``ROUTED``."""
         now = time.time() if now is None else now
-        where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})"]
+        where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
         if channel_id is not None:
             where.append("channel_id=?")

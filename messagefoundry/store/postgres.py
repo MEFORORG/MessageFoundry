@@ -124,6 +124,7 @@ from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
+    PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -254,6 +255,18 @@ _EPOCH_GUARD_RESOLVE = (
 #: :meth:`PostgresStore.replay` and :meth:`PostgresStore.replay_dead` so neither re-queues a delivery
 #: whose content retention has erased.
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
+
+#: A queue row that is NOT a pass-through completion marker (BACKLOG #1580). The Postgres twin of
+#: ``store._NOT_PT_MARKER``; the reasoning lives there and is not restated. Spliced into
+#: :meth:`PostgresStore.replay`, :meth:`PostgresStore.replay_dead` and the source read of
+#: :meth:`PostgresStore.resend_to`, so none of them turns a marker back into outbound work.
+_NOT_PT_MARKER = "NOT (stage = 'outbound' AND COALESCE(handler_name, '') = '@passthrough-marker')"
+
+#: The same exclusion over an aliased ``queue q``, DERIVED so the two cannot drift. Used by the
+#: attachment clean-up's live-holder check, which must agree with replay about what can be re-queued.
+_NOT_PT_MARKER_Q = _NOT_PT_MARKER.replace("stage", "q.stage").replace(
+    "handler_name", "q.handler_name"
+)
 
 
 class _FencedWrite(Exception):
@@ -2590,12 +2603,13 @@ class PostgresStore:
         await conn.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
             " payload, status, attempts, next_attempt_at, created_at, updated_at)"
-            " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,0,$8,$9,$10)",
+            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$9,$10,$11)",
             marker_id,
             parent_id,
             Stage.OUTBOUND.value,
             pt_name,
             pt_name,
+            PASSTHROUGH_MARKER_HANDLER,  # the stamp replay keys on (BACKLOG #1580)
             self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
             status,
             now,
@@ -5172,7 +5186,8 @@ class PostgresStore:
         return (
             f"EXISTS (SELECT 1 FROM queue q WHERE q.message_id = {msg_col}"
             f" AND (q.status = ANY(${inflight_ph}::text[])"
-            f" OR (q.status = ${dead_ph} AND (q.payload <> '' OR q.body_ref IS NOT NULL))))"
+            f" OR (q.status = ${dead_ph} AND (q.payload <> '' OR q.body_ref IS NOT NULL)"
+            f" AND {_NOT_PT_MARKER_Q})))"
         )
 
     def _attachment_release_body_where(
@@ -5483,7 +5498,8 @@ class PostgresStore:
         A row whose body retention has ERASED is never re-queued (:data:`_REPLAYABLE_BODY`, BACKLOG
         #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
         idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
-        docstring carries the reasoning — including why the ``stuck`` count deliberately does not."""
+        docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
+        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580)."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
@@ -5503,15 +5519,15 @@ class PostgresStore:
                 # completed as a crash-re-run duplicate. Scoped to this message only.
                 await conn.execute(
                     "DELETE FROM delivered_keys WHERE outbox_id IN"
-                    f" (SELECT id FROM queue WHERE message_id=$1 AND status=$2"
-                    f" AND ({_REPLAYABLE_BODY}))",
+                    " (SELECT id FROM queue WHERE message_id=$1 AND status=$2"
+                    f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER})",
                     message_id,
                     OutboxStatus.DONE.value,
                 )
             result = await conn.execute(
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
                 f" updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
-                f" AND ({_REPLAYABLE_BODY})",
+                f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                 OutboxStatus.PENDING.value,
                 now,
                 message_id,
@@ -5658,12 +5674,14 @@ class PostgresStore:
                         conn, child_mid, src_channel, to, body, now
                     )
                 else:
-                    # Resolve the source + its stored body (deref a shared body via COALESCE). ANY retained
-                    # stage='outbound' row is an eligible source (done/cancelled/dead/pending) — the
-                    # transform already produced its body; diverting a permanently-failed (dead) delivery
-                    # to a standby is a marquee use case (ADR 0090 §1). `from_destination` names the source
-                    # LANE, not a delivery claim (review #123-3).
-                    src_where = "message_id=$1 AND stage=$2"
+                    # Resolve the source + its stored body (deref a shared body via COALESCE). A
+                    # pass-through completion marker is never a source (no body, BACKLOG #1580).
+                    # Every other retained stage='outbound' row is an eligible source
+                    # (done/cancelled/dead/pending) — the transform already produced its body;
+                    # diverting a permanently-failed (dead) delivery to a standby is a marquee use
+                    # case (ADR 0090 §1). `from_destination` names the source LANE, not a delivery
+                    # claim (review #123-3).
+                    src_where = f"message_id=$1 AND stage=$2 AND {_NOT_PT_MARKER}"
                     src_args: list[Any] = [message_id, Stage.OUTBOUND.value]
                     if from_ is not None:
                         src_where += " AND destination_name=$3"
@@ -5879,13 +5897,16 @@ class PostgresStore:
         Unlike the SQLite and SQL Server backends this spells its two statements out separately, so the
         predicate is written TWICE on purpose: the affected message set comes from the ``SELECT
         DISTINCT``, and guarding only the UPDATE would revert a purged message from ``ERROR`` to
-        ``ROUTED`` with nothing re-queued. ``tests/test_replay_erased_body_scope.py`` pins both."""
+        ``ROUTED`` with nothing re-queued. ``tests/test_replay_erased_body_scope.py`` pins both. The
+        pass-through marker exclusion (:data:`_NOT_PT_MARKER`, BACKLOG #1580) is written twice for the
+        same reason, and the same file pins it."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
                 "SELECT DISTINCT message_id FROM queue WHERE stage=$1 AND status=$2"
                 " AND ($3::text IS NULL OR channel_id=$3)"
-                f" AND ($4::text IS NULL OR destination_name=$4) AND ({_REPLAYABLE_BODY})",
+                f" AND ($4::text IS NULL OR destination_name=$4) AND ({_REPLAYABLE_BODY})"
+                f" AND {_NOT_PT_MARKER}",
                 Stage.OUTBOUND.value,
                 OutboxStatus.DEAD.value,
                 channel_id,
@@ -5898,7 +5919,8 @@ class PostgresStore:
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
                 " updated_at=$2 WHERE stage=$3 AND status=$4"
                 " AND ($5::text IS NULL OR channel_id=$5)"
-                f" AND ($6::text IS NULL OR destination_name=$6) AND ({_REPLAYABLE_BODY})",
+                f" AND ($6::text IS NULL OR destination_name=$6) AND ({_REPLAYABLE_BODY})"
+                f" AND {_NOT_PT_MARKER}",
                 OutboxStatus.PENDING.value,
                 now,
                 Stage.OUTBOUND.value,

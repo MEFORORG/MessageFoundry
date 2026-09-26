@@ -3,8 +3,9 @@
 """Transport connectors (sources & destinations).
 
 Each connector implements the small async interface in :mod:`.base` and is keyed by
-:class:`~messagefoundry.config.models.ConnectorType` in a registry, so new transports
-register without changes to the channel model or pipeline. Phase 1: MLLP + file.
+:class:`~messagefoundry.config.models.ConnectorType` in a registry, so the pipeline builds
+every transport the same way. ``ConnectorType`` is a closed enum, so a new transport still
+adds a member in ``config/models.py``; :mod:`.base` lists what else it touches.
 
 Importing this package registers the built-in connectors (the ``mllp`` and ``file``
 modules call ``register_source``/``register_destination`` at import time), so callers can

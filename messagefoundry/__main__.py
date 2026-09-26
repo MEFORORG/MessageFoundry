@@ -3651,6 +3651,25 @@ def _serve(args: argparse.Namespace) -> int:
     settings.security.block_unlisted_outbound = settings.egress.deny_by_default
     settings.security.delete_message_bodies_after_days = settings.retention.messages_days
 
+    # BACKLOG #1276: THE ENGINE ALWAYS SERVES TLS. Owner ruling 2026-08-22 (option 3), which
+    # SUPERSEDES ADR 0143's premise that the console is hardened "over a cleartext loopback
+    # secure-context WITHOUT auto-TLS". An operator certificate always wins; with none configured
+    # the engine mints a self-signed placeholder rather than opening a cleartext socket.
+    #
+    # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
+    # DAST target each decide it their own way, which is the defect this item exists to remove.
+    from messagefoundry.api.tls import ensure_api_tls_material, generated_state_dir
+
+    _material = ensure_api_tls_material(
+        settings.api, state_dir=generated_state_dir(settings.store.path)
+    )
+    # Minted HERE, before the app is built, so the expiry monitor below watches the certificate this
+    # listener actually presents. [api].tls_cert_file is the PRE-mint config value and is empty
+    # exactly when the engine minted, so handing the monitor that value left the generated pair
+    # unwatched (BACKLOG #1276). None only behind a declared upstream terminator: the engine then
+    # serves no certificate of its own, so it has none to watch.
+    _served_api_cert = _material[0] if _material is not None else None
+
     app = create_managed_app(
         store_settings=settings.store,
         security_settings=settings.security,
@@ -3705,7 +3724,7 @@ def _serve(args: argparse.Namespace) -> int:
         update_check_settings=settings.update_check,
         backup_settings=settings.backup,
         dr_settings=settings.dr,
-        api_tls_cert_file=settings.api.tls_cert_file,
+        api_tls_cert_file=_served_api_cert,  # the SERVED cert, generated or operator (#1276)
         # ASVS 6.4.5: operator-held copies of inbound service callers' client certs — watched by the same
         # [cert_monitor] scan, so a caller's cert cannot expire unnoticed while it has stopped connecting.
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
@@ -3784,22 +3803,8 @@ def _serve(args: argparse.Namespace) -> int:
         "http": floored_http_protocol_class(),
         "ws": floored_ws_protocol_class(),
     }
-    # BACKLOG #1276: THE ENGINE ALWAYS SERVES TLS. Owner ruling 2026-08-22 (option 3), which
-    # SUPERSEDES ADR 0143's premise that the console is hardened "over a cleartext loopback
-    # secure-context WITHOUT auto-TLS". An operator certificate always wins; with none configured
-    # the engine mints a self-signed placeholder rather than opening a cleartext socket.
-    #
-    # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
-    # DAST target each decide it their own way, which is the defect this item exists to remove.
-    from messagefoundry.api.tls import (
-        build_api_ssl_context,
-        ensure_api_tls_material,
-        generated_state_dir,
-    )
+    from messagefoundry.api.tls import build_api_ssl_context
 
-    _material = ensure_api_tls_material(
-        settings.api, state_dir=generated_state_dir(settings.store.path)
-    )
     if _material is not None:
         _cert, _key = _material
         # _key is None when the operator embedded the private key in the cert PEM (tls_key_file is

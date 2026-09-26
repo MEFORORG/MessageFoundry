@@ -79,8 +79,10 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
     current_hop_posture,
     is_loopback_hop_host,
+    log_revocation_attestation,
 )
 from messagefoundry.config.wiring import (
+    FhirLookupSpec,
     InboundConnection,
     OutboundConnection,
     PortConflictError,
@@ -1811,8 +1813,8 @@ class RegistryRunner:
             return None
         resolved: dict[str, dict[str, Any]] = {}
         for name, spec in self.registry.fhir_lookups.items():
-            settings = resolve_env_settings(spec.settings, self._env_values)
-            _apply_egress_proxy_default(settings, self._egress)  # ADR 0126: site-wide forward proxy
+            # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
+            settings = _fhir_lookup_settings(spec, self._env_values, self._egress)
             check_fhir_lookup_allowed(name, settings, self._egress)
             resolved[name] = settings
         # #200 (ADR 0092): stamp the derived posture around the live executor build so each connection's
@@ -3679,7 +3681,9 @@ class RegistryRunner:
         This runs inside ``_reload_lock``, which ``reload()``, ``stop()``, the per-connection
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
         therefore wedge re-promotion, engine shutdown and the connection API for as long as a wedged
-        File/Database ``stop()`` runs (those gather with no cancel and no timeout).
+        File/Database ``stop()`` runs. (Database gathers with no cancel and no timeout. File now
+        cancels a poll task blocked on a share call after a grace, BACKLOG #1620, but still waits
+        without a bound while that task is inside a store call.)
 
         On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
         operator-recoverable), whereas refusing to re-promote strands the whole graph — and
@@ -7754,6 +7758,62 @@ def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings
         settings["proxy_no_proxy"] = list(egress.proxy_no_proxy)
 
 
+#: The settings keys that mirror a revocation attestation (ADR 0173), written only from a validated
+#: declaration: an outbound's typed fields in `_dest_config`, a FhirLookupSpec's in
+#: `_fhir_lookup_settings`.
+_REVOCATION_MIRROR_KEYS: tuple[str, ...] = (
+    "tls_revocation_attested",
+    "tls_revocation_attested_reason",
+    "tls_revocation_attested_connection",
+)
+
+#: The settings keys `_dest_config` mirrors from a connection's top-level declarations (ADR 0153,
+#: ADR 0173). Named once so the strip and the writes cannot drift apart.
+_DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
+    "cleartext_accepted",
+    "cleartext_reason",
+    "cleartext_connection",
+    *_REVOCATION_MIRROR_KEYS,
+)
+
+
+def _mirror_revocation_attestation(
+    settings: dict[str, Any], *, attested: bool, reason: str | None, connection: str
+) -> None:
+    """Write the revocation-attestation mirror the SMART token-endpoint provider reads (ADR 0173).
+
+    The caller has already stripped the raw keys. Written only when declared, so a connection that
+    declared nothing carries no new keys. The name rides with it so the audit line that seam logs names
+    the declaring connection."""
+    if attested:
+        settings["tls_revocation_attested"] = True
+        settings["tls_revocation_attested_reason"] = reason
+        settings["tls_revocation_attested_connection"] = connection
+
+
+def _fhir_lookup_settings(
+    spec: FhirLookupSpec, env_values: Mapping[str, Any], egress: EgressSettings | None
+) -> dict[str, Any]:
+    """The resolved settings the read executor gets for one ``FhirLookup`` (ADR 0043).
+
+    Resolves ``env()``, merges the site-wide forward proxy (ADR 0126), and replaces the revocation
+    keys with the mirror of the spec's typed declaration (ADR 0173). ``spec.settings`` is a mutable
+    dict, so a raw ``tls_revocation_attested`` key there would otherwise cross the SMART refusal with
+    no reason check and name whatever connection it chose. The one builder for both the live executor
+    and the check build, so the two cannot differ. The egress allowlist check stays with each caller."""
+    settings = resolve_env_settings(spec.settings, env_values)
+    _apply_egress_proxy_default(settings, egress)
+    for key in _REVOCATION_MIRROR_KEYS:
+        settings.pop(key, None)
+    _mirror_revocation_attestation(
+        settings,
+        attested=spec.tls_revocation_attested,
+        reason=spec.tls_revocation_attested_reason,
+        connection=spec.name,
+    )
+    return settings
+
+
 def _dest_config(
     oc: OutboundConnection,
     env_values: Mapping[str, Any],
@@ -7768,6 +7828,11 @@ def _dest_config(
     # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
     # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
     _apply_egress_proxy_default(settings, egress)
+    # Only a top-level declaration may write the mirrored keys below. A code-first spec could otherwise
+    # carry them as raw transport settings, and a settings-driven seam would then cross its refusal with
+    # no reason check and name whatever connection the spec chose in the audit line. So clear them first.
+    for key in _DECLARATION_MIRROR_KEYS:
+        settings.pop(key, None)
     # ADR 0153: MIRROR the cleartext-acceptance declaration into the resolved settings. The connectors
     # read the typed Destination fields below, but the deep settings-driven seams — the forward-proxy
     # credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers — receive only a
@@ -7780,10 +7845,13 @@ def _dest_config(
         settings["cleartext_reason"] = oc.cleartext_reason
         settings["cleartext_connection"] = oc.name
     # ADR 0173: mirror the revocation attestation the same way, for the one settings-driven seam that
-    # reads it -- the SMART token-endpoint provider (transports/smart.py). Written only when set.
-    if oc.tls_revocation_attested:
-        settings["tls_revocation_attested"] = True
-        settings["tls_revocation_attested_reason"] = oc.tls_revocation_attested_reason
+    # reads it -- the SMART token-endpoint provider (transports/smart.py).
+    _mirror_revocation_attestation(
+        settings,
+        attested=oc.tls_revocation_attested,
+        reason=oc.tls_revocation_attested_reason,
+        connection=oc.name,
+    )
     return Destination(
         name=oc.name,
         type=oc.spec.type,
@@ -7983,8 +8051,7 @@ def _build_check_connectors(
         DatabaseLookupExecutor(resolved_lookups)
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
-        fsettings = resolve_env_settings(fspec.settings, env_values)
-        _apply_egress_proxy_default(fsettings, egress)  # ADR 0126: site-wide forward proxy
+        fsettings = _fhir_lookup_settings(fspec, env_values, egress)
         check_fhir_lookup_allowed(
             fname, fsettings, egress
         )  # fail-closed egress allowlist (ADR 0043)
@@ -8444,11 +8511,12 @@ def check_inbound_revocation(
         # condition RevocationHopGuard.enforce_construction audits on the outbound side. The Source
         # validator guarantees the reason is present.
         if posture is not None and posture.enforcing:
-            log.warning(
-                "inbound %r: mTLS listener that checks NO client-certificate revocation bound on "
-                "operator attestation (tls_revocation_attested; reason: %s)",
-                name,
-                source.tls_revocation_attested_reason,
+            log_revocation_attestation(
+                log,
+                crossing="mTLS listener that checks no client-certificate revocation bound",
+                connection=name,
+                detail="inbound listener requires and verifies a client certificate",
+                reason=source.tls_revocation_attested_reason,
             )
         return
     if _inbound_revocation_gap_permitted(posture=posture):
