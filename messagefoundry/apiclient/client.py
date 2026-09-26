@@ -346,17 +346,34 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
 #: client must not import ``config/`` (CLAUDE.md section 4), so it cannot read the engine's tuple.
 #: ``tests/test_tls_default_suites.py`` pins the two equal, order included, so they cannot drift.
 #: The engine's API listener offers exactly these by default, so pinning them here refuses nothing a
-#: stock engine speaks; it stops the client offering the six CBC-SHA2 suites the interpreter enables.
+#: stock engine speaks; it stops the client offering the six CBC-SHA2 suites the interpreter enables,
+#: and since owner ruling R4 of 2026-09-26 (BACKLOG #2042) the three AES-128-GCM suites.
 _APPROVED_TLS12_SUITES = (
     "ECDHE-ECDSA-AES256-GCM-SHA384",
     "ECDHE-RSA-AES256-GCM-SHA384",
-    "ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-AES128-GCM-SHA256",
     "ECDHE-ECDSA-CHACHA20-POLY1305",
     "ECDHE-RSA-CHACHA20-POLY1305",
     "DHE-RSA-AES256-GCM-SHA384",
-    "DHE-RSA-AES128-GCM-SHA256",
 )
+
+#: The TLS 1.3 suites this client offers where the interpreter can say so (ruling R4). A COPY of
+#: ``messagefoundry.config.tls_policy.APPROVED_TLS13_SUITES``, pinned to it by the same test file.
+_APPROVED_TLS13_SUITES = (
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+)
+
+
+def _narrow_tls13(ctx: ssl.SSLContext) -> bool:
+    """This client's copy of ``tls_policy.narrow_tls13_suites``, whose docstring states when it acts,
+    why its no-op on CPython 3.14 is a recorded gap, and why it targets a ``truststore`` wrapper's
+    inner ``_ctx``. This client's default branch builds exactly such a wrapper. A copy, because
+    ``apiclient/`` may not import ``config/``. Returns whether it narrowed."""
+    target = getattr(ctx, "_ctx", ctx)
+    if not hasattr(target, "set_ciphersuites"):
+        return False
+    target.set_ciphersuites(":".join(_APPROVED_TLS13_SUITES))
+    return True
 
 
 def _build_verify_context(
@@ -380,6 +397,7 @@ def _build_verify_context(
 
     **The TLS 1.2 suites are pinned** to :data:`_APPROVED_TLS12_SUITES` on either branch (BACKLOG
     #300), so this client offers the AEAD suites the engine listener defaults to and nothing wider.
+    The TLS 1.3 suites are pinned too, where the interpreter allows it (:func:`_narrow_tls13`).
 
     An opt-in **client** certificate (mTLS, ASVS 12.3.5) is loaded onto whichever context is built — this
     is also what replaces httpx 0.28's deprecated ``cert=`` keyword. Plaintext ``http`` never reaches
@@ -399,6 +417,7 @@ def _build_verify_context(
     # security level is written back in front of the names, as the engine's
     # narrow_to_approved_suites does, so it is stated rather than left to the OpenSSL build.
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
+    _narrow_tls13(ctx)
     if client_cert is not None:
         # keyfile=None is valid: the private key may be bundled in the client cert PEM.
         ctx.load_cert_chain(client_cert, client_key)
