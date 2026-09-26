@@ -26,15 +26,20 @@ honest, and let the mechanism stay boring.
 
 from __future__ import annotations
 
+import ast
 import re
 import tomllib
 from pathlib import Path
 
 import pytest
 
+from tests import _tooling_manifest as tooling_manifest
+
 _ROOT = Path(__file__).resolve().parents[1]
 _TESTS = _ROOT / "tests"
-_MANIFEST = _TESTS / "tooling_manifest.txt"
+# Python reads the manifest through tests/_tooling_manifest.py (BACKLOG #1434), so its path comes
+# from there too. test_the_manifest_has_one_reader reds on at least the shapes a copy has taken.
+_MANIFEST = tooling_manifest.MANIFEST
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 
 # `messagefoundry_webconsole` MUST be named explicitly. `\b` does not end the alternation after
@@ -82,10 +87,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # gating argument is the one that keeps test_control_char_check.py here, applied to a
         # different scanned population: what it guards is `tests/**` and
         # `packaging/messagefoundry-webconsole/tests/**`, and a change to either sets `code=true` (a
-        # .py path) but NOT `tooling=true` -- that gate names only three tests/ files (conftest.py,
-        # tooling_manifest.txt, test_tooling_partition.py). Listed as tooling it would be deselected
-        # by `-m 'not tooling'` on the engine legs AND unreached by the tooling job's path gate, so
-        # the PR that adds the offending import would face nothing.
+        # .py path) but NOT `tooling=true` -- that gate names only four tests/ files (conftest.py,
+        # _tooling_manifest.py, tooling_manifest.txt, test_tooling_partition.py). Listed as tooling
+        # it would be deselected by `-m 'not tooling'` on the engine legs AND unreached by the
+        # tooling job's path gate, so the PR that adds the offending import would face nothing.
         "test_conftest_name_collision_guard.py",
         "test_cp1252_console_safety.py",
         # Arrived with #421 while this branch was in flight. Same shape as cp1252_console_safety and
@@ -128,7 +133,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # security/runtime-closure-core.txt and cross-checks that against requirements.lock. The
         # gating argument is the one that keeps the repo-wide scanners here. A dependency bump edits
         # pyproject.toml / uv.lock / requirements.lock, which sets `code=true` but NOT `tooling=true`
-        # -- that gate names only three tests/ files. Listed as tooling this would be deselected by
+        # -- that gate's few tests/ files are named above. Listed as tooling this would be dropped by
         # `-m 'not tooling'` on the engine legs AND unreached by the tooling job's path gate, so the
         # PR that added an unclassified dependency would face nothing, which is the one thing the
         # designation exists to prevent (BACKLOG #1189).
@@ -205,41 +210,6 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
 )
 
 
-def _manifest_lines(text: str) -> list[str]:
-    return [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-
-
-def _names_from(text: str) -> list[str]:
-    """THIS FILE's manifest parser, over arbitrary text rather than over the file.
-
-    Split out so ``test_the_gate_offers_a_line_the_manifest_parser_accepts`` can feed the example
-    line the failure message hands out straight back through it. A message that recommends a shape
-    nothing checks is the compensating-control-on-a-false-premise defect (CLAUDE.md 11).
-
-    IT IS NOT THE ONLY PARSER, AND SAYING SO WOULD BE THE SAME DEFECT ONE LEVEL UP. The copy that
-    actually applies the ``tooling`` marker is ``_tooling_basenames`` in tests/conftest.py, and a
-    third lives in ``_manifest_paths`` in tests/test_ci_tooling_gate.py. All three implement the
-    same rule -- strip, drop blanks and ``#`` comments, rsplit on ``/`` -- and NOTHING pins them
-    against each other. Extracting one shared ``tests/_tooling_manifest.py`` is the real fix and it
-    is not this change's job; until then, what the arm below proves is that the recommended line
-    survives THIS parser.
-    """
-    return [line.rsplit("/", 1)[-1] for line in _manifest_lines(text)]
-
-
-def _manifest_entries() -> list[str]:
-    """The manifest's full lines -- ``tests/<name>.py``, which is what ci.yml's path gate matches."""
-    return _manifest_lines(_MANIFEST.read_text(encoding="utf-8"))
-
-
-def _manifest_names() -> list[str]:
-    return [line.rsplit("/", 1)[-1] for line in _manifest_entries()]
-
-
 def _unclassified_remedy(names: list[str]) -> str:
     """The text ``test_every_non_engine_test_is_classified`` fails with.
 
@@ -280,12 +250,12 @@ def test_every_manifest_entry_resolves_as_written() -> None:
     """A stale entry silently un-marks a test back onto the engine legs.
 
     RESOLVED AS WRITTEN, not by basename, and that is the strengthening. The predecessor read this
-    file through ``_manifest_names``, which rsplits the directory away -- so it proved a file of
+    file through a basename reader, which rsplits the directory away -- so it proved a file of
     that NAME exists somewhere in tests/ and was blind to the path actually written down. That
     blindness matters because ci.yml's ``changes`` job summons the tooling job by matching WHOLE
     changed paths against these lines (``grep -qxFf`` over ``git diff --name-only``). A bare
-    ``test_x.py``, a ``./tests/`` prefix or a backslash separator all still MARK the test -- this
-    file's parser and tests/conftest.py both rsplit on ``/`` -- so the test leaves the engine legs
+    ``test_x.py`` or a ``./tests/`` prefix still MARKS the test -- the one parser,
+    tests/_tooling_manifest.py, rsplits on ``/`` -- so the test leaves the engine legs
     by ``-m 'not tooling'``, and then a later pull request editing only that test matches no arm of
     the gate and summons no tooling job. Deselected everywhere, green.
 
@@ -293,7 +263,7 @@ def test_every_manifest_entry_resolves_as_written() -> None:
     spelled the way git spells it. ``./tests/test_x.py`` satisfies the first and fails the second.
     """
     bad: list[str] = []
-    for line in _manifest_entries():
+    for line in tooling_manifest.entries():
         target = _ROOT / line
         if not target.is_file():
             bad.append(f"{line} (names no file)")
@@ -307,7 +277,7 @@ def test_every_manifest_entry_resolves_as_written() -> None:
 
 
 def test_manifest_has_no_duplicates() -> None:
-    names = _manifest_names()
+    names = tooling_manifest.names()
     dupes = sorted({n for n in names if names.count(n) > 1})
     assert not dupes, f"tooling_manifest.txt lists the same file twice: {dupes}"
 
@@ -316,7 +286,7 @@ def test_no_listed_test_imports_the_engine() -> None:
     """Importing the engine is sufficient proof the subject is the engine, so it cannot be harness."""
     wrong = sorted(
         n
-        for n in _manifest_names()
+        for n in tooling_manifest.names()
         if _ENGINE_IMPORT.search((_TESTS / n).read_text(encoding="utf-8", errors="replace"))
     )
     assert not wrong, (
@@ -353,7 +323,9 @@ def test_every_non_engine_test_is_classified() -> None:
 
     Without this, a new worktree-gate test quietly joins the engine legs and the tier grows back.
     """
-    _assert_every_test_is_classified(_TESTS, set(_manifest_names()), _STAYS_WITHOUT_IMPORTING)
+    _assert_every_test_is_classified(
+        _TESTS, set(tooling_manifest.names()), _STAYS_WITHOUT_IMPORTING
+    )
 
 
 #: The offender the two arms below fabricate. One spelling, so renaming it cannot leave an
@@ -377,15 +349,17 @@ def _raised_remedy(tmp_path: Path) -> str:
 
 
 def test_the_gate_offers_a_line_the_manifest_parser_accepts(tmp_path: Path) -> None:
-    """The message hands out a manifest line; this file's parser must read it back.
+    """The message hands out a manifest line; the manifest parser must read it back.
 
     Taken off the RAISED message, so it cannot drift from the assertion that issues it, and fed
-    through ``_names_from``, so it cannot drift from the reader that consumes it.
+    through ``tooling_manifest.names_from``, so it cannot drift from the reader that consumes it.
+    That is the same function the conftest hook applies the marker through, so the line is proven
+    against the reader that matters rather than a copy of it (BACKLOG #1434).
     """
     rendered = _raised_remedy(tmp_path)
     recommended = f"tests/{_SENTINEL}"
     assert f"`{recommended}`" in rendered, rendered
-    assert _names_from(recommended) == [_SENTINEL], (
+    assert tooling_manifest.names_from(recommended) == [_SENTINEL], (
         "the manifest parser does not read back the line the failure message recommends"
     )
 
@@ -460,7 +434,7 @@ def test_the_two_lists_are_disjoint() -> None:
     Disjointness is the whole guarantee: a name in both lists is a contradiction the author has to
     resolve, not a precedence rule to be quietly applied in the manifest's favour.
     """
-    both = sorted(set(_manifest_names()) & _STAYS_WITHOUT_IMPORTING)
+    both = sorted(set(tooling_manifest.names()) & _STAYS_WITHOUT_IMPORTING)
     assert not both, (
         "these files are in BOTH tests/tooling_manifest.txt and _STAYS_WITHOUT_IMPORTING; the manifest "
         "would win silently and the file would leave the engine legs. Decide which list it belongs in: "
@@ -494,3 +468,211 @@ def test_marker_is_registered() -> None:
 def test_ci_wires_both_halves(needle: str, why: str) -> None:
     """Both spellings must appear. Either one alone is a silent half-failure."""
     assert needle in _CI.read_text(encoding="utf-8"), f"{needle!r} missing from ci.yml: {why}"
+
+
+# ---------------------------------------------------------------------------------------------------
+# ONE READER (BACKLOG #1434). The manifest used to be parsed three times -- in tests/conftest.py (the
+# copy that applies the marker), in this file, and in tests/test_ci_tooling_gate.py -- and nothing
+# pinned the copies against each other. They now all import tests/_tooling_manifest.py. The tests
+# below keep it that way. One reds on a second Python reader, in at least the shapes a copy has
+# taken. The others pin the shared parser's refusal of the lines found so far that ci.yml's shell
+# reader, which cannot import it, would read differently. No test runs that grep pipeline itself.
+# ---------------------------------------------------------------------------------------------------
+
+_PARSER_HOME = Path(tooling_manifest.__file__).resolve()
+
+#: Where a second reader would plausibly land. At least these; a reader outside them is not seen.
+_READER_ROOTS = ("tests", "scripts", ".github")
+
+#: A string that is nothing but a path ending in the manifest's name. Prose that merely mentions
+#: the file carries spaces and does not match, so an error message naming it is not a read.
+_PATH_TO_MANIFEST = re.compile(r"[\w./\\-]*" + re.escape(_MANIFEST.name))
+
+_READ_METHODS = frozenset({"read_text", "read_bytes", "open"})
+
+
+def _names_manifest(node: ast.expr) -> bool:
+    """True for a name ending in ``MANIFEST``, a ``.MANIFEST`` attribute, or ``Path()`` of either.
+
+    Not an alias under another name (``m = MANIFEST; m.read_text()``): the scan is at least these
+    shapes, not every way to reach the file.
+    """
+    if isinstance(node, ast.Name):
+        return node.id.endswith("MANIFEST")
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Path":
+        return any(_names_manifest(arg) for arg in node.args)
+    return isinstance(node, ast.Attribute) and node.attr == "MANIFEST"
+
+
+def _manifest_read_sites(source: str) -> list[int]:
+    """The lines where ``source`` spells a path to the manifest, or reads ``MANIFEST`` itself.
+
+    Three arms. A string that is a bare path ending in the manifest's name, wherever it sits: a
+    ``/`` join, a call argument, an assignment or an f-string part. A ``read_text``, ``read_bytes``
+    or ``open`` method on anything ``_names_manifest`` accepts. And the builtin ``open()`` called on
+    one. The last two are how a copy would read the file without ever spelling its name.
+
+    SOME PLACES ARE DATA AND NOT A READ, and the detector skips them. A string inside a list, tuple,
+    set or dict value is how tests/test_ci_tooling_gate.py spells the manifest as a CHANGED PATH fed
+    to its gate. A bare string statement is a docstring. Anything else that spells the path is
+    reported, including a write of a fake manifest into ``tmp_path``. A test that needs the name as
+    a value should take it from ``tooling_manifest.MANIFEST``.
+    """
+    tree = ast.parse(source)
+    data: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            data.update(id(element) for element in node.elts)
+        elif isinstance(node, ast.Dict):
+            data.update(id(value) for value in node.values)
+        elif isinstance(node, ast.Expr):
+            data.add(id(node.value))
+    spells_the_path = (
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in data
+        and _PATH_TO_MANIFEST.fullmatch(node.value)
+    )
+    reads_manifest = (
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr in _READ_METHODS
+        and _names_manifest(node.value)
+    )
+    opens_manifest = (
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "open"
+        and any(_names_manifest(arg) for arg in node.args)
+    )
+    return sorted({*spells_the_path, *reads_manifest, *opens_manifest})
+
+
+@pytest.mark.parametrize(
+    ("source", "fires"),
+    [
+        ('_TESTS_DIR / "tooling_manifest.txt"', True),  # the shape all three retired copies used
+        ('open("tests/tooling_manifest.txt")', True),
+        ('REL = "tests/tooling_manifest.txt"', True),
+        ('p = Path(f"{root}/tests/tooling_manifest.txt")', True),
+        ("text = tooling_manifest.MANIFEST.read_text()", True),
+        ("raw = _MANIFEST.read_bytes()", True),
+        ('handle = open(tooling_manifest.MANIFEST, encoding="utf-8")', True),
+        ("text = Path(_MANIFEST).read_text()", True),
+        ('CASES = [(["tests/tooling_manifest.txt"], True, "why")]', False),
+        ('ROW = {"changed": "tests/tooling_manifest.txt"}', False),
+        # path-shaped, so only the docstring rule holds it
+        ('"""tests/tooling_manifest.txt"""', False),
+        ('msg = "check tests/tooling_manifest.txt and the hook"', False),
+        ("where = _MANIFEST.relative_to(_ROOT)", False),
+        ("names = tooling_manifest.names()", False),
+    ],
+)
+def test_the_reader_detector_on_planted_sources(source: str, fires: bool) -> None:
+    """Every arm of the detector, fired and held, so a regression in one cannot hide behind another."""
+    assert bool(_manifest_read_sites(source)) is fires, source
+
+
+def test_the_manifest_has_one_reader() -> None:
+    """A second parser of the manifest is the defect #1434 removed. This reds if one comes back.
+
+    The instrument must be able to fire on the real tree, or its zero means nothing. So the walk
+    must reach the one reader that is allowed, and the detector must see that reader read the file.
+    """
+    readers: list[str] = []
+    reached_the_parser = False
+    scanned = 0
+    for top in _READER_ROOTS:
+        root = _ROOT / top
+        assert root.is_dir(), f"{root} is gone, so this scan covers less than it says"
+        for path in sorted(root.rglob("*.py")):
+            scanned += 1
+            raw = path.read_bytes()
+            if b"tooling_manifest" not in raw:
+                continue
+            source = raw.decode("utf-8", errors="replace")
+            if path.resolve() == _PARSER_HOME:
+                reached_the_parser = True
+                assert _manifest_read_sites(source), (
+                    "the detector does not see the shared parser read the manifest, so it cannot "
+                    "see a copy either and this test would pass on anything"
+                )
+                continue
+            rel = path.relative_to(_ROOT).as_posix()
+            try:
+                sites = _manifest_read_sites(source)
+            except SyntaxError:
+                readers.append(f"{rel} (does not parse, so it could not be checked)")
+                continue
+            if sites:
+                readers.append(f"{rel} lines {sites}")
+    assert reached_the_parser, (
+        f"the walk over {_READER_ROOTS} never reached {_PARSER_HOME}, so it is not scanning the "
+        f"tree this test thinks it is ({scanned} files)"
+    )
+    assert not readers, (
+        f"these files read {_MANIFEST.name} themselves: {readers}. Read it through "
+        "tests/_tooling_manifest.py instead (`from tests import _tooling_manifest`), which is the "
+        "parser the conftest hook applies the `tooling` marker with. A second parser can drift from "
+        "it silently, and the tests that pin the partition would then be checking a different list "
+        "from the one that moves tests between CI legs (BACKLOG #1434)."
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "tests/test_a.py ",
+        " tests/test_a.py",
+        "tests/test_a.py\t",
+        "tests/test_a\x00.py",
+        "tests/test_a.py\x0ctests/test_b.py",
+        "tests/test_a.py\rtests/test_b.py",
+        "tests/tést_a.py",
+        "tests\\test_a.py",
+        "﻿tests/test_a.py",
+        "# a comment carrying a NUL \x00",
+    ],
+    ids=[
+        "trailing-space",
+        "leading-space",
+        "tab",
+        "nul",
+        "form-feed",
+        "lone-cr",
+        "non-ascii",
+        "backslash",
+        "bom",
+        "nul-in-comment",
+    ],
+)
+def test_the_parser_refuses_a_line_ci_yml_would_read_differently(line: str) -> None:
+    """ci.yml's `grep -qxFf` matches each entry line whole, so the parser must not tidy one up.
+
+    Stripping would mark the test and take it off the engine legs, while the shell kept the stray
+    character and never matched an edit to that test. Deselected everywhere, green. A NUL is
+    refused even in a comment, because it turns grep's whole read of the file into binary mode.
+    """
+    with pytest.raises(ValueError, match="line 2 "):
+        tooling_manifest.entries_from(f"# header\n{line}\n")
+
+
+def test_a_bom_in_front_of_a_first_line_entry_is_refused() -> None:
+    """The BOM is tolerated only in front of a first-line comment; in front of an entry, grep keeps
+    it as part of the pattern, so the entry would match no changed path."""
+    with pytest.raises(ValueError, match="line 1 "):
+        tooling_manifest.entries_from("﻿tests/test_a.py\n")
+
+
+def test_the_parser_still_drops_what_the_shell_drops() -> None:
+    """The control for the refusals above. An indented comment, a whitespace-only line, a BOM in
+    front of a first-line comment and a CRLF line ending are not entries, or are harmless, to both
+    readers. Refusing them would break a manifest ci.yml reads correctly, including a Windows
+    checkout under ``core.autocrlf``."""
+    text = "﻿# header\r\n  # indented comment\r\n \t\r\ntests/test_a.py\r\n\r\n# tail\r\n"
+    assert tooling_manifest.entries_from(text) == ["tests/test_a.py"]

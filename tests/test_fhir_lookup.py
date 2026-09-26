@@ -11,10 +11,13 @@ end-to-end dry-run-raises / router-raises behavior. Synthetic data only — neve
 
 from __future__ import annotations
 
+import asyncio
 import email.message
+import http.client
 import io
 import json
 import threading
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +27,7 @@ import pytest
 
 from messagefoundry import FhirRaw, FhirToken, fhir_lookup, fhirsearch
 from messagefoundry.config.fhir_lookup import FhirLookupError, activated
+from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
@@ -33,15 +37,22 @@ from messagefoundry.config.wiring import (
     WiringError,
     build_inbound_connection,
 )
-from messagefoundry.pipeline import dryrun
-from messagefoundry.pipeline.wiring_runner import check_fhir_lookup_allowed
+from messagefoundry.parsing import FhirPeekError
+from messagefoundry.pipeline import dryrun, wiring_runner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, check_fhir_lookup_allowed
 from messagefoundry.store import MessageStatus
+from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.bounded_read import AmbiguousFramingError
 from messagefoundry.transports.fhir import (
     FhirLookupExecutor,
     _encode_search_params,
     _resolve_read_url,
 )
-from messagefoundry.transports.smart import SmartAuthError, with_smart_backend
+from messagefoundry.transports.smart import (
+    SmartAuthError,
+    SmartBackendTokenProvider,
+    with_smart_backend,
+)
 
 BASE = "https://fhir.example.org/fhir"
 _CONN = {"epic": {"url": BASE}}
@@ -646,6 +657,253 @@ async def test_smart_bearer_applied_and_reminted_on_401() -> None:  # AC-5
     with pytest.raises(FhirLookupError, match="401"):
         await ex2.read("epic", "Patient/123")
     assert prov2.invalidated == 1
+
+
+# --- a SMART token failure surfaces as FhirLookupError (BACKLOG #1980) -------
+#
+# The bearer is minted before the GET's own try, so a failed mint once escaped the lookup as the
+# provider's raw DeliveryError. The sandbox worker and a Handler both catch only the lookup error
+# types, so that escape read as a Handler crash. These drive a REAL provider against a faked token
+# endpoint, so each failure is the one the provider actually raises, not a stand-in.
+
+_TOKEN_URL = "https://auth.example.org/oauth2/token"
+
+
+def _wire(raw: bytes) -> http.client.HTTPResponse:
+    """A real parsed ``HTTPResponse`` over ``raw``, with no socket involved."""
+
+    class _Sock:
+        def makefile(self, *a: object, **k: object) -> io.BytesIO:
+            return io.BytesIO(raw)
+
+        def close(self) -> None:
+            pass
+
+    resp = http.client.HTTPResponse(_Sock(), method="POST")  # type: ignore[arg-type]
+    resp.begin()
+    return resp
+
+
+class _WireOpener:
+    """A token-endpoint opener that answers with a real parsed reply built from ``raw``."""
+
+    def __init__(self, raw: bytes) -> None:
+        self.raw = raw
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> Any:
+        return _wire(self.raw)
+
+
+# Transfer-Encoding beside Content-Length: reply_framing_fault refuses it (RFC 9112 section 6.1).
+_AMBIGUOUS_TOKEN_REPLY = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+    b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+)
+
+_TOKEN_FAILURES: dict[str, tuple[Any, type[BaseException]]] = {
+    # A 200 whose body is no token response: _parse_token_response raises DeliveryError.
+    "garbled": (_FakeOpener(body=b"<html>not a token</html>"), DeliveryError),
+    # A reply whose framing is ambiguous: the bounded read raises an EgressReplyError.
+    "ambiguous-framing": (_WireOpener(_AMBIGUOUS_TOKEN_REPLY), AmbiguousFramingError),
+    # The endpoint is down: DeliveryError.
+    "unreachable": (_FakeOpener(exc=urllib.error.URLError("connection refused")), DeliveryError),
+    # The endpoint refuses the client: DeliveryError naming the status.
+    "http-400": (_FakeOpener(exc=_http_error(400, b'{"error":"invalid_client"}')), DeliveryError),
+    # A malformed status line: http.client raises an HTTPException, which is not an OSError.
+    "bad-status-line": (_FakeOpener(exc=http.client.BadStatusLine("hello")), DeliveryError),
+    # A deeply nested body under the token cap: json.loads raises RecursionError.
+    "deep-nesting": (_FakeOpener(body=b"[" * 200_000), DeliveryError),
+    # An integer expires_in too large for a float: float() raises OverflowError.
+    "huge-expires-in": (
+        _FakeOpener(body=b'{"access_token":"not a token","expires_in":' + b"9" * 400 + b"}"),
+        DeliveryError,
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def _ec_pem() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+
+
+def _smart_executor(pem: str, token_opener: Any) -> tuple[FhirLookupExecutor, _FakeOpener]:
+    """A lookup executor whose connection carries a real SMART provider on a faked token endpoint."""
+    ex, fhir_opener = _executor(body=PATIENT.encode())
+    provider = SmartBackendTokenProvider(
+        token_url=_TOKEN_URL,
+        client_id="cid",
+        private_key=pem,
+        algorithm=SignatureAlgorithm.ES256,
+        scope="system/Patient.rs",
+    )
+    provider._opener = token_opener  # type: ignore[assignment]
+    ex._token["epic"] = provider  # type: ignore[attr-defined]
+    return ex, fhir_opener
+
+
+def _assert_token_failure_is_a_lookup_error(
+    err: pytest.ExceptionInfo[FhirLookupError],
+    cause_type: type[BaseException],
+    fhir_opener: _FakeOpener,
+) -> None:
+    assert type(err.value) is FhirLookupError
+    assert isinstance(err.value.__cause__, cause_type)  # the cause stays chained
+    assert "epic" in str(err.value)
+    # Secret-safe: no reply body and no token-URL query reach the message. The redacted token
+    # host and path may, as they do in every sibling mapping.
+    # "eyJ" opens every compact JWT, so it would show a leaked client assertion.
+    for secret in ("invalid_client", "not a token", "hello", "aaaa", "eyJ"):
+        assert secret not in str(err.value)
+    # No FHIR request went out without its bearer.
+    assert fhir_opener.requests == []
+
+
+@pytest.mark.parametrize("failure", sorted(_TOKEN_FAILURES))
+async def test_smart_token_failure_on_read_is_a_lookup_error(_ec_pem: str, failure: str) -> None:
+    token_opener, cause_type = _TOKEN_FAILURES[failure]
+    ex, fhir_opener = _smart_executor(_ec_pem, token_opener)
+    with pytest.raises(FhirLookupError) as err:
+        await ex.read("epic", "Patient/123")
+    _assert_token_failure_is_a_lookup_error(err, cause_type, fhir_opener)
+
+
+@pytest.mark.parametrize("failure", sorted(_TOKEN_FAILURES))
+async def test_smart_token_failure_on_probe_is_a_lookup_error(_ec_pem: str, failure: str) -> None:
+    token_opener, cause_type = _TOKEN_FAILURES[failure]
+    ex, fhir_opener = _smart_executor(_ec_pem, token_opener)
+    with pytest.raises(FhirLookupError) as err:
+        await ex.test_connection("epic")
+    _assert_token_failure_is_a_lookup_error(err, cause_type, fhir_opener)
+
+
+async def test_smart_token_url_over_the_length_limit_is_a_lookup_error(_ec_pem: str) -> None:
+    # The mint measures the configured token URL and raises ValueError when it is over the limit.
+    # That is a config fault the Handler cannot fix, but it must still arrive as the lookup error.
+    ex, fhir_opener = _smart_executor(_ec_pem, _FakeOpener())
+    ex._token["epic"].token_url = _TOKEN_URL + "?" + "a" * 9000  # type: ignore[attr-defined]
+    for call in (lambda: ex.read("epic", "Patient/123"), lambda: ex.test_connection("epic")):
+        with pytest.raises(FhirLookupError) as err:
+            await call()
+        _assert_token_failure_is_a_lookup_error(err, ValueError, fhir_opener)
+
+
+class _HungTokenOpener:
+    """A token endpoint that does not answer until ``release`` is set, then answers with a token."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.answered = threading.Event()
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> _FakeResp:
+        self.release.wait(10)
+        self.answered.set()
+        return _FakeResp(json.dumps({"access_token": "tok", "expires_in": 300}).encode())
+
+
+async def test_a_hung_token_mint_reaches_the_handler_as_a_lookup_error(
+    _ec_pem: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #1980: the Handler bridge waits a bounded time for the whole read, and a mint that
+    # never answers once reached the Handler as the bridge's builtin TimeoutError. The bridge runs
+    # here exactly as a Handler's worker thread runs it, against a live loop, with the wait shrunk.
+    monkeypatch.setattr(wiring_runner, "_LOOKUP_RESULT_TIMEOUT_SECONDS", 0.2)
+    token_opener = _HungTokenOpener()
+    ex, fhir_opener = _smart_executor(_ec_pem, token_opener)
+    runner = types.SimpleNamespace(_fhir_lookup_executor=ex, _loop=asyncio.get_running_loop())
+    try:
+        with pytest.raises(FhirLookupError) as err:
+            await asyncio.to_thread(
+                RegistryRunner._run_fhir_lookup,
+                runner,  # type: ignore[arg-type]
+                "epic",
+                "Patient/123",
+            )
+    finally:
+        token_opener.release.set()
+    assert type(err.value) is FhirLookupError
+    assert isinstance(err.value.__cause__, TimeoutError)
+    assert "epic" in str(err.value) and "0.2s" in str(err.value)
+    # The orphaned read still finishes on the loop, as it did before the mapping.
+    assert await asyncio.to_thread(token_opener.answered.wait, 5)
+    for _ in range(100):
+        if fhir_opener.requests:
+            break
+        await asyncio.sleep(0.01)
+    assert len(fhir_opener.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        http.client.BadStatusLine("hello"),
+        http.client.LineTooLong("header line"),
+    ],
+    ids=["bad-status-line", "line-too-long"],
+)
+async def test_a_malformed_fhir_reply_is_a_lookup_error(exc: Exception) -> None:
+    # BACKLOG #1980: http.client raises these from the FHIR server's own reply, and neither is an
+    # OSError or a URLError, so both once escaped read and probe raw. Named by class only.
+    for call in ("read", "probe"):
+        ex, _ = _executor(exc=exc)
+        with pytest.raises(FhirLookupError) as err:
+            if call == "read":
+                await ex.read("epic", "Patient/123")
+            else:
+                await ex.test_connection("epic")
+        assert type(err.value) is FhirLookupError
+        assert err.value.__cause__ is exc
+        assert f"malformed HTTP reply ({type(exc).__name__})" in str(err.value)
+        assert "hello" not in str(err.value)
+
+
+async def test_a_deeply_nested_fhir_reply_is_a_lookup_error() -> None:
+    # BACKLOG #1980: json.loads raises RecursionError on a deeply nested body. FhirPeek maps it to
+    # FhirPeekError since BACKLOG #1600, so the RecursionError is one link down the chain; the
+    # lookup's own RecursionError arm stays as the guard if that mapping ever regresses. 200 KB is
+    # far under the read bound.
+    ex, _ = _executor(body=b"[" * 200_000)
+    with pytest.raises(FhirLookupError, match="unparseable") as err:
+        await ex.read("epic", "Patient/123")
+    cause = err.value.__cause__
+    assert isinstance(cause, FhirPeekError)
+    assert isinstance(cause.__cause__, RecursionError)
+
+
+async def test_a_timeout_the_read_raised_is_not_called_a_bridge_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On 3.11+ the bridge's wait and a read's own TimeoutError are one class. A read that raised
+    # at once must not be reported as a wait that ran out.
+    class _TimesOut:
+        async def read(self, *a: object) -> dict[str, Any]:
+            raise TimeoutError("inner")
+
+    runner = types.SimpleNamespace(
+        _fhir_lookup_executor=_TimesOut(), _loop=asyncio.get_running_loop()
+    )
+    with pytest.raises(FhirLookupError, match="the read timed out"):
+        await asyncio.to_thread(
+            RegistryRunner._run_fhir_lookup,
+            runner,  # type: ignore[arg-type]
+            "epic",
+            "Patient/123",
+        )
+
+
+async def test_remote_disconnected_keeps_the_os_error_wording() -> None:
+    # RemoteDisconnected is both an OSError and an HTTPException. The HTTPException arm sits after
+    # the OSError arm, so this reply keeps the wording it had.
+    ex, _ = _executor(exc=http.client.RemoteDisconnected("closed"))
+    with pytest.raises(FhirLookupError, match="failed: closed"):
+        await ex.read("epic", "Patient/123")
 
 
 # --- CapabilityStatement probe (AC-8) ----------------------------------------

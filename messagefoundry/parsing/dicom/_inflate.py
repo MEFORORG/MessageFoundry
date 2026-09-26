@@ -10,8 +10,9 @@ compressed "bomb" (a few KiB that inflates to hundreds of MiB) therefore exhaust
 ``dcmread`` touches it. This module pre-checks the inflate **in bounded memory** and rejects an over-cap
 object *before* any ``dcmread``.
 
-The raw-stream bound, :func:`bounded_inflate_or_error`, is stdlib-only (``zlib``). The Part-10 guard,
-:func:`guard_part10_deflate`, is not, on purpose (BACKLOG #1926). To bound the bytes ``dcmread`` will
+The raw-stream bound, :func:`bounded_inflate_or_error`, is stdlib-only (``zlib``, through the loop in
+:mod:`messagefoundry.parsing._bounded_inflate` it shares with the compression codec, BACKLOG #1977).
+The Part-10 guard, :func:`guard_part10_deflate`, is not, on purpose (BACKLOG #1926). To bound the bytes ``dcmread`` will
 inflate, it must read the header exactly as ``dcmread`` does, so it runs ``pydicom``'s own header
 readers, the ones ``read_partial`` calls before its inflate. Any second reading of the header can
 disagree with ``pydicom``'s, and each disagreement lets a bomb through. Two of those readers are
@@ -31,7 +32,7 @@ Two entry points:
 
 Both raise :class:`~messagefoundry.parsing.dicom.errors.DicomBombError` (a ``DicomError``) for an
 over-cap deflated object. A corrupt deflate stream that stays under the cap before it breaks is left to
-``dcmread``, which fails on it within one :data:`_INFLATE_CHUNK` of what the guard counted. The
+``dcmread``, which fails on it within one 64 KiB working window of what the guard counted. The
 Part-10 guard catches nothing from its header replay: whatever ``pydicom`` raises there propagates,
 and the callers run the guard inside the same handler that wraps ``dcmread``.
 """
@@ -41,6 +42,7 @@ from __future__ import annotations
 import zlib
 from io import BytesIO
 
+from messagefoundry.parsing._bounded_inflate import InflateCeilingExceeded, bounded_inflate
 from messagefoundry.parsing.dicom._deps import load_header_readers
 from messagefoundry.parsing.dicom.errors import DicomBombError
 
@@ -62,53 +64,45 @@ DEFLATED_EXPLICIT_VR_LE = "1.2.840.10008.1.2.1.99"
 #: enforce).
 DEFAULT_MAX_INFLATED_BYTES = 16 * 1024 * 1024
 
-# The working window: never materialise more than this much decompressed output at once. The inflate is
-# cancelled the instant the running total crosses ``max_bytes``, so peak memory is ~this + the shrinking
-# compressed remainder, regardless of the declared/actual inflated size.
-_INFLATE_CHUNK = 65536
-
 
 def bounded_inflate_or_error(compressed: bytes | memoryview, *, max_bytes: int) -> None:
     """Inflate a **raw DEFLATE** stream (RFC 1951, DICOM Deflated Explicit VR LE) in bounded memory,
     **discarding** the output, and raise :class:`DicomBombError` if the cumulative uncompressed size
-    would exceed ``max_bytes``. Streams the decompression in :data:`_INFLATE_CHUNK`-bounded chunks so a
-    small compressed bomb with a huge inflated size never materialises in memory.
+    would exceed ``max_bytes``. Streams the decompression in 64 KiB chunks so a small compressed bomb
+    with a huge inflated size never materialises in memory.
 
     A silent no-op when ``compressed`` is empty or is not a valid deflate stream (``zlib.error``) — those
-    are not bombs; the normal ``dcmread`` path then produces the real parse error / dead-letters."""
+    are not bombs; the normal ``dcmread`` path then produces the real parse error / dead-letters.
+
+    The loop is :func:`messagefoundry.parsing._bounded_inflate.bounded_inflate`, shared with the
+    compression codec (BACKLOG #1977). Two of its settings are this guard's own:
+
+    * ``trailing="stop"``: it stops at the end of the stream and ignores what follows. pydicom and
+      pynetdicom both pad an odd-length stream with one NUL, and ``dcmread``'s one-shot inflate also
+      stops at the end of the first stream.
+    * ``exact_ceiling=False``: it asks zlib for a whole window each round, even near the cap. The
+      output is discarded, so this costs no memory. It keeps the verdict on a corrupt stream that
+      breaks inside the window that crosses the cap: zlib raises first, and the object is left to
+      ``dcmread``. Asking for one byte past the cap would call that object a bomb instead, and the
+      SCP answers a bomb with Out of Resources, a status a sender may treat as transient and retry.
+      A corrupt object gets Cannot Understand from the decode path, which it does not retry."""
     if not compressed:
         return
-    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)  # negative wbits ⇒ raw deflate, no header
-    total = 0
-    view = memoryview(compressed)
     try:
-        # Feed the input one window at a time. ``unconsumed_tail`` is a copy of the input not yet
-        # consumed, so handing the whole stream in at once copies the remainder on every round, and the
-        # guard's CPU grows with the square of the compressed size (4 s at 32 MiB, measured 2026-09-24).
-        for offset in range(0, len(view), _INFLATE_CHUNK):
-            pending: bytes | memoryview = view[offset : offset + _INFLATE_CHUNK]
-            # Stop at the end of the stream as well as at the end of the window. After the end, zlib
-            # keeps any trailing input in ``unconsumed_tail`` and never consumes it, so a loop on
-            # ``pending`` alone spins forever. pydicom and pynetdicom both pad an odd-length stream
-            # with one NUL, so a legitimate object is enough to hit that.
-            while pending and not decompressor.eof:
-                out = decompressor.decompress(pending, _INFLATE_CHUNK)
-                total += len(out)
-                if total > max_bytes:
-                    raise DicomBombError(
-                        "deflated DICOM object exceeds the maximum uncompressed size "
-                        f"({max_bytes} bytes); refusing to decode (possible decompression bomb)"
-                    )
-                pending = decompressor.unconsumed_tail
-            if decompressor.eof:
-                break  # dcmread's one-shot inflate also stops at the end of the first stream
-        tail = decompressor.flush()
-        total += len(tail)
-        if total > max_bytes:
-            raise DicomBombError(
-                "deflated DICOM object exceeds the maximum uncompressed size "
-                f"({max_bytes} bytes); refusing to decode (possible decompression bomb)"
-            )
+        bounded_inflate(
+            # A view, so each window is sliced without a copy. Safe for bytes, which cannot resize.
+            memoryview(compressed),
+            zlib.decompressobj(-zlib.MAX_WBITS),  # negative wbits means raw deflate, no header
+            max_output_bytes=max_bytes,
+            trailing="stop",
+            keep_output=False,
+            exact_ceiling=False,
+        )
+    except InflateCeilingExceeded:
+        raise DicomBombError(
+            "deflated DICOM object exceeds the maximum uncompressed size "
+            f"({max_bytes} bytes); refusing to decode (possible decompression bomb)"
+        ) from None
     except zlib.error:
         # Not a valid deflate stream, so dcmread's one-shot inflate fails on it too, at the same point.
         # By then it has produced at most what the loop counted plus one working window, and the loop

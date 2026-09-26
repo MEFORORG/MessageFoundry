@@ -8,12 +8,13 @@ drops. This module is the primitive: a Handler calls it on demand against a
 body, and the File connector uses the single-stream ``gzip`` pair for its ``compress=``/``decompress=``
 option (:mod:`messagefoundry.transports.file`).
 
-It is **pure** — stdlib (:mod:`gzip`, :mod:`zlib`, :mod:`zipfile`, :mod:`io`) plus one sibling under
-``parsing/`` (:mod:`messagefoundry.parsing.sniff`, for the archive-member admission checks), **no engine
-imports** — so it sits under the ``parsing/`` carve-out (a client may import it, mirroring
-:mod:`messagefoundry.parsing.binary` / :mod:`messagefoundry.parsing.x12`). The sibling import is
-deliberate rather than a copied magic-byte table: the extension-keyed check and the declared-type check
-must not be able to drift apart.
+It is **pure** — stdlib (:mod:`gzip`, :mod:`zlib`, :mod:`zipfile`, :mod:`io`) plus two siblings under
+``parsing/`` (:mod:`messagefoundry.parsing.sniff`, for the archive-member admission checks, and
+:mod:`messagefoundry.parsing._bounded_inflate`, the inflate loop it shares with the DICOM deflate
+guard), **no engine imports** — so it sits under the ``parsing/`` carve-out (a client may import it,
+mirroring :mod:`messagefoundry.parsing.binary` / :mod:`messagefoundry.parsing.x12`). Both sibling
+imports are deliberate rather than copies: the extension-keyed check and the declared-type check must
+not be able to drift apart, and neither may two copies of one inflate loop (BACKLOG #1977).
 
 Compression is **orthogonal**
 to the ADR 0028 base64 *carriage* codec: carriage makes bytes NUL-safe over the str/TEXT store;
@@ -52,6 +53,12 @@ import zipfile
 import zlib
 from collections.abc import Mapping
 
+from messagefoundry.parsing._bounded_inflate import (
+    CHUNK,
+    InflateCeilingExceeded,
+    InflateTrailingData,
+    bounded_inflate,
+)
 from messagefoundry.parsing.sniff import (
     archive_member_content_reason,
     archive_member_name_reason,
@@ -77,10 +84,15 @@ class CompressionError(ValueError):
     message names the **codec and the byte ceiling only**, never any (PHI) decompressed content."""
 
 
-# Read/decompress in bounded chunks so a bomb is refused incrementally, never fully expanded.
-_CHUNK = 1 << 16  # 64 KiB
+# Read/decompress in bounded chunks so a bomb is refused incrementally, never fully expanded. The
+# same 64 KiB window the shared inflate loop feeds, so a stream sized in windows means one thing.
+_CHUNK = CHUNK
 # zlib window-bits selectors: 15 = zlib-wrapped DEFLATE ("deflate"); 31 = 16+15 = gzip.
 _ZLIB_WBITS = 15
+# The ZIP end-of-central-directory record (APPNOTE 4.3.16): a fixed 22-byte record whose last two
+# bytes declare the length of the archive comment that follows it. The comment ends the archive.
+_ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
+_ZIP_EOCD_SIZE = 22
 
 
 def _check_level(level: int) -> int:
@@ -154,7 +166,29 @@ def deflate_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
     :class:`CompressionError` (BACKLOG #1964). Stdlib :func:`zlib.decompress` ignores such bytes. This
     refuses them, so no part of the input is dropped without a word."""
     _check_ceiling(max_output_bytes)
-    return _bounded_inflate(data, max_output_bytes, label="deflate")
+    # The loop is shared with the DICOM deflate guard (BACKLOG #1977). The rules here are the codec's:
+    # its one error type, a truncated stream is an error, and nothing may follow the stream.
+    try:
+        result = bounded_inflate(
+            data,
+            zlib.decompressobj(wbits=_ZLIB_WBITS),
+            max_output_bytes=max_output_bytes,
+            # Refused rather than ignored: returning the first stream would drop the rest of the
+            # input without a word, which is accept-and-drop (BACKLOG #1964). Wrong for gzip, which
+            # has members and NUL padding, so this loop is zlib-wrapped only.
+            trailing="refuse",
+            keep_output=True,
+            exact_ceiling=True,
+        )
+    except InflateCeilingExceeded as exc:
+        raise _over_ceiling("deflate", exc.ceiling) from None
+    except InflateTrailingData:
+        raise CompressionError("trailing data after the end of the deflate stream") from None
+    except zlib.error as exc:
+        raise CompressionError(f"corrupt or truncated deflate stream: {exc}") from exc
+    if not result.eof:
+        raise CompressionError("truncated deflate stream (input ended mid-stream)")
+    return result.output
 
 
 def _over_ceiling(label: str, max_output_bytes: int) -> CompressionError:
@@ -162,45 +196,6 @@ def _over_ceiling(label: str, max_output_bytes: int) -> CompressionError:
         f"{label} stream decompresses beyond the {max_output_bytes}-byte ceiling "
         "(possible decompression bomb)"
     )
-
-
-def _bounded_inflate(data: bytes, max_output_bytes: int | None, *, label: str) -> bytes:
-    # zlib-wrapped only. The tail rule below is wrong for gzip, which has members and NUL padding.
-    d = zlib.decompressobj(wbits=_ZLIB_WBITS)
-    out = bytearray()
-    try:
-        # Feed the input one window at a time. unconsumed_tail is a copy of the input not yet used,
-        # so handing zlib the whole remainder copies it on every round, which is quadratic in the
-        # compressed size (BACKLOG #1964). Slicing copies each window once, and unlike a memoryview
-        # it leaves no export on a caller's bytearray behind a raised error.
-        for offset in range(0, len(data), _CHUNK):
-            pending = data[offset : offset + _CHUNK]
-            # Stop at the end of the stream too. After it, zlib can keep trailing input in
-            # unconsumed_tail and never use it, so a loop that watches only pending spins forever
-            # without growing the output, and the ceiling never fires (BACKLOG #1964).
-            while pending and not d.eof:
-                # Ask for at most one byte past the ceiling, so a bomb stops at the ceiling itself.
-                room = _CHUNK if max_output_bytes is None else max_output_bytes - len(out) + 1
-                out += d.decompress(pending, min(_CHUNK, room))
-                if max_output_bytes is not None and len(out) > max_output_bytes:
-                    raise _over_ceiling(label, max_output_bytes)
-                pending = d.unconsumed_tail
-            if d.eof:
-                if pending or d.unused_data or offset + _CHUNK < len(data):
-                    # Refused rather than ignored: returning the first stream would drop the rest
-                    # of the input without a word, which is accept-and-drop. A zlib stream has no
-                    # multi-member form and no padding convention, so there is no tail to accept.
-                    raise CompressionError(f"trailing data after the end of the {label} stream")
-                return bytes(out)
-        # The input ran out first. zlib may still hold output for input it has already taken.
-        out += d.flush()
-    except zlib.error as exc:
-        raise CompressionError(f"corrupt or truncated {label} stream: {exc}") from exc
-    if max_output_bytes is not None and len(out) > max_output_bytes:
-        raise _over_ceiling(label, max_output_bytes)
-    if not d.eof:
-        raise CompressionError(f"truncated {label} stream (input ended mid-stream)")
-    return bytes(out)
 
 
 def zip_compress(entries: Mapping[str, bytes], *, level: int | None = None) -> bytes:
@@ -244,7 +239,8 @@ def _member_codec_errors() -> tuple[type[Exception], ...]:
 
 
 # What a corrupt archive or member raises. ValueError covers a member name flagged UTF-8 that is not
-# (UnicodeDecodeError) and a corrupt offset that makes zipfile seek to a negative position.
+# (UnicodeDecodeError). A corrupt offset that would make zipfile seek to a negative position is a
+# ValueError too, though _zip_layout_reason refuses that archive before any member is opened.
 # CompressionError is a ValueError too, so zip_decompress re-raises it in an arm AHEAD of this one;
 # without that arm the refusals its loop raises would be caught here and relabelled.
 _ZIP_CORRUPT_ERRORS: tuple[type[Exception], ...] = (
@@ -282,7 +278,17 @@ def zip_decompress(
     not sanitization, is the treatment. A refused member raises :class:`CompressionError` for the WHOLE
     archive rather than being skipped — silently dropping one member of a feed is the accept-and-drop this
     project forbids ([CLAUDE.md](../../CLAUDE.md) §12), and the raise routes the message to the caller's
-    error / dead-letter path."""
+    error / dead-letter path.
+
+    Bytes before or after the archive are refused too (BACKLOG #1976). The archive ends at its
+    end-of-central-directory record plus the comment that record declares, and starts at its first
+    member. Stdlib :mod:`zipfile` finds that record by scanning back from the end of the input, and
+    treats anything before the archive as prepended data it skips. So it opens an archive with a short
+    tail after it, or with bytes, even a whole second archive, in front of it, and never reads them.
+    That is the same accept-and-drop :func:`deflate_decompress` refuses, so this refuses it the same
+    way. A tail too long for that scan, with no archive at its end, fails in :mod:`zipfile` as corrupt.
+    A comment shorter than its record declares is refused as truncated. Bytes hidden between two
+    members are not checked."""
     _check_ceiling(max_output_bytes)
     if not isinstance(max_entries, int) or max_entries < 0:
         raise CompressionError(f"max_entries must be a non-negative int, got {max_entries!r}")
@@ -292,6 +298,10 @@ def zip_decompress(
     failure: str | None = None
     try:
         with zipfile.ZipFile(io.BytesIO(data), mode="r") as zf:
+            # Before any member is read, like the member-count cap: a refused archive costs nothing.
+            layout_reason = _zip_layout_reason(data, zf)
+            if layout_reason is not None:
+                raise CompressionError(layout_reason)
             names = zf.namelist()
             if len(names) > max_entries:
                 raise CompressionError(
@@ -350,3 +360,32 @@ def zip_decompress(
         where = f"zip archive member {position}" if position else "zip archive"
         raise CompressionError(f"{where} {failure}")
     return result
+
+
+def _zip_layout_reason(data: bytes, zf: zipfile.ZipFile) -> str | None:
+    """Why ``data`` holds bytes outside the archive :mod:`zipfile` opened, or ``None`` when it holds
+    none. The reason names no content.
+
+    **After the archive.** ``zf.comment`` is the comment :mod:`zipfile` read, after the LAST
+    end-record signature in the input. A clean archive therefore ends with that record, whose declared
+    comment length is ``len(comment)``, followed by the comment. With a tail, the bytes where the
+    record would have to start are not a record: a record there would be a later signature, and
+    :mod:`zipfile` would have used it. With a comment shorter than it declares, :mod:`zipfile` still
+    reads the short comment, so the record sits where it should and only its declared length
+    disagrees.
+
+    **Before the archive.** :mod:`zipfile` adds the length of any prepended data to every member's
+    ``header_offset``, so a clean archive has a member at offset 0. An archive with no members is only
+    its end record, so that record starts the input."""
+    comment = zf.comment
+    start = len(data) - _ZIP_EOCD_SIZE - len(comment)
+    record = data[start : start + _ZIP_EOCD_SIZE] if start >= 0 else b""
+    if record[:4] != _ZIP_EOCD_SIGNATURE:
+        return "trailing data after the end of the zip archive"
+    if int.from_bytes(record[-2:], "little") != len(comment):
+        return "truncated zip archive comment (input ended before the archive did)"
+    members = zf.infolist()
+    first = min(info.header_offset for info in members) if members else start
+    if first != 0:
+        return "data before the start of the zip archive"
+    return None
