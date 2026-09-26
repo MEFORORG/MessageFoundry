@@ -59,7 +59,7 @@ from messagefoundry.config.tls_policy import (
     resolve_trust_anchor,
 )
 from messagefoundry.parsing.message import emit_raw_separators
-from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
+from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.timezone import hl7_now
 from messagefoundry.transports.base import (
@@ -452,6 +452,27 @@ _CODES = {
 }
 
 
+def _ack_echo(peek: Peek | None) -> tuple[str, str, str, str, str, str, str, str]:
+    """The inbound header values an ACK echoes, or their defaults when there is no ``peek``.
+
+    Returns ``(field_sep, enc, sending_app, sending_fac, receiving_app, receiving_fac, version,
+    control_id)``. Every value is echoed from the (untrusted) inbound message, so CR/LF is stripped to
+    prevent segment injection into the ACK; MSA-3 free text is escaped separately (HL7-3).
+    """
+    if peek is None:
+        return _DEFAULT_FIELD_SEP, _DEFAULT_ENC, "", "", "", "", "2.5.1", ""
+    return (
+        peek.field("MSH-1") or _DEFAULT_FIELD_SEP,
+        peek.field("MSH-2") or _DEFAULT_ENC,
+        _no_seg_sep(peek.sending_app or ""),
+        _no_seg_sep(peek.sending_facility or ""),
+        _no_seg_sep(peek.receiving_app or ""),
+        _no_seg_sep(peek.receiving_facility or ""),
+        _no_seg_sep(peek.version or "2.5.1"),
+        _no_seg_sep(peek.control_id or ""),
+    )
+
+
 def build_ack(
     inbound: str | bytes | Peek,
     *,
@@ -486,16 +507,26 @@ def build_ack(
     except HL7PeekError:
         peek = None
 
-    field_sep = (peek.field("MSH-1") if peek else None) or _DEFAULT_FIELD_SEP
-    enc = (peek.field("MSH-2") if peek else None) or _DEFAULT_ENC
-    # Every value below is echoed from the (untrusted) inbound message, so strip CR/LF to prevent
-    # segment injection into the ACK; MSA-3 free text is additionally escaped (HL7-3).
-    sending_app = _no_seg_sep((peek.sending_app if peek else None) or "")
-    sending_fac = _no_seg_sep((peek.sending_facility if peek else None) or "")
-    receiving_app = _no_seg_sep((peek.receiving_app if peek else None) or "")
-    receiving_fac = _no_seg_sep((peek.receiving_facility if peek else None) or "")
-    version = _no_seg_sep((peek.version if peek else None) or "2.5.1")
-    original_control = _no_seg_sep((peek.control_id if peek else None) or "")
+    try:
+        echo = _ack_echo(peek)
+    except PEEK_READ_FAULTS as exc:
+        # BACKLOG #1594: this function builds the NAK for a message that just failed, so it must
+        # never raise on one Peek.parse accepted. A faulting read degrades to the no-peek defaults;
+        # the ACK then carries no echoed header values, which is what an unparseable inbound gets.
+        logger.warning(
+            "ACK header echo failed (%s); building the ACK without it", type(exc).__name__
+        )
+        echo = _ack_echo(None)
+    (
+        field_sep,
+        enc,
+        sending_app,
+        sending_fac,
+        receiving_app,
+        receiving_fac,
+        version,
+        original_control,
+    ) = echo
     ack_control = _no_seg_sep(control_id if control_id is not None else original_control)
 
     # Swap sender/receiver: the ACK goes back the way it came.
@@ -1003,7 +1034,8 @@ class MLLPDestination(DestinationConnector):
             if self.verify_ack_control_id:
                 try:
                     sent_control_id = Peek.parse(payload).control_id
-                except HL7PeekError:
+                except PEEK_READ_FAULTS:  # HL7PeekError is a ValueError, so it lands here too
+                    # A faulting MSH-10 read is "unreadable" too (BACKLOG #1594): skip correlation.
                     sent_control_id = None
             if not self.persistent:
                 return await self._send_once(payload, sent_control_id)

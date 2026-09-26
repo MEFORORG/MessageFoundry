@@ -187,6 +187,12 @@ _EMPTY_FIELDS = (
     "\r"  # blank segment
     "PV1|1\r"
 )
+# A line that STARTS with the field separator has id "" on the built-ins but is not an empty line, so
+# python-hl7's segments() scan reads it without raising. The built-ins used to raise on it anyway
+# (BACKLOG #1594); this entry pins the two backends together on Peek, Message and every mutation.
+_LEADING_FIELD_SEP = (
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|C5|P|2.5.1\r|stray\rPID|1||444^^^A||DOE^JO\rPV1|1|I\r"
+)
 _NO_TRAILING_CR = (
     "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|C4|P|2.5.1\rOBR|1\rOBX|1|NM|GLU^Glucose^LN|1|99|mg/dL"
 )
@@ -195,6 +201,7 @@ _ADVERSARIAL: list[tuple[str, str]] = [
     ("adv:escapes", normalize(_ESCAPED)),
     ("adv:custom-seps", normalize(_CUSTOM_SEPS)),
     ("adv:empty-fields", normalize(_EMPTY_FIELDS)),
+    ("adv:leading-field-sep", normalize(_LEADING_FIELD_SEP)),
     ("adv:no-trailing-cr", normalize(_NO_TRAILING_CR)),
 ]
 
