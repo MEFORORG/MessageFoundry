@@ -15,6 +15,7 @@ indirection that bypassed the patch would leave that test passing while proving 
 
 from __future__ import annotations
 
+import ast
 import os
 import shutil
 import subprocess
@@ -282,7 +283,123 @@ def test_the_storm_counts_are_unchanged() -> None:
     assert DRAINS == 8, "DRAINS moved; the same argument applies"
 
 
-def test_a_wrapped_file_does_not_quietly_grow_an_unwrapped_pwsh_launch() -> None:
+#: The ``subprocess`` entry points that start a process. ``run_single`` wraps only ``run``, but a
+#: bare ``check_output`` of pwsh starves in a storm exactly as a bare ``run`` does.
+_LAUNCHERS = frozenset(
+    f"subprocess.{f}" for f in ("run", "Popen", "call", "check_call", "check_output")
+)
+
+
+def _is_pwsh_list(node: ast.expr | None) -> bool:
+    """A list or tuple literal whose first element names an interpreter ``run_single`` locks.
+
+    Normalised as ``run_single`` normalises it, so ``pwsh.exe`` and a full path count too.
+    """
+    if not isinstance(node, (ast.List, ast.Tuple)) or not node.elts:
+        return False
+    head = node.elts[0]
+    if not isinstance(head, ast.Constant):
+        return False
+    binary = str(head.value).replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+    return binary in _spawn_lock._LOCKED_INTERPRETERS
+
+
+def _unwrapped_pwsh_launches(source: str) -> list[int]:
+    """Lines where a ``subprocess`` launcher starts pwsh outside the spawn lock.
+
+    Two spellings of the command are seen, positional or as ``args=``: a literal list, and a NAME
+    bound to one by a plain assignment in the same scope. ``test_announce_hook.py`` builds its
+    command as ``args = ["pwsh", ...]`` and passes the name, so a literal-only check would not see
+    its main launch at all. A launch inside ``with single_spawn():`` holds the lock by hand and is
+    not an offender.
+
+    AT LEAST THESE SHAPES, NOT EVERY SHAPE. A name bound in an enclosing scope or by an annotated
+    assignment, or an aliased import of ``subprocess``, is not resolved. Rebinding one name from
+    pwsh to git in the same scope errs loud: the git call is flagged too.
+    """
+    tree = ast.parse(source)
+    held: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+            isinstance(item.context_expr, ast.Call)
+            and ast.unparse(item.context_expr.func).rsplit(".", 1)[-1] == "single_spawn"
+            for item in node.items
+        ):
+            held.append((node.lineno, node.end_lineno or node.lineno))
+
+    def own_nodes(scope: ast.AST) -> list[ast.AST]:
+        # One scope's nodes, NOT its nested functions'. Walking the module with ast.walk would bind
+        # a name from one function and then flag an unrelated use of that name in another.
+        out: list[ast.AST] = []
+        stack = list(ast.iter_child_nodes(scope))
+        while stack:
+            n = stack.pop()
+            out.append(n)
+            if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                stack.extend(ast.iter_child_nodes(n))
+        return out
+
+    offenders: set[int] = set()
+    scopes: list[ast.AST] = [tree]
+    scopes += [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+    ]
+    for scope in scopes:
+        nodes = own_nodes(scope)
+        pwsh_names = {
+            target.id
+            for n in nodes
+            if isinstance(n, ast.Assign) and _is_pwsh_list(n.value)
+            for target in n.targets
+            if isinstance(target, ast.Name)
+        }
+        for n in nodes:
+            if not isinstance(n, ast.Call) or ast.unparse(n.func) not in _LAUNCHERS:
+                continue
+            keyword = next((k.value for k in n.keywords if k.arg == "args"), None)
+            first = n.args[0] if n.args else keyword
+            if first is None:
+                continue
+            if not (
+                _is_pwsh_list(first) or (isinstance(first, ast.Name) and first.id in pwsh_names)
+            ):
+                continue
+            if any(start <= n.lineno <= end for start, end in held):
+                continue
+            offenders.add(n.lineno)
+    return sorted(offenders)
+
+
+def test_the_unwrapped_launch_finder_sees_every_shape_it_claims_to() -> None:
+    """POSITIVE CONTROL for the gate below. A finder that returns nothing passes every file."""
+    source = (
+        "import subprocess\n"
+        "def a():\n"
+        "    subprocess.run(['pwsh', '-File', 'x'])\n"  # 3: literal, unwrapped
+        "def b():\n"
+        "    args = ['pwsh', '-File', 'x']\n"
+        "    subprocess.run(args, check=False)\n"  # 6: name, unwrapped
+        "def c():\n"
+        "    subprocess.Popen(['powershell', '-c', 'x'])\n"  # 8: Popen, unwrapped
+        "def d():\n"
+        "    with single_spawn():\n"
+        "        subprocess.Popen(['pwsh', '-c', 'x'])\n"  # 11: held by hand
+        "def e():\n"
+        "    run_single(['pwsh', '-c', 'x'])\n"  # 13: wrapped
+        "    subprocess.run(['git', 'status'])\n"  # 14: not an interpreter
+        "    args = ['git', 'status']\n"
+        "    subprocess.run(args)\n"  # 16: a name bound to something else
+        "def f(ex):\n"
+        "    ex.submit(lambda: subprocess.run(['pwsh', '-c', 'x']))\n"  # 18: inside a lambda
+        "    subprocess.check_output(args=[r'C:\\\\ps\\\\pwsh.EXE', '-c', 'x'])\n"  # 19: keyword, path
+    )
+    assert _unwrapped_pwsh_launches(source) == [3, 6, 8, 18, 19]
+
+
+@pytest.mark.parametrize("name", ["test_coord_usage.py", "test_announce_hook.py"])
+def test_a_wrapped_file_does_not_quietly_grow_an_unwrapped_pwsh_launch(name: str) -> None:
     """THE CONVENTION IN A DOCSTRING, MADE INTO A GATE -- BACKLOG #1304.
 
     ``tests/test_coord_usage.py`` reds ``main``'s harness leg when one of its ``pwsh`` launches
@@ -295,32 +412,20 @@ def test_a_wrapped_file_does_not_quietly_grow_an_unwrapped_pwsh_launch() -> None
     module's files are heavily commented ABOUT ``subprocess.run(["pwsh"``, so a text search reports
     the prose and fails. The AST sees calls only.
 
-    This gates the file that has CI evidence, not the tier. Wrapping the other ~65 launcher files is
-    the unbuilt ``run_pwsh`` abstraction the module docstring names; a gate that demanded it here
-    would fail on work nobody has scheduled.
+    This gates the files that have CI evidence, not the tier. ``tests/test_announce_hook.py`` joined
+    on 2026-09-26, after its own launches timed out at 45s on the windows-2025 leg in at least four
+    jobs; that file's docstring carries the run ids. Wrapping the other ~65 launcher files is the
+    unbuilt ``run_pwsh`` abstraction the module docstring names; a gate that demanded it here would
+    fail on work nobody has scheduled.
     """
-    import ast
-
-    source = Path(__file__).resolve().parent / "test_coord_usage.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-
-    offenders: list[int] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or ast.unparse(node.func) != "subprocess.run":
-            continue
-        if not node.args:
-            continue
-        first = node.args[0]
-        if isinstance(first, (ast.List, ast.Tuple)) and first.elts:
-            head = first.elts[0]
-            if isinstance(head, ast.Constant) and str(head.value).lower() in {"pwsh", "powershell"}:
-                offenders.append(node.lineno)
+    source = Path(__file__).resolve().parent / name
+    offenders = _unwrapped_pwsh_launches(source.read_text(encoding="utf-8"))
 
     assert not offenders, (
-        f"{source.name} launches pwsh through subprocess.run at line(s) {offenders} instead of "
-        "run_single, so that launch does not take the shared side of the spawn lock and a storm "
-        "will not wait for it (BACKLOG #1304). Use run_single, or state in the file why this launch "
-        "is exempt and relax this gate deliberately."
+        f"{source.name} launches pwsh outside the spawn lock at line(s) {offenders} instead of "
+        "through run_single, so that launch does not take the shared side of the lock and a storm "
+        "will not wait for it (BACKLOG #1304). Use run_single (or `with single_spawn():` for a "
+        "Popen), or state in the file why this launch is exempt and relax this gate deliberately."
     )
 
 

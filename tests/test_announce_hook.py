@@ -16,6 +16,16 @@ wrong reason, the positive one goes red first.
 The hook is driven as a real subprocess with a real payload on stdin, against a stub presence script
 supplying known rows, inside a throwaway git repo. It is never run against the live checkout: sibling
 sessions are using that while the suite runs.
+
+EVERY ``pwsh`` LAUNCH HERE TAKES THE SHARED SIDE OF ``tests/_spawn_lock.py`` (BACKLOG #1304), and
+that is on CI evidence. On the windows-2025 harness leg a single hook launch timed out at 45s in at
+least four jobs of 2026-09-26: main runs 36258251762 and 36259087495, and the first attempts of the
+PR 1621 and PR 1626 runs. Passing jobs logged single launches of 23-25s, against 1-3s locally. The
+slow tests sat in one contiguous block of this file and changed from job to job, which points at a
+window of time rather than at any test's content. That is the shape #1304 measured for a launch
+overlapping ``test_session_mail.py``'s 16-process storm. The logs carry no per-test start times, so
+the overlap itself is inferred here, not observed. Keep new launches on ``run_single`` or
+``single_spawn``; ``tests/test_spawn_lock.py`` gates this file for the spellings it checks.
 """
 
 from __future__ import annotations
@@ -31,18 +41,36 @@ from typing import Any
 
 import pytest
 
+from tests._spawn_lock import run_single, single_spawn
+
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "scripts" / "hooks" / "announce-session.ps1"
 
 # Below pyproject.toml's --timeout=60 (and CI's 120) so a hung hook fails THIS test by name via
 # TimeoutExpired instead of taking the whole leg down through --timeout-method=thread, which kills the
 # pytest process with no attribution.
+#
+# NOT RAISED for the 2026-09-26 timeouts, on purpose, and the reason rests on an inference. The lock
+# removes the storm those launches are inferred to have starved in; outside a storm, #1304 measured
+# ANOTHER file's launches at a 5.2s max, and this hook runs in 1-3s locally. Nobody has timed this
+# hook on CI outside a storm. The lock waits BEFORE the process starts, so the wait is not charged
+# to this clock, and 45s still names a real hang.
 TIMEOUT = 45
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("pwsh") is None or os.name != "nt",
-    reason="announce-session.ps1 needs pwsh on Windows",
-)
+# THE PER-TEST CLOCK IS A DIFFERENT CLOCK, and the lock wait IS charged to it. A launch may wait up
+# to _spawn_lock._SINGLE_WAIT_S (90s) for a storm, and a test here makes up to four launches. So the
+# tier's --timeout=120, and pyproject's 60, could kill a test that is only waiting -- through
+# --timeout-method=thread, with no test named, which is what TIMEOUT above exists to prevent. 300s
+# is the storm's own per-test bound in test_session_mail.py. A hung launch still fails at 45s.
+PER_TEST_TIMEOUT = 300
+
+pytestmark = [
+    pytest.mark.skipif(
+        shutil.which("pwsh") is None or os.name != "nt",
+        reason="announce-session.ps1 needs pwsh on Windows",
+    ),
+    pytest.mark.timeout(PER_TEST_TIMEOUT),
+]
 
 SELF_ID = "11111111-2222-3333-4444-555555555555"
 
@@ -187,7 +215,7 @@ def run(
     ):
         reg_env["USERPROFILE"] = str(_registry(tmp_path / "reg-home", session_id, ".claude"))
     full_env = {**os.environ, **reg_env, **(env or {})}
-    proc = subprocess.run(
+    proc = run_single(
         args,
         cwd=str(repo),
         input=json.dumps(payload) if stdin else None,
@@ -797,7 +825,7 @@ def test_selftest_writes_nothing_and_emits_no_instruction(repo: Path, tmp_path: 
     run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
     before = {p: p.stat().st_mtime_ns for p in sorted(sd.rglob("*"))}
     presence = presence_stub(tmp_path, [SELF_ROW, PEER])
-    proc = subprocess.run(
+    proc = run_single(
         [
             "pwsh",
             "-NoProfile",
@@ -828,29 +856,31 @@ def test_selftest_does_not_read_stdin(repo: Path, tmp_path: Path) -> None:
     """[Console]::IsInputRedirected is True from an agent shell even with no pipe, so a read guarded
     only on redirection turns the diagnostic switch into a hang."""
     presence = presence_stub(tmp_path, [SELF_ROW, PEER])
-    proc = subprocess.Popen(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(HOOK),
-            "-PresenceScript",
-            str(presence),
-            "-SelfTest",
-        ],
-        cwd=str(repo),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        # stdin is left OPEN and never written: a hook that reads it would block here.
-        out, _ = proc.communicate(timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        pytest.fail("-SelfTest blocked reading stdin")
+    # run_single wraps subprocess.run only, so this Popen takes the shared side by hand.
+    with single_spawn():
+        proc = subprocess.Popen(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(HOOK),
+                "-PresenceScript",
+                str(presence),
+                "-SelfTest",
+            ],
+            cwd=str(repo),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            # stdin is left OPEN and never written: a hook that reads it would block here.
+            out, _ = proc.communicate(timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            pytest.fail("-SelfTest blocked reading stdin")
     assert proc.returncode == 0
     assert "read-only" in out
 
@@ -1370,7 +1400,7 @@ def test_the_self_test_reports_the_mail_split_under_a_stated_login(
         "-AsLogin",
         "default",
     ]
-    p = subprocess.run(
+    p = run_single(
         args, cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False
     )
     assert p.returncode == 0, p.stderr
