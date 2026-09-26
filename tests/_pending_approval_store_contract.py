@@ -152,12 +152,15 @@ _OUTCOME_ACTIONS = ("approval.approved", "approval.failed", "approval.interrupte
 
 
 async def _audit_actions(store: Any, approval_id: str) -> list[str]:
-    """This request's outcome audit actions. Read per action and filtered on the id, because the
-    server legs share one log: a plain newest-N read could miss this request's row under load and
-    turn an absence assertion vacuous."""
+    """This request's outcome audit actions. Read per action, from the request's own time, and
+    filtered on the id, because the server legs share one log: a plain newest-N read could miss this
+    request's row under load and turn an absence assertion vacuous."""
+    row = await store.get_pending_approval(approval_id)
+    assert row is not None
+    since = float(row["requested_at"]) - 1.0
     found: list[str] = []
     for action in _OUTCOME_ACTIONS:
-        for r in await store.list_audit(action=action, limit=500):
+        for r in await store.list_audit(action=action, since=since, limit=500):
             if json.loads(str(r["detail"])).get("approval_id") == approval_id:
                 found.append(action)
     return found

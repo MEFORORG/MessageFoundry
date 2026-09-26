@@ -453,6 +453,7 @@ async def test_raising_executor_audits_the_failure_against_both_identities(
     assert detail["operation"] == "dead_letter_replay"
     assert detail["requester"] == "maker"
     assert detail["compensated"] is True
+    assert detail["stage"] == "execute"  # the executor ran and raised (BACKLOG #1562)
     # The exception TYPE is recorded, never its message: executor text can carry connection names,
     # paths or params, and the audit log is not a PHI sink.
     assert detail["error"] == "RuntimeError"
@@ -687,9 +688,33 @@ async def test_cancel_during_the_claim_settles_to_failed_and_never_runs(engine: 
     await _eventually(_failed)
     assert ran == []  # the executor never started
     assert await _status_of(engine, approval_id) == "failed"
-    failed = (await engine.store.list_audit(action="approval.failed"))[0]
-    assert json.loads(str(failed["detail"]))["error"] == "CancelledError"
+    failed = json.loads(str((await engine.store.list_audit(action="approval.failed"))[0]["detail"]))
+    assert failed["error"] == "CancelledError" and failed["stage"] == "claim"
     assert await engine.store.list_audit(action="approval.approved") == []
+
+
+async def test_a_failed_approved_write_still_writes_the_audit_row(engine: Engine) -> None:
+    """The operation RAN. If moving the row to 'approved' fails, approval.approved is still written
+    and the error still reaches the caller; the row is left 'executing', never 'failed'."""
+    from tests._pending_approval_store_contract import _resolve, _StandingStore
+
+    class _SettleFails(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw["status"] == "approved":
+                raise OSError("store unreachable")
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    gate = ApprovalGate(_SettleFails(engine.store), ON, resolve_identity=_resolve)
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    with pytest.raises(OSError):
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+    assert await engine.store.list_audit(action="approval.failed") == []
+    assert await _status_of(engine, approval_id) == "executing"
 
 
 # --- BACKLOG #1540: the self-approval refusal keys on users.id, not on the username --------
