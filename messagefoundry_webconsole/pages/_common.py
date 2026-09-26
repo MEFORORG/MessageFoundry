@@ -112,6 +112,40 @@ def _window_note(shown: int, limit: int, noun: str) -> Markup:
     return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
 
 
+# At most this many failed inbounds are named in the heart's reason; the rest become "and N more".
+# The reason renders into a title= attribute, so an estate-wide outage must not produce a tooltip
+# hundreds of names long.
+_MAX_NAMED_FAILURES = 3
+
+
+def _failed_inbound_reason(count: int, names: list[str]) -> str:
+    """The sentence for ``count`` failed inbounds, naming the ones the caller may see.
+
+    ONE builder feeds both surfaces that report a start failure: the nav heart's tooltip
+    (``routes.status._derive_health``) and the status page's Inbound rows (BACKLOG #1816). Two
+    spellings would let the heart and the page beside it describe the same connection differently,
+    which is the disagreement that item closed.
+
+    ``names`` is the caller-visible SUBSET (``EngineInfo.channels_failed_names``), so it can be
+    shorter than ``count`` or empty — a channel-scoped operator still learns that something is down
+    without learning whose feed it is. Connection NAMES only: the engine's failure reason is a raw
+    exception string, and this text lands in a ``title=`` attribute.
+    """
+    shown = names[:_MAX_NAMED_FAILURES]
+    if count == 1:
+        # The scoped caller's single hidden failure takes the second form: "1 inbound connections"
+        # is what a shared plural head would produce, and an operator reading a tooltip notices.
+        if shown:
+            return f"inbound {shown[0]} failed to start"
+        return "1 inbound connection failed to start"
+    head = f"{count} inbound connections failed to start"
+    if not shown:
+        return head
+    hidden = count - len(shown)
+    listed = ", ".join(shown)
+    return f"{head}: {listed}, and {hidden} more" if hidden > 0 else f"{head}: {listed}"
+
+
 def _num(value: object) -> str:
     """Render a count/None as text ('—' for None)."""
     return "—" if value is None else str(value)

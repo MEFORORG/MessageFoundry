@@ -5716,6 +5716,41 @@ def test_status_update_banner() -> None:
     )
 
 
+def test_status_page_renders_a_failed_inbound_as_failed_in_the_hearts_words() -> None:
+    """BACKLOG #1816: a start failure used to read as an ordinary stopped inbound on /ui/status.
+
+    The page must say "failed to start" and must say it in the SAME sentence the nav heart shows,
+    so the reason is taken from ``_derive_health`` itself rather than restated here. The failure
+    is a subset of the stopped count, so the count line says "of which" and never adds a term."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    failed = _sysinfo(50 * _GIB, channels=3, failed_names=["IB_ACME_ADT"])
+    _health, reason = _derive_health(failed, None, None, None)
+    assert reason == "inbound IB_ACME_ADT failed to start"
+    html = _status_html(failed)
+    assert "2/3 running (1 stopped, of which 1 failed to start)" in html
+    assert reason in html
+    assert 'class="status status-failed"' in html
+
+    # A channel-scoped caller sees the count and no names; the page must not invent any.
+    scoped = _sysinfo(50 * _GIB, channels=3, failed_count=2)
+    _health, scoped_reason = _derive_health(scoped, None, None, None)
+    assert scoped_reason == "2 inbound connections failed to start"
+    assert scoped_reason in _status_html(scoped)
+
+    # A connection name is free text, so it goes through the escaping builder like any other value.
+    hostile = _status_html(_sysinfo(50 * _GIB, channels=1, failed_names=["<b>IB</b>"]))
+    assert "<b>IB</b>" not in hostile and "&lt;b&gt;IB&lt;/b&gt;" in hostile
+
+
+def test_status_page_without_a_failed_inbound_keeps_the_plain_stopped_line() -> None:
+    """The #1816 control: an ordinary stop is not a failure, and the page must not call it one."""
+    html = _status_html(_sysinfo(50 * _GIB, channels=3, channels_running=2))
+    assert "2/3 running (1 stopped)" in html
+    assert "failed to start" not in html
+    assert "Inbound start failures" not in html
+
+
 # Gap 3 — per-connection stats reset ---------------------------------------------------------------
 
 

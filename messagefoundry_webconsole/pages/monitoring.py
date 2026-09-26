@@ -29,6 +29,7 @@ from messagefoundry.api.models import (
 )
 
 from .._html import Markup, el, page, register_nav, rows_table
+from ._common import _failed_inbound_reason
 
 __all__ = [
     "alerts",
@@ -368,16 +369,34 @@ def status(
     e = sys.engine
     db = sys.db
     kpi = sys.kpis
+    # BACKLOG #1816. A start failure is folded into channels_stopped (a SUBSET, never a fourth
+    # bucket), so the count line says "of which" rather than adding a term an operator would sum.
+    # The row below it is the heart's own sentence from the shared builder, so the page and the
+    # nav heart above it cannot describe the same connection two ways.
+    inbound = f"{e.channels_running}/{e.channels_total} running ({e.channels_stopped} stopped"
+    inbound += f", of which {e.channels_failed} failed to start)" if e.channels_failed else ")"
+    failed_rows: list[list[object]] = (
+        [
+            [
+                "Inbound start failures",
+                el(
+                    "span",
+                    _failed_inbound_reason(e.channels_failed, e.channels_failed_names),
+                    class_="status status-failed",
+                ),
+            ]
+        ]
+        if e.channels_failed
+        else []
+    )
     engine_tbl = rows_table(
         ["Field", "Value"],
         [
             ["Version", e.version],
             ["Uptime", f"{e.uptime_seconds:.0f}s"],
             ["PID", e.pid],
-            [
-                "Inbound",
-                f"{e.channels_running}/{e.channels_total} running ({e.channels_stopped} stopped)",
-            ],
+            ["Inbound", inbound],
+            *failed_rows,
             # #93 engine-wide KPI headline: combined inbound+outbound endpoint count + engine-wide
             # msg/s (reusing the recent_done rate window) — the single-glance roll-up no per-connection
             # row gives. Metadata only (counts + a rate), no PHI.
