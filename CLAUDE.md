@@ -324,7 +324,9 @@ recency.
 **The fleet wiki is the memory every seat on every account can search.** Query it for the subject
 of your work before you act, and write a lesson, decision, gotcha or correction after; a miss never
 blocks. A note is advice: where it disagrees with the tree or an owner instruction, the tree wins,
-and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how.
+and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how. Where
+`install-coordination.ps1` has wired `mefor-wiki`, a Stop hook prompts for a note after substantive
+work, and `wiki: nothing to record` is a fine answer.
 
 **Run korus's wiki scripts by path, FROM YOUR ENGINE WORKTREE.** This repository has no
 `ccx.config.json`, so without `-StateRoot` a query reads no inbox and still prints `no note`. Work

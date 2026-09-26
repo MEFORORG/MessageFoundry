@@ -141,6 +141,15 @@ paths, dirty count and tip. Mail sent with `mail.ps1` leaves a receipt. An alloc
 None of those carries your reasoning. Your session transcript does not survive in any form another
 seat can act on. If a fact matters, put it in the commit, the PR body, or the BACKLOG item.
 
+A lesson that outlives the item belongs in the fleet wiki, and another Stop hook asks for one. It is
+`scripts/hooks/wiki-write-prompt.ps1`, wired by the same installer under the marker `mefor-wiki`. It
+fires after enough tool uses or a `git commit` or `git push`, with a cooldown between prompts, and
+never while `stop_hook_active` is set. The thresholds are named constants at the top of that
+script. If nothing qualifies, reply `wiki: nothing to record`. To turn it off, create the file
+`mefor-coord/wiki-prompt/OFF`, which reaches sessions already running. `MEFOR_WIKI_PROMPT=off` works
+too, but only for sessions started with it set. Each prompt it fires is logged under
+`mefor-coord/wiki-prompt/`, beside its per-session state.
+
 A headless Builder can do all of this. PR 739 proved it: commit `f075acfd0` on branch
 `it2-docs-readme`, clean worktree afterwards, process gone.
 
