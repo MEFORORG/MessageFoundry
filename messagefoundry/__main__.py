@@ -1072,11 +1072,39 @@ def main(argv: list[str] | None = None) -> int:
     #
     # `configure_stderr_logging` is the shipped answer to "this process's stdout is not a log
     # channel" (the ADR 0087 sandbox worker, whose stdout carries IPC frames), and it carries the
-    # PHI-redaction + control-char-scrub filter chain, which is strictly more than the UNFILTERED
-    # `logging.lastResort` a handler-less subcommand degrades to today. `serve` and `supervise` take
-    # no `--json`, print no payload and are untouched: they still log to the stdout NSSM captures.
+    # PHI-redaction + control-char-scrub filter chain. `serve` and `supervise` take no `--json`,
+    # print no payload and are untouched: they still log to the stdout NSSM captures.
+    #
+    # EVERY OTHER SUBCOMMAND GETS THE SAME STDERR SINK, `--json` OR NOT (BACKLOG #1441). Before this,
+    # a subcommand without `--json` ran with NO root handler, so a WARNING or above went to the
+    # standard library's `logging.lastResort`: no filters and no formatter. A traceback quoting a PHI
+    # segment printed as written. Redaction is a property of the HANDLER, so a process that installs
+    # none has no chain at all. Stderr keeps stdout for data. The root stays at WARNING, the level
+    # `lastResort` used. At least these visible changes follow:
+    #   * Every such record now carries the timestamp/level/logger prefix and is redacted.
+    #   * The handler is at NOTSET, so a logger given its OWN level below WARNING (an operator's
+    #     `log.setLevel(logging.INFO)`, or the audit tee's) now prints those records. `lastResort`
+    #     dropped them. They pass the same chain as under `serve`, which prints them too; the chain
+    #     does not catch a lone identifier, so "never put PHI in a log message" still applies.
+    #   * A library that puts a NullHandler on its own logger (urllib3, pynetdicom and others) had
+    #     its WARNINGs DROPPED, because a NullHandler counts as "a handler found" and so skips
+    #     `lastResort`. They now print, through the chain, exactly as they already do under `serve`.
+    #   * A stdlib `basicConfig(...)` call in an operator's config module becomes a no-op under
+    #     `dryrun`/`check`/`validate`, because basicConfig does nothing once the root has a handler.
+    #     `serve` already behaves this way. The fix for an operator is a named logger, not basicConfig.
+    # The audit tee's INFO records reached stderr through `ensure_logger_sink` (#1199) before this;
+    # that now finds this handler and adds no second one. The exempt subcommands, and the one
+    # residual the exemption leaves, are stated once at `_CONFIGURES_OWN_LOGGING`.
+    #
+    # Only when the root has NO handler yet, which is the state a `python -m messagefoundry` process
+    # starts in. A caller that configured logging before calling main() owns its own handlers, and
+    # main() does not take them away: an embedding host, or pytest, whose `caplog` capture lives on
+    # the root (replacing it would empty `caplog`, as the ledger row measured). That host's handler
+    # is then the host's to filter. `--json` still replaces unconditionally, because a handler left
+    # in place could write to stdout and corrupt the document (#1489).
     as_json = bool(getattr(args, "json", False))
-    if as_json:
+    needs_sink = args.command not in _CONFIGURES_OWN_LOGGING and not logging.getLogger().handlers
+    if as_json or needs_sink:
         configure_stderr_logging()
     # THE FLOOR UNDER `_emit_error`'s --json CONTRACT (BACKLOG #1863). Without this `try`, an exception
     # no subcommand arm names went to `sys.excepthook`: one redacted CRITICAL line on stderr, exit 1,
@@ -6899,6 +6927,19 @@ def _emit_error(message: str, *, as_json: bool) -> int:
         print(f"error: {message}", file=sys.stderr)
     return 1
 
+
+#: The subcommands main() does NOT give a stderr log sink, because each installs its own root handler
+#: with the PHI filter chain (`configure_logging`). Every other entry in `_DISPATCH` gets the sink by
+#: default, so a new subcommand is covered without anyone remembering to add it (BACKLOG #1441).
+#: Adding a name here takes a subcommand OUT of that default. `tests/test_cli.py` pins this set and
+#: checks that each member really calls `configure_logging`.
+#:
+#: KNOWN RESIDUAL, NOT FIXED HERE: `serve` calls `configure_logging` only after its settings, key
+#: and egress gates run, and its WARNINGs in that window still go through the unfiltered
+#: `logging.lastResort`. The comments inside `_serve` rely on that path by name. `supervise` calls it
+#: on its first line, so it has no such window. Whether `serve` should take main()'s sink for that
+#: window is an open question, deliberately not decided by the change that added this set.
+_CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
 
 _DISPATCH = {
     "serve": _serve,
