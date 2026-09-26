@@ -5235,11 +5235,19 @@ def _provision_admin(args: argparse.Namespace) -> int:
         f"Sign in as {outcome.username!r} once the engine is running; it creates no account itself."
     )
     if not (args.email and args.email.strip()):
+        # Not `!r` (BACKLOG #1985): cmd.exe does not read single quotes as quoting.
+        user_arg = _paste_safe_option("--username", outcome.username)
+        hint = (
+            ""
+            if user_arg
+            else " The username has a character a shell or console could change, so type it quoted "
+            "for the shell in use."
+        )
         _safe_print(
             "WARNING: no notification address. A PHI instance under [security].enforcement=enforce "
             "refuses to start unless some enabled Administrator carries one -- set it with "
-            f"`messagefoundry admin-set-notify-email --username {outcome.username!r} --email "
-            "<address>` before the first serve."
+            f"`messagefoundry admin-set-notify-email {user_arg or '--username <username>'} --email "
+            f"<address>` before the first serve.{hint}"
         )
     return 0
 
@@ -6864,6 +6872,35 @@ def _safe_print(line: str) -> None:
     path they cannot paste back. ``tests/test_cp1252_console_safety.py`` measures that asymmetry."""
     enc = getattr(sys.stdout, "encoding", None) or "utf-8"
     sys.stdout.write(line.encode(enc, "replace").decode(enc) + "\n")
+
+
+#: ASCII characters that mean something inside double quotes to cmd.exe, PowerShell or a POSIX
+#: shell: ``%`` (cmd), ``$`` and backtick (PowerShell, POSIX), ``!`` (history, delayed expansion),
+#: and the double quote itself.
+_SHELL_SPECIAL_IN_QUOTES = frozenset('"$`%!')
+
+
+def _paste_safe_option(option: str, value: str) -> str | None:
+    """``option="value"`` if that one spelling passes ``value`` unchanged in cmd.exe, PowerShell
+    and a POSIX shell, else ``None`` (BACKLOG #1985).
+
+    Double quotes are the only quoting all three read. ``=`` keeps a value that starts with ``-``
+    from being read as a flag. A backslash is literal in all three unless it doubles or ends the
+    value, where POSIX halves a pair and Windows reads ``\\"`` as an escaped quote. A leading ``/``
+    is refused because Git Bash rewrites ``--opt=/x`` into a Windows path. Non-ASCII is refused
+    too: :func:`_safe_print` turns a character the console cannot encode into ``?``, and
+    PowerShell reads typographic quotes as quotes.
+    """
+    unsafe = (
+        any(
+            ch in _SHELL_SPECIAL_IN_QUOTES or not (ch.isascii() and ch.isprintable())
+            for ch in value
+        )
+        or "\\\\" in value
+        or value.endswith("\\")
+        or value.startswith("/")
+    )
+    return None if unsafe else f'{option}="{value}"'
 
 
 def _print_json(data: object, *, compact: bool) -> None:
