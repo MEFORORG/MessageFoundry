@@ -1992,7 +1992,7 @@ def test_alerts_builder_escapes_hostile() -> None:
         realert_seconds=300.0,
         rules=[],
     )
-    html = str(alerts(instances, config))
+    html = str(alerts(instances, config, limit=200))
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
 
@@ -2246,9 +2246,59 @@ def test_alerts_builder_renders_write_controls() -> None:
         realert_seconds=300.0,
         rules=[],
     )
-    html = str(alerts(instances, config))
+    html = str(alerts(instances, config, limit=200))
     assert "/ui/alerts/42/ack" in html and "Ack" in html
     assert "/ui/alerts/42/resolve" in html and "Resolve" in html
+
+
+def _alert_list(shown: int, total: int) -> object:
+    """``shown`` active alert rows beside a store ``total`` that may differ from it (BACKLOG #1821)."""
+    from messagefoundry.api.models import AlertInstanceInfo, AlertInstanceList
+
+    return AlertInstanceList(
+        alerts=[
+            AlertInstanceInfo(
+                id=i,
+                event_type="queue_depth",
+                connection="IB_ACME",
+                severity="warning",
+                status="open",
+                first_seen=0.0,
+                last_seen=0.0,
+                count=1,
+            )
+            for i in range(1, shown + 1)
+        ],
+        total=total,
+        worst_severity="warning" if total else None,
+    )
+
+
+def test_alerts_page_states_the_count_when_the_list_is_capped() -> None:
+    """BACKLOG #1821: the bell reports every active alert, and the page beneath it listed the newest
+    ``limit`` with no sign that more existed. The line is the capped-listing footer, not a pager:
+    ``GET /alerts`` takes no offset, so a Next link would lead nowhere."""
+    from messagefoundry_webconsole.pages import alerts
+
+    html = str(alerts(_alert_list(3, 214), None, limit=3))
+    assert "3 of 214 alert(s) shown, capped at the newest 3." in html
+    assert 'class="pager"' not in html and "offset=" not in html
+
+
+def test_alerts_page_count_line_claims_no_cap_when_nothing_is_missing() -> None:
+    """The #1821 control: a complete list says so and states no cap. ``total`` is a second read
+    beside the rows, so a smaller one (a concurrent resolve) is floored rather than printed."""
+    from messagefoundry_webconsole.pages import alerts
+
+    complete = str(alerts(_alert_list(3, 3), None, limit=200))
+    assert "3 of 3 alert(s) shown." in complete and "capped" not in complete
+    raced = str(alerts(_alert_list(3, 2), None, limit=200))
+    assert "3 of 3 alert(s) shown." in raced and "3 of 2" not in raced
+    # A total above a window that is NOT full is rows that arrived between the two reads.
+    grew = str(alerts(_alert_list(5, 7), None, limit=200))
+    assert "5 of 7 alert(s) shown." in grew and "capped" not in grew
+    empty = str(alerts(_alert_list(0, 0), None, limit=200))
+    assert "No active alerts." in empty and "alert(s) shown" not in empty
 
 
 # --- L3b: queue purge (step-up + dual-control), BACKLOG #75 phase 3 -------------------------------
@@ -5714,6 +5764,41 @@ def test_status_update_banner() -> None:
             )
         )
     )
+
+
+def test_status_page_renders_a_failed_inbound_as_failed_in_the_hearts_words() -> None:
+    """BACKLOG #1816: a start failure used to read as an ordinary stopped inbound on /ui/status.
+
+    The page must say "failed to start" and must say it in the SAME sentence the nav heart shows,
+    so the reason is taken from ``_derive_health`` itself rather than restated here. The failure
+    is a subset of the stopped count, so the count line says "of which" and never adds a term."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    failed = _sysinfo(50 * _GIB, channels=3, failed_names=["IB_ACME_ADT"])
+    _health, reason = _derive_health(failed, None, None, None)
+    assert reason == "inbound IB_ACME_ADT failed to start"
+    html = _status_html(failed)
+    assert "2/3 running (1 stopped, of which 1 failed to start)" in html
+    assert reason in html
+    assert 'class="status status-failed"' in html
+
+    # A channel-scoped caller sees the count and no names; the page must not invent any.
+    scoped = _sysinfo(50 * _GIB, channels=3, failed_count=2)
+    _health, scoped_reason = _derive_health(scoped, None, None, None)
+    assert scoped_reason == "2 inbound connections failed to start"
+    assert scoped_reason in _status_html(scoped)
+
+    # A connection name is free text, so it goes through the escaping builder like any other value.
+    hostile = _status_html(_sysinfo(50 * _GIB, channels=1, failed_names=["<b>IB</b>"]))
+    assert "<b>IB</b>" not in hostile and "&lt;b&gt;IB&lt;/b&gt;" in hostile
+
+
+def test_status_page_without_a_failed_inbound_keeps_the_plain_stopped_line() -> None:
+    """The #1816 control: an ordinary stop is not a failure, and the page must not call it one."""
+    html = _status_html(_sysinfo(50 * _GIB, channels=3, channels_running=2))
+    assert "2/3 running (1 stopped)" in html
+    assert "failed to start" not in html
+    assert "Inbound start failures" not in html
 
 
 # Gap 3 — per-connection stats reset ---------------------------------------------------------------

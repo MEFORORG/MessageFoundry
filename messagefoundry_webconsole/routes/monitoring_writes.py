@@ -85,7 +85,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if identity.has(Permission.MONITORING_READ)
             else None
         )
-        return HTMLResponse(pages.alerts(instances, config, error=message), status_code=400)
+        return HTMLResponse(
+            pages.alerts(instances, config, limit=ACTIVE_ALERTS_LIMIT, error=message),
+            status_code=400,
+        )
 
     @app.post("/ui/alerts/{alert_id}/suspend")
     async def ui_suspend_alert(
