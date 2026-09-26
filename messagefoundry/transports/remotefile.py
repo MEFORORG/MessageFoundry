@@ -725,6 +725,54 @@ def _open_sftp_within(client: Any, seconds: float) -> Any:
     return outcome[0]
 
 
+#: The message paramiko gives an authentication the server never answered inside ``auth_timeout``.
+#: It is the ONLY thing that tells that case apart from a refusal: both are a bare
+#: ``AuthenticationException``, with no subclass, attribute or chained cause between them.
+_PARAMIKO_AUTH_TIMEOUT = "Authentication timeout."
+
+
+def _sftp_connect_timeout(paramiko: Any, exc: BaseException, client: Any) -> str | None:
+    """Name the phase a failed ``SSHClient.connect`` timed out in, or ``None`` if it did not time out
+    (BACKLOG #1999).
+
+    THIS DOCSTRING IS THE ONE PLACE THE PARAMIKO FACTS BELOW ARE STATED. Read against paramiko 5.0.0.
+
+    **Authentication.** ``AuthHandler.wait_for_response`` raises
+    ``AuthenticationException("Authentication timeout.")`` once ``auth_timeout`` passes with no reply.
+    A refusal is the same class, ``"Authentication failed."``, so the message is the discriminator.
+    Matching it exactly fails safe: if paramiko rewords it, the timeout goes back to being a
+    credential fault, which stops the lane rather than retrying into a lockout.
+
+    **Banner and key exchange.** ``SSHClient.connect`` passes one ``timeout`` to both the TCP connect
+    and ``Transport.start_client``, and this connector sets ``banner_timeout`` to the same value.
+    ``start_client`` does not raise when its own wait runs out; it returns, and the next call,
+    ``get_remote_server_key``, raises ``SSHException("No existing session")`` with nothing chained.
+    That is what a silent peer produces here, measured on every run against a peer that accepts the
+    connection and never sends a banner. The transport is then still active with its first key
+    exchange not done, which is the discriminator: a host-key rejection and every authentication
+    outcome happen only after that exchange completes.
+
+    The transport thread's own banner read raises ``SSHException("Error reading SSH protocol
+    banner")`` chained from ``TimeoutError``. It reaches the caller when it wins the race with
+    ``start_client``, or it is left on the transport when the thread dies between that return and
+    this check; both are read here. A key-exchange mismatch dies the same way with no timeout
+    chained, so it stays permanent.
+    """
+    if isinstance(exc, paramiko.AuthenticationException):
+        return "authentication" if str(exc) == _PARAMIKO_AUTH_TIMEOUT else None
+    transport = client.get_transport()
+    if transport is None or transport.initial_kex_done:
+        return None
+
+    def _from_timeout(e: BaseException | None) -> bool:
+        return e is not None and isinstance(e.__context__, TimeoutError)
+
+    # Short-circuit order matters: get_exception() clears what it returns, so it is read last.
+    if _from_timeout(exc) or transport.is_active() or _from_timeout(transport.get_exception()):
+        return "banner and key exchange"
+    return None
+
+
 class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
@@ -756,8 +804,48 @@ class _SftpClient(_RemoteClient):
             )
 
     def _connect(self) -> Any:
+        """Connect and authenticate, or raise a classified :class:`_RemoteError`. Every connect fault
+        is classified here and nowhere else, so ``_op`` needs no connect arms of its own.
+
+        A host-key rejection is permanent (the operator must add the key; a retry cannot fix it). An
+        authentication refusal is a permanent credential fault. A TCP/IO failure is transient, and so
+        is a banner, key-exchange or authentication timeout (BACKLOG #1999)."""
         paramiko = _import_paramiko()
         client = paramiko.SSHClient()
+        try:
+            self._dial(paramiko, client)
+        except (paramiko.AuthenticationException, paramiko.SSHException) as exc:
+            # Read the phase before closing: the close ends the transport state it is read from.
+            # The close matters most on the timeout path, where the transport thread is still
+            # waiting on the peer and would otherwise hold the socket past this call.
+            phase = _sftp_connect_timeout(paramiko, exc, client)
+            client.close()
+            if phase is not None:
+                # A slow peer, not a refusing one: transient, so the caller retries. As a permanent
+                # error it would dead-letter on first deployment, and an authentication timeout
+                # would stop the lane as a credential fault (ADR 0095) that no credential caused.
+                raise _RemoteError(
+                    f"SFTP connect timed out: the server did not finish the {phase} "
+                    f"within {self._timeout:g}s: {exc}",
+                    permanent=False,
+                ) from exc
+            if isinstance(exc, paramiko.AuthenticationException):
+                # #109 (ADR 0095): auth rejection = a CREDENTIAL fault (account-lockout risk) — the
+                # delivery worker STOP-and-retains instead of dead-lettering + re-authing the backlog.
+                raise _RemoteError(
+                    f"SFTP authentication failed: {exc}", permanent=True, credential_fault=True
+                ) from exc
+            # SSHException covers an unknown/rejected host key (RejectPolicy) — a security stop the
+            # operator must resolve, so it's permanent, not a retry.
+            raise _RemoteError(f"SFTP connection rejected: {exc}", permanent=True) from exc
+        except (OSError, EOFError) as exc:
+            client.close()
+            raise _RemoteError(f"SFTP connect failed: {exc}", permanent=False) from exc
+        return client
+
+    def _dial(self, paramiko: Any, client: Any) -> None:
+        """Load host keys, pick the host-key policy, and ``connect`` ``client``. Unclassified: every
+        exception is :meth:`_connect`'s to map."""
         client.load_system_host_keys()
         if self._known_hosts:
             client.load_host_keys(str(self._known_hosts))
@@ -800,7 +888,6 @@ class _SftpClient(_RemoteClient):
             allow_agent=False,
             look_for_keys=False,
         )
-        return client
 
     def _load_key(self, paramiko: Any) -> Any:
         if not self._private_key:
@@ -881,24 +968,11 @@ class _SftpClient(_RemoteClient):
         return self._op(run)
 
     def _op(self, fn: Callable[[Any], _T]) -> _T:
-        """Connect, open an SFTP channel, run ``fn(sftp)``, always close. Maps a host-key rejection
-        to a permanent error (the operator must add the key — a retry can't fix it) and authentication
-        failure to permanent; connect/IO/timeout to transient."""
+        """Connect, open an SFTP channel, run ``fn(sftp)``, always close. A connect fault arrives
+        already classified from :meth:`_connect`; an operation fault is mapped below, a missing path
+        to permanent and connect/IO/timeout to transient."""
         paramiko = _import_paramiko()
-        try:
-            client = self._connect()
-        except paramiko.AuthenticationException as exc:
-            # #109 (ADR 0095): auth rejection = a CREDENTIAL fault (account-lockout risk) — the delivery
-            # worker STOP-and-retains instead of dead-lettering + re-authing the whole backlog.
-            raise _RemoteError(
-                f"SFTP authentication failed: {exc}", permanent=True, credential_fault=True
-            ) from exc
-        except paramiko.SSHException as exc:
-            # SSHException covers an unknown/rejected host key (RejectPolicy) — a security stop the
-            # operator must resolve, so it's permanent, not a retry.
-            raise _RemoteError(f"SFTP connection rejected: {exc}", permanent=True) from exc
-        except (OSError, EOFError) as exc:
-            raise _RemoteError(f"SFTP connect failed: {exc}", permanent=False) from exc
+        client = self._connect()
         try:
             sftp = _open_sftp_within(client, SFTP_CHANNEL_READ_TIMEOUT_SECONDS)
             _bound_sftp_channel_reads(sftp)

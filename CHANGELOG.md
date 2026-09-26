@@ -293,6 +293,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   got that answer. On those two backends the insert is refused by the foreign key to the account.
   The engine now re-reads the account to tell the two refusals apart. SQL Server has no such foreign
   key, so there the insert is not refused and this change does not apply. (`BACKLOG #1807`)
+- **An SFTP server that is slow to connect is now retried, not dead-lettered or treated as a bad
+  credential.** A server that did not finish the SSH banner or key exchange within the connect
+  timeout was classed as a permanent error, so the delivery would dead-letter on first deployment.
+  One that did not answer authentication in time was classed as a credential fault, so the lane
+  would stop (ADR 0095) though no credential was wrong. Both are now transient. A host-key rejection
+  stays permanent, and an authentication refusal stays a credential fault. The connector now also
+  closes the half-open client when the connect fails. (`BACKLOG #1999`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`

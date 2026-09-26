@@ -17,9 +17,11 @@ about the socket the connector makes, not about the transfer semantics that file
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -107,8 +109,8 @@ class _FakeSshException(Exception):
     pass
 
 
-class _FakeAuthException(Exception):
-    pass
+class _FakeAuthException(_FakeSshException):
+    """Subclasses the SSH exception, as ``paramiko.AuthenticationException`` does."""
 
 
 class _FakeParamiko:
@@ -363,9 +365,102 @@ def test_a_fast_open_failure_keeps_its_own_message(monkeypatch: pytest.MonkeyPat
     assert "timed out" not in str(caught.value)
 
 
+@pytest.fixture(scope="module")
+def host_key() -> Any:
+    """One RSA host key for every real-paramiko server in this file; generating one is slow.
+
+    Requesting it SKIPS the test where the ``[sftp]`` extra is not installed; a skip claims nothing.
+    """
+    paramiko = pytest.importorskip("paramiko", reason="the [sftp] extra is not installed")
+    return paramiko.RSAKey.generate(2048)
+
+
+@contextlib.contextmanager
+def _ssh_server(
+    server: Any, host_key: Any, tmp_path: Path, *, trust_key: bool = True
+) -> Iterator[tuple[int, Path]]:
+    """A real in-process paramiko SSH server on loopback, serving one connection with ``server``.
+
+    Yields the port and a ``known_hosts`` file that trusts ``host_key`` for it, or is empty when
+    ``trust_key`` is false. Every server transport and the listener are closed on exit.
+    """
+    paramiko = pytest.importorskip("paramiko", reason="the [sftp] extra is not installed")
+    transports: list[Any] = []
+    listener = socket.create_server(("127.0.0.1", 0))
+    try:
+        port = listener.getsockname()[1]
+        known_hosts = tmp_path / "known_hosts"
+        keys = paramiko.HostKeys()
+        if trust_key:
+            keys.add(f"[127.0.0.1]:{port}", host_key.get_name(), host_key)
+        keys.save(str(known_hosts))
+
+        def _serve() -> None:
+            try:
+                conn, _ = listener.accept()
+            except OSError:  # the listener closed first: the client never got that far
+                return
+            transport = paramiko.Transport(conn)
+            transports.append(transport)
+            transport.add_server_key(host_key)
+            try:
+                transport.start_server(server=server)
+            except (paramiko.SSHException, EOFError, OSError):
+                # The client dropped the connection mid-negotiation, for example after rejecting
+                # the host key. That is what some tests set out to cause, not a failure.
+                return
+
+        threading.Thread(target=_serve, daemon=True).start()
+        yield port, known_hosts
+    finally:
+        for transport in transports:
+            transport.close()
+        listener.close()
+
+
+def _sftp_settings(
+    port: int, known_hosts: Path, connect_timeout: float | None = None
+) -> dict[str, Any]:
+    """Settings for an ``_SftpClient`` against a loopback test server. ``connect_timeout`` left
+    ``None`` keeps the connector's own 30 s default."""
+    settings: dict[str, Any] = {
+        "host": "127.0.0.1",
+        "port": port,
+        "remote_dir": "/in",
+        "username": "synthetic",
+        "password": "synthetic-test-password",
+        "known_hosts": str(known_hosts),
+    }
+    if connect_timeout is not None:
+        settings["connect_timeout"] = connect_timeout
+    return settings
+
+
+def _list_on_a_thread(client: _SftpClient) -> tuple[object, float]:
+    """Run ``list_dir`` on a daemon thread joined at the harness ceiling; return outcome, seconds.
+
+    The ceiling is what turns a regression into a failure instead of a hung run.
+    """
+    outcome: list[object] = []
+
+    def _poll() -> None:
+        try:
+            outcome.append(client.list_dir("/in"))
+        except BaseException as exc:  # recorded for the caller's assertions
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_poll, daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(_PARKED_AFTER)
+    assert not worker.is_alive(), f"list_dir was still parked after {_PARKED_AFTER:g}s"
+    (result,) = outcome
+    return result, time.monotonic() - started
+
+
 @pytest.mark.parametrize("silent_at", ["channel-open", "subsystem", "version"])
 def test_real_paramiko_silent_session_open_is_bounded(
-    silent_at: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    silent_at: str, host_key: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The same property against the real library and a real in-process SSH server.
 
@@ -404,60 +499,310 @@ def test_real_paramiko_silent_session_open_is_bounded(
     # exchange on a loaded runner cannot time out before the test reaches the session open.
     bound = 2.0
     monkeypatch.setattr(remotefile, "SFTP_CHANNEL_READ_TIMEOUT_SECONDS", bound)
-    host_key = paramiko.RSAKey.generate(2048)
-    server_transports: list[Any] = []
+    with _ssh_server(_SilentServer(), host_key, tmp_path) as (port, known_hosts):
+        try:
+            result, elapsed = _list_on_a_thread(_SftpClient(_sftp_settings(port, known_hosts)))
+        finally:
+            release.set()
+
+    assert isinstance(result, _RemoteError), f"expected a refusal, got {result!r}"
+    assert result.permanent is False
+    assert "session open timed out" in str(result), str(result)
+    assert elapsed < bound + 5.0
+
+
+# --- connect timeouts are transient (BACKLOG #1999) --------------------------
+#
+# A peer that is slow in the banner exchange or in authentication is live-again-later, not refusing.
+# Before #1999 both were permanent: a banner or key-exchange timeout would dead-letter on first
+# deployment, and an authentication timeout would stop the lane as an ADR 0095 credential fault.
+# What paramiko raises in each case, and why each discriminator is the one used, is stated once, in
+# ``remotefile._sftp_connect_timeout``'s docstring.
+
+
+class _NegTransport:
+    """A paramiko ``Transport`` as the connector finds it after a failed ``connect``."""
+
+    def __init__(self, *, kex_done: bool, active: bool, saved: BaseException | None = None) -> None:
+        self.initial_kex_done = kex_done
+        self._active = active
+        self._saved = saved
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def get_exception(self) -> BaseException | None:
+        saved, self._saved = self._saved, None
+        return saved
+
+
+def _chained_from_timeout(message: str) -> _FakeSshException:
+    """An SSH exception raised while handling a ``TimeoutError``, as paramiko's banner read raises
+    one: the chain is implicit, on ``__context__``, not an explicit ``from``."""
+    exc = _FakeSshException(message)
+    exc.__context__ = TimeoutError()
+    return exc
+
+
+def _sftp_client_failing_with(
+    exc: BaseException, transport: _NegTransport, monkeypatch: pytest.MonkeyPatch
+) -> tuple[_SftpClient, list[int]]:
+    """An ``_SftpClient`` whose real ``_connect`` runs against a paramiko whose ``connect`` raises
+    ``exc`` and leaves ``transport`` behind. Returns the client and a list counting closes."""
+    closes: list[int] = []
+
+    class _FailingClient:
+        def load_system_host_keys(self) -> None:
+            return None
+
+        def set_missing_host_key_policy(self, policy: Any) -> None:
+            return None
+
+        def connect(self, **kw: Any) -> None:
+            raise exc
+
+        def get_transport(self) -> _NegTransport:
+            return transport
+
+        def close(self) -> None:
+            closes.append(1)
+
+    class _Policy:
+        pass
+
+    class _Transport:
+        _preferred_macs: tuple[str, ...] = ()
+        _preferred_ciphers: tuple[str, ...] = ()
+
+    class _Paramiko(_FakeParamiko):
+        SSHClient = _FailingClient
+        RejectPolicy = _Policy
+        AutoAddPolicy = _Policy
+        Transport = _Transport
+
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _Paramiko)
+    return _SftpClient({"host": "h", "port": 22, "remote_dir": "/in"}), closes
+
+
+@pytest.mark.parametrize(
+    ("exc", "transport"),
+    [
+        pytest.param(
+            # What a silent peer produces with the shipped settings: start_client's own wait runs
+            # out first and get_remote_server_key refuses on a transport still awaiting the banner.
+            _FakeSshException("No existing session"),
+            _NegTransport(kex_done=False, active=True),
+            id="start_client gave up",
+        ),
+        pytest.param(
+            _chained_from_timeout("Error reading SSH protocol banner"),
+            _NegTransport(kex_done=False, active=False),
+            id="the banner read timed out first",
+        ),
+        pytest.param(
+            # The thread died of the banner timeout between start_client returning and the check.
+            _FakeSshException("No existing session"),
+            _NegTransport(
+                kex_done=False,
+                active=False,
+                saved=_chained_from_timeout("Error reading SSH protocol banner"),
+            ),
+            id="the banner read timed out in the gap",
+        ),
+        pytest.param(
+            _FakeAuthException("Authentication timeout."),
+            _NegTransport(kex_done=True, active=True),
+            id="authentication got no answer",
+        ),
+    ],
+)
+def test_a_connect_timeout_is_transient(
+    exc: BaseException, transport: _NegTransport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every way a slow peer surfaces at connect is a retry, never a dead-letter or a lane stop."""
+    client, closes = _sftp_client_failing_with(exc, transport, monkeypatch)
+
+    with pytest.raises(_RemoteError) as caught:
+        client.list_dir("/in")
+
+    assert caught.value.permanent is False, "a slow peer is transient, not a dead-letter"
+    assert caught.value.credential_fault is False, "no credential caused this"
+    assert "timed out" in str(caught.value), str(caught.value)
+    assert caught.value.__cause__ is exc, "the paramiko exception must stay on the chain"
+    assert closes == [1], f"the half-open client was closed {len(closes)} times"
+
+
+@pytest.mark.parametrize(
+    ("exc", "transport", "credential_fault"),
+    [
+        pytest.param(
+            _FakeSshException("Server '[h]:22' not found in known_hosts"),
+            _NegTransport(kex_done=True, active=True),
+            False,
+            id="a host-key rejection",
+        ),
+        pytest.param(
+            _FakeAuthException("Authentication failed."),
+            _NegTransport(kex_done=True, active=True),
+            True,
+            id="an authentication refusal",
+        ),
+        pytest.param(
+            # A key-exchange mismatch kills the thread before the exchange completes, with no
+            # timeout anywhere on its chain. It is a configuration fault, not a slow peer.
+            _FakeSshException("Incompatible ssh peer (no acceptable kex algorithm)"),
+            _NegTransport(kex_done=False, active=False),
+            False,
+            id="a key-exchange mismatch",
+        ),
+        pytest.param(
+            # A negotiated transport rules out the negotiation arm even with a timeout on the chain.
+            _chained_from_timeout("No existing session"),
+            _NegTransport(kex_done=True, active=True),
+            False,
+            id="a post-exchange failure chained from a timeout",
+        ),
+    ],
+)
+def test_a_refusal_at_connect_stays_permanent(
+    exc: BaseException,
+    transport: _NegTransport,
+    credential_fault: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CONTROL for the test above: the timeout arm must not swallow a real refusal.
+
+    A host-key rejection is a security stop the operator must resolve. An authentication refusal must
+    keep its ADR 0095 credential marker, so the lane stops instead of retrying into a lockout.
+    """
+    client, closes = _sftp_client_failing_with(exc, transport, monkeypatch)
+
+    with pytest.raises(_RemoteError) as caught:
+        client.list_dir("/in")
+
+    assert caught.value.permanent is True, f"must stay permanent: {caught.value}"
+    assert caught.value.credential_fault is credential_fault
+    assert "timed out" not in str(caught.value), str(caught.value)
+    assert closes == [1], f"the half-open client was closed {len(closes)} times"
+
+
+def test_real_paramiko_banner_stall_is_transient(tmp_path: Path) -> None:
+    """A peer that accepts the connection and never sends a banner, against the real library.
+
+    This is what checks the stub model above. Which exception wins the race between the banner read
+    and ``start_client``'s own wait is paramiko's business, and the test passes whichever wins.
+    SKIPS where the ``[sftp]`` extra is not installed; a skip claims nothing.
+    """
+    pytest.importorskip("paramiko", reason="the [sftp] extra is not installed")
+
+    held: list[socket.socket] = []
     listener = socket.create_server(("127.0.0.1", 0))
     try:
         port = listener.getsockname()[1]
-        known_hosts = tmp_path / "known_hosts"
-        keys = paramiko.HostKeys()
-        keys.add(f"[127.0.0.1]:{port}", host_key.get_name(), host_key)
-        keys.save(str(known_hosts))
 
-        def _serve() -> None:
-            conn, _ = listener.accept()
-            transport = paramiko.Transport(conn)
-            server_transports.append(transport)
-            transport.add_server_key(host_key)
-            transport.start_server(server=_SilentServer())
-
-        threading.Thread(target=_serve, daemon=True).start()
-
-        client = _SftpClient(
-            {
-                "host": "127.0.0.1",
-                "port": port,
-                "remote_dir": "/in",
-                "username": "synthetic",
-                "password": "synthetic-test-password",
-                "known_hosts": str(known_hosts),
-            }
-        )
-        outcome: list[object] = []
-
-        def _poll() -> None:
+        def _accept_and_say_nothing() -> None:
             try:
-                outcome.append(client.list_dir("/in"))
-            except BaseException as exc:  # recorded for the assertions below
-                outcome.append(exc)
+                conn, _ = listener.accept()
+            except OSError:  # the listener closed first: the connect never got that far
+                return
+            held.append(conn)
 
-        worker = threading.Thread(target=_poll, daemon=True)
-        started = time.monotonic()
-        worker.start()
-        worker.join(_PARKED_AFTER)
-        elapsed = time.monotonic() - started
+        threading.Thread(target=_accept_and_say_nothing, daemon=True).start()
+        # The peer never reaches a host key, so an empty known_hosts is enough; it must exist.
+        known_hosts = tmp_path / "known_hosts"
+        known_hosts.write_text("", encoding="utf-8")
+        bound = 1.0
 
-        assert not worker.is_alive(), (
-            f"list_dir was still parked after {_PARKED_AFTER:g}s with the server silent at "
-            f"{silent_at}: the session open is unbounded"
+        result, elapsed = _list_on_a_thread(
+            _SftpClient(_sftp_settings(port, known_hosts, connect_timeout=bound))
         )
-        (result,) = outcome
-        assert isinstance(result, _RemoteError), f"expected a refusal, got {result!r}"
-        assert result.permanent is False
-        assert "session open timed out" in str(result), str(result)
-        assert elapsed < bound + 5.0
     finally:
-        release.set()
-        for transport in server_transports:
-            transport.close()
+        for conn in held:
+            conn.close()
         listener.close()
+
+    assert isinstance(result, _RemoteError), f"expected a refusal, got {result!r}"
+    assert result.permanent is False, f"a silent peer is transient, not a dead-letter: {result}"
+    assert result.credential_fault is False
+    assert "banner and key exchange" in str(result), str(result)
+    assert elapsed < bound + 5.0
+
+
+@pytest.mark.parametrize(
+    ("server_stalls", "permanent", "credential_fault"),
+    [
+        pytest.param(True, False, False, id="the server never answers"),
+        # CONTROL: an implementation that made every authentication failure transient would pass
+        # the stall arm alone.
+        pytest.param(False, True, True, id="the server refuses"),
+    ],
+)
+def test_real_paramiko_authentication_timeout_vs_refusal(
+    server_stalls: bool,
+    permanent: bool,
+    credential_fault: bool,
+    host_key: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authentication the server never answers is transient; one it refuses is a credential fault.
+
+    Both arms run against the real library and a real in-process SSH server, because paramiko raises
+    the same class for both and only the message differs.
+    """
+    paramiko = pytest.importorskip("paramiko", reason="the [sftp] extra is not installed")
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+
+    release = threading.Event()
+    server_interface: Any = paramiko.ServerInterface
+
+    class _AuthServer(server_interface):  # type: ignore[misc]
+        def get_allowed_auths(self, username: str) -> str:
+            return "password"
+
+        def check_auth_password(self, username: str, password: str) -> int:
+            if server_stalls:
+                release.wait(_PARKED_AFTER * 2)
+            return int(paramiko.AUTH_FAILED)
+
+    # Long enough for a key exchange on a loaded runner; it is also the authentication bound.
+    bound = 3.0
+    with _ssh_server(_AuthServer(), host_key, tmp_path) as (port, known_hosts):
+        try:
+            result, elapsed = _list_on_a_thread(
+                _SftpClient(_sftp_settings(port, known_hosts, connect_timeout=bound))
+            )
+        finally:
+            release.set()
+
+    assert isinstance(result, _RemoteError), f"expected a refusal, got {result!r}"
+    assert result.permanent is permanent, str(result)
+    assert result.credential_fault is credential_fault, str(result)
+    assert ("timed out" in str(result)) is server_stalls, str(result)
+    assert elapsed < bound + 5.0
+
+
+def test_real_paramiko_unknown_host_key_stays_permanent(
+    host_key: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host-key rejection is still a permanent, non-credential stop against the real library.
+
+    CONTROL for the negotiation arm: this refusal is also a plain ``SSHException``, so a classifier
+    reading the exception type alone would have made it transient.
+    """
+    paramiko = pytest.importorskip("paramiko", reason="the [sftp] extra is not installed")
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+
+    # trust_key=False: an EMPTY known_hosts, so RejectPolicy refuses the server's key.
+    with _ssh_server(paramiko.ServerInterface(), host_key, tmp_path, trust_key=False) as (
+        port,
+        known_hosts,
+    ):
+        result, _ = _list_on_a_thread(
+            _SftpClient(_sftp_settings(port, known_hosts, connect_timeout=5.0))
+        )
+
+    assert isinstance(result, _RemoteError), f"expected a refusal, got {result!r}"
+    assert result.permanent is True, f"a rejected host key is a security stop: {result}"
+    assert result.credential_fault is False
+    assert "known_hosts" in str(result), str(result)

@@ -1040,6 +1040,12 @@ class _FakeSSHClient:
     def open_sftp(self) -> Any:
         raise AssertionError("connect should have raised before open_sftp under RejectPolicy")
 
+    def get_transport(self) -> Any:
+        # paramiko checks the host key only after the first key exchange completes, so a rejection
+        # arrives on a negotiated transport. The connector reads this to tell a rejection from a
+        # negotiation timeout (BACKLOG #1999).
+        return SimpleNamespace(initial_kex_done=True)
+
     def close(self) -> None:
         pass
 
