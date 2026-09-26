@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.09.26.1"
+$GateVersion = "2026.09.26.3"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -1291,14 +1291,304 @@ function Get-HostConvention([string]$ToolName) {
     }
 }
 
+# WHERE A COMMAND SUBSTITUTION ENDS, or -1 if it does not end on its own line (BACKLOG #1429).
+# $At is the `$` of `$(`, or on posix a backtick. Inside `$( ... )` quoting starts afresh: a quoted
+# word is skipped whole, a double-quoted one may hold another substitution, and parentheses count.
+# Nothing here reads past the line, so the cost is bounded by the line, and the nesting is capped
+# because this runs inside a hook with a timeout; either limit returns -1, which only makes the
+# caller fall back to the per-line reading.
+function Find-SubstitutionEnd([string]$Text, [int]$At, [string]$Convention, [int]$LineEnd = -1,
+                              [int]$Depth = 0) {
+    if ($Depth -gt 16) { return -1 }
+    $n = $Text.Length
+    if ($LineEnd -lt 0) { $LineEnd = $Text.IndexOf("`n", $At); if ($LineEnd -lt 0) { $LineEnd = $n } }
+    $esc = Get-EscapeChar $Convention
+    if ($Text[$At] -eq '`') {
+        for ($j = $At + 1; $j -lt $LineEnd; $j++) {
+            if ($Text[$j] -eq '\') { $j++; continue }
+            if ($Text[$j] -eq '`') { return $j + 1 }
+        }
+        return -1
+    }
+    $parens = 0
+    $j = $At + 1
+    while ($j -lt $LineEnd) {
+        $c = $Text[$j]
+        if ($c -eq $esc) { $j += 2; continue }
+        if ($c -eq "'") {
+            $e = $Text.IndexOf("'", $j + 1, $LineEnd - $j - 1)
+            if ($e -lt 0) { return -1 }
+            $j = $e + 1; continue
+        }
+        if ($c -eq '"') {
+            $j++
+            while ($j -lt $LineEnd -and $Text[$j] -ne '"') {
+                if ($Text[$j] -eq $esc) { $j += 2; continue }
+                if ($Text[$j] -eq '$' -and $j + 1 -lt $LineEnd -and $Text[$j + 1] -eq '(') {
+                    $j = Find-SubstitutionEnd $Text $j $Convention $LineEnd ($Depth + 1)
+                    if ($j -lt 0) { return -1 }
+                    continue
+                }
+                $j++
+            }
+            if ($j -ge $LineEnd) { return -1 }
+            $j++; continue
+        }
+        if ($c -eq '(') { $parens++ }
+        elseif ($c -eq ')') { $parens--; if ($parens -eq 0) { return $j + 1 } }
+        $j++
+    }
+    -1
+}
+
+# THE COMMAND'S LOGICAL LINES: a newline INSIDE a quoted span does not end a line (BACKLOG #1429).
+#
+# Get-ScannableSegments splits on newlines before any quoting is considered, so a quoted span crossing
+# a newline is an unterminated quote on one line and a stray quote on the next. When a gated command
+# sits on a line carrying the CLOSING quote of one such span and the OPENING quote of the next, those
+# two pair ACROSS it and blank it. This function carries the quote state across the newline instead,
+# so each span is one span, and it feeds a SECOND view of the command (see the caller). It never
+# replaces the per-line view.
+#
+# CARRYING QUOTE STATE IS ONLY AS GOOD AS THE QUOTE MODEL, and a naive carry is worse than the split.
+# A quote the SHELL reads as data then opens a span, runs across the newline and blanks the live line
+# below it. Measured with a naive carry on origin/main's gate: ten shapes that DENY per line went to
+# ALLOW, all pinned in tests/test_worktree_gate_line_split_discriminator.py. So these are modelled,
+# for the two hosts whose quoting this file already models ('posix' and 'pwsh'):
+#   * a COMMENT: `#` at the start of a word, to the end of the line. Word start is per host and
+#     MEASURED: bash needs whitespace or an operator before it (`echo 'x'#c` prints `x#c`); pwsh also
+#     starts one straight after a closing quote (`Write-Output 'x'#c` prints `x`). Dropped.
+#   * a PowerShell BLOCK comment `<# ... #>`, which spans lines. Dropped.
+#   * a POSIX HEREDOC. Its body starts after the logical line holding `<<WORD` and ends at a line
+#     equal to WORD (tabs stripped for `<<-`). The body is CODE only when an interpreter reads it
+#     (`bash <<'EOF'`), so the program is asked of Get-FlagOwner, the same allowlist the `-c`
+#     recursion uses. An interpreter's body is split again under ITS convention and added after the
+#     line that opened it; any other program's body is data and is left out of this view.
+#   * a PowerShell HERE-STRING, `@'` or `@"` ending its line, closed by `'@` or `"@` at column 0
+#     (MEASURED: pwsh refuses whitespace before the terminator). The here-string becomes an empty
+#     quoted word, so the rest of its statement stays on its line, and its body is left out.
+#
+# LEFT OUT OF THIS VIEW IS NOT LEFT UNSCANNED. The per-line view still scans every body line raw,
+# exactly as before. Leaving data out is what stops a document that QUOTES a straddle -- this item's
+# own repro, written to a file through a heredoc -- from denying here.
+#
+# BOUNDED, BECAUSE THIS RUNS ON EVERY TOOL CALL UNDER A HOOK TIMEOUT. A body is split with -NoNest,
+# which reads no further heredoc or here-string. Unbounded, N unterminated heredocs nested N deep
+# and scanned the tail N times: a 600-line command went from 2 s to 22 s, measured, past the 15 s
+# hook timeout -- and a killed hook lets the command through. One level keeps it linear.
+# Any other convention ('cmd', 'none') gets the plain per-line split back, so it has no second view.
+#
+#   * a SUBSTITUTION inside a double-quoted word -- `$( ... )` on both hosts, a backtick pair on
+#     posix -- where quoting starts afresh, so `"$(echo "x")"` is ONE word. Found by
+#     Find-SubstitutionEnd, and the whole word becomes an empty quoted word here, so the flat
+#     Remove-QuotedSpans agrees with it. ONLY WHEN IT CLOSES ON ITS OWN LINE.
+#   * bash's ANSI-C `$'...'`, where `\'` does not close the word. Also becomes an empty quoted word.
+#
+# WHEN THE MODEL CANNOT FOLLOW, THE LINE FALLS BACK. A substitution that spans lines, or an ANSI-C
+# word with no closer, marks the logical line, and it is handed back as its PHYSICAL lines -- the
+# per-line view's own reading, so this view adds nothing there and costs nothing there. The case that
+# matters is `git commit -m "$(cat <<'EOF' ... EOF)"`, this fleet's everyday commit idiom: a body
+# line holding a double-quoted phrase mis-paired under a flat model, exposed the quoted words, and
+# DENIED text that never runs. MEASURED on the PowerShell tool with
+# `Write-Output "$(Write-Output "x")<NL>Write-Output "git reset --hard" done"`: ALLOW before this
+# view, DENY with a flat model, ALLOW with this one.
+#
+# WHAT IS STILL NOT MODELLED, read as "at least these": a substitution that spans lines (it falls
+# back, as above, so a straddle on the SAME logical line as one is not seen here); a heredoc whose
+# reader comes AFTER it (`cat <<'EOF' | bash`), since the reader is asked of the text before `<<`;
+# comments and heredocs inside a substitution; PowerShell's typographic quotes.
+#
+# Where the model is wrong in a way it does not detect, the second view can mis-pair, and that is
+# why it is a second view: every rule reaches a segment through a continue-or-deny loop, so the
+# per-line segments still deny exactly what they denied before. The ANSI-C and nesting shapes are
+# pinned as must-stay rows for that reason.
+function Split-LogicalLines([string]$Text, [string]$Convention, [switch]$NoNest) {
+    $posix = $Convention -eq 'posix'
+    $pwsh = $Convention -eq 'pwsh'
+    if (-not ($posix -or $pwsh)) { return @($Text -split '\r?\n') }
+    # Mirrors Remove-QuotedSpans exactly, escape rule included. The scan of each logical line is that
+    # function's output, so the two must agree about where every span opens and closes.
+    $esc = Get-EscapeChar $Convention
+    $hasEsc = $esc -ne [char]0
+    $wordStartAfter = $(if ($posix) { ';&|()<>' } else { ';&|(){}''"' })
+    $out = [System.Collections.Generic.List[string]]::new()
+    # Heredoc and here-string bodies, added after the logical line that opened them.
+    $nested = [System.Collections.Generic.List[string]]::new()
+    $heredocs = [System.Collections.Generic.List[object]]::new()
+    $sb = [System.Text.StringBuilder]::new()
+    $quote = [char]0
+    # Set when the current logical line holds a shape this model cannot follow (see above).
+    $unmodelled = $false
+    # Where the open quoted span began in $sb, and whether it held a substitution that was modelled.
+    $spanAt = -1
+    $complexSpan = $false
+    # Positions past which a here-string terminator is already known to be absent, per quote.
+    $noTerminatorFrom = @{}
+    $n = $Text.Length
+    $i = 0
+    while ($i -lt $n) {
+        $ch = $Text[$i]
+        if ($quote -ne [char]0) {
+            if ($hasEsc -and $quote -eq '"' -and $ch -eq $esc -and $i + 1 -lt $n) {
+                [void]$sb.Append($ch).Append($Text[$i + 1]); $i += 2; continue
+            }
+            # A substitution inside a double-quoted word starts a fresh quoting context on both hosts.
+            # Once the line has fallen back nothing more is modelled on it, which also bounds the cost.
+            if ($quote -eq '"' -and -not $unmodelled -and
+                (($ch -eq '$' -and $i + 1 -lt $n -and $Text[$i + 1] -eq '(') -or ($posix -and $ch -eq '`'))) {
+                $end = Find-SubstitutionEnd $Text $i $Convention
+                if ($end -gt $i) {
+                    [void]$sb.Append($Text.Substring($i, $end - $i)); $i = $end; $complexSpan = $true; continue
+                }
+                $unmodelled = $true
+            }
+            if ($ch -eq $quote) {
+                $quote = [char]0
+                if ($complexSpan) {
+                    # The whole word, substitution included, as the empty word Remove-QuotedSpans
+                    # would have made of a simple one.
+                    $sb.Length = $spanAt; [void]$sb.Append('""'); $complexSpan = $false; $i++; continue
+                }
+            }
+            [void]$sb.Append($ch); $i++; continue
+        }
+        if ($ch -eq "`n") {
+            $line = $sb.ToString().TrimEnd([char]13); [void]$sb.Clear(); $i++
+            if ($unmodelled) { $out.AddRange([string[]]@($line -split '\r?\n')) } else { $out.Add($line) }
+            $unmodelled = $false
+            foreach ($h in $heredocs) {
+                # An unterminated body runs to the end of the text, as bash reads it.
+                $body = [System.Text.StringBuilder]::new()
+                while ($i -lt $n) {
+                    $e = $Text.IndexOf("`n", $i)
+                    if ($e -lt 0) { $e = $n }
+                    $line = $Text.Substring($i, $e - $i)
+                    $i = $e + 1
+                    $bare = $line.TrimEnd([char]13)
+                    if ($h.Tabs) { $bare = $bare.TrimStart([char]9) }
+                    if ($bare -ceq $h.Word) { break }
+                    [void]$body.Append($line).Append("`n")
+                }
+                if ($h.Conv -ne 'none') {
+                    $nested.AddRange([string[]]@(Split-LogicalLines $body.ToString() $h.Conv -NoNest))
+                }
+            }
+            $heredocs.Clear()
+            foreach ($x in $nested) { if ($x.Trim()) { $out.Add($x) } }
+            $nested.Clear()
+            continue
+        }
+        if ($hasEsc -and $ch -eq $esc -and $i + 1 -lt $n) {
+            [void]$sb.Append($ch).Append($Text[$i + 1]); $i += 2; continue
+        }
+        $prev = $(if ($i -gt 0) { $Text[$i - 1] } else { [char]10 })
+        $wordStart = [char]::IsWhiteSpace($prev) -or $wordStartAfter.IndexOf($prev) -ge 0
+        if ($wordStart -and $ch -eq '#') {
+            $e = $Text.IndexOf("`n", $i)
+            $i = $(if ($e -lt 0) { $n } else { $e })
+            continue
+        }
+        if ($pwsh -and $wordStart -and $ch -eq '<' -and $i + 1 -lt $n -and $Text[$i + 1] -eq '#') {
+            $e = $Text.IndexOf('#>', $i + 2)
+            $i = $(if ($e -lt 0) { $n } else { $e + 2 })
+            [void]$sb.Append(' ')
+            continue
+        }
+        # `<<` but not `<<<` (a here-STRING in bash, one word, no body) and not the tail of one.
+        if ($posix -and -not $NoNest -and $ch -eq '<' -and $i + 2 -lt $n -and $Text[$i + 1] -eq '<' -and
+            $Text[$i + 2] -ne '<' -and $prev -ne '<') {
+            $j = $i + 2
+            $tabs = $Text[$j] -eq '-'
+            if ($tabs) { $j++ }
+            while ($j -lt $n -and ($Text[$j] -eq ' ' -or $Text[$j] -eq "`t")) { $j++ }
+            # The delimiter word, quotes and backslashes removed, as bash compares it.
+            $word = [System.Text.StringBuilder]::new()
+            $wq = [char]0
+            while ($j -lt $n -and $Text[$j] -ne "`n") {
+                $c = $Text[$j]
+                if ($wq -ne [char]0) {
+                    if ($c -eq $wq) { $wq = [char]0 } else { [void]$word.Append($c) }
+                    $j++; continue
+                }
+                if ($c -eq "'" -or $c -eq '"') { $wq = $c; $j++; continue }
+                if ($c -eq '\' -and $j + 1 -lt $n) { [void]$word.Append($Text[$j + 1]); $j += 2; continue }
+                if ([char]::IsWhiteSpace($c) -or ';&|<>()'.IndexOf($c) -ge 0) { break }
+                [void]$word.Append($c); $j++
+            }
+            if ($wq -eq [char]0 -and $word.Length -gt 0) {
+                # Which program reads the body: the text of this line before `<<` is its command.
+                $heredocs.Add([pscustomobject]@{
+                    Word = $word.ToString(); Tabs = $tabs; Conv = (Get-FlagOwner $sb.ToString())
+                })
+                [void]$sb.Append($Text.Substring($i, $j - $i))
+                $i = $j
+                continue
+            }
+        }
+        if ($pwsh -and -not $NoNest -and $ch -eq '@' -and $i + 1 -lt $n -and
+            ($Text[$i + 1] -eq "'" -or $Text[$i + 1] -eq '"')) {
+            $hq = $Text[$i + 1]
+            $eol = $Text.IndexOf("`n", $i + 2)
+            if ($eol -ge 0 -and $Text.Substring($i + 2, $eol - $i - 2).Trim().Length -eq 0) {
+                # A NATIVE search, and a failed one is remembered. A per-line loop here rescanned the
+                # tail for every opener without a closer: 4,500 such lines took 24.7 s against 3.5 s
+                # before this view, MEASURED, past the hook's timeout -- and a killed hook allows.
+                $term = -1
+                $key = [string]$hq
+                if (-not ($noTerminatorFrom.ContainsKey($key) -and $eol -ge $noTerminatorFrom[$key])) {
+                    $t = $Text.IndexOf(("`n" + $hq + '@'), $eol, [System.StringComparison]::Ordinal)
+                    if ($t -ge 0) { $term = $t + 1 } else { $noTerminatorFrom[$key] = $eol }
+                }
+                # An unterminated here-string is a parse error and runs nothing; it falls through to
+                # the ordinary quote below, which leaves the rest visible.
+                if ($term -ge 0) {
+                    [void]$sb.Append("''")
+                    $i = $term + 2
+                    continue
+                }
+            }
+        }
+        if ($posix -and $ch -eq "'" -and $prev -eq '$' -and -not $unmodelled) {
+            # `$'...'` is bash's ANSI-C quoting, where `\'` does not close the word.
+            $k = $i + 1
+            while ($k -lt $n -and $Text[$k] -ne "'") { $k += $(if ($Text[$k] -eq '\') { 2 } else { 1 }) }
+            if ($k -lt $n) { [void]$sb.Append("''"); $i = $k + 1; continue }
+            $unmodelled = $true
+        }
+        if ($ch -eq '"' -or $ch -eq "'") { $quote = $ch; $spanAt = $sb.Length; $complexSpan = $false }
+        [void]$sb.Append($ch); $i++
+    }
+    # A span still open here is unterminated. The rest stays ONE line, which Remove-QuotedSpans
+    # emits raw from the opener -- visible, so it fails closed rather than swallowing the tail.
+    $line = $sb.ToString()
+    if ($unmodelled) { $out.AddRange([string[]]@($line -split '\r?\n')) } else { $out.Add($line) }
+    foreach ($x in $nested) { if ($x.Trim()) { $out.Add($x) } }
+    $out.ToArray()
+}
+
+# ONE COMPUTATION PER COMMAND, SHARED BY THE THREE RULE SITES (BACKLOG #1429). Each site used to
+# rebuild the same segments from the same command. The second view made that cost worth removing: the
+# hook runs under a timeout, and a hook killed by it lets the command through. The key is the whole
+# command and its convention, and no site modifies a segment, so a hit returns exactly what a rebuild
+# would.
 function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
+    $key = "$Convention`0$Cmd"
+    if ($null -eq $script:SegmentCache -or $script:SegmentCache.Key -cne $key) {
+        $script:SegmentCache = @{ Key = $key; Segments = @(Get-SegmentView $Cmd $Convention) }
+    }
+    $script:SegmentCache.Segments
+}
+
+function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$LogicalLines = $null) {
     # Fold line continuations FIRST, or the per-line split below separates `git \` from its verb and the
     # rule stops seeing the command at all. Prose does not end a line with a continuation character, so
     # this does not resurrect the `echo about to merge stuff` false positive.
     $folded = $Cmd -replace '\\\r?\n[ \t]*', ' '
     $folded = $folded -replace '`\r?\n[ \t]*', ' '
 
-    $lines = @($folded -split '\r?\n')
+    # PHYSICAL lines, unless the caller handed down LOGICAL ones -- which only the second view at
+    # the end of this function does (BACKLOG #1429).
+    $lines = @(if ($null -ne $LogicalLines) { $LogicalLines } else { $folded -split '\r?\n' })
 
     # ONE LEVEL of interpreter recursion -- and the flag is recognised by a RULE, never by a list of
     # spellings. What stood here was a fixed list of literals (`-c|-lc|-ec|-Command|-EncodedCommand` plus
@@ -1355,7 +1645,8 @@ function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
     #     main"` is the shape sitting next to it that must keep allowing). It is the one residual this
     #     audit ADDED to this list rather than inherited.
     #   * More than one level of nesting, unchanged from before (BACKLOG #1066/#1067 record it).
-    #   * A quoted argument SPANNING LINES, because the split above is per line. **THIS ENTRY USED TO
+    #   * A quoted argument SPANNING LINES -- REACHED NOW, BY THE SECOND VIEW (BACKLOG #1429); the
+    #     entry is kept for its history. The split above is per line. **THIS ENTRY USED TO
     #     SAY "Both multi-line forms deny today anyway", AND THAT IS MEASURED FALSE.** The claim is
     #     corrected in place rather than deleted, because it is a compensating control resting on a
     #     false premise: it told the next reader the class was harmless, so nobody probed it.
@@ -1364,7 +1655,7 @@ function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
     #     payload line does not only carry the git token -- it can also carry ONE QUOTE FROM EACH of the
     #     two multi-line spans around it, and those two pair ACROSS the gated command and blank it.
     #     Which is #1229's straddle exactly, reached through the line split instead of the pass order.
-    #     MEASURED on the shipped gate, cwd inside the governed repo, with the middle statement pinned
+    #     MEASURED on the gate before #1429, cwd inside the governed repo, with the middle statement pinned
     #     to whether it RUNS (`expr 111 \* 3` and `111*3` -> 333, so an echo-back proves nothing):
     #
     #         echo 'a<NL>b' ; git -C <governed> checkout main ; echo 'c<NL>d'    bash 333    ALLOW
@@ -1387,12 +1678,23 @@ function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
     #     all four that one shape. The near-miss neighbours are pinned as must-KEEP-denying rows in
     #     tests/test_worktree_gate_line_split_discriminator.py, so a fix has both halves to hold.
     #
-    #     STILL NOT FIXED HERE, and now for a stated reason rather than a false one: closing it means
-    #     carrying quote state ACROSS the split, which changes what every rule sees on every multi-line
-    #     command -- a far wider blast radius than the span-ownership fix this function is. Filed as
-    #     BACKLOG #1429 with the rows above, and pinned as a tripwire in
-    #     tests/test_worktree_gate_quote_straddle.py so the ALLOW is KNOWN rather than assumed absent.
-    #     BACKLOG #1086's message-flag blanking is a different change and does not close this.
+    #     CLOSED BY BACKLOG #1429, AS A SECOND VIEW AND NOT AS A NEW SPLIT. The per-line segments are
+    #     still emitted, unchanged. After all of them, this function runs again over the command's
+    #     LOGICAL lines (Split-LogicalLines), where a newline inside a quoted span does not end a
+    #     line. Each span is then blanked whole, so the gated command between two of them is visible.
+    #     An interpreter argument spanning lines is extracted from a logical line, so the recursion
+    #     reaches it, and its payload is split into logical lines under its own convention.
+    #
+    #     REPLACING the per-line view was measured and refused. A naive carry turned ten per-line
+    #     DENYs into ALLOWs, and even the modelled one cannot follow a substitution that spans
+    #     lines (see Split-LogicalLines). As a second view it can only ADD a deny, which is the
+    #     argument the cmd view below already rests on.
+    #
+    #     THE COST IT KEEPS, stated so it is not read as an oversight: a gated command INSIDE one
+    #     multi-line span never runs, yet still DENIES through its per-line segment. That is the
+    #     `gated_inside_span_never_runs` false positive in the discriminator suite, kept rather than
+    #     traded for a fail-open. BACKLOG #1086's message-flag blanking is a different change and
+    #     does not close any of this.
     #
     # COST, measured rather than assumed: recursion only ADDS a scan line, and a line still needs a git
     # token AND a gated verb to deny, so a path argument behind a family flag (`git -C "<path>"`,
@@ -1707,6 +2009,19 @@ function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
     # Each extracted payload carries ITS OWN convention, taken from the interpreter that was matched
     # rather than from the tool name at the call site. See the note at the extraction above.
     foreach ($item in $inner) {
+        # A PAYLOAD HOLDING A NEWLINE comes only from the second view: a physical line has none. It is
+        # split into logical lines under the INTERPRETER's convention, so `bash -c '<code>'` spanning
+        # lines is scanned statement by statement, with its own comments and heredocs modelled.
+        if ($item.Text.Contains("`n")) {
+            $pp = $item.Prior
+            foreach ($piece in @(Split-LogicalLines $item.Text $item.Conv)) {
+                if (-not $piece.Trim()) { continue }
+                $ps = Remove-QuotedSpans $piece $item.Conv
+                [pscustomobject]@{ Raw = $piece; Scan = $ps; Prior = $pp }
+                $pp += $ps + "`n"
+            }
+            continue
+        }
         $s = Remove-QuotedSpans $item.Text $item.Conv
         [pscustomobject]@{ Raw = $item.Text; Scan = $s; Prior = $item.Prior }
     }
@@ -1750,6 +2065,45 @@ function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
         $unwrapped = Remove-CmdWrapperQuotes (Remove-EscapeChars $item.Text $Convention)
         if ($unwrapped -ceq $item.Text) { continue }
         [pscustomobject]@{ Raw = $unwrapped; Scan = (Remove-QuotedSpans $unwrapped $item.Conv) }
+    }
+
+    # =================================================================================================
+    # THE SECOND VIEW: THE SAME COMMAND, SPLIT INTO LOGICAL LINES (BACKLOG #1429).
+    #
+    # THE DEFECT. The split above is per PHYSICAL line, so a quoted span crossing a newline is an
+    # unterminated quote on one line and a stray quote on the next. A gated command on a line holding
+    # the CLOSING quote of one such span and the OPENING quote of the next was blanked by those two
+    # quotes pairing across it. MEASURED on the gate before this change, and every middle statement
+    # RUNS (`expr 111 \* 3` and `111*3` print 333):
+    #
+    #     echo 'a<NL>b' ; git -C <governed> checkout main ; echo 'c<NL>d'    Bash tool    ALLOW
+    #     echo "a<NL>b" ; ... the same with double quotes                     Bash tool    ALLOW
+    #     Write-Output 'a<NL>b' ; git -C <governed> reset --hard ; ...       PowerShell   ALLOW
+    #     Write-Output "a<NL>b" ; ... the same with double quotes             PowerShell   ALLOW
+    #
+    # All four DENY with this view. So do the same straddle after a comment, a heredoc or a here-string
+    # carrying a stray quote, inside a heredoc fed to bash, and inside a multi-line interpreter argument.
+    #
+    # APPENDED AFTER EVERY EXISTING SEGMENT, AND ADDITIVE, for the reason the cmd view above gives:
+    # every rule reaches a segment through a continue-or-deny loop, and rule 3's first-verb bookkeeping
+    # sees exactly what it saw. So a place where Split-LogicalLines models the shell WRONGLY can cost a
+    # missed straddle or a false deny here, and never a deny the per-line view already had.
+    #
+    # ONLY WHEN IT CAN DIFFER. A single-line command, one with no quote character at all, or one whose
+    # logical lines are its physical lines would repeat the view above for nothing, on a hook that runs
+    # on every tool call. With no quote there is no span to cross a newline, so nothing to straddle.
+    #
+    # AND NOT PAST 100,000 CHARACTERS. The view is linear, but its constant is a PowerShell loop, and a
+    # hook killed by its timeout lets the command through. Measured on a 63 KB single line of closed
+    # substitutions: 2.0 s before this view, 4.7 s with it. Above the cap the command gets exactly the
+    # per-line reading it had before #1429 -- the straddle stays open there, and only there.
+    # =================================================================================================
+    if ($null -eq $LogicalLines -and $lines.Count -gt 1 -and $folded.Length -le 100000 -and
+        $folded.IndexOfAny([char[]]"'`"") -ge 0) {
+        $logical = @(Split-LogicalLines $folded $Convention)
+        if (($logical -join [char]0) -cne ($lines -join [char]0)) {
+            Get-SegmentView $Cmd $Convention -LogicalLines $logical
+        }
     }
 }
 
@@ -3067,7 +3421,8 @@ $cleanupBullet
     $verbs = 'cherry-pick|checkout|switch|reset|restore|stash|clean|rebase|merge|revert|am|apply'
 
     # Scan SEGMENT BY SEGMENT (Get-ScannableSegments): per line, with quoted spans blanked, plus the
-    # contents of any interpreter argument recursed into. A verb must come from a git invocation on the
+    # contents of any interpreter argument recursed into, then the same again per LOGICAL line where a
+    # quoted span crosses a newline (BACKLOG #1429). A verb must come from a git invocation on the
     # same segment and outside inert quotes, or prose supplies it.
     # Evaluate EVERY verb-bearing segment, not just the first. `git -C ../x checkout main ; git checkout
     # main` has two invocations and only the second touches this tree; stopping at the first match judged
