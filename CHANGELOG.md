@@ -136,6 +136,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
+  is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
+  handle still open on the extracted store, such as a scanner's, made the removal fail. The
+  directory then stayed for good with the decrypted store in it. The failure also replaced the
+  verdict with a `PermissionError`, or replaced the error the verify was raising. The verify now
+  truncates every file to zero bytes and retries the removal for about two seconds. Truncation
+  usually works while another process holds the file open, but not when the holder denies write
+  sharing or has the file mapped. The verdict or error is the verify's own. If a file can be neither
+  removed nor emptied, the verify names the directory to delete: a `PASS` becomes `FAIL`, another
+  verdict keeps its status, and an exception carries it as a note.
+  `docs/PHI.md` says the same. (`BACKLOG #1721`)
+- **The Python engine client now ends the session a new sign-in replaces.** `EngineClient.login`
+  used to overwrite the bearer token it held and never revoke it, so the old session would have
+  stayed valid on first deployment until it idled out. It now calls `POST /auth/logout` with the
+  old token after the engine accepts the new sign-in, as the IDE does. Unlike the IDE, it ends only
+  a token the engine issued to that client. A token adopted with `set_token`, such as one from a
+  keyring or `--token`, may be shared with another process, so the client drops it and leaves it
+  live. A refused sign-in ends nothing, and a revoke that fails is logged without the token and
+  never fails the sign-in.
+  (`BACKLOG #1901`)
+- **`audit-anchor --json` now reports a missing audit database, or one with no `audit_log` table,
+  as JSON on stdout.** Both refusals printed plain text to stderr whatever `--json` said, so a
+  caller piping to `jq` got an empty stdout. They now print `{"error": ...}` on stdout, as the
+  unreadable-file refusal already did. The message and exit code 2 are unchanged, and text mode is
+  byte-identical. (`BACKLOG #1922`)
 - **`Direct(...)` now fails at construction on faults that used to fail every send.** A
   `recipient_cert` whose key is not RSA is refused, because the S/MIME envelope supports RSA key
   transport only. This reverses the EC recipient allowance. An EC `signing_key` or `trust_anchor` is
@@ -301,6 +326,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   that drops the connection before the key exchange completes. A host-key rejection stays
   permanent, and an authentication refusal stays a credential fault. The connector now also closes
   the half-open client whenever the connect fails. (`BACKLOG #1999`)
+- **The FHIR parsers and the OIDC token exchange no longer put their input on the exception
+  chain.** `FhirPeek.parse`, `FhirResource.parse` and `exchange_code` each raised a content-free
+  error `from exc`. The chained decode error holds the whole input: the FHIR body, or the token
+  endpoint's reply. The default traceback printer does not show it. Anything that reads the chain
+  by attribute would have written it to a log on first deployment. All three now decode
+  through `redaction.json_loads_or_refusal` and raise outside any handler, so `__cause__` and
+  `__context__` are both empty. The message keeps a content-free hint: the line and column, or the
+  error's class name. A token reply nested past json's depth limit now also fails as a login
+  error; it used to escape `exchange_code` as a `RecursionError`. At least four other JSON parse
+  sites still chain the decode error and are not covered here. (`BACKLOG #2048`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`

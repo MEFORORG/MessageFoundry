@@ -14,6 +14,8 @@ when not gated).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 from collections.abc import AsyncIterator
@@ -25,9 +27,12 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
+from messagefoundry.auth import trust_anchors as ta
+from messagefoundry.auth.anchor_path import PathVerdict
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import ApprovalsSettings, AuthSettings
+from messagefoundry.config.settings import ApiSettings, ApprovalsSettings, AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store import MessageStore
 
 PW = "a-strong-test-passphrase"
 # min_dwell_seconds=0: this suite releases a reload within milliseconds of holding it, which the
@@ -234,3 +239,64 @@ async def test_dry_run_reload_is_never_held(engine: Engine) -> None:
         )
         assert r.status_code == 200, r.text  # dry-run pre-flight is read-only, never held
         assert r.json()["dry_run"] is True
+
+
+# --- BACKLOG #2034: a released reload runs the settings-anchor preflight ------
+
+
+async def test_a_released_reload_refuses_a_swapped_settings_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before BACKLOG #2034 only the inline route ran the settings-anchor preflight, so a reload held
+    for a second approver went live on a substituted anchor when it was released. The engine now
+    runs it on every real reload. The control is a release before the swap, which goes live."""
+    good = b"-----BEGIN CERTIFICATE-----\ngood\n"
+    anchor = tmp_path / "ad-ca.pem"
+    anchor.write_bytes(good)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
+    auth = AuthSettings(
+        ad_tls_ca_cert_file=str(anchor), ad_tls_ca_cert_pin=hashlib.sha256(good).hexdigest()
+    )
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    store = await MessageStore.open(tmp_path / "dc.db")
+    preflight = ta.make_settings_anchor_preflight(
+        ta.collect_anchor_specs(auth, ApiSettings()), store, enforcing=True
+    )
+    engine = Engine(store, poll_interval=0.02, config_dir=cfg, settings_preflight=preflight)
+    try:
+        service = await _service(engine)
+        await _add(service, "op", Role.ADMINISTRATOR)
+        await _add(service, "approver", Role.ADMINISTRATOR)
+        app = create_app(engine, auth=service, approvals=GATED)
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            op, admin = await _token(c, "op"), await _token(c, "approver")
+
+            async def hold_and_release() -> httpx.Response:
+                held = await c.post("/config/reload", json={}, headers=op)
+                assert held.status_code == 202, held.text
+                approval_id = held.json()["approval_id"]
+                return await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+
+            ok = await hold_and_release()  # the control: an unchanged anchor goes live
+            assert ok.status_code == 200, ok.text
+            live = engine.registry_runner
+            assert live is not None
+            before = live.registry
+
+            anchor.write_bytes(b"-----BEGIN CERTIFICATE-----\nevil\n")
+            refused = await hold_and_release()
+            # 422 as the inline route answers, not an unhandled 500 (raise_app_exceptions=False
+            # would turn a crash into a response, so the exact code is what proves the handling).
+            assert refused.status_code == 422, refused.text
+            assert engine.registry_runner is live and live.registry is before  # nothing swapped
+        rows = await store.list_audit(limit=100)
+        assert "approval.failed" in [r["action"] for r in rows]
+        failed = [json.loads(r["detail"]) for r in rows if r["action"] == "config_reload_failed"]
+        assert failed == [{"requested": None, "dry_run": False, "reason": "trust_anchor"}]
+        events = [json.loads(r["detail"])["event"] for r in rows if r["action"] == ta.AUDIT_ACTION]
+        assert "pin_mismatch" in events
+    finally:
+        await engine.stop()

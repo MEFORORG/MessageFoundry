@@ -17,7 +17,8 @@ would silently mis-route a multi-entry Bundle, the same trap :meth:`X12Peek.grou
 tolerates request-only entries (a transaction/batch entry may carry only ``request.method``/``url`` —
 e.g. a conditional ``DELETE`` — so a missing inline ``resource`` is skipped, never a ``KeyError``).
 
-Pure: works on ``str`` (or ``bytes``, decoded UTF-8/replace), no I/O, no engine imports. The bare
+Pure: works on ``str`` (or ``bytes``, decoded UTF-8/replace), no I/O, and no engine imports but
+the stdlib-only ``redaction``. The bare
 structural accessors need **no** dependency; only :meth:`evaluate` (FHIRPath) pulls the optional
 ``[fhir]`` extra. The content type is referred to by the literal string ``"fhir"`` (never imported from
 ``config``) to keep this purity. **JSON-FHIR is the MVP**; FHIR-XML is deferred (ADR 0022 Options #5).
@@ -25,12 +26,12 @@ structural accessors need **no** dependency; only :meth:`evaluate` (FHIRPath) pu
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
 from messagefoundry.parsing.fhir._deps import load_fhirpathpy
 from messagefoundry.parsing.fhir.errors import FhirPeekError
+from messagefoundry.redaction import json_loads_or_refusal
 
 __all__ = ["FhirPeek"]
 
@@ -64,12 +65,11 @@ class FhirPeek:
             raise FhirPeekError(
                 f"FHIR {fmt!r} peek is not supported in the MVP (JSON only; ADR 0022 Options #5)"
             )
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
-            # PHI rule: name the failure, never echo the body. RecursionError is json's depth limit;
-            # it is a RuntimeError, so the ValueError beside it does not reach it (BACKLOG #1600).
-            raise FhirPeekError("body is not parseable FHIR JSON") from exc
+        # PHI rule: name the failure, never echo the body. No handler here, so the decode error
+        # (which holds the body) is on neither chain (BACKLOG #2048).
+        parsed, refusal = json_loads_or_refusal(raw)
+        if refusal is not None:
+            raise FhirPeekError(f"body is not parseable FHIR JSON ({refusal})")
         if not isinstance(parsed, dict):
             raise FhirPeekError("FHIR JSON body must be a resource object, not a scalar/array")
         return cls(obj=parsed, format=fmt)

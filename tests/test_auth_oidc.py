@@ -14,8 +14,11 @@ import base64
 import io
 import json
 import threading
+import traceback
 import urllib.error
-from collections.abc import Mapping
+import uuid
+from collections.abc import Callable, Mapping
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -722,6 +725,72 @@ def test_exchange_code_token_endpoint_errors_leave_no_exception_chain() -> None:
             "__suppress_context__; raise from outside the `except` block"
         )
         assert "SYNTHETIC-SECRET" not in f"{exc!r}"
+
+
+@pytest.mark.parametrize(
+    ("build_body", "hint"),
+    [
+        # Unquoted token: a JSONDecodeError, whose `.doc` is the whole reply.
+        pytest.param(
+            lambda m: b'{"id_token": ' + m, "JSONDecodeError at line 1, column", id="bad-json"
+        ),
+        # A byte that is not UTF-8: a UnicodeDecodeError, whose `.object` is the whole reply.
+        pytest.param(
+            lambda m: b'{"id_token": "' + m + b'\xff"}', "(UnicodeDecodeError)", id="bad-utf8"
+        ),
+    ],
+)
+def test_exchange_code_unparseable_reply_leaves_it_off_the_exception_chain(
+    build_body: Callable[[bytes], bytes], hint: str
+) -> None:
+    """A token reply that is not JSON must not ride the raised FlowError's chain (BACKLOG #2048).
+
+    The reply carries tokens. ``from exc`` put the decode error on ``__cause__``, and that error
+    holds the WHOLE reply (``JSONDecodeError.doc``, ``UnicodeDecodeError.object``). The marker is
+    built at run time so ``traceback``'s echoed source lines cannot carry it. The chain asserts are
+    the discriminating ones; the rendering check guards against a message that interpolates the
+    reply. Frame locals are out of scope: ``exchange_code``'s frame still holds ``body``."""
+    marker = ("SYNTH" + uuid.uuid4().hex).encode()
+    with pytest.raises(oidc.FlowError, match="not valid JSON") as excinfo:
+        oidc.exchange_code(
+            token_endpoint="https://idp.example/token",
+            client_id="c",
+            client_secret=None,
+            code="x",
+            redirect_uri="http://localhost/cb",
+            code_verifier="v",
+            opener=_FakeOpener(build_body(marker)),  # type: ignore[arg-type]
+        )
+    err = excinfo.value
+    assert err.__cause__ is None
+    assert err.__context__ is None, "the decode error (and the reply on it) is still on __context__"
+    assert hint in str(err)
+    assert marker.decode() not in "".join(traceback.format_exception(err))
+
+
+def test_exchange_code_too_deep_reply_is_a_flow_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """json's depth limit is a ``RecursionError``, which the old ``ValueError`` arm did not reach, so a
+    deeply nested reply escaped ``exchange_code`` as a non-FlowError and skipped the audited
+    login-failure path. The trigger is a raised ``RecursionError``, not a deep body, because the depth
+    where json's C decoder gives out is a property of the runner (BACKLOG #1222)."""
+    from messagefoundry import redaction
+
+    def _recursing_loads(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    stand_in = SimpleNamespace(loads=_recursing_loads, JSONDecodeError=json.JSONDecodeError)
+    monkeypatch.setattr(redaction, "json", stand_in)
+    with pytest.raises(oidc.FlowError, match=r"not valid JSON \(RecursionError\)") as excinfo:
+        oidc.exchange_code(
+            token_endpoint="https://idp.example/token",
+            client_id="c",
+            client_secret=None,
+            code="x",
+            redirect_uri="http://localhost/cb",
+            code_verifier="v",
+            opener=_FakeOpener(b'{"id_token": "x.y.z"}'),  # type: ignore[arg-type]
+        )
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
 
 
 class _TripwireOpener:

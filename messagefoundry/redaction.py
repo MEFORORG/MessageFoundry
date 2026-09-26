@@ -52,18 +52,21 @@ count here went stale the first time this module grew a pattern and nothing repo
 the register is a register of SPANS -- a dependency on the whole text rather than on a span is a
 different shape it cannot hold (:func:`_sniff_delimiters`, below).
 
-Pure stdlib (``re``, ``hashlib``, ``string``), so it can be used from any engine package.
+Pure stdlib, so it can be used from any engine package.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
+from typing import Any
 
 __all__ = [
     "clamp_untrusted",
+    "json_loads_or_refusal",
     "redact",
     "redact_untrusted",
     "safe_error",
@@ -1401,3 +1404,27 @@ def safe_exc(
         raw = raw.replace(base, safe_name(file_name))
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
+
+
+def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:
+    """``json.loads(raw)`` as ``(value, None)``, or ``(None, hint)`` when it fails, never raising.
+
+    Test the hint, never the value: a JSON ``null`` is ``(None, None)``.
+
+    The hint is content-free: the line and column for a decode error, else the class name (a
+    ``UnicodeDecodeError`` on bytes, or json's depth-limit ``RecursionError``, which is a
+    ``RuntimeError`` a ``ValueError`` arm does not reach -- BACKLOG #1600).
+
+    It returns rather than raises so a caller's refusal is raised outside any handler (BACKLOG
+    #2048). The decode error holds the WHOLE input (``JSONDecodeError.doc``,
+    ``UnicodeDecodeError.object``): ``from exc`` puts it on ``__cause__``, and ``from None`` still
+    leaves it on ``__context__``. See ``encode_wire_body`` in transports/base.py. Frame locals are
+    out of reach of this: the raised error's traceback still holds the caller's frame."""
+    refusal: str | None = None
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError as exc:
+        refusal = f"JSONDecodeError at line {exc.lineno}, column {exc.colno}"
+    except (ValueError, RecursionError) as exc:
+        refusal = type(exc).__name__
+    return None, refusal

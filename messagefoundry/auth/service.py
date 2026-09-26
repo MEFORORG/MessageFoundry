@@ -855,9 +855,10 @@ class AuthService:
         # #285 (ASVS 6.7.1): the ADR 0148 [security].enforcement dial, threaded in by the caller
         # (the lifespan passes trust_anchors_enforcing). It gates the OIDC anchor's construction-site
         # ACL preflight in build_idp_opener below so a group/world-writable anchor WARNS (not refuses)
-        # in warn mode — matching the central run_anchor_preflight and build_api_ssl_context, which is
-        # the only place AuthService needs the dial. AuthSettings carries no [security] block, so the
-        # dial cannot be read off settings here; it must be passed. Defaults enforce (fail-closed).
+        # in warn mode — matching the central run_anchor_preflight and build_api_ssl_context. The LDAP
+        # authenticator's AD CA check reads it too (BACKLOG #2034). AuthSettings carries no
+        # [security] block, so the dial cannot be read off settings here; it must be passed.
+        # Defaults enforce (fail-closed).
         self._trust_anchors_enforcing = enforcing
         # Out-of-band security-event push (ASVS 6.3.5/6.3.7), injected by the API lifespan. None = no
         # email push. What the /me/security-events pull feed still shows is stated once, in
@@ -873,8 +874,12 @@ class AuthService:
             # resolves the bind password from the external backend (fail-closed) at construction. #329:
             # thread the instance hop posture too — LDAPS is built out of the connector-construction gate,
             # so its ad_tls_verify=false escape clamp is inert unless the posture arrives explicitly here.
+            # BACKLOG #2034: the enforcement dial too, since the authenticator now checks its CA anchor.
             self._ldap = LdapAuthenticator(
-                settings, secret_provider=secret_provider, posture=hop_posture
+                settings,
+                secret_provider=secret_provider,
+                posture=hop_posture,
+                enforcing=self._trust_anchors_enforcing,
             )
         else:
             self._ldap = None

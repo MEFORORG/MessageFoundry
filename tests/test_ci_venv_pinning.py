@@ -296,14 +296,16 @@ SECURITY_YML_PIP_BOOTSTRAPS = 4
 #: `-r` and its argument, so `pip install --require-hashes -r <lock>` names zero packages and passes by
 #: not being looked at. The tests below are the ones that look.
 #:
-#: THE COUNT IS LOAD-BEARING, not decoration. Twelve install sites collapse onto five (workflow, lock)
-#: pairs — `security.yml` installs `ci-scanners.lock` three times (the pip-audit step, the bandit step
-#: and released-line-audit, which audits the latest release tag's core lock rather than the tree),
-#: `quality-advisory.yml` installs `ci-quality.lock` twice (the coverage job and the mutation job), and
-#: `release.yml` installs `release-tools.lock` five times. An
+#: THE COUNT IS LOAD-BEARING, not decoration. Several install sites can collapse onto one (workflow,
+#: lock) pair — for example `security.yml` installs `ci-scanners.lock` in the pip-audit step, the bandit
+#: step and released-line-audit (which audits the latest release tag's core lock rather than the tree),
+#: `quality-advisory.yml` installs `ci-quality.lock` in the coverage job and the mutation job, and
+#: `release.yml` installs `release-tools.lock` in several jobs. The rows carry the numbers; no total
+#: is kept here, because a total in prose is a second copy free to drift. An
 #: `assert lines` non-vacuity check is satisfied by ONE surviving line, so deleting either of a pair
-#: leaves its job installing nothing while every check here stays green. Measured: with only "≥1", four
-#: of the five sites were individually deletable at zero test cost — and the coverage job's failure mode
+#: leaves its job installing nothing while every check here stays green. Measured when this table had
+#: three rows and five sites: with only "≥1", four of the five were individually deletable at zero test
+#: cost — and the coverage job's failure mode
 #: is silent (`pytest -q --cov` dies on `unrecognized arguments`, `|| true` swallows it, and the
 #: diff-coverage step reports "skipped" and exits 0).
 #:
@@ -322,6 +324,15 @@ LOCK_INSTALLED_TOOLCHAINS = (
     ("quality-advisory.yml", "ci/locks/ci-quality.lock", 2),
     ("release.yml", "ci/locks/release-tools.lock", 5),
     ("security.yml", "ci/locks/release-tools.lock", 1),
+    # The last two were installing from a lock with no row here, so no exact count watched them
+    # (BACKLOG #1545). `required-workflow-state.yml` installs `ci-scanners.lock` for PyYAML in both of
+    # its jobs, `reachable` and `accurate`. `ci.yml`'s packaging build job installs `release-tools.lock`
+    # so it builds with the backend the release will use. Both already pass `--require-hashes`; what
+    # the rows add is noticing if one stops, or if one of the pair is deleted.
+    # `test_every_lock_install_site_is_registered` now reds on a new unregistered pair, for any install
+    # line that names its lock path in full (the same line shape the count test reads).
+    ("required-workflow-state.yml", "ci/locks/ci-scanners.lock", 2),
+    ("ci.yml", "ci/locks/release-tools.lock", 1),
 )
 
 #: Tools that MOVED from an inline `pip install <tool>==<version>` into a PEP 735 dependency group. Two
@@ -333,6 +344,12 @@ LOCK_INSTALLED_TOOLCHAINS = (
 #: the live one: both are ordinary tools somebody would reach for inline while debugging a release, and
 #: `pip install build` beside the lock install would win, silently, with every hash check here still
 #: green because those checks only ever read the lock line.
+#:
+#: `sigstore` joined LAST, though it moved FIRST (BACKLOG #1545). It left `RELEASE_PINNED_TOOLS` for the
+#: lock before step 6, and the two tables it should have landed in were never updated, so it was the one
+#: moved tool this sweep did not look for. A second `pip install "sigstore==<other>"` beside the lock
+#: install in the signing step would pass the blanket release scan, because an `==` target counts as
+#: pinned, and then win -- in the signing step, which runs with the OIDC identity that signs.
 MOVED_TO_A_GROUP = (
     "bandit",
     "pip-audit",
@@ -342,6 +359,7 @@ MOVED_TO_A_GROUP = (
     "pytest-cov",
     "build",
     "cyclonedx-bom",
+    "sigstore",
 )
 
 #: Moved tools whose `[dependency-groups]` spec must be an EXACT `==` pin, and why the exactness is the
@@ -359,7 +377,16 @@ MOVED_TO_A_GROUP = (
 #: `build` joined 2026-09-10: it is the PEP 517 frontend that produces the wheel and sdist the release
 #: then signs, attests and publishes, so the version that builds the artifact is the contract in the
 #: strongest sense available here.
-EXACT_GROUP_PINS = ("bandit", "pip-audit", "zizmor", "diff-cover", "mutmut", "build")
+#:
+#: `sigstore` joined with BACKLOG #1545. Its version is an OWNER RULING, and the `==` in `pyproject.toml`
+#: is the only thing binding that ruling to what the resolver picks. The reasoning lives once, at
+#: `[dependency-groups].release-tools`; this entry does not restate the version and must not be read as
+#: reopening it. `.github/dependabot.yml`'s `ignore` blocks only `>=4.5.0` and leaves the 4.4.x patch
+#: track open on purpose. Under a floor, a Dependabot patch PR moves `uv.lock` with no `pyproject.toml`
+#: diff to review, and `dependabot-lock-resync.yml` re-exports and stages the lock green. The `ignore`
+#: binds only the bot, so a human `uv lock --upgrade` would take 4.5.0 the same way, with only lock
+#: files in the diff. Only this declaration-side check sees a floor.
+EXACT_GROUP_PINS = ("bandit", "pip-audit", "zizmor", "diff-cover", "mutmut", "build", "sigstore")
 
 #: The counterpart: moved tools deliberately declared as a FLOOR. Enumerated so "floor by design" and
 #: "floor nobody noticed" cannot look the same.
@@ -657,6 +684,43 @@ def test_lock_installed_toolchain_install_is_hash_verified(
         )
 
 
+#: A path under `ci/locks/`, as it appears on an install line.
+_CI_LOCK_PATH = re.compile(r"ci/locks/[A-Za-z0-9._-]+\.lock")
+
+
+def test_every_lock_install_site_is_registered() -> None:
+    """Every workflow that installs a `ci/locks/` lock must have its (workflow, lock) row above.
+
+    The per-row tests only see the rows they are given, so a NEW install site in an unregistered
+    workflow gets no exact count and no `--require-hashes` check. That is not hypothetical: BACKLOG
+    #1545 found two such pairs, in `required-workflow-state.yml` and `ci.yml`. Both were hashed, so the
+    hole was that nothing would notice if one stopped being. This sweep uses the same line predicate as
+    `test_lock_installed_toolchain_install_is_hash_verified`, so the sweep and the counted rows agree
+    on what an install site is. That also means they share a blind spot: a lock path on a
+    backslash-continued line, or held in a shell variable, is seen by neither. No such shape exists
+    today.
+    """
+    registered = {(wf, lock) for wf, lock, _ in LOCK_INSTALLED_TOOLCHAINS}
+    found = {
+        (wf.name, lock)
+        for wf in sorted(_WORKFLOWS.glob("*.yml"))
+        for ln in _code_lines(wf)
+        if _PIP_INSTALL.search(ln)
+        for lock in _CI_LOCK_PATH.findall(ln)
+    }
+    print(f"[ci-venv-pinning] {len(found)} (workflow, lock) install pair(s) found in the workflows")
+    # Non-vacuity: a broken regex or a moved workflow directory would otherwise report nothing missing.
+    assert found, (
+        f"no `ci/locks/` install found under {_WORKFLOWS} -- this sweep would pass vacuously"
+    )
+    missing = sorted(found - registered)
+    assert not missing, (
+        "these workflows install a ci/locks lock but have no LOCK_INSTALLED_TOOLCHAINS row, so no "
+        f"exact site count and no --require-hashes check covers them: {missing}. Add a row with the "
+        "measured site count."
+    )
+
+
 @pytest.mark.parametrize(("workflow", "lock", "sites"), LOCK_INSTALLED_TOOLCHAINS)
 def test_lock_installed_toolchain_lock_is_pinned_and_hashed(
     workflow: str, lock: str, sites: int
@@ -793,6 +857,28 @@ def test_floored_group_pins_stay_declared(package: str) -> None:
     assert re.fullmatch(rf"{re.escape(package)}(>=|~=)\d+(\.\d+)*", spec), (
         f"`{package}` is listed in FLOOR_BY_DESIGN but declared as {spec!r}. If it was deliberately "
         f"tightened to an exact pin, move it to EXACT_GROUP_PINS with its reason in the same commit."
+    )
+
+
+def test_every_group_spec_has_a_declared_shape() -> None:
+    """Every `[dependency-groups]` name is in EXACTLY ONE of EXACT_GROUP_PINS and FLOOR_BY_DESIGN.
+
+    The two tests above are parametrized over those tables, so a name in neither generates no case at
+    all, and its spec can become a floor with nothing going red. That is how `sigstore` sat unguarded
+    (BACKLOG #1545): it moved into `release-tools` and never reached either table. This makes the claim
+    in `test_floored_group_pins_stay_declared` -- that the two tables together give every spec's shape
+    -- something a test holds rather than something the prose asserts.
+    """
+    names = sorted({_dist_name(spec) for specs in _dependency_groups().values() for spec in specs})
+    assert names, "[dependency-groups] declares no requirement strings -- this check is vacuous"
+    exact, floor = set(EXACT_GROUP_PINS), set(FLOOR_BY_DESIGN)
+    print(f"[ci-venv-pinning] {len(names)} group spec(s) checked for a declared shape")
+    both = sorted(exact & floor)
+    assert not both, f"listed as both an exact pin and a floor by design: {both}"
+    unclassified = [name for name in names if name not in exact | floor]
+    assert not unclassified, (
+        f"[dependency-groups] declares {unclassified}, which is in neither EXACT_GROUP_PINS nor "
+        f"FLOOR_BY_DESIGN, so nothing checks its spec's shape. Add it to one of them, with its reason."
     )
 
 

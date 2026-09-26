@@ -15,8 +15,9 @@ The FHIR **version** is an explicit per-connection choice (default ``"R4B"`` —
 ship R5/R4B/STU3, not plain R4; ``"R5"``/``"STU3"`` opt-in), mirroring CLAUDE.md §8's "be explicit about
 the version" rule. **JSON is the MVP**; FHIR-XML is deferred (ADR 0022 Options #5).
 
-Pure: no I/O, no engine imports, no network. The typed library (``fhir.resources``) is lazily loaded
-from the optional ``[fhir]`` extra, so importing this module needs neither the extra nor the engine.
+Pure: no I/O, no network, and no engine imports but the stdlib-only ``redaction``. The typed library
+(``fhir.resources``) is lazily loaded from the optional ``[fhir]`` extra, so importing this module
+needs neither the extra nor the engine.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from pydantic import ValidationError
 
 from messagefoundry.parsing.fhir._deps import _SUPPORTED_VERSIONS, load_get_fhir_model_class
 from messagefoundry.parsing.fhir.errors import FhirError, FhirValidationError
+from messagefoundry.redaction import json_loads_or_refusal
 
 __all__ = ["FhirResource"]
 
@@ -73,12 +75,10 @@ class FhirResource:
         if isinstance(raw, (bytes, bytearray)):
             raw = bytes(raw).decode("utf-8", "replace")
         raw = raw.lstrip("﻿")  # tolerate a leading UTF-8 BOM (json.loads would otherwise choke)
-        try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
-            # RecursionError is json's depth limit, a RuntimeError the ValueError does not reach
-            # (BACKLOG #1600).
-            raise FhirValidationError("body is not parseable FHIR JSON") from exc
+        # No handler here, so the decode error (which holds the body) is on neither chain (#2048).
+        data, refusal = json_loads_or_refusal(raw)
+        if refusal is not None:
+            raise FhirValidationError(f"body is not parseable FHIR JSON ({refusal})")
         if not isinstance(data, dict):
             raise FhirValidationError(
                 "FHIR JSON body must be a resource object, not a scalar/array"
