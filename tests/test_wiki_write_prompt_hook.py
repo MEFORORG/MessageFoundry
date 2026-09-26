@@ -58,9 +58,20 @@ WIKI_MARKER = re.search(r"\$WIKI_MARKER\s*=\s*\"([^\"]+)\"", _SRC).group(1)  # t
 
 def _clean_env() -> dict[str, str]:
     """The fixture decides what the hook reads, not whoever runs the suite. A GIT_DIR inherited from
-    a git hook would point `git -C <tmp>` at the REAL repository and its live coordination tree."""
+    a git hook would point `git -C <tmp>` at the REAL repository and its live coordination tree. A
+    CLAUDE_* variable from the session running the suite would decide whether the hook prompts."""
     scrub = {"MEFOR_WIKI_PROMPT", "KORUS_SEAT", "KORUS_AGENT", "KORUS_STATE_REL"}
-    return {k: v for k, v in os.environ.items() if k not in scrub and not k.startswith("GIT_")}
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k.upper() not in scrub
+        and not k.upper().startswith("GIT_")
+        and not k.upper().startswith("CLAUDE")
+    }
+
+
+# What an attended session's hook sees. Every test that expects a prompt needs it.
+ATTENDED = {"CLAUDE_CODE_SESSION_ATTENDED": "1"}
 
 
 class Env:
@@ -103,8 +114,11 @@ class Env:
         active: bool = False,
         stdin: str | None = None,
         env: dict[str, str] | None = None,
+        session: dict[str, str] | None = None,
         transcript: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        """``session`` is the CLAUDE_* set Claude Code would pass. The default is an attended
+        session; pass ``{}`` for a hook that sees none of them."""
         payload = stdin
         if payload is None:
             payload = json.dumps(
@@ -120,6 +134,7 @@ class Env:
                 ensure_ascii=False,
             )
         full_env = _clean_env()
+        full_env.update(ATTENDED if session is None else session)
         full_env.update(env or {})
         proc = subprocess.run(
             ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK)],
@@ -207,6 +222,70 @@ def test_stop_hook_active_never_blocks(env: Env) -> None:
     silent(env.run(active=True))
     # Positive control: the same transcript does fire once the loop guard is off.
     blocked(env.run())
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        {"CLAUDE_CODE_SESSION_ATTENDED": "1"},
+        {"CLAUDE_CODE_SESSION_ATTENDED": "true", "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"},
+        {"CLAUDE_CODE_ENTRYPOINT": "cli"},
+    ],
+    ids=["attended-1", "attended-true-wins-over-entrypoint", "absent-with-interactive-cli"],
+)
+def test_an_attended_session_is_prompted(env: Env, session: dict[str, str]) -> None:
+    env.append(tools(MIN_TOOLS))
+    blocked(env.run(session=session))
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        {"CLAUDE_CODE_SESSION_ATTENDED": "0"},
+        {"CLAUDE_CODE_SESSION_ATTENDED": "false"},
+        # Attended says no, so an interactive-looking entrypoint must not overrule it.
+        {"CLAUDE_CODE_SESSION_ATTENDED": "0", "CLAUDE_CODE_ENTRYPOINT": "cli"},
+        {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"},
+        {"CLAUDE_CODE_ENTRYPOINT": "sdk-ts"},
+        # A print-mode child of a Desktop session inherits this value unchanged.
+        {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"},
+        {"CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SESSION_KIND": "bg"},
+        {"CLAUDE_CODE_SESSION_ATTENDED": "1", "CLAUDE_CODE_HOST_SCHEDULED_RUN": "1"},
+        {},
+    ],
+    ids=[
+        "attended-0",
+        "attended-false",
+        "attended-0-beats-cli",
+        "absent-sdk-cli",
+        "absent-sdk-ts",
+        "absent-claude-desktop",
+        "absent-cli-bg-kind",
+        "scheduled-run",
+        "both-absent",
+    ],
+)
+def test_an_unattended_session_is_never_prompted(env: Env, session: dict[str, str]) -> None:
+    env.append(tools(MIN_TOOLS + 5))
+    env.append([tool_use("Bash", 'git commit -m "x"')])
+    silent(env.run(session=session))
+    # Nothing written: no state, no log line.
+    assert not env.state_path.exists()
+    assert env.logs() == []
+    # Positive control: the same transcript prompts once the session is attended.
+    blocked(env.run())
+
+
+def test_a_skipped_session_keeps_its_existing_offset(env: Env) -> None:
+    env.append(tools(MIN_TOOLS - 5))
+    silent(env.run())
+    before = env.state_path.read_text(encoding="utf-8")
+    env.append(tools(5))
+    silent(env.run(session={"CLAUDE_CODE_SESSION_ATTENDED": "0"}))
+    assert env.state_path.read_text(encoding="utf-8") == before
+    # The new lines are still counted once, from the saved offset.
+    blocked(env.run())
+    assert env.logs()[-1]["tools"] == MIN_TOOLS
 
 
 def test_below_threshold_is_silent(env: Env) -> None:

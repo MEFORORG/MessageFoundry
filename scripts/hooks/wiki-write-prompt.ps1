@@ -39,9 +39,22 @@
     A memory prompt must never block work or wedge a session. Unreadable state is also rewritten from
     the transcript's end, so one bad file cannot silence a session for good.
 
-    KNOWN COST. A block makes the wiki exchange the session's last message. For a headless
-    `claude -p` run, that exchange replaces the final report as the run's result. A subagent is not
-    affected: it ends on SubagentStop, which this hook is not wired to.
+    ATTENDED SESSIONS ONLY. A block makes the wiki exchange the session's last message. A headless
+    `claude -p` run, a spawned Builder or a scheduled job reports through that last message, so the
+    hook must never block one. Test-AttendedSession decides, and it rests on this reading of the
+    Claude Code 2.1.281 binary (grep -a, 2026-09-26):
+      - Claude Code sets CLAUDE_CODE_SESSION_ATTENDED to "1" or "0" in every command hook's
+        environment. It is "0" for a bg or daemon session and for a teammate agent. It is "1" for an
+        interactive session. A print-mode session gets "1" only when it is not a child session and
+        its entrypoint is a host surface such as claude-desktop or claude-vscode. So a `claude -p`
+        Builder spawned from a Desktop session reads "0".
+      - A host marks its own scheduled runs with CLAUDE_CODE_HOST_SCHEDULED_RUN=1, and the attended
+        test above ignores it. So a scheduled run is refused here on its own, when a hook can see it.
+      - When the attended variable is absent (an older Claude Code), CLAUDE_CODE_ENTRYPOINT decides,
+        and only "cli" counts. Claude Code rewrites an inherited "cli" to "sdk-cli" in print mode,
+        but keeps any other inherited value, so a print-mode child of a Desktop session still reads
+        "claude-desktop". Absent both, the hook stays quiet.
+    A subagent is not affected either way: it ends on SubagentStop, which this hook is not wired to.
 #>
 [CmdletBinding()]
 param()
@@ -75,6 +88,21 @@ $CommitRegex = [regex]::new(
 $WriteRegex = [regex]::new(
     '(?:-File\s+|&\s*|' + $CommandStart + ')["'']?[^\s"'']*write\.ps1["'']?\s(?!.*-CheckOnly\b).*-(?:Type|FromJson)\b',
     'IgnoreCase, Singleline', $RegexTimeout)
+
+function Test-Truthy([string]$Value) {
+    # The truthy set Claude Code itself parses an environment flag with.
+    return @('1', 'true', 'yes', 'on') -contains $Value.Trim().ToLowerInvariant()
+}
+
+function Test-AttendedSession {
+    # True only when a person is at this session to answer. The header says which reading this
+    # rests on. Every doubtful case is false: a missed prompt costs one note, a wrong one costs a
+    # headless run its report.
+    if (Test-Truthy ([string]$env:CLAUDE_CODE_HOST_SCHEDULED_RUN)) { return $false }
+    if ($null -ne $env:CLAUDE_CODE_SESSION_ATTENDED) { return (Test-Truthy $env:CLAUDE_CODE_SESSION_ATTENDED) }
+    if (@('bg', 'daemon', 'daemon-worker') -contains [string]$env:CLAUDE_CODE_SESSION_KIND) { return $false }
+    return ([string]$env:CLAUDE_CODE_ENTRYPOINT -eq 'cli')
+}
 
 function Test-Match([regex]$Regex, [string]$Text) {
     # A pathological command must not stall the hook. A timeout counts as no match.
@@ -179,6 +207,10 @@ function Get-Reason([string]$Coord, [string]$Seat) {
 
 try {
     if ($env:MEFOR_WIKI_PROMPT -eq 'off') { exit 0 }
+    # Before any read or write: a session nobody attends is never prompted, so its state and the
+    # log are left alone. Attendance does not change within a session, so the offset kept in any
+    # existing state stays correct.
+    if (-not (Test-AttendedSession)) { exit 0 }
 
     # Claude Code sends UTF-8, and git prints UTF-8. The console default is the OEM code page, which
     # garbles any non-ASCII path in the payload or in git's output.
