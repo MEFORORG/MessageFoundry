@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
+from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import safe_exc
@@ -1276,7 +1277,7 @@ def _full_open_check(snap: Path, settings: StoreSettings | None) -> tuple[str, s
             await store.close()
 
     try:
-        ok, msg = asyncio.run(_open())
+        ok, msg = run_guarded(_open())
     except StoreKeylessError as exc:
         # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
         # encrypted store, and they reach this before the decrypt pass below ever runs. Same cause,
