@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -443,14 +444,14 @@ async def test_read_request_parses_post() -> None:
 
 
 async def test_read_request_rejects_declared_oversize() -> None:
-    raw = b"POST /x HTTP/1.1\r\nContent-Length: 100\r\n\r\n"
+    raw = b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\n"
     with pytest.raises(HttpRequestError) as exc:
         await _read_request(await _reader_from(raw), max_header_bytes=8192, max_body_bytes=16)
     assert exc.value.status == 413 and exc.value.kind == "frame_oversize"
 
 
 async def test_read_request_rejects_chunked() -> None:
-    raw = b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
     with pytest.raises(HttpRequestError) as exc:
         await _read_request(
             await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
@@ -461,7 +462,7 @@ async def test_read_request_rejects_chunked() -> None:
 async def test_read_request_rejects_duplicate_content_length() -> None:  # DELTA-06
     # Two Content-Length headers are an ambiguous-framing / request-smuggling signal (a dict would
     # silently keep the last); reject rather than pick one.
-    raw = b"POST /x HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc"
+    raw = b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc"
     with pytest.raises(HttpRequestError) as exc:
         await _read_request(
             await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
@@ -471,7 +472,9 @@ async def test_read_request_rejects_duplicate_content_length() -> None:  # DELTA
 
 async def test_read_request_rejects_content_length_with_transfer_encoding() -> None:  # DELTA-06
     # Both Content-Length and Transfer-Encoding present: RFC 7230 §3.3.3 mandates rejection.
-    raw = b"POST /x HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc"
+    raw = (
+        b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc"
+    )
     with pytest.raises(HttpRequestError) as exc:
         await _read_request(
             await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
@@ -481,7 +484,7 @@ async def test_read_request_rejects_content_length_with_transfer_encoding() -> N
 
 async def test_read_request_rejects_duplicate_transfer_encoding() -> None:  # DELTA-06
     # A duplicated Transfer-Encoding is how an obfuscated encoding is smuggled past the chunked check.
-    raw = b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n"
+    raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n"
     with pytest.raises(HttpRequestError) as exc:
         await _read_request(
             await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
@@ -883,6 +886,132 @@ async def test_a_framing_refusal_is_answered_logged_and_never_ingested(
     assert resp.status == status
     assert resp.headers.get("connection") == "close"
     assert any(kind == "framing_error" for kind, *_ in events)
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+    assert (await cur.fetchone())["n"] == 0
+
+
+# --- Host header: exactly one on HTTP/1.1, never two (RFC 9112 section 3.2, BACKLOG #1972) --------
+
+_NO_HOST = "missing Host header"
+_TWO_HOSTS = "duplicate Host header"
+_DUP_FRAMING = "duplicate framing header"
+
+
+@pytest.mark.parametrize(
+    ("label", "raw", "reason"),
+    [
+        ("post no host", b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc", _NO_HOST),
+        ("get no host", b"GET /health HTTP/1.1\r\n\r\n", _NO_HOST),
+        ("head no host", b"HEAD /health HTTP/1.1\r\n\r\n", _NO_HOST),
+        # Every 1.x minor past 0 is read as 1.1 (RFC 9110 section 2.5), so it owes a Host too.
+        ("http/1.2 no host", b"GET / HTTP/1.2\r\n\r\n", _NO_HOST),
+        # The dict kept the LAST value, so this used to parse with Host `b` and no refusal.
+        (
+            "two hosts differing",
+            b"POST / HTTP/1.1\r\nHost: a\r\nHost: b\r\nContent-Length: 3\r\n\r\nabc",
+            _TWO_HOSTS,
+        ),
+        ("two hosts equal", b"GET / HTTP/1.1\r\nHost: h\r\nHost: h\r\n\r\n", _TWO_HOSTS),
+        # Field names are case-insensitive, so a case change is still a second Host.
+        ("two hosts by case", b"GET / HTTP/1.1\r\nHost: h\r\nhOST: h\r\n\r\n", _TWO_HOSTS),
+        # An empty value counts as a line, so it cannot hide a second one.
+        ("empty then host", b"GET / HTTP/1.1\r\nHost:\r\nHost: h\r\n\r\n", _TWO_HOSTS),
+        # The "more than one" MUST is not scoped to 1.1.
+        ("two hosts on 1.0", b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n", _TWO_HOSTS),
+    ],
+)
+async def test_the_head_parse_refuses_a_missing_or_repeated_host(
+    label: str, raw: bytes, reason: str
+) -> None:
+    reader = await _reader_from(raw)
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(reader, max_header_bytes=8192)
+    assert excinfo.value.status == 400, label
+    assert excinfo.value.kind == "framing_error", label
+    assert excinfo.value.reason == reason, label
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", _TE_REFUSED),
+        (b"POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc", _DUP_FRAMING),
+        (
+            b"POST / HTTP/1.1\r\nHost: a\r\nHost: b\r\nTransfer-Encoding: chunked\r\n\r\n",
+            _TE_REFUSED,
+        ),
+    ],
+)
+async def test_a_smuggling_probe_keeps_its_framing_reason_when_host_is_also_wrong(
+    raw: bytes, reason: str
+) -> None:
+    # The Host check runs AFTER the framing refusals, so an operator filtering `framing_error`
+    # events for smuggling probes still sees the framing reason when the probe also omits Host.
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_head(await _reader_from(raw), max_header_bytes=8192)
+    assert excinfo.value.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        ("one host", b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"),
+        ("one host with port", b"GET / HTTP/1.1\r\nhost: example.test:8080\r\n\r\n"),
+        # RFC 9112 section 3.2 has a client send an EMPTY Host when the target has no authority.
+        # This listener routes on no Host value, so empty is pinned as present, not refused.
+        ("empty host", b"GET / HTTP/1.1\r\nHost:\r\n\r\n"),
+        ("whitespace-only host", b"GET / HTTP/1.1\r\nHost: \t\r\n\r\n"),
+        # HTTP/1.0 predates the field, and a 1.0 health check commonly omits it.
+        ("http/1.0 no host", b"GET /health HTTP/1.0\r\n\r\n"),
+        ("http/1.0 one host", b"GET /health HTTP/1.0\r\nHost: h\r\n\r\n"),
+    ],
+)
+async def test_a_single_or_empty_host_and_a_hostless_http_1_0_still_parse(
+    label: str, raw: bytes
+) -> None:
+    # Accept-controls for the refusals above, so a parser gone refuse-everything reddens here.
+    head = await _read_head(await _reader_from(raw), max_header_bytes=8192)
+    assert head.method == "GET", label
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        (b"POST /ingest HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc", _NO_HOST),
+        (
+            b"POST /ingest HTTP/1.1\r\nHost: localhost\r\nHost: SENTINEL-HOST-VALUE\r\n"
+            b"Content-Length: 3\r\n\r\nabc",
+            _TWO_HOSTS,
+        ),
+    ],
+)
+async def test_a_host_refusal_is_answered_400_content_free_and_never_ingested(
+    store: MessageStore, raw: bytes, reason: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """End to end over a socket: a closed 400 before dispatch, a `framing_error` event whose reason
+    is the fixed refusal text, and no ingress row. The duplicate row carries a sentinel Host value,
+    which must appear nowhere: not in the response, the event, or the log at any level."""
+    caplog.set_level(logging.DEBUG)
+    events: list[tuple] = []
+    ic = build_inbound_connection(
+        "IB_HTTP",
+        Http(port=0),
+        router="r",
+        content_type=ContentType.TEXT,
+        capture_connection_errors=True,
+    )
+    src = await _start_source(store, ic, events=events)
+    try:
+        resp = await _http(src.sockport, raw_override=raw, half_close=True)
+    finally:
+        await src.stop()
+    assert resp.status == 400
+    assert resp.headers.get("connection") == "close"
+    assert resp.json() == {"error": reason}
+    assert ("framing_error", reason) in [(kind, why) for kind, _peer, why in events]
+    assert b"SENTINEL" not in resp.body
+    assert not any("SENTINEL" in str(event) for event in events)
+    assert "SENTINEL" not in caplog.text
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
     assert (await cur.fetchone())["n"] == 0
 

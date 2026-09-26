@@ -344,7 +344,8 @@ authentication is on, because a browser cannot set the `Authorization` header on
 
 The two gates audit differently. Under the default audit setting, `authorize_ws` writes one
 `auth.permission_granted` row per authorized handshake, before the route's connection-cap check.
-`authorize_ui_ws` writes no grant row, and its denial rows carry no client address.
+`authorize_ui_ws` writes no grant row. Its denial rows carry the client address, as those of
+`authorize_ws` do, read through the same `client_ip()` (ADR 0150, BACKLOG #1644).
 
 ### Permission catalogue (29)
 
@@ -997,13 +998,35 @@ server-side, not a client confirmation). On release the captured operation is **
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`.
 
-**The audit log must accept a release before the operation runs.** Just before it releases a
-request, the gate writes an `approval.release_attempted` row against the approver, naming the
-requester. If the audit log refuses that write, the approve returns **503**, nothing runs, and the
-request stays pending. `approval.approved` is written after the operation, with its result. If only
-that later write fails, the error is logged and the release still succeeds, because the operation
-has already run. A release that loses a race with another approve or a reject leaves an
-`approval.release_attempted` row with no outcome row after it; the request's status says what won.
+**The audit log must accept a release before the operation runs.** Before it claims a request, the
+gate writes an `approval.release_attempted` row against the approver, naming the requester. If the
+audit log refuses that write, the approve returns **503**, nothing runs, and the request stays
+pending. `approval.approved` is written after the operation, with its result. If only that later
+audit write fails, the error is logged and the release still succeeds, because the operation has
+already run. At least a release that loses a race with another approve or a reject, or is
+cancelled before its claim lands, leaves an `approval.release_attempted` row with no outcome row
+after it; the request's status says what won.
+
+**A release records what happened to it (BACKLOG #1562).** The gate claims the request as
+`executing` before it runs the operation, so two approvers cannot both release it. It then settles
+the row to one of three outcomes, each with its own audit row after the `approval.release_attempted`
+row:
+
+| Status | Meaning | Audit row (against the approver) |
+|---|---|---|
+| `approved` | The operation ran and returned | `approval.approved` |
+| `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
+| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
+
+Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
+worse than a stuck row, so an operator has to check the operation's own effects. The engine has no
+route to settle an `interrupted` row yet. A process that dies mid-operation leaves its row at
+`executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
+share one store, and each would see the others' live releases as leftovers. If the operation ran but
+the move from `executing` to `approved` fails, the error is logged and the release still succeeds,
+because the operation has already run and an error would invite a new request that runs it twice.
+The row may stay at `executing`, and the gate still tries to write the `approval.approved` audit
+row.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
@@ -2445,7 +2468,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Account lockout | `[auth].lockout_threshold`, `lockout_minutes` | 5 / 15 min | — | **yes** | no | no | **store-backed** — the local password leg + the TOTP/recovery leg of any account with TOTP enrolled, directory ones included, and the step-up re-auth re-proof (AD re-binds included) + the password-change re-proof (local accounts only), counted by one atomic `increment_login_failure` per attempt (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — `auth.login_locked` on the password leg, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs, `auth.login_failed` with `reason=locked` on the Kerberos and OIDC sign-ins (which do not feed it), the re-proofs are not refused by it, and the failure that spends a session's cap revokes that session: `auth.reauth` (`session_revoked=true`) / `auth.password_change_failed` (`reason=session_revoked`) |
 | PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 7 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 5 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`; logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
 | Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds` | on / 12 / 1.0 s | 1.0 s | **yes** (12) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + `Retry-After: 1`, logged. `/ui`: 429 + `Retry-After: 10`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |
-| Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login | the user's oldest session is revoked |
+| Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login | the user's oldest live session is revoked; sessions past the idle or absolute limit do not count and are revoked |
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
 | Remote-file retrieve | `max_file_bytes` (the `File(...)` and `Sftp`/`Ftp` inbound connections) | 16 MiB | per file | no | no | no | **stateless** — a per-file test carrying no budget, applied in the connector | the file is quarantined to `error_subdir` and WARNING-logged; it never becomes a received message, so there is no store disposition. **Charged twice on a remote source, and the second charge is the one that binds** (BACKLOG #1191): once against the size the partner server reported in its own directory listing, then again against the **bytes actually read**, streaming in 1 MiB chunks so a share that lists a small file and delivers an arbitrarily large body is cut off mid-transfer. That second charge is the only bound that can see this surface at all — the connector consumes the body *before* an ingress row exists |

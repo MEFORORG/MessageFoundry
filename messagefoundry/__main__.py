@@ -47,6 +47,7 @@ from messagefoundry.logging_setup import (
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings
 
 
@@ -3714,10 +3715,22 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
     # DAST target each decide it their own way, which is the defect this item exists to remove.
-    from messagefoundry.api.tls import ensure_api_tls_material, generated_state_dir
+    from messagefoundry.api.tls import (
+        GeneratedPairReplaced,
+        ensure_api_tls_material,
+        generated_state_dir,
+    )
 
+    # A renewal or recovery of the generated pair is reported here and audited by the lifespan once
+    # the store is open, which is after this point (ADR 0172 decision 6: never silent).
+    _replaced: list[GeneratedPairReplaced] = []
     _material = ensure_api_tls_material(
-        settings.api, state_dir=generated_state_dir(settings.store.path)
+        settings.api,
+        state_dir=generated_state_dir(settings.store.path),
+        replacements=_replaced,
+        # An engine shard never renews: `supervise` renews before it spawns the whole fleet, so a
+        # lone restarted shard cannot leave its siblings serving a different certificate (#1276).
+        renew=args.shard is None,
     )
     # Minted HERE, before the app is built, so the expiry monitor below watches the certificate this
     # listener actually presents. [api].tls_cert_file is the PRE-mint config value and is empty
@@ -3781,6 +3794,7 @@ def _serve(args: argparse.Namespace) -> int:
         backup_settings=settings.backup,
         dr_settings=settings.dr,
         api_tls_cert_file=_served_api_cert,  # the SERVED cert, generated or operator (#1276)
+        api_tls_replacements=_replaced,  # audited once the store opens (ADR 0172 decision 6)
         # ASVS 6.4.5: operator-held copies of inbound service callers' client certs — watched by the same
         # [cert_monitor] scan, so a caller's cert cannot expire unnoticed while it has stopped connecting.
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
@@ -3897,6 +3911,64 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> None:
+    """Renew the shared generated API pair, if due, before any engine shard starts (#1276).
+
+    Every shard serves this one pair from the state dir beside its store, and a shard never renews
+    it (``serve --shard`` passes ``renew=False``), so this is the fleet's only renewal: all shards
+    then start together on the same certificate.
+
+    **The state dir is derived the way each shard derives it.** A shard anchors a relative
+    ``[store].path`` under the merged ``[environments].base_dir`` (``--project-root``, which the
+    supervisor forwards, or the settings file). ``db_base`` is anchored only by ``--project-root``
+    here, so a base_dir set in the file is applied too, or the two would name different pairs.
+
+    A re-mint is audited like serve's, in the store the shards are about to open, over the same
+    derived store-hop posture serve's lifespan opens it with. A failure to open propagates, as it
+    would in serve: the WARNING the renewal logged, with both fingerprints, is then its record.
+    """
+    from messagefoundry.api.tls import (
+        GeneratedPairReplaced,
+        ensure_api_tls_material,
+        generated_state_dir,
+        record_generated_pair_replacements,
+    )
+    from messagefoundry.config.anchor import resolve_project_root
+    from messagefoundry.config.settings import hop_posture_from_ai
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store import open_store
+
+    store_path = Path(db_base)
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=Path.cwd())
+    if root is not None and not store_path.is_absolute():
+        store_path = root / store_path
+
+    replaced: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(
+        settings.api, state_dir=generated_state_dir(str(store_path)), replacements=replaced
+    )
+    if not replaced:
+        return
+    posture = (
+        hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+        if settings.ai is not None
+        else None
+    )
+
+    async def _audit() -> None:
+        store = await open_store(
+            settings.store.model_copy(update={"path": str(store_path)}),
+            create=True,
+            posture=posture,
+        )
+        try:
+            await record_generated_pair_replacements(store, replaced)
+        finally:
+            await store.close()
+
+    run_guarded(_audit())
+
+
 def _supervise(args: argparse.Namespace) -> int:
     """L3 multi-process sharding (messagefoundry/pipeline/supervisor.py): discover the shard ids in the
     config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
@@ -3932,6 +4004,8 @@ def _supervise(args: argparse.Namespace) -> int:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
         return 2
+
+    _renew_api_tls_before_spawning(settings, db_base)
 
     return run_guarded(
         supervise(
@@ -5044,11 +5118,27 @@ class _KeylessProvisionRefused(RuntimeError):
 
 
 def _store_key_configured(settings: ServiceSettings) -> bool:
-    """Is a local store key configured? The at-rest gate's one test for "keyed" (a DPAPI key file counts;
-    ``open_store`` fails closed later if it is unreadable). It does not consult ``cipher_provider`` --
-    the documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` -- and keeping the test
-    here means that gap, when it is closed, is closed once for every command that applies the gate."""
-    return bool(settings.store.encryption_key or settings.store.encryption_key_file)
+    """Is a store key configured? The at-rest gate's one test for "keyed". A local key or a DPAPI key
+    file counts, and so does an external ``[store].key_provider`` such as ``vault`` (BACKLOG #1998).
+
+    The test reads what is CONFIGURED, not what resolves: the gate runs before ``open_store`` and must
+    not need the network. That is safe because a source that cannot resolve fails closed at
+    ``open_store`` -- an unreadable key file raises ``DpapiError``, and an external provider raises
+    ``KeyProviderError`` -- rather than opening under the identity cipher. (Under ``vault_transit`` the
+    store never resolves ``key_provider`` at all, and Transit encrypts.) The known exception is a
+    pinned built-in provider that ignores the configured source (``env`` with only a key file), which
+    ``provision-admin`` checks after opening (BACKLOG #1905). It does not consult
+    ``cipher_provider`` -- the documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` --
+    and keeping the test here means that gap, when it is closed, is closed once for every command that
+    applies the gate."""
+    from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS
+
+    store = settings.store
+    return bool(
+        store.encryption_key
+        or store.encryption_key_file
+        or store.key_provider in _EXTERNAL_PROVIDERS
+    )
 
 
 def _keyless_store_gate(settings: ServiceSettings, *, enforcing: bool) -> str | None:
@@ -5171,6 +5261,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # BACKLOG #2034: the [security].enforcement dial `serve` hands the lifespan as
+    # trust_anchors_enforcing, derived the same way. AuthService checks the OIDC and AD trust anchors
+    # when it is built, and it enforces when no dial is passed. Without this, a weak anchor that
+    # `serve` only warns about at `warn` would make this command refuse.
+    trust_anchors_enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+
     async def administrator_exists() -> bool:
         from messagefoundry.store.base import StoreNotFoundError
 
@@ -5184,16 +5280,20 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except StoreNotFoundError:
             return False
         try:
-            return await AuthService(store, settings.auth).has_enabled_administrator()
+            service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
+            return await service.has_enabled_administrator()
         finally:
             await store.close()
 
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.store.crypto import StoreKeylessError
 
     try:
         exists = run_guarded(administrator_exists())
     except StoreKeylessError as exc:
         return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
+    except TrustAnchorError as exc:
+        return _emit_trust_anchor_refusal(exc, as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if exists:
@@ -5239,7 +5339,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     "shell, so the store opened KEYLESS; refusing to provision. Make the key the "
                     "service runs with readable here and re-run."
                 )
-            outcome = await AuthService(store, settings.auth).provision_first_administrator(
+            service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
+            outcome = await service.provision_first_administrator(
                 username=args.username,
                 password=password,
                 display_name=args.display_name,
@@ -5262,6 +5363,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         outcome, store_path = run_guarded(run())
     except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
         return _emit_error(str(exc), as_json=args.json)
+    except TrustAnchorError as exc:
+        return _emit_trust_anchor_refusal(exc, as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
@@ -5288,11 +5391,19 @@ def _provision_admin(args: argparse.Namespace) -> int:
         f"Sign in as {outcome.username!r} once the engine is running; it creates no account itself."
     )
     if not (args.email and args.email.strip()):
+        # Not `!r` (BACKLOG #1985): cmd.exe does not read single quotes as quoting.
+        user_arg = _paste_safe_option("--username", outcome.username)
+        hint = (
+            ""
+            if user_arg
+            else " The username has a character a shell or console could change, so type it quoted "
+            "for the shell in use."
+        )
         _safe_print(
             "WARNING: no notification address. A PHI instance under [security].enforcement=enforce "
             "refuses to start unless some enabled Administrator carries one -- set it with "
-            f"`messagefoundry admin-set-notify-email --username {outcome.username!r} --email "
-            "<address>` before the first serve."
+            f"`messagefoundry admin-set-notify-email {user_arg or '--username <username>'} --email "
+            f"<address>` before the first serve.{hint}"
         )
     return 0
 
@@ -5335,7 +5446,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.permissions import Role
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import open_store
+    from messagefoundry.store.base import open_store, store_driver_errors
     from messagefoundry.store.crypto import StoreKeylessError
     from messagefoundry.store.store import require_notify_email
 
@@ -5359,9 +5470,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     # also finds it.
     wanted = args.username.strip()
     actor = f"cli:{getpass.getuser()}"
-    # Store failures a refused write can raise on SQLite. `RuntimeError` covers the audit chain's
-    # keyed-append refusal and the store's own acquire timeout.
-    store_errors = (RuntimeError, sqlite3.DatabaseError)
+    # Store failures a refused write can raise on every backend (BACKLOG #1983). `RuntimeError` covers
+    # the audit chain's keyed-append refusal and the store's own acquire timeout; `OSError` a server
+    # backend's lost connection; the rest are the drivers' own bases, which subclass neither.
+    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
 
     async def run() -> tuple[str, str, str]:
         """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
@@ -5397,8 +5509,11 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 return ("audit-refused", user.username, str(exc))
             try:
                 await store.set_user_notify_email(user.id, email=address)
-            except store_errors as exc:
+            except BaseException as exc:
                 # The row above now records a change that did not happen, so say so in the log too.
+                # Whatever the failure was (BACKLOG #1983), Ctrl-C included: the compensating row
+                # must not depend on this command recognising the error, since a missed class
+                # leaves a false log.
                 try:
                     await store.record_audit(
                         "auth.admin_notify_email_set_failed", actor=actor, detail=detail
@@ -5406,6 +5521,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                     logged = "a matching _failed audit row was appended"
                 except store_errors as follow:
                     logged = f"appending the matching _failed audit row also failed ({follow})"
+                if not isinstance(exc, store_errors):
+                    raise  # not a store refusal but a defect: the dispatch floor reports it
                 return ("write-failed", user.username, f"{exc}; {logged}")
             return ("set", user.username, store.path)
         finally:
@@ -6914,6 +7031,35 @@ def _safe_print(line: str) -> None:
     sys.stdout.write(line.encode(enc, "replace").decode(enc) + "\n")
 
 
+#: ASCII characters that mean something inside double quotes to cmd.exe, PowerShell or a POSIX
+#: shell: ``%`` (cmd), ``$`` and backtick (PowerShell, POSIX), ``!`` (history, delayed expansion),
+#: and the double quote itself.
+_SHELL_SPECIAL_IN_QUOTES = frozenset('"$`%!')
+
+
+def _paste_safe_option(option: str, value: str) -> str | None:
+    """``option="value"`` if that one spelling passes ``value`` unchanged in cmd.exe, PowerShell
+    and a POSIX shell, else ``None`` (BACKLOG #1985).
+
+    Double quotes are the only quoting all three read. ``=`` keeps a value that starts with ``-``
+    from being read as a flag. A backslash is literal in all three unless it doubles or ends the
+    value, where POSIX halves a pair and Windows reads ``\\"`` as an escaped quote. A leading ``/``
+    is refused because Git Bash rewrites ``--opt=/x`` into a Windows path. Non-ASCII is refused
+    too: :func:`_safe_print` turns a character the console cannot encode into ``?``, and
+    PowerShell reads typographic quotes as quotes.
+    """
+    unsafe = (
+        any(
+            ch in _SHELL_SPECIAL_IN_QUOTES or not (ch.isascii() and ch.isprintable())
+            for ch in value
+        )
+        or "\\\\" in value
+        or value.endswith("\\")
+        or value.startswith("/")
+    )
+    return None if unsafe else f'{option}="{value}"'
+
+
 def _print_json(data: object, *, compact: bool) -> None:
     print(json.dumps(data) if compact else json.dumps(data, indent=2))
 
@@ -6937,6 +7083,20 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
     else:
         print(f"error: {message}", file=sys.stderr)
     return 2
+
+
+def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
+    """Report a trust anchor ``provision-admin`` refused, and return exit 1 (BACKLOG #2034).
+
+    ``AuthService`` checks the OIDC and AD anchors when it is built, so a command that builds one
+    refuses an anchor ``serve`` would refuse. The anchor's own text is kept whole: its later lines are
+    the commands that fix the file. Without this arm ``main``'s dispatch floor would report only the
+    exception type and a redacted message (BACKLOG #1863)."""
+    return _emit_error(
+        f"{exc}\nThis command applies the trust-anchor check `serve` applies, so it provisioned "
+        "nothing. Fix the anchor and re-run.",
+        as_json=as_json,
+    )
 
 
 class _OperatorJsonError(Exception):

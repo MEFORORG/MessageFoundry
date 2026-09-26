@@ -117,6 +117,16 @@ class IngressGuardError(Exception):
     :func:`admit_resubmitted_body` adds three more, ``"type"`` for the declared-type sniff,
     ``"parse"`` for ``Peek.parse`` and ``"strict"`` for strict ``hl7apy`` validation; the dry-run entry
     points never raise any of them.
+
+    **Never raised with a body-holding error on its chain (BACKLOG #1796).** The caught error can hold
+    the body: a ``UnicodeEncodeError``'s or ``UnicodeDecodeError``'s ``.object`` is the WHOLE text or
+    byte string, and an ``HL7PeekError`` from python-hl7 quotes what it failed on. ``from exc`` puts
+    that on ``__cause__``. ``from None`` only hides it from the default traceback printer and leaves it
+    on ``__context__``, where a structured-logging serializer or a crash reporter still reads it. So
+    each handler here that catches such an error keeps only the content-free reason in a local and
+    raises after the handler has ended, which leaves both empty. ``reason`` is the same text either
+    way. The one ``from None`` left, :func:`admit_resubmission`'s strict timeout, catches a
+    ``TimeoutError`` that holds nothing.
     """
 
     def __init__(self, reason: str, *, phase: str) -> None:
@@ -185,18 +195,16 @@ def _encode_declared(raw: str, ic: InboundConnection) -> bytes:
 
     A text a charset cannot hold is one the listener could never have decoded from a sender's bytes.
     The reason names a position and never the character: ``str(UnicodeEncodeError)`` quotes the
-    offending character, which is a byte of the body."""
+    offending character, which is a byte of the body. The refusal is raised after the handler ends,
+    because the caught error's ``.object`` is the whole body (see :class:`IngressGuardError`)."""
     encoding = ingress_encoding(ic)
     try:
         return raw.encode(encoding)
     except UnicodeEncodeError as exc:
-        raise IngressGuardError(
-            f"encode error ({encoding}): {exc.reason} at position {exc.start}", phase="decode"
-        ) from exc
+        reason = f"encode error ({encoding}): {exc.reason} at position {exc.start}"
     except LookupError as exc:
-        raise IngressGuardError(
-            f"encode error ({encoding}): {safe_exc(exc)}", phase="decode"
-        ) from exc
+        reason = f"encode error ({encoding}): {safe_exc(exc)}"
+    raise IngressGuardError(reason, phase="decode")
 
 
 #: Codecs in which every ASCII character encodes, so an ASCII-only text needs no trial encode.
@@ -268,15 +276,16 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
         )
     hl7v2 = ic.content_type is ContentType.HL7V2
     encoding = ingress_encoding(ic)
+    refused: str | None = None
     try:
         if hl7v2:
             text = normalize(raw, encoding=encoding, errors="strict")
         else:
             text = raw.decode(encoding) if isinstance(raw, bytes) else raw
     except (UnicodeDecodeError, LookupError) as exc:
-        raise IngressGuardError(
-            f"decode error ({encoding}): {safe_exc(exc)}", phase="decode"
-        ) from exc
+        refused = f"decode error ({encoding}): {safe_exc(exc)}"
+    if refused is not None:
+        raise IngressGuardError(refused, phase="decode")
     if "\x00" in text:
         raise IngressGuardError(NUL_REJECTED_REASON, phase="decode")
     if not hl7v2:
@@ -325,14 +334,16 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             raise IngressGuardError(NUL_REJECTED_REASON, phase="decode")
         _raise_if_oversize(len(raw))
         return raw
+    # The reason a caught error refused the body, raised once its handler has ended.
+    refused: str | None = None
     if ic.content_type.is_binary:
         if is_marked(raw):
             try:
                 data = decode_carriage(raw)
             except BinaryCarriageError as exc:
-                raise IngressGuardError(
-                    f"binary carriage error: {safe_exc(exc)}", phase="decode"
-                ) from exc
+                refused = f"binary carriage error: {safe_exc(exc)}"
+            if refused is not None:
+                raise IngressGuardError(refused, phase="decode")
         else:
             data = _encode_declared(raw, ic)
         # Measured on the raw bytes, before base64 inflation, as the listener measures a binary body.
@@ -356,11 +367,15 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
         try:
             enforce_size_limits(text, max_bytes=ceiling)
         except HL7PeekError as exc:
-            raise IngressGuardError(str(exc), phase="size") from exc
+            refused = str(exc)
+        if refused is not None:
+            raise IngressGuardError(refused, phase="size")
         try:
             Peek.parse(text, max_bytes=ceiling)
         except HL7PeekError as exc:
-            raise IngressGuardError(f"parse error: {safe_exc(exc)}", phase="parse") from exc
+            refused = f"parse error: {safe_exc(exc)}"
+        if refused is not None:
+            raise IngressGuardError(refused, phase="parse")
     else:
         _raise_if_mistyped(ic, text_sniff_head(text))
     return text

@@ -11,16 +11,17 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
 import ssl
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
 from messagefoundry.auth.trust_anchors import api_client_anchor_spec, verified_anchor_cadata
@@ -33,15 +34,22 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
 )
 
+if TYPE_CHECKING:
+    from messagefoundry.pki import SelfSignedFacts
+    from messagefoundry.store.base import Store
+
 __all__ = [
+    "GENERATED_PAIR_REPLACED",
     "ApiTlsPlan",
     "ApiTlsSource",
+    "GeneratedPairReplaced",
     "api_tls_source",
     "build_api_ssl_context",
     "ensure_api_tls_material",
     "generated_state_dir",
     "plan_api_tls_material",
     "plaintext_upstream_hop_unacknowledged",
+    "record_generated_pair_replacements",
 ]
 
 log = logging.getLogger(__name__)
@@ -115,6 +123,77 @@ _GENERATED_LOCK_NAME = "api-generated.lock"
 #: P-256 key and two small writes, so this is far past any real mint; it bounds only a hung holder.
 _MINT_LOCK_TIMEOUT_S = 60.0
 _MINT_LOCK_POLL_S = 0.05
+#: The generated pair's lifetime, inheriting the ``cert self-signed`` CLI default rather than
+#: inventing a second lifetime for the same primitive.
+_GENERATED_LIFETIME_DAYS = 365
+#: Renew the generated pair at startup once less than this share of its OWN validity period is
+#: left: about 122 of 365 days (ADR 0172, 2026-09-26 amendment). Early rather than at expiry, so a
+#: renewal lands at an ordinary restart months before any client could see an expired certificate.
+#: The expiry monitor stays the backstop for an engine that is never restarted.
+_RENEW_REMAINING_FRACTION = 1 / 3
+#: Suffix of the new pair while it is staged beside the live one, before the two replaces.
+_STAGED_SUFFIX = ".renewing"
+
+#: The audit action for every replacement of a generated pair that already existed: an early
+#: renewal, and the recovery of an unusable or half-written pair (ADR 0172 decision 6).
+GENERATED_PAIR_REPLACED = "api.tls_generated_pair_replaced"
+
+
+@dataclass(frozen=True)
+class GeneratedPairReplaced:
+    """One replacement of the generated pair, for the audit record ``serve`` writes once the store
+    is open. :func:`ensure_api_tls_material` runs before the store exists, so it reports the event
+    rather than recording it.
+
+    Public facts only: SHA-256 fingerprints and expiry dates of certificates every client receives
+    in the handshake. Never key material. ``old_*`` is ``None`` when the old certificate could not be
+    parsed, or was the missing half of a half-written pair.
+    """
+
+    #: ``renewal``: a loadable pair near or past its expiry. ``unusable``: a pair that would not
+    #: load as one. ``half_pair``: one file of the two, left by an interrupted mint or renewal.
+    reason: Literal["renewal", "unusable", "half_pair"]
+    cert_file: str
+    old_sha256: str | None
+    old_not_after: str | None
+    new_sha256: str
+    new_not_after: str
+
+    def audit_detail(self) -> str:
+        return json.dumps(
+            {
+                "reason": self.reason,
+                "cert_file": self.cert_file,
+                "old_sha256": self.old_sha256,
+                "old_not_after": self.old_not_after,
+                "new_sha256": self.new_sha256,
+                "new_not_after": self.new_not_after,
+            },
+            sort_keys=True,
+        )
+
+
+async def record_generated_pair_replacements(
+    store: Store, events: Sequence[GeneratedPairReplaced]
+) -> None:
+    """Write one hash-chained ``api.tls_generated_pair_replaced`` audit row per event.
+
+    Called from the serve lifespan as soon as the store is open, before any listener binds.
+    **A failed write does not stop the engine**, because it cannot undo anything: the pair on disk
+    is already the new one, and the next start finds it fresh and reports nothing. So the failure is
+    logged at ERROR with the whole record, which keeps the replacement from being silent.
+    """
+    for event in events:
+        try:
+            await store.record_audit(
+                GENERATED_PAIR_REPLACED, actor=None, detail=event.audit_detail()
+            )
+        except Exception:  # any backend's write failure; logged in full below, never swallowed
+            log.exception(
+                "could not write the %s audit row; the record is: %s",
+                GENERATED_PAIR_REPLACED,
+                event.audit_detail(),
+            )
 
 
 def _generated_pair(state_dir: Path) -> tuple[Path, Path]:
@@ -243,27 +322,49 @@ def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
 
 #: Windows ERROR_SHARING_VIOLATION: another process holds the file open without delete sharing.
 _WINERROR_SHARING_VIOLATION = 32
+#: Windows ERROR_ACCESS_DENIED: what a REPLACE onto a file held open elsewhere returns, measured on
+#: Windows 11 with a reader holding the destination (a delete returns the sharing violation).
+_WINERROR_ACCESS_DENIED = 5
 _UNLINK_RETRY_S = 2.0
 
 
-def _unlink_generated(path: Path) -> None:
-    """Delete one generated file, riding out a brief Windows sharing violation.
+def _ride_out_a_held_file(action: Callable[[], None], held: frozenset[int]) -> None:
+    """Run ``action``, retrying for :data:`_UNLINK_RETRY_S` while Windows refuses it with one of the
+    ``held`` codes.
 
-    On Windows a file another process holds open cannot be deleted, and a certificate is exactly the
-    file other processes open: the tray pins it, and backup or antivirus may scan it. That hold is
-    momentary, so a refusal is retried for :data:`_UNLINK_RETRY_S` before it propagates. Any other
-    error, and every error off Windows, propagates at once.
+    On Windows a file another process holds open cannot be deleted or replaced, and a certificate is
+    exactly the file other processes open: the tray pins it, and backup or antivirus may scan it.
+    That hold is momentary, so the refusal is retried before it propagates. Any other error, and
+    every error off Windows, propagates at once.
     """
     deadline = time.monotonic() + _UNLINK_RETRY_S
     while True:
         try:
-            path.unlink()
+            action()
             return
         except PermissionError as exc:
-            shared = getattr(exc, "winerror", None) == _WINERROR_SHARING_VIOLATION
-            if not shared or time.monotonic() >= deadline:
+            if getattr(exc, "winerror", None) not in held or time.monotonic() >= deadline:
                 raise
         time.sleep(_MINT_LOCK_POLL_S)
+
+
+def _unlink_generated(path: Path) -> None:
+    """Delete one generated file, riding out a brief Windows sharing violation."""
+    _ride_out_a_held_file(path.unlink, frozenset({_WINERROR_SHARING_VIOLATION}))
+
+
+def _replace_generated(staged: Path, live: Path) -> None:
+    """Move a staged file over its live name, riding out a brief Windows hold on the live file.
+
+    ``os.replace`` is atomic on one volume, and the staged file sits in the same directory, so a
+    reader sees the old file or the new one, never a partial one. On NTFS the rename keeps the staged
+    file's own access list, which is why the key's DACL and the cert's local-users grant are applied
+    BEFORE the replace rather than after it.
+    """
+    _ride_out_a_held_file(
+        lambda: os.replace(staged, live),
+        frozenset({_WINERROR_SHARING_VIOLATION, _WINERROR_ACCESS_DENIED}),
+    )
 
 
 def _why_generated_pair_is_unusable(cert_path: Path, key_path: Path) -> str | None:
@@ -292,10 +393,11 @@ def _discard_unusable_pair(cert_path: Path, key_path: Path, reason: str) -> None
     """Remove a complete but unusable generated pair, so the mint that follows can replace it.
 
     Reached only under :func:`_generated_pair_lock`, with both files present and
-    :func:`_why_generated_pair_is_unusable` naming a content refusal. **This is not a rotation.** A
-    pair that loads is never replaced; this one cannot serve, and reusing it failed every start
-    until someone deleted it by hand. The mismatched shape is exactly what two processes minting
-    into one state dir used to leave (BACKLOG #1276), and a disk fault can leave the others.
+    :func:`_why_generated_pair_is_unusable` naming a content refusal. **This is not a renewal.** A
+    pair that loads is never discarded here (renewal is :func:`_renew_generated_pair`); this one
+    cannot serve, and reusing it failed every start until someone deleted it by hand. The mismatched
+    shape is exactly what two processes minting into one state dir used to leave (BACKLOG #1276), a
+    renewal interrupted between its two replaces leaves it too, and a disk fault can leave the others.
 
     Logged at WARNING, per ADR 0172 decision 6: replacing a key on disk is never silent. The reason
     is the TLS layer's error text, which names the refusal and carries no key material.
@@ -359,7 +461,7 @@ def _unlock(fd: int) -> None:
 def _generated_pair_lock(state_dir: Path) -> Iterator[None]:
     """Hold the ONE-WRITER lock for the generated pair in ``state_dir``, waiting a bounded time.
 
-    **Why the pair needs one.** ``serve --shards`` starts N engine processes that all derive the
+    **Why the pair needs one.** ``supervise`` starts N engine processes that all derive the
     same state dir, so on a first run they all find no pair at once. Unserialised, one process won
     the key's ``O_EXCL`` create and every other died with ``FileExistsError``; worse, a process
     arriving between another's key and cert writes read a lone key as debris, deleted it, and minted
@@ -420,7 +522,13 @@ def _let_local_users_read_cert(cert_path: Path) -> None:
     _grant_read(cert_path, _LOCAL_USERS_SID)
 
 
-def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, str | None] | None:
+def ensure_api_tls_material(
+    api: ApiSettings,
+    *,
+    state_dir: Path,
+    replacements: list[GeneratedPairReplaced] | None = None,
+    renew: bool = True,
+) -> tuple[str, str | None] | None:
     """Return the ``(cert_path, key_path)`` the API should serve with, minting on first run.
 
     **``key_path`` is ``None`` when the operator embedded the key in the cert PEM.** That is a
@@ -440,22 +548,43 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     applies is :func:`plan_api_tls_material`'s decision, not this function's -- this one adds only
     the minting, so a read-only caller can ask the same question without writing a key.
 
-    **Mint-once, then reuse.** The pair is written with :func:`_write_private_key`'s ``O_EXCL`` +
-    ``0o600`` + Windows-DACL sequence, which REFUSES to overwrite. So a second start finds the
-    files and loads them; it does not re-mint, and it cannot clobber a key. The certificate, and
-    only the certificate, is then made readable by local users so the tray can pin it
-    (:func:`_let_local_users_read_cert`).
+    **Mint once, reuse while fresh, renew early (ADR 0172, 2026-09-26 amendment).** The pair is
+    written with :func:`_write_private_key`'s ``O_EXCL`` + ``0o600`` + Windows-DACL sequence, which
+    REFUSES to overwrite, so a start that finds a fresh pair loads it and writes nothing. A pair
+    with less than a third of its lifetime left, or past it, is RENEWED at startup -- see
+    :func:`_renew_generated_pair` -- but only when it is still the engine's own shape (self-signed,
+    ``CA=false``). Anything else at the generated path is served as found and never replaced.
+    Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because ``serve``
+    hands it the path this function RETURNS, and it stays the alarm for an engine never restarted.
 
-    **ONE WRITER (BACKLOG #1276).** Every ``serve --shards`` shard shares this state dir, so any
-    discard and the mint run under :func:`_generated_pair_lock`, after the reuse check is repeated
-    there. A process that loses the race waits, then reuses the winner's pair; it neither crashes
-    nor deletes a key another process is still writing. A pair that already loads is reused before
-    the lock is taken (:func:`_loads_without_the_lock`).
+    **``renew=False`` is for an engine shard (``serve --shard``).** Every process that serves the
+    pair must start together when it is renewed, or a lone restarted shard would serve a new
+    certificate while its siblings keep the old one in memory. So ``supervise`` renews before it
+    spawns any shard, and a shard only reuses a pair that loads, due or not. It still mints on a
+    first run and still recovers a pair that does not load, because it has nothing else to serve.
+    **A file or lock failure never costs a start the old pair can still serve**: any ``OSError`` on
+    the locked path -- including a lock it could not take -- falls back to that pair with a WARNING,
+    and only a pair that does not load or has expired lets the error propagate. Other errors, such
+    as a ``[api].host`` the certificate builder refuses, still stop the start.
+
+    **EVERY REPLACEMENT IS REPORTED, never silent (ADR 0172 decision 6).** A renewal, and the
+    recovery of an unusable or half-written pair, each append one :class:`GeneratedPairReplaced` to
+    ``replacements`` and log a WARNING. ``serve`` passes a list and writes one audit row per entry
+    once its store is open (:func:`record_generated_pair_replacements`). A first-run mint, which
+    replaces nothing, reports nothing. **The row needs that start to reach its store**: a start that
+    fails in between leaves the WARNING line as the only record, because the next start finds a
+    fresh pair and has nothing to report.
+
+    **ONE WRITER (BACKLOG #1276).** Every ``supervise`` shard shares this state dir, so any
+    discard, mint and renewal runs under :func:`_generated_pair_lock`, after the reuse check is
+    repeated there. A process that loses the race waits, then reuses the winner's pair; it neither
+    crashes, nor deletes a key another process is still writing, nor renews a second time. A fresh
+    pair that loads is reused before the lock is taken (:func:`_reusable_without_the_lock`).
 
     **REUSE MEANS THE PAIR LOADS, not that two files exist.** A pair that fails
     :func:`_why_generated_pair_is_unusable` (a cert that is not the key's, a truncated file) is
-    discarded with a WARNING and re-minted -- see :func:`_discard_unusable_pair`. A pair that loads
-    is never replaced here, so this is recovery, not rotation.
+    discarded with a WARNING and re-minted -- see :func:`_discard_unusable_pair`. That is also how a
+    renewal interrupted between its two replaces recovers: a new cert beside an old key does not load.
 
     **A HALF-PAIR IS THE OTHER EXCEPTION, and it re-mints rather than refusing** -- see
     :func:`_discard_half_minted_pair`. Reuse needs BOTH files, so one alone is unusable AND a trap:
@@ -464,17 +593,8 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     **The generated certificate is a PLACEHOLDER TO BE REPLACED, not an endorsed production
     terminator.** It is self-signed, so it carries no chain of trust: strictly better than
     cleartext, strictly worse than an operator-supplied chain. A browser reaching the console gets
-    a trust interstitial until it is imported (``docs/TRAY.md`` documents that import).
-
-    **NOT HANDLED HERE, and it is filed rather than forgotten:** nothing re-mints an EXPIRED
-    generated pair. ``build_api_ssl_context`` performs no expiry check, so on day 366 the engine
-    would serve an expired certificate every client rejects. The rotation shape is an open decision
-    on #1276; until it lands, ``CertExpiryRunner`` alarms on this path like any other served cert.
-    That holds because ``serve`` hands the monitor the path this function RETURNS, not
-    ``[api].tls_cert_file``, which is empty exactly when a pair was minted -- so passing the config
-    value left the generated certificate unwatched. ``tests/test_api_tls.py`` pins the wiring. The
-    alarm fires from ``[cert_monitor].warn_days`` out (0 turns the monitor off), and it re-mints
-    nothing: the reuse branch below returns an expired pair unchanged on every later start.
+    a trust interstitial until it is imported (``docs/TRAY.md`` documents that import), and that
+    import must be repeated after a renewal, because the renewed certificate is a new one.
     """
     # The branch order lives in plan_api_tls_material, so the read-only reporter and the minting
     # path cannot disagree about which certificate the bind presents. Two of the three branches
@@ -482,56 +602,243 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     # included -- see the key_path note above), and a DECLARED UPSTREAM TERMINATOR IS NOT AN
     # UNPROTECTED HOP, so minting there would break the proxy's own plaintext hop rather than
     # harden anything. "Always serves TLS" means the engine never leaves a hop unprotected, NOT
-    # that it terminates TLS in every topology.
+    # that it terminates TLS in every topology. Neither branch is ever renewed.
     plan = plan_api_tls_material(api, state_dir=state_dir)
     if plan.source != "generated":
         return plan.material()
 
     cert_path, key_path = _generated_pair(state_dir)
-    if _loads_without_the_lock(cert_path, key_path):
+    if _reusable_without_the_lock(cert_path, key_path, renew=renew):
         return str(cert_path), str(key_path)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    with _generated_pair_lock(state_dir):
-        # Re-decided UNDER the lock: a process that waited here finds the pair the holder just
-        # minted, and reuses it. Only here may a failed check lead to a discard.
-        if cert_path.exists() and key_path.exists():
-            reason = _why_generated_pair_is_unusable(cert_path, key_path)
-            if reason is None:
-                return str(cert_path), str(key_path)
-            _discard_unusable_pair(cert_path, key_path, reason)
-        else:
-            _discard_half_minted_pair(cert_path, key_path)
-        _mint_generated_pair(api, cert_path, key_path)
+    events = replacements if replacements is not None else []
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with _generated_pair_lock(state_dir):
+            _settle_under_the_lock(api, cert_path, key_path, events, renew=renew)
+    except OSError as exc:
+        # A RENEWAL IS EARLY, SO ITS FAILURE MUST NOT STOP A START THE OLD PAIR CAN SERVE. That
+        # covers a failed stage or first replace, a state dir the engine may read but not write,
+        # and a lock held past its timeout. A pair that does not load, or has expired, has
+        # nothing to fall back on, so then the error propagates.
+        if not _still_serves(cert_path, key_path):
+            raise
+        current = _cert_facts(cert_path)
+        log.warning(
+            "could not check or renew the generated TLS pair at %s (%s); serving the current "
+            "certificate, which expires %s, and the next start tries again.",
+            cert_path,
+            exc,
+            "at an unknown date" if current is None else current.not_after_iso,
+        )
     return str(cert_path), str(key_path)
 
 
-def _loads_without_the_lock(cert_path: Path, key_path: Path) -> bool:
-    """True when the pair already loads, read WITHOUT the lock. Every other answer is ``False``.
+def _settle_under_the_lock(
+    api: ApiSettings,
+    cert_path: Path,
+    key_path: Path,
+    events: list[GeneratedPairReplaced],
+    *,
+    renew: bool,
+) -> None:
+    """Reuse, renew, recover or mint the generated pair. Call only under the lock.
 
-    Safe because a pair that loads is never replaced, so seeing one is final. A read that races a
-    mint in progress sees a partial or vanishing file and answers ``False``, and the caller then
-    decides again under the lock. So nothing here raises and nothing here deletes. The point of
-    reading first is that the common start -- a pair minted long ago -- needs no write access to the
-    state dir and no OS lock support, which is what it needed before the lock existed.
+    Re-decided here: a process that waited for the lock finds the pair the holder just minted or
+    renewed, and reuses it. Only here may a failed check lead to a discard.
+    """
+    _discard_staged_leftovers(cert_path, key_path)
+    if cert_path.exists() and key_path.exists():
+        reason = _why_generated_pair_is_unusable(cert_path, key_path)
+        if reason is None:
+            due = _renewal_due(cert_path) if renew else None
+            if due is not None:
+                _renew_generated_pair(api, cert_path, key_path, due, events)
+            return
+        old = _cert_facts(cert_path)
+        _discard_unusable_pair(cert_path, key_path, reason)
+        recovered: Literal["unusable", "half_pair"] | None = "unusable"
+    else:
+        old = _cert_facts(cert_path) if cert_path.exists() else None
+        recovered = "half_pair" if cert_path.exists() or key_path.exists() else None
+        _discard_half_minted_pair(cert_path, key_path)
+    new = _mint_generated_pair(api, cert_path, key_path)
+    if recovered is not None:
+        events.append(_replaced(recovered, cert_path, old, new))
+
+
+def _still_serves(cert_path: Path, key_path: Path) -> bool:
+    """True when the pair on disk loads as one and has not expired. Never raises."""
+    try:
+        if _why_generated_pair_is_unusable(cert_path, key_path) is not None:
+            return False
+    except OSError:
+        return False
+    facts = _cert_facts(cert_path)
+    return facts is None or facts.not_after > time.time()
+
+
+def _reusable_without_the_lock(cert_path: Path, key_path: Path, *, renew: bool) -> bool:
+    """True when the pair loads and, if ``renew``, is not due for renewal, read WITHOUT the lock.
+
+    Every other answer is ``False``, and the caller then decides again under the lock. A read that
+    races a mint or renewal in progress sees a partial, vanishing or mismatched file and answers
+    ``False``, so nothing here raises and nothing here deletes. The point of reading first is that
+    the common start -- a fresh pair minted long ago -- needs no write access to the state dir and no
+    OS lock support, which is what it needed before the lock existed.
+
+    A certificate at the generated path that is NOT the engine's shape is never due, so a pair
+    holding one is reused here as found, with the WARNING :func:`_renewal_due` logs when it is
+    near or past expiry. Nothing is ever written for it, so it needs no lock.
     """
     try:
         return (
             cert_path.exists()
             and key_path.exists()
             and _why_generated_pair_is_unusable(cert_path, key_path) is None
+            and (not renew or _renewal_due(cert_path) is None)
         )
     except OSError:
         return False
 
 
-def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> None:
-    """Mint the pair into two ABSENT paths. Call only under :func:`_generated_pair_lock`."""
+def _cert_facts(cert_path: Path) -> SelfSignedFacts | None:
+    """The certificate's public facts, or ``None`` when it cannot be read or parsed."""
+    from messagefoundry import pki
+
+    try:
+        return pki.read_self_signed_facts(cert_path.read_bytes())
+    except (OSError, ValueError):
+        return None
+
+
+def _renewal_due(cert_path: Path) -> SelfSignedFacts | None:
+    """The old certificate's facts when the generated pair should be renewed now, else ``None``.
+
+    Due means expired, or less than :data:`_RENEW_REMAINING_FRACTION` of the certificate's own
+    validity period left. **Only the engine's own shape is ever due**: a certificate at the
+    generated path that is not self-signed with ``CA=false`` was put there by someone else, so it is
+    served as found. That case is logged at WARNING, because a certificate left to expire beside
+    the store deserves a reason in the log. ``None`` too when the certificate cannot be
+    parsed, since nothing here may replace what it cannot identify.
+    """
+    facts = _cert_facts(cert_path)
+    if facts is None:
+        return None
+    lifetime = facts.not_after - facts.not_before
+    if facts.not_after - time.time() >= lifetime * _RENEW_REMAINING_FRACTION:
+        return None
+    if not facts.engine_shaped:
+        log.warning(
+            "not renewing %s: it expires %s, but it is not a self-signed certificate the engine "
+            "generated, so the engine leaves it alone. Replace it yourself, or set "
+            "[api].tls_cert_file.",
+            cert_path,
+            facts.not_after_iso,
+        )
+        return None
+    return facts
+
+
+def _staged_pair(cert_path: Path, key_path: Path) -> tuple[Path, Path]:
+    """Where a renewal writes the new pair before moving it over the live one."""
+    return (
+        cert_path.with_name(cert_path.name + _STAGED_SUFFIX),
+        key_path.with_name(key_path.name + _STAGED_SUFFIX),
+    )
+
+
+def _discard_staged_leftovers(cert_path: Path, key_path: Path) -> None:
+    """Remove a staged pair left by a renewal that died before its replaces. Only under the lock.
+
+    Under the lock no renewal is running, so a staged file is debris. The staged key must go before
+    the next renewal, whose ``O_EXCL`` write would otherwise refuse it on every later start.
+    """
+    for leftover in _staged_pair(cert_path, key_path):
+        if leftover.exists():
+            log.warning("discarding %s, left by an interrupted certificate renewal", leftover)
+            _unlink_generated(leftover)
+
+
+def _renew_generated_pair(
+    api: ApiSettings,
+    cert_path: Path,
+    key_path: Path,
+    old: SelfSignedFacts,
+    events: list[GeneratedPairReplaced],
+) -> None:
+    """Replace a loadable generated pair that is due, with a new key and certificate. Lock held.
+
+    **Staged, then replaced, certificate first.** The new key is written under a temporary name with
+    :func:`_write_private_key` (``O_EXCL``, ``0o600``, Windows DACL) and the new certificate beside it,
+    with the local-users read grant the tray needs. Only then are they moved over the live names.
+    The certificate goes first because it is the file other processes hold open, so it is the replace
+    most likely to be refused, and a refusal there has changed nothing.
+
+    **A renewal that fails before the first replace has changed nothing.** The staged files are
+    removed and the error propagates; :func:`ensure_api_tls_material` then keeps the old pair if it
+    still serves, and the next start tries again. A failure BETWEEN the two replaces leaves a new
+    certificate beside the old key, which does not load, so that start fails; the next one discards
+    and re-mints it as an unusable pair, and reports that too.
+    """
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
 
-    # 365 days, inheriting the `cert self-signed` CLI default rather than inventing a second
-    # lifetime for the same primitive.
-    cert_pem, key_pem = pki.make_self_signed(api.host, [], 365)
+    staged_cert, staged_key = _staged_pair(cert_path, key_path)
+    cert_pem, key_pem = pki.make_self_signed(api.host, [], _GENERATED_LIFETIME_DAYS)
+    new = pki.read_self_signed_facts(cert_pem)
+    try:
+        _write_private_key(staged_key, key_pem)
+        staged_cert.write_bytes(cert_pem)
+        _let_local_users_read_cert(staged_cert)
+        _replace_generated(staged_cert, cert_path)
+    except OSError:
+        for leftover in (staged_cert, staged_key):
+            try:
+                if leftover.exists():
+                    _unlink_generated(leftover)
+            except OSError as cleanup:
+                # Never mask the renewal's own error. The next start's locked pass discards it.
+                log.warning("could not remove %s after a failed renewal: %s", leftover, cleanup)
+        raise
+    _replace_generated(staged_key, key_path)
+    event = _replaced("renewal", cert_path, old, new)
+    events.append(event)
+    log.warning(
+        "renewed the generated self-signed TLS certificate at %s: the old one (sha256 %s) expires "
+        "%s, the new one (sha256 %s) expires %s. Any browser trust store or --cacert copy that "
+        "holds the old certificate must import the new one.",
+        cert_path,
+        event.old_sha256,
+        event.old_not_after,
+        event.new_sha256,
+        event.new_not_after,
+    )
+
+
+def _replaced(
+    reason: Literal["renewal", "unusable", "half_pair"],
+    cert_path: Path,
+    old: SelfSignedFacts | None,
+    new: SelfSignedFacts,
+) -> GeneratedPairReplaced:
+    return GeneratedPairReplaced(
+        reason=reason,
+        cert_file=str(cert_path),
+        old_sha256=None if old is None else old.sha256,
+        old_not_after=None if old is None else old.not_after_iso,
+        new_sha256=new.sha256,
+        new_not_after=new.not_after_iso,
+    )
+
+
+def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> SelfSignedFacts:
+    """Mint the pair into two ABSENT paths. Call only under :func:`_generated_pair_lock`.
+
+    Returns the new certificate's public facts, for the report of a recovery."""
+    from messagefoundry import pki
+    from messagefoundry.__main__ import _write_private_key
+
+    cert_pem, key_pem = pki.make_self_signed(api.host, [], _GENERATED_LIFETIME_DAYS)
     _write_private_key(key_path, key_pem)
     paired = False
     try:
@@ -553,3 +860,4 @@ def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> N
         api.host,
         cert_path,
     )
+    return pki.read_self_signed_facts(cert_pem)

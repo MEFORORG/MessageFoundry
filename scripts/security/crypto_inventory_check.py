@@ -401,8 +401,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # snapshot's cipher-covered cells through the store's own cipher, under the same cell-bound AAD the
     # store writes (cell_aad, ASVS 11.3.3), to prove the PHI is readable and not merely that a SQLite
     # file opened. No primitive is implemented here — the cipher is built by build_store_cipher and the
-    # AEAD runs inside it; this module holds only the marker prefix, the AAD constructor and the
-    # fail-closed CipherError/StoreKeylessError verdicts.
+    # AEAD runs inside it; this module holds only the marker prefix and the fail-closed
+    # CipherError/StoreKeylessError verdicts. The AAD comes from store/cipher_cells.py (BACKLOG #1719).
     "messagefoundry/pipeline/dr_backup.py": frozenset(
         {"hashlib", "messagefoundry.store.backup_codec", "messagefoundry.store.crypto"}
     ),
@@ -423,6 +423,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # as per-frame AAD + the one-way key_id fingerprint. Net-new crypto surface; the store DEK key source
     # is reused, the cipher mechanism is new.
     "messagefoundry/store/backup_codec.py": frozenset({"hashlib", "cryptography"}),
+    # BACKLOG #1719: a read-only declaration of the store's composite-key cipher cells, each with the
+    # columns its writer binds into the cell AAD. It builds that AAD with cell_aad through the
+    # store.crypto seam and performs no encrypt or decrypt itself; the full restore-verify does that
+    # through the store cipher in pipeline/dr_backup.py.
+    "messagefoundry/store/cipher_cells.py": frozenset({"messagefoundry.store.crypto"}),
     # crypto.py also derives the audit-chain HMAC key (#190) via HKDF-SHA256 (cryptography) from the
     # store DEK — no new import (still hashlib + cryptography), an additive key-derivation off the DEK.
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
@@ -768,6 +773,10 @@ IMPORT_ONLY: dict[str, str] = {
         "construct objects rather than call a primitive; the operations run later as METHODS on "
         "those objects, which the store backends' rows count"
     ),
+    "messagefoundry/store/cipher_cells.py": (
+        "builds a cell AAD with cell_aad, which is byte framing and not a primitive; the decrypt "
+        "that consumes it runs in pipeline/dr_backup.py, which is inventoried"
+    ),
     "messagefoundry/store/gcm_bound.py": (
         "reads the cipher's reserve-block size and cipher TYPES; performs no operation"
     ),
@@ -842,7 +851,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:truststore.SSLContext",
         }
     ),
-    "messagefoundry/auth/ldap.py": frozenset({"tls_context:via messagefoundry.config.tls_policy"}),
+    # BACKLOG #2034: the AD CA anchor is checked (its SHA-256 pinned) at construction, and the bind
+    # loads those checked bytes, as auth/oidc_http.py does for the IdP anchor.
+    "messagefoundry/auth/ldap.py": frozenset(
+        {
+            "hash:via messagefoundry.auth.trust_anchors",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
     "messagefoundry/auth/oidc/claims.py": frozenset(
         {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}
     ),

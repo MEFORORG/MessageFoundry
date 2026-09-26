@@ -6650,6 +6650,7 @@ class PostgresStore:
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
+        adopt_notify_email: bool = True,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -6662,7 +6663,7 @@ class PostgresStore:
             auth_provider,
             display_name,
             email,
-            seed_notify_email(email),
+            seed_notify_email(email) if adopt_notify_email else None,
             now,
             password_hash,
             now if password_hash is not None else None,
@@ -7419,21 +7420,29 @@ class PostgresStore:
         return _rowcount(result)
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, now: float | None = None
+        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
     ) -> None:
-        """Revoke a user's active sessions beyond the ``keep`` most recently created (AUTH-SESS-CAP)."""
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
+        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`.
+
+        The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL`` and ``_SESSION_LIVE_SQL``, respelled
+        for ``$n``."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
+            " AND created_at <= $1 AND last_used_at <= $1"
             " AND token_hash NOT IN ("
             "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
+            "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
+            "  AND $1 - last_used_at <= $4"
             "  ORDER BY created_at DESC, token_hash DESC LIMIT $3"
             ")",
             now,
             user_id,
             keep,
+            float(idle_seconds),
         )
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:

@@ -20,7 +20,7 @@ from urllib.parse import quote, urlsplit
 from fastapi import HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import RedirectResponse
 
-from messagefoundry.api.security import enforce_phi_read_hop, get_auth
+from messagefoundry.api.security import client_ip, enforce_phi_read_hop, get_auth
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
 
@@ -360,8 +360,9 @@ def require_ui(
             #
             # BEFORE the raise, not after: _mfa_redirect returns an exception, and raising first
             # would skip the row. Awaited rather than fired-and-forgotten so a store failure
-            # surfaces instead of dropping the record.
-            await auth.audit_mfa_denied(identity, request.url.path)
+            # surfaces instead of dropping the record. The client goes on the row (ADR 0150, BACKLOG
+            # #1644) through the one shared extractor, so an investigator has a host to follow.
+            await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
             raise _mfa_redirect() if mfa_refusal is None else mfa_refusal(request)
         # BACKLOG #1139 (ASVS 6.3.7), the cookie mirror of the JSON gate: below the factor gate, so a
         # password-only cookie proves its factor before it chooses where notices go, and above the
@@ -376,7 +377,9 @@ def require_ui(
             )
         for permission in permissions:
             if not identity.has(permission):
-                await auth.audit_permission_denied(identity, permission, request.url.path)
+                await auth.audit_permission_denied(
+                    identity, permission, request.url.path, client=client_ip(request)
+                )
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
         if phi:
             # BACKLOG #1738, the same shape as the #287 block below. The console reaches the PHI
@@ -934,8 +937,9 @@ async def authorize_ui_ws(
         # this row exists to catch.
         #
         # Same shape as ``require_ui`` above and ``api/security.py``: the PATH, never the full URL,
-        # because the query string is where an operator's search terms live.
-        await auth.audit_mfa_denied(identity, websocket.url.path)
+        # because the query string is where an operator's search terms live. The client rides along
+        # through the same shared extractor (ADR 0150, BACKLOG #1644).
+        await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
         return None, None
     # BACKLOG #1139: an account that owes a notification address does not stream. BELOW the factor
     # check, as in ``require_ui``, so a password-only probe still leaves its ``auth.mfa_denied`` row.
@@ -952,7 +956,9 @@ async def authorize_ui_ws(
             # engine's gates, not the console's. Same call shape as ``require_ui`` above and
             # ``api/security.py``: the row carries the permission and the PATH, never the full URL,
             # because the query string is where an operator's search terms live.
-            await auth.audit_permission_denied(identity, permission, websocket.url.path)
+            await auth.audit_permission_denied(
+                identity, permission, websocket.url.path, client=client_ip(websocket)
+            )
             return None, None
     return identity, token
 

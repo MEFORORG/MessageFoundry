@@ -31,16 +31,19 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.__main__ import main
+from messagefoundry.__main__ import _store_key_configured, main
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
     SecretRotationSettings,
     SecuritySettings,
+    ServiceSettings,
     StoreSettings,
     security_loosenings,
 )
+from messagefoundry.store.base import open_store
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS, KeyProviderError
 from messagefoundry.store.store import MessageStore, audit_row_hash
 from tests.test_provision_first_administrator import _tty
 
@@ -340,3 +343,68 @@ def test_provision_admin_refuses_a_configured_key_the_provider_did_not_resolve(
             await store.close()
 
     assert asyncio.run(no_audit_rows()) == 0
+
+
+# --- BACKLOG #1998: an external key provider is a configured key ------------------------------------
+#
+# The gate reads settings; it runs before `open_store` and must not need the network, so "keyed" is
+# decided by what is CONFIGURED, not by whether the provider resolves. A provider that cannot resolve
+# is not waved through keyless: `open_store` raises KeyProviderError before any file exists. The last
+# test below pins that half, because the first half is only safe while it holds.
+
+#: The environment the ``vault`` provider reads, cleared so a developer's own Vault wiring cannot
+#: turn the fail-closed arm into a live unwrap.
+_VAULT_ENV = (
+    "MEFOR_STORE_VAULT_ADDR",
+    "MEFOR_STORE_VAULT_TOKEN",
+    "MEFOR_STORE_VAULT_TRANSIT_KEY",
+    "MEFOR_STORE_VAULT_WRAPPED_DEK",
+    "MEFOR_STORE_VAULT_CA_FILE",
+)
+
+
+@pytest.mark.parametrize("provider", sorted(_EXTERNAL_PROVIDERS))
+def test_an_external_key_provider_counts_as_a_configured_key(provider: str) -> None:
+    """``vault`` with no local key used to read as keyless, so the default posture refused to start
+    and the only way past was an opt-out that misdescribed a keyed store."""
+    assert _store_key_configured(ServiceSettings(store=StoreSettings(key_provider=provider)))
+
+
+@pytest.mark.parametrize("provider", ["auto", "env", "dpapi"])
+def test_a_builtin_provider_with_no_local_key_is_still_keyless(provider: str) -> None:
+    """The control arm: a built-in provider sources the key from ``encryption_key`` or its file, so
+    with neither set the store is still keyless."""
+    assert not _store_key_configured(ServiceSettings(store=StoreSettings(key_provider=provider)))
+
+
+def test_provision_admin_with_a_vault_provider_is_not_refused_as_keyless(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Through a real command. The keyless refusal must not fire, and with the Vault wiring absent
+    from this shell the open must still fail closed and leave no store behind."""
+    for name in _VAULT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "vault")
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    db = shell / "vault.db"
+    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert rc != 0, error
+    assert "no store key is set in this shell" not in error, "a Vault key is a configured key"
+    # The refusal is the Vault one -- not some unrelated failure that also leaves no store.
+    assert "MEFOR_STORE_VAULT_TRANSIT_KEY" in error, error
+    assert not db.exists(), "a refused open must not leave a store behind"
+
+
+@pytest.mark.parametrize("provider", sorted(_EXTERNAL_PROVIDERS))
+async def test_an_external_provider_that_cannot_resolve_fails_closed_at_open(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Counting a provider as keyed before it resolves is safe only because a provider that cannot
+    resolve refuses the open, rather than returning no key and opening under the identity cipher."""
+    for name in _VAULT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    db = shell / f"{provider}.db"
+    with pytest.raises(KeyProviderError, match=provider):
+        await open_store(StoreSettings(key_provider=provider, path=str(db)), create=True)
+    assert not db.exists(), "a refused open must not leave a store behind"
