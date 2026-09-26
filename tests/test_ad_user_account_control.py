@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -38,21 +38,24 @@ ENABLED = "512"  # NORMAL_ACCOUNT
 DISABLED = "514"  # NORMAL_ACCOUNT | ACCOUNTDISABLE (0x2)
 NON_NUMERIC = "NORMAL_ACCOUNT"
 
-#: The three refusals the item names, each with the shape its warning must report (``None`` for the
-#: disabled bit, which is a readable answer and warns about nothing).
+#: The refusals, each with the shape its warning must report (``None`` for the disabled bit, which
+#: is a readable answer and warns about nothing). ``None`` as a VALUE is what ldap3 returns for an
+#: attribute it was asked for and did not receive, under its return_empty_attributes option.
 REFUSED = [
     pytest.param(ABSENT, "absent", id="absent"),
+    pytest.param(None, "empty", id="empty"),
     pytest.param(NON_NUMERIC, "non-numeric str", id="non-numeric"),
     pytest.param(DISABLED, None, id="disabled-bit"),
 ]
 
 
 @pytest.fixture(autouse=True)
-def _reset_the_warning_latches() -> None:
-    """Both latches are process-wide, so each test starts with them empty or its own warning would
-    depend on which tests ran first."""
+def _reset_the_warning_latch() -> Iterator[None]:
+    """The latch is process-wide, so it is emptied before each test, or a test's own warning would
+    depend on which tests ran first, and after, so this module leaves nothing behind for another."""
     ldap_module._uac_shapes_warned.clear()
-    ldap_module._object_guid_shapes_warned.clear()
+    yield
+    ldap_module._uac_shapes_warned.clear()
 
 
 # --- the one place the attribute is interpreted -------------------------------------------------
@@ -81,29 +84,31 @@ def _uac_entry(uac: Any) -> _Entry:
 
 
 @pytest.mark.parametrize(
-    ("value", "enabled"),
+    ("value", "enabled", "shape"),
     [
-        (ENABLED, True),
-        (512, True),  # ldap3 with a schema loaded formats the INTEGER syntax as an int
-        (b"512", True),
-        (" 512 ", True),
-        (DISABLED, False),
-        (514, False),
-        (ABSENT, False),
-        ("", False),
-        ([], False),  # what ldap3 returns for a requested attribute it did not receive
-        (None, False),
-        (NON_NUMERIC, False),
-        ("5l2", False),
-        ("²", False),  # isdigit() says yes, int() says no: must refuse, not raise
-        (True, False),  # a bool is an int subclass, and is not a flag word
-        (["512", "514"], False),  # a single-valued attribute answering twice is not an answer
+        (ENABLED, True, None),
+        (512, True, None),  # ldap3 with a schema loaded formats the INTEGER syntax as an int
+        (b"512", True, None),
+        (" 512 ", True, None),
+        (DISABLED, False, None),
+        (514, False, None),
+        (ABSENT, False, "absent"),
+        (None, False, "empty"),
+        ("", False, "empty"),
+        ("   ", False, "empty"),
+        ([], False, "empty"),
+        (NON_NUMERIC, False, "non-numeric str"),
+        ("5l2", False, "non-numeric str"),
+        (chr(0xB2), False, "non-numeric str"),  # superscript 2: isdigit() yes, int() no
+        (True, False, "non-numeric bool"),  # a bool is an int subclass, and is not a flag word
+        (["512", "514"], False, "non-numeric list"),  # a single-valued attribute answering twice
     ],
 )
 def test_only_a_readable_flag_word_with_the_disabled_bit_clear_is_enabled(
-    value: Any, enabled: bool
+    value: Any, enabled: bool, shape: str | None
 ) -> None:
     assert _account_enabled(_uac_entry(value)) is enabled
+    assert ldap_module._uac_shapes_warned == (set() if shape is None else {shape})
 
 
 def test_each_unusable_shape_is_reported_once_and_names_the_consequence(

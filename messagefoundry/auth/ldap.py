@@ -223,8 +223,8 @@ def _warn_once_about_user_account_control(shape: str) -> None:
     logger.warning(
         "AD %s is unusable (%s), so the engine cannot tell whether these accounts are disabled; "
         "their AD logins are refused and the session reconciler reads them as absent. Check that "
-        "the [auth].ad_bind_dn service account can read this attribute (BACKLOG #1639). Reported "
-        "once per shape.",
+        "the [auth].ad_bind_dn service account can read this attribute and that it arrives as an "
+        "integer (BACKLOG #1639). Reported once per shape.",
         _UAC_ATTR,
         shape,
     )
@@ -239,9 +239,14 @@ def _account_enabled(entry: Any) -> bool:
     the attribute saw every principal as enabled, so a directory-disabled account would still sign
     in and keep its sessions through the reconciler.
 
-    ``int()`` rather than ``str.isdigit()``: ``isdigit`` accepts characters such as superscript
-    digits that ``int`` then rejects, which would raise out of the lookup instead of refusing. The
-    value itself is never logged; the shape is what a reader needs in order to fix the read.
+    The parse is ``int()`` inside a ``ValueError`` handler, and it is lenient rather than strict:
+    whatever ``int()`` reads as an integer is taken as the flag word. What it must never do is
+    raise out of the lookup; the old ``str.isdigit()`` guard could, because ``isdigit`` accepts
+    superscript digits that ``int`` rejects. The value itself is never logged; the shape is what a
+    reader needs in order to fix the read.
+
+    **The only property checked is ACCOUNTDISABLE**, as before this item. Expiry
+    (``accountExpires``) and lockout are not read here.
     """
     if _UAC_ATTR not in entry:
         shape = "absent"
@@ -254,9 +259,10 @@ def _account_enabled(entry: Any) -> bool:
                 return not int(value) & _ACCOUNTDISABLE
             except ValueError:
                 pass
-        # ldap3 hands back an empty list for an attribute it asked for and did not receive, so
-        # "empty" is usually the same fact as "absent", seen through a different connection option.
-        shape = "empty" if not value else f"non-numeric {type(value).__name__}"
+        # ldap3 can return an attribute it asked for and did not receive as present with no value
+        # (its return_empty_attributes option), so "empty" is usually the same fact as "absent".
+        blank = isinstance(value, str | bytes) and not value.strip()
+        shape = "empty" if blank or not value else f"non-numeric {type(value).__name__}"
     _warn_once_about_user_account_control(shape)
     return False
 

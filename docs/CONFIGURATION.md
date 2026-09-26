@@ -624,7 +624,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `ad_domain` | str | — | UPN suffix, e.g. `example.com` |
 | `ad_user_search_base` | str | — | required when `ad_enabled` |
 | `ad_group_search_base` | str | — | base for nested-group resolution |
-| `ad_bind_dn` | str | — | service-account DN used for lookups |
+| `ad_bind_dn` | str | — | service-account DN used for lookups. It must be able to read each user's `userAccountControl`: an account whose value it cannot read is refused at sign-in and read as absent by the session reconciler (BACKLOG #1639). |
 | `ad_bind_password` | secret | — | **env only** (`MEFOR_AUTH_AD_BIND_PASSWORD`), or use `ad_bind_password_secret` |
 | `ad_bind_password_secret` | str | — | connector `SecretProvider` reference (ADR 0019 §5) — when set and `[secrets].provider` is configured, the bind password is resolved from that backend (e.g. a Vault KV `path#field`) instead of `ad_bind_password`. A reference, not a secret. |
 | `ad_use_nested_groups` | bool | `true` | resolve nested groups (`LDAP_MATCHING_RULE_IN_CHAIN`) |

@@ -42,13 +42,12 @@ LEDGER_MAX = 10_000
 class ProbeOutcome(Enum):
     """What one directory probe of one principal established."""
 
-    #: The principal resolved — the account exists and is not disabled (``_find_user`` rejects
-    #: ``userAccountControl & 0x2``, and since BACKLOG #1639 an unreadable ``userAccountControl``
-    #: too). Carries the current group set, so the role re-diff is free.
+    #: The principal resolved — the account exists and ``auth.ldap._account_enabled`` passed it.
+    #: Carries the current group set, so the role re-diff is free.
     PRESENT = "present"
-    #: The lookup succeeded but matched nothing. **Ambiguous**: disabled, deleted, moved out of the
-    #: search base, a search base that was never right, or an entry whose ``userAccountControl`` the
-    #: bind account cannot read (BACKLOG #1639). Strikes, never revokes on its own.
+    #: The lookup succeeded but matched nothing. **Ambiguous**: refused by
+    #: ``auth.ldap._account_enabled``, deleted, moved out of the search base, or a search base that
+    #: was never right. Strikes, never revokes on its own.
     ABSENT = "absent"
     #: The directory could not be consulted (``LdapError`` — connectivity/bind/config). Contributes
     #: nothing: no strike, no revocation, no strike reset.

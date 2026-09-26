@@ -2530,7 +2530,7 @@ class AuthService:
         operator can find out.
 
         ``resolve_principal`` is the password-free service-account lookup the Kerberos path uses. It
-        already rejects a disabled account (``userAccountControl & 0x2``) by returning ``None`` on
+        already rejects an account ``auth.ldap._account_enabled`` refuses by returning ``None`` on
         either key, and returns the group set, so the role re-diff below costs no extra round trip.
         """
         assert self._ldap is not None  # guarded by directory_reconcile_enabled
