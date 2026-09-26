@@ -351,3 +351,59 @@ async def test_the_notifier_sink_emits_both_events() -> None:
     assert by_type["approval_approver_provenance"]["changed"] == ["account_created"]
     assert by_type["administrator_granted"]["connection"] == "user:admin2"
     assert by_type["administrator_granted"]["granted_by"] == "admin1"
+
+
+async def test_mapping_a_directory_group_to_administrator_raises_the_grant_alert(
+    engine: Engine,
+) -> None:
+    """Every member of a group mapped to Administrator becomes an approver at sign-in, and the map is
+    an engine table this route writes, so a NEWLY mapped group pages like a promotion."""
+    service = await _service(engine)
+    await _add(service, "admin1", Role.ADMINISTRATOR)
+    sink = _Sink()
+    async with _app_client(engine, service, sink) as c:
+        headers = await _token(c, "admin1")
+        body = {
+            "entries": [
+                {"ad_group": "CN=Ops", "role": Role.OPERATOR.value},
+                {"ad_group": "CN=Admins", "role": Role.ADMINISTRATOR.value},
+                # The store folds case, so this is the same group: it must not page twice.
+                {"ad_group": "cn=admins ", "role": Role.ADMINISTRATOR.value},
+            ]
+        }
+        r = await c.put("/ad-group-map", headers=headers, json=body)
+        assert r.status_code == 200, r.text
+        # Saving the same map again grants nothing new.
+        r = await c.put("/ad-group-map", headers=headers, json=body)
+        assert r.status_code == 200, r.text
+    assert sink.events == [
+        (
+            "administrator_granted",
+            "ad-group:cn=admins",
+            {"via": "ad_group_map", "granted_by": "admin1"},
+        )
+    ]
+    assert not is_connection_name("ad-group:cn=admins")
+
+
+async def test_a_failed_executor_is_still_flagged(engine: Engine) -> None:
+    """The flag is written in a `finally` around the executor, so a release that failed still says
+    who released it."""
+
+    async def _boom(_params: Mapping[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("executor failed")
+
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    gate = ApprovalGate(
+        engine.store, ON, resolve_identity=service.identity_for_user_id, alert_sink=_Sink()
+    )
+    gate.register("dead_letter_replay", "replay", _boom, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate, maker)
+    checker = await _add(service, "checker", Role.ADMINISTRATOR)
+
+    with pytest.raises(RuntimeError):
+        await gate.approve(approval_id, approver="checker", approver_user_id=checker)
+
+    assert len(await _flags(engine)) == 1
+    assert len(await engine.store.list_audit(action="approval.failed")) == 1

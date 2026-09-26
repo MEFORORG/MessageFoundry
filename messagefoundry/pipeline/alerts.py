@@ -194,25 +194,24 @@ class AlertSink(Protocol):
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
         """A held dual-control request was RELEASED by an approver whose account changed after the
-        request was made (BACKLOG #315). The release went ahead: this flags it and refuses nothing.
-        One Administrator can mint or take over a second approver account, so this is the signal
-        that the two identities on the release may be one person. ``name`` is
-        ``approval:<approval id>``; the colon is outside the connection-name grammar, so a rule's
-        ``control_action`` can never land on a real connection through it (BACKLOG #1898). ``changed`` holds one or more
-        of ``account_created``, ``password_changed`` and ``totp_enrolled``. Carries the key, the
+        request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``). The release
+        went ahead: this flags it and refuses nothing. ``name`` is ``approval:<approval id>``. The
+        colon is outside the connection-name grammar, so a rule's ``control_action`` can never land
+        on a real connection through it (BACKLOG #1898). ``changed`` holds one or more of
+        ``account_created``, ``password_changed`` and ``totp_enrolled``. Carries the key, the
         operation key and the slugs only: no username, no params, no PHI. The
         ``approval.approver_provenance`` audit row is the durable record. Emitted by
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""
         ...
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
-        """An account was given the built-in Administrator role, by creating it with the role or by a
-        role change that adds it (BACKLOG #315). Every approver is an Administrator, so this is how a
-        second approver gets minted. ``name`` is ``user:<username>``, outside the connection-name
-        grammar for the same reason as :meth:`approval_approver_provenance`. ``via`` is ``account_created`` or ``roles_changed``; ``granted_by`` is the acting
-        administrator's username. No PHI. Emitted by the API's user-administration routes, never from
-        ``auth/``. A directory account that gains the role from the AD group map at sign-in is NOT
-        this event."""
+        """The built-in Administrator role was granted through the console API (BACKLOG #315). Every
+        approver is an Administrator, so this is how a second approver gets minted. ``via`` is
+        ``account_created`` or ``roles_changed`` with ``name`` = ``user:<username>``, or
+        ``ad_group_map`` with ``name`` = ``ad-group:<group>`` when a group newly maps to the role.
+        Both keys are outside the connection-name grammar for the same reason as
+        :meth:`approval_approver_provenance`. ``granted_by`` is the acting administrator's username.
+        No PHI. Emitted by the API's user-administration routes, never from ``auth/``."""
         ...
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:

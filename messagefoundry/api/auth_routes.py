@@ -115,18 +115,15 @@ _VALID_ROLE_IDS = {role.value for role in Role}
 _log = logging.getLogger(__name__)
 
 
-def _alert_administrator_granted(app: FastAPI, username: str, *, via: str, granted_by: str) -> None:
-    """Raise the ``administrator_granted`` alert (BACKLOG #315). Every dual-control approver is an
-    Administrator and every Administrator can make another one, so this is the page for the step
-    that mints a second approver. Raised here, in the API, never from ``auth/`` (CLAUDE.md section 4).
-    Best effort: the grant already happened and is audited."""
+def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
+    """Raise the ``administrator_granted`` alert (BACKLOG #315; why, and the key grammar, are on
+    ``AlertSink.administrator_granted``). Raised here, in the API, never from ``auth/`` (CLAUDE.md
+    section 4). Best effort: the grant already happened and is audited."""
     try:
-        alert_sink_for(app.state).administrator_granted(
-            f"user:{username}", via=via, granted_by=granted_by
-        )
+        alert_sink_for(app.state).administrator_granted(key, via=via, granted_by=granted_by)
     except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not 500 a
         # user-administration call whose write is already committed and audited.
-        _log.exception("the administrator_granted alert for %r failed to emit", username)
+        _log.exception("the administrator_granted alert for %r failed to emit", key)
 
 
 # CSV formula injection (CWE-1236 / ASVS 1.2.10). The audit export is the ONE attacker-influenced
@@ -860,7 +857,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         )
         if Role.ADMINISTRATOR.value in body.roles:
             _alert_administrator_granted(
-                app, body.username, via="account_created", granted_by=identity.username
+                app, f"user:{body.username}", via="account_created", granted_by=identity.username
             )
         user = await service.store.get_user(user_id)
         assert user is not None
@@ -988,7 +985,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         await service.set_roles(user_id, body.roles, actor=identity.username)
         if granted:
             _alert_administrator_granted(
-                app, user.username, via="roles_changed", granted_by=identity.username
+                app, f"user:{user.username}", via="roles_changed", granted_by=identity.username
             )
         return SimpleMessage(detail="roles updated")
 
@@ -1201,9 +1198,24 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         await _validate_roles(service, [e.role for e in body.entries])
+
+        # BACKLOG #315: mapping a group to Administrator makes every member who signs in an approver,
+        # so each group that newly maps to it pages, as a promotion does. Read back from the store on
+        # both sides, because the store normalises group names and a re-save must not page.
+        async def admin_groups() -> set[str]:
+            rows = await service.store.list_ad_group_role_map()
+            return {
+                str(r["ad_group"]) for r in rows if str(r["role_id"]) == Role.ADMINISTRATOR.value
+            }
+
+        before = await admin_groups()
         await service.set_ad_group_map(
             [(e.ad_group, e.role) for e in body.entries], actor=identity.username
         )
+        for group in sorted(await admin_groups() - before):
+            _alert_administrator_granted(
+                app, f"ad-group:{group}", via="ad_group_map", granted_by=identity.username
+            )
         return SimpleMessage(detail="ad-group map updated")
 
     @app.get("/ad-group-scope-map", response_model=AdGroupScopeMap)

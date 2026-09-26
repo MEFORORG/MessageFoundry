@@ -961,10 +961,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         )
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
-        # BACKLOG #315: an account gained the built-in Administrator role, which is what makes it a
-        # dual-control approver. `user:<username>` stands in for "connection", as the #1141 reminder's
-        # key does (the key's grammar is on AlertSink). The granting administrator is an operator
-        # account name, not message content.
+        # BACKLOG #315: the Administrator role was granted. `user:<username>` or `ad-group:<group>`
+        # stands in for "connection" (the key's grammar is on AlertSink). The granting administrator
+        # is an operator account name, not message content.
         self._emit(
             {
                 "type": "administrator_granted",
