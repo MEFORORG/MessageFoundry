@@ -1034,11 +1034,11 @@ def test_a_pin_caught_mid_renewal_keeps_the_current_client(
 def test_a_pin_rewritten_during_its_load_is_not_recorded(
     renewable_engine: _RenewableEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A rewrite between the read and the load leaves which bytes the context holds unknown.
+    """A file that changes across the load is refused for that tick, and adopted on the next.
 
-    Recording the bytes read first would tie the client to a certificate it may not trust, and a
-    follower that rebuilds only on a change of bytes would never correct it. So that tick loads
-    nothing and the next one does.
+    This pins that the second read exists and refuses a mismatch. It rewrites AFTER the load, so
+    the context and the first read agree here; the case the second read guards against, a rewrite
+    between the first read and the load, is not driven directly.
     """
     from messagefoundry.tray import probe
 

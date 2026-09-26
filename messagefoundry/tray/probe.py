@@ -247,9 +247,10 @@ def load_pin(cacert: str) -> LoadedPin | None:
 
     The file is read on both sides of the load, and a difference returns ``None``. Without that, a
     rewrite landing between the read and the load would leave the caller recording one certificate
-    while its context trusts another, and a caller that rebuilds only on a CHANGE of bytes would
-    then never correct it. The context still loads through ``cafile``, so what a pin may hold is
-    unchanged; the second read is what ties that load to the bytes returned.
+    for a tick while its context trusts another. A caller that rebuilds on a change of bytes would
+    correct that on its next tick, so the second read saves a spare rebuild rather than closing a
+    permanent gap. It cannot see a file that changes and changes back within the load. The context
+    still loads through ``cafile``, so what a pin may hold is unchanged.
     """
     before = read_pin(cacert)
     if before is None:
