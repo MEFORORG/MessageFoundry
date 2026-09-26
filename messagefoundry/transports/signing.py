@@ -202,20 +202,31 @@ def _load_private_key(setting: str, private_key: str, password: str | None) -> _
     return key
 
 
-#: Smallest RSA modulus this engine will SIGN with. NIST SP 800-131A disallowed RSA-1024 for
-#: signature generation in 2013; ASVS 11.4.1 and every current candidate list agree on 2048 as the
-#: floor. Measured before this floor existed: :func:`_load_private_key` was a TYPE check only and
-#: loaded a 1024-bit key without complaint, against a control in the same run showing it does reject
+#: Smallest RSA modulus this engine will SIGN with: 3072 bits, about 128 bits of security (BACKLOG
+#: #300). ASVS 11.2.3 asks for at least 128 bits and names RSA-3072 as the RSA equivalent; 2048 gives
+#: about 112. The floor was 2048 until #300, which is where NIST SP 800-131A and ASVS 11.4.1 stop.
+#:
+#: This key went first and alone because the operator generates it and registers only its public
+#: half, so nobody else chose it and no TLS handshake depends on it. One cost is possible and was
+#: not measured: an authorization server that caps the RSA size it accepts for a registered SMART or
+#: OAuth2 client-assertion key. ES256 or ES384 is the fallback there, and needs no floor here.
+#:
+#: The CA-issued DIRECT signer key in ``transports/direct.py`` and the IdP keys
+#: ``require_public_key_for_alg`` admits are counterparty-facing, and are NOT raised by this
+#: constant (BACKLOG #1166 says not to fold them in).
+#:
+#: Measured before any floor existed: :func:`_load_private_key` was a TYPE check only and loaded a
+#: 1024-bit key without complaint, against a control in the same run showing it does reject
 #: unparseable material -- so the loader was live and simply never asked how big the modulus was.
-_MIN_RSA_BITS = 2048
+_MIN_RSA_BITS = 3072
 
 
 def _require_key_strength(key: _PrivateKey) -> None:
     """Refuse a signing key that is the right TYPE but too weak to sign with.
 
     Scoped to the key this engine signs with, deliberately. The operator generates it and registers
-    only its public half, so raising the floor costs no counterparty anything -- it cannot break a
-    handshake with anybody, because nobody else chose this key.
+    only its public half, so nobody else chose it. The one possible cost is the one
+    :data:`_MIN_RSA_BITS` names: a registrar that caps RSA size, answered by an EC key.
 
     **The verification path is a different question and is NOT changed here.**
     :func:`require_public_key_for_alg` admits an identity provider's JWKS key, where a floor WOULD be
@@ -230,8 +241,9 @@ def _require_key_strength(key: _PrivateKey) -> None:
     if isinstance(key, rsa.RSAPrivateKey) and key.key_size < _MIN_RSA_BITS:
         raise SigningError(
             f"signing key is RSA-{key.key_size}, below the {_MIN_RSA_BITS}-bit floor for signature "
-            f"generation (NIST SP 800-131A, ASVS 11.4.1). Generate a new key of at least "
-            f"{_MIN_RSA_BITS} bits and register its public half with the counterparty."
+            f"generation (about 128 bits of security, ASVS 11.2.3). Generate a new key of at least "
+            f"{_MIN_RSA_BITS} bits, or an EC key for ES256 / ES384, and register its public half "
+            f"with the counterparty."
         )
 
 

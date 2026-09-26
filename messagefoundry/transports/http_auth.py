@@ -65,7 +65,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credential_hop,
     refuse_url_credentials,
 )
-from messagefoundry.transports.smart import token_provider_from_settings
+from messagefoundry.transports.smart import smart_auth_configured, token_provider_from_settings
 
 if TYPE_CHECKING:  # avoid importing heavy wiring at module import (transports <- config cycle)
     from messagefoundry.config.wiring import ConnectionSpec
@@ -76,6 +76,7 @@ __all__ = [
     "OAuth2ClientCredentialsProvider",
     "bearer_provider_from_settings",
     "digest_handler_from_settings",
+    "oauth2_auth_configured",
     "oauth2_cc_provider_from_settings",
     "proxy_auth_handler_from_settings",
     "with_http_digest",
@@ -84,6 +85,19 @@ __all__ = [
 
 # The HTTP destinations these auth modes apply to (REST/SOAP/FHIR share rest.py's HTTP plumbing).
 _HTTP_CONNECTOR_TYPES = (ConnectorType.REST, ConnectorType.SOAP, ConnectorType.FHIR)
+
+
+def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
+    """Whether a settings mapping has OAuth2 client-credentials auth turned ON.
+
+    ON means ``oauth2_token_url`` is present and ``oauth2_enabled`` is not switched off. The SINGLE
+    definition, shared by :func:`oauth2_cc_provider_from_settings` (which builds the provider), by the
+    mutual-exclusion screen in :func:`bearer_provider_from_settings` and by the static-credential hop reader
+    (BACKLOG #1182). Before it existed the builder treated any falsy ``oauth2_enabled`` as off while the
+    screen treated only a literal ``False`` as off. Off is the conservative reading, so a falsy value is
+    off, the same rule :func:`~messagefoundry.transports.smart.smart_auth_configured` states."""
+    return bool(s.get("oauth2_token_url")) and bool(s.get("oauth2_enabled", True))
+
 
 # Renew this many seconds before the server's stated expiry so a token never expires mid-flight.
 _DEFAULT_EXPIRY_SKEW = 60.0
@@ -194,8 +208,8 @@ class OAuth2ClientCredentialsProvider:
         except InsecureHopRefused as exc:
             raise HttpAuthError(
                 "OAuth2 token endpoint over cleartext http would expose the client_secret; refused by "
-                "the instance security posture (use https, attest the hop as secure via "
-                "tls_hop_attested, or declare cleartext_accepted with a cleartext_reason)"
+                "the instance security posture (use https, or declare cleartext_accepted with a "
+                "cleartext_reason)"
             ) from exc
         if not client_id:
             raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_client_id' setting")
@@ -359,9 +373,7 @@ def oauth2_cc_provider_from_settings(
 
     ``trust_anchor_policy`` (#1660) is the instance-wide ``[tls]`` policy the caller already holds, off
     its ``Destination``. ``None`` resolves to the OS trust store, byte-identical."""
-    if not s.get("oauth2_token_url"):
-        return None
-    if not s.get("oauth2_enabled", True):
+    if not oauth2_auth_configured(s):
         return None
     _accepted = cleartext_acceptance_from_settings(s)
     token_url = str(s.get("oauth2_token_url") or "")
@@ -416,8 +428,8 @@ def bearer_provider_from_settings(
     # Detect the conflict from settings PRESENCE before constructing either provider, so a "both
     # configured" mistake reports the mutual-exclusion error rather than whichever provider's own
     # validation happens to fire first on partial config.
-    has_smart = bool(s.get("smart_token_url")) and s.get("smart_enabled", True) is not False
-    has_oauth = bool(s.get("oauth2_token_url")) and s.get("oauth2_enabled", True) is not False
+    has_smart = smart_auth_configured(s)
+    has_oauth = oauth2_auth_configured(s)
     if has_smart and has_oauth:
         raise HttpAuthError(
             "a connection cannot use BOTH SMART Backend Services and OAuth2 client-credentials auth "
@@ -506,8 +518,8 @@ def digest_handler_from_settings(
     except InsecureHopRefused as exc:
         raise HttpAuthError(
             "HTTP Digest over cleartext http would expose the digest credential; refused by the "
-            "instance security posture (use https, attest the hop as secure via tls_hop_attested, or "
-            "declare cleartext_accepted with a cleartext_reason)"
+            "instance security posture (use https, or declare cleartext_accepted with a "
+            "cleartext_reason)"
         ) from exc
     user = str(s.get("http_auth_user") or "")
     password = str(s.get("http_auth_password") or "")

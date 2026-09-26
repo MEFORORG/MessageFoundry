@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-65ee7bd5234eb01b
+f01646b975e29601
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -83,6 +83,8 @@ set_user_roles
 set_channel_scope
 reset_user_password
 reset_user_mfa
+bind_user_federated_identity
+unbind_user_federated_identity
 admin_revoke_user_sessions
 delete_user
 create_custom_role
@@ -100,6 +102,7 @@ list_audit
 my_security_events
 user_summary
 current_user
+federated_identity_view
 
 ## api.security surface (imported directly by the console, outside UiDeps)
 client_ip: (conn: 'Request | WebSocket') -> 'str | None'
@@ -119,14 +122,15 @@ audit_kerberos_reject: (self, reason: 'str') -> 'None'
 audit_mfa_denied: (self, identity: 'Identity', path: 'str', *, client: 'str | None' = None) -> 'None'
 audit_oidc_reject: (self, reason: 'str') -> 'None'
 audit_permission_denied: (self, identity: 'Identity', permission: 'Permission', path: 'str', *, client: 'str | None' = None) -> 'None'
-authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, seed_reauth: 'bool' = True) -> 'LoginOutcome'
-begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str') -> 'tuple[str, str]'
+authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, supersedes: 'str | None' = None) -> 'LoginOutcome'
+begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str', prior_session: 'str | None' = None) -> 'tuple[str, str]'
 begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str | None'
 begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'
 complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'LoginOutcome'
 confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'Elevation'
 delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'str', *, client: 'str | None' = None) -> 'bool'
 factor_binding_is_blocked: (self, token: 'str | None', action: 'str') -> 'bool'
+fill_own_notify_email: (self, identity: 'Identity', email: 'str', *, client: 'str | None' = None) -> 'bool'
 finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
 finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
 flag_new_client_ip: (self, token: 'str | None', client_ip: 'str | None', *, path: 'str') -> 'bool'
@@ -135,16 +139,18 @@ has_recent_step_up: (self, token: 'str | None') -> 'bool'
 identity_for_token: (self, token: 'str | None', *, activity: 'bool' = True) -> 'Identity | None'
 kerberos_available: property -> 'bool'
 list_sessions: (self, user_id: 'str') -> 'list[SessionRecord]'
-login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None) -> 'LoginOutcome'
+login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None, supersedes: 'str | None' = None) -> 'LoginOutcome'
 logout: (self, token: 'str | None', *, actor: 'str | None' = None) -> 'None'
 mfa_satisfied: (self, token: 'str | None') -> 'bool'
 mfa_status: (self, identity: 'Identity') -> 'MfaStatus'
 oidc_enabled: property -> 'bool'
 oidc_flow_ttl_seconds: property -> 'int'
+password_change_owes_factor: (self, token: 'str | None') -> 'bool'
 reauth: (self, identity: 'Identity', password: 'str', *, token: 'str', client: 'str | None' = None, purpose: 'str | None' = None) -> 'Elevation'
 revoke_other_sessions: (self, identity: 'Identity', current_token_hash: 'str', *, actor: 'str') -> 'int'
 revoke_own_session: (self, identity: 'Identity', session_id: 'str', *, actor: 'str') -> 'bool'
 store: property -> 'AdminStore'
+suggested_notify_email: (profile_email: 'str | None') -> 'str | None'
 verify_mfa: (self, token: 'str | None', code: 'str', *, client: 'str | None' = None) -> 'Elevation'
 webauthn_available: (self) -> 'bool'
 
@@ -169,7 +175,10 @@ messagefoundry.api.auth_models.ChannelScope: channels
 messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, user_id, username
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
 messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
+messagefoundry.api.auth_models.FederatedIdentityRequest: subject
+messagefoundry.api.auth_models.FederatedIdentityView: auth_provider, bind_issuer, has_directory_object_id, issuer, subject, user_id, username
 messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
+messagefoundry.api.auth_models.NotifyEmailRequest: email
 messagefoundry.api.auth_models.PasswordChangeRequest: current_password, new_password
 messagefoundry.api.auth_models.PasswordResetResponse: expires_at, must_change_password, temp_password
 messagefoundry.api.auth_models.RoleInfo: builtin, description, display_name, id, permissions
@@ -178,7 +187,7 @@ messagefoundry.api.auth_models.SecurityEventInfo: action, detail, ts
 messagefoundry.api.auth_models.SecurityEventsList: events
 messagefoundry.api.auth_models.UserCreateRequest: display_name, email, password, roles, username
 messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, credential_expires_at, disabled, display_name, email, id, notify_email, roles, username
-messagefoundry.api.auth_models.UserUpdateRequest: disabled, display_name, email
+messagefoundry.api.auth_models.UserUpdateRequest: disabled, display_name, email, notify_email
 messagefoundry.api.models.AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status, suspended_until
 messagefoundry.api.models.AlertInstanceList: alerts, total, worst_severity
 messagefoundry.api.models.AlertRuleInfo: connection, content_label, control_action, control_target, cooldown_seconds, escalate_tiers, event_type, id, min_depth, min_oldest_seconds, mute, recipient_count, schedule_configured, severity, transports
@@ -191,7 +200,7 @@ messagefoundry.api.models.ClusterNode: acquire_delay_seconds, fresh, host, is_le
 messagefoundry.api.models.ClusterNodeList: leader_node_id, lease_expires_at, lease_owner, nodes
 messagefoundry.api.models.ClusterStatus: clustered, config_version, is_leader, node_id, role
 messagefoundry.api.models.ClusterStepdownRequest: force
-messagefoundry.api.models.ClusterStepdownResult: force, new_leader_eligible, node_id, released_at, was_leader
+messagefoundry.api.models.ClusterStepdownResult: force, lease_released, new_leader_eligible, node_id, released_at, was_leader
 messagefoundry.api.models.ConfigProvenance: drift, files, fingerprint, git_head, loaded
 messagefoundry.api.models.ConnectionEventInfo: connection, direction, id, kind, message_id, peer_host, reason, transport, ts
 messagefoundry.api.models.ConnectionFlagRequest: direction, flagged
@@ -227,8 +236,9 @@ messagefoundry.api.models.ResendRequest: idempotency_key, source, to
 messagefoundry.api.models.SearchPresetCreateRequest: criteria, name
 messagefoundry.api.models.SearchPresetCriteria: channel_id, content, control_id, field_path, field_value, limit, message_type, status, target
 messagefoundry.api.models.SecurityLoosening: risk, switch
-messagefoundry.api.models.SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, store_privilege
+messagefoundry.api.models.SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, static_credential_hops, static_credential_hops_scope, store_privilege
 messagefoundry.api.models.ServiceStatusInfo: enabled, service_name, state
+messagefoundry.api.models.StaticCredentialHopView: accepted, compliant_kind, credential, detail, name
 messagefoundry.api.models.StatsResetRequest: all, targets
 messagefoundry.api.models.StatsResetTarget: channel_id, destination, role
 messagefoundry.api.models.StorePrivilegeView: detail, excess, status

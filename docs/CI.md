@@ -16,7 +16,7 @@ claims move with it.
 
 | Workflow | What it does |
 |---|---|
-| `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. |
+| `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. A small `crypto-operations` job runs the TypeScript/JavaScript and PowerShell arms of the ASVS 11.1.3 crypto gate on every event, with no path gate (BACKLOG #1164). It is its own context rather than a leg of `CI gate`, so it blocks a merge only once branch protection requires it; `.github/required-contexts.txt` is the record. |
 | `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. Two **composite** jobs, `repo-scan` and `dependency-and-secret-scan`, run the same seven scans in two runner slots instead of seven; they are staged alongside the originals, so during the overlap every scan runs twice. **Only the composite copy gates the merge, since 2026-09-16** -- this cell said *"both are now required ... both copies gate the merge"*, which was true for two days and then was not. `.github/required-contexts.txt` is the live answer; see *Consolidating the seven security contexts* below. |
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Advisory — **not** required checks. |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
@@ -42,6 +42,7 @@ The stable contexts required on `main` are — mirroring
 - `test (ubuntu-latest, py3.14)`
 - `test (windows-2022, py3.14)`
 - `test (windows-2025, py3.14)`
+- `crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)`
 - `repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)`
 - `dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`

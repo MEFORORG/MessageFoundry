@@ -166,7 +166,11 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     # not yet run -- the change landed at 18:45Z and the schedule fires at 07:00Z -- so the detector's
     # first opportunity to report was still hours away. That is worth recording next to the pin: the
     # drift script closes the "nobody ever checks" hole, not the "nobody checks promptly" one.
-    assert len(contexts) == 8, (
+    #
+    # 9 SINCE BACKLOG #1164: the owner's 2026-09-24 decision added
+    # `crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)` from ci.yml. The job
+    # landed and reported first; protection took the context next; this line followed, in that order.
+    assert len(contexts) == 9, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )

@@ -111,10 +111,13 @@ from messagefoundry.store.store import (
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
     AuditHeadMovedError,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimAbortPhase,
     ClaimedHeads,
     ClaimLockTimeout,
@@ -304,6 +307,16 @@ def _encode_proc_lanes(lanes: Sequence[str]) -> str:
     connection names. Oversized lanes are removed upstream by ``_keep_matchable_lanes``; the call
     here is idempotent and kept so this encoder is safe to use on an unfiltered list."""
     return json.dumps(_keep_matchable_lanes(lanes))
+
+
+#: The SQL Server form of ``store.WITHDRAW_AD_SCOPE_SQL`` (BACKLOG #1927). Same binds, in the same
+#: order; ``withdraw_ad_channel_scope`` says why it differs.
+_WITHDRAW_AD_SCOPE_SQL_MSSQL = (
+    "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"
+    " WHERE id=? AND channel_scope COLLATE Latin1_General_100_BIN2"
+    " = CAST(? AS NVARCHAR(MAX)) COLLATE Latin1_General_100_BIN2"
+    " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
+)
 
 
 def _claim_proc_param_pins() -> list[tuple[int, int, int]]:
@@ -1486,7 +1499,10 @@ _SCHEMA: list[str] = [
         -- 1700-byte nonclustered limit that shaped the oidc_* pair above is not in play. A canonical
         -- GUID is 36 characters, so the width is slack, not a bound.
         directory_object_id NVARCHAR(256) NULL,
-        password_claimed_at FLOAT NULL)""",
+        password_claimed_at FLOAT NULL,
+        -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
+        -- on UserRecord.channel_scope_source.
+        channel_scope_source NVARCHAR(16) NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1513,6 +1529,10 @@ _SCHEMA: list[str] = [
     # is the item. No backfill exists; nothing has ever held the directory's identifier.
     """IF COL_LENGTH('users','directory_object_id') IS NULL
         ALTER TABLE users ADD directory_object_id NVARCHAR(256) NULL""",
+    # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source):
+    # COL_LENGTH-gated ADD on a pre-existing users table. No backfill is possible.
+    """IF COL_LENGTH('users','channel_scope_source') IS NULL
+        ALTER TABLE users ADD channel_scope_source NVARCHAR(16) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -3501,15 +3521,21 @@ class SqlServerStore:
         rows = await self._fetchall(sql, params)
         return rows[0] if rows else None
 
-    async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        """Run a single write statement (or T-SQL batch) in its own committed transaction."""
+    async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
+        the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
+        stepdown reads it to say truthfully whether its owner-scoped release matched a row."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, params)
+                # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
+                count = getattr(cur, "rowcount", -1)
+                rows = count if isinstance(count, int) else -1
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+        return rows
 
     def _event_stmt(
         self,
@@ -9655,7 +9681,8 @@ class SqlServerStore:
         self, username: str, *, limit: int = 100
     ) -> list[dict[str, Any]]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
-        /me/security-events`` (ASVS 6.3.5/6.3.7); admin-initiated changes go out-of-band by email."""
+        /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
+        user only by email, when one can be sent. ``auth/notifications.py`` states the rule."""
         return await self._fetchall(
             "SELECT TOP (?) ts, action, detail FROM audit_log "
             "WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC",
@@ -10261,13 +10288,43 @@ class SqlServerStore:
                 raise
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
-            (scope_json, now, user_id),
+            "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
+            (scope_json, source, now, user_id),
         )
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``.
+
+        Its own statement, not the shared ``WITHDRAW_AD_SCOPE_SQL``, for two reasons. The column
+        has no COLLATE, so a plain ``=`` would compare under the database default, usually
+        case-insensitive: a newer scope differing only in case would match and be withdrawn,
+        where SQLite and Postgres refuse it. And the bound value is CAST to NVARCHAR(MAX), so a
+        scope over 4000 characters compares as NVARCHAR(MAX) whatever long type the driver binds
+        it as."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    _WITHDRAW_AD_SCOPE_SQL_MSSQL,
+                    (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(count) > 0
 
     async def set_user_username(
         self, user_id: str, username: str, *, now: float | None = None
@@ -10307,14 +10364,34 @@ class SqlServerStore:
         )
 
     async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015)."""
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015); see ``AuthStore``."""
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
-            (issuer, subject, now, user_id),
+        sql = (
+            "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
+            " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
+            if expect_unbound
+            else "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
         )
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    sql,
+                    (issuer, subject, now, user_id),
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(count) > 0
 
     async def clear_user_federated_subject(
         self, user_id: str, *, now: float | None = None

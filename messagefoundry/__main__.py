@@ -696,11 +696,10 @@ def main(argv: list[str] | None = None) -> int:
     cert_self_signed.add_argument("--json", action="store_true", help="emit JSON")
 
     # BACKLOG #1236 (ASVS availability). A sole-administrator deployment had NO recovery from account
-    # lockout: the bootstrap account is named `admin` so it is the one an attacker guesses first, it is
-    # created with no email so the ACCOUNT_LOCKED notice never leaves the process, self-reset is
-    # refused, an admin reset needs ANOTHER admin, re-bootstrap only fires on an EMPTY users table, and
-    # no CLI managed users. Every exit is individually deliberate; they close SIMULTANEOUSLY for a
-    # deployment with one administrator. This is the offline exit.
+    # lockout: self-reset is refused, an admin reset needs ANOTHER admin, `provision-admin` refuses
+    # while that administrator is still enabled (a lockout is not a disable), and without an address
+    # the ACCOUNT_LOCKED notice never leaves the process. Every exit is individually deliberate; they
+    # close SIMULTANEOUSLY for a deployment with one administrator. This is the offline exit.
     admin_unlock = sub.add_parser(
         "admin-unlock",
         help="clear a local account's lockout from the host (offline sole-administrator recovery)",
@@ -714,12 +713,18 @@ def main(argv: list[str] | None = None) -> int:
     admin_unlock.add_argument("--db", default=None, help="store path (overrides [store].path)")
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
-    # BACKLOG #1136 (ASVS 6.3.2). Run before the first `serve` and the engine never mints a default
-    # account: `_ensure_bootstrap_admin` seeds only an EMPTY user table. There is deliberately no
-    # --password and no --password-file -- see `_provision_admin`.
+    # BACKLOG #1136 (ASVS 6.3.2). The engine creates no account on its own (ADR 0183 Amendment A), so
+    # this is how an install gets its first administrator. There is deliberately no --password and no
+    # --password-file -- see `_provision_admin`.
     provision_admin = sub.add_parser(
         "provision-admin",
-        help="create the first administrator offline, so no default account is ever minted",
+        help="create the first administrator offline (the engine creates no account on its own)",
+        description="Create the first Administrator from the host, against the store the service "
+        "uses. The engine creates no account on its own, so an install has no way to sign in until "
+        "this runs. It refuses, before asking for a password, when an enabled Administrator already "
+        "exists or an argument is out of range, and it creates the store only once the password "
+        "has passed the policy, so a refusal leaves no new SQLite store file behind. Run it with the "
+        "engine stopped.",
     )
     provision_admin.add_argument(
         "--username", required=True, help="the administrator to create (no default, on purpose)"
@@ -1740,6 +1745,31 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # Static-credential refusal (BACKLOG #1182, ASVS 13.2.1), OPT-IN and off by default (owner decision
+    # 2026-09-23). [security].require_nonstatic_credentials refuses every backend hop that presents an
+    # unchanging credential or none unless [security].static_credential_accepted names it. Two halves,
+    # one reader: the SETTINGS half ([store], [secrets], [alerts], [ai], [auth], [logging]) is checked
+    # here, before anything starts; the GRAPH half is checked by the registry guard below at the first graph load and
+    # on every /config/reload, because the graph is not loaded in this function (load_config executes
+    # operator code, so it is not run twice). Same refuse/warn split as require_managed_identity above.
+    # Each honoured opt-out is logged at WARNING, which the root lastResort handler surfaces before
+    # configure_logging runs, exactly as the egress AUDIT line below relies on.
+    from messagefoundry.config.static_credentials import (
+        apply_static_credential_gate,
+        make_static_credential_guard,
+    )
+
+    _credlog = logging.getLogger(__name__)
+    sc_reason = apply_static_credential_gate(settings, registry=None, log=_credlog)
+    if sc_reason is not None:
+        if enforcing:
+            print(f"error: {sc_reason}; refusing to start.", file=sys.stderr)
+            return 2
+        print(f"warning: {sc_reason}.", file=sys.stderr)
+    static_credential_guard = make_static_credential_guard(
+        settings, enforcing=enforcing, log=_credlog
+    )
+
     # PHI-at-rest posture (H3, OWASP *Fail Securely* / SDS §4.3 PW.9 secure-by-default): with no key
     # configured the instance REFUSES to start (fail-closed), in EVERY environment. It is not gated on
     # the environment label, and since BACKLOG #1279 it is not gated on a data class either: every
@@ -2330,8 +2360,8 @@ def _serve(args: argparse.Namespace) -> int:
         # an operator tls_cert_file wins over the no-mint branch, so with one the hop is TLS and there
         # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
         # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
-        # hop the engine leaves unprotected.
-        from messagefoundry.api.tls import api_tls_source
+        # hop the engine leaves unprotected. The predicate is shared with `messagefoundry check`.
+        from messagefoundry.api.tls import api_tls_source, plaintext_upstream_hop_unacknowledged
 
         serves_plaintext = (
             api_tls_source(
@@ -2340,7 +2370,7 @@ def _serve(args: argparse.Namespace) -> int:
             )
             == "upstream"
         )
-        if serves_plaintext and not settings.api.plaintext_upstream_hop_acknowledged:
+        if plaintext_upstream_hop_unacknowledged(settings.api):
             print(
                 "error: refusing to serve behind an upstream TLS terminator "
                 "([api].tls_terminated_upstream) without [api].plaintext_upstream_hop_acknowledged. "
@@ -3108,8 +3138,9 @@ def _serve(args: argparse.Namespace) -> int:
                         "error: no out-of-band security-notification channel is configured on a "
                         f"{'production ' if production else ''}PHI instance ({env_name!r}); refusing to "
                         "start — account-security events (lockout, password/roles change, new-IP admin "
-                        "action) would have no push channel, only the pull-only /me/security-events feed "
-                        "(ASVS 6.3.5/6.3.7). Configure the [alerts] SMTP transport (email_smtp_host + "
+                        "action) would have no push channel. The pull-only /me/security-events feed "
+                        "carries the user's own events but not an administrator's change to their "
+                        "account (ASVS 6.3.5/6.3.7). Configure the [alerts] SMTP transport (email_smtp_host + "
                         'email_from; add email_to as well if any [[alerts.rules]] routes to "email" — '
                         "the alert email transport requires all three) and keep "
                         "[auth].notify_security_events on; or, to rely on the "
@@ -3120,7 +3151,8 @@ def _serve(args: argparse.Namespace) -> int:
                 print(
                     "warning: no out-of-band security-notification channel is configured in a "
                     f"PHI-carrying environment ({env_name!r}) — account-security events have no push "
-                    "channel, only the pull-only /me/security-events feed. Configure the [alerts] SMTP "
+                    "channel; the pull-only /me/security-events feed carries the user's own events but "
+                    "not an administrator's change to their account. Configure the [alerts] SMTP "
                     "transport (email_smtp_host + email_from) with [auth].notify_security_events on "
                     "(ASVS 6.3.5/6.3.7).",
                     file=sys.stderr,
@@ -3129,8 +3161,9 @@ def _serve(args: argparse.Namespace) -> int:
                 logging.getLogger(__name__).warning(
                     "AUDIT: starting a %sPHI instance (environment %r) with no security-"
                     "notification channel ([alerts].security_notifications_required=false) — "
-                    "account-security events are recorded only in the pull-only /me/security-events "
-                    "feed (out-of-band-notification opt-out override).",
+                    "a user sees their own account-security events only in the pull-only "
+                    "/me/security-events feed, and an administrator's change to their account not at "
+                    "all (out-of-band-notification opt-out override).",
                     "production " if production else "",
                     env_name,
                 )
@@ -3539,6 +3572,8 @@ def _serve(args: argparse.Namespace) -> int:
         security_settings=settings.security,
         config_dir=config_dir,
         registry_filter=registry_filter,
+        registry_guard=static_credential_guard,
+        static_credential_settings=settings,
         config_reload_roots=settings.api.config_reload_roots,
         inbound_bind_host=settings.inbound.bind_host,
         allow_insecure_bind=insecure_bind_ok,
@@ -4899,21 +4934,32 @@ def _keyless_store_gate(settings: ServiceSettings, *, enforcing: bool) -> str | 
 def _provision_admin(args: argparse.Namespace) -> int:
     """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
 
-    Run before the first ``serve`` and the engine never creates the account named ``admin``: the
-    seeding path fires only on an EMPTY user table, so an operator-named administrator pre-empts it.
-    That is the "not present" arm of the verb, reached by an operator action rather than by a
-    configuration knob. The shipped default is unchanged and still mints one -- retiring the
-    auto-create is the remaining half of the item, and it is not this command.
+    The engine creates no account on its own since ADR 0183 Amendment A, Wave 2, so this is the "not
+    present" arm of the verb and the way every install gets its first administrator. It works in
+    either order: before the first ``serve``, or after a ``serve`` that was refused for want of one.
 
     The gate is host access, argued once on :func:`_admin_unlock` and in ADR 0171. What differs is
     the refusal: this one declines when an ENABLED ADMINISTRATOR exists rather than when the table is
     non-empty, because a directory sign-in can fill the table without producing an administrator.
+
+    **It refuses before it prompts wherever it can, and it creates the store last (AC-15).** The
+    length limits, the keyless gate and the "an Administrator exists" answer all come before the
+    password prompt; the password policy comes before the store is created. Two reasons. A refusal
+    that created the store first left a new store behind, and on a Windows service that store is
+    secured to whoever opened it. And a scripted install step, like the IDE's Start flow, reads "an
+    enabled Administrator exists" as go-ahead, which it can only do if no password is asked for first.
+    Answering that opens an EXISTING store the way ``serve`` does; an absent SQLite store is not
+    created by asking. ``provision_first_administrator`` repeats the blank-name, Administrator and
+    policy checks itself, so for those this ordering is a courtesy and not the control. The length
+    limits are this command's alone: the service method does not apply them.
     """
     import asyncio
     import getpass
 
     from pydantic import ValidationError
 
+    from messagefoundry.api.auth_models import _NAME_MAX
+    from messagefoundry.auth.policy import BreachCorpusUnavailable, PasswordPolicy
     from messagefoundry.auth.service import (
         AuthService,
         FirstAdministratorRefused,
@@ -4929,6 +4975,24 @@ def _provision_admin(args: argparse.Namespace) -> int:
         settings = load_settings(config_path=args.service_config, cli=cli)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         return _emit_error(str(exc), as_json=args.json)
+
+    # AC-15: the argument checks, before the prompt and before any open. The limits are the web
+    # console's (`UserCreateRequest`), so this offline surface admits nothing the console refuses,
+    # and the address limit is the one `admin-set-notify-email` applies. A blank address is still no
+    # address rather than a refusal (AC-9), so only its length is checked here.
+    username = args.username.strip()
+    if not username:
+        return _emit_error("a username is required and must not be blank", as_json=args.json)
+    if len(username) > _NAME_MAX:
+        return _emit_error(f"the username is longer than {_NAME_MAX} characters", as_json=args.json)
+    if args.email is not None and len(args.email) > _NAME_MAX:
+        return _emit_error(
+            f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
+        )
+    if args.display_name is not None and len(args.display_name) > _NAME_MAX:
+        return _emit_error(
+            f"the display name is longer than {_NAME_MAX} characters", as_json=args.json
+        )
 
     # BACKLOG #1905: the same at-rest gate `serve` applies, and BEFORE the password prompt and the
     # store open, so a refusal leaves no store behind. This command writes the store's FIRST audit row,
@@ -4962,12 +5026,60 @@ def _provision_admin(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    async def administrator_exists() -> bool:
+        from messagefoundry.store.base import StoreNotFoundError
+
+        # Opened WITHOUT create, so asking cannot make a SQLite store: an absent one holds no
+        # Administrator, and the write below creates it. An EXISTING store is opened as `serve`
+        # opens it, migrations and file permissions included. The answer is asked of AuthService,
+        # the one definition `provision_first_administrator` itself refuses on. It comes before the
+        # terminal check on purpose: a scripted re-run with no terminal still gets this answer.
+        try:
+            store = await open_store(settings.store)
+        except StoreNotFoundError:
+            return False
+        try:
+            return await AuthService(store, settings.auth).has_enabled_administrator()
+        finally:
+            await store.close()
+
+    from messagefoundry.store.crypto import StoreKeylessError
+
+    try:
+        exists = asyncio.run(administrator_exists())
+    except StoreKeylessError as exc:
+        return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if exists:
+        return _emit_error(
+            "this store already has an enabled Administrator, so there is nothing to provision "
+            "-- create further accounts from the web console, and use `admin-unlock` if the "
+            "administrator is locked out",
+            as_json=args.json,
+        )
+
     try:
         password = _read_new_password("New administrator password: ")
     except _PasswordEntryRefused as exc:
-        # Read BEFORE the store is opened, so a refusal cannot leave a SQLite file behind that the
-        # next `serve` would find non-empty.
+        # Read BEFORE the store is opened for writing, so a refusal cannot create a SQLite file.
         return _emit_error(str(exc), as_json=args.json)
+    # The policy `provision_first_administrator` applies, asked before the open (AC-15). An
+    # unusable bundled corpus refuses here in words rather than as a traceback, since this is the
+    # one command that can create an install's first administrator.
+    try:
+        violations = PasswordPolicy.from_settings(settings.auth).violations(
+            password, username=username
+        )
+    except BreachCorpusUnavailable as exc:
+        return _emit_error(
+            f"{exc}; the password cannot be screened, so it is refused (ASVS 6.2.4). Reinstall the "
+            "messagefoundry wheel to repair the corpus, or set [auth].password_check_breached = "
+            "false in the service config to accept unscreened passwords deliberately",
+            as_json=args.json,
+        )
+    if violations:
+        return _emit_error("; ".join(violations), as_json=args.json)
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
@@ -4993,7 +5105,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # `admin-unlock` is deliberate: the ordinary sequence is install, provision, serve, so on
             # a first run the SQLite store legitimately does NOT exist and creating it is correct.
             # The typo hazard M-31 covers is real all the same -- a mistyped --db provisions into a
-            # store `serve` will never open, and `serve` then mints the default account after all.
+            # store `serve` will never open, and `serve` then starts with no Administrator at all.
             # The substitute is naming the target below. It is read off the OPENED store rather than
             # off `[store].path`, which is the SQLite field and would name a file that was never
             # touched on the two server backends.
@@ -5028,7 +5140,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # UnicodeEncodeError on a legacy Windows console would traceback AFTER the account was created.
     _safe_print(f"OK: {verb} Administrator {outcome.username!r} in {store_path}")
     _safe_print(
-        "The engine will NOT create a default 'admin' account: the user table is no longer empty."
+        f"Sign in as {outcome.username!r} once the engine is running; it creates no account itself."
     )
     if not (args.email and args.email.strip()):
         _safe_print(
@@ -5087,8 +5199,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         return settings
     try:
         # Validated before the store opens, so a refusal touches nothing. The same helper every
-        # write of the column uses, plus the web console's length bound, so this offline surface
-        # accepts nothing the console's user form refuses.
+        # write of the column uses, plus the web console's length bound. It does NOT apply the
+        # one-mailbox shape check the console's user form and POST /me/notify-email apply (BACKLOG
+        # #1139), so it accepts a host-only address such as ops@localhost that those refuse. The
+        # console's user form does not re-check a stored value it is handed back unchanged.
         address = require_notify_email(args.email)
     except ValueError as exc:
         return _emit_error(str(exc), as_json=args.json)
@@ -5505,6 +5619,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
         import datetime
 
+        from messagefoundry.pipeline.secret_rotation import fingerprints_equal
         from messagefoundry.store.store import SecretRotationMetaStore
 
         store = await open_store(settings.store)
@@ -5534,12 +5649,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
                     today = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
                     meta = await store.get_secret_rotation_meta()
                     prior = meta.get("MEFOR_STORE_ENCRYPTION_KEY")
-                    await store.upsert_secret_rotation_meta(
-                        "MEFOR_STORE_ENCRYPTION_KEY",
-                        fingerprint=key_id,
-                        tracked_since=prior.tracked_since if prior is not None else today,
-                        last_rotated=today,
-                    )
+                    # Stamp only a key that CHANGED. BACKLOG #1169 made rotate-key the fix for
+                    # plaintext uploads, which an operator runs with the SAME key; stamping then
+                    # would reset the key-age clock for a key that was never rotated.
+                    # Compared as the rotation watcher compares this same field (ASVS 11.2.4,
+                    # BACKLOG #1167): constant-time, over its byte form, never a bare `!=`.
+                    if prior is None or not fingerprints_equal(prior.fingerprint, key_id):
+                        await store.upsert_secret_rotation_meta(
+                            "MEFOR_STORE_ENCRYPTION_KEY",
+                            fingerprint=key_id,
+                            tracked_since=prior.tracked_since if prior is not None else today,
+                            last_rotated=today,
+                        )
             # BACKLOG #1904: the audit chain is the third surface the key covers. Its rows are never
             # re-MAC'd (the off-box tee and every recorded anchor hold those values); instead the chain
             # gets a range under the NEW key, whose first row commits to a digest of the old range, so
@@ -5574,6 +5695,15 @@ def _rotate_key(args: argparse.Namespace) -> int:
     # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
     # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904).
     print(f"OK: {done}" if rolled_ok else f"PARTIAL: {done}")
+    if uploads.sealed_plaintext:
+        # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
+        # Sealing makes them readable, and it would seal a planted file just the same, so say how
+        # many. The operator can check this against the count `serve` logged at startup.
+        print(
+            f"note: sealed {uploads.sealed_plaintext} plaintext uploaded file(s) under the active "
+            "key. If serve logged a count of plaintext uploads at startup, check this number against "
+            "it; an extra one may be a file that did not come through the engine."
+        )
     if uploads.skipped:
         # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
         # key now destroys it. This is the one outcome where "OK" alone would mislead.

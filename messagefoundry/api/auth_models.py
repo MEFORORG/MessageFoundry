@@ -80,7 +80,8 @@ class UserSummary(BaseModel):
     #: overwrites, so it is not where a security notice goes -- see ``notify_email`` (BACKLOG #1139).
     email: str | None = None
     #: READ-ONLY: the engine-owned address every out-of-band security notice is sent to. No directory
-    #: sync writes it, and no request can clear it -- it is repointed by setting ``email`` on a PATCH.
+    #: sync writes it, and no request can clear it -- it is repointed by setting ``notify_email`` on a
+    #: PATCH. Setting ``email`` does not move it (BACKLOG #1139, ADR 0182 Amendment A).
     #: Surfaced so an operator can see where notices actually go; without it the split is invisible.
     #: Defaults None, so an older client that never reads it is unaffected.
     notify_email: str | None = None
@@ -95,6 +96,35 @@ class UserSummary(BaseModel):
     #: password can convey its deadline. ``GET /users`` needs only users:read and leaves it ``None``.
     #: Same source as the login gate. ``None`` once the holder sets their own password.
     credential_expires_at: float | None = None
+
+
+class FederatedIdentityView(BaseModel):
+    """One account's federated binding, as the console's federated-identity screen renders it
+    (BACKLOG #1143 / #295, ADR 0184 slice B).
+
+    A view of its own rather than two more fields on :class:`UserSummary`. That model is what
+    ``GET /users`` returns under users:read, where the pair must not appear, and a field that is
+    always ``None`` there would read as "not linked" to any client that trusts it.
+
+    ``issuer`` and ``subject`` are the stored pair; either one set counts as linked, as it does in
+    :meth:`AuthService.unbind_federated_subject`. ``bind_issuer`` is the issuer a bind would use,
+    ``[auth].oidc_issuer``, or ``None`` when it is unset and every bind is refused.
+    ``has_directory_object_id`` says whether the account carries its immutable directory id; a bind
+    is refused without one (BACKLOG #1143 slice C). A flag rather than the id, which the screen has
+    no use for.
+    """
+
+    user_id: str
+    username: str
+    auth_provider: str
+    issuer: str | None = None
+    subject: str | None = None
+    bind_issuer: str | None = None
+    has_directory_object_id: bool = False
+
+    @property
+    def linked(self) -> bool:
+        return self.issuer is not None or self.subject is not None
 
 
 class UserPermissions(BaseModel):
@@ -135,17 +165,40 @@ class UserCreateRequest(RequestModel):
 
 class UserUpdateRequest(RequestModel):
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
+    #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
     email: str | None = Field(default=None, max_length=_NAME_MAX)
     disabled: bool | None = None
+    #: The engine-owned address security notices go to. Omitted leaves it as it is. A value moves it
+    #: and notifies the address it moves away from. It must be one plain mailbox, and an explicit
+    #: null or a blank value is refused, because the address can be repointed but never cleared.
+    notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
 class RolesUpdateRequest(RequestModel):
     roles: list[RoleId] = Field(max_length=64)
 
 
+class FederatedIdentityRequest(RequestModel):
+    """``PUT /users/{user_id}/federated-identity``: the IdP ``sub`` to bind (BACKLOG #1143).
+
+    No issuer field: the service binds under the configured ``[auth].oidc_issuer``, the only issuer
+    whose tokens the claims ladder accepts. 255 is OpenID Connect Core's own ceiling on ``sub``, and
+    fits the narrowest backend column (SQL Server ``NVARCHAR(256)``).
+    """
+
+    subject: str = Field(min_length=1, max_length=255)
+
+
 class PasswordChangeRequest(RequestModel):
     current_password: str = Field(max_length=_PASSWORD_MAX)
     new_password: str = Field(max_length=_PASSWORD_MAX)
+
+
+class NotifyEmailRequest(RequestModel):
+    """``POST /me/notify-email``: the address that fills a missing notification address (BACKLOG
+    #1139). Same bound as ``UserCreateRequest.email``; blank is refused by the service."""
+
+    email: str = Field(max_length=_NAME_MAX)
 
 
 class ReauthRequest(RequestModel):

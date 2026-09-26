@@ -38,6 +38,7 @@ import os
 import re
 import sys
 import threading
+import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -74,6 +75,7 @@ from messagefoundry.config.models import (
     _check_revocation_attestation,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
+from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.secretscrub import scrub_credentials
 
@@ -1333,6 +1335,8 @@ def MLLP(
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
+    tls_ca_pin: str
+    | None = None,  # INBOUND: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
@@ -1428,6 +1432,11 @@ def MLLP(
     verifies the server cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
     and may present ``tls_cert_file`` for mTLS.
 
+    **The inbound CA is checked before it is trusted** (BACKLOG #1142). ``tls_ca_pin`` is its
+    optional SHA-256. A pin that does not match refuses. Under ``[security].enforcement = enforce``
+    the engine also refuses a CA another account can replace, or one whose permissions it cannot
+    read; a matching pin lets the second case load. The Http and DICOM listeners take the same key.
+
     ``verify_ack_control_id`` (**outbound only**, BACKLOG #82) tightens the *accept* decision: when
     ``True``, a **positive** ACK (MSA-1 AA/CA) is accepted only if its MSA-2 (message control id)
     equals the sent message's MSH-10 — a reply carrying a different control id is treated as a
@@ -1459,8 +1468,9 @@ def MLLP(
 
     ``tls_ciphers`` (**both directions**, ADR 0188) is the opt-in OpenSSL cipher string for **this
     hop**, the per-connection sibling of ``[api].tls_ciphers``. Unset (the default) the listener and
-    the destination build exactly the context they build today — the interpreter's inherited suite
-    list, six CBC-SHA2 suites included, which is what keeps a legacy hospital peer negotiable. Set, the
+    the destination offer the approved AEAD suites, the default on every hop the engine builds
+    (BACKLOG #300). A legacy peer that speaks only CBC cannot negotiate TLS 1.2 with them, and this
+    setting cannot reopen CBC: the fix is a reviewed change to ``_APPROVED_TLS_SUITES``. Set, the
     string is validated by the **same** strict allow-list that guards ``[api].tls_ciphers`` (AEAD-only,
     forward-secret, encrypting, peer-authenticating, 128-bit floor) and then applied, so opting in
     NARROWS this one hop. A rejected string fails loud at construction, surfaced by
@@ -1495,6 +1505,7 @@ def MLLP(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_crl_file": tls_crl_file,
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
@@ -1704,6 +1715,7 @@ def Http(
     | EnvRef
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str | None = None,  # trust anchor — opt-in mTLS (require + verify a client cert)
+    tls_ca_pin: str | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
     | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     # --- Intake authentication (ADR 0154 D6) — a PEER control on this connector, not admin RBAC ---
@@ -1829,6 +1841,7 @@ def Http(
         "tls_key_file": tls_key_file,
         "tls_key_password": tls_key_password,
         "tls_ca_file": tls_ca_file,
+        "tls_ca_pin": tls_ca_pin,
         "tls_crl_file": tls_crl_file,
         "intake_auth": intake_auth,
         "intake_api_key": intake_api_key,
@@ -2587,6 +2600,9 @@ def DICOM(
     tls_ca_file: str
     | EnvRef
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
+    tls_ca_pin: str
+    | EnvRef
+    | None = None,  # SCP: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
     | EnvRef
     | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
@@ -2615,7 +2631,9 @@ def DICOM(
     ``calling_ae_allowlist`` AE Titles (when set) from the peers allowed by the ``inbound(...)``
     ``source_ip_allowlist`` keyword (there is no ``[inbound].source_ip_allowlist`` service key), and
     rejects an object over ``max_object_bytes`` with a DIMSE failure before it is decoded, and so before
-    the commit. A non-loopback
+    the commit. On the SCP that cap never exceeds the engine's 16 MiB binary ingress ceiling, whatever is
+    set here: the engine records a larger object ``ERROR``, so accepting it would answer Success for an
+    object that is never processed (BACKLOG #1910). A non-loopback
     cleartext SCP (no ``tls``) is refused at startup unless ``serve --allow-insecure-bind`` (PHI on the
     wire, §9).
 
@@ -2644,9 +2662,10 @@ def DICOM(
 
     **Per-connection suite list (``tls_ciphers``, both directions, ADR 0188).** The opt-in OpenSSL
     cipher string for **this** hop, the per-connection sibling of ``[api].tls_ciphers``. Unset (the
-    default) the SCP and the SCU build exactly the context they build today — the interpreter's
-    inherited suite list, six CBC-SHA2 suites included, which is what keeps an older modality or PACS
-    negotiable. Set, the string is validated by the **same** strict allow-list that guards
+    default) the SCP and the SCU offer the approved AEAD suites, the default on every hop the engine
+    builds (BACKLOG #300). An older modality or PACS that speaks only CBC cannot negotiate TLS 1.2 with
+    them, and this setting cannot reopen CBC: the fix is a reviewed change to
+    ``_APPROVED_TLS_SUITES``. Set, the string is validated by the **same** strict allow-list that guards
     ``[api].tls_ciphers`` (AEAD-only, forward-secret, encrypting, peer-authenticating, 128-bit floor)
     and then applied, so opting in NARROWS this one hop. A rejected string fails loud at construction,
     surfaced by ``messagefoundry check`` / dry-run."""
@@ -2665,6 +2684,7 @@ def DICOM(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_crl_file": tls_crl_file,
             "tls_allow_expired": tls_allow_expired,
             "tls_ciphers": tls_ciphers,
@@ -3185,7 +3205,7 @@ def Sftp(
     port: int | EnvRef = 22,
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
-    private_key: str | EnvRef | None = None,  # PEM private key text/path — secret, use env()
+    private_key: str | EnvRef | None = None,  # RSA private key TEXT, not a path — secret, use env()
     key_password: str | EnvRef | None = None,  # passphrase for an encrypted key — secret, use env()
     known_hosts: str | EnvRef | None = None,  # extra known_hosts file (system hosts always loaded)
     remote_dir: str | EnvRef,
@@ -4146,6 +4166,24 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     return problems
 
 
+def _require_connection_name(conn: InboundConnection | OutboundConnection, kind: str) -> None:
+    """Refuse a connection name the operator API would refuse (BACKLOG #1107, ASVS 1.2.2).
+
+    Registration is the point both authoring surfaces pass through: a code-first
+    ``inbound()``/``outbound()`` call and a ``connections.toml`` entry. Why the loader holds the
+    API's rule is in :mod:`messagefoundry.connection_names`."""
+    if is_connection_name(conn.name):
+        return
+    where = ""
+    if conn.source_file:
+        line = f":{conn.source_line}" if conn.source_line else ""
+        where = f" (declared at {conn.source_file}{line})"
+    raise WiringError(
+        f"invalid {kind} name {conn.name!r}{where}: a connection name must match "
+        f"{CONNECTION_NAME_PATTERN}"
+    )
+
+
 @dataclass
 class Registry:
     """The wired graph produced by loading config modules."""
@@ -4222,9 +4260,11 @@ class Registry:
         )
 
     def add_inbound(self, conn: InboundConnection) -> None:
+        _require_connection_name(conn, "inbound connection")
         self._add(self.inbound, conn.name, conn, "inbound connection")
 
     def add_outbound(self, conn: OutboundConnection) -> None:
+        _require_connection_name(conn, "outbound connection")
         self._add(self.outbound, conn.name, conn, "outbound connection")
 
     def add_router(self, name: str, fn: RouterFn) -> None:
@@ -4488,31 +4528,108 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+#: What :func:`_peer_label` says when an address does not parse as scheme, host and port. It is fixed
+#: text, so an address the label cannot read is never echoed, since that address may hold a secret.
+_WITHHELD_PEER = "(peer address withheld: it did not parse as a host and port)"
+
+#: A DNS name or IPv4 address, or a bracketed IPv6 literal. No ``%``: an encoded ``@`` or ``:`` in
+#: the host is how a userinfo hides from a parser that looks only for the literal characters.
+_HOST = re.compile(r"[a-z0-9._-]+|\[[0-9a-f:.]+\]")
+_PORT = re.compile(r"[0-9]{1,5}")
+#: A SQL Server ``server`` value that is not a URL authority: an optional ``tcp:`` prefix, a host, an
+#: optional ``\INSTANCE`` and an optional ``,port``. Tried only when the URL parse refuses the value.
+_SQL_SERVER = re.compile(
+    r"(?:tcp:)?([A-Za-z0-9._-]+(?:\\[A-Za-z0-9_$-]+)?)(?:,([0-9]{1,5}))?", re.IGNORECASE
+)
+
+
+def _split_address(text: str) -> tuple[str, str, str] | None:
+    """``(scheme, host, port)`` from one address, scheme and port possibly empty, or ``None``.
+
+    ``urlsplit`` is the one URL parser here (``tests/test_security_static.py``), so this label and
+    the egress host check agree on what the host is. A value with no ``://`` is parsed as a bare
+    authority, which is what a scheme-less ``user:password@proxy:3128`` is. The userinfo is dropped,
+    and so are the path, query and fragment. An ``@`` after the authority returns ``None``: that is
+    either an ``@`` in a query or a credential holding an unencoded ``/``, ``?`` or ``#``, and in the
+    second case the "host" a parser finds is the head of the credential. A value with no scheme must
+    be a bare authority, so any path, query or fragment on it returns ``None`` too.
+
+    Whitespace or a control character anywhere returns ``None`` before parsing, because ``urlsplit``
+    silently deletes tab, CR and LF: ``host\\tSECRET`` would otherwise parse as one host name."""
+    text = text.strip()
+    if any(c.isspace() or not c.isprintable() for c in text):
+        return None
+    has_scheme = "://" in text
+    try:
+        parts = urllib.parse.urlsplit(text if has_scheme else "//" + text)
+        port = parts.port
+    except ValueError:  # a malformed IPv6 literal, or a port that is not a number in range
+        return None
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    tail = parts.path + parts.query + parts.fragment
+    if "@" in tail or (tail and not has_scheme) or not _HOST.fullmatch(host):
+        return None
+    return parts.scheme, host, "" if port is None else str(port)
+
+
+def _bare_ipv6(text: str) -> str | None:
+    """``[addr]`` for a bare IPv6 literal, which a ``host`` setting may hold and a socket accepts, but
+    which no authority parse can read (its colons look like a port). A zone ID (``%...``) is refused:
+    ``ip_address`` accepts almost any text after the ``%`` and hands it back unchanged."""
+    if "%" in text:
+        return None
+    try:
+        addr = ipaddress.ip_address(text.strip())
+    except ValueError:
+        return None
+    return f"[{addr}]" if addr.version == 6 else None
+
+
 def _peer_label(settings: Mapping[str, Any]) -> str:
-    """A readable, secret-free peer address for a connection's settings — the ``url`` if it has one,
-    else ``host``/``server`` with its ``port``, else ``"(unknown peer)"``.
+    """A peer label that cannot carry a secret: scheme, host and port, and nothing else.
 
-    Three keys because the connectors genuinely use three: ``url`` (Rest/FHIR/Soap), ``host``
-    (MLLP/DICOM/Ftp) and ``server`` (Database, which is also the ``[egress].allowed_db`` allowlist key).
+    It reads the ``url`` if there is one, else ``host`` or ``server`` with its ``port``, else says
+    ``"(unknown peer)"``. Three keys because the connectors use three: ``url`` (Rest/FHIR/Soap),
+    ``host`` (MLLP/DICOM/Ftp) and ``server`` (Database, which is also the ``[egress].allowed_db``
+    allowlist key). The labels reach ``GET /security/posture`` and ``messagefoundry check`` output.
 
-    An unresolved :class:`EnvRef` renders as ``env(<key>)``: the KEY, never the value, because these
-    labels land in a posture report and a resolved value can be a credentialed URL. A resolved ``url``
-    is passed through :func:`_mask_url_userinfo` for the same reason — the password half of
-    ``https://user:SECRET@host/`` must not ride into ``GET /security/posture``."""
-
-    def one(value: object) -> str | None:
-        if isinstance(value, EnvRef):
-            return f"env({value.key})"
-        return str(_mask_url_userinfo(value)) if value else None
-
-    url = one(settings.get("url"))
-    if url:
-        return url
-    host = one(settings.get("host")) or one(settings.get("server"))
-    if not host:
-        return "(unknown peer)"
-    port = one(settings.get("port"))
-    return f"{host}:{port}" if port else host
+    **Built up from parsed parts, never cut down from the configured string** (BACKLOG #1182). The
+    label this replaced masked only the password half of a URL's userinfo, so a key-only userinfo, a
+    scheme-less ``user:password@proxy``, a secret in a webhook path and a query credential all went
+    through, and an ``@`` in a query was read as a userinfo. Here userinfo, path, query and fragment
+    are never copied, and an address that does not parse renders as :data:`_WITHHELD_PEER`, never as
+    itself. An unresolved :class:`EnvRef` renders as ``env(<key>)``: the key, never the value. A
+    ``port`` setting is appended only when the address carries none, and only when it is a number or
+    an ``env()`` reference."""
+    raw_port = settings.get("port")
+    if isinstance(raw_port, EnvRef):
+        port_setting = f"env({raw_port.key})"
+    else:
+        port_setting = str(raw_port) if _PORT.fullmatch(str(raw_port)) else ""
+    for key in ("url", "host", "server"):
+        raw = settings.get(key)
+        if raw is None or raw == "":
+            continue
+        if isinstance(raw, EnvRef):
+            scheme, host, port = "", f"env({raw.key})", ""
+        elif key != "url" and (v6 := _bare_ipv6(str(raw))):
+            scheme, host, port = "", v6, ""
+        elif parsed := _split_address(str(raw)):
+            scheme, host, port = parsed
+        elif key == "server" and (sql := _SQL_SERVER.fullmatch(str(raw).strip())):
+            scheme, host, port = "", sql.group(1), sql.group(2) or ""
+        else:
+            return _WITHHELD_PEER
+        if key != "url" and not port:
+            port = port_setting
+        # A database ``server`` joins its port as the DSN does (``SERVER=host,port``), however the
+        # operator spelled it; every other address uses ``host:port``.
+        sep = "," if key == "server" else ":"
+        label = f"{host}{sep}{port}" if port else host
+        return f"{scheme}://{label}" if scheme else label
+    return "(unknown peer)"
 
 
 def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
@@ -4620,9 +4737,10 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
     than unchanging credentials. Nothing here refuses anything: a hop this function names may be
     entirely legitimate, and a site that has no managed-identity option on a given database has no
     compliant answer to move to. Read it as "which database hops present a static credential", never as
-    "which hops are misconfigured". A refusing gate is deliberately NOT built, because #1182 records
-    that a gate shipped before every hop has a reachable compliant credential kind collects an opt-out
-    on precisely the hops that made the requirement fail, which is theatre.
+    "which hops are misconfigured". It is the DATABASE ARM of the engine-wide reader,
+    :func:`messagefoundry.config.static_credentials.static_credential_hops`, which every surface calls
+    instead of this one; the opt-in refusal that reads the wide set is
+    ``[security].require_nonstatic_credentials``, off by default (owner decision 2026-09-23).
 
     **It walks FOUR tables, because there are four database-hop factories and the ledger named two.**
     ``Database()`` lands in ``outbound``; ``DatabasePoll()`` lands in ``inbound`` and crosses the same
@@ -4669,7 +4787,9 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
         auth = str(settings.get("auth", "sql")).lower()
         if auth in _DELEGATED_DB_AUTH:
             return None
-        return f"static SQL login (auth={auth!r})"
+        # Named from a closed set rather than echoed: this reason reaches the static-credential detail,
+        # which must not be able to carry an operator-typed string.
+        return "static SQL login (auth='sql')" if auth == "sql" else "static SQL login"
 
     out: list[tuple[str, str]] = []
     for label, table in (("", registry.outbound), ("inbound:", registry.inbound)):

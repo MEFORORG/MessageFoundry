@@ -83,6 +83,7 @@ __all__ = [
     "split_messages",
     "MAX_FIXTURE_FILE_BYTES",
     "fixture_cap",
+    "read_fixture",
 ]
 
 log = logging.getLogger(__name__)
@@ -105,14 +106,17 @@ def fixture_cap(registry: Registry | None = None) -> int:
     return max(caps)
 
 
-def _read_fixture(path: Path, cap: int) -> bytes:
+def read_fixture(
+    path: Path, cap: int, *, advice: str = "split it into smaller fixture files"
+) -> bytes:
     """``path``'s bytes, or ``ValueError`` when it is over ``cap`` or cannot be read.
 
     Refuses on the size the file reports before reading, then reads at most one byte past what is
     left of the cap, so an oversized file, or one that grows while it is read, never lands in memory
     whole. An unreadable path (a directory named ``*.hl7``, a permission error) is a ``ValueError``
-    naming the file, so both callers report it rather than raise a traceback."""
-    too_big = f"{path} is over the {cap}-byte dry-run file cap; split it into smaller fixture files"
+    naming the file, so every caller reports it rather than raise a traceback. ``advice`` ends the
+    over-cap message; ``check`` passes its own for a fixture's ``.expect`` sidecar."""
+    too_big = f"{path} is over the {cap}-byte dry-run file cap; {advice}"
     try:
         with path.open("rb") as fh:
             size = os.fstat(fh.fileno()).st_size
@@ -1035,7 +1039,7 @@ def read_messages(paths: list[str], *, cap: int | None = None) -> list[tuple[str
         else:
             raise FileNotFoundError(f"no such file or directory: {path}")
         for f in files:
-            messages = split_messages(_read_fixture(f, limit))
+            messages = split_messages(read_fixture(f, limit))
             if len(messages) == 1:
                 out.append((f.name, str(f), messages[0]))
             else:
@@ -1079,7 +1083,7 @@ def read_message_sets(
         raise FileNotFoundError(f"no such file or directory: {root_path}")
     out: list[tuple[str, str, bytes, str | None]] = []
     for f, target in pairs:
-        messages = split_messages(_read_fixture(f, limit))
+        messages = split_messages(read_fixture(f, limit))
         if len(messages) == 1:
             out.append((f.name, str(f), messages[0], target))
         else:

@@ -68,9 +68,16 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # GET plus a stepdown POST for each of the planned and forced variants -- and no JSON route.
 # BACKLOG #1500 (ADR 0090 residual (a)) added two /ui routes -- the message resend confirm GET and the
 # body-less resend POST behind it -- and no JSON route: the resend endpoint already shipped with #123.
-_ROUTES_DEFAULT = 109
-_ROUTES_WITH_DOCS = 113
-_ROUTES_WITH_UI = 218
+# BACKLOG #1139 (ASVS 6.3.7) added one JSON route, POST /me/notify-email, and two /ui routes, the GET
+# and POST of /ui/account/notify-address: the way out of the missing-address confinement.
+# BACKLOG #1143 / #295 (ADR 0184 slice A) added two JSON routes -- PUT and DELETE
+# /users/{user_id}/federated-identity, the only path that binds a federated identity -- and no /ui
+# route: the console leg is slice B.
+# BACKLOG #1143 / #295 (ADR 0184 slice B) added four /ui routes and no JSON route: the
+# federated-identity screen and its unlink confirm page, and the link and unlink POSTs behind them.
+_ROUTES_DEFAULT = 112
+_ROUTES_WITH_DOCS = 116
+_ROUTES_WITH_UI = 227
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -153,6 +160,7 @@ _PERMISSIONLESS_ROUTES = frozenset(
         ("POST", "/auth/logout"),
         ("GET", "/auth/me"),
         ("POST", "/me/password"),
+        ("POST", "/me/notify-email"),
         ("POST", "/me/reauth"),
         ("POST", "/auth/mfa-verify"),
         ("GET", "/me/mfa"),
@@ -336,8 +344,6 @@ _CONTEXTUAL_TOKENS = frozenset(
         "oidc_required_acr_values",
         "oidc_allowed_username_domains",
         "oidc_username_strip_domain",
-        # a time attribute x admin-population state that DENIES (disable + revoke + audit)
-        "bootstrap_expiry_hours",
         # DATA PLANE — the binding correction: these are pre-auth, IP-keyed ALLOW/DENY decisions too
         "source_ip_allowlist",
         "calling_ae_allowlist",
@@ -369,6 +375,9 @@ _CONTEXTUAL_TOKENS = frozenset(
         # workflow dual control: operation x requester-vs-approver identity x hold age
         "approvals",
         "expiry_hours",
+        # the hold-age FLOOR beside that ceiling (ASVS 2.4.2, BACKLOG #287)
+        "min_dwell_seconds",
+        "approval.too_early",
         # observable outcomes
         "X-MessageFoundry-Denied",
         "client-network",
@@ -410,7 +419,6 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "ad_session_recheck_max_users", 200, "200 users"),
     ("auth", "ad_session_revoke_max", 5, "**5**"),
     ("auth", "ad_session_revoke_max_fraction", 0.34, "**0.34**"),
-    ("auth", "bootstrap_expiry_hours", 72, "72 h"),
     ("auth", "oidc_require_mfa_claim", True, "on"),
     # These three were documented but unpinned — precisely the defaults the trailing lanes plan to
     # move (#297's 8.3.2 route proposes an ADR-0080-style derived ad_session_recheck_seconds), so a
@@ -421,6 +429,9 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "oidc_flow_cache_max", 512, "**512**"),
     ("auth", "oidc_flow_ttl_seconds", 300, "300 s"),
     ("auth", "oidc_max_age_seconds", 43200, "43200 s"),
+    # The approval hold-age floor (ASVS 2.4.2). Provisional, so pinned: a change must move the row.
+    # Anchored on the "; " separator, because a bare "2 s" is also a substring of "12 s" and "0.2 s".
+    ("approvals", "min_dwell_seconds", 2.0, "; 2 s"),
 )
 
 #: Settings-name fragments that make a field a candidate contextual/environmental input. Every field
@@ -478,11 +489,6 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # trusts the IdP's certificate, not what the engine decides about a request it receives. A
         # certificate it rejects never yields an identity at all.
         "oidc_tls_crl_file",
-        # ASVS 6.4.5 arm 2: how long BEFORE the bootstrap deadline to start reminding an operator that
-        # the unclaimed first-run credential is about to be retired. Purely the timing of an advisory
-        # ALERT — no login, session or authorization outcome turns on it (contrast its sibling
-        # `bootstrap_expiry_hours`, which DISABLES the account and is therefore an inventoried input).
-        "bootstrap_warn_hours",
         # ASVS 3.7.3: destinations exempted from the "you are leaving this site" interstitial. It
         # decides whether the operator is SHOWN A NOTIFICATION before an outbound navigation — not
         # whether any request is authorized. No login, session, permission or authorization outcome
@@ -1169,8 +1175,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     assert len(gated) == len(rows) - len(no_gate) - len(permissionless)
     # 87 -> 90: BACKLOG #1184's three needle-bearing POSTs, each gated exactly as its GET sibling.
     # 90 -> 91: BACKLOG #1494's POST /cluster/stepdown, gated on the new cluster:control.
-    assert len(gated) == 91, (
-        f"{len(gated)} permission-gated routes, not 91 — update the doc's totals."
+    # 91 -> 93: BACKLOG #1143's PUT and DELETE /users/{user_id}/federated-identity, users:manage.
+    assert len(gated) == 93, (
+        f"{len(gated)} permission-gated routes, not 93 — update the doc's totals."
     )
 
 

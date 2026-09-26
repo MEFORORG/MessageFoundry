@@ -77,6 +77,7 @@ from types import SimpleNamespace
 from typing import cast
 
 from harness.load.connscale.runner import _reconcile as connscale_reconcile
+from harness.load.connscale.runner import _ReloadAccount
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.estate.runner import _reconcile as estate_reconcile
 from harness.load.metrics import Counters, Histogram
@@ -249,6 +250,163 @@ def test_connscale_reconcile_more_timeouts_than_sends_cannot_go_vacuous() -> Non
     result = connscale_reconcile(c, _BASE, _sample(read=0, written=0), unconfirmed_budget=100)
     assert not result.ok, result.detail
     assert "intake floor 5" in result.detail
+
+
+# --- connscale _reconcile: the reload probe's own stranding (BACKLOG #1292) ---------------------
+#
+# The mid-hold reload probe closes every inbound connection. What it strands is the harness's doing,
+# so the reconcile excuses it by COUNT (`_ReloadAccount.stranded`) and keeps its guards over every
+# other send. These pin the three things that must still fail: stranding the reload did NOT cause, an
+# accept-ACKed message with no row, and a reload after which the engine answered nothing.
+
+
+def _reload(
+    stranded: int, *, sent: int, acked: int, timeouts: int, not_reconnected: int = 0
+) -> _ReloadAccount:
+    """A reload account whose `after` snapshot holds the counters at the moment every connection was
+    back. The helpers set no send in flight at that moment. The sender does not promise that, but a
+    send in flight then was written on a socket opened after the reload, so its reply still counts
+    as the engine answering after the reload (see `_ReloadAccount`)."""
+    return _ReloadAccount(
+        seconds=0.5,
+        stranded=stranded,
+        not_reconnected=not_reconnected,
+        extra_hold_s=0.0,
+        after=Counters(sent=sent, acked=acked, timeouts=timeouts),
+    )
+
+
+def test_connscale_reconcile_excuses_what_the_reload_probe_stranded() -> None:
+    # 30 of 36 stranded by the reload, all before every connection came back; 6 sends after it, all
+    # ACKed. The engine read 18: the 6 confirmed plus 12 stranded sends that committed before the
+    # close. Nothing accepted is missing, so the step reconciles and SAYS what it excused.
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=18)
+    reload = _reload(30, sent=30, acked=0, timeouts=30)
+    result = connscale_reconcile(
+        c, _BASE, _sample(read=18, written=18), unconfirmed_budget=12, reload=reload
+    )
+    assert result.ok, result.detail
+    assert "30 send(s) stranded by the reload probe" in result.detail
+
+
+def test_connscale_reconcile_stranding_the_reload_did_not_cause_still_fails() -> None:
+    # THE CONTROL for the test above: the SAME final counters with no reload account. 30 unconfirmed
+    # of 36 is over the budget max(12, 27), so the step fails exactly as the CI steps of 2026-09-25
+    # did. The excusal comes from the reload account and nowhere else.
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=18)
+    result = connscale_reconcile(c, _BASE, _sample(read=18, written=18), unconfirmed_budget=12)
+    assert not result.ok
+    assert "stranding budget" in result.detail
+    # And a reload account that attributes only PART of the stranding leaves the rest budgeted: 10
+    # stranded by the reload, 20 more unconfirmed out of a population of 26 is over max(12, 19).
+    partial = _reload(10, sent=10, acked=0, timeouts=10)
+    result2 = connscale_reconcile(
+        c, _BASE, _sample(read=18, written=18), unconfirmed_budget=12, reload=partial
+    )
+    assert not result2.ok
+    # The budget is named over the base it was computed on, 26 sends, so a reader can redo it.
+    assert "(19 = max(connections, three quarters of the 26 send(s)" in result2.detail
+
+
+def test_connscale_reconcile_an_absent_acked_message_fails_despite_the_reload_excusal() -> None:
+    # PLANTED LOSS. Same shape as the passing test, but the stranded sends left no rows and one of the
+    # 6 accept-ACKed sends has none either: read is 5 against 6 confirmed. The reload excusal forgives
+    # the 30 stranded sends and nothing more, so the one accepted-and-absent message is reported.
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=5)
+    reload = _reload(30, sent=30, acked=0, timeouts=30)
+    result = connscale_reconcile(
+        c, _BASE, _sample(read=5, written=5), unconfirmed_budget=12, reload=reload
+    )
+    assert not result.ok
+    assert "lost 1 on intake" in result.detail
+
+
+def test_connscale_reconcile_a_reload_the_engine_never_answered_after_fails() -> None:
+    # The excusal must not hide a reload that broke intake. 6 sends after the reload, no reply to any
+    # of them. Every count arm passes here (the 6 fit the budget, read 18 clears the floor of 3), so
+    # the reply signature is the only thing that fails it.
+    c = Counters(sent=36, acked=0, timeouts=36, sink_received=18)
+    reload = _reload(30, sent=30, acked=0, timeouts=30)
+    result = connscale_reconcile(
+        c, _BASE, _sample(read=18, written=18), unconfirmed_budget=12, reload=reload
+    )
+    assert not result.ok
+    assert "drew no reply" in result.detail
+
+
+def test_connscale_reconcile_no_traffic_after_the_reload_cannot_pass_on_the_excusal() -> None:
+    # The CI shape of 2026-09-25 exactly, had the step offered nothing after the reload: 33 of 36
+    # stranded and not one send after it, though every connection came back. Excusing the 33 alone
+    # would leave 3 sends to judge, so "nothing was measured after the reload" fails the step
+    # instead of passing it on trust. No other guard fires here: the reconnect one is quiet.
+    c = Counters(sent=36, acked=3, timeouts=33, sink_received=15)
+    reload = _reload(33, sent=36, acked=3, timeouts=33)
+    result = connscale_reconcile(
+        c, _BASE, _sample(read=15, written=15), unconfirmed_budget=12, reload=reload
+    )
+    assert not result.ok
+    assert "nothing was sent after the reload probe" in result.detail
+    assert "never came back" not in result.detail
+    # With the connections down as well, both signatures are named.
+    down = _reload(33, sent=36, acked=3, timeouts=33, not_reconnected=12)
+    result2 = connscale_reconcile(
+        c, _BASE, _sample(read=15, written=15), unconfirmed_budget=12, reload=down
+    )
+    assert "nothing was sent after the reload probe" in result2.detail
+    assert "12 connection(s) never came back" in result2.detail
+
+
+def test_connscale_reload_that_left_a_listener_down_fails_though_the_counts_pass() -> None:
+    # 4 of 12 connections never came back. Sends routed to them were queued and never written, so
+    # they are in no counter: the other 8 carried 6 answered sends and every count arm passes. Only
+    # the reconnect signature can fail this, and it must.
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=18)
+    reload = _reload(30, sent=30, acked=0, timeouts=30, not_reconnected=4)
+    result = connscale_reconcile(
+        c, _BASE, _sample(read=18, written=18), unconfirmed_budget=12, reload=reload
+    )
+    assert not result.ok
+    assert "4 connection(s) never came back" in result.detail
+
+
+def test_connscale_reload_guards_leave_a_step_that_offered_nothing_alone() -> None:
+    # A zero-rate lane sends nothing before or after the reload. There is no intake to measure, so
+    # the reload guards do not fail it; the old reconcile passed it too.
+    reload = _reload(0, sent=0, acked=0, timeouts=0)
+    result = connscale_reconcile(
+        Counters(), _BASE, _sample(read=0, written=0), unconfirmed_budget=12, reload=reload
+    )
+    assert result.ok, result.detail
+
+
+def test_connscale_reconcile_a_reload_that_stranded_nothing_changes_nothing() -> None:
+    # A quick reload strands nothing. The verdict and the text must then be exactly what they are with
+    # no reload account at all, so the fast path's readings stay comparable.
+    c = Counters(sent=36, acked=35, timeouts=1, sink_received=35)
+    reload = _reload(0, sent=18, acked=18, timeouts=0)
+    with_reload = connscale_reconcile(
+        c, _BASE, _sample(read=35, written=35), unconfirmed_budget=_BUDGET, reload=reload
+    )
+    without = connscale_reconcile(
+        c, _BASE, _sample(read=35, written=35), unconfirmed_budget=_BUDGET
+    )
+    assert with_reload == without
+
+
+def test_connscale_reconcile_the_reload_excusal_is_clamped_to_the_unconfirmed_count() -> None:
+    # A reload account claiming more stranding than there were unconfirmed sends cannot excuse a
+    # confirmed one, and the report must not repeat the inflated count. `stranded` is clamped to
+    # `timeouts`: the 1 absent ACKed message still shows, and the note says 6, not 50. Unclamped, the
+    # verdict survives by arithmetic (the negative remainder cancels) but the note reads 50, which is
+    # more sends than the step left unconfirmed.
+    c = Counters(sent=36, acked=30, timeouts=6, sink_received=29)
+    reload = _reload(50, sent=10, acked=4, timeouts=6)
+    result = connscale_reconcile(
+        c, _BASE, _sample(read=29, written=29), unconfirmed_budget=_BUDGET, reload=reload
+    )
+    assert not result.ok
+    assert "lost 1 on intake" in result.detail
+    assert "; 6 send(s) stranded by the reload probe" in result.detail
 
 
 def test_connscale_reconcile_empty_run_clears_the_floor_trivially() -> None:
@@ -641,8 +799,10 @@ def test_the_two_rig_reconcile_copies_emit_the_same_over_budget_detail() -> None
     # "(possible accepted-and-dropped); nothing excused" suffix its sibling carries, and the SAME
     # systemic fault therefore read differently to an operator depending on which runner caught it.
     #
-    # THIS COVERED THREE COPIES AND NOW COVERS TWO. connscale and estate run on the benchmark rig,
-    # never on the merge queue, and keep the offered-volume detectors unchanged.
+    # THIS COVERED THREE COPIES AND NOW COVERS TWO. connscale and estate keep the offered-volume
+    # detectors unchanged. This comment used to say both run on the benchmark rig and never on the
+    # merge queue. That was false for connscale: tests/test_connscale_smoke.py runs it in the
+    # required `test` matrix, and it ejected pull requests from the queue on 2026-09-25 (#1292).
     c = Counters(sent=36, acked=6, timeouts=30, sink_received=36)
     full = _sample(read=36, written=36)
     details = {
@@ -668,6 +828,11 @@ def test_the_load_copy_has_deliberately_parted_from_the_rig_copies() -> None:
     # sentence: either rows genuinely absent, or an `engine_read` sample that read short, which is
     # the discrimination harness/load/connscale/intake_audit.py was built to make per message. Do
     # not read the load copy going green as that sibling being answered.
+    #
+    # ANSWERED FOR THE 2026-09-25 REDS, BY THE AUDIT (BACKLOG #1292). Both had no accept-ACKed send
+    # missing from the store. They were stranding by the harness's own mid-hold reload probe, which
+    # closes every connection. The connscale section above now pins how that is excused, and what
+    # still fails: stranding the reload did not cause, an absent ACKed message, and no reply after it.
     c = Counters(sent=36, acked=6, timeouts=30, sink_received=36)
     full = _sample(read=36, written=36)
     assert not connscale_reconcile(c, _BASE, full, unconfirmed_budget=_BUDGET).ok

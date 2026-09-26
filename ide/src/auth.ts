@@ -178,11 +178,24 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
       }
       throw e;
     }
+    // ASVS 7.2.4: this store REPLACES any token cached for this engine, so that session is then
+    // ended on the engine, or it would stay valid, unreachable from here, until it idles out. Only
+    // after the new sign-in succeeded, so a failed sign-in signs nobody out, and only that one token,
+    // never the user's other sessions. The new token is stored FIRST and the revoke is not awaited:
+    // postJson has no timeout, and a slow engine must not hold a sign-in that already succeeded.
+    // `withAuth` clears the cache before it re-signs in after a 401, so the case this covers is the
+    // status bar's explicit "Sign in" over a token that is still cached and still live.
+    const prior = await peekToken(ctx, url);
     await ctx.secrets.store(secretKey(url), res.token);
+    if (prior && prior !== res.token) {
+      void postJson<unknown>(url, "/auth/logout", {}, prior).catch(() => undefined);
+    }
     // Both of these produce a token that LOOKS fine and then 403s later, so say so now, at the moment
     // the user can act on it, rather than letting them discover it as an opaque failure mid-promote.
     if (res.must_change_password) {
-      // The engine 403s this token on every route except /auth/logout, /auth/me and /me/password.
+      // The engine 403s this token on every route outside its must-change exempt set
+      // (_MUST_CHANGE_EXEMPT_PATHS in messagefoundry/api/security.py). The console page below
+      // asks for an enrolled second factor first when the account has one (BACKLOG #1954).
       // BACKLOG #1141 (ASVS 6.4.5): name the instant the temporary credential dies, when sent.
       void showConsoleFix(
         url,
@@ -223,21 +236,32 @@ export async function withAuth<T>(
   url: string,
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
-  const token = await ensureToken(ctx, url);
-  if (token === undefined) {
+  const first = await ensureToken(ctx, url);
+  if (first === undefined) {
     return undefined; // sign-in cancelled
   }
-  try {
-    return await call(token);
-  } catch (e) {
-    if (e instanceof HttpError && e.status === 401) {
+  let token: string = first;
+  // At most three calls. A 401 is retried once with a NEWER cached token if a sign-in elsewhere
+  // replaced (and revoked) the one this call used -- clearing the cache then would strand that new
+  // session on the engine with no client holding it -- and otherwise by signing in again.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call(token);
+    } catch (e) {
+      if (!(e instanceof HttpError && e.status === 401) || attempt >= 2) {
+        throw e;
+      }
+      const cached = await peekToken(ctx, url);
+      if (cached !== undefined && cached !== token) {
+        token = cached;
+        continue;
+      }
       await clearToken(ctx, url);
       const fresh = await signIn(ctx, url);
       if (fresh === undefined) {
         return undefined;
       }
-      return await call(fresh);
+      token = fresh;
     }
-    throw e;
   }
 }
