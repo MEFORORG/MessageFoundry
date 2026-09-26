@@ -120,6 +120,7 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport
+from messagefoundry.store.schema_verify import verify_live_schema
 
 log = logging.getLogger(__name__)
 
@@ -4288,6 +4289,9 @@ class MessageStore:
             async with _writer_txn(db, asyncio.Lock()):
                 await cls._migrate(db)
                 await db.commit()
+            # BACKLOG #1720: every CREATE above is IF NOT EXISTS and every migration is additive, so a
+            # table or index an incompatible version left under the same name was skipped, not fixed.
+            await verify_live_schema(db, schema=_SCHEMA, migrate=cls._migrate, path=path)
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
             # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
             # completes before anything is serving, so this one is consistency rather than a fix.
