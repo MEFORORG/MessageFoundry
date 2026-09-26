@@ -145,6 +145,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   live. A refused sign-in ends nothing, and a revoke that fails is logged without the token and
   never fails the sign-in.
   (`BACKLOG #1901`)
+- **`audit-anchor --json` now reports a missing audit database, or one with no `audit_log` table,
+  as JSON on stdout.** Both refusals printed plain text to stderr whatever `--json` said, so a
+  caller piping to `jq` got an empty stdout. They now print `{"error": ...}` on stdout, as the
+  unreadable-file refusal already did. The message and exit code 2 are unchanged, and text mode is
+  byte-identical. (`BACKLOG #1922`)
 - **`Direct(...)` now fails at construction on faults that used to fail every send.** A
   `recipient_cert` whose key is not RSA is refused, because the S/MIME envelope supports RSA key
   transport only. This reverses the EC recipient allowance. An EC `signing_key` or `trust_anchor` is

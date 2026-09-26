@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -560,6 +561,88 @@ def test_audit_anchor_cli_refuses_missing_db(
     assert main(["audit-anchor", "--db", str(missing)]) == 2
     assert "no audit database" in capsys.readouterr().err
     assert not missing.exists()
+
+
+# --- BACKLOG #1922: the not-an-audit-log refusals honour --json -------------------------------------
+#
+# `audit-anchor` is the only one of the guard's three callers with a --json flag. The guard answered it
+# on one refusal of three -- an unreadable file, via #1670's reporter -- and printed plain text to
+# stderr for the other two, so a --json caller piping to `jq` got an empty stdout and a parse failure.
+# Each refusal is driven in both modes: the JSON arm is the fix, the text arm is the control that the
+# fix did not move the text-mode output. Both pin the same lead and tail, so the two modes carry one
+# message and the JSON form echoes no more of the path than the text form always has.
+
+
+def _absent_db(tmp_path: Path) -> Path:
+    return tmp_path / "typo.db"
+
+
+def _zero_byte_db(tmp_path: Path) -> Path:
+    zero = tmp_path / "zero.db"
+    zero.write_bytes(b"")
+    return zero
+
+
+# The lead of each refusal, as the shipped text form printed it before #1922 -- the text-mode control
+# pins these bytes, so the fix could not quietly reword or re-path the operator's line.
+_NOT_AN_AUDIT_LOG = [
+    pytest.param(_absent_db, "no audit database at {db}", id="missing-file"),
+    pytest.param(
+        _zero_byte_db, "{db} is a SQLite database with no audit_log table", id="no-audit-table"
+    ),
+]
+_ANCHOR_REFUSAL_TAIL = (
+    " — refusing to create one and print an anchor of an empty log (check --db / [store].path)"
+)
+
+
+@pytest.mark.parametrize(("make_db", "lead"), _NOT_AN_AUDIT_LOG)
+def test_audit_anchor_json_refusal_is_json_on_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    make_db: Callable[[Path], Path],
+    lead: str,
+) -> None:
+    db = make_db(tmp_path)
+    before = db.stat().st_size if db.exists() else None
+
+    assert main(["audit-anchor", "--db", str(db), "--json"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"error": lead.format(db=db) + _ANCHOR_REFUSAL_TAIL}
+    assert lead.format(db=db) not in captured.err
+    # The JSON arm refuses as early as the text arm: nothing created, nothing migrated.
+    assert (db.stat().st_size if db.exists() else None) == before
+
+
+@pytest.mark.parametrize(("make_db", "lead"), _NOT_AN_AUDIT_LOG)
+def test_audit_anchor_text_refusal_is_unchanged(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    make_db: Callable[[Path], Path],
+    lead: str,
+) -> None:
+    db = make_db(tmp_path)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 2
+    text = capsys.readouterr()
+    assert text.out == ""
+    assert text.err == f"error: {lead.format(db=db)}{_ANCHOR_REFUSAL_TAIL}\n"
+
+
+def test_audit_anchor_json_refusal_of_a_non_database_is_json_on_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The guard's third refusal, which honoured --json before #1922 through #1670's reporter. Pinned
+    # here so all three are covered under --json, and dropping `as_json` from that call goes red.
+    text = tmp_path / "notes.txt"
+    text.write_text("this is not a database\n", encoding="utf-8")
+
+    assert main(["audit-anchor", "--db", str(text), "--json"]) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert list(payload) == ["error"]
+    assert payload["error"].startswith(f"cannot open the store at {text}: ")
+    assert "cannot open the store" not in captured.err
 
 
 def test_expected_anchor_detects_a_truncated_tail(
