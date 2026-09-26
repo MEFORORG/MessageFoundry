@@ -1031,18 +1031,30 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 | Signal | When | Where it goes |
 |---|---|---|
 | `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
-| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, or `PUT /users/{id}/roles` adds it | Alert keyed `user:<username>`, naming the granting administrator |
-| `client` on the `user.created` audit row | Every local account creation | The creating administrator's address, like the approval rows |
-| `account_created` notice | Every local account creation that has a notification address | The new account's own notification address |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, or `PUT /ad-group-map` newly maps a group to it | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator |
+| `client` on the `user.created` audit row | An account created through `POST /users` | The creating administrator's address, like the approval rows |
+| `account_created` notice | An account created through `POST /users` with a notification address | The new account's own notification address |
 
-**These signals miss at least three routes.**
+**These signals miss at least five routes.** Each ends in one person holding two approver accounts
+with no page.
 
-- An approver account minted or taken over *before* the request passes all three timestamp
-  comparisons, so the release is not flagged. The `administrator_granted` alert is the only signal.
-- An existing account promoted to Administrator *after* the request is not flagged either, because
-  promotion changes none of the three timestamps. Again, `administrator_granted` is the only signal.
-- A directory (AD) account that gets Administrator from the AD-group map at sign-in raises no
-  `administrator_granted` alert, because that grant happens in the directory.
+- **Takeover before the request.** An existing Administrator's password and second factor are reset
+  before the request is filed. All three timestamps predate the request, so the release is not
+  flagged. No role changed, so `administrator_granted` does not fire either. Only the audit rows for
+  the resets record it.
+- **Mint before the request.** A new Administrator created before the request is not flagged at
+  release. Its `administrator_granted` alert fired when it was created.
+- **Promotion after the request.** Promotion changes none of the three timestamps, so the release is
+  not flagged. Its `administrator_granted` alert is the only page.
+- **Re-enabling a disabled Administrator, or binding a directory Administrator's federated
+  identity.** Neither changes a timestamp or grants a role, so neither pages.
+- **A directory grant.** An account that gets Administrator because the *directory* added it to a
+  group already mapped to Administrator raises no alert. The engine never sees that grant.
+
+The check also flags some releases that changed nothing. A login that rehashes a password after an
+argon2 parameter change restamps `password_changed_at`, so each approver's first release after such a
+change is flagged. The comparison uses two clocks, the requester's and the store writer's, so the
+skew described under the dwell floor shifts it too.
 
 The provenance check flags rather than refuses on purpose. A refusal would stop only the careless
 route, and it would also refuse an honest directory approver whose engine row is created at first
