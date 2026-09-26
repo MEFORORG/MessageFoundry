@@ -10,7 +10,7 @@ backlog, and drain. See ``docs/LOAD-TESTING.md``.
 
 Like :mod:`harness.scenarios`, this package imports no PySide6, and drives the engine through the
 **pure** surfaces a client is allowed to use: the MLLP framing primitives
-(:mod:`messagefoundry.transports.mllp`), the parsing library, the generators, and the HTTP
+(:mod:`messagefoundry.mllpcodec`), the parsing library, the generators, and the HTTP
 :class:`~messagefoundry.apiclient.EngineClient`.
 
 **The store carve-out, and it is not the client rule being bent.** The rigs that OWN the engine
@@ -21,10 +21,11 @@ clients, and some of their jobs are only doable against the store directly. In
 (``runner._store_reader``); :mod:`harness.load.shardcert` provisions its own store the same way.
 Each goes through the ``Store`` protocol via ``open_store``, lazily imported inside the function so
 the import graph of everything else is unchanged, and each is a read/reset path on a store the rig
-itself provisioned — never a shortcut around the API for something the API could answer. (Separately
-and harmlessly, several modules import the ``AckMode`` enum from ``config``; that is a value type,
-not engine state.) The Qt-free client rule itself is unchanged: nothing here imports PySide6, and
-the monitoring path is still the HTTP API.
+itself provisioned — never a shortcut around the API for something the API could answer. Those two
+rigs are the named entries on the client allow-list in ``tests/test_dependency_boundaries.py``
+(BACKLOG #1697); ``AckMode`` now comes from :mod:`messagefoundry.mllpcodec`, not ``config``. The
+Qt-free client rule itself is unchanged: nothing here imports PySide6, and the monitoring path is
+still the HTTP API.
 """
 
 from __future__ import annotations

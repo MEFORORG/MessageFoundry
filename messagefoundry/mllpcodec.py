@@ -24,6 +24,10 @@ configuration layer. So they live here, and ``transports.mllp`` and ``config.mod
 :mod:`messagefoundry.timezone` and, inside :func:`build_ack` only, ``parsing.peek``. It must import
 nothing from ``transports/``, ``config/`` or the package root: ``config.models`` imports
 :class:`AckMode` from here, so any of those would be a cycle as well as a broken boundary.
+
+That is a promise about THIS module's imports, not about everything a call reaches. The first
+:func:`build_ack` call loads ``parsing``, and ``parsing``'s package init still reaches three
+``config`` modules; that pull-in is BACKLOG #1596's to remove, not this module's.
 """
 
 from __future__ import annotations

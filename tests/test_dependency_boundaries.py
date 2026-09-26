@@ -536,11 +536,12 @@ class _ClientScan(NamedTuple):
 
 
 def _allowance_key(rel: str, allowed: Mapping[str, _Allowance]) -> str | None:
-    """The allow-list key covering `rel` (a POSIX path under the repo), or None."""
-    for key in allowed:
-        if rel == key or (key.endswith("/") and rel.startswith(key)):
-            return key
-    return None
+    """The allow-list key covering `rel` (a POSIX path under the repo), or None.
+
+    The LONGEST match wins, so a file entry nested under a directory entry is honoured whatever the
+    dict order, rather than silently shadowed by the directory's narrower allowance."""
+    hits = [k for k in allowed if rel == k or (k.endswith("/") and rel.startswith(k))]
+    return max(hits, key=len, default=None)
 
 
 def _forbidden_root(module: str, forbidden: tuple[str, ...]) -> str | None:
@@ -740,10 +741,20 @@ def test_the_client_walk_refuses_the_shapes_that_would_make_it_vacuous(tmp_path:
         _client_scan(tmp_path, _CLIENT_ROOTS, _PLANT_FLOORS, *args)
 
 
+def test_a_nested_file_entry_wins_over_its_directory_entry() -> None:
+    wide = _Allowance(frozenset({"messagefoundry.store"}), "file")
+    narrow = _Allowance(frozenset({"messagefoundry.config"}), "dir")
+    for allowed in ({"h/": narrow, "h/x.py": wide}, {"h/x.py": wide, "h/": narrow}):
+        assert _allowance_key("h/x.py", allowed) == "h/x.py"
+        assert _allowance_key("h/y.py", allowed) == "h/"
+        assert _allowance_key("hx.py", allowed) is None
+
+
 def test_the_mllp_leaf_loads_no_engine_runtime_package() -> None:
     # The leaf's own promise, in a fresh interpreter for the reason the api test below gives: importing
     # `messagefoundry.mllpcodec` (which brings `messagefoundry.framing`) loads none of the four runtime
-    # packages and not `parsing` either, since `build_ack` imports it on call.
+    # packages and not `parsing` either, since `build_ack` imports it on call. This pins IMPORT time
+    # only: the first `build_ack` call loads `parsing`, which still reaches `config` (BACKLOG #1596).
     code = (
         "import sys\n"
         "import messagefoundry.mllpcodec\n"
