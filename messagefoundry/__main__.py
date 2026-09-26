@@ -5973,10 +5973,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if not rolled_ok:
-        # The data is rotated but the audit chain is not: its current range is still under the prior
-        # key, so dropping that key now would leave the newest range unverifiable. Say so, and fail.
+        # The data is rotated but the audit chain is not settled: its current range is still under
+        # the prior key, that range's key is missing, or the chain does not verify (BACKLOG #1945).
+        # Dropping a key now could leave the newest range unverifiable. Say so, and fail.
         print(
-            f"error: the audit chain was not rolled to the active key — {rolled_msg}. Do NOT remove "
+            f"error: the audit chain step did not complete — {rolled_msg}. Do NOT remove "
             "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until `messagefoundry rotate-key` completes "
             "without this error.",
             file=sys.stderr,

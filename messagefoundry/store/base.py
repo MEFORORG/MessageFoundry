@@ -1638,7 +1638,8 @@ class AuditStore(Protocol):
         the ACTIVE key. Verifies the whole chain first and refuses on a break; then appends one range row,
         MAC'd under the active key, carrying a digest of the range it closes, so that range stays
         provable after its key is dropped. Rewrites no existing row. A no-op when the current range is
-        already under the active key or the chain is keyless. Run offline. Returns ``(ok, message)``."""
+        already under the active key (verified first, BACKLOG #1945) or the chain is keyless. Run
+        offline. Returns ``(ok, message)``."""
         ...
 
     def audit_chain_unkeyed(self) -> bool:
