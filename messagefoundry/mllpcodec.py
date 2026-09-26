@@ -28,12 +28,13 @@ nothing from ``transports/``, ``config/`` or the package root: ``config.models``
 :class:`AckMode` from here, so any of those would be a cycle as well as a broken boundary.
 
 That is a promise about THIS module's imports, not about everything a call reaches. The first
-:func:`build_ack` call loads ``parsing``, and ``parsing``'s package init still reaches three
-``config`` modules; that pull-in is BACKLOG #1596's to remove, not this module's.
+:func:`build_ack` call loads ``parsing``. Since BACKLOG #1596 that reaches no ``config`` module
+either, and ``tests/test_dependency_boundaries.py`` pins both halves.
 """
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -54,6 +55,8 @@ __all__ = [
     "MLLPDecoder",
     "build_ack",
 ]
+
+logger = logging.getLogger(__name__)
 
 # MLLP framing is the VT/FS+CR preset of the shared, configurable codec (messagefoundry.framing);
 # these names + frame()/MLLPDecoder are the MLLP-specific surface.
@@ -132,6 +135,27 @@ _CODES = {
 }
 
 
+def _ack_echo(peek: Peek | None) -> tuple[str, str, str, str, str, str, str, str]:
+    """The inbound header values an ACK echoes, or their defaults when there is no ``peek``.
+
+    Returns ``(field_sep, enc, sending_app, sending_fac, receiving_app, receiving_fac, version,
+    control_id)``. Every value is echoed from the (untrusted) inbound message, so CR/LF is stripped to
+    prevent segment injection into the ACK; MSA-3 free text is escaped separately (HL7-3).
+    """
+    if peek is None:
+        return _DEFAULT_FIELD_SEP, _DEFAULT_ENC, "", "", "", "", "2.5.1", ""
+    return (
+        peek.field("MSH-1") or _DEFAULT_FIELD_SEP,
+        peek.field("MSH-2") or _DEFAULT_ENC,
+        _no_seg_sep(peek.sending_app or ""),
+        _no_seg_sep(peek.sending_facility or ""),
+        _no_seg_sep(peek.receiving_app or ""),
+        _no_seg_sep(peek.receiving_facility or ""),
+        _no_seg_sep(peek.version or "2.5.1"),
+        _no_seg_sep(peek.control_id or ""),
+    )
+
+
 def build_ack(
     inbound: str | bytes | Peek,
     *,
@@ -156,10 +180,10 @@ def build_ack(
     own UTC-stamped record would mis-order events by an hour. An explicit offset pins the instant.
     An operator-supplied ``timestamp`` is used verbatim; the caller owns its form.
     """
-    # Imported here, not at module top: `parsing`'s package init reaches `config.models` (BACKLOG
-    # #1596), and `config.models` imports AckMode from this module, so a top-level import is a
-    # cycle. It also keeps a framing-only client from loading the parsing library at all.
-    from messagefoundry.parsing.peek import HL7PeekError, Peek
+    # Imported here, not at module top, so a framing-only client never loads the parsing library.
+    # It was also a cycle once: `parsing` reached `config.models`, which imports AckMode from here.
+    # BACKLOG #1596 removed that edge; the first reason still holds.
+    from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
 
     if code not in _CODES[AckMode.ORIGINAL]:
         raise ValueError(f"unknown ack code {code!r} (expected AA, AE or AR)")
@@ -171,16 +195,26 @@ def build_ack(
     except HL7PeekError:
         peek = None
 
-    field_sep = (peek.field("MSH-1") if peek else None) or _DEFAULT_FIELD_SEP
-    enc = (peek.field("MSH-2") if peek else None) or _DEFAULT_ENC
-    # Every value below is echoed from the (untrusted) inbound message, so strip CR/LF to prevent
-    # segment injection into the ACK; MSA-3 free text is additionally escaped (HL7-3).
-    sending_app = _no_seg_sep((peek.sending_app if peek else None) or "")
-    sending_fac = _no_seg_sep((peek.sending_facility if peek else None) or "")
-    receiving_app = _no_seg_sep((peek.receiving_app if peek else None) or "")
-    receiving_fac = _no_seg_sep((peek.receiving_facility if peek else None) or "")
-    version = _no_seg_sep((peek.version if peek else None) or "2.5.1")
-    original_control = _no_seg_sep((peek.control_id if peek else None) or "")
+    try:
+        echo = _ack_echo(peek)
+    except PEEK_READ_FAULTS as exc:
+        # BACKLOG #1594: this function builds the NAK for a message that just failed, so it must
+        # never raise on one Peek.parse accepted. A faulting read degrades to the no-peek defaults;
+        # the ACK then carries no echoed header values, which is what an unparseable inbound gets.
+        logger.warning(
+            "ACK header echo failed (%s); building the ACK without it", type(exc).__name__
+        )
+        echo = _ack_echo(None)
+    (
+        field_sep,
+        enc,
+        sending_app,
+        sending_fac,
+        receiving_app,
+        receiving_fac,
+        version,
+        original_control,
+    ) = echo
     ack_control = _no_seg_sep(control_id if control_id is not None else original_control)
 
     # Swap sender/receiver: the ACK goes back the way it came.

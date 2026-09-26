@@ -1010,8 +1010,11 @@ local first (`m = f"bad {x}"`; `raise ValueError(m)`), one passed as a keyword o
 (`raise FeedError("E01", f"bad {x}")`), and one wrapped in a call (`raise ValueError(str(x))`) all go
 unflagged. The convention is what governs; `_check_raise_fstring` catalogues what the check itself
 over- and under-flags. The existing controls — never log full bodies at
-INFO+, the CR/LF log-injection filter, and silencing python-hl7's PHI-prone loggers — remain in
-[logging_setup.py](../messagefoundry/logging_setup.py).
+INFO+ and the CR/LF log-injection filter — remain in
+[logging_setup.py](../messagefoundry/logging_setup.py). Silencing python-hl7's PHI-prone loggers
+lives in the stdlib-only [phi_log_silencer.py](../messagefoundry/phi_log_silencer.py), so
+`parsing/` can run it on import without loading the config layer (BACKLOG #1596);
+`configure_logging` still calls it too.
 
 **Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **Four** handler filters run, **on every record emitted by the engine process and by the ADR 0087 sandbox worker child**, in this
 order, on **every** emitted record and on **every** handler — stdout *and* the off-box forwarder —

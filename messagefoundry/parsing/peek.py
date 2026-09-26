@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "Peek",
     "HL7PeekError",
+    "PEEK_READ_FAULTS",
     "normalize",
     "parse_path",
     "DEFAULT_MAX_MESSAGE_BYTES",
@@ -51,6 +52,14 @@ DEFAULT_MAX_SEGMENTS = 10_000  # generous for big batches/ORUs, bounds segment-c
 
 class HL7PeekError(ValueError):
     """Raised when bytes are not a parseable HL7 message, or a field path is malformed."""
+
+
+#: What a field read on an ACCEPTED :class:`Peek` could raise if a parser fault slipped past the
+#: tolerant contract. None is expected: a read returns a value or ``None``. The pre-ACK callers catch
+#: this family anyway, so a fault becomes a recorded ``ERROR`` and a NAK rather than an exception that
+#: drops the sender's connection with no disposition (BACKLOG #1594). The blank-segment ``IndexError``
+#: that motivated it is fixed at the source; this is the defence in depth the ledger asked for.
+PEEK_READ_FAULTS: tuple[type[Exception], ...] = (LookupError, TypeError, ValueError)
 
 
 def enforce_size_limits(
@@ -170,6 +179,31 @@ def parse_path(path: str) -> tuple[str, int, int | None, int | None]:
     return m["seg"], field, comp, sub
 
 
+#: A run of two or more segment terminators: every ``\r`` after the first ends an EMPTY segment.
+_BLANK_SEGMENT_RUN = re.compile("\r{2,}")
+
+
+def drop_blank_segments(norm: str) -> str:
+    """``norm`` with every empty segment line removed, before a tolerant parse (BACKLOG #1594).
+
+    A sender that ends segments with ``CRLF`` and adds a blank line produces ``\\r\\r`` once
+    :func:`normalize` has run. Both backends parse that into a segment with no id. python-hl7 then
+    raises ``IndexError`` from its by-id segment scan on **any** field read or whole-field set, and
+    the built-ins replicate that for byte parity. On the pre-ACK path that error is not an
+    :class:`HL7PeekError`, so it escaped the listener: no disposition, no NAK, and a dropped
+    connection.
+
+    An empty line carries nothing, so :meth:`Peek.parse` and :meth:`Message.parse
+    <messagefoundry.parsing.message.Message.parse>` both drop it, on both backends alike, and the two
+    surfaces agree about a body. :attr:`Peek.raw` and the stored message keep the text as received.
+    A parsed ``Message`` does not, so its ``encode()`` carries no blank line. Only exactly empty
+    lines go; a whitespace-only line is a segment with an odd id, which already parses and reads.
+    """
+    if "\r\r" not in norm:
+        return norm
+    return _BLANK_SEGMENT_RUN.sub("\r", norm)
+
+
 def normalize(raw: str | bytes, *, encoding: str = "utf-8", errors: str = "replace") -> str:
     """Decode (if ``raw`` is bytes) with ``encoding``/``errors`` and collapse all line endings to
     HL7's ``\\r`` separator.
@@ -191,8 +225,9 @@ class Peek:
     Construct via :meth:`parse`. ``message`` is the underlying parse — either a built-ins
     :data:`~messagefoundry.parsing._builtin_hl7.ParsedMessage` (ADR 0054, the default backend) or a
     legacy ``python-hl7`` :class:`hl7.Message` (when ``_backend.USE_BUILTIN`` is off or the built-ins
-    path fell back). ``raw`` is the normalized (``\\r``-delimited) text it was parsed from. Field
-    access dispatches on the backing type, so the public surface is identical either way.
+    path fell back). ``raw`` is the normalized (``\\r``-delimited) text as received; the parse ran
+    over that text less its empty segment lines (:func:`drop_blank_segments`). Field access
+    dispatches on the backing type, so the public surface is identical either way.
     """
 
     message: _builtin_hl7.ParsedMessage | hl7.Message
@@ -213,9 +248,10 @@ class Peek:
         if not norm.lstrip().startswith("MSH"):
             raise HL7PeekError("message does not start with an MSH segment")
         enforce_expansion_budget(norm)
+        text = drop_blank_segments(norm)
         if _backend.use_builtin():
             try:
-                return cls(message=_builtin_hl7.parse(norm), raw=norm)
+                return cls(message=_builtin_hl7.parse(text), raw=norm)
             except HL7PeekError:
                 # A contract error is never fallen back from (the python-hl7 path would only be the
                 # *unbounded* one): re-raise so the ADR 0054 guard below stays an internal-fault
@@ -230,7 +266,7 @@ class Peek:
                     "built-ins HL7 parse failed; falling back to python-hl7", exc_info=True
                 )
         try:
-            message = hl7.parse(norm)
+            message = hl7.parse(text)
         except Exception as exc:  # python-hl7 raises a variety of ValueErrors
             raise HL7PeekError(f"could not parse HL7 message: {exc}") from exc
         return cls(message=message, raw=norm)
@@ -257,12 +293,9 @@ class Peek:
     def _resolve_builtin(
         msg: _builtin_hl7.ParsedMessage, seg: str, fld: int, comp: int | None, sub: int | None
     ) -> str | None:
-        # python-hl7 resolves the segment through its ``segments()`` scan, which blows up with an
-        # IndexError on any blank/empty segment *before* the value extraction — and that error is NOT
-        # caught by the legacy path's inner ``except IndexError`` (which only wraps ``extract_field``).
-        # Run the equivalent scan first, outside the catch, so a blank-segment error propagates exactly
-        # like the legacy path while a genuine invalid-depth over-index still maps to None below.
-        _builtin_hl7.raise_if_blank_segment_scan(msg)
+        # No blank-segment scan runs here any more (BACKLOG #1594). Peek.parse drops empty lines before
+        # either backend sees them, so the scan ``extract_field`` still runs internally cannot fire on
+        # a peeked message; running it here, outside the catch, is what used to let IndexError escape.
         # The built-ins ``extract_field`` mirrors python-hl7's ``Segment.extract_field`` exactly,
         # including the whole-value-no-component rule and the ""-vs-IndexError asymmetry; an
         # invalid-depth index surfaces here as IndexError, mapped to None like the python-hl7 path.
@@ -295,7 +328,10 @@ class Peek:
         # character (e.g. "ORC-2.1" of "PLACER123" => "P"). Out-of-range parts raise IndexError.
         try:
             value = message.extract_field(seg, 1, fld, 1, comp, sub if sub is not None else 1)
-        except IndexError:
+        except (IndexError, ValueError):
+            # ValueError: python-hl7's own unescape runs ``int()`` on a rich-text repeat count, so a
+            # malformed ``\.inX\`` raises it here. The built-ins path already maps that to None
+            # (DELTA-02); this is the fallback backend's half of the same rule (BACKLOG #1594).
             return None
         return value or None
 
