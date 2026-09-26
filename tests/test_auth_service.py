@@ -968,8 +968,12 @@ async def test_directory_email_repoint_is_audited_and_notified_to_the_old_addres
         await service.initialize()
 
         # The first directory login CREATES the account. Creation is not a change, so it announces
-        # nothing -- without this the assertion below could pass on the wrong event.
-        assert (await service._complete_ad_login(_principal("old@x"), None, mfa_verified=True)).ok
+        # nothing -- without this the assertion below could pass on the wrong event. The birth
+        # address is a plain mailbox so the birth seeds `notify_email` from it (BACKLOG #2014); a
+        # shape like `old@x` is refused there and would reach this assertion only through the mirror.
+        assert (
+            await service._complete_ad_login(_principal("old@example.org"), None, mfa_verified=True)
+        ).ok
         assert [e for e in notifier.events if e.event_type == EMAIL_CHANGED] == []
 
         # The directory now returns a DIFFERENT address for the same principal.
@@ -981,7 +985,7 @@ async def test_directory_email_repoint_is_audited_and_notified_to_the_old_addres
         ev = changed[0]
         # Addressed to the OLD address: the holder of the address being replaced is the party who
         # needs to hear about the replacement.
-        assert ev.email == "old@x"
+        assert ev.email == "old@example.org"
         assert ev.username == "jdoe"
         assert ev.detail["new_email"] == "new@x"
         assert ev.detail["source"] == "directory"
@@ -1021,7 +1025,11 @@ async def test_a_second_directory_repoint_notifies_the_engine_owned_address() ->
         service = AuthService(store, _ad_settings(), security_notifier=notifier)
         await service.initialize()
 
-        assert (await service._complete_ad_login(_principal("owner@x"), None, mfa_verified=True)).ok
+        assert (
+            await service._complete_ad_login(
+                _principal("owner@example.org"), None, mfa_verified=True
+            )
+        ).ok
         assert (
             await service._complete_ad_login(_principal("attacker@evil"), None, mfa_verified=True)
         ).ok
@@ -1032,11 +1040,11 @@ async def test_a_second_directory_repoint_notifies_the_engine_owned_address() ->
         user = await store.get_user_by_username("jdoe")
         assert user is not None
         assert user.email == "attacker2@evil"  # the mirror tracks the directory
-        assert user.notify_email == "owner@x"  # the notification target does not
+        assert user.notify_email == "owner@example.org"  # the notification target does not
 
         changed = [e for e in notifier.events if e.event_type == EMAIL_CHANGED]
         assert len(changed) == 2
-        assert changed[-1].email == "owner@x"
+        assert changed[-1].email == "owner@example.org"
         assert changed[-1].detail["new_email"] == "attacker2@evil"
         # The address the first repoint installed must never be a notice target.
         assert all(e.email != "attacker@evil" for e in notifier.events)
@@ -1058,14 +1066,18 @@ async def test_a_repoint_after_a_profile_clear_still_notifies_the_engine_owned_a
         service = AuthService(store, _ad_settings(), security_notifier=notifier)
         await service.initialize()
 
-        assert (await service._complete_ad_login(_principal("owner@x"), None, mfa_verified=True)).ok
+        assert (
+            await service._complete_ad_login(
+                _principal("owner@example.org"), None, mfa_verified=True
+            )
+        ).ok
         user = await store.get_user_by_username("jdoe")
         assert user is not None
         await service.update_user(
             user.id, display_name="J Doe", email=None, disabled=None, actor="admin"
         )
         user = await store.get_user_by_username("jdoe")
-        assert user is not None and user.email is None and user.notify_email == "owner@x"
+        assert user is not None and user.email is None and user.notify_email == "owner@example.org"
 
         before = len(notifier.events)
         assert (
@@ -1074,7 +1086,7 @@ async def test_a_repoint_after_a_profile_clear_still_notifies_the_engine_owned_a
 
         changed = [e for e in notifier.events[before:] if e.event_type == EMAIL_CHANGED]
         assert len(changed) == 1
-        assert changed[0].email == "owner@x"
+        assert changed[0].email == "owner@example.org"
         assert changed[0].detail["new_email"] == "attacker@evil"
     finally:
         await store.close()

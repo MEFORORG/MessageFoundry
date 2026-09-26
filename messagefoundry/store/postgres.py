@@ -6650,6 +6650,7 @@ class PostgresStore:
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
+        adopt_notify_email: bool = True,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -6662,7 +6663,7 @@ class PostgresStore:
             auth_provider,
             display_name,
             email,
-            seed_notify_email(email),
+            seed_notify_email(email) if adopt_notify_email else None,
             now,
             password_hash,
             now if password_hash is not None else None,
