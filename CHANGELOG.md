@@ -176,6 +176,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: `zip_decompress` now refuses any bytes before or after the archive.** Stdlib
+  `zipfile` finds the archive's end record by scanning back from the end of the input, and skips
+  anything in front of the archive as prepended data. So an archive with up to about 64 KiB of extra
+  bytes after it, or with any bytes before it, opened and read normally, and those bytes were dropped
+  without a word. Two archives joined end to end returned only the second one's members. On first
+  deployment, a Handler unpacking an untrusted archive would have taken those members and never
+  learned that anything else was there. Now bytes outside the archive raise `CompressionError`, the
+  same rule `deflate_decompress` follows. That includes a self-extracting archive's stub, so a
+  Handler must strip the stub first. An archive comment is part of the archive and is still
+  accepted. A comment shorter than its end record declares is refused as truncated. Bytes hidden
+  between two members are still not checked. ([BACKLOG #1976](docs/BACKLOG.md))
 - **Startup attestation now checks the web console, not just the engine.** The console ships as its
   own wheel, `messagefoundry-webconsole`, and runs inside the engine process. Attestation compared
   only the engine wheel's files, so a console file edited, added or deleted in place went unseen.
