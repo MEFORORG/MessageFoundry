@@ -111,7 +111,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
+from messagefoundry.store.gcm_bound import (
+    bounded_cipher,
+    checkpoint_invocations,
+    reserve_invocations_ahead,
+)
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -120,6 +124,7 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport
+from messagefoundry.store.schema_verify import verify_live_schema
 
 log = logging.getLogger(__name__)
 
@@ -3566,6 +3571,10 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS ix_messages_channel  ON messages(channel_id, received_at);
 CREATE INDEX IF NOT EXISTS ix_messages_control  ON messages(channel_id, control_id);
+-- BACKLOG #1726: serves the tracking view's newest-first page (ORDER BY received_at DESC, id DESC, so
+-- no sort of every row) and its received_at filter. Here, not in _migrate: both columns date from the
+-- first release and this batch runs on every open, so an existing store builds it on its next open.
+CREATE INDEX IF NOT EXISTS ix_messages_received ON messages(received_at, id);
 
 -- Generic staged-queue table (staged pipeline, ADR 0001). One table for every stage; the `stage`
 -- column discriminates ingress | routed | outbound rows. Supersedes the original `outbox` table
@@ -4067,6 +4076,16 @@ CREATE TABLE IF NOT EXISTS secret_rotation_meta (
 );
 """
 
+# The latest event of each listed message, for the tracking view (list_messages, search_messages).
+# BACKLOG #1726: MAX(id) reads ix_events_message as a covering scan and fetches one row by primary key,
+# where an ORDER BY id sorted each message's events in a temp B-tree (that index orders by ts, not id).
+# A message with no events yields NULL. It correlates on `messages.id`, so use it only where the query
+# names `messages` without an alias.
+_LAST_EVENT_COLUMN = (
+    "(SELECT event FROM message_events e WHERE e.id ="
+    " (SELECT MAX(e2.id) FROM message_events e2 WHERE e2.message_id = messages.id)) AS last_event"
+)
+
 # Columns added after the initial release; ALTER-ed in on open for existing DBs.
 # `documents_pruned` (#47, ADR 0042): a nullable epoch timestamp set when retention strips an embedded
 # document in place (NULL = never pruned / no document was ever present). Orthogonal to `status` — it
@@ -4389,6 +4408,16 @@ class MessageStore:
             # can reach this connection yet.
             async with _writer_txn(db, asyncio.Lock()):
                 await cls._migrate(db)
+                # BACKLOG #1720: every CREATE is IF NOT EXISTS and every migration is additive, so an
+                # object an incompatible version left under an expected name was skipped, not fixed.
+                # Checked before the commit, so a refusal rolls the migrations back.
+                await verify_live_schema(
+                    db,
+                    schema=_SCHEMA,
+                    migrate=cls._migrate,
+                    path=path,
+                    keyed=bounded_cipher(cipher) is not None,
+                )
                 await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
             # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
@@ -9141,9 +9170,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
-                " status, error, summary, metadata,"
-                " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
-                "  ORDER BY e.id DESC LIMIT 1) AS last_event"
+                f" status, error, summary, metadata, {_LAST_EVENT_COLUMN}"
                 f" FROM messages{where}"
                 " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
@@ -9207,9 +9234,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
-                " status, error, summary, metadata, raw,"
-                " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
-                "  ORDER BY e.id DESC LIMIT 1) AS last_event"
+                f" status, error, summary, metadata, raw, {_LAST_EVENT_COLUMN}"
                 f" FROM messages{where}"
                 " ORDER BY received_at DESC, id DESC",
                 params,
@@ -11859,6 +11884,8 @@ class MessageStore:
         for cid, (read, errored) in counts.items():  # since-window rows w/o an all-time row
             inbound[cid] = InboundMetrics(read=int(read), errored=int(errored or 0), last_at=None)
 
+        # Reads every outbound row the store holds (BACKLOG #1726, left open): no queue index carries
+        # updated_at or the (channel, destination) pair, so no rewrite over the existing indexes helps.
         cur = await db.execute(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN (?,?) THEN 1 ELSE 0 END) AS queue_depth,"

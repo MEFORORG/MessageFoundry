@@ -1353,3 +1353,33 @@ def test_a_cut_after_whitespace_or_punctuation_led_xml_text_is_a_stated_residual
     (``--username <name> --email``), so the fragment before the cut survives. Pinned so a fix is
     noticed and this arm is turned round."""
     assert "zqxa" in redact_untrusted(_over_window(tail))
+
+
+# --- json_loads_or_refusal (BACKLOG #2048) ------------------------------------
+
+
+def test_json_loads_or_refusal_returns_the_value_and_no_hint() -> None:
+    assert "json_loads_or_refusal" in redaction.__all__
+    assert redaction.json_loads_or_refusal('{"a": [1, 2]}') == ({"a": [1, 2]}, None)
+    assert redaction.json_loads_or_refusal(b"[]") == ([], None)
+
+
+@pytest.mark.parametrize(
+    ("build", "hint"),
+    [
+        # A decode error: position only, never the document.
+        pytest.param(lambda m: '{"k": ' + m, "JSONDecodeError at line 1, column 7", id="bad-json"),
+        # Bytes that are not UTF-8: the class name only, never the bytes.
+        pytest.param(lambda m: (m + "\xff").encode("latin-1"), "UnicodeDecodeError", id="bad-utf8"),
+    ],
+)
+def test_json_loads_or_refusal_hint_is_content_free(
+    build: Callable[[str], str | bytes], hint: str
+) -> None:
+    """The hint carries the position or the class name and nothing of the input. The marker is built
+    at run time so the check cannot pass on a literal that sits in this file's source."""
+    marker = "SYNTH" + str(random.getrandbits(64))
+    value, refusal = redaction.json_loads_or_refusal(build(marker))
+    assert value is None
+    assert refusal == hint
+    assert marker not in refusal

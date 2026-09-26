@@ -244,6 +244,7 @@ class Engine:
         sandbox_settings: SandboxSettings | None = None,
         log_dir: str | None = None,
         registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
+        settings_preflight: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.store = store
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
@@ -267,6 +268,12 @@ class Engine:
         # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
         # (BACKLOG #1142, slice 3); None = no preflight.
         self._registry_preflight = registry_preflight
+        # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
+        # a held reload a second approver releases, cluster convergence, and the DR profile reload.
+        # Dry runs skip it, because it writes audit rows. It raises WiringError to refuse. `serve`
+        # passes the settings trust-anchor preflight here (BACKLOG #2034). It is a callback because
+        # those anchors are known to the API layer, which this package must never import. None = none.
+        self._settings_preflight = settings_preflight
         # Cluster coordination seam (Track B Step 3). None → the no-op NullCoordinator, so single-node
         # (SQLite and single-node Postgres) is byte-identical: is_leader() is always True and
         # start()/stop() do nothing. A DbCoordinator (built by build_coordinator on an enabled [cluster]
@@ -700,6 +707,7 @@ class Engine:
         at/above ``[dr].priority_threshold`` (the rest report ``status:"filtered"``). A reload (not a
         cold start) so a box already serving its full graph drops to the critical set in place, with
         in-flight rows preserved (the reload is quiesce-and-swap)."""
+        was_active = self._dr_active
         self._dr_active = True
         rr = self._registry_runner
         if rr is None:
@@ -709,10 +717,18 @@ class Engine:
         # config dir is configured; otherwise (embedding) re-run the runner over its current registry,
         # which re-evaluates the DR filter in place. propagate=False — a local DR decision, never a
         # cluster-wide config bump.
-        if self.config_dir is not None:
-            await self.reload(self.config_dir, propagate=False)
-        else:
-            await rr.reload(rr.registry)
+        try:
+            if self.config_dir is not None:
+                await self.reload(self.config_dir, propagate=False)
+            else:
+                await self.preflight_settings()  # reload_detail runs it on the branch above (#2034)
+                await rr.reload(rr.registry)
+        except Exception:
+            # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile, so
+            # the latch goes back too. Left set, the next operator reload would park the feeds below
+            # the threshold on a box the DR coordinator reports as not active.
+            self._dr_active = was_active
+            raise
 
     async def _dr_release_drain(self) -> None:
         """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
@@ -1757,6 +1773,13 @@ class Engine:
         if self._registry_preflight is not None:
             await self._registry_preflight(registry, self._env_values)
 
+    async def preflight_settings(self) -> None:
+        """Run the engine's settings preflight; raises ``WiringError`` to refuse. A no-op when none
+        was configured. :meth:`reload_detail` runs it on every real reload, and the DR profile reload
+        runs it when it re-applies the running graph without a config dir (BACKLOG #2034)."""
+        if self._settings_preflight is not None:
+            await self._settings_preflight()
+
     async def reload(
         self,
         config_dir: str | Path | None = None,
@@ -1824,6 +1847,10 @@ class Engine:
         live graph is the one that was already running.
         """
         failures: list[ReloadStepFailure] = []
+        if not dry_run:
+            # First, so every reload route refuses a bad settings anchor at the point the reload
+            # route used to, before anything is read or swapped (BACKLOG #2034).
+            await self.preflight_settings()
         path = self._resolve_reload_target(config_dir)
         self.last_reload_dir = path
         if not path.is_dir():

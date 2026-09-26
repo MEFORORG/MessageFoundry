@@ -1004,10 +1004,14 @@ def urllib_handler_context(
 #:
 #: These are the two the engine passes, and both are measured: ``validate`` becomes ``verify_mode`` (no
 #: effect on the suite list, replicated anyway so the probe mirrors ldap3's construction rather than
-#: approximating it), and ``ca_certs_file`` changes the trust anchors and not one entry of the
+#: approximating it), and ``ca_certs_data`` changes the trust anchors and not one entry of the
 #: negotiable suite list. Every OTHER ``Tls`` argument is REFUSED rather than ignored — see the
 #: function's docstring for why ``ciphers=`` in particular must never be quietly accepted here.
-_LDAP3_TLS_REPLICABLE_KWARGS = frozenset({"validate", "ca_certs_file"})
+#:
+#: ``ca_certs_file`` left this set in BACKLOG #2034. The bind now hands ldap3 the checked bytes rather
+#: than the path, so a path here would mean the bind reads the anchor again, after its check. Refusing
+#: it turns that regression into a construction-time error.
+_LDAP3_TLS_REPLICABLE_KWARGS = frozenset({"validate", "ca_certs_data"})
 
 
 def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str) -> None:
@@ -1037,10 +1041,9 @@ def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str)
     false-premise shape SDS-3.7 forbids. An argument outside :data:`_LDAP3_TLS_REPLICABLE_KWARGS`
     therefore raises here rather than being replicated wrongly or passed over in silence.
 
-    ``ca_certs_file`` is accepted and deliberately **not loaded**: it changes the trust anchors and not
-    one entry of the suite list (measured), while loading it would move a missing-CA failure from
-    connect time to construction time — a behaviour change on a control whose whole point is to change
-    nothing about the connection.
+    ``ca_certs_data`` is accepted and deliberately **not loaded**: it changes the trust anchors and not
+    one entry of the suite list (measured). ``ca_certs_file`` is refused, because the bind loads the
+    checked bytes and never the path (BACKLOG #2034).
 
     Raises :class:`ValueError` at construction, like every other assertion site.
     """

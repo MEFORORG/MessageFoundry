@@ -173,7 +173,9 @@ async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_canno
     # Rebuilt rather than ALTER ... DROP COLUMN: SQLite re-parses the stored CREATE TABLE text after
     # a drop, and the trailing ``--`` comment this change puts on the final column makes that
     # reconstruction "incomplete input". The column list is DERIVED from the live table, so this does
-    # not hard-code a schema that will drift.
+    # not hard-code a schema that will drift. CREATE TABLE AS SELECT carries no constraints, so the
+    # rebuild restores the PRIMARY KEY and UNIQUE(username) as unique indexes: without them the open
+    # refuses the table as missing both (BACKLOG #1720), which a real pre-#1245 store never was.
     con = sqlite3.connect(db)
     try:
         keep = [
@@ -188,6 +190,8 @@ async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_canno
             f"CREATE TABLE users_legacy AS SELECT {cols} FROM users;\n"
             "DROP TABLE users;\n"
             "ALTER TABLE users_legacy RENAME TO users;\n"
+            "CREATE UNIQUE INDEX ux_legacy_users_id ON users(id);\n"
+            "CREATE UNIQUE INDEX ux_legacy_users_username ON users(username);\n"
         )
         con.commit()
         after = {row[1] for row in con.execute("PRAGMA table_info(users)")}
