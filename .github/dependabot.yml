@@ -21,6 +21,21 @@ updates:
   # still audits ci/locks/*.lock directly, for the reason recorded at that step.
   - package-ecosystem: "uv"
     directory: "/"
+    # The uv updater treats any requirements-shaped `.txt` in a top-level directory as a manifest.
+    # `security/runtime-closure-core.txt` is one, but it is an INVENTORY copied from
+    # docker/locks/requirements-core.lock and installs nothing. Dependabot bumped its pins without
+    # the lock in PR 1068 and PR 1295, which is how it came to record 13 versions nothing installs
+    # (BACKLOG #1812). A test now holds it equal to that lock, so such a bump would red the PR.
+    # Excluding it hides no advisory: pip-audit audits requirements.lock, which the same test holds
+    # to the same versions.
+    #
+    # This keeps the VERSION track off the file. An open dependabot-core report (issue 14408) says the
+    # security track ignores `exclude-paths`, so dependabot-lock-resync.yml's rewrite from the lock is
+    # what holds the file to it on both tracks. Key checked on 2026-09-26 against GitHub's
+    # dependabot-options-reference page: one list of globs per update entry, no ecosystem restriction,
+    # relative to `directory` above.
+    exclude-paths:
+      - "security/runtime-closure-core.txt"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
