@@ -1031,6 +1031,34 @@ def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
     assert "--allow-insecure-bind" in capsys.readouterr().err  # warned, served
 
 
+def test_serve_config_twin_alone_names_itself_in_both_bind_arms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #1672: [security].require_encryption_for_remote=false reaches the same two arms as the
+    # flag (it folds into insecure_bind_ok), so an operator who set only the config key must see it
+    # named rather than being told about a flag they never passed. No --allow-insecure-bind here.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # pass the keyless gate
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    base = (
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        "security.block_unlisted_outbound = true\n"
+        "security.require_encryption_for_remote = false\n"
+    )
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]
+    (tmp_path / "messagefoundry.toml").write_text(base, encoding="utf-8")
+    assert main(argv) == 2  # default enforce: the clamp refuses the twin exactly like the flag
+    err = capsys.readouterr().err
+    assert "neither can [security].require_encryption_for_remote=false" in err
+    (tmp_path / "messagefoundry.toml").write_text(
+        base + 'security.enforcement = "warn"\n', encoding="utf-8"
+    )
+    assert main(argv) == 0
+    err = capsys.readouterr().err
+    assert "(or [security].require_encryption_for_remote=false)" in err
+    assert "self-signed placeholder" in err
+
+
 # --- MFA-at-exposure posture (sec-mfa-on; off-loopback bind + [auth].require_mfa) ----------------
 #
 # An exposed (non-loopback) PHI bind with require_mfa off is single-factor over the network: refuse on

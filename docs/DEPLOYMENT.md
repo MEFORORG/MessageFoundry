@@ -38,8 +38,8 @@ wiring time.
 **The API refusal is not about cleartext.** With no certificate configured, the engine still serves
 TLS: it mints a self-signed placeholder on first run
 ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
-No trust store vouches for the placeholder, so a remote client can authenticate the engine only if
-someone hands it that exact certificate out of band. That is why
+No trust store vouches for the placeholder, so a remote client can authenticate the engine only by
+pinning that exact certificate, handed over out of band. That is why
 an exposed bind is refused until a real certificate is configured (BACKLOG #1672). The inbound
 listeners are different: without `tls` they really are cleartext.
 

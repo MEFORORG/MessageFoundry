@@ -188,8 +188,8 @@ def main(argv: list[str] | None = None) -> int:
         help="a dev override for a trusted, firewalled network, honoured only under "
         "[security].enforcement=warn. For the API it permits a non-loopback bind with NO operator "
         "certificate: the engine then serves TLS on its generated self-signed placeholder, which no "
-        "trust store vouches for, so a remote client can authenticate the engine only if it is "
-        "handed that exact certificate out of band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
+        "trust store vouches for, so a remote client can authenticate the engine only by pinning "
+        "that exact certificate, handed over out of band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
         "X12 listeners it permits a non-loopback CLEARTEXT bind, and PHI crosses the network "
         "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file), which is allowed off-loopback "
         "without this flag, and per-connection tls where the connector has it (raw-TCP and X12 have "
@@ -2281,8 +2281,8 @@ def _serve(args: argparse.Namespace) -> int:
     # BACKLOG #1672: WITHOUT AN OPERATOR CERTIFICATE THE HOP IS NOT CLEARTEXT. The unconditional
     # ensure_api_tls_material call further down (ADR 0172) mints a self-signed pair and serves
     # https on it, so every no-certificate arm below would still encrypt. The reason to refuse is
-    # that no trust store vouches for the placeholder, so only a client handed that exact
-    # certificate out of band can authenticate the engine.
+    # that no trust store vouches for the placeholder, so a client can authenticate the engine only
+    # by pinning that exact certificate, handed over out of band.
     # Owner ruling 2026-08-17, amendment to ruling 3 (vault docs/security/OWNER-RULINGS-2026-08-17.md):
     # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
     # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
@@ -2312,15 +2312,16 @@ def _serve(args: argparse.Namespace) -> int:
                 "--allow-insecure-bind (or [security].require_encryption_for_remote=false) and NO "
                 "operator certificate; it serves TLS on the engine's generated self-signed "
                 "placeholder, which no trust store vouches for. A remote client can authenticate the "
-                "engine only if it is handed that exact certificate out of band; any other client "
-                "cannot tell the engine from an on-path attacker presenting a certificate of its own. "
+                "engine only by pinning that exact certificate, handed over out of band; any other "
+                "client cannot tell the engine from an on-path attacker presenting a certificate of "
+                "its own. "
                 "Configure [api].tls_cert_file (+ tls_key_file) for real remote access.",
                 file=sys.stderr,
             )
         elif insecure_bind_ok:
             # #200 (ADR 0092, decision 2) + [security].enforcement: --allow-insecure-bind is CLAMPED
             # shut while the security dial is ENFORCING — the API refuses an off-loopback bind on the
-            # unauthenticated placeholder even WITH the flag (a staging instance under the default
+            # untrusted placeholder even WITH the flag (a staging instance under the default
             # enforce refuses exactly like prod; the same decoupling as every other posture gate — set
             # [security].enforcement=warn to accept the risk). Serving bearer tokens + PHI behind a
             # certificate no trust store vouches for, under strict enforcement, is never one "I accept
@@ -2330,8 +2331,8 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{settings.api.host!r} without an operator certificate under "
                 f"[security].enforcement=enforce ({env_name!r}). The only certificate available is "
                 "the engine's generated self-signed placeholder, which no trust store vouches for, "
-                "so a remote client can authenticate the engine only if it is handed that exact "
-                "certificate out of band; --allow-insecure-bind cannot relax that under strict "
+                "so a remote client can authenticate the engine only by pinning that exact "
+                "certificate, handed over out of band; --allow-insecure-bind cannot relax that under strict "
                 "enforcement (#200), and neither can [security].require_encryption_for_remote=false. "
                 "Configure [api].tls_cert_file for in-process "
                 "TLS, set [api].tls_terminated_upstream (+ trusted_proxies) if a proxy terminates "
@@ -2345,8 +2346,8 @@ def _serve(args: argparse.Namespace) -> int:
                 "error: refusing to serve the API on non-loopback host "
                 f"{settings.api.host!r} without an operator certificate. The only certificate "
                 "available is the engine's generated self-signed placeholder, which no trust store "
-                "vouches for, so a remote client can authenticate the engine only if it is handed "
-                "that exact certificate out of band. Configure "
+                "vouches for, so a remote client can authenticate the engine only by pinning that "
+                "exact certificate, handed over out of band. Configure "
                 "[api].tls_cert_file for in-process TLS, set [api].tls_terminated_upstream "
                 "(+ trusted_proxies) if a proxy terminates TLS, or, under "
                 "[security].enforcement=warn, pass --allow-insecure-bind to accept serving on the "
