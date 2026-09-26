@@ -75,6 +75,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: the Windows config-source guard now refuses to load when it cannot finish reading an
+  ACL.** It used to log a WARNING and load the config Python unchecked. At least these now refuse the
+  load: a `GetNamedSecurityInfoW` error, an owner SID it cannot resolve, a DACL it cannot enumerate,
+  and an unreadable process token. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
+  WARNING for a dev/CI checkout, as it does every refusal from this guard. A `*.py` deleted between
+  the listing and the read is still skipped. The refusal now names the Windows error text. The
+  guard's decisions now run in tests on every platform; the ctypes reader itself still does not.
+  See ADR 0036 Amendment B. (`BACKLOG #1654`)
 - **BREAKING: an administrator must give a notification address to create an account.**
   `POST /users` now requires `email`, and the web console's create-user form requires it too. The
   address becomes the account's notification address, so its holder is told about changes made
