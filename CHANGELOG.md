@@ -136,6 +136,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **`Direct(...)` now fails at construction on faults that used to fail every send.** A
+  `recipient_cert` whose key is not RSA is refused, because the S/MIME envelope supports RSA key
+  transport only. This reverses the EC recipient allowance. An EC `signing_key` or `trust_anchor` is
+  still accepted. Construction also signs and encrypts one synthetic body. So a crypto library that
+  refuses the algorithms, or a line break inside `subject`, now fails `check`.
+- **A `Direct(...)` message that cannot be built now dead-letters at once, with no body on the
+  error.** That is a body the `encoding` cannot represent, or a build failure that began after
+  construction. It used to be a retried transport error. The error now keeps only the failure class,
+  or the codec and position. The old one chained the encode error, whose `.object` is the whole body.
+  `UnsupportedAlgorithm` and `InternalError` are now mapped too. The first was reported under a
+  FIPS-enabled OpenSSL. Neither case was reproduced. (`BACKLOG #1918`, `#1919`, `#1920`, `#1921`)
 - **The shared redactor now scrubs FHIR JSON, DICOM tag dumps and XML, not only HL7.** Its passes
   were HL7-shaped, so a structured payload handed them single tokens and a family name, an MRN or a
   DICOM patient id went through a stored error, a log line, the support bundle and `GET /logs/tail`
