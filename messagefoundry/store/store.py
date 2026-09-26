@@ -240,6 +240,13 @@ class UncommittedWriteError(RuntimeError):
     success (BACKLOG #1803)."""
 
 
+class AbandonedTransactionError(RuntimeError):
+    """A :func:`_writer_guard` found another block's transaction open and could not roll it back.
+
+    The guard refuses the writer rather than run it on a connection that may still hold that
+    transaction; the caller's write did not happen (BACKLOG #1803)."""
+
+
 @asynccontextmanager
 async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
     """Hold ``lock`` over a SHORT writer and never let the block leave a transaction open.
@@ -269,8 +276,11 @@ async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIt
     make the stranger's partial write durable, and a read-only exit would raise
     :class:`UncommittedWriteError` on the stranger's behalf. With every short writer routed through
     here, the one known source left is a writer rollback that outran ``_ROLLBACK_TIMEOUT`` and
-    is still pending. This writer's statements would queue behind that rollback on aiosqlite's one
-    worker thread anyway, so the extra rollback costs no extra wait beyond it."""
+    is still pending.
+
+    If that entry rollback cannot be confirmed, because it failed or is still pending past its bound,
+    the guard raises :class:`AbandonedTransactionError` and never runs the block. Running it would
+    let its DML join the stranger's transaction, which is the torn write this guard exists to stop."""
     async with lock:
         if db.in_transaction:
             log.error(
@@ -280,6 +290,11 @@ async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIt
             )
             if await _unwind_txn(db, role="writer"):
                 raise asyncio.CancelledError
+            if db.in_transaction:
+                raise AbandonedTransactionError(
+                    "the writer connection still holds an abandoned transaction after the entry"
+                    " rollback; refusing to run a writer that would join it (BACKLOG #1803)"
+                )
         try:
             yield
             if db.in_transaction:
@@ -11641,18 +11656,26 @@ class MessageStore:
     async def wal_checkpoint(self) -> None:
         """Force a full WAL checkpoint + truncate (``PRAGMA wal_checkpoint(TRUNCATE)``) so the ``-wal``
         sidecar — which holds recently-written PHI outside any app-level cipher — doesn't grow
-        unbounded between SQLite's own ~1000-page auto-checkpoints. Runs outside a transaction."""
-        async with self._lock:
-            await self._commit()  # ensure no open transaction before checkpointing
+        unbounded between SQLite's own ~1000-page auto-checkpoints. Runs outside a transaction.
+
+        The guard's entry rollback is what ensures that, so the ``_commit()`` below has no
+        transaction to commit. Taken bare, that commit made any transaction another block had
+        abandoned durable (BACKLOG #1803). It stays for its other effect: sqlite3's ``commit()``
+        resets statements still in progress on the connection."""
+        async with _writer_guard(self._db, self._lock):
+            await self._commit()
             await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     async def vacuum(self) -> None:
         """Rebuild the database file to reclaim space freed by purges (SQLite ``VACUUM``). VACUUM holds
         a write lock on the whole DB for its duration and serialises on the store lock, so the
         RetentionRunner schedules it at a daily off-peak time and it is off by default. Must run
-        outside a transaction (VACUUM cannot run inside one)."""
-        async with self._lock:
-            await self._commit()  # VACUUM cannot run inside a transaction
+        outside a transaction (VACUUM cannot run inside one); the guard's entry rollback ensures that
+        without committing another block's abandoned work (BACKLOG #1803). The ``_commit()`` below
+        therefore commits nothing; it stays because VACUUM also refuses to run beside a statement
+        still in progress, and sqlite3's ``commit()`` resets those."""
+        async with _writer_guard(self._db, self._lock):
+            await self._commit()
             await self._db.execute("VACUUM")
 
     async def snapshot_to(self, dest_path: str | Path, *, method: str = "vacuum_into") -> None:
@@ -11686,10 +11709,12 @@ class MessageStore:
             raise ValueError(
                 f"unknown snapshot method {method!r}; expected 'vacuum_into' or 'online_backup'"
             )
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             # Fold the latest committed WAL frames into the main DB so the snapshot is point-in-time and
-            # the -wal sidecar is empty. Commit first so no open transaction blocks the checkpoint, and
-            # fully drain the PRAGMA's result cursor (an open cursor would leave "SQL statements in
+            # the -wal sidecar is empty. The guard's entry rollback leaves no open transaction to block
+            # the checkpoint, so these commits commit nothing; taken bare, they made another block's
+            # abandoned work durable (BACKLOG #1803). They stay to reset statements still in progress.
+            # Fully drain the PRAGMA's result cursor (an open cursor would leave "SQL statements in
             # progress" and abort the VACUUM INTO below).
             await self._commit()
             cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")

@@ -17,9 +17,10 @@ same things:
 
 1. the failure propagates;
 2. NO transaction is left open;
-3. an UNRELATED writer can still use the connection afterwards -- that writer deliberately issues no
-   ``BEGIN``, so it is the probe that would carry the abandoned work if one were still open;
-4. it did NOT carry that work: the ingress row is still there, still ``inflight``, and nothing the
+3. an UNRELATED writer can still use the connection afterwards. That writer issues no ``BEGIN``,
+   and since BACKLOG #1803 it runs under ``_writer_guard``, which rolls an abandoned transaction back
+   on entry. So point 2 is what detects a failed unwind, and this point shows the connection works;
+4. the abandoned work is gone: the ingress row is still there, still ``inflight``, and nothing the
    failed handoff would have produced leaked;
 5. the handoff RE-RUNS to success, which is the at-least-once contract the unwind exists to keep.
 

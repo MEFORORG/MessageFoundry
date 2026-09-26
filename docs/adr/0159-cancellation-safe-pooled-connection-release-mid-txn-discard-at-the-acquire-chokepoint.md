@@ -268,7 +268,10 @@ the next reader does not re-derive the wrong precedent from the same comment.
   needs no sentinel: `in_transaction` already reports precisely what a sentinel would have to encode.
   It is filed as BACKLOG #1803. The 2026-09-18 amendment below records what this sentence said
   before that number existed. **So do not cite this ADR as evidence that a given SQLite writer
-  unwinds on cancellation; check whether that writer goes through `_writer_txn`.**
+  unwinds on cancellation; check whether that writer goes through `_writer_txn`.** *Amended
+  2026-09-26:* the guard above now exists as `_writer_guard`, so check for either helper.
+  `tests/test_writer_guard_covers_every_short_writer.py` pins that no SQLite writer takes the lock
+  bare (BACKLOG #1803).
 
   One property the whole residual rests on is worth stating once: **`isolation_level` is never set
   anywhere in the package.** `MessageStore.open` calls `aiosqlite.connect(str(path))` with no such

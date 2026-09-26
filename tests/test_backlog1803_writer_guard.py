@@ -23,8 +23,10 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+from messagefoundry.store import store as store_mod
 from messagefoundry.store.crypto import CipherError, IdentityCipher
 from messagefoundry.store.store import (
+    AbandonedTransactionError,
     MessageStatus,
     MessageStore,
     OutboxStatus,
@@ -201,6 +203,60 @@ async def test_a_transaction_left_open_by_another_block_is_rolled_back_on_entry(
         await db.close()
 
 
+async def test_an_entry_rollback_that_cannot_clear_refuses_the_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the entry rollback fails, or is still pending past its bound, the stranger's transaction
+    is still open. Running the block would let its DML join that transaction, so the guard refuses
+    and the block never runs."""
+    db = await _fresh(tmp_path)
+    lock = asyncio.Lock()
+
+    async def rollback_that_does_nothing(_db: aiosqlite.Connection, *, role: str) -> bool:
+        return False  # as _unwind_txn does after a logged failure or a timeout
+
+    monkeypatch.setattr(store_mod, "_unwind_txn", rollback_that_does_nothing)
+    ran = False
+    try:
+        await db.execute("INSERT INTO t VALUES ('stranger')")
+        with pytest.raises(AbandonedTransactionError):
+            async with _writer_guard(db, lock):
+                ran = True
+        assert not ran, "the guard ran a writer on a connection holding a stranger's transaction"
+        assert not lock.locked()
+    finally:
+        await db.rollback()
+        await db.close()
+
+
+async def test_a_cancel_during_the_entry_rollback_is_honoured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation swallowed while the entry rollback finished is re-raised, and the block does
+    not run."""
+    db = await _fresh(tmp_path)
+    lock = asyncio.Lock()
+    real_unwind = store_mod._unwind_txn
+
+    async def unwind_then_report_a_cancel(conn: aiosqlite.Connection, *, role: str) -> bool:
+        await real_unwind(conn, role=role)
+        return True  # a cancellation landed mid-rollback and was held until it finished
+
+    monkeypatch.setattr(store_mod, "_unwind_txn", unwind_then_report_a_cancel)
+    ran = False
+    try:
+        await db.execute("INSERT INTO t VALUES ('stranger')")
+        with pytest.raises(asyncio.CancelledError):
+            async with _writer_guard(db, lock):
+                ran = True
+        assert not ran
+        assert not db.in_transaction
+        assert not lock.locked()
+        assert await _keys(db) == []
+    finally:
+        await db.close()
+
+
 # --- the writers the census found reachable on an ordinary path ----------------------------------
 
 
@@ -245,6 +301,13 @@ async def test_a_duplicate_username_leaves_no_open_transaction(tmp_path: Path) -
             await store.create_user(
                 user_id="alice-2", username="alice", auth_provider="local", now=2_000.0
             )
+        # An early-return writer must not hand a leaked transaction on. This one reads, finds no
+        # such user and returns before any DML.
+        assert await store.consume_totp_step("nobody", 1) is False
+        assert not store._db.in_transaction, "an early-return writer handed on an open transaction"
+        # The double-submit shape: the WINNER's own next step opens a transaction of its own. With
+        # the loser's refusal left open, that BEGIN failed and the winner got a 500.
+        await store.set_user_roles("alice", [])
         await _assert_writer_clean(store, "bystander")
         assert await store.get_user("alice-2") is None
     finally:
@@ -342,5 +405,32 @@ async def test_an_incref_of_a_missing_attachment_leaves_no_open_transaction(
         with pytest.raises(KeyError):
             await store.attachment_incref("f" * 64)
         await _assert_writer_clean(store, "bystander")
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("writer", ["wal_checkpoint", "vacuum", "withdraw_ad_channel_scope"])
+async def test_a_maintenance_or_late_writer_never_commits_a_strangers_transaction(
+    tmp_path: Path, writer: str
+) -> None:
+    """``wal_checkpoint`` and ``vacuum`` used to open with a bare ``COMMIT`` to clear the connection,
+    which made any transaction another block had abandoned durable. ``withdraw_ad_channel_scope`` was
+    added after the 2026-09-18 census and took the lock bare. All three now run under the guard, so a
+    stranger's open write is rolled back on entry instead of riding out on their commit."""
+    store = await _store(tmp_path)
+    try:
+        # Left open on the writer, as a leaking block would leave it.
+        await store._db.execute(
+            "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES ('stranger', 'X')"
+        )
+        assert store._db.in_transaction
+        if writer == "withdraw_ad_channel_scope":
+            assert await store.withdraw_ad_channel_scope("nobody", "[]") is False
+        else:
+            await getattr(store, writer)()
+        assert not store._db.in_transaction
+        cur = await store._db.execute("SELECT COUNT(*) AS n FROM ad_group_scope_map")
+        row = await cur.fetchone()
+        assert row is not None and row["n"] == 0, "the stranger's write was made durable"
     finally:
         await store.close()

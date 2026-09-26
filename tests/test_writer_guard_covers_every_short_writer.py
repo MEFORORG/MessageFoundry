@@ -32,20 +32,15 @@ from tests.test_writer_txn_is_the_only_begin import _module_strings, _sql_text
 STORE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "store" / "store.py"
 
 #: The ONLY blocks allowed to take the writer lock bare, keyed by qualified function name, with how
-#: many bare blocks each holds and why it needs no guard. Each is checked below to issue no DML.
-#: Pinned by count so a second bare block inside an exempt method still reds.
+#: many bare blocks each holds and why it needs no guard. Each is checked below to issue no DML and
+#: no commit: a bare COMMIT makes durable whatever another block abandoned, which is the same torn
+#: write a bare DML block causes. Pinned by count so a second bare block in an exempt method reds.
 _BARE_LOCK_ALLOWED: dict[str, tuple[int, str]] = {
     "MessageStore._read": (
         1,
         "the :memory: read fallback; yields the writer connection to reads, which never auto-begin",
     ),
     "MessageStore.list_fifo_lanes": (1, "lane discovery: SELECTs only, no commit needed"),
-    "MessageStore.wal_checkpoint": (1, "a PRAGMA, which never opens a transaction"),
-    "MessageStore.vacuum": (1, "VACUUM, which SQLite refuses to run inside a transaction"),
-    "MessageStore.snapshot_to": (
-        1,
-        "a PRAGMA plus VACUUM INTO or the backup API; copies the file, writes no rows here",
-    ),
 }
 
 #: The context managers that make a lock block safe. A block under either is not a bare lock.
@@ -64,6 +59,7 @@ class _Block(NamedTuple):
     kind: str  # "bare", or the safe helper's name
     guard_args: str  # the helper's arguments as source text; "" for a bare block
     dml: tuple[str, ...]  # DML statement heads found directly inside the block
+    commits: bool  # the block calls `commit()` or `_commit()` itself
 
 
 def _owners(tree: ast.Module) -> dict[int, str]:
@@ -103,6 +99,16 @@ def _dml_in(node: ast.AST, names: dict[str, str]) -> tuple[str, ...]:
     return tuple(heads)
 
 
+def _commits_in(node: ast.AST) -> bool:
+    """Does a call inside `node` commit: `<x>.commit()` or `<x>._commit()`?"""
+    return any(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in ("commit", "_commit")
+        for call in ast.walk(node)
+    )
+
+
 def _lock_blocks(src: str) -> list[_Block]:
     """Every `async with` over a writer lock in `src`: bare `<x>._lock`, or a safe helper call."""
     tree = ast.parse(src)
@@ -120,7 +126,16 @@ def _lock_blocks(src: str) -> list[_Block]:
                 kind, args = ast.unparse(expr.func), ", ".join(ast.unparse(a) for a in expr.args)
             else:
                 continue
-            blocks.append(_Block(owners[id(node)], node.lineno, kind, args, _dml_in(node, names)))
+            blocks.append(
+                _Block(
+                    owner=owners[id(node)],
+                    line=node.lineno,
+                    kind=kind,
+                    guard_args=args,
+                    dml=_dml_in(node, names),
+                    commits=_commits_in(node),
+                )
+            )
     return blocks
 
 
@@ -135,7 +150,8 @@ def _audit(
         for owner, (count, _reason) in sorted(allowed.items())
         if (got := sum(1 for b in bare if b.owner == owner)) != count
     ]
-    writing = [b for b in bare if b.owner in allowed and b.dml]
+    # A commit counts as writing: it turns another block's abandoned transaction into durable work.
+    writing = [b for b in bare if b.owner in allowed and (b.dml or b.commits)]
     return stray, moved, writing
 
 
@@ -146,7 +162,7 @@ def test_every_writer_lock_block_is_guarded() -> None:
     blocks = _lock_blocks(STORE.read_text(encoding="utf-8"))
 
     # Receipts: a walker that found nothing would pass vacuously. Measured 2026-09-26 on engine main
-    # plus #1803: 76 guard blocks (70 with DML this reader can see), 26 _writer_txn blocks, 5 bare.
+    # plus #1803: 79 guard blocks (70 with DML this reader can see), 26 _writer_txn blocks, 2 bare.
     guards = [b for b in blocks if b.kind == "_writer_guard"]
     txns = [b for b in blocks if b.kind == "_writer_txn"]
     assert len(guards) > 60, f"liveness: only {len(guards)} _writer_guard blocks seen"
@@ -168,8 +184,10 @@ def test_every_writer_lock_block_is_guarded() -> None:
         "stale and should be deleted."
     )
     assert not writing, (
-        "an allowlisted bare block issues DML, so its reason no longer holds:\n"
-        + "\n".join(f"  {b.owner} at store.py:{b.line}: {', '.join(b.dml)}" for b in writing)
+        "an allowlisted bare block issues DML or commits, so its reason no longer holds:\n"
+        + "\n".join(
+            f"  {b.owner} at store.py:{b.line}: {', '.join(b.dml) or 'commit'}" for b in writing
+        )
     )
     wrong_args = [b for b in guards if b.guard_args != "self._db, self._lock"]
     assert not wrong_args, (
@@ -216,3 +234,15 @@ def test_the_scanner_finds_a_bare_writer_and_passes_a_guarded_one() -> None:
     # The "reason no longer holds" arm: an allowlisted block that writes.
     _, _, writing = _audit(blocks, {"MessageStore.bare_writer": (1, "control")})
     assert [b.owner for b in writing] == ["MessageStore.bare_writer"]
+
+    # The commit arm: a bare block with no DML that still commits is writing too.
+    committer = _lock_blocks(
+        "class MessageStore:\n"
+        "    async def checkpoint(self):\n"
+        "        async with self._lock:\n"
+        "            await self._commit()\n"
+        '            await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")\n'
+    )
+    assert [(b.dml, b.commits) for b in committer] == [((), True)]
+    _, _, writing = _audit(committer, {"MessageStore.checkpoint": (1, "control")})
+    assert [b.owner for b in writing] == ["MessageStore.checkpoint"]
