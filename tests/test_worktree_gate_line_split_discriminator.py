@@ -63,6 +63,7 @@ from typing import Any
 import pytest
 from _bash_resolver import explain_returncode, require_bash
 
+from tests._spawn_lock import run_single
 from tests.test_worktree_gate import assert_denied, run_gate  # reuse the subprocess harness
 
 # Built by concatenation, matching the straddle suite: a test about quote handling must not depend on
@@ -72,6 +73,7 @@ DQ = '"'
 
 #: An inert marker that ARITHMETICS. An echo-back is not a run, so the marker has to compute.
 BASH_MARKER = "expr 111 \\* 3"
+PWSH_MARKER = "111*3"
 MARKER_RESULT = "333"
 
 #: The four tool x quote corners: (tool, printing program, quote character, gated verb).
@@ -270,3 +272,98 @@ def test_the_denied_shapes_would_really_have_executed(tmp_path: Path) -> None:
         f"rather than the shape. {explain_returncode(proc.returncode, 'the inert marker')} "
         f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# BACKLOG #1429's must-STAY half: a quote character the SHELL treats as data.
+# ---------------------------------------------------------------------------------------------
+#
+# Carrying quote state across the per-line split is how #1429 closes, and it brings a failure the
+# per-line split cannot have. A quote character that the shell reads as DATA -- in a comment, a
+# heredoc or here-string body, an ANSI-C string, a nested substitution -- opens a span in a naive
+# scanner, runs across the newline, pairs with the next real quote, and blanks the live line
+# between. Every row below puts such a quote on one line, a gated command on the NEXT line, and a
+# real quoted word after it.
+#
+# THE TRAILING QUOTED WORD IS WHAT LETS A ROW SEE ITS SHAPE. Without it the stray quote has nothing
+# to pair with, the scanner leaves the unterminated span visible, and a naive cross-line scanner
+# still denies -- so the row could not fail. Each row was run three ways when it was written: DENY
+# on the per-line gate, ALLOW under a deliberately naive cross-line scanner (proof the row can see
+# the shape), and DENY under the #1429 fix.
+#
+# The gated line RUNS in every row; test_the_must_stay_rows_really_run_their_gated_line proves it,
+# so none of these DENYs is a false positive being counted as coverage.
+MUST_STAY = {
+    # A quoted heredoc body is literal, so its apostrophe opens nothing.
+    "heredoc_body_apostrophe": ("Bash", "cat <<'EOF' > notes.txt\ndon't\nEOF\n{G}\necho 'done'"),
+    # A comment is not scanned for quotes by either shell.
+    "comment_apostrophe_bash": ("Bash", "# don't\n{G}\necho 'done'"),
+    "comment_apostrophe_pwsh": ("PowerShell", "# don't\n{G}\nWrite-Output 'done'"),
+    # PowerShell starts a comment straight after a closing quote; bash does not. Measured, pwsh 7.6.
+    "comment_after_a_closing_quote_pwsh": (
+        "PowerShell",
+        "Write-Output 'x'#don't\n{G}\nWrite-Output 'done'",
+    ),
+    # A PowerShell block comment spans lines.
+    "block_comment_apostrophe_pwsh": ("PowerShell", "<# don't\n#>\n{G}\nWrite-Output 'done'"),
+    # A here-string body is literal up to a terminator at column 0.
+    "here_string_single_apostrophe": (
+        "PowerShell",
+        "$m = @'\ndon't\n'@\n{G}\nWrite-Output 'done'",
+    ),
+    "here_string_double_quote": ("PowerShell", '$m = @"\nsay "hi\n"@\n{G}\nWrite-Output "done"'),
+    # An interpreter payload spanning lines, with a comment inside it.
+    "interpreter_payload_comment_spanning_lines": ("Bash", 'bash -c \'# don"t\n{G}\necho "x"\''),
+    # ANSI-C quoting honours a backslash before an apostrophe; a plain single quote does not.
+    "ansi_c_escaped_apostrophe": ("Bash", "echo $'it\\'s'\n{G}\necho 'done'"),
+    # Inside "$( ... )" the quotes NEST, so this apostrophe sits in an inner double-quoted word.
+    "apostrophe_inside_nested_substitution": ("Bash", 'echo "$(echo "it\'s")"\n{G}\necho \'done\''),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(MUST_STAY))
+def test_a_quote_the_shell_reads_as_data_does_not_hide_the_next_line(
+    primary: Path, repos_file: Path, shape: str
+) -> None:
+    """A fix that carries quote state across lines must not start pairing quotes the shell ignores."""
+    tool, template = MUST_STAY[shape]
+    verb = "checkout main" if tool == "Bash" else "reset --hard"
+    command = template.replace("{G}", f"git -C {primary} {verb}")
+    assert_denied(run_gate(payload(tool, command, cwd=primary), repos_file))
+
+
+def test_the_must_stay_rows_really_run_their_gated_line(tmp_path: Path) -> None:
+    """Each MUST_STAY row's gated slot is live code, so its DENY protects something (SDS-3.8).
+
+    The slot is filled with an inert marker that COMPUTES. No git command is built or run here.
+    """
+    bash = require_bash(tmp_path)
+    for shape, (tool, template) in sorted(MUST_STAY.items()):
+        if tool == "Bash":
+            proc = subprocess.run(
+                [bash, "-c", template.replace("{G}", BASH_MARKER)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=tmp_path,
+            )
+            why = explain_returncode(proc.returncode, shape)
+        else:
+            proc = run_single(
+                [
+                    "pwsh",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    template.replace("{G}", PWSH_MARKER),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=tmp_path,
+            )
+            why = f"pwsh exited {proc.returncode}"
+        assert MARKER_RESULT in proc.stdout, (
+            f"{shape}: the gated slot did not run, so its DENY would be over shell data rather than "
+            f"a live command. {why} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
