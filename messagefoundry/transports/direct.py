@@ -74,6 +74,7 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    encode_wire_body,
     register_destination,
 )
 
@@ -510,7 +511,9 @@ class DirectDestination(DestinationConnector):
     def _build_smime(self, payload: str) -> EmailMessage:
         """Build the outbound S/MIME message: SIGN the body with the sender key+cert, then ENCRYPT the
         signed blob to the recipient cert. Returns a fully-formed ``EmailMessage`` ready to submit."""
-        body = payload.encode(self.encoding)
+        # The shared helper, not a bare .encode(): a UnicodeEncodeError carries the WHOLE payload on
+        # `.object`, and the helper raises a content-free error with that chain severed (#1920).
+        body = encode_wire_body(payload, self.encoding, transport=f"Direct {self.host}:{self.port}")
         # SIGN — attach the signer cert so the recipient can verify without a side-channel. Options:
         #   * Binary       — keep the body byte-exact (no MIME/CRLF canonicalization that would corrupt
         #                    an HL7/binary payload).
@@ -584,12 +587,18 @@ class DirectDestination(DestinationConnector):
         # PHI/secret-safe error text: the host + failure class only, never the body, the recipients'
         # PHI, or the password. Crypto failures (a key/cert problem that slipped past construction) map
         # to a non-transient DeliveryError so the message dead-letters rather than spinning on retry.
+        #
+        # The raise sits OUTSIDE the handler on purpose (BACKLOG #1920): `from exc` would chain the
+        # build error as `__cause__`, and `from None` would still leave it on `__context__`. Only the
+        # type NAME survives the handler. See `encode_wire_body` in transports/base.py.
+        msg: EmailMessage | None = None
+        failure = ""
         try:
             msg = self._build_smime(payload)
         except (ValueError, TypeError) as exc:
-            raise DeliveryError(
-                f"Direct {self.host}:{self.port} S/MIME encode failed: {type(exc).__name__}"
-            ) from exc
+            failure = type(exc).__name__
+        if msg is None:
+            raise DeliveryError(f"Direct {self.host}:{self.port} S/MIME encode failed: {failure}")
         try:
             with self._connect() as smtp:
                 if self.username is not None:

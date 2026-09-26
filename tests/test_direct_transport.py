@@ -29,6 +29,7 @@ import datetime
 import inspect
 import smtplib
 import ssl
+import traceback
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -397,6 +398,37 @@ async def test_delivery_error_is_phi_and_secret_safe(
     assert "s3cret" not in text  # never the password
     assert "recipient@hisp.example" not in text  # never a recipient
     assert "SYN123" not in text  # never the (synthetic) body content
+
+
+#: A synthetic body that cannot encode as ASCII. The marker stands in for PHI: it must not be
+#: reachable from the raised error by any route, printed or by attribute.
+_ENCODE_MARKER = "ZZSYNTHMARKER42"
+_UNENCODABLE_HL7 = (
+    "MSH|^~\\&|SEND|FAC|RECV|FAC|20260101||ADT^A01|1|P|2.5\r"
+    f"PID|1||{_ENCODE_MARKER}^^^FAC||MUÑOZ^ANA\r"
+)
+
+
+async def test_encode_failure_leaves_no_exception_chain(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    """BACKLOG #1920. A body the configured codec cannot encode raises ``UnicodeEncodeError``, whose
+    ``.object`` is the WHOLE payload. Chained onto the ``DeliveryError`` -- as ``__cause__`` by
+    ``from exc``, or as ``__context__`` by a raise inside the handler -- it would put the body in
+    front of any logger, serializer or crash reporter that walks the chain. Both links must be empty,
+    and neither the marker nor the offending character may appear in the formatted traceback."""
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki, encoding="ascii"))
+    with pytest.raises(DeliveryError) as ei:
+        await d.send(_UNENCODABLE_HL7)
+    exc = ei.value
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    rendered = "".join(traceback.format_exception(exc))
+    assert _ENCODE_MARKER not in rendered
+    assert "\\xd1" not in rendered and "Ñ" not in rendered  # the offending character
+    assert "ascii" in rendered  # still actionable: names the codec
+    assert _FakeSMTP.instances == []  # nothing dialled for a message that never built
 
 
 # --- test_connection probe: connect + EHLO + NOOP only, no MAIL FROM / DATA --------------------------
