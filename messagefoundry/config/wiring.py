@@ -421,6 +421,37 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
         )
 
 
+def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
+    """Refuse an ``env()`` reference written as an ITEM of a list-valued setting (BACKLOG #1820).
+
+    This is the one statement of the rule; the factories that call it do not restate it. A list
+    setting takes ``env()`` only as its WHOLE value -- ``recipients=env("to")``, or
+    ``recipients = { env = "to" }`` in ``connections.toml`` -- because only a top-level value is
+    resolved by :func:`resolve_env_settings`, the ruling :func:`_reject_envref_headers` is built on.
+    A reference one item down is never resolved, and a connector that ``str()``s its items (at least
+    Email's ``recipients`` and DICOM's ``calling_ae_allowlist`` do) receives its repr, ``default=``
+    included. Both spellings are refused: an :class:`EnvRef` from code-first, and the raw marker dict
+    ``connections.toml`` leaves behind (see :func:`_is_nested_envref`).
+
+    Each factory calls this FIRST, ahead of its own validators, because at least one of them --
+    ``Http``'s ``intake_client_subjects`` prefix check -- quotes the offending items in its message and
+    would print the default this refusal withholds. Offenders are named by setting and index only."""
+    offenders = [
+        f"{name} item {index}"
+        for name, value in settings.items()
+        if isinstance(value, list | tuple | set | frozenset)
+        for index, item in enumerate(value)
+        if _contains_envref(item)
+    ]
+    if offenders:
+        raise WiringError(
+            f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "
+            "not env-resolved, so it would reach the connector as its repr with any default= inside "
+            "it. Write the items as static values, or let one env() reference stand for the whole "
+            "setting."
+        )
+
+
 def parse_env_setting(value: Any) -> Any:
     """Decode one ``connections.toml`` settings value into a literal or an :class:`EnvRef` (ADR 0007).
 
@@ -1811,6 +1842,7 @@ def Http(
     An inbound **without** ``reply_from`` keeps the shipped ``202``-on-receipt behaviour byte for
     byte; every knob above is inert without it, and setting one alone is refused rather than silently
     ignored."""
+    _reject_envref_in_lists("Http", intake_client_subjects=intake_client_subjects)
     settings: dict[str, Any] = {
         "port": port,
         "encoding": encoding,
@@ -2310,6 +2342,11 @@ def Rest(
     ``proxy_user``/``proxy_password`` (secret → ``env()``) authenticate to it (``proxy_auth_type``
     Basic/Digest); ``proxy_no_proxy`` lists intranet hosts to reach directly."""
     _reject_envref_headers("Rest", headers)
+    _reject_envref_in_lists(
+        "Rest",
+        capture_response_headers=capture_response_headers,
+        proxy_no_proxy=proxy_no_proxy,
+    )
     return ConnectionSpec(
         ConnectorType.REST,
         {
@@ -2394,6 +2431,11 @@ def FHIR(
     (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
     (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022."""
     _reject_envref_headers("FHIR", headers)
+    _reject_envref_in_lists(
+        "FHIR",
+        capture_response_headers=capture_response_headers,
+        proxy_no_proxy=proxy_no_proxy,
+    )
     return ConnectionSpec(
         ConnectorType.FHIR,
         {
@@ -2460,6 +2502,7 @@ def Email(
     secrets in ``env()`` (``username``/``password``), never inline. Delivery is at-least-once, so a retry
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""
+    _reject_envref_in_lists("Email", recipients=recipients)
     return ConnectionSpec(
         ConnectorType.EMAIL,
         {
@@ -2534,6 +2577,7 @@ def Direct(
     non-RSA key. It governs the SIGNATURE only: the ENVELOPE's key transport is RSAES-PKCS1-v1_5 and
     the pinned ``cryptography`` exposes no OAEP alternative on ``PKCS7EnvelopeBuilder``, so this
     setting does not make the whole message OAEP-clean."""
+    _reject_envref_in_lists("Direct", recipients=recipients)
     return ConnectionSpec(
         ConnectorType.DIRECT,
         {
@@ -2653,6 +2697,11 @@ def DICOM(
     ``[api].tls_ciphers`` (AEAD-only, forward-secret, encrypting, peer-authenticating, 128-bit floor)
     and then applied, so opting in NARROWS this one hop. A rejected string fails loud at construction,
     surfaced by ``messagefoundry check`` / dry-run."""
+    _reject_envref_in_lists(
+        "DICOM",
+        presentation_contexts=presentation_contexts,
+        calling_ae_allowlist=calling_ae_allowlist,
+    )
     return ConnectionSpec(
         ConnectorType.DIMSE,
         {
@@ -2729,6 +2778,7 @@ def DICOMweb(
     ``env()`` (``bearer_token``/``basic_*``), never in ``headers``. The DICOMweb server **must be
     idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever)."""
     _reject_envref_headers("DICOMweb", headers)
+    _reject_envref_in_lists("DICOMweb", proxy_no_proxy=proxy_no_proxy)
     return ConnectionSpec(
         ConnectorType.DICOMWEB,
         {
@@ -3145,6 +3195,11 @@ def Soap(
     operation **must be idempotent**: an at-least-once re-send mints a fresh ``<wsa:MessageID>`` (correct
     WS-\\* retry semantics), so the partner's dedup must treat a re-send as a retry, not a duplicate."""
     _reject_envref_headers("Soap", headers)
+    _reject_envref_in_lists(
+        "Soap",
+        capture_response_headers=capture_response_headers,
+        proxy_no_proxy=proxy_no_proxy,
+    )
     return ConnectionSpec(
         ConnectorType.SOAP,
         {
