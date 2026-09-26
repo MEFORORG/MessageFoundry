@@ -384,6 +384,11 @@ async def test_keyed_close_after_a_cancelled_handoff_commits_nothing(
         assert reserved >= GCM_RESERVE_BLOCK, "the open did not reserve a block to settle"
 
         await _fail(call, trap, "cancel")
+        # Pin the unwind itself, before close(). Since #1803 the settlement's guard would discard an
+        # open transaction anyway, so the durable reads below check the end state, not the unwind.
+        # A bare check rather than _assert_connection_clean: its probe write would take close()'s
+        # place as the next writer.
+        assert not store._db.in_transaction, "the cancelled handoff left its transaction open"
         await store.close()
         closed = True
     finally:
