@@ -100,20 +100,25 @@ class DicomPeek:
                 if file_meta is not None
                 else None
             )
-            return cls(
-                sop_class_uid=str_or_none(ds.get("SOPClassUID")),
-                sop_instance_uid=str_or_none(ds.get("SOPInstanceUID")),
-                study_instance_uid=str_or_none(ds.get("StudyInstanceUID")),
-                series_instance_uid=str_or_none(ds.get("SeriesInstanceUID")),
-                modality=str_or_none(ds.get("Modality")),
-                transfer_syntax_uid=transfer_syntax,
-                calling_ae_title=calling_ae_title,
-                called_ae_title=called_ae_title,
-            )
+            sop_class_uid = str_or_none(ds.get("SOPClassUID"))
+            sop_instance_uid = str_or_none(ds.get("SOPInstanceUID"))
+            study_instance_uid = str_or_none(ds.get("StudyInstanceUID"))
+            series_instance_uid = str_or_none(ds.get("SeriesInstanceUID"))
+            modality = str_or_none(ds.get("Modality"))
         except DicomError:
             raise  # a DicomBombError is already the verdict; ValueError below must not rewrap it
         except parse_error_types() as exc:
             raise DicomPeekError("body is not a parseable DICOM Part-10 object") from exc
+        return cls(
+            sop_class_uid=sop_class_uid,
+            sop_instance_uid=sop_instance_uid,
+            study_instance_uid=study_instance_uid,
+            series_instance_uid=series_instance_uid,
+            modality=modality,
+            transfer_syntax_uid=transfer_syntax,
+            calling_ae_title=calling_ae_title,
+            called_ae_title=called_ae_title,
+        )
 
     def is_structured_report(self) -> bool:
         """Whether this is a Structured Report (its ``SOPClassUID`` is an SR storage class), so a

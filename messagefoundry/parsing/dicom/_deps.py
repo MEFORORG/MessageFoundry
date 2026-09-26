@@ -65,7 +65,8 @@ def load_header_readers() -> ModuleType:
 
 def parse_error_types() -> tuple[type[BaseException], ...]:
     """The exception tuple a read of **untrusted** DICOM bytes may raise, from ``dcmread``, the deflate
-    guard's header replay, or a lazy value conversion. The codec wraps each one into a PHI-safe
+    guard's header replay, or the peek's read of a value pydicom converts lazily. The parse methods
+    wrap each one into a PHI-safe
     :class:`~messagefoundry.parsing.dicom.errors.DicomError`, so a malformed object dead-letters
     (``ERROR``) instead of escaping the parse contract.
 
@@ -74,8 +75,10 @@ def parse_error_types() -> tuple[type[BaseException], ...]:
     ``BytesLengthException`` both descend straight from ``Exception``, and
     ``tests/test_dicom_parse_error_contract.py`` fails if that module grows a third one the tuple
     misses. pydicom also raises ``NotImplementedError`` for an unknown VR (``values.py``). Enumerated
-    at pydicom 3.0.2, and "at least": the list covers what was found, not everything a later 3.x can
-    raise. The stdlib members cover the truncation and garbage decode paths.
+    at pydicom 3.0.2, and "at least": the list covers what was found, not everything a later pydicom
+    can raise. The stdlib members cover the truncation and garbage decode paths. The accessors on a
+    parsed :class:`~messagefoundry.parsing.dicom.dataset.DicomDataset` read values after ``parse``
+    returns, outside this wrap.
 
     Never add bare ``RuntimeError`` or ``Exception``. :func:`load_dcmread` and
     :func:`load_header_readers` raise ``RuntimeError`` for a missing or broken ``[dicom]`` extra, a

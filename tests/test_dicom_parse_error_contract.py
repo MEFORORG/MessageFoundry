@@ -33,6 +33,7 @@ from messagefoundry.parsing.dicom import (  # noqa: E402
     DicomError,
     DicomPeek,
     DicomPeekError,
+    _inflate,
 )
 from messagefoundry.parsing.dicom import dataset as dataset_module  # noqa: E402
 from messagefoundry.parsing.dicom import peek as peek_module  # noqa: E402
@@ -122,6 +123,10 @@ def _assert_wrapped(
 def test_a_header_the_guard_replay_rejects_is_a_dicom_error(
     parse: _Parse, wrapper: type[DicomError], seed: bytes, cause: type[BaseException]
 ) -> None:
+    # Pin the path: without this, the case would pass unchanged if the guard stopped raising and
+    # dcmread met the error instead, which is what the without-the-guard test already covers.
+    with pytest.raises(cause):
+        _inflate.guard_part10_deflate(seed, force=False)
     _assert_wrapped(parse, wrapper, seed, cause)
 
 
@@ -132,6 +137,7 @@ def test_a_header_the_guard_replay_rejects_is_a_dicom_error(
 def test_a_body_element_dcmread_rejects_is_a_dicom_error(
     parse: _Parse, wrapper: type[DicomError], seed: bytes, cause: type[BaseException]
 ) -> None:
+    _inflate.guard_part10_deflate(seed, force=False)  # the guard passes it, so dcmread meets it
     _assert_wrapped(parse, wrapper, seed, cause)
 
 
