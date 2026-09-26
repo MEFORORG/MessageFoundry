@@ -135,6 +135,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   whatever its `acquire_delay_seconds`. The delay still applies to a lease that expired on its own.
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
+- **BREAKING — the `Http()` inbound listener answers 422 to a body it refuses at ingress.** The
+  engine refuses some bodies after reading them, for example one it cannot decode or one over the
+  ingress ceiling; `docs/CONNECTIONS.md` lists more. The receipt
+  path answered that `202` with no `message_id`, which told the caller its body was accepted. It now
+  answers `422` with `{"error":"message was not accepted"}`, the answer a `reply_from` inbound already
+  gave. The message is still recorded with status `ERROR`. A committed body still gets `202` with its
+  `message_id`. On a `reply_from` inbound, that `422` now logs a `closed` connection event, which it
+  used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
+  to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
 - **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
   is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a

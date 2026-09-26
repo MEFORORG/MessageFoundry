@@ -141,8 +141,12 @@ def test_sync_reply_and_intake_auth_compose() -> None:
 REPLY_BODY = '{"partner":"ok","mrn":"100"}'
 
 
-async def _serve(reply: InboundReply | None, **settings: Any) -> tuple[int, dict[str, str], bytes]:
-    """POST once to a listener wired with a resolver that returns ``reply``; return the raw answer."""
+async def _serve(
+    reply: InboundReply | None, *, events: list[str] | None = None, **settings: Any
+) -> tuple[int, dict[str, str], bytes]:
+    """POST once to a listener wired with a resolver that returns ``reply``; return the raw answer.
+
+    ``events``, when given, collects the connection-event kinds the listener emits."""
     base: dict[str, Any] = {"host": "127.0.0.1", "port": 0}
     if reply is not None:
         base["reply_from"] = "OB_PARTNER"
@@ -158,13 +162,23 @@ async def _serve(reply: InboundReply | None, **settings: Any) -> tuple[int, dict
             return reply
 
         src.sync_reply = resolver
+    if events is not None:
+        sink_events = events
+
+        async def sink(kind: str, peer_host: str | None, reason: str | None) -> None:
+            sink_events.append(kind)
+
+        src.on_connection_event = sink
     await src.start(handler)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
-        writer.write(b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}")
-        await writer.drain()
-        data = await asyncio.wait_for(reader.read(-1), 5.0)
-        writer.close()
+        try:
+            writer.write(b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}")
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(-1), 5.0)
+        finally:
+            writer.close()
+            await asyncio.gather(writer.wait_closed(), return_exceptions=True)
     finally:
         await src.stop()
     head, _, body = data.partition(b"\r\n\r\n")
@@ -247,12 +261,31 @@ async def test_the_refusal_bodies_are_fixed_non_phi_json() -> None:
 
 
 async def test_a_declined_handler_is_422_on_the_sync_path() -> None:
-    # The shipped 202 path answers "202 without a message_id", which is a lie to a proxy client. A
-    # caller blocked on a reply deserves to be told the submission itself failed. Post-record, so
+    # A caller blocked on a reply deserves to be told the submission itself failed. Post-record, so
     # count-and-log holds: the handler already wrote the message with status ERROR.
     status, _, body = await _serve(InboundReply(ReplyOutcome.REPLY, body="x"), _decline=True)
     assert status == 422
     assert "not accepted" in body.decode()
+
+
+async def test_a_declined_handler_gets_the_same_422_on_both_paths() -> None:
+    # Owner ruling 2026-09-26 (BACKLOG #1960): the receipt path used to answer "202 without a
+    # message_id" here, which told the caller a refused body was accepted. Both paths now answer the
+    # same status and the same bytes, so a caller cannot tell which mode refused it.
+    #
+    # The connection log must match too. The sync path's 422 used to return True from _serve_one,
+    # which suppresses the outer "closed" event, although a post-record refusal emits no event kind
+    # of its own. So that log showed "established" with no end.
+    sync_events: list[str] = []
+    receipt_events: list[str] = []
+    sync = await _serve(
+        InboundReply(ReplyOutcome.REPLY, body="x"), events=sync_events, _decline=True
+    )
+    receipt = await _serve(None, events=receipt_events, _decline=True)
+    assert receipt == sync  # status, headers and body alike
+    assert receipt[0] == 422
+    assert receipt[2] == b'{"error":"message was not accepted"}'
+    assert sync_events == receipt_events == ["established", "closed"]
 
 
 async def test_a_hostile_partner_content_type_cannot_take_the_turn_down() -> None:

@@ -2,6 +2,11 @@
 
 - **Status:** **Accepted (2026-07-31) — owner-ratified at revision 5. BOTH increments are now authorised, built and merged: increment A 2026-08-01 (`f2ef0ea9`, PR #109), increment B 2026-08-01 (PR #119). `AC-18` was deliberately deferred and remains outstanding — see the note below.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-30 (rev 1–4), 2026-07-31 (rev 5, ratified)
+- **Amended 2026-09-26 (BACKLOG #1960, owner ruling):** a body the receipt handler refuses at ingress
+  is now answered **`422`** on the `202` receipt path too, not only on the sync path. D5's note on the
+  `None` return and **AC-8** said the receipt path kept its "`202` without a `message_id`". Both keep
+  their original text, with a dated note in place. See
+  [Amendment 2026-09-26](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
   start*. Here it was **scoped**, because rev 4 split the build and that split is part of what was
   ratified. **Both halves have since been authorised and built** — the split below is retained as the
@@ -363,7 +368,9 @@ reaches a connector — as a runtime-injected attribute on `SourceConnector`, de
 ACK-on-receipt:** the sync path *physically cannot run* before the body is durable, because its argument does
 not exist until `enqueue_ingress` returns. `_handle_inbound_http` is untouched; `InboundHandler`
 ([`transports/base.py`](../../messagefoundry/transports/base.py)) is untouched, so MLLP/TCP are unaffected;
-and an inbound without `reply_from` takes the byte-identical shipped path.
+and an inbound without `reply_from` takes the byte-identical shipped path. *(Amended 2026-09-26: except
+for a refused body, which both paths now answer `422`; see the
+[amendment](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).)*
 
 **The resolver arms the rendezvous itself, as its first action.** Revision 1 required arming "after
 `enqueue_ingress` returns and before `_wake_lane(Stage.INGRESS, …)`" — two sites that are only ever adjacent
@@ -576,6 +583,10 @@ timeouts would silently corrupt the one metric an operator pages on.
 **Outside the outcome table, because it happens before the resolver exists:** a handler returning `None`
 yields **`422`** on the sync path only. Today it yields "`202` without a `message_id`", which is a lie to a
 proxy client. The shipped `202` path keeps today's behaviour exactly.
+*(Amended 2026-09-26: the last sentence no longer holds. By owner ruling the `202` path answers the same
+`422` and the same body, because a `202` misleads a plain receipt client exactly as it misleads a proxy
+client. See the
+[amendment](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).)*
 
 **This is a *post-record* refusal, not a pre-ingress one, and the distinction matters for count-and-log.**
 `_handle_inbound_http` returns `None` only *after* `record_received(status=MessageStatus.ERROR, …)` has
@@ -632,7 +643,9 @@ The rejection stands on the field being untyped free text, which is the honest r
 **Note that three of these deltas change the shipped `202` path**: the `503` reason-phrase fix, `TCP_NODELAY`,
 and the `_read_request` split. AC-8's "unchanged" is therefore scoped to the **response body and status
 semantics** of a `reply_from`-less inbound, not to every byte on the wire. Saying so is the honest form of
-the claim.
+the claim. *(Amended 2026-09-26: a fourth delta now changes that path's status semantics too. A body the
+handler refuses is answered `422`, not `202`. See the
+[amendment](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).)*
 
 **Bounding is three independent clocks**: `receive_timeout` (read only, unchanged) + `reply_timeout` (the
 block) + `reply_write_timeout` (the drain). `self._active` already spans all of `_serve_one`, so
@@ -975,7 +988,11 @@ to skip auth.
   → `tests/test_inbound_http_intake_auth.py::test_intake_auth_offline_validation_refuses`
 - **AC-8** — THE SYSTEM SHALL leave every inbound without `reply_from` unchanged in response body and status
   semantics: the same `202` receipt, the same `InboundHandler` contract, and no new store read on that path.
+  *(Amended 2026-09-26: "the same `202` receipt" now covers a body the handler commits. A body it refuses,
+  returning `None` after recording `ERROR`, is answered `422` as on the sync path. See the
+  [amendment](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).)*
   → `tests/test_inbound_http_source.py::test_respond_with_receipt_on_ingress`
+  → `tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`
 - **AC-9** — WHILE a reply is being returned, THE SYSTEM SHALL NOT log the reply body at INFO or above nor
   place it in any exception, `connection_event.reason` or `message_events.detail`, SHALL bound the response
   drain by `reply_write_timeout`, and SHALL reject a captured `Content-Type` containing CR or LF **inside
@@ -1232,3 +1249,60 @@ the CIDR-aware predicate; the others are left as found.
 owner ratified it at revision 5 — the status line above records that. (This paragraph previously ended
 "the status line stays **Proposed** because ratification is the owner's, not the author's", which was
 true when it was written at revision 4 and contradicted the header from revision 5 onward.)
+
+## Amendment 2026-09-26: a body refused at ingress is answered 422 on both paths
+
+**The owner ruled on 2026-09-26, given to a Manager seat in session via AskUserQuestion.** The answer, verbatim:
+*"Answer 422, amend 0154 (Recommended)"*. The option it selected read: *"the async path answers 422
+{"error":"message was not accepted"} like the sync path; amend ADR 0154 lines 576-578 and AC-8; update
+CONNECTIONS.md and the stale comments. Ships as its own PR because it amends an ADR."* Filed and built
+as BACKLOG #1960.
+
+**What changed.** The receipt handler returns `None` when it refuses a body after reading it. The
+guards that do this live in `RegistryRunner._handle_inbound_http`; each records the message with status
+`ERROR` and commits no ingress row. D5 answered that `422` on the sync path only, and kept the `202`
+receipt path answering `202` with no `message_id`. Now both paths answer **`422`** with the fixed,
+non-PHI body `{"error":"message was not accepted"}`. One branch in `HttpSource._serve_one`
+([`transports/http_listener.py`](../../messagefoundry/transports/http_listener.py)) answers it before
+the mode is chosen, so the two paths cannot drift.
+
+That move changed one more thing on the sync path. Its `422` used to suppress the listener's closing
+`connection_event`, although the refusal emits no event kind of its own. So the connection log showed
+`established` with no end. Both paths now log `closed` after the `422`. The `422` also drains under the
+receipt-sized budget in both modes, since `reply_write_timeout` exists for a partner-sized body.
+
+**Why the carve-out went.** D5 gave the reason itself: a `202` without a `message_id` is a lie to a proxy
+client. A plain receipt client is told the same lie. It reads `202` as "your body is stored and will flow",
+while the body is an `ERROR` row that will never route. The only cost the original text protected was an
+unchanged wire answer for existing callers, and section 0 of `CLAUDE.md` puts that cost at zero, because
+nothing is deployed.
+
+**What did not change.**
+
+- Count-and-log. The `ERROR` row is still the record, written before the answer. Only the HTTP status
+  and body move. This is still a post-record refusal, as D5's following paragraph explains.
+- A committed body still gets the same `202` receipt carrying its `message_id`. AC-8 holds for it.
+- The pre-ingress refusals happen before the handler runs and are untouched. That covers at least the
+  `400`, `401`, `403`, `408`, `411`, `413` and `503` answers.
+- Other receipt-handler consumers keep their own answer. The DICOM C-STORE SCP, at least, already
+  answers a DIMSE failure on `None` (BACKLOG #1910).
+
+**Known limits, not settled by this amendment.** A `None` says neither why the handler refused nor which
+`ERROR` row it wrote. Three consequences follow.
+
+- At least two causes are on the engine's side and may pass on a retry: the streaming detach's in-flight
+  budget, and the strict-validation timeout. They now answer `422` like bad content, and a sender that
+  treats every `4xx` as final gives up.
+- A body over the engine's ingress ceiling answers `422`, while one over the listener's `max_body_bytes`
+  answers `413`. The two differ only when an operator raises `max_body_bytes` past that ceiling.
+- The `422` carries no id, so an operator matches it to its `ERROR` row by time and peer only. The
+  refusal emits no `connection_event` kind of its own either.
+
+Before this amendment each of these answered `202`, which told the sender the body was stored, so the
+`422` is still the more honest answer. Fixing any of them widens the receipt-handler contract past
+`str | None`. That is unfiled, and it needs its own decision.
+
+**Where the original text stays.** D5's note and AC-8 keep their wording, each with a dated italic note in
+place. AC-8 now links a second test,
+`tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`, which pins
+the `422`, the exact body, exactly one `ERROR` row, no ingress row, and the `closed` event.
