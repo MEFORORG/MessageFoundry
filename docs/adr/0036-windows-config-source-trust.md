@@ -5,6 +5,9 @@
   the IDE-trust ADR — `0036` is the next free number (see [README.md](README.md)).
   **Amended 2026-09-18 (Amendment A, BACKLOG #1647)** — the owner is now vetted instead of trusted
   unconditionally, and that one new arm is fail-closed. Read Decisions 1 and 3 as amended below.
+  **Amended 2026-09-26 (Amendment B, BACKLOG #1654):** the read-failure arms now fail closed too,
+  under the same escape. Amendment B supersedes the fail-open text in Decision 3 and in
+  *Alternatives considered*.
 - **Built:** yes — [`_assert_safe_config_source`](../../messagefoundry/config/wiring.py) now dispatches
   to a real Windows check (`_assert_safe_config_source_windows` + the pure `_evaluate_config_dacl`
   policy) instead of an unconditional early-return; [`install-service.ps1`](../../scripts/service/install-service.ps1)
@@ -55,7 +58,8 @@ could drop/rewrite a config module that executes as the service account on the n
    ACE is reported as itself rather than masked by the owner verdict. When the process token cannot be
    read at all (`self_sid` is `None`) the owner comparison is **skipped**, mirroring the POSIX arm's
    `self_uid` guard: with nothing to compare against, refusing would turn an unreadable token into a
-   service that cannot start.
+   service that cannot start. *Superseded by Amendment B (Decision 3): an unreadable token now
+   refuses the load, and the skip is reached only when the escape has downgraded that refusal.*
 
    Two limits of the well-known-SID arm are accepted rather than solved, and both are recorded in
    `_is_well_known_admin_sid`'s docstring so a reader meets them at the code. First, the RID is matched
@@ -80,7 +84,8 @@ could drop/rewrite a config module that executes as the service account on the n
    `console/service_control.py`). This keeps the
    DEP-1 / pip-audit surface flat — **no new runtime dependency**.
 
-3. **Fail OPEN with a loud WARNING on a Win32 API *error*** (not a policy decision). A
+3. **Fail OPEN with a loud WARNING on a Win32 API *error*** (not a policy decision).
+   *Superseded by Amendment B below: these arms now refuse.* A
    `GetNamedSecurityInfoW`/`GetAce` failure must **not brick a previously-working service** — the guard
    logs a `WARNING` (the config-dir ACL could not be evaluated; verify it manually) and **proceeds**,
    so the worst case is "no worse than the old no-op". A WARNING about an *unevaluable* guard means
@@ -137,6 +142,40 @@ could drop/rewrite a config module that executes as the service account on the n
    hatch, one fails closed with one. Widening the fail-closed posture to the other four is a separate
    change with its own argument to make, and it is not made here.
 
+   **Amended 2026-09-26 (Amendment B, BACKLOG #1654): the four read-failure arms fail CLOSED.** This
+   supersedes the fail-open posture above. At least these now **refuse** the load: a
+   `GetNamedSecurityInfoW` error, an owner SID that `ConvertSidToStringSidW` cannot render, a DACL
+   that `GetAce` cannot enumerate, and a process token that cannot be read. Each refusal goes through
+   `_refuse_unsafe_config_source`, so `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades it to a WARNING,
+   exactly as it does for the owner-membership arm. With the escape set, a per-path read failure skips
+   that path, and an unreadable token lets the load go on with the owner comparison skipped while the
+   ACE pass still runs. The inconsistency named in the paragraph above is gone for these four arms:
+   each refuses, with the same escape as the membership arm.
+
+   One read failure deliberately does not refuse. A `*.py` removed between the directory listing and
+   its read returns `ERROR_FILE_NOT_FOUND` or `ERROR_PATH_NOT_FOUND`. The guard skips it only when
+   `os.path.lexists` confirms the path is gone, so a dangling link, which reads as not-found too,
+   still refuses. A file that no longer exists is not code this load can execute. The directory
+   itself still refuses on those errors. The POSIX arm also skips this race, but inside a wider
+   `except OSError: continue` that skips any failed `stat`. Amendment B does not change the POSIX arm.
+
+   Two things changed the argument. First, "never brick a service that started fine before this
+   check existed" protects running services, and MessageFoundry has none: it is a beta with no
+   deployment (CLAUDE.md section 0), so there is nothing a stricter check could brick. Second, the
+   ASVS v5.0.0 V16.5.3 reasoning above applies to these arms as much as to the membership arm. A check
+   that could not read the DACL has not shown the code safe to execute, and loading it anyway is
+   *"processing a transaction despite errors resulting from validation logic"*. Before this
+   amendment, a first Windows deployment that hit one of these errors would have run the config
+   Python unchecked. One WARNING line would have been the only sign.
+
+   **The decision now runs on every platform.** The ctypes readers moved into
+   `_win32_config_source_probes`, which only reads and reports. The pure
+   `_enforce_windows_config_source` makes every decision on what those readers return. The tests
+   replace the readers and nothing else, so each error arm runs on the Linux CI leg. The ctypes
+   readers' own error paths are still run by no test, on any platform. The test this
+   replaced patched the whole Windows function with a stub that logged its own warning, so it
+   asserted the stub, and it stayed green when the branch it named was made fail-closed.
+
 4. **Installer `-LockConfigDir` (opt-in) + always-on WARNING.** `install-service.ps1` gains
    `-LockConfigDir`, which runs `icacls <Config> /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F'
    '*S-1-5-32-544:(OI)(CI)F' '<account>:(OI)(CI)RX'` — stripping inherited (incl. low-priv write) ACEs
@@ -178,6 +217,9 @@ could drop/rewrite a config module that executes as the service account on the n
   because that arm has no prior behavior to be worse than. It is new code, so "no worse than the old
   no-op" cannot be claimed for it, and ASVS v5.0.0 V16.5.3 applies to it directly (Decision 3 as
   amended). It fails closed, with the `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` escape.
+  **Adopted by Amendment B** (2026-09-26, BACKLOG #1654): the Win32-API-error arms fail closed too,
+  with the same escape. The rejection rested on a running service to protect, and there is none
+  (Decision 3 as amended).
 
 - **Resolve Administrators membership with `CheckTokenMembership`.** Rejected for Amendment A:
   `CheckTokenMembership` is local-token-only and cannot block on a domain controller, which is what we
@@ -200,7 +242,8 @@ could drop/rewrite a config module that executes as the service account on the n
   must lock it (`-LockConfigDir`, or point `-Config` at an admin-owned dir).
 - A too-strict check could refuse a legitimate dir; mitigated by (a) the write-class mask (read/execute
   passes), (b) trusting the current user + admin/SYSTEM + **a vetted owner** (Amendment A), and (c)
-  fail-open-on-API-error for the arms Decision 3 as amended names.
+  the `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` escape. Item (c) read "fail-open-on-API-error" until
+  Amendment B made those arms refuse.
 - **Amendment A widens what can be refused, and one shape is worth stating plainly.** A config
   directory owned by an IT account whose administrator rights come only through a nested domain group
   is refused, because the membership lookup is deliberately local. The cures are to re-own the
@@ -214,9 +257,10 @@ could drop/rewrite a config module that executes as the service account on the n
   (the runner workspace and most dev trees), so the guard would refuse every config load outside a
   locked-down install. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` (off by default) downgrades the refusal to a
   loud WARNING for a user-writable dev/CI checkout — symmetric with the POSIX guard and mirroring
-  `MEFOR_ALLOW_INSECURE_TLS`. It is **never set in production** (the installer locks the dir, so the
-  guard never trips there); the test suite sets it only on win32, and the guard's own refusal test pins
-  it back OFF. See `insecure_config_source_allowed()` in `config/settings.py`.
+  `MEFOR_ALLOW_INSECURE_TLS`. It is **never set in production**. The installer locks the dir, so the
+  permission arms do not trip there, but a read failure still can (Amendment B), and its cure is to
+  fix the read, not to set the escape. The test suite sets it only on win32, and the guard's own
+  refusal test pins it back OFF. See `insecure_config_source_allowed()` in `config/settings.py`.
 - `docs/SERVICE.md` "Lock down the config directory" is updated to say the guard is now actively
   enforced and to document `-LockConfigDir`.
 

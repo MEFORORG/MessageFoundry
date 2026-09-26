@@ -685,11 +685,16 @@ def test_verify_fails_a_crl_file_the_engine_refuses(
     anchored: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The row passes [auth].oidc_tls_crl_file, as AuthService does. It used to leave it out, so a
-    CRL file that refuses engine startup read as PASS here."""
+    CRL file that refuses engine startup read as PASS here.
+
+    The file EXISTS but holds no CRL. A missing path no longer reaches this row: the settings load
+    refuses it first, naming [auth].oidc_tls_crl_file (BACKLOG #1997)."""
     _verdicts(monkeypatch, acl=True, path=True)
-    row = _tls_row(_fed_settings(anchored, crl=str(tmp_path / "absent-crl.pem")))
+    not_a_crl = tmp_path / "not-a-crl.pem"
+    not_a_crl.write_text("placeholder, no X509 CRL block\n", encoding="utf-8")
+    row = _tls_row(_fed_settings(anchored, crl=str(not_a_crl)))
     assert row.status is Status.FAIL
-    assert "does not exist" in row.detail
+    assert "no CRL found" in row.detail
 
 
 # --- the per-connection inbound CAs (BACKLOG #1142, slice 3) -----------------------------------------
