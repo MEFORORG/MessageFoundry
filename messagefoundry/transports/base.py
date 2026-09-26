@@ -144,7 +144,9 @@ def positive_cap[NumT: (int, float)](
     try:
         cap = cap_setting(value, convert)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{transport} {knob}={value!r} is not a valid number") from exc
+        raise ValueError(
+            f"{transport} {knob}={value!r} is not a valid {convert.__name__} value"
+        ) from exc
     if cap is not None and not cap > 0:
         raise ValueError(
             f"{transport} {knob}={value!r} must be above zero (use None or 0 to disable it)"
@@ -168,7 +170,10 @@ def resolve_poll_ceiling(value: Any, *, knob: str, transport: str) -> int | None
     # ``value`` is typed Any rather than object because every call site reads it out of an untyped
     # settings mapping; object would need a `type: ignore` on this line, and a suppression a reader
     # has to decide whether to trust is worse than the honest Any.
-    ceiling = cap_setting(value, int)
+    try:
+        ceiling = cap_setting(value, int)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{transport} {knob}={value!r} is not a valid int value") from exc
     if ceiling is None:
         return None
     if ceiling < 1:

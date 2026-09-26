@@ -150,7 +150,8 @@ transport = "mllp"
   cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
   those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
   spelling. The one cap with no "off", the HTTP listener's `max_header_bytes`, refuses `0` in either
-  spelling. DICOM `max_pdu_size` is handed to the DICOM library as written and is not covered.
+  spelling. Not every numeric setting has the negative refusal yet: at least DICOM `max_pdu_size`,
+  `max_associations` and `timeout_seconds` do not.
   A setting whose type is a **table** or an **array** — `headers`, `odbc_params`,
   `capture_response_headers`, `proxy_no_proxy` — is held to its shape, so `headers = 5` is refused;
   where the entries have a readable type it is held to those too, one level in, so

@@ -161,20 +161,25 @@ def test_the_dicom_scp_object_cap_reads_a_string_zero_as_uncapped() -> None:
         _SCP({"max_object_bytes": -1})
 
 
+_RATE = "max_messages_per_second"
 _BURSTS = [
-    pytest.param(_MLLP_IN, "message_burst", "max_messages_per_second", id="mllp-burst"),
-    pytest.param(_TCP_IN, "message_burst", "max_messages_per_second", id="tcp-burst"),
-    pytest.param(_X12_IN, "message_burst", "max_messages_per_second", id="x12-burst"),
-    pytest.param(_HTTP_IN, "message_burst", "max_messages_per_second", id="http-burst"),
+    pytest.param(_MLLP_IN, "message_burst", _RATE, "MLLP source", id="mllp-burst"),
+    pytest.param(_TCP_IN, "message_burst", _RATE, "TCP source", id="tcp-burst"),
+    pytest.param(_X12_IN, "message_burst", _RATE, "X12 source", id="x12-burst"),
+    pytest.param(_HTTP_IN, "message_burst", _RATE, "HTTP source", id="http-burst"),
     pytest.param(
-        _SCP, "association_burst", "max_associations_per_second", id="scp-association-burst"
+        _SCP,
+        "association_burst",
+        "max_associations_per_second",
+        "DICOM SCP source",
+        id="scp-association-burst",
     ),
 ]
 
 
-@pytest.mark.parametrize(("build", "key", "rate_key"), _BURSTS)
+@pytest.mark.parametrize(("build", "key", "rate_key", "transport"), _BURSTS)
 def test_a_string_zero_burst_defaults_to_the_rate_like_a_number_zero(
-    build: Build, key: str, rate_key: str
+    build: Build, key: str, rate_key: str, transport: str
 ) -> None:
     """A burst of ``0`` means "one second's worth", the rate. A string ``"0"`` used to become a burst
     of zero, which the pacer floors to one, so every burst past one message was paced.
@@ -186,7 +191,8 @@ def test_a_string_zero_burst_defaults_to_the_rate_like_a_number_zero(
     assert getattr(zero, burst_attr) == 100.0
     assert getattr(string_zero, burst_attr) == 100.0
     assert getattr(build({rate_key: 100, key: "7"}), burst_attr) == 7.0  # the control
-    with pytest.raises(ValueError, match=key):
+    # The refusal names the connector too, so a listener that stops passing its own name shows up.
+    with pytest.raises(ValueError, match=f"{transport} {key}="):
         build({rate_key: 100, key: -1})
 
 
@@ -281,7 +287,7 @@ def test_positive_cap_refuses_what_is_left_after_zero_reads_as_off() -> None:
     assert positive_cap("3", int, knob="k", transport="t") == 3
     # 0.5 truncates to an int cap of zero, which refuses everything; NaN, "1e3" and text fail inside
     # int() itself, and must still name the setting.
-    for bad in (-1, "-1", 0.5, math.nan, "1e3", "lots"):
+    for bad in (-1, "-1", 0.5, math.nan, "1e3", "lots", [1], math.inf):
         with pytest.raises(ValueError, match="t k="):
             positive_cap(bad, int, knob="k", transport="t")
     for bad_seconds in (-0.5, "-0.5", math.nan):

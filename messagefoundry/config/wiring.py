@@ -1409,8 +1409,9 @@ def MLLP(
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
     accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
     ``message_burst`` sizes the allowance above that sustained rate; ``None`` **and** ``0`` both mean
-    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. The connector
-    reads it as ``message_burst or rate``, so any falsy value takes the rate. Both keys reach the
+    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. ``None`` or
+    ``0`` in any spelling, including the text ``"0"``, takes the rate, and a negative is refused at
+    build (BACKLOG #1872). Both keys reach the
     connector from here or from a ``connections.toml`` inbound entry, which desugars through this same
     factory.
 
