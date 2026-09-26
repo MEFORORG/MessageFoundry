@@ -1076,12 +1076,17 @@ def test_the_pin_is_still_enforced_after_a_rebuild(renewable_engine: _RenewableE
         assert poller._client is not first  # it did follow the file; the pin is what refused
 
 
-def test_a_pin_that_will_not_load_is_tried_and_logged_once(
+def test_a_pin_that_will_not_load_is_retried_but_logged_once(
     renewable_engine: _RenewableEngine,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Changed bytes that do not load are remembered: one load, one log line, then quiet."""
+    """Changed bytes that do not load: one log line, but the load is retried every tick.
+
+    Retrying matters because the bytes a tick reads and the bytes its load saw can differ, so
+    bytes once logged as refused may be a good certificate. The last step is that case: the
+    refused bytes' load is made to fail, then the same bytes load and are adopted.
+    """
     from messagefoundry.tray.probe import load_pin
 
     loads: list[str] = []
@@ -1096,8 +1101,18 @@ def test_a_pin_that_will_not_load_is_tried_and_logged_once(
         with caplog.at_level(logging.INFO, logger=_POLLER_LOGGER):
             for tick in range(3):
                 assert _health(poller, float(tick)) is HealthProbe.OK
-        assert len(loads) == 1
+        assert len(loads) == 3
         assert caplog.text.count("does not load") == 1
+
+        # A good certificate whose first load fails (as a mid-load rewrite would) is still adopted.
+        first = poller._client
+        renewable_engine.serve(renewable_engine.renew_pin())
+        monkeypatch.setattr("messagefoundry.tray.poller.load_pin", lambda _c: None)
+        poller.poll_once(3.0)
+        assert poller._client is first
+        monkeypatch.setattr("messagefoundry.tray.poller.load_pin", counting)
+        assert _health(poller, 4.0) is HealthProbe.OK
+        assert poller._client is not first
 
 
 def test_a_pin_on_a_plain_http_url_is_not_followed(tmp_path: Path) -> None:

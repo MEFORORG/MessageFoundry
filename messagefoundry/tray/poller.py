@@ -249,7 +249,7 @@ class StatusPoller:
         self._client_factory = client_factory
         #: The pin bytes the current client was built from, or None when it was not built from them.
         self._pin_pem: bytes | None = None
-        #: The last changed pin bytes that would not load, so they are tried and logged only once.
+        #: The last changed pin bytes that would not load, so the same bytes are logged only once.
         self._pin_refused: bytes | None = None
         self._clock = clock
         self._toast_min_interval_s = toast_min_interval_s
@@ -378,23 +378,26 @@ class StatusPoller:
         OS trust store or turns verification off. The record moves only after the new client
         exists, so a build that raises is retried on the next tick.
 
-        Changed bytes that do not load are remembered, so the same bytes are neither loaded again
-        every tick nor logged again. A renewal caught mid-write logs one line and then settles; a
-        file that stays broken says so once, instead of the engine silently reading DOWN.
+        Changed bytes that do not load are logged once, so a file that stays broken says so
+        instead of the engine silently reading DOWN, and a renewal caught mid-write costs one line.
+        The load itself is retried every tick even for bytes already logged. Skipping it would be
+        wrong: the bytes read here and the bytes the load saw can differ, so bytes recorded as
+        refused may be a good certificate the load simply never saw.
         """
         if self._pin is None or self._stop.is_set():
             return
         current = read_pin(self._pin)
-        if current is None or current in (self._pin_pem, self._pin_refused):
-            return  # unreadable, unchanged, or already refused: keep the current client
+        if current is None or current == self._pin_pem:
+            return  # unreadable (keep the current client) or unchanged (nothing to do)
         loaded = load_pin(self._pin)
         if loaded is None:
             # Present but not loadable: empty, half-written, or rewritten mid-load.
-            self._pin_refused = current
-            log.info(
-                "engine certificate %s changed but does not load; keeping the current probe client",
-                self._pin,
-            )
+            if current != self._pin_refused:
+                self._pin_refused = current
+                log.info(
+                    "engine certificate %s changed but does not load; keeping the current client",
+                    self._pin,
+                )
             return
         log.info(
             "engine certificate %s %s; rebuilding the probe client",
