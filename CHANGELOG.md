@@ -293,6 +293,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   got that answer. On those two backends the insert is refused by the foreign key to the account.
   The engine now re-reads the account to tell the two refusals apart. SQL Server has no such foreign
   key, so there the insert is not refused and this change does not apply. (`BACKLOG #1807`)
+- **A missing or blank CRL path is now refused at load, naming the setting the operator wrote.**
+  Before, `[api].tls_client_crl_file`, `[logging].forward_tls_crl_file`, `[auth].oidc_tls_crl_file`
+  and `[tls].crl_file` had no load-time check. A missing path failed closed only if a hop's TLS
+  context was built, and that refusal began `[tls] crl file` for every one of them. Each now has its
+  own validator, the shape `[store].ssl_crl_file` already had, and all five refuse a blank value.
+  The refusal names the setting and the path, and nothing else. It applies even where the setting
+  has no effect, such as `[auth].oidc_tls_crl_file` with OIDC off. A CRL that exists but is expired
+  or unloadable is still refused when the context is built, under the old `[tls] crl file` prefix.
+  (`BACKLOG #1997`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`

@@ -25,6 +25,7 @@ import logging
 import time
 import urllib.request
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -284,7 +285,7 @@ async def _oidc_login(
 
 
 async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """AuthService.__init__ must forward [security].enforcement (and the configured SHA-256 pin) to
     build_idp_opener, so the OIDC anchor's construction-site preflight honors warn vs enforce. The seam
@@ -305,10 +306,14 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
         return urllib.request.build_opener()
 
     monkeypatch.setattr("messagefoundry.auth.service.build_idp_opener", spy)
+    # The CRL path must name a real file: [auth].oidc_tls_crl_file refuses a missing one at load
+    # (BACKLOG #1997). The spy never reads it, so its content does not matter.
+    crl = tmp_path / "idp-crl.pem"
+    crl.write_text("placeholder", encoding="utf-8")
     settings = _settings(
         oidc_tls_ca_cert_file="C:/anchors/idp-ca.pem",
         oidc_tls_ca_cert_pin="ab" * 32,
-        oidc_tls_crl_file="C:/anchors/idp-crl.pem",
+        oidc_tls_crl_file=str(crl),
     )
     for enforcing in (False, True):
         store = await MessageStore.open(":memory:")
@@ -321,7 +326,7 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
     assert all(c["ca"] == "C:/anchors/idp-ca.pem" and c["pin"] == "ab" * 32 for c in calls)
     # BACKLOG #299: the CRL path is threaded on the same seam. Asserted here rather than only at
     # build_idp_opener, because a setting that never reaches the builder is a knob that does nothing.
-    assert all(c["crl"] == "C:/anchors/idp-crl.pem" for c in calls)
+    assert all(c["crl"] == str(crl) for c in calls)
 
 
 # --- AC-2: roles come from LDAP, never from a token claim -------------------------------------------

@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,7 @@ from messagefoundry.config.settings import (
     SqlAuth,
     SqliteSync,
     StoreBackend,
+    _section_models,
     load_settings,
 )
 from messagefoundry.store.base import pool_over_provisioned_warning, warm_pool_target
@@ -1822,3 +1825,75 @@ def test_retry_forever_loads_from_a_file_named_messagefoundry_toml(tmp_path: Pat
     )
     cfg = _write(tmp_path / _DEFAULT_FILE, '[delivery]\nretry_max_attempts = "forever"\n')
     assert load_settings(config_path=cfg, environ={}).delivery.retry_max_attempts is None
+
+
+# --- BACKLOG #1997: each CRL setting names ITSELF on a missing or blank path -------------------------
+
+#: (TOML section, key, the name the refusal must carry): every service setting handed to
+#: harden_crl_check. [store].ssl_crl_file already had its validator; it is listed so that one table
+#: carries the set, which the next test checks against the models' field names.
+_CRL_KNOBS = [
+    pytest.param("api", "tls_client_crl_file", "[api].tls_client_crl_file", id="api"),
+    pytest.param("tls", "crl_file", "[tls].crl_file", id="tls"),
+    pytest.param("logging", "forward_tls_crl_file", "[logging].forward_tls_crl_file", id="logging"),
+    pytest.param("auth", "oidc_tls_crl_file", "[auth].oidc_tls_crl_file", id="auth"),
+    pytest.param("store", "ssl_crl_file", "[store].ssl_crl_file", id="store"),
+]
+
+
+def _toml(section: str, key: str, value: str) -> str:
+    # json.dumps writes a valid TOML basic string for any path, backslashes and quotes included.
+    return f"[{section}]\n{key} = {json.dumps(value)}\n"
+
+
+def test_the_crl_table_lists_every_crl_file_field() -> None:
+    """A new field named ``*crl_file`` on a top-level section model, added without a row here, fails
+    this test. That is at least the naming the existing five share. A CRL setting named otherwise,
+    or on a nested sub-table, is not caught, so this is a tripwire and not a proof of coverage."""
+    found = {
+        (section, key)
+        for section, model in _section_models().items()
+        for key in model.model_fields
+        if key.endswith("crl_file")
+    }
+    assert found == {(p.values[0], p.values[1]) for p in _CRL_KNOBS}
+
+
+@pytest.mark.parametrize(("section", "key", "name"), _CRL_KNOBS)
+def test_a_missing_crl_path_is_refused_at_load_naming_its_own_setting(
+    tmp_path: Path, section: str, key: str, name: str
+) -> None:
+    """harden_crl_check refuses a missing file too, but only when the hop's context is built, and
+    its refusal begins "[tls] crl file" for every caller. That sent an operator who mistyped
+    [api].tls_client_crl_file to go and fix [tls].crl_file. The load-time refusal names the setting
+    the operator wrote, and nothing else but the path."""
+    absent = tmp_path / "absent-crl.pem"
+    cfg = _write(tmp_path / "messagefoundry.toml", _toml(section, key, str(absent)))
+    with pytest.raises(ValidationError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    assert f"{name} path does not exist or is not a file: {str(absent)!r}" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(("section", "key", "name"), _CRL_KNOBS)
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_a_blank_crl_path_is_refused_at_load_naming_its_own_setting(
+    tmp_path: Path, section: str, key: str, name: str, blank: str
+) -> None:
+    """None is the only spelling of "no CRL". A blank value, such as an environment variable set to
+    nothing, reached harden_crl_check on some hops and read as unset on others."""
+    cfg = _write(tmp_path / "messagefoundry.toml", _toml(section, key, blank))
+    with pytest.raises(ValidationError, match=rf"{re.escape(name)} is set but empty"):
+        load_settings(config_path=cfg, environ={})
+
+
+@pytest.mark.parametrize(("section", "key", "name"), [p for p in _CRL_KNOBS if p.id != "store"])
+def test_an_existing_crl_path_loads_on_each_setting(
+    tmp_path: Path, section: str, key: str, name: str
+) -> None:
+    """The positive control: the same setting with a real file loads, so the refusals above are
+    about the path and not the setting. The store is left out because it also needs the postgres
+    backend and a pinned CA; test_hop_refusal_revocation.py covers it."""
+    crl = _write(tmp_path / "crl.pem", "placeholder")
+    cfg = _write(tmp_path / "messagefoundry.toml", _toml(section, key, str(crl)))
+    loaded = load_settings(config_path=cfg, environ={})
+    assert getattr(getattr(loaded, section), key) == str(crl), name
