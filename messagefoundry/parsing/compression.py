@@ -56,7 +56,9 @@ from collections.abc import Mapping
 from messagefoundry.parsing._bounded_inflate import (
     CHUNK,
     InflateCeilingExceeded,
+    InflateResult,
     InflateTrailingData,
+    TrailingRule,
     bounded_inflate,
 )
 from messagefoundry.parsing.sniff import (
@@ -70,6 +72,7 @@ __all__ = [
     "gzip_decompress",
     "deflate_compress",
     "deflate_decompress",
+    "deflate_decompress_with_tail",
     "zip_compress",
     "zip_decompress",
 ]
@@ -164,19 +167,48 @@ def deflate_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
     of the stream, and its time is linear in the input plus the output. A corrupt or truncated
     stream, an over-ceiling size, or any bytes after the end of the stream raise
     :class:`CompressionError` (BACKLOG #1964). Stdlib :func:`zlib.decompress` ignores such bytes. This
-    refuses them, so no part of the input is dropped without a word."""
+    refuses them, so no part of the input is dropped without a word. When other data follows the
+    stream by design, use :func:`deflate_decompress_with_tail`, which hands it back."""
+    # Refused rather than ignored: returning the first stream would drop the rest of the input
+    # without a word, which is accept-and-drop (BACKLOG #1964).
+    return _inflate_zlib(data, max_output_bytes, trailing="refuse").output
+
+
+def deflate_decompress_with_tail(
+    data: bytes, *, max_output_bytes: int | None
+) -> tuple[bytes, bytes]:
+    """Decompress the zlib-wrapped DEFLATE stream that starts ``data``, and return what follows it.
+
+    Returns ``(body, tail)``. ``body`` is the inflated stream. ``tail`` is every input byte after the
+    end of the stream, and is ``b""`` when nothing follows. This is for a stream with other data after
+    it, such as a PDF ``FlateDecode`` stream and its end-of-line, or several streams back to back.
+    Stripping that data first is not safe: only the inflater knows where the stream ends. A stream's
+    last byte is a checksum byte, which can itself be a CR or LF, so stripping line ends truncates
+    that stream (BACKLOG #1978).
+
+    ``max_output_bytes`` is **required** (BACKLOG #1237) and bounds this one stream. The ceiling, the
+    linear-time loop and the errors are :func:`deflate_decompress`'s: a corrupt or truncated stream
+    or an over-ceiling size raises :class:`CompressionError`. The tail is returned unread, so the
+    caller decides what it may hold. A caller that walks several streams calls this once per stream,
+    and owns the bound on how many it takes. Each call copies the tail, so that walk costs time in
+    proportion to the number of streams times the input size."""
+    result = _inflate_zlib(data, max_output_bytes, trailing="stop")
+    return result.output, bytes(data[result.end :])
+
+
+def _inflate_zlib(
+    data: bytes, max_output_bytes: int | None, *, trailing: TrailingRule
+) -> InflateResult:
+    """The codec's rules over the shared loop (BACKLOG #1977): its one error type, and a truncated
+    stream is an error. ``trailing`` is the only thing the two public callers set differently. Wrong
+    for gzip, which has members and NUL padding, so this is zlib-wrapped only."""
     _check_ceiling(max_output_bytes)
-    # The loop is shared with the DICOM deflate guard (BACKLOG #1977). The rules here are the codec's:
-    # its one error type, a truncated stream is an error, and nothing may follow the stream.
     try:
         result = bounded_inflate(
             data,
             zlib.decompressobj(wbits=_ZLIB_WBITS),
             max_output_bytes=max_output_bytes,
-            # Refused rather than ignored: returning the first stream would drop the rest of the
-            # input without a word, which is accept-and-drop (BACKLOG #1964). Wrong for gzip, which
-            # has members and NUL padding, so this loop is zlib-wrapped only.
-            trailing="refuse",
+            trailing=trailing,
             keep_output=True,
             exact_ceiling=True,
         )
@@ -188,7 +220,7 @@ def deflate_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
         raise CompressionError(f"corrupt or truncated deflate stream: {exc}") from exc
     if not result.eof:
         raise CompressionError("truncated deflate stream (input ended mid-stream)")
-    return result.output
+    return result
 
 
 def _over_ceiling(label: str, max_output_bytes: int) -> CompressionError:

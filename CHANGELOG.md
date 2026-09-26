@@ -7,6 +7,14 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`deflate_decompress_with_tail` inflates a zlib stream that has other data after it.** It
+  returns `(body, tail)`: the inflated stream, and every byte after the end of the stream, unread.
+  `deflate_decompress` refuses such bytes, and the advice was to strip them first. That is not safe
+  for a PDF stream's end-of-line: a stream's last byte is a checksum byte that can itself be a CR or
+  LF, so stripping truncates it. Only the inflater knows where the stream ends. The new function runs
+  the same bounded loop under the same required `max_output_bytes` ceiling, which bounds the one
+  stream. A corrupt, truncated or over-ceiling stream still raises `CompressionError`.
+  `deflate_decompress` is unchanged and stays strict. ([BACKLOG #1978](docs/BACKLOG.md))
 - **A DAST pass now sends hostile bytes to live MLLP, raw-TCP and X12 listeners and checks the
   engine's ingress rules.** `scripts/security/dast_ingress_sweep.py` runs a real engine on loopback.
   It sends broken framing, hostile HL7 and seeded mutations. Six detectors check each case: one reply
