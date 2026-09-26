@@ -2,9 +2,9 @@
 
 - **Status:** **Accepted -- 2026-09-26, by an owner ruling given to a Manager seat.** The owner
   accepted the drafter's recommendation, choosing the option labelled "Accept option 5 (Recommended)".
-  The ruling is posted on engine PR 1655. The build may start. The chosen option settles one item under
-  *To resolve on acceptance*, and one more is a build list rather than a choice. Four stay open, and
-  the build brief must settle each; that section says which.
+  The ruling is posted on engine PR 1655. The build may start. Under *To resolve on acceptance*,
+  three items are settled and one is a build list rather than a choice. Two stay open: the new names
+  and the revocation reason. They are implementation details the build decides, not policy.
   > **Superseded status text, kept as a record.** Until 2026-09-26 this line read: *"Proposed -- for
   > the owner to accept. No code until Accepted."*
   <!-- Proposed (no code yet) -> Accepted (build may start) -> Superseded by NNNN / Rejected -->
@@ -289,18 +289,26 @@ reopen it.
       `plan.aborted` path. **Settled 2026-09-26 by the chosen option itself.** Option 5, as defined
       under *Options considered*, holds every undetermined account and reconciles the rest of the estate
       as today. The whole-pass abort is not taken.
-- [ ] Is the count of one a fixed rule (recommended; there is no deploying site to tune for) or a new
-      `[auth]` setting? **Open for the build.** The owner ruling does not settle this, so the build
-      brief must. Option 5 fixes the count at one; the ruling does not say whether that one is fixed or
-      configurable.
-- [ ] Names: the held audit action, the alert type, and the reason slug. **Open for the build.** The
-      owner ruling does not settle this, so the build brief must.
+- [x] Is the count of one a fixed rule (recommended; there is no deploying site to tune for) or a new
+      `[auth]` setting? **Settled 2026-09-26: a fixed rule, not a setting.** The Manager seat read the
+      2026-09-26 ruling as accepting the drafter's recommendation, so an item that recommendation
+      already answers is settled by the ruling. This item's own text recommends a fixed rule, and the
+      Decision section says "Option 5's count of one needs no tuning". A setting would also need threat
+      reasoning of its own.
+- [ ] Names: the held audit action, the alert type, and the reason slug. **Open for the build, as an
+      implementation detail, not policy.** The build decides it, following the engine's existing
+      conventions.
 - [ ] The revocation `reason` for `DISABLED` and a single `UNDETERMINED`. Keeping `directory_absent`
       leaves audit readers and the AC-3 test unchanged. A new reason tells an operator more. **Open for
-      the build.** The owner ruling does not settle this, so the build brief must.
-- [ ] Whether ADR 0079's "Acknowledged floor" paragraph and its Consequences residual get a dated
+      the build, as an implementation detail, not policy.** The build decides it, following the engine's
+      existing conventions. AC-3's "revocation reason as settled on acceptance" is then the reason the
+      build chooses.
+- [x] Whether ADR 0079's "Acknowledged floor" paragraph and its Consequences residual get a dated
       pointer amendment to this ADR. The drafter's lean is yes, since both argue the opposite for this
-      case. **Open for the build.** The owner ruling does not settle this, so the build brief must.
+      case. **Settled 2026-09-26: yes, the build adds the dated pointer amendment to ADR 0079.** The
+      Manager seat read the 2026-09-26 ruling as accepting the drafter's recommendation, so an item that
+      recommendation already answers is settled by the ruling. The drafter's answer here is the lean
+      quoted above, written in this item rather than in the Decision section.
 - [x] **Not a choice; carried to the build.** The accepted option makes these corrections part of the
       build, and the build brief must list them. Prose the build must correct, at least: the comment
       above `ad_session_revoke_max` in `config/settings.py` (BACKLOG #2039 closing item 5); the

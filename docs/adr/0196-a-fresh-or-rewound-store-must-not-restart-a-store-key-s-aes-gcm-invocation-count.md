@@ -2,9 +2,10 @@
 
 - **Status:** **Accepted -- 2026-09-26, by an owner ruling given to a Manager seat.** The owner
   accepted the drafter's recommendation, choosing the option labelled "C+ per-store sub-key
-  (Recommended)". The ruling is posted on engine PR 1655. The build may start. The chosen option
-  settles one item under *To resolve on acceptance*, and one more is a build list rather than a
-  choice. Five stay open, and the build brief must settle each; that section says which.
+  (Recommended)". The ruling is posted on engine PR 1655. The build may start. Under *To resolve
+  on acceptance*, five items are settled and one is a build list rather than a choice. One stays
+  open: how the salt reaches the cipher. It is an implementation detail the build decides, not
+  policy.
   > **Superseded status text, kept as a record.** Until 2026-09-26 this line read: *"Proposed
   > (2026-09-26). An options memo with the drafter's recommendation. The owner accepts or rejects it,
   > and no code may follow until it is Accepted. BACKLOG #2070 stays open until then; its closing step
@@ -142,9 +143,9 @@ state, not an act.
 ## Decision
 
 **Owner ruling, 2026-09-26: option C+.** The owner accepted the drafter's recommendation, choosing the
-option labelled "C+ per-store sub-key (Recommended)". The label names the option. It does not name
-where the salt lives or how the residual routes are handled, which the drafter's recommendation also
-covered. *To resolve on acceptance* keeps both open for the build brief.
+option labelled "C+ per-store sub-key (Recommended)". The label names the option. The Manager seat
+read the ruling as accepting the whole recommendation, which also names where the salt lives and how
+the residual routes are handled. *To resolve on acceptance* records both as settled on that reading.
 
 > **Superseded decision text, kept as a record.** Until 2026-09-26 this section read: *"**None. This
 > memo does not choose.** It lays out the options with their costs and gives one drafter's
@@ -419,24 +420,38 @@ Manager-dispatched vault Builder once something is built.
 
 - [x] **The shape.** C+, A with D, B as an opt-in, or something else. This is the owner's ruling and the
       reason the status is Proposed. **Settled 2026-09-26:** C+, by the owner ruling.
-- [ ] **Where the salt lives**, if C or C+: one row, or each value's marker. **Open for the build.** The
-      owner ruling does not settle this, so the build brief must. The drafter recommended each value's
-      marker (sub-choice 2); the ruling's label does not name it.
-- [ ] **The residual routes.** Accept a copy or rewind the engine never sees as a documented limit, or
-      ask for B as an opt-in for sites that run Vault or a KMS. **Open for the build.** The owner ruling
-      does not settle this, so the build brief must.
-- [ ] **The key-age half.** Accept the floor with the #1004 consequence recorded, or add an ENFORCE
-      refusal for a fresh keyed store with no stamp. **Open for the build.** The owner ruling does not
-      settle this, so the build brief must.
+- [x] **Where the salt lives**, if C or C+: one row, or each value's marker. **Settled 2026-09-26: in
+      each value's marker (sub-choice 2).** The Manager seat read the 2026-09-26 ruling as accepting the
+      drafter's recommendation, so an item that recommendation already answers is settled by the ruling.
+      The accepted recommendation reads "Take **C+, with the salt in each value's marker** (sub-choice
+      2)".
+- [x] **The residual routes.** Accept a copy or rewind the engine never sees as a documented limit, or
+      ask for B as an opt-in for sites that run Vault or a KMS. **Settled 2026-09-26: an accepted limit
+      under E; B is not offered.** The Manager seat read the 2026-09-26 ruling as accepting the
+      drafter's recommendation, so an item that recommendation already answers is settled by the ruling.
+      The accepted recommendation reads "Record what it leaves open as an accepted limit under **E**: a
+      store copy or rewind the engine never sees".
+- [x] **The key-age half.** Accept the floor with the #1004 consequence recorded, or add an ENFORCE
+      refusal for a fresh keyed store with no stamp. **Settled 2026-09-26: keep the `tracked_since`
+      floor.** The Manager seat read the 2026-09-26 ruling as accepting the drafter's recommendation, so
+      an item that recommendation already answers is settled by the ruling. This half has its own
+      recommendation, which reads "accept the floor as designed". Its named cost is recorded with it:
+      under ENFORCE, recreating the store, or restoring one taken before the last rotation, clears the
+      #1004 refusal. The build records that in `docs/PHI.md`'s rotation steps, including the restore
+      case, as the recommendation says.
 - [ ] **How the salt reaches the cipher.** `open_store` builds every store's cipher with
       `build_store_cipher` before the backend opens, and so does `dr_backup._decrypt_check`. Under C the
       salt lives in the store, so the cipher must learn it after open, or the order must change. **Open
-      for the build.** The owner ruling does not settle this, so the build brief must.
-- [ ] **The four gaps found in review.** The backup run that fails mid-build, the quiet fallback on a
+      for the build, as an implementation detail, not policy.** The build decides it, following the
+      engine's existing conventions.
+- [x] **The four gaps found in review.** The backup run that fails mid-build, the quiet fallback on a
       failing counter write, the full restore-verify's scratch open, and the DR codec that never
       consults the ceiling. Say whether AC-6 and AC-8 stay in this build or move to their own ledger
-      items, and what handles the other two. **Open for the build.** The owner ruling does not settle
-      this, so the build brief must.
+      items, and what handles the other two. **Settled 2026-09-26.** AC-6 and AC-8 stay in this build as
+      drafted, because they are acceptance criteria of the ADR the owner accepted. The other two gaps,
+      the quiet fallback and the DR codec that never consults the ceiling, go to the backlog ledger as
+      their own items. That routing is the Manager seat's, not the recommendation's; the recommendation
+      did not address it.
 - [x] **Not a choice; carried to the build.** The accepted option makes these corrections part of the
       build, and the build brief must list them. **Text to update in the same build**, at least: PR
       1629's keyed remedy ("would zero its AES-GCM use count") and the comment above it in
