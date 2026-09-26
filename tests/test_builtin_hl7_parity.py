@@ -30,9 +30,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import hl7
 import pytest
 
 import messagefoundry.parsing._backend as _backend
+import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.generators import _core, all_types  # noqa: F401 — registers the generators
 from messagefoundry.parsing import HL7PeekError, normalize, validate
 from messagefoundry.parsing.message import Message
@@ -449,6 +451,44 @@ def test_tolerant_and_no_msh(bad: str) -> None:
     assert not isinstance(exp_ok, Exception), f"python-hl7 raised on odd-but-parseable: {exp_ok!r}"
     assert not isinstance(got_ok, Exception), f"builtins raised on odd-but-parseable: {got_ok!r}"
     assert _eq(exp_ok, got_ok), f"odd message_type: python-hl7={exp_ok!r} builtins={got_ok!r}"
+
+
+@pytest.mark.parametrize(
+    ("label", "line", "raises"),
+    [
+        ("empty-line", "", True),
+        ("leading-field-sep", "|stray", False),
+        ("space", " ", False),
+    ],
+    ids=["empty-line", "leading-field-sep", "space"],
+)
+@pytest.mark.parametrize("touch_first", [False, True], ids=["lazy", "split"])
+def test_whole_field_set_over_a_tree_held_blank_segment(
+    label: str, line: str, raises: bool, touch_first: bool
+) -> None:
+    """The built-ins' blank-segment raise still matches python-hl7 exactly (BACKLOG #1594).
+
+    ``Message.parse`` and ``Peek.parse`` now drop empty lines, so the corpus no longer reaches
+    ``raise_if_blank_segment_scan`` with one. A ``Message`` built straight from a backend's parse
+    tree still can. Only a truly empty line raises on a whole-field set; a line that merely starts
+    with the field separator does not. ``touch_first`` reads the odd segment first, so the built-ins
+    have split it and the scan takes its post-split branch rather than the lazy one.
+    """
+    text = f"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|C6|P|2.5.1\r{line}\rPID|1||444\r"
+
+    def run(builtin: bool) -> str:
+        msg = Message(_builtin_hl7.parse(text) if builtin else hl7.parse(text))
+        if touch_first:
+            msg.field("PID-3", occurrence=1)
+            msg.repetitions("MSH-9")
+            if builtin:
+                _builtin_hl7._ensure_split(msg._m, 1)
+        msg.set("MSH-10", "EDITED")
+        return msg.encode()
+
+    expected, got = _both(lambda: run(_backend.use_builtin()))
+    assert _eq(expected, got), f"[{label}] python-hl7={expected!r} builtins={got!r}"
+    assert isinstance(got, IndexError) is raises, f"[{label}] builtins={got!r}"
 
 
 # ---------------------------------------------------------------------------

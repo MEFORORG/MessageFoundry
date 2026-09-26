@@ -130,8 +130,9 @@ def split_by_obr(message: Message | str | bytes) -> list[str]:
 
     **0 or 1 OBR.** A message with **one** ``OBR`` returns a single-element list (the whole message,
     with MSH-10 suffixed ``-1`` per above). A message with **zero** ``OBR`` is *not* an order message
-    to split, so it is returned **as-is** in a single-element list with its control id **unchanged**
-    (no suffix) — the natural no-op for a non-order message.
+    to split, so it is returned **as parsed** (``msg.encode()``) in a single-element list with its
+    control id **unchanged** (no suffix) — the natural no-op for a non-order message. For text input
+    that is the text without any empty segment lines, which :meth:`Message.parse` drops.
 
     **Blank segments.** :meth:`Message.parse` drops empty segment lines, so text input never
     carries one here. A :class:`Message` built straight from a parse tree still can. Such a segment
@@ -145,7 +146,7 @@ def split_by_obr(message: Message | str | bytes) -> list[str]:
     segments = msg.segments()
     obr_count = segments.count("OBR")
 
-    # No order groups: not a splittable order message — return it verbatim (control id untouched).
+    # No order groups: not a splittable order message — return it as parsed (control id untouched).
     if obr_count == 0:
         return [msg.encode()]
 
