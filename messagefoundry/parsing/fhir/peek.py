@@ -66,8 +66,9 @@ class FhirPeek:
             )
         try:
             parsed = json.loads(raw)
-        except (json.JSONDecodeError, ValueError) as exc:
-            # PHI rule: name the failure, never echo the body.
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+            # PHI rule: name the failure, never echo the body. RecursionError is json's depth limit;
+            # it is a RuntimeError, so the ValueError beside it does not reach it (BACKLOG #1600).
             raise FhirPeekError("body is not parseable FHIR JSON") from exc
         if not isinstance(parsed, dict):
             raise FhirPeekError("FHIR JSON body must be a resource object, not a scalar/array")
