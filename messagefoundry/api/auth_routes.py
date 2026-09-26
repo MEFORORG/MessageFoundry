@@ -35,6 +35,7 @@ from messagefoundry.api.auth_models import (
     CurrentUser,
     CustomRoleInfo,
     CustomRoleRequest,
+    DirectoryUserCreateRequest,
     ElevatedResponse,
     FederatedIdentityRequest,
     FederatedIdentityView,
@@ -90,6 +91,7 @@ from messagefoundry.auth import (
     Permission,
     Role,
 )
+from messagefoundry.auth.ldap import LdapError
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
@@ -103,6 +105,9 @@ from messagefoundry.auth.service import (
     USERNAME_TAKEN,
     AuthService,
     CurrentPasswordCheck,
+    DirectoryAccountNotFound,
+    DirectoryAccountRefused,
+    DirectoryObjectIdMissing,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
     NotifyEmailAlreadySet,
@@ -879,6 +884,45 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             sorted(body.roles),
             credential_expires_at=pending_credential_deadline(service, user),
         )
+
+    @app.post("/users/directory", response_model=UserSummary, status_code=status.HTTP_201_CREATED)
+    async def create_directory_user(
+        body: DirectoryUserCreateRequest,
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+    ) -> UserSummary:
+        """Create a directory (AD) account's mirror row by name, without a sign-in (BACKLOG #2021).
+
+        Gated as ``POST /users`` is. The row's directory identity comes from a service-account
+        lookup, never from the request (see ``AuthService.create_directory_account``), so the row can
+        then take ``PUT /users/{id}/federated-identity`` on a site with no Windows SSO. 404 when the
+        directory has no enabled account by that name, 409 when a row already holds it, 503 when the
+        directory cannot be reached, 400 for every other refusal."""
+        try:
+            user_id = await service.create_directory_account(
+                body.username,
+                actor=identity.username,
+                client=_client(request),
+                notify_email=body.notify_email,
+            )
+        except DirectoryAccountNotFound as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except UsernameTaken as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except LdapError as exc:
+            # The directory's own text can name hosts and DNs. It is logged, not returned.
+            _log.warning("directory account create: the directory lookup failed: %s", exc)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "directory unavailable"
+            ) from exc
+        except (DirectoryAccountRefused, DirectoryObjectIdMissing, InvalidNotifyEmail) as exc:
+            # Named rather than a bare ValueError: each is raised before any write, so a 400 here
+            # never answers "refused" for a row that exists.
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        user = await service.store.get_user(user_id)
+        assert user is not None
+        return _user_summary(user, [])
 
     @app.patch("/users/{user_id}", response_model=SimpleMessage)
     async def update_user(

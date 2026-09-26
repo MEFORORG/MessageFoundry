@@ -3427,6 +3427,19 @@ def seed_notify_email(email: str | None) -> str | None:
     return email.strip() or None if email is not None else None
 
 
+def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
+    """The ``users.notify_email`` a ``create_user`` INSERT binds, on all three backends.
+
+    ``typed`` wins when given: an administrator's address for a directory account whose ``mail``
+    was not adopted (BACKLOG #2021), bound in the same INSERT so no crash can leave the row with
+    none. The caller has already checked it. Otherwise ``email`` is seeded (:func:`seed_notify_email`)
+    unless ``adopt`` is ``False`` (BACKLOG #2014).
+    """
+    if typed is not None:
+        return typed
+    return seed_notify_email(email) if adopt else None
+
+
 def require_notify_email(email: str) -> str:
     """Validate a new ``users.notify_email`` value — shared by all three backends (BACKLOG #1139).
 
@@ -10248,6 +10261,7 @@ class MessageStore:
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
+        notify_email: str | None = None,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
@@ -10262,7 +10276,7 @@ class MessageStore:
                     auth_provider,
                     display_name,
                     email,
-                    seed_notify_email(email) if adopt_notify_email else None,
+                    birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
                     now,
                     now,
                     password_hash,

@@ -657,3 +657,27 @@ async def test_every_store_backend_can_create_an_account_without_adopting_its_ad
         assert user is not None and user.email == mail and user.notify_email is None
     finally:
         await backend_store.delete_user(user_id)
+
+
+async def test_every_store_backend_binds_a_typed_address_in_the_same_insert(
+    backend_store: Any,
+) -> None:
+    """BACKLOG #2021. An administrator's address for a directory account whose `mail` was not
+    adopted is bound by the INSERT itself, so no crash can leave that row with none. The profile
+    mirror still holds the directory's value."""
+    name = f"typed-{uuid4().hex[:12]}"
+    user_id = uuid4().hex
+    mail = _UNADOPTABLE_DIRECTORY_MAIL[0][1]
+    await backend_store.create_user(
+        user_id=user_id,
+        username=name,
+        auth_provider="ad",
+        email=mail,
+        adopt_notify_email=False,
+        notify_email=ADDRESS,
+    )
+    try:
+        user = await backend_store.get_user(user_id)
+        assert user is not None and user.email == mail and user.notify_email == ADDRESS
+    finally:
+        await backend_store.delete_user(user_id)

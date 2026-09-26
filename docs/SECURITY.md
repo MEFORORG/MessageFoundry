@@ -18,7 +18,7 @@ with secure defaults, and AD-group→role mapping is automatic.
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer (`[security] require_sign_in = true` by default). Of the **112** engine route objects, **93 demand a
+auth layer (`[security] require_sign_in = true` by default). Of the **113** engine route objects, **94 demand a
 specific permission** and 19 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -317,7 +317,7 @@ apply. What each **adds** over plain `require()`:
 | `require` | 41 | nothing — the ladder itself |
 | `require_paced` | 19 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
-| `require_step_up` | 28 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up` | 29 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 6 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`). Promoting a route here no longer drops the pacing floor |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
@@ -351,7 +351,7 @@ The two gates audit differently. Under the default audit setting, `authorize_ws`
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 95, not 93, because BOTH `/messages/export` routes require two).
+under `create_app()` (they sum to 96, not 94, because BOTH `/messages/export` routes require two).
 
 | Constant | Permission | PHI | Routes | Gates |
 |---|---|---|:--:|---|
@@ -375,7 +375,7 @@ under `create_app()` (they sum to 95, not 93, because BOTH `/messages/export` ro
 | `AI_ASSIST` | `ai:assist` | | 1 | `POST /ai/chat`; also *reported* (not enforced) as `assist_permitted` on the unauthenticated `GET /ai/policy` |
 | `SERVICE_CONFIGURE` | `service:configure` | | 1 | `POST /alerts/test-email` — a live outbound SMTP dial through the configured `[alerts]` mail transport (BACKLOG #118); service/settings administration, not the diagnostic ack/resolve tier |
 | `USERS_READ` | `users:read` | | 4 | `GET /roles`, `/roles/custom`, `/users`, `/users/{id}/permissions` |
-| `USERS_MANAGE` | `users:manage` | | 18 | every user/role/AD-map write **and** the three reads `GET /users/{id}/channel-scope`, `/ad-group-map`, `/ad-group-scope-map`. Never assignable to a custom role |
+| `USERS_MANAGE` | `users:manage` | | 19 | every user/role/AD-map write **and** the three reads `GET /users/{id}/channel-scope`, `/ad-group-map`, `/ad-group-scope-map`. Never assignable to a custom role |
 | `AUDIT_READ` | `audit:read` | | 1 | `GET /audit` |
 | `AUDIT_EXPORT` | `audit:export` | | 1 | `GET /audit/export` — the filtered audit-report CSV (BACKLOG #170); distinct from `audit:read` |
 | `LOGS_VIEW` | `logs:view` | **PHI** | 1 | `GET /logs/tail` — the best-effort-redacted application-log tail (residual single-token PHI is possible), so it rides `require_phi_read` and writes a `logs_view` audit row |
@@ -447,12 +447,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **112 route objects** — 71 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket) and 41 declared in
+**Counting basis.** `create_app()` with no arguments builds **113 route objects** — 71 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket) and 42 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
-and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 116 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 227
-(112 + the 114 console routes + the `/ui/static` mount). Of the 112: **93 are permission-gated**, 19 are
+and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 117 (`/openapi.json`,
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 228
+(113 + the 114 console routes + the `/ui/static` mount). Of the 113: **94 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -501,6 +501,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/users` | `users:read` | `require` |
 | `GET` | `/users/{user_id}/permissions` | `users:read` | `require` — the effective-permission inspector |
 | `POST` | `/users` | `users:manage` | `require_step_up` |
+| `POST` | `/users/directory` | `users:manage` | `require_step_up`. Creates a directory (AD) account's mirror row by name, without a sign-in (BACKLOG #2021). The row's `objectGUID`, display name and `mail` come from a service-account directory lookup, never from the request: the body carries `username` and an optional `notify_email`, and an unknown key is refused 422. The row is never born without a notification address: the directory's `mail` is it when BACKLOG #2014's rule adopts it, and `notify_email` is then refused; otherwise `notify_email` is required and checked as `POST /users` checks `email` (400). 404 when the directory has no enabled account by that name, 400 when it returns no readable `objectGUID`, 409 when a row already holds the name or id, 503 when the directory cannot be reached. No roles: they come from the AD-group map at sign-in |
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up` |
@@ -668,7 +669,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 112 route objects a default `create_app()` serves, **fifteen** can put
+**PHI-egress route set.** Of the 113 route objects a default `create_app()` serves, **fifteen** can put
 PHI on the wire: the twelve message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
@@ -1099,8 +1100,8 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 |---|---|---|
 | `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
 | `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, or `PUT /ad-group-map` newly maps a group to it | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator |
-| `client` on the `user.created` audit row | An account created through `POST /users` | The creating administrator's address, like the approval rows |
-| `account_created` notice | An account created through `POST /users`, which requires a notification address (BACKLOG #2018) | The new account's own notification address |
+| `client` on the `user.created` audit row | An account created through `POST /users` or `POST /users/directory` (BACKLOG #2021) | The creating administrator's address, like the approval rows |
+| `account_created` notice | An account created through `POST /users` or `POST /users/directory`, neither of which creates one without a notification address (BACKLOG #2018, #2021) | The new account's own notification address |
 
 **These signals miss at least five routes.** Each ends in one person holding two approver accounts
 with no page.
@@ -1114,7 +1115,11 @@ with no page.
 - **Promotion after the request.** Promotion changes none of the three timestamps, so the release is
   not flagged. Its `administrator_granted` alert is the only page.
 - **Re-enabling a disabled Administrator, or binding a directory Administrator's federated
-  identity.** Neither changes a timestamp or grants a role, so neither pages.
+  identity.** Neither changes a timestamp or grants a role, so neither pages. Creating a directory
+  Administrator's row with `POST /users/directory` (BACKLOG #2021) pages nothing either: the row
+  holds no role until the group map gives it one at sign-in. Created after a request, it is still
+  flagged at that release, like any new account, and its notification address gets the
+  `account_created` notice.
 - **A directory grant.** An account that gets Administrator because the *directory* added it to a
   group already mapped to Administrator raises no alert. The engine never sees that grant.
 

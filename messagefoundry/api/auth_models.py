@@ -168,6 +168,23 @@ class UserCreateRequest(RequestModel):
     roles: list[RoleId] = Field(default=[], max_length=64)
 
 
+class DirectoryUserCreateRequest(RequestModel):
+    """``POST /users/directory``: create a directory (AD) account's mirror row by name, with no
+    sign-in (BACKLOG #2021).
+
+    The row's ``objectGUID``, display name and ``mail`` come from a service-account directory
+    lookup, so there is deliberately no field for them, and the model refuses an unknown key with
+    422: a caller cannot choose which directory identity a row claims.
+
+    ``notify_email`` is not identity. It is required when the directory supplies no usable ``mail``
+    and refused when it does, so the row is never born without an address and an administrator
+    cannot point the holder's notices away from the directory's (ASVS 6.3.7).
+    """
+
+    username: str = Field(min_length=1, max_length=_NAME_MAX)
+    notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
+
+
 class UserUpdateRequest(RequestModel):
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).

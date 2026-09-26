@@ -454,6 +454,15 @@ def _is_adoptable_directory_address(address: str) -> bool:
     return not any(label.lower().startswith("xn--") for label in domain.split("."))
 
 
+def _adopts_directory_mail(principal: AdPrincipal) -> bool:
+    """Whether a directory birth seeds ``notify_email`` from ``principal``'s ``mail`` (BACKLOG #2014).
+
+    ``True`` for an absent ``mail`` too: there is nothing to refuse, and the seed is NULL. The one
+    predicate both the birth and the administrator's create ask (BACKLOG #2021)."""
+    directory_mail = (principal.email or "").strip()
+    return not directory_mail or _is_adoptable_directory_address(directory_mail)
+
+
 class InvalidNotifyEmail(ValueError):
     """A notification address was refused before anything was written (BACKLOG #1139).
 
@@ -527,7 +536,19 @@ class FederatedSubjectHeld(RuntimeError):
 
 class UsernameTaken(RuntimeError):
     """:meth:`AuthService.create_local_user` lost a concurrent create's race for its username
-    (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text."""
+    (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text.
+    :meth:`AuthService.create_directory_account` raises it too, when a row already holds the
+    directory account's name or id (BACKLOG #2021)."""
+
+
+class DirectoryAccountNotFound(ValueError):
+    """:meth:`AuthService.create_directory_account` found no enabled directory account by the name
+    given (BACKLOG #2021). ``POST /users/directory`` answers it 404."""
+
+
+class DirectoryAccountRefused(ValueError):
+    """:meth:`AuthService.create_directory_account` refused before its lookup: no directory is
+    configured, or the name is blank (BACKLOG #2021). ``POST /users/directory`` answers it 400."""
 
 
 class DirectoryObjectIdMissing(ValueError):
@@ -554,6 +575,10 @@ class DirectoryObjectIdMissing(ValueError):
     above no longer ask by name (BACKLOG #2027): the federated login refuses it with this same
     reason, and the reconciler skips it (``_holds_unkeyed_federated_binding``).
     **The cost:** on a directory that returns no readable ``objectGUID``, no account can be bound.
+
+    :meth:`AuthService.create_directory_account` raises it too, before any write, when the directory
+    returns no readable ``objectGUID`` for the account named: the row it would create could never
+    take a binding (BACKLOG #2021).
     """
 
     reason = DIRECTORY_OBJECT_ID_MISSING
@@ -2459,44 +2484,7 @@ class AuthService:
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
-            user_id = uuid4().hex
-            # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
-            # become `notify_email`, where every later security notice goes. So it must pass the test
-            # the address form applies before it suggests the same value; the form never sees an
-            # account born with an address. Someone who can write `mail` but cannot sign in could
-            # otherwise plant a lookalike before the holder's first sign-in. A refused value stays
-            # in the profile mirror, and the account is born with no target, which confines it
-            # until the holder chooses one (`notify_email_required`). Refused in the same INSERT
-            # rather than cleared after, so no crash can leave the lookalike seeded.
-            directory_mail = (principal.email or "").strip()
-            adopt = not directory_mail or _is_adoptable_directory_address(directory_mail)
-            await self._store.create_user(
-                user_id=user_id,
-                username=principal.username,
-                auth_provider=AuthProvider.AD.value,
-                display_name=principal.display_name,
-                email=principal.email,
-                # Written AT CREATION rather than by a follow-up setter, so the row cannot exist in an
-                # unbound state. A crash between the two writes would have left a row no id-carrying
-                # login may adopt and no operator asked for -- a self-inflicted lockout.
-                directory_object_id=principal.directory_object_id,
-                adopt_notify_email=adopt,
-            )
-            if not adopt:
-                # The address stays out of the row and the log. It is directory-supplied and may be
-                # a lookalike of someone's real one. The audit row is a second write after the
-                # INSERT, so a crash between them loses the record but never seeds the address.
-                _log.warning(
-                    "directory account %s created without a notification address: the directory "
-                    "mail is not one plain ASCII mailbox with no Punycode label",
-                    user_id,
-                )
-                await self._audit(
-                    "auth.ad_notify_email_not_adopted",
-                    actor=principal.username,
-                    detail=_json({"user_id": user_id, "source": "directory"}),
-                    client=client,
-                )
+            user_id = await self._create_directory_row(principal, client=client)
         else:
             user_id = existing.id
             if principal.username != existing.username:
@@ -2591,6 +2579,185 @@ class AuthService:
         user = await self._store.get_user(user_id)
         assert user is not None  # just upserted
         return user
+
+    async def _create_directory_row(
+        self,
+        principal: AdPrincipal,
+        *,
+        client: str | None,
+        actor: str | None = None,
+        typed_notify_email: str | None = None,
+    ) -> str:
+        """Insert the mirror row for a directory principal the store does not hold, and return its id.
+
+        The one directory birth, shared by a directory sign-in (:meth:`_upsert_ad_user`) and an
+        administrator's create (:meth:`create_directory_account`, BACKLOG #2021), so the two cannot
+        disagree about what a new directory account carries. The caller has already established that
+        no row holds the principal's id or name.
+
+        ``typed_notify_email`` is the administrator's checked address for a row whose ``mail`` is
+        not adopted (#2021 only). It is bound in the same INSERT, so no crash leaves that row with
+        no address. The profile mirror still gets the directory's ``mail``.
+        """
+        user_id = uuid4().hex
+        # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
+        # become `notify_email`, where every later security notice goes. So it must pass the test
+        # the address form applies before it suggests the same value; the form never sees an
+        # account born with an address. Someone who can write `mail` but cannot sign in could
+        # otherwise plant a lookalike before the holder's first sign-in. A refused value stays
+        # in the profile mirror, and the account is born with no target, which confines it
+        # until the holder chooses one (`notify_email_required`). Refused in the same INSERT
+        # rather than cleared after, so no crash can leave the lookalike seeded.
+        adopt = _adopts_directory_mail(principal)
+        await self._store.create_user(
+            user_id=user_id,
+            username=principal.username,
+            auth_provider=AuthProvider.AD.value,
+            display_name=principal.display_name,
+            email=principal.email,
+            # Written AT CREATION rather than by a follow-up setter, so the row cannot exist in an
+            # unbound state. A crash between the two writes would have left a row no id-carrying
+            # login may adopt and no operator asked for -- a self-inflicted lockout.
+            directory_object_id=principal.directory_object_id,
+            adopt_notify_email=adopt,
+            notify_email=typed_notify_email,
+        )
+        if not adopt:
+            # The address stays out of the row and the log. It is directory-supplied and may be
+            # a lookalike of someone's real one. The audit row is a second write after the
+            # INSERT, so a crash between them loses the record but never seeds the address.
+            if typed_notify_email is None:
+                _log.warning(
+                    "directory account %s created without a notification address: the directory "
+                    "mail is not one plain ASCII mailbox with no Punycode label",
+                    user_id,
+                )
+            else:
+                _log.warning(
+                    "directory account %s: the directory mail is not one plain ASCII mailbox with "
+                    "no Punycode label, so an administrator gave its notification address",
+                    user_id,
+                )
+            await self._audit(
+                "auth.ad_notify_email_not_adopted",
+                # The sign-in's own holder, or the administrator whose create this is (#2021).
+                actor=actor or principal.username,
+                detail=_json({"user_id": user_id, "source": "directory"}),
+                client=client,
+            )
+        return user_id
+
+    async def create_directory_account(
+        self,
+        username: str,
+        *,
+        actor: str,
+        client: str | None = None,
+        notify_email: str | None = None,
+    ) -> str:
+        """Admin: create the mirror row for a directory (AD) account without a sign-in (BACKLOG #2021).
+
+        Before this, only a Kerberos sign-in created one, so a site without Windows SSO had no row
+        that ``PUT /users/{id}/federated-identity`` could bind, and nobody could sign in through its
+        IdP (ADR 0184 slice A).
+
+        **THE ROW'S DIRECTORY IDENTITY COMES FROM THE DIRECTORY, NEVER FROM THE CALLER.** The
+        administrator names the account; a service-account lookup
+        (:meth:`~messagefoundry.auth.ldap.LdapAuthenticator.resolve_principal`, the one a Kerberos
+        sign-in makes) supplies its ``objectGUID``, current ``sAMAccountName``, display name and
+        ``mail``. An administrator-typed id would let one account's row claim another's identity,
+        which is the recycle the id exists to stop (BACKLOG #1471). The birth is
+        :meth:`_create_directory_row`, the one a sign-in uses, #2014's address rule included.
+
+        **THE ROW IS NEVER BORN WITHOUT A NOTIFICATION ADDRESS (ASVS 6.3.7, as #2018 rules for a
+        local create).** Its holder is not present, and the next thing done to it is usually a
+        federated binding, whose notice goes to that address. So the directory's ``mail`` is the
+        address when #2014's rule adopts it, and ``notify_email`` must then be omitted: the
+        administrator does not get to point the holder's notices elsewhere. When the directory
+        supplies no adoptable ``mail``, ``notify_email`` is required and is checked as
+        ``POST /users`` checks its address (:func:`_require_single_mailbox`). Both refusals are
+        :class:`InvalidNotifyEmail`.
+
+        Refuses, before any write: no directory configured or a blank name
+        (:class:`DirectoryAccountRefused`), a name the directory does not return or returns disabled
+        (:class:`DirectoryAccountNotFound`), an entry
+        with no readable ``objectGUID`` (:class:`DirectoryObjectIdMissing`, since such a row could
+        never take a binding), a name or id a row already holds (:class:`UsernameTaken`), and the
+        address rule above. :class:`~messagefoundry.auth.ldap.LdapError` propagates when the
+        directory is unreachable.
+
+        The row carries no roles. A directory account's roles come from the AD-group map at each
+        sign-in, and no administrator route sets them. Audited as ``user.created`` with
+        ``"provider": "ad"`` and where the address came from. The address is told the account was
+        created (``ACCOUNT_CREATED``).
+        """
+        if self._ldap is None:
+            raise DirectoryAccountRefused("no directory (AD) is configured ([auth].ad_enabled)")
+        name = username.strip()
+        if not name:
+            raise DirectoryAccountRefused("a directory account name is required")
+        principal = await asyncio.to_thread(self._ldap.resolve_principal, name)
+        if principal is None:
+            raise DirectoryAccountNotFound("the directory returned no enabled account by that name")
+        if not principal.directory_object_id:
+            raise DirectoryObjectIdMissing(
+                f"{DIRECTORY_OBJECT_ID_MISSING}: the directory returned no readable objectGUID for"
+                " this account, so an account created from it could never take a federated binding."
+                " Make the directory return objectGUID to the service account, then retry"
+            )
+        if await self._store.get_user_by_username(principal.username) is not None:
+            raise UsernameTaken(USERNAME_TAKEN)
+        if (
+            await self._store.get_user_by_directory_object_id(principal.directory_object_id)
+            is not None
+        ):
+            # A row already mirrors this directory account under an older name (a rename its
+            # holder has not signed in since). Its next sign-in or reconciler pass refreshes it.
+            raise UsernameTaken("an account already mirrors that directory account")
+        # The predicate the birth below applies, asked here so every refusal precedes the INSERT.
+        directory_mail = (principal.email or "").strip()
+        if directory_mail and _adopts_directory_mail(principal):
+            if notify_email is not None:
+                raise InvalidNotifyEmail(
+                    "the directory supplies this account's notification address; omit notify_email"
+                )
+            typed: str | None = None
+            address = directory_mail
+        else:
+            if notify_email is None or not notify_email.strip():
+                raise InvalidNotifyEmail(
+                    "the directory supplies no usable notification address for this account;"
+                    " give one as notify_email, such as name@example.org"
+                )
+            typed = address = _require_single_mailbox(notify_email)
+        try:
+            user_id = await self._create_directory_row(
+                principal, client=client, actor=actor, typed_notify_email=typed
+            )
+        except Exception as exc:
+            if not _is_integrity_refusal(exc):
+                raise
+            # Re-read rather than assume the name index fired, as create_local_user does.
+            if await self._store.get_user_by_username(principal.username) is None:
+                raise
+            raise UsernameTaken(USERNAME_TAKEN) from exc
+        await self._audit(
+            "user.created",
+            actor=actor,
+            detail=_json(
+                {
+                    "username": principal.username,
+                    "roles": [],
+                    "provider": "ad",
+                    "notify_email_source": "directory" if typed is None else "administrator",
+                }
+            ),
+            client=client,
+        )
+        await self._notify_security(
+            ACCOUNT_CREATED, username=principal.username, email=address, detail={"roles": []}
+        )
+        return user_id
 
     # --- directory session reconciliation (ADR 0079 mechanism 2) --------------
 
@@ -5505,11 +5672,11 @@ class AuthService:
             raise DirectoryObjectIdMissing(
                 f"{DIRECTORY_OBJECT_ID_MISSING}: this account has no immutable directory identifier"
                 " (objectGUID), so it cannot take a federated binding, and it never gains one."
-                " Only a Windows SSO sign-in creates an account with one, through a directory that"
-                " returns a readable objectGUID. To link this person: make the directory return"
-                " objectGUID, turn Windows SSO on if it is off, remove this account, have the"
-                " person sign in once with Windows SSO, then bind the new account. Removing the"
-                " account discards its user_id and what is keyed on it"
+                " An account gets one at creation, from a directory that returns a readable"
+                " objectGUID: through POST /users/directory, or when the person signs in once with"
+                " Windows SSO. To link this person: make the directory return objectGUID, remove"
+                " this account, create it again one of those two ways, then bind the new account."
+                " Removing the account discards its user_id and what is keyed on it"
             )
         holder = await self._store.get_user_by_federated_subject(issuer, subject)
         if holder is not None and holder.id != user_id:

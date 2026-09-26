@@ -28,11 +28,13 @@ import httpx
 import pytest
 
 from messagefoundry.auth import Role
+from messagefoundry.auth.ldap import AdPrincipal, LdapError
 from messagefoundry.auth.service import (
     DIRECTORY_OBJECT_ID_MISSING,
     AuthService,
     DirectoryObjectIdMissing,
 )
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from tests.test_api_auth import (
@@ -410,7 +412,8 @@ async def test_the_route_refuses_a_row_with_no_directory_object_id(engine: Engin
         assert r.status_code == 400, r.text
         detail = r.json()["detail"]
         assert detail.startswith(f"{DIRECTORY_OBJECT_ID_MISSING}: ")
-        assert "sign in once with Windows SSO" in detail
+        # Both ways to a row that can bind are named: #2021's create, and a Windows SSO sign-in.
+        assert "POST /users/directory" in detail and "Windows SSO" in detail
         assert await _pairs(engine, target) == {target: (None, None)}
         assert await _federated_rows_since(engine, mark) == []
         [row] = await _audit(engine, "auth.federated_bind_refused")
@@ -530,3 +533,166 @@ async def test_an_administrator_cannot_change_their_own_binding(engine: Engine) 
             f"/users/{target}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
         )
         assert ok.status_code == 200, ok.text
+
+
+# --- BACKLOG #2021: an administrator creates the directory mirror row a binding needs ---------------
+
+
+class _Directory:
+    """A service-account directory lookup. ``down`` makes it unreachable, as ``LdapError`` says."""
+
+    def __init__(self, *principals: AdPrincipal) -> None:
+        self._by_name = {p.username: p for p in principals}
+        self.down = False
+        self.asked: list[str] = []
+
+    def resolve_principal(
+        self, username: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
+        self.asked.append(username)
+        if self.down:
+            raise LdapError("dc01.corp.example: connection refused")
+        return self._by_name.get(username)
+
+
+def _principal(username: str, *, object_id: str | None = "guid-from-directory") -> AdPrincipal:
+    return AdPrincipal(
+        username=username,
+        display_name=username.upper(),
+        # A usable `mail`, so the directory supplies the notification address and the request
+        # needs none. The service suite covers the directory that supplies no usable one.
+        email=f"{username}@example.org",
+        dn=f"CN={username},DC=x",
+        groups=frozenset(),
+        directory_object_id=object_id,
+    )
+
+
+async def _directory_service(engine: Engine, directory: _Directory) -> AuthService:
+    """Directory on, Windows SSO off (``kerberos_enabled`` defaults False), an issuer configured."""
+    settings = AuthSettings(
+        require_mfa=False,
+        oidc_issuer=ISSUER,
+        ad_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+    )
+    assert settings.kerberos_enabled is False
+    service = AuthService(engine.store, settings, ldap=directory)  # type: ignore[arg-type]
+    await service.initialize()
+    return service
+
+
+async def test_a_directory_row_created_by_name_takes_its_id_from_the_directory_and_binds(
+    engine: Engine,
+) -> None:
+    """The row the create makes carries the objectGUID the directory answered with, and then takes
+    a federated binding on a site with Kerberos off. THE CONTROL is the same request carrying an id
+    of the caller's: the model has no such field, so it is refused 422 and nothing is written."""
+    directory = _Directory(_principal("jdoe"))
+    service = await _directory_service(engine, directory)
+    async with _client(engine, service) as c:
+        tok = await _admin(c, service)
+        planted = await c.post(
+            "/users/directory",
+            json={"username": "jdoe", "directory_object_id": "guid-chosen-by-caller"},
+            headers=_auth(tok),
+        )
+        assert planted.status_code == 422, planted.text
+        assert await engine.store.get_user_by_username("jdoe") is None
+        assert directory.asked == []
+
+        r = await c.post("/users/directory", json={"username": "jdoe"}, headers=_auth(tok))
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["auth_provider"] == "ad" and body["roles"] == []
+        user = await engine.store.get_user(body["id"])
+        assert user is not None
+        assert user.directory_object_id == "guid-from-directory"
+        assert user.display_name == "JDOE"
+        [row] = [
+            a for a in await _audit(engine, "user.created") if a["actor"] == "root" and a["client"]
+        ]
+        assert json.loads(str(row["detail"]))["provider"] == "ad"
+
+        _r, tok = await _reauth(c, tok, purpose=ACTION)
+        bound = await c.put(
+            f"/users/{user.id}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+        )
+        assert bound.status_code == 200, bound.text
+    assert await _pairs(engine, user.id) == {user.id: (ISSUER, "S-1-a")}
+
+
+async def test_the_directory_create_needs_users_manage_and_a_fresh_step_up(engine: Engine) -> None:
+    """Gated as ``POST /users``: a Viewer is refused, and so is an Administrator whose step-up
+    window has lapsed. The control is the same Administrator after a re-authentication."""
+    directory = _Directory(_principal("jdoe"))
+    service = await _directory_service(engine, directory)
+    await _add(service, "vw", Role.VIEWER)
+    async with _client(engine, service) as c:
+        viewer = (await _login(c, "vw")).json()["token"]
+        denied = await c.post("/users/directory", json={"username": "jdoe"}, headers=_auth(viewer))
+        assert denied.status_code == 403, denied.text
+
+        tok = await _admin(c, service)
+        await engine.store.mark_session_reauthed(hash_token(tok), now=0.0)
+        stale = await c.post("/users/directory", json={"username": "jdoe"}, headers=_auth(tok))
+        assert stale.status_code == 403, stale.text
+        assert stale.headers.get("X-Step-Up-Required") == "1"
+        assert directory.asked == []
+        assert await engine.store.get_user_by_username("jdoe") is None
+
+        _r, tok = await _reauth(c, tok)
+        ok = await c.post("/users/directory", json={"username": "jdoe"}, headers=_auth(tok))
+        assert ok.status_code == 201, ok.text
+
+
+async def test_the_directory_create_refusals_and_their_codes(engine: Engine) -> None:
+    """404 when the lookup finds nothing, 400 when the entry has no readable objectGUID, 409 when a
+    row already holds the name, 400 when the directory has no usable ``mail`` and the request gives
+    no address, 503 when the directory is down. No refusal writes a row; ``nomail`` is the one the
+    addressed retry created. The 503 does not hand the directory's own error text to the caller."""
+    directory = _Directory(_principal("jdoe"), _principal("noid", object_id=None))
+    service = await _directory_service(engine, directory)
+    async with _client(engine, service) as c:
+        tok = await _admin(c, service)
+        missing = await c.post("/users/directory", json={"username": "ghost"}, headers=_auth(tok))
+        assert missing.status_code == 404, missing.text
+        no_id = await c.post("/users/directory", json={"username": "noid"}, headers=_auth(tok))
+        assert no_id.status_code == 400, no_id.text
+        assert no_id.json()["detail"].startswith(f"{DIRECTORY_OBJECT_ID_MISSING}: ")
+        taken = await c.post("/users/directory", json={"username": "root"}, headers=_auth(tok))
+        assert taken.status_code == 404, taken.text  # the directory has no "root"; a local row
+        directory._by_name["root"] = _principal("root", object_id="guid-root")
+        taken = await c.post("/users/directory", json={"username": "root"}, headers=_auth(tok))
+        assert taken.status_code == 409, taken.text
+        # No usable directory `mail`: 400 until the administrator gives the address.
+        nomail = AdPrincipal(
+            username="nomail",
+            display_name=None,
+            email=None,
+            dn="CN=nomail,DC=x",
+            groups=frozenset(),
+            directory_object_id="guid-nomail",
+        )
+        directory._by_name["nomail"] = nomail
+        unaddressed = await c.post(
+            "/users/directory", json={"username": "nomail"}, headers=_auth(tok)
+        )
+        assert unaddressed.status_code == 400, unaddressed.text
+        assert "notify_email" in unaddressed.json()["detail"]
+        addressed = await c.post(
+            "/users/directory",
+            json={"username": "nomail", "notify_email": "nomail@example.org"},
+            headers=_auth(tok),
+        )
+        assert addressed.status_code == 201, addressed.text
+        assert addressed.json()["notify_email"] == "nomail@example.org"
+        directory.down = True
+        down = await c.post("/users/directory", json={"username": "jdoe"}, headers=_auth(tok))
+        assert down.status_code == 503, down.text
+        assert "dc01" not in down.text
+    names = {u.username for u in await engine.store.list_users()}
+    assert names == {"root", "nomail"}

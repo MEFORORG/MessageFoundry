@@ -7,6 +7,25 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **An administrator can create a directory (AD) account without a Windows SSO sign-in.**
+  `POST /users/directory` takes a body of `{"username": "<name>"}` and creates the account's mirror
+  row. Before, only a Kerberos sign-in created one, so a site with no Windows SSO had no account to
+  link a federated (OIDC) identity to, and nobody could sign in through its identity provider. The
+  engine looks the name up with the directory service account, as a Kerberos sign-in does. The
+  account's `objectGUID`, display name and `mail` come from that answer, never from the request, so
+  an administrator cannot choose which directory identity an account claims. The route refuses a
+  name the directory does not return or returns disabled (404), an entry with no readable
+  `objectGUID` (400, since that account could never be linked), a name or `objectGUID` an account
+  already holds (409), and an unreachable directory (503). It needs `users:manage` and the same
+  step-up as `POST /users`. The account is never created without a notification address. When the
+  directory's `mail` passes the rule a sign-in applies to it, that is the address, and a
+  `notify_email` in the body is refused, so an administrator cannot send the holder's notices
+  elsewhere. Otherwise the body must carry `notify_email`, checked as `POST /users` checks `email`.
+  The address gets the `account_created` notice. The account starts with no roles; they come from
+  the AD-group map at sign-in. It writes a `user.created` audit row with `"provider": "ad"` and
+  where the address came from.
+  The account can then take `PUT /users/{user_id}/federated-identity`. There is no console screen
+  for it yet. (`BACKLOG #2021`, ADR 0184)
 - **A DAST pass now sends hostile bytes to live MLLP, raw-TCP and X12 listeners and checks the
   engine's ingress rules.** `scripts/security/dast_ingress_sweep.py` runs a real engine on loopback.
   It sends broken framing, hostile HL7 and seeded mutations. Six detectors check each case: one reply
@@ -517,8 +536,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   longer emitted. **What an operator must do before turning on `[auth].oidc_enabled`:** link each
   account with `PUT /users/{user_id}/federated-identity` and a body of `{"subject": "<the IdP
   sub>"}`. The issuer is always `[auth].oidc_issuer`, which must be set. The account must already
-  exist as a directory account; a Windows SSO (Kerberos) sign-in creates one. Nothing else creates
-  one yet, so a site with no Kerberos sign-in cannot link anyone until a later change adds that.
+  exist as a directory account. A Windows SSO (Kerberos) sign-in creates one, and so does an
+  administrator's `POST /users/directory`, which needs no sign-in (`BACKLOG #2021`, its own entry).
   The same route with a new `sub` moves the link and signs the account out. `DELETE` on the same
   path removes the link and signs the account out. Both routes need `users:manage` and a fresh
   re-authentication for the action `admin_federated_identity`. Each write leaves an audit row

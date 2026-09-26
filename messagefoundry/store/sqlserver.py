@@ -161,6 +161,7 @@ from messagefoundry.store.store import (
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
+    birth_notify_email,
     build_audit_mac_keys,
     delivery_key,
     next_lockout_state,
@@ -169,7 +170,6 @@ from messagefoundry.store.store import (
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
-    seed_notify_email,
     settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
@@ -10150,6 +10150,7 @@ class SqlServerStore:
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
+        notify_email: str | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -10163,7 +10164,7 @@ class SqlServerStore:
                 auth_provider,
                 display_name,
                 email,
-                seed_notify_email(email) if adopt_notify_email else None,
+                birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
                 now,
                 now,
                 password_hash,

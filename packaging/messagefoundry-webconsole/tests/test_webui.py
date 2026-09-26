@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -3560,7 +3561,8 @@ async def test_the_create_form_requires_a_notification_address(engine: Engine) -
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
         form = await c.get("/ui/users/new")
-        assert 'name="email"' in form.text and "required" in form.text
+        [email_input] = re.findall(r'<input[^>]*name="email"[^>]*>', form.text)
+        assert "required" in email_input
         for email in ("", "a@b.org, c@d.org"):
             r = await c.post(
                 "/ui/users",

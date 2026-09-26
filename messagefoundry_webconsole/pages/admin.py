@@ -438,8 +438,8 @@ def _link_form(view: FederatedIdentityView, subject: str) -> Markup:
         return el(
             "p",
             "This account cannot be linked. It has no immutable directory id (objectGUID), and it "
-            "never gains one. Only a Windows SSO sign-in through a directory that returns "
-            "objectGUID creates an account with one.",
+            "never gains one. An account gets one at creation, from a directory that returns "
+            "objectGUID: through POST /users/directory, or at a first Windows SSO sign-in.",
             class_="muted",
         )
     return el(
