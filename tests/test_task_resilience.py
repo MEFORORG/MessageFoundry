@@ -781,12 +781,14 @@ async def test_status_names_a_pooled_stage_whose_claimer_is_down(
 #
 # Two earlier hand probes were blind: the root logger level filtered the records they asserted on,
 # and an untargeted injection hit a different worker from the one it meant to kill. So every log
-# assertion below pins its own logger, every injection is keyed on the claim's STAGE, and the
-# per-lane test carries a control arm proving the injection really kills the named worker.
+# assertion below pins its own logger and names the worker it expects, the per-lane kill is keyed on
+# the claim's STAGE and then on the very task that took the fault, and the pooled kill is patched on
+# one dispatcher instance. Each respawn test has a control arm that removes only the respawn.
 
 _RUNNER_LOGGER = "messagefoundry.pipeline.wiring_runner"
 
-# (kind, the runner dict that holds the worker, its key, the stage its claim names)
+# (kind, the runner dict that holds the worker, its key, the stage its claim names). The response
+# worker, the fourth per-lane kind, needs a LOOPBACK inbound and is not covered here.
 _PER_LANE_WORKERS = [
     ("router", "_router_workers", "IB", Stage.INGRESS.value),
     ("transform", "_transform_workers", "IB", Stage.ROUTED.value),
@@ -794,25 +796,39 @@ _PER_LANE_WORKERS = [
 ]
 
 
+def _control_ids(collector: _Collector) -> list[str]:
+    """MSH-10 of each delivered payload, in delivery order."""
+    return [p.split("|")[9] for p in collector.deliveries]
+
+
+async def _until_delivered(store: MessageStore, n: int, timeout: float = 10.0) -> None:
+    async def _enough() -> bool:
+        return await _delivered_count(store) >= n
+
+    await _until_async(_enough, timeout=timeout)
+
+
 def _kill_per_lane_worker(
     runner: RegistryRunner, store: MessageStore, stage: str, monkeypatch: pytest.MonkeyPatch
 ) -> dict[str, int]:
     """Kill the per-lane worker that claims ``stage``: fault its next claim, then raise out of the
-    backoff sleep its except arm takes after that fault. Nothing else is touched, so only the worker
-    whose claim names ``stage`` can die. (The delivery worker's claim passes no ``stage``; it is the
-    OUTBOUND claim by default.)"""
+    backoff sleep its except arm takes after that fault. The raise is keyed on the TASK that took the
+    claim fault, so a sibling that happens to back off in the same window sleeps normally. (The
+    delivery worker's claim passes no ``stage``; it is the OUTBOUND claim by default.)"""
     armed = {"claim_faults": 0, "sleep_raises": 0}
+    victim: dict[str, asyncio.Task[Any] | None] = {"task": None}
     real_claim = store.claim_next_fifo
     real_sleep = runner._stop_or_sleep
 
     async def claim(*a: Any, **k: Any) -> Any:
         if k.get("stage", Stage.OUTBOUND.value) == stage and armed["claim_faults"] == 0:
             armed["claim_faults"] += 1
+            victim["task"] = asyncio.current_task()
             raise RuntimeError(f"injected {stage} claim fault")
         return await real_claim(*a, **k)
 
     async def sleep(delay: float) -> bool:
-        if armed["claim_faults"] == 1 and armed["sleep_raises"] == 0:
+        if victim["task"] is asyncio.current_task() and armed["sleep_raises"] == 0:
             armed["sleep_raises"] += 1
             raise RuntimeError(f"injected death in the {stage} worker's backoff")
         return await real_sleep(delay)
@@ -837,8 +853,8 @@ async def test_a_dead_per_lane_worker_is_respawned_and_its_lane_delivers(
     """Each per-lane worker kind dies by injection and its REAL done-callback respawns it.
 
     The control arm disables only the respawn (the spawn helper the callback calls becomes a no-op
-    AFTER start) and asserts the injected death really left the named worker dead. Without that arm a
-    passing respawn arm could not tell "respawned" from "never killed"."""
+    AFTER start) and asserts the lane then does NOT deliver. That is what credits the respawn arm's
+    delivery to the callback rather than to some other path that could move the lane."""
     caplog.set_level(logging.ERROR, logger=_RUNNER_LOGGER)
     store, runner, collector = await _start_runner(tmp_path, "per_lane")
     try:
@@ -852,12 +868,17 @@ async def test_a_dead_per_lane_worker_is_respawned_and_its_lane_delivers(
 
         await _until(first.done, timeout=5.0)
         assert armed == {"claim_faults": 1, "sleep_raises": 1}
-        assert first.exception() is not None  # it died of the injection, not of a stop
+        exc = first.exception()
+        assert isinstance(exc, RuntimeError) and "injected death" in str(exc), exc
+        # The supervisor names the worker it respawned; the three kinds share the suffix only.
+        assert f"{kind} worker '{key}' exited unexpectedly; respawning" in caplog.text
 
+        control_id = f"M1614{kind[:3]}"
         if not respawn:
-            await asyncio.sleep(0.1)  # give a (disabled) respawn every chance to happen
-            assert workers[key] is first and first.done()
-            assert "exited unexpectedly; respawning" in caplog.text  # the callback did run
+            await runner._handle_inbound(runner.registry.inbound["IB"], _hl7(control_id))
+            await asyncio.sleep(1.0)  # ample: the respawn arm delivers in well under this
+            assert workers[key] is first
+            assert collector.deliveries == []  # no respawn, so the lane does not drain
             return
 
         def _replaced() -> bool:
@@ -865,17 +886,19 @@ async def test_a_dead_per_lane_worker_is_respawned_and_its_lane_delivers(
             return task is not None and task is not first and not task.done()
 
         await _until(_replaced, timeout=5.0)
-        assert "exited unexpectedly; respawning" in caplog.text
-        await runner._handle_inbound(runner.registry.inbound["IB"], _hl7(f"M1614{kind[:3]}"))
-
-        async def _delivered() -> bool:
-            return await _delivered_count(store) >= 1
-
-        await _until_async(_delivered, timeout=10.0)
-        assert [p.split("|")[9] for p in collector.deliveries] == [f"M1614{kind[:3]}"]
+        await runner._handle_inbound(runner.registry.inbound["IB"], _hl7(control_id))
+        await _until_delivered(store, 1)
+        assert _control_ids(collector) == [control_id]
     finally:
         await runner.stop()
         await store.close()
+
+
+async def _pending_at(store: MessageStore, stage: Stage) -> int:
+    cur = await store._db.execute(
+        "SELECT COUNT(*) AS c FROM queue WHERE stage=? AND status='pending'", (stage.value,)
+    )
+    return int((await cur.fetchone())["c"])
 
 
 @pytest.mark.parametrize("stage", [Stage.ROUTED, Stage.OUTBOUND], ids=lambda s: s.value)
@@ -883,24 +906,50 @@ async def test_a_dead_pooled_claimer_at_a_later_stage_is_respawned_and_delivers_
     stage: Stage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#1609's respawn at the two later stages. INGRESS is the test above; the 2026-09-11
-    measurement also stranded messages at ``routed`` when the OUTBOUND claimer died."""
+    measurement also stranded messages at ``routed`` when the OUTBOUND claimer died.
+
+    The order assertion only means something if the second message is already PENDING on the lane
+    while the first sits stranded in flight. So the claimer dies twice (the first respawn is
+    immediate, the second backs off), and the backed-off replacement is held until P2 is pending at
+    this stage. A replacement that claimed before releasing P1 would take P2 first."""
+    from messagefoundry.pipeline import stage_dispatcher
+
+    gate_delay = 0.37  # a value no other sleep in the dispatcher uses
+    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_BACKOFF_BASE_SECONDS", gate_delay)
     store, runner, collector = await _start_runner(tmp_path, "pooled")
     try:
         dispatcher = runner._dispatchers[stage]
         first = dispatcher._claimers[0].task
-        fired = _kill_next_claims(dispatcher, monkeypatch, times=1)
+        assert first is not None and not first.done()
+        gate = asyncio.Event()
+        real_sleep = dispatcher._sleep_or_stop
+
+        async def gated_sleep(seconds: float) -> None:
+            if seconds == gate_delay:
+                await gate.wait()
+                return
+            await real_sleep(seconds)
+
+        monkeypatch.setattr(dispatcher, "_sleep_or_stop", gated_sleep)
+        fired = _kill_next_claims(dispatcher, monkeypatch, times=2)
         ib = runner.registry.inbound["IB"]
         await runner._handle_inbound(ib, _hl7("M1614P1"))
-        await _until(lambda: fired["n"] == 1, timeout=5.0)
+        await _until(lambda: fired["n"] == 2 and dispatcher.respawns == 2, timeout=5.0)
+        assert first.done() and isinstance(first.exception(), RuntimeError)
+
         await runner._handle_inbound(ib, _hl7("M1614P2"))
 
-        async def _both() -> bool:
-            return await _delivered_count(store) >= 2
+        async def _p2_waiting() -> bool:
+            return await _pending_at(store, stage) >= 1
 
-        await _until_async(_both, timeout=10.0)
-        assert dispatcher._claimers[0].task is not first and dispatcher.respawns == 1
-        assert [p.split("|")[9] for p in collector.deliveries] == ["M1614P1", "M1614P2"]
+        await _until_async(_p2_waiting, timeout=5.0)
+        assert collector.deliveries == []  # nothing has moved past the dead claimer yet
+        gate.set()
+
+        await _until_delivered(store, 2)
+        assert _control_ids(collector) == ["M1614P1", "M1614P2"]
         assert await _inflight_rows(store) == 0
+        assert dispatcher.respawns == 2
     finally:
         await runner.stop()
         await store.close()
@@ -912,14 +961,30 @@ async def test_one_route_handoff_fault_on_a_running_runner_still_delivers_withou
 ) -> None:
     """In-flight recovery EXISTS in both modes, so this asserts delivery rather than a strand.
 
-    Per-lane: the router worker's except arm re-pends the claimed row (#1611). Pooled: the
-    serializer's T17 arm reschedules the head with a durable backoff (ADR 0070 fix A). Both backoffs
-    are shortened so the recovery, not the default one-second wait, is what the timeout measures."""
+    Per-lane: the router worker's except arm re-pends the claimed row (#1611; the per_lane arm
+    overlaps the #1611 test above, and is kept so the brief's pooled/per-lane pair reads side by
+    side). Pooled: the serializer's T17 arm reschedules the head with a durable backoff (ADR 0070
+    fix A). Both backoffs are shortened only to keep the test fast."""
     from messagefoundry.pipeline import stage_dispatcher
 
     monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.05)
     monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.05)
     store, runner, collector = await _start_runner(tmp_path, claim_mode)
+
+    def _snapshot() -> dict[str, Any]:
+        """Every supervised task in this mode, so 'nothing was replaced' covers all of them."""
+        if claim_mode == "per_lane":
+            return {
+                **{f"router:{k}": t for k, t in runner._router_workers.items()},
+                **{f"transform:{k}": t for k, t in runner._transform_workers.items()},
+                **{f"delivery:{k}": t for k, t in runner._workers.items()},
+            }
+        return {
+            f"{stage.value}:{i}": c.task
+            for stage, d in runner._dispatchers.items()
+            for i, c in enumerate(d._claimers)
+        }
+
     try:
         faults = {"n": 0}
         real_handoff = store.route_handoff
@@ -931,27 +996,17 @@ async def test_one_route_handoff_fault_on_a_running_runner_still_delivers_withou
             return await real_handoff(*a, **k)
 
         monkeypatch.setattr(store, "route_handoff", flaky_handoff)
-        tasks_before = (
-            dict(runner._router_workers)
-            if claim_mode == "per_lane"
-            else {"c": runner._dispatchers[Stage.INGRESS]._claimers[0].task}
-        )
+        tasks_before = _snapshot()
         await runner._handle_inbound(runner.registry.inbound["IB"], _hl7("M1614H"))
 
-        async def _delivered() -> bool:
-            return await _delivered_count(store) >= 1
-
-        await _until_async(_delivered, timeout=10.0)
+        await _until_delivered(store, 1)
         assert faults["n"] >= 2  # the fault really fired, and the row really was re-tried
-        assert [p.split("|")[9] for p in collector.deliveries] == ["M1614H"]
+        assert _control_ids(collector) == ["M1614H"]
         assert await _inflight_rows(store) == 0
         # Recovered in place: no worker or claimer was replaced to get there.
-        tasks_after = (
-            dict(runner._router_workers)
-            if claim_mode == "per_lane"
-            else {"c": runner._dispatchers[Stage.INGRESS]._claimers[0].task}
-        )
-        assert tasks_after == tasks_before
+        assert _snapshot() == tasks_before
+        if claim_mode == "pooled":
+            assert sum(d.respawns for d in runner._dispatchers.values()) == 0
     finally:
         await runner.stop()
         await store.close()
