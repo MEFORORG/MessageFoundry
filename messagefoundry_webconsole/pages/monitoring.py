@@ -296,6 +296,12 @@ _EVENT_KINDS = (
     # BACKLOG #1662 — the DATABASE poll source, on a row it cannot turn into a body. The first
     # non-listener kind: a poll source has no peer, so its rows carry a NULL peer_host.
     "row_undecodable",
+    # BACKLOG #1621 - the FILE source's four quarantine arms, each moving a drop to `.error`. Also
+    # poll-source kinds, so their rows carry a NULL peer_host.
+    "file_oversize",
+    "file_decompress_failed",
+    "file_content_mismatch",
+    "file_scan_rejected",
     # ADR 0154 D6 — inbound HTTP intake-auth refusals. CI asserts this tuple equals the set the
     # engine actually emits, so these are not optional garnish: without them the vocabulary test
     # fails. Each also writes an audit_log row, which is the copy that survives diagnostics being off.
