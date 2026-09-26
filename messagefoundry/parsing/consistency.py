@@ -3,10 +3,14 @@
 """Cross-field HL7 consistency checks for Routers/Handlers (WP-7b; ASVS 2.2.3/2.1.2/2.2.1).
 
 Strict validation ([validate.py](validate.py), opt-in `validation.strict`) checks message
-*structure* — segment cardinality, datatypes, table values, lengths — against the official HL7
-schema. It does **not** check *business coherence across fields*: that a required identifier is
-present, that a value is echoed consistently across segments, or that admit ≤ discharge. ASVS 2.2.3 /
-2.1.2 place that "combined-item" consistency on the application — here, the Router/Handler.
+*structure* — segment cardinality, required segments and required fields — against the official
+HL7 message structure for the version. It does **not** check field *content*: it parses at
+hl7apy's TOLERANT level, so a malformed date, an over-long value and a code outside its HL7 table
+all pass it ([validate.py](validate.py) states the measured scope). Nor does it check *business
+coherence across fields*: that an identifier a feed requires is present, that a value is echoed
+consistently across segments, or that admit ≤ discharge. ASVS 2.2.3 / 2.1.2 place that
+"combined-item" consistency on the application — here, the Router/Handler. So content checks such
+as :func:`valid_date` also belong here.
 
 This module is a small, **pure** (side-effect-free) toolkit of reusable checks a Handler composes.
 Each primitive takes a parsed :class:`~messagefoundry.parsing.message.Message` plus field *paths*
