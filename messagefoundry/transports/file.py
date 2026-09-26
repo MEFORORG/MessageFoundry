@@ -55,6 +55,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
+    positive_cap,
     register_destination,
     register_source,
     resolve_poll_ceiling,
@@ -80,8 +81,8 @@ _T = TypeVar("_T")
 #: ``(size, mtime_ns)``: what the partial-write guard compares (BACKLOG #116).
 _FileSig = tuple[int, int]
 
-# Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). A
-# falsy value (None/0) in settings disables the cap; see docs/CONNECTIONS.md.
+# Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). None/0 in
+# settings, in any spelling, disables the cap; see docs/CONNECTIONS.md.
 DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB — matches the MLLP frame cap
 
 # Cap the leave-in-place (#142) in-memory dedup fast-path so it can't outgrow the durable
@@ -90,10 +91,24 @@ DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB — matches the MLLP frame c
 # ledger.is_processed(), so eviction never causes a false re-ingest. Shared by RemoteFileSource.
 LEAVE_SEEN_CACHE_MAX = 100_000
 
+# Bound the settle gate's poll-to-poll memory (BACKLOG #1811). Each scan also forgets files it has not
+# listed for SETTLE_MISS_LIMIT scans in a row, so in practice it holds one entry per unsettled file in
+# the drop directory; this cap only matters for a directory with more unsettled files than this. At the
+# cap a NEW file is not recorded, so it waits; nothing already recorded is evicted. Evicting would let
+# unsettled files push each other out on every scan so that none of them ever settled, while refusing
+# new entries lets the recorded ones settle, be admitted and make room.
+SETTLE_SEEN_MAX = 100_000
+
+# How many scans in a row may fail to list a file before the settle gate forgets it. More than one, so a
+# listing that fails now and then (a share that drops out, a recursive subtree that is briefly
+# unreadable, a transient stat error that makes is_file() False) does not wipe a sighting and restart
+# the wait; a failed listing returns no candidates rather than raising.
+SETTLE_MISS_LIMIT = 3
+
 # When `decompress=` is set, this bounds the *decompressed* output (ADR 0123): `max_file_bytes` only
 # caps the COMPRESSED input (`st_size`), so a small gzip can expand to gigabytes (a decompression bomb).
 # Because the batch split, the sniff, and every downstream stage run on the decompressed bytes, bounding
-# the decompressed output also bounds post-split expansion. A falsy value (None/0) disables the cap.
+# the decompressed output also bounds post-split expansion. None/0 (in any spelling) disables the cap.
 DEFAULT_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024  # 64 MiB
 
 # How long FileSource.stop() waits for the poll task before it gives up on a blocked share call
@@ -470,6 +485,10 @@ class FileSource(SourceConnector):
         # ledger, so it can't outgrow the ledger's own count cap. A miss falls through to the durable
         # is_processed() read, so an eviction never causes a false re-ingest.
         self._processed_seen: OrderedDict[str, None] = OrderedDict()
+        # BACKLOG #1811 settle gate: the (size, mtime_ns) each not-yet-admitted file showed at the poll
+        # that last saw it, and how many scans in a row have since failed to list it, keyed by path. In
+        # memory only and never logged. See _settled.
+        self._settle_seen: dict[str, tuple[_FileSig, int]] = {}
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (a missing dir is logged-and-retried each poll, never fails start).
         self.validate_directory: bool = bool(s.get("validate_directory", False))
@@ -480,12 +499,16 @@ class FileSource(SourceConnector):
         # Encoding used to re-encode split batch messages back to bytes for the handler. A single
         # (non-batch) message is handed off verbatim, so its bytes never round-trip through this.
         self.encoding: str = s.get("encoding", "utf-8")
-        mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
-        self.max_file_bytes: int | None = int(mfb) if mfb else None
+        self.max_file_bytes: int | None = positive_cap(
+            s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES),
+            int,
+            knob="max_file_bytes",
+            transport="file source",
+        )
         # Per-tick intake ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
         # poll source may default this on are stated once, in transports/base.py). Caps how many files
-        # ONE scan disposes of; the rest stay in the drop directory and the next scan takes them. A
-        # falsy value (None/0) disables the cap, matching max_file_bytes above.
+        # ONE scan disposes of; the rest stay in the drop directory and the next scan takes them.
+        # None/0 (in any spelling) disables the cap, matching max_file_bytes above.
         self.poll_max_files: int | None = resolve_poll_ceiling(
             s.get("poll_max_files", DEFAULT_MAX_ITEMS_PER_POLL),
             knob="poll_max_files",
@@ -495,9 +518,13 @@ class FileSource(SourceConnector):
         # AV scan / batch split (they must see the real HL7). None (default) is byte-identical to before.
         self.decompress: str | None = _validate_compression(s.get("decompress"), "decompress")
         # Bounds the DECOMPRESSED output (a bomb guard `max_file_bytes` — a compressed-`st_size` cap —
-        # cannot provide). A falsy value disables it. Only consulted when `decompress` is set.
-        mdb = s.get("max_decompressed_bytes", DEFAULT_MAX_DECOMPRESSED_BYTES)
-        self.max_decompressed_bytes: int | None = int(mdb) if mdb else None
+        # cannot provide). None/0 disables it. Only consulted when `decompress` is set.
+        self.max_decompressed_bytes: int | None = positive_cap(
+            s.get("max_decompressed_bytes", DEFAULT_MAX_DECOMPRESSED_BYTES),
+            int,
+            knob="max_decompressed_bytes",
+            transport="file source",
+        )
         self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
         self.error_dir = self.directory / s.get("error_subdir", ".error")
         self._handler: InboundHandler | None = None
@@ -709,6 +736,7 @@ class FileSource(SourceConnector):
             0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
         )
         candidates = await self._run_fs(self._candidates)
+        self._prune_settle(candidates)
         disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, path in enumerate(candidates):
             if self._stop.is_set():
@@ -732,6 +760,10 @@ class FileSource(SourceConnector):
                     already = await self._leave_already_ingested(file_key)
                 if already:
                     continue
+            if not self._settled(path, before):
+                # BACKLOG #1811: first sighting, or the file changed since the last poll. Nothing is
+                # read, moved or charged against the per-tick budget, the same as #116's skip below.
+                continue
             if self.max_file_bytes is not None and before[0] > self.max_file_bytes:
                 # Transport-level reject *before* any message is read — parallels MLLP dropping an
                 # over-cap frame. It never became a "received message", so (like MLLP) there's no
@@ -768,6 +800,8 @@ class FileSource(SourceConnector):
                     len(raw),
                     read_sig[0],
                 )
+                # The file is still moving, so it must settle again from its latest stat (#1811).
+                self._remember_sig(path, read_sig)
                 continue
             if self.decompress == "gzip":
                 # Decompress BEFORE the sniff, the AV/ICAP scan, and the batch split (ADR 0123): each
@@ -943,7 +977,8 @@ class FileSource(SourceConnector):
         FINISHED with charges: one handed to the pipeline, or one quarantined to ``.error`` (oversize,
         a failed gunzip, a content-vs-type mismatch, a scanner rejection). Each of those leaves the
         candidate set, so the next scan starts on new work. The arms that leave a file **in place** to be
-        retried — a locked/vanished file, a malfunctioning scan hook, a handler failure — deliberately do
+        retried — a file not yet settled (#1811) or changed during the read (#116), a locked/vanished
+        file, a malfunctioning scan hook, a handler failure — deliberately do
         NOT charge. If they did, a permanently stuck file that sorts early would eat the whole budget on
         every scan and the healthy files behind it would never be ingested. A budget can only be charged
         by something that makes progress.
@@ -995,6 +1030,87 @@ class FileSource(SourceConnector):
         self._processed_seen.move_to_end(file_key)
         while len(self._processed_seen) > LEAVE_SEEN_CACHE_MAX:
             self._processed_seen.popitem(last=False)
+
+    def _settled(self, path: Path, sig: _FileSig) -> bool:
+        """True when ``path`` shows the same ``(size, mtime_ns)`` it showed at the last poll that looked
+        at it, which admits it for reading (BACKLOG #1811). Otherwise remember ``sig`` and return False,
+        so the file waits for a later poll. "The last poll that looked at it" is usually the previous
+        one; a file past the per-tick ceiling's break keeps an older sighting, which is only ever
+        compared as "unchanged since then" and so is still safe.
+
+        **Why this and not #116 alone.** #116 compares a stat before and after the read inside ONE scan,
+        so it only sees a write that lands during the read. A partner that writes, pauses, then writes
+        again leaves a file that is still for the length of the read, and #116 passes the first part
+        as a complete message. This gate compares across polls, so a pause shorter than
+        ``poll_seconds`` is seen.
+
+        **Always on, with no setting.** The failure it prevents is a truncated clinical message that is
+        accepted and indistinguishable downstream from a complete one, so an off switch would only be a
+        way to reopen it. The cost is one poll of latency per file, which ``poll_seconds`` controls.
+        ``min_age_seconds`` is not this gate: it defaults to 0, and even when set it compares the mtime
+        with the clock rather than with an earlier sighting.
+
+        **What it cannot see.** At least these three:
+
+        - a writer that pauses for longer than ``poll_seconds``. The window is ``poll_seconds`` wide,
+          so a very small ``poll_seconds`` narrows it to almost nothing;
+        - a same-length rewrite inside the share's mtime resolution;
+        - a copier that sets the final size first and holds the mtime fixed while it fills the file
+          in, which leaves both size and mtime unchanged between polls.
+
+        The partner's write-then-rename covers all of them. A ``min_age_seconds`` longer than the
+        partner's pause covers the first.
+
+        An admitted file leaves the map. If it is then left in place for a retry, it settles again
+        before the next attempt, which is the safe reading of a file nobody finished with. It also
+        means a retry after a read, scan-hook or hand-off failure waits one extra poll. A file that
+        changed during the read (#116) is re-recorded from its post-read stat instead, so it can be
+        admitted on the very next poll."""
+        key = str(path)
+        seen = self._settle_seen.get(key)
+        if seen is not None and seen[0] == sig:
+            del self._settle_seen[key]
+            return True
+        recorded = self._remember_sig(path, sig)
+        # safe_name hashes the name, so skip it when nobody reads the line.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "file source %s: %s not yet settled (%d bytes); %s",
+                self.directory,
+                safe_name(path.name),
+                sig[0],
+                "waiting for the next poll to agree"
+                if recorded
+                else f"settle memory is full ({SETTLE_SEEN_MAX}), so it waits for room",
+            )
+        return False
+
+    def _remember_sig(self, path: Path, sig: _FileSig) -> bool:
+        """Record ``sig`` as this poll's sighting of ``path`` and return True. At ``SETTLE_SEEN_MAX`` a
+        path not already recorded is left out and this returns False, so it waits for room (see that
+        constant for why this is not eviction)."""
+        key = str(path)
+        if key in self._settle_seen or len(self._settle_seen) < SETTLE_SEEN_MAX:
+            self._settle_seen[key] = (sig, 0)
+            return True
+        return False
+
+    def _prune_settle(self, candidates: list[Path]) -> None:
+        """Forget a file once ``SETTLE_MISS_LIMIT`` scans in a row have not listed it (moved, deleted,
+        renamed away), so the settle map is bounded by the drop directory rather than by every name it
+        ever held. A file listed again has its count reset. Waiting for several misses, rather than
+        forgetting on the first, keeps a listing that fails now and then from restarting every wait."""
+        if not self._settle_seen:
+            return
+        listed = {str(p) for p in candidates}
+        for key, (sig, missed) in list(self._settle_seen.items()):
+            if key in listed:
+                if missed:
+                    self._settle_seen[key] = (sig, 0)
+            elif missed + 1 >= SETTLE_MISS_LIMIT:
+                del self._settle_seen[key]
+            else:
+                self._settle_seen[key] = (sig, missed + 1)
 
     async def _leave_already_ingested(self, file_key: str) -> bool:
         """True if this leave-in-place file was already ingested — the bounded in-process cache first (no

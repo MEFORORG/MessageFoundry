@@ -93,6 +93,7 @@ _PHI_PROVISIONS = (
     "retention.dead_letter_days = 30\n"
     'alerts.email_smtp_host = "smtp.example.org"\n'
     'alerts.email_from = "sec@example.org"\n'
+    'alerts.email_to = ["ops@example.org"]\n'
 )
 
 
@@ -312,7 +313,8 @@ def test_loosening_warns_and_prod_phi_refuses(
         '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
-        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n',
+        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n',
         env="prod",
     )
     assert rc == 2
@@ -444,7 +446,8 @@ def test_debug_logging_gate_keys_on_tier_not_enforcement(
         monkeypatch,
         'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n'
         "security.delete_message_bodies_after_days = 30\n[retention]\ndead_letter_days = 30\n"
-        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n' + debug,
+        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n' + debug,
         env="prod",
     )
     assert rc == 2

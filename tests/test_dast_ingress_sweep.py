@@ -15,6 +15,7 @@ so a tolerated finding cannot outlive its defect.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -26,10 +27,13 @@ from messagefoundry.mllpcodec import frame
 from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT, MLLPSource
 from scripts.security.dast_ingress_sweep import (
     KNOWN_DEFECT_DISCRIMINATORS,
+    PROFILE_BOUNDS,
     Budget,
     Case,
     CaseResult,
+    PolicyError,
     _judge,
+    apply_profile,
     catalogue,
     classify_replies,
     evaluate,
@@ -49,10 +53,23 @@ from scripts.security.dast_ingress_target import (
 _REPO = Path(__file__).resolve().parents[1]
 _POLICY_PATH = _REPO / "scripts" / "security" / "dast-ingress-policy.json"
 _CAP = 65536
+#: The profile the clean pass and every single-case run here use. The required legs share a loaded
+#: hosted runner, and the policy's ``profiles._about`` says why the strict budget flaked there and
+#: what still proves the time detector can fire under this one.
+_PROFILE = "required"
+_PROFILE_ARGS = ["--profile", _PROFILE]
+#: The per-test watchdog for a test that drives a live engine. The leg's own cap (60s ubuntu, 120s
+#: Windows) is below what the profile tolerates for one slow case on top of a loaded run, and a
+#: watchdog kill names nothing, where the sweep's own bound names the case. A hang still dies here.
+_LIVE = pytest.mark.timeout(300)
+
+
+def _strict_policy() -> dict[str, Any]:
+    return load_policy(_POLICY_PATH)
 
 
 def _policy() -> dict[str, Any]:
-    return load_policy(_POLICY_PATH)
+    return apply_profile(_strict_policy(), _PROFILE)
 
 
 def _budget(**overrides: Any) -> Budget:
@@ -73,7 +90,7 @@ async def _run_alone(case: Case, budget: Budget, **posture: float) -> CaseResult
 def clean_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[int, dict[str, Any]]:
     """One seeded run against a real engine, shared by every test that reads its receipt."""
     receipt_path = tmp_path_factory.mktemp("dast-ingress") / "receipt.json"
-    code = main(["--policy", str(_POLICY_PATH), "--receipt", str(receipt_path)])
+    code = main(["--policy", str(_POLICY_PATH), *_PROFILE_ARGS, "--receipt", str(receipt_path)])
     return code, json.loads(receipt_path.read_text(encoding="utf-8"))
 
 
@@ -82,6 +99,7 @@ def clean_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[int, dict[str, 
 # =====================================================================================================
 
 
+@_LIVE
 def test_the_pass_is_clean_against_the_real_engine(clean_run: tuple[int, dict[str, Any]]) -> None:
     code, receipt = clean_run
     untolerated = [f for f in receipt["findings"] if f not in receipt["known_defect_findings"]]
@@ -89,6 +107,7 @@ def test_the_pass_is_clean_against_the_real_engine(clean_run: tuple[int, dict[st
     assert receipt["verdict"] == "PASS"
 
 
+@_LIVE
 def test_the_receipt_names_what_it_examined(clean_run: tuple[int, dict[str, Any]]) -> None:
     """Every detector must have been ARMED, not merely silent: cases on every plane, both reply
     kinds seen, a liveness probe per case, a log watch that saw records, and a resource phase."""
@@ -105,6 +124,7 @@ def test_the_receipt_names_what_it_examined(clean_run: tuple[int, dict[str, Any]
     assert receipt["mutation_cases"] == _policy()["mutations"]
 
 
+@_LIVE
 def test_the_receipt_carries_no_message_content(clean_run: tuple[int, dict[str, Any]]) -> None:
     """Section 9: the receipt travels as a CI artifact, so it carries counts, never a body."""
     _code, receipt = clean_run
@@ -113,6 +133,7 @@ def test_the_receipt_carries_no_message_content(clean_run: tuple[int, dict[str, 
     assert "MSH|" not in text and "ISA*" not in text
 
 
+@_LIVE
 def test_every_tolerated_defect_still_reproduces_in_the_run(
     clean_run: tuple[int, dict[str, Any]],
 ) -> None:
@@ -127,10 +148,31 @@ def test_every_tolerated_defect_still_reproduces_in_the_run(
 # =====================================================================================================
 
 
-@pytest.mark.parametrize("canary", CANARIES)
-def test_each_canary_trips_its_own_detector(canary: str, tmp_path: Path) -> None:
+#: Every canary runs on the STRICT budget, which is the one the nightly gates its scan on, so the
+#: strict path is still exercised end to end on every pull request. A canary only grows more likely
+#: to fire under load, so the strict budget does not make it flaky. The stall canary runs under the
+#: required profile as well, because its detector is the one that profile relaxes.
+_CANARY_RUNS = [(canary, None) for canary in CANARIES] + [("stall", _PROFILE)]
+
+
+@_LIVE
+@pytest.mark.parametrize(("canary", "profile"), _CANARY_RUNS)
+def test_each_canary_trips_its_own_detector(
+    canary: str, profile: str | None, tmp_path: Path
+) -> None:
     receipt_path = tmp_path / f"{canary}.json"
-    code = main(["--policy", str(_POLICY_PATH), "--canary", canary, "--receipt", str(receipt_path)])
+    profile_args = ["--profile", profile] if profile else []
+    code = main(
+        [
+            "--policy",
+            str(_POLICY_PATH),
+            *profile_args,
+            "--canary",
+            canary,
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     detector = CANARY_DETECTOR[canary]
     fired = [f for f in receipt["findings"] if f["detector"] == detector]
@@ -144,14 +186,31 @@ def test_every_detector_has_a_canary() -> None:
     assert set(CANARY_DETECTOR.values()) == set(DETECTORS)
 
 
+@_LIVE
 async def test_the_stall_bound_fires_when_the_frame_deadline_is_off() -> None:
     """The stall half of the time detector, controlled by SUPPORTED configuration: with
     ``max_frame_seconds`` off, a peer trickling inside a frame is never closed, and the case must say
-    so. Without this, a stall check that could not fire would pass every slowloris case."""
-    result = await _run_alone(
-        _case("mllp", "slowloris-in-frame"), _budget(stall_close_seconds=1.0), max_frame_seconds=0
+    so. Without this, a stall check that could not fire would pass every slowloris case.
+
+    It waits out the REQUIRED profile's whole stall bound, not a shortened one, so the bound the clean
+    pass runs under is shown to be reachable. The idle timeout is raised past that bound as well: at
+    the shipped 0.5s, one scheduling gap between trickled bytes on a loaded runner would let the
+    listener close the peer as idle, and the control would fail for a reason it is not about.
+    """
+    budget = _budget()
+    assert (
+        budget.stall_close_seconds
+        == _policy()["profiles"][_PROFILE]["budget"]["stall_close_seconds"]
     )
-    assert any(f["detector"] == "time" for f in result.findings), result.findings
+    assert budget.stall_close_seconds > _strict_policy()["budget"]["stall_close_seconds"]
+    result = await _run_alone(
+        _case("mllp", "slowloris-in-frame"),
+        budget,
+        max_frame_seconds=0,
+        receive_timeout=budget.stall_close_seconds * 4,
+    )
+    stalls = [f for f in result.findings if f["detector"] == "time" and "stalled" in f["detail"]]
+    assert stalls, result.findings
 
 
 def test_a_blind_canary_exits_2_not_1() -> None:
@@ -167,6 +226,7 @@ def test_the_leak_canary_floors_heap_and_handles_separately() -> None:
     assert code == 2, "a heap finding alone must not certify the handle instrument"
 
 
+@_LIVE
 def test_a_floor_breach_exits_2(clean_run: tuple[int, dict[str, Any]]) -> None:
     _code, receipt = clean_run
     policy = _policy()
@@ -176,6 +236,7 @@ def test_a_floor_breach_exits_2(clean_run: tuple[int, dict[str, Any]]) -> None:
     assert any("floor unmet" in m for m in messages)
 
 
+@_LIVE
 def test_a_blind_log_watch_exits_2(clean_run: tuple[int, dict[str, Any]]) -> None:
     _code, receipt = clean_run
     blind = dict(receipt, log={"records_seen": 0, "sentinel_hits": 0})
@@ -185,6 +246,77 @@ def test_a_blind_log_watch_exits_2(clean_run: tuple[int, dict[str, Any]]) -> Non
 
 def test_a_missing_policy_fails_closed(tmp_path: Path) -> None:
     assert main(["--policy", str(tmp_path / "absent.json")]) == 2
+
+
+@_LIVE
+def test_the_run_used_the_required_profile(clean_run: tuple[int, dict[str, Any]]) -> None:
+    _code, receipt = clean_run
+    assert receipt["profile"] == _PROFILE
+    assert receipt["budget"]["case_seconds"] == _policy()["budget"]["case_seconds"]
+
+
+def test_the_required_profile_only_raises_wall_clock_bounds() -> None:
+    """Everything a profile could weaken other than a time bound stays exactly the strict policy."""
+    strict, profiled = _strict_policy(), _policy()
+    raised = profiled["profiles"][_PROFILE]["budget"]
+    assert raised and set(raised) <= PROFILE_BOUNDS
+    for key, value in raised.items():
+        assert value > strict["budget"][key], key
+    for key in ("posture", "floors", "resource_bounds", "canary", "known_defects", "seed"):
+        assert profiled[key] == strict[key], key
+    assert {k: v for k, v in profiled["budget"].items() if k not in raised} == {
+        k: v for k, v in strict["budget"].items() if k not in raised
+    }
+
+
+@pytest.mark.parametrize(
+    ("profile", "why"),
+    [
+        ({"floors": {"min_liveness_probes": 0}}, "nothing else"),
+        ({"budget": {"trickle_delay": 5.0}}, "may not set"),
+        ({"budget": {"case_seconds": 0.1}}, "outside"),
+        ({"budget": {"case_seconds": 61.0}}, "outside"),
+        ({"budget": {"case_seconds": float("nan")}}, "outside"),
+        ({"budget": {"case_seconds": float("inf")}}, "outside"),
+        ({"budget": {"case_seconds": "soon"}}, "unusable"),
+    ],
+)
+def test_a_profile_can_only_raise_a_time_bound(profile: dict[str, Any], why: str) -> None:
+    policy = dict(_strict_policy(), profiles={"loose": profile})
+    with pytest.raises(PolicyError, match=why):
+        apply_profile(policy, "loose")
+
+
+def test_no_profile_is_the_strict_budget() -> None:
+    assert apply_profile(_strict_policy(), None) == _strict_policy()
+
+
+async def test_the_connection_task_count_sees_a_live_connection() -> None:
+    """The resource snapshot waits on this count, so a count stuck at 0 would quietly undo the wait."""
+    settings = dict(_policy()["posture"], canary_stall_seconds=1.0)
+    async with ingress_target(settings) as target:
+        assert target.connection_tasks() == 0
+        _reader, writer = await asyncio.open_connection("127.0.0.1", target.ports["tcp"])
+        try:
+            writer.write(b"\x02")
+            await writer.drain()
+            for _ in range(200):
+                if target.connection_tasks():
+                    break
+                await asyncio.sleep(0.01)
+            assert target.connection_tasks() == 1
+        finally:
+            writer.close()
+        for _ in range(500):
+            if not target.connection_tasks():
+                break
+            await asyncio.sleep(0.01)
+        assert target.connection_tasks() == 0
+
+
+def test_an_unknown_profile_fails_closed() -> None:
+    assert main(["--policy", str(_POLICY_PATH), "--profile", "no-such-profile"]) == 2
+    assert main(["--policy", str(_POLICY_PATH), "--profile", "_about"]) == 2
 
 
 def test_a_known_defect_never_silences_liveness_time_or_log() -> None:
@@ -307,6 +439,7 @@ def test_a_known_defect_cannot_hide_a_second_defect_in_the_same_case() -> None:
     assert not _explained(all_short, 1)
 
 
+@_LIVE
 async def test_a_blank_segment_among_pipelined_frames_is_answered_like_any_other() -> None:
     """Before BACKLOG #1594 a blank segment faulted the handler, which NAKed and closed, so a frame
     pipelined after it went unanswered. Now every frame gets the runner's own reply and a row."""
@@ -318,6 +451,7 @@ async def test_a_blank_segment_among_pipelined_frames_is_answered_like_any_other
         assert not result.findings, result.findings
 
 
+@_LIVE
 async def test_a_live_handler_fault_is_recognised_and_never_tolerated() -> None:
     """Live control for the handler-fault branch, so it is not tested only against hand-built bytes.
     The MLLP handler raises on one frame, so the listener sends its real BACKLOG #1619 NAK and closes.
@@ -382,6 +516,7 @@ def test_each_known_defect_discriminator_matches_its_catalogue_case() -> None:
 # xfails became the two plain tests below, so a regression reds instead of passing quietly.
 
 
+@_LIVE
 async def test_a_blank_segment_is_accepted_and_recorded() -> None:
     """The face that decodes: the empty line is dropped, so the frame is ACKed with a non-ERROR row."""
     result = await _run_alone(_case("mllp", "blank-segment"), _budget())
@@ -390,6 +525,7 @@ async def test_a_blank_segment_is_accepted_and_recorded() -> None:
     assert not result.findings, result.findings
 
 
+@_LIVE
 async def test_a_blank_segment_that_fails_utf8_decode_gets_the_runners_own_nak() -> None:
     """The face that fails UTF-8 decode: one NAK and one ERROR row. ``faults == 0`` tells the
     runner's own NAK apart from the listener's handler-fault AE, which a sender would retry."""
@@ -406,6 +542,7 @@ async def test_a_blank_segment_that_fails_utf8_decode_gets_the_runners_own_nak()
         "that separator, so MSA-1 (itself letters) cannot be read back by the sender."
     ),
 )
+@_LIVE
 async def test_an_alphanumeric_field_separator_gets_a_readable_reply() -> None:
     result = await _run_alone(_case("mllp", "letter-field-separator"), _budget())
     assert not result.findings, result.findings
@@ -421,6 +558,7 @@ _TRICKLE = Case("trickle", "tcp", b"\x02", stall=True, trickle=b"ISA*00*" * 40)
         "so a peer trickling one byte inside receive_timeout holds its slot indefinitely."
     ),
 )
+@_LIVE
 async def test_the_raw_tcp_listener_closes_a_trickling_peer() -> None:
     result = await _run_alone(_TRICKLE, _budget(stall_close_seconds=1.0))
     assert not result.findings, result.findings
@@ -433,6 +571,7 @@ async def test_the_raw_tcp_listener_closes_a_trickling_peer() -> None:
         "peer trickling an interchange inside receive_timeout holds its slot indefinitely."
     ),
 )
+@_LIVE
 async def test_the_x12_listener_closes_a_trickling_peer() -> None:
     trickle = replace(_TRICKLE, plane="x12", payload=b"ISA")
     result = await _run_alone(trickle, _budget(stall_close_seconds=1.0))
@@ -457,6 +596,13 @@ def test_the_ingress_job_installs_no_scanner() -> None:
     for step in _ingress_job()["steps"]:
         run = str(step.get("run", ""))
         assert "pip install" not in run.replace("uv pip install --system --constraint", ""), step
+
+
+def test_the_nightly_keeps_the_strict_budget() -> None:
+    """The load-tolerant profile is for the required legs only; the advisory job keeps the strict
+    bounds, so a listener that is merely slow is still reported somewhere."""
+    for step in _ingress_job()["steps"]:
+        assert "--profile" not in str(step.get("run", "")), step
 
 
 def test_the_ingress_canaries_run_first_and_demand_exit_1() -> None:

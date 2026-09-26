@@ -48,6 +48,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     encode_wire_body,
     peer_ip_allowed,
+    positive_cap,
     probe_tcp_reachable,
     register_destination,
     register_source,
@@ -112,17 +113,29 @@ class X12Destination(DestinationConnector):
         # no-reply a retry. capture_response is forced True by reingress_to at wiring time (ADR 0013).
         self.capture_response: bool = bool(s.get("capture_response", False))
         self.ta1_required: bool = bool(s.get("ta1_required", False))
-        mib = s.get("max_interchange_bytes", DEFAULT_MAX_INTERCHANGE_BYTES)
-        self.max_interchange_bytes: int | None = int(mib) if mib else None
+        self.max_interchange_bytes: int | None = positive_cap(
+            s.get("max_interchange_bytes", DEFAULT_MAX_INTERCHANGE_BYTES),
+            int,
+            knob="max_interchange_bytes",
+            transport="X12 destination",
+        )
         # ADR 0067 §9 (BACKLOG #97): persistent outbound connection — opt-in reuse of ONE lazily-
         # established TCP connection across deliveries (default False = connect-per-send, byte-identical).
         # Same knobs/semantics as MLLP (ADR 0067) minus TLS (X12-over-TCP has none). Key absent → off; the
-        # two freshness knobs follow the receive_timeout convention (present-but-falsy None/0 = disabled).
+        # two freshness knobs follow the receive_timeout convention (None/0 in any spelling = disabled).
         self.persistent: bool = bool(s.get("persistent", False))
-        it = s.get("idle_timeout_seconds", 60.0)
-        self.idle_timeout_seconds: float | None = float(it) if it else None
-        ma = s.get("max_connection_age_seconds")
-        self.max_connection_age_seconds: float | None = float(ma) if ma else None
+        self.idle_timeout_seconds: float | None = positive_cap(
+            s.get("idle_timeout_seconds", 60.0),
+            float,
+            knob="idle_timeout_seconds",
+            transport="X12 destination",
+        )
+        self.max_connection_age_seconds: float | None = positive_cap(
+            s.get("max_connection_age_seconds"),
+            float,
+            knob="max_connection_age_seconds",
+            transport="X12 destination",
+        )
         # Cached connection + freshness stamps (monotonic clock); cached only after a fully-successful
         # transaction (including a TA1 — a complete request/response on a healthy transport).
         self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
@@ -490,18 +503,33 @@ class X12Source(SourceConnector):
         self.host: str = str(s.get("host") or "127.0.0.1")
         self.port: int = int(s["port"])
         self.encoding: str = str(s.get("encoding", "utf-8"))
-        # Caps below: key absent → secure default; present-but-falsy (None/0) → disabled.
-        mc = s.get("max_connections", DEFAULT_MAX_CONNECTIONS)
-        self.max_connections: int | None = int(mc) if mc else None
-        rt = s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT)
-        self.receive_timeout: float | None = float(rt) if rt else None
-        mib = s.get("max_interchange_bytes", DEFAULT_MAX_INTERCHANGE_BYTES)
-        self.max_interchange_bytes: int | None = int(mib) if mib else None
+        # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
+        # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).
+        self.max_connections: int | None = positive_cap(
+            s.get("max_connections", DEFAULT_MAX_CONNECTIONS),
+            int,
+            knob="max_connections",
+            transport="X12 source",
+        )
+        self.receive_timeout: float | None = positive_cap(
+            s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT),
+            float,
+            knob="receive_timeout",
+            transport="X12 source",
+        )
+        self.max_interchange_bytes: int | None = positive_cap(
+            s.get("max_interchange_bytes", DEFAULT_MAX_INTERCHANGE_BYTES),
+            int,
+            knob="max_interchange_bytes",
+            transport="X12 source",
+        )
         # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
         # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. One
         # token per INTERCHANGE, which is what this connector's frame is. The port changed
         # REACHABILITY, never the default -- a stock X12 inbound still has no rate bound.
-        self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        self.max_messages_per_second, self.message_burst = _pacing_settings(
+            s, transport="X12 source"
+        )
         # Carried only so a pacing report can name this connection (BACKLOG #290).
         self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.

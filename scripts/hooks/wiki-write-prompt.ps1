@@ -33,6 +33,18 @@
     one JSON line to log-<yyyy-MM>.jsonl, so prompts can be compared with writes and with the wiki's
     own query log.
 
+    KORUS CHECKOUT. The prompt prints query.ps1 and write.ps1 commands from a korus checkout. It
+    takes the first of these whose scripts/wiki/write.ps1 exists:
+      1. $env:MEFOR_KORUS_CHECKOUT, made absolute (the prompt says when it names no checkout);
+      2. <primary parent>/korus-wiki-main, which the wiki cycle task (korus scripts/wiki/cycle.ps1)
+         keeps detached at origin/main;
+      3. <primary parent>/korus, a working tree that goes stale whenever nobody pulls it.
+    Measured 2026-09-26: that working tree sat 9 commits behind origin/main, and its query.ps1 had no
+    -Seat, so the printed query command would have failed. So the hook text-searches the chosen
+    query.ps1 for a Seat parameter and leaves -Seat off the QUERY command when it finds none;
+    write.ps1 has always taken -Seat. The prompt names the checkout it used, so a stale one shows.
+    With none found it prints the literal <korus checkout>. No git calls: this runs on every Stop.
+
     OPT OUT with $env:MEFOR_WIKI_PROMPT = 'off', or create <coord>/wiki-prompt/OFF. The file reaches
     sessions that are already running; the variable does not.
 
@@ -185,24 +197,72 @@ function Get-Seat([string]$Cwd) {
     return ''
 }
 
-function Get-Reason([string]$Coord, [string]$Seat) {
-    # <coord> is <primary>/.git/mefor-coord, and korus is checked out beside <primary>.
+function Resolve-Korus([string]$Coord) {
+    # The header's KORUS CHECKOUT section gives the order and the reason for it. Returns the path
+    # with forward slashes and the source it came from, or $null when none has write.ps1.
+    # <coord> is <primary>/.git/mefor-coord, so the checkouts sit beside <primary>.
     $primaryParent = Split-Path (Split-Path (Split-Path $Coord -Parent) -Parent) -Parent
-    $korus = '<korus checkout>'
-    if ($primaryParent) {
-        $k = Join-Path $primaryParent 'korus'
-        if (Test-Path -LiteralPath (Join-Path $k 'scripts/wiki/write.ps1')) { $korus = $k.Replace('\', '/') }
+    $candidates = @()
+    $pinned = ([string]$env:MEFOR_KORUS_CHECKOUT).Trim().Trim('"', "'")
+    # Absolute, so the printed command works from whatever directory the seat runs it in.
+    if ($pinned) {
+        try { $candidates += , @([System.IO.Path]::GetFullPath($pinned), 'MEFOR_KORUS_CHECKOUT') } catch { }
     }
+    if ($primaryParent) {
+        $candidates += , @((Join-Path $primaryParent 'korus-wiki-main'), 'korus-wiki-main')
+        $candidates += , @((Join-Path $primaryParent 'korus'), 'korus')
+    }
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath (Join-Path $c[0] 'scripts/wiki/write.ps1') -PathType Leaf) {
+            return @{ path = $c[0].Replace('\', '/').TrimEnd('/'); source = $c[1] }
+        }
+    }
+    return $null
+}
+
+function Test-QueryTakesSeat([string]$Korus) {
+    # A text search is enough: a typed $Seat declaration, such as `[string] $Seat`, inside the
+    # script's param( ... ) block, which closes on a `)` at column 0. A stale checkout's query.ps1
+    # predates -Seat and refuses it, so the printed command would fail. A missing file is false.
+    try {
+        $text = [string](Get-Content -LiteralPath (Join-Path $Korus 'scripts/wiki/query.ps1') -Raw)
+        $block = [regex]::Match($text, '(?ims)^param\s*\((.*?)^\)')
+        if (-not $block.Success) { return $false }
+        return [regex]::IsMatch($block.Groups[1].Value, '(?im)^\s*\[[^\r\n]*\]\s*\$Seat\b')
+    }
+    catch { return $false }
+}
+
+function Get-Reason([string]$Coord, [string]$Seat) {
+    $resolved = Resolve-Korus $Coord
+    $korus = '<korus checkout>'
     # Unknown seat: leave -Seat off, and write.ps1 resolves it or says how to declare one.
     $seatArg = if ($Seat) { " -Seat $Seat" } else { '' }
+    # With no checkout found, assume a current korus, whose query.ps1 takes -Seat.
+    $querySeatArg = $seatArg
+    if ($resolved) {
+        $korus = $resolved.path
+        $korusLine = "Korus checkout used: $korus (from $($resolved.source)). If it is stale, pull it or set MEFOR_KORUS_CHECKOUT."
+        if (-not (Test-QueryTakesSeat $korus)) {
+            $querySeatArg = ''
+            $korusLine += ' Its query.ps1 is missing or has no Seat parameter, so it is probably stale.'
+        }
+    }
+    else {
+        $korusLine = 'Korus checkout used: none found. Set MEFOR_KORUS_CHECKOUT, or keep korus-wiki-main or korus beside the primary checkout.'
+    }
+    if ($env:MEFOR_KORUS_CHECKOUT -and (-not $resolved -or $resolved.source -ne 'MEFOR_KORUS_CHECKOUT')) {
+        $korusLine += ' MEFOR_KORUS_CHECKOUT is set but names no checkout with scripts/wiki/write.ps1, so it was ignored.'
+    }
     $coordArg = $Coord.Replace('\', '/')
     $lines = @(
         '[fleet wiki] Write prompt. A lesson nobody writes down is lost when this session ends.'
         'Record AT MOST ONE event, and only a lesson, gotcha, decision or correction that will still be true next month.'
         'Never live state such as open PRs or who is running, nor what a playbook already says. No PHI, no secrets, no customer or site names.'
         'Evidence must be a commit SHA, a PR with its repo, ref:path such as origin/main:docs/X.md, or an owner ruling with its date.'
+        $korusLine
         'Query first, so you reuse an existing key or write a correction:'
-        "  pwsh -NoProfile -File `"$korus/scripts/wiki/query.ps1`" -StateRoot `"$coordArg`" -Text `"<subject>`"$seatArg"
+        "  pwsh -NoProfile -File `"$korus/scripts/wiki/query.ps1`" -StateRoot `"$coordArg`" -Text `"<subject>`"$querySeatArg"
         'Then write:'
         "  pwsh -NoProfile -File `"$korus/scripts/wiki/write.ps1`" -StateRoot `"$coordArg`" -Type <lesson|gotcha|decision|correction> -Key <area/thing/aspect> -Summary `"<one line>`" -Evidence `"<...>`"$seatArg"
         'If nothing qualifies, reply exactly: wiki: nothing to record'
