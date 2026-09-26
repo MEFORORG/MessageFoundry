@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -1130,3 +1131,163 @@ async def test_resend_refused_by_the_target_inbounds_guards_names_its_own_cause(
         landed = await c.get(refused.headers["location"], follow_redirects=False)
         assert landed.status_code == 200 and "declared content type" in landed.text
     assert await engine.store.list_messages(channel_id="in1") == []
+
+
+async def test_a_refused_upload_is_explained_rather_than_answered_as_json(
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1169: a keyed store refuses a plaintext upload until ``rotate-key`` seals it, and the
+    engine answers that refusal 423. The console's browse, resend and delete routes did not map it,
+    so the HTTPException escaped as application/json inside the HTML console.
+
+    Two refused shapes, the same two the engine's own test builds. ``refused`` is a plaintext upload
+    whose SIDECAR is refused: its owner cannot be read, so the engine answers 404 to everyone but a
+    files:access_any holder, and 423 to that holder. ``half`` has a sealed sidecar over a plaintext
+    body, so its owner reaches the body and gets 423. Neither ``save`` nor an interrupted reseal
+    leaves that shape (a reseal seals the body first); it stands in for a body swapped in behind a
+    real sidecar, which is why the notice keeps its fix conditional.
+
+    Each 423 must land on the list page as an allow-listed code whose notice names the fix, and never
+    suggest the ciphertext opt-out. The 404 answers stay exactly as they were: the refusal must not
+    become an existence oracle through the console either."""
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.uploads import UploadStore
+    from messagefoundry_webconsole.routes import uploaded_logs as ul_routes
+
+    for d in ("in", "o1"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB1", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o1")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB1", m))
+    engine.add_registry(reg)
+    await engine.start()  # a running target, so resend gets past its 404/409 target checks
+
+    service = await _service(engine, ("op", Role.OPERATOR), ("root", Role.ADMINISTRATOR))
+    app: Any = _app(engine, service, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        await _upload(c, "acme.hl7")
+        await _upload(c, "half.hl7")
+    plain = app.state.upload_store
+    by_name = {m.filename: m.file_id for m in await plain.list_files()}
+    refused, half = by_name["acme.hl7"], by_name["half.hl7"]
+    # The test engine is keyless, so both were stored as plaintext. Enable a key, and seal only the
+    # second file's sidecar.
+    keyed = UploadStore(
+        tmp_path / "uploads", make_cipher(generate_key(), write_v2=True), max_bytes=10**6
+    )
+    _, half_meta = keyed._paths(half)  # noqa: SLF001
+    half_meta.write_text(
+        keyed._encrypt_meta(await plain.get_meta(half)),  # noqa: SLF001
+        encoding="utf-8",
+    )
+    app.state.upload_store = keyed
+
+    async def _landed(c: httpx.AsyncClient, r: httpx.Response, code: str, lead: str) -> None:
+        assert r.status_code == 303, r.text
+        assert "application/json" not in r.headers.get("content-type", "")
+        assert r.headers["location"] == f"/ui/uploaded-logs?e={code}"
+        page = await c.get(r.headers["location"], follow_redirects=False)
+        assert page.status_code == 200, page.text
+        assert lead in page.text
+        assert "messagefoundry rotate-key" in page.text
+        assert "allow_unmarked_ciphertext" not in page.text
+
+    with caplog.at_level(logging.WARNING, logger=_ROUTE_LOGGER):
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            await _login(c, "op")
+            # The owner reaches the half-sealed file's body: browse, filter and resend all refuse.
+            for r in (
+                await c.get(f"/ui/uploaded-logs/file/{half}", follow_redirects=False),
+                await c.post(
+                    f"/ui/uploaded-logs/file/{half}/filter",
+                    data={"message_type": "ADT"},
+                    follow_redirects=False,
+                ),
+                # Bad criteria 400 first; the route's retry without them then meets the 423.
+                await c.get(
+                    f"/ui/uploaded-logs/file/{half}?field_path=not+a+path",
+                    follow_redirects=False,
+                ),
+                # An over-long criterion fails the console's own model, so the page browses
+                # metadata-only and meets the 423 on that path instead.
+                await c.post(
+                    f"/ui/uploaded-logs/file/{half}/filter",
+                    data={"field_path": "P" * 40},
+                    follow_redirects=False,
+                ),
+            ):
+                await _landed(c, r, "browse_locked", "That file could not be opened")
+            resend = await c.post(
+                f"/ui/uploaded-logs/file/{half}/resend",
+                params={"index": "0", "to": "in1"},
+                follow_redirects=False,
+            )
+            await _landed(c, resend, "resend_locked", "That resend did not run")
+
+            # Controls: the refused sidecar hides its owner, so the owner gets the engine's 404, and
+            # the console keeps answering that 404 exactly as before.
+            gone = await c.get(f"/ui/uploaded-logs/file/{refused}", follow_redirects=False)
+            assert gone.status_code == 303
+            assert gone.headers["location"] == "/ui/uploaded-logs"
+            not_found = await c.post(
+                f"/ui/uploaded-logs/file/{refused}/delete", follow_redirects=False
+            )
+            assert not_found.headers["location"] == "/ui/uploaded-logs?e=delete_failed"
+            hidden = await c.post(
+                f"/ui/uploaded-logs/file/{refused}/resend",
+                params={"index": "0", "to": "in1"},
+                follow_redirects=False,
+            )
+            assert hidden.headers["location"] == "/ui/uploaded-logs?e=resend_failed"
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as a:
+            await _login(a, "root")
+            # The override holder is told the file exists and why it is refused.
+            browse = await a.get(f"/ui/uploaded-logs/file/{refused}", follow_redirects=False)
+            await _landed(a, browse, "browse_locked", "That file could not be opened")
+            resend = await a.post(
+                f"/ui/uploaded-logs/file/{refused}/resend",
+                params={"index": "0", "to": "in1"},
+                follow_redirects=False,
+            )
+            await _landed(a, resend, "resend_locked", "That resend did not run")
+            delete = await a.post(
+                f"/ui/uploaded-logs/file/{refused}/delete", follow_redirects=False
+            )
+            await _landed(a, delete, "delete_locked", "That delete did not run")
+
+    # The refused delete removed nothing.
+    assert all(p.exists() for p in keyed._paths(refused))  # noqa: SLF001
+    lines = [r.getMessage() for r in caplog.records if r.name == _ROUTE_LOGGER]
+    assert f"uploaded-log delete refused: file_id={refused} status=423" in lines
+    assert f"uploaded-log resend refused: file_id={half} status=423" in lines
+    assert f"uploaded-log browse refused: file_id={half} status=423" in lines
+    assert f"uploaded-log browse refused: file_id={refused} status=423" in lines
+    # No log line names a file.
+    assert not any("acme" in line or "half.hl7" in line for line in lines)
+    # No notice points at the store's opt-out for unmarked values, by name or by paraphrase.
+    for notice in (
+        ul_routes.BROWSE_LOCKED_NOTICE,
+        ul_routes.RESEND_LOCKED_NOTICE,
+        ul_routes.DELETE_LOCKED_NOTICE,
+    ):
+        assert "rotate-key" in notice
+        assert not any(w in notice.lower() for w in ("unmarked", "allow_", "opt-out", "opt out"))
