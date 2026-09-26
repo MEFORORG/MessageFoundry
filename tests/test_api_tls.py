@@ -3399,6 +3399,45 @@ def test_every_recovery_re_mint_is_reported_for_the_audit_log(tmp_path: Path, da
     assert events[0].new_sha256 == _sha256(cert)
 
 
+def test_what_the_engine_mints_is_what_it_would_renew() -> None:
+    """The renewal tests plant hand-built pairs. This pins the link to the real primitive: a
+    certificate `make_self_signed` produces must read as the engine's shape, or renewal would
+    silently stop while every planted-pair test stayed green."""
+    from messagefoundry import pki
+
+    cert_pem, _ = pki.make_self_signed("127.0.0.1", [], 365)
+    assert pki.read_self_signed_facts(cert_pem).engine_shaped
+
+
+@pytest.mark.parametrize(("left", "keeps_old"), [(65, True), (-5, False)])
+def test_a_lock_the_start_cannot_take_keeps_a_still_valid_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, left: int, keeps_old: bool
+) -> None:
+    """A due pair can no longer be reused without the lock, so a lock the start cannot take -- a
+    read-only state dir, a hung holder -- must not stop a start the old pair can still serve. An
+    expired pair has nothing to fall back on, so the error propagates."""
+    import messagefoundry.api.tls as tls
+
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=left)
+    before = _snapshot(cert, key)
+
+    def unavailable(state_dir: Path) -> Any:
+        raise TimeoutError(f"{state_dir} lock held by a hung holder")
+
+    monkeypatch.setattr(tls, "_generated_pair_lock", unavailable)
+    events: list[GeneratedPairReplaced] = []
+    if keeps_old:
+        assert ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events) == (
+            str(cert),
+            str(key),
+        )
+    else:
+        with pytest.raises(TimeoutError):
+            ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+    assert _snapshot(cert, key) == before
+    assert events == []
+
+
 def test_a_first_run_mint_replaces_nothing_and_reports_nothing(tmp_path: Path) -> None:
     """CONTROL for the reports above: a mint into an empty state dir is not a re-mint."""
     events: list[GeneratedPairReplaced] = []

@@ -20,7 +20,7 @@ import ipaddress
 from dataclasses import dataclass
 
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
@@ -233,6 +233,7 @@ def read_self_signed_facts(pem: bytes) -> SelfSignedFacts:
         x509.ExtensionNotFound,
         x509.DuplicateExtension,
         InvalidSignature,
+        UnsupportedAlgorithm,
         ValueError,
         TypeError,
     ):

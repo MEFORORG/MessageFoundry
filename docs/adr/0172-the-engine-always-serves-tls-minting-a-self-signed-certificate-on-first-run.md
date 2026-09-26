@@ -177,18 +177,24 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
 5. **How it replaces.** The new key is staged under a temporary name with `_write_private_key`
    (`O_EXCL`, `0o600`, Windows DACL), and the new certificate beside it with the local-users read
    grant the tray needs. The certificate is then moved over the live name first, and the key second.
-   A failure before the first move keeps an old pair that still serves, and the next start tries
-   again; an expired old pair has nothing to fall back on, so the start fails. A crash between the
-   two moves leaves a new certificate beside the old key. That pair does not load, so the next
-   start discards it, mints a fresh one, and reports it as an unusable pair.
+   Any failure that leaves an old pair which still loads and has not expired keeps that pair, and
+   the next start tries again. That includes a failed first move, a state directory the engine can
+   read but not write, and a lock it could not take. An expired or unloadable pair has nothing to
+   fall back on, so the start fails. A crash between the two moves leaves a new certificate beside
+   the old key. That pair does not load, so the next start discards it, mints a fresh one, and
+   reports it as an unusable pair. That row's old fingerprint is the half-installed certificate,
+   not the one clients trusted, whose fingerprint only the earlier WARNING line carries.
 6. **Decision 6, realised: every re-mint of an existing pair is audited.** A renewal, a replaced
    unusable pair, and a replaced half-pair each write one `api.tls_generated_pair_replaced` row to
    the store's existing hash-chained audit log. The row carries the reason, the certificate path,
    and the old and new SHA-256 fingerprints and expiry dates. It never carries key material. The
    replacement happens before the store is open, so `serve` hands the event to the app, and the
    lifespan writes the row as soon as the store opens, before any listener binds. A WARNING is also
-   logged at the moment of the renewal. A failed audit write cannot undo the replacement, so it does
-   not stop the engine; it is logged at ERROR with the whole record. A first-run mint replaces
+   logged at the moment of the renewal, with both fingerprints. A failed audit write cannot undo the
+   replacement, so it does not stop the engine; it is logged at ERROR with the whole record. **The
+   row needs that start to reach its store.** A start that fails between the renewal and the store
+   opening, for example on an unreachable database, leaves the WARNING line as the only record,
+   because the next start finds a fresh pair and has nothing to report. A first-run mint replaces
    nothing and writes no row.
 7. **One pair for all engine shards is now DECIDED, not accidental.** `serve --shards` gives every
    shard the same state directory, which is why they already shared one pair; BACKLOG #1276 called
@@ -196,8 +202,9 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
    shards differ only by port. **The consequence to know:** a shard restarted alone inside the
    renewal window, such as a crashed shard the supervisor restarts, renews the pair on disk while
    its siblings keep serving the old certificate from memory. Both are valid, but a client pinning
-   one sees the other as unknown until the siblings restart. Restart the whole service after a
-   renewal to bring them together.
+   one sees the other as unknown until the siblings restart. The expiry monitor reads the file, so
+   in a sibling it now reports the new certificate, not the old one still served from memory.
+   Restart the whole service after a renewal to bring them together.
 8. **What an operator does after a renewal.** The renewed certificate is a new certificate. A
    browser trust-store import and any copied `--cacert` file must be done again with the new
    `api-generated-cert.pem`. The tray pins that file from the data directory; teaching it to notice

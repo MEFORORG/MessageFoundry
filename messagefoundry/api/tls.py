@@ -555,12 +555,17 @@ def ensure_api_tls_material(
     ``CA=false``). Anything else at the generated path is served as found and never replaced.
     Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because ``serve``
     hands it the path this function RETURNS, and it stays the alarm for an engine never restarted.
+    **A failed renewal never costs a start the old pair can still serve**: any ``OSError`` on the
+    locked path -- including a lock it could not take -- falls back to that pair with a WARNING,
+    and only a pair that does not load or has expired lets the error propagate.
 
     **EVERY REPLACEMENT IS REPORTED, never silent (ADR 0172 decision 6).** A renewal, and the
     recovery of an unusable or half-written pair, each append one :class:`GeneratedPairReplaced` to
     ``replacements`` and log a WARNING. ``serve`` passes a list and writes one audit row per entry
     once its store is open (:func:`record_generated_pair_replacements`). A first-run mint, which
-    replaces nothing, reports nothing.
+    replaces nothing, reports nothing. **The row needs that start to reach its store**: a start that
+    fails in between leaves the WARNING line as the only record, because the next start finds a
+    fresh pair and has nothing to report.
 
     **ONE WRITER (BACKLOG #1276).** Every ``serve --shards`` shard shares this state dir, so any
     discard, mint and renewal runs under :func:`_generated_pair_lock`, after the reuse check is
@@ -597,30 +602,64 @@ def ensure_api_tls_material(
     cert_path, key_path = _generated_pair(state_dir)
     if _reusable_without_the_lock(cert_path, key_path):
         return str(cert_path), str(key_path)
-    state_dir.mkdir(parents=True, exist_ok=True)
     events = replacements if replacements is not None else []
-    with _generated_pair_lock(state_dir):
-        # Re-decided UNDER the lock: a process that waited here finds the pair the holder just
-        # minted or renewed, and reuses it. Only here may a failed check lead to a discard.
-        _discard_staged_leftovers(cert_path, key_path)
-        if cert_path.exists() and key_path.exists():
-            reason = _why_generated_pair_is_unusable(cert_path, key_path)
-            if reason is None:
-                due = _renewal_due(cert_path)
-                if due is not None:
-                    _renew_generated_pair(api, cert_path, key_path, due, events)
-                return str(cert_path), str(key_path)
-            old = _cert_facts(cert_path)
-            _discard_unusable_pair(cert_path, key_path, reason)
-            recovered: Literal["unusable", "half_pair"] | None = "unusable"
-        else:
-            old = _cert_facts(cert_path) if cert_path.exists() else None
-            recovered = "half_pair" if cert_path.exists() or key_path.exists() else None
-            _discard_half_minted_pair(cert_path, key_path)
-        new = _mint_generated_pair(api, cert_path, key_path)
-        if recovered is not None:
-            events.append(_replaced(recovered, cert_path, old, new))
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with _generated_pair_lock(state_dir):
+            _settle_under_the_lock(api, cert_path, key_path, events)
+    except OSError as exc:
+        # A RENEWAL IS EARLY, SO ITS FAILURE MUST NOT STOP A START THE OLD PAIR CAN SERVE. That
+        # covers a failed stage or first replace, a state dir the engine may read but not write,
+        # and a lock held past its timeout. A pair that does not load, or has expired, has
+        # nothing to fall back on, so then the error propagates.
+        if not _still_serves(cert_path, key_path):
+            raise
+        log.warning(
+            "could not renew the generated TLS pair at %s (%s); the current certificate still "
+            "serves, and the next start tries again.",
+            cert_path,
+            exc,
+        )
     return str(cert_path), str(key_path)
+
+
+def _settle_under_the_lock(
+    api: ApiSettings, cert_path: Path, key_path: Path, events: list[GeneratedPairReplaced]
+) -> None:
+    """Reuse, renew, recover or mint the generated pair. Call only under the lock.
+
+    Re-decided here: a process that waited for the lock finds the pair the holder just minted or
+    renewed, and reuses it. Only here may a failed check lead to a discard.
+    """
+    _discard_staged_leftovers(cert_path, key_path)
+    if cert_path.exists() and key_path.exists():
+        reason = _why_generated_pair_is_unusable(cert_path, key_path)
+        if reason is None:
+            due = _renewal_due(cert_path)
+            if due is not None:
+                _renew_generated_pair(api, cert_path, key_path, due, events)
+            return
+        old = _cert_facts(cert_path)
+        _discard_unusable_pair(cert_path, key_path, reason)
+        recovered: Literal["unusable", "half_pair"] | None = "unusable"
+    else:
+        old = _cert_facts(cert_path) if cert_path.exists() else None
+        recovered = "half_pair" if cert_path.exists() or key_path.exists() else None
+        _discard_half_minted_pair(cert_path, key_path)
+    new = _mint_generated_pair(api, cert_path, key_path)
+    if recovered is not None:
+        events.append(_replaced(recovered, cert_path, old, new))
+
+
+def _still_serves(cert_path: Path, key_path: Path) -> bool:
+    """True when the pair on disk loads as one and has not expired. Never raises."""
+    try:
+        if _why_generated_pair_is_unusable(cert_path, key_path) is not None:
+            return False
+    except OSError:
+        return False
+    facts = _cert_facts(cert_path)
+    return facts is None or facts.not_after > time.time()
 
 
 def _reusable_without_the_lock(cert_path: Path, key_path: Path) -> bool:
@@ -720,11 +759,11 @@ def _renew_generated_pair(
     The certificate goes first because it is the file other processes hold open, so it is the replace
     most likely to be refused, and a refusal there has changed nothing.
 
-    **A renewal that fails before the first replace keeps the old pair**, if that pair has not yet
-    expired: it still serves, the next start tries again, and the expiry monitor keeps watching.
-    An expired old pair has nothing to fall back on, so the failure propagates. A failure BETWEEN
-    the two replaces leaves a new certificate beside the old key, which does not load; the next
-    start discards and re-mints it as an unusable pair, and reports that too.
+    **A renewal that fails before the first replace has changed nothing.** The staged files are
+    removed and the error propagates; :func:`ensure_api_tls_material` then keeps the old pair if it
+    still serves, and the next start tries again. A failure BETWEEN the two replaces leaves a new
+    certificate beside the old key, which does not load, so that start fails; the next one discards
+    and re-mints it as an unusable pair, and reports that too.
     """
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
@@ -737,19 +776,15 @@ def _renew_generated_pair(
         staged_cert.write_bytes(cert_pem)
         _let_local_users_read_cert(staged_cert)
         _replace_generated(staged_cert, cert_path)
-    except OSError as exc:
+    except OSError:
         for leftover in (staged_cert, staged_key):
-            leftover.unlink(missing_ok=True)
-        if old.not_after <= time.time():
-            raise
-        log.warning(
-            "could not renew the generated TLS pair at %s (%s); the current certificate still "
-            "serves until %s, and the next start tries again.",
-            cert_path,
-            exc,
-            old.not_after_iso,
-        )
-        return
+            try:
+                if leftover.exists():
+                    _unlink_generated(leftover)
+            except OSError as cleanup:
+                # Never mask the renewal's own error. The next start's locked pass discards it.
+                log.warning("could not remove %s after a failed renewal: %s", leftover, cleanup)
+        raise
     _replace_generated(staged_key, key_path)
     event = _replaced("renewal", cert_path, old, new)
     events.append(event)
