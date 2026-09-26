@@ -17,6 +17,7 @@ string, not a handle on the stored row. The WARNING is what makes that visible. 
 from __future__ import annotations
 
 import ftplib  # nosec B402 - a stub's error type only; nothing here opens a connection
+import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -97,6 +98,12 @@ def _local(inbox: Path, **over: object) -> FileSource:
     return src
 
 
+async def _settle(src: FileSource) -> None:
+    """Take the settle poll (BACKLOG #1811): the first sighting of a file only records its stat, so the
+    scan after this one is the one that reads it. These tests are about #116, which is the read."""
+    await src._scan_once()
+
+
 def _append_tail(path: Path) -> None:
     with path.open("ab") as fh:
         fh.write(_TAIL)
@@ -115,6 +122,7 @@ async def test_a_file_that_grows_after_the_read_is_neither_archived_nor_deleted(
     src = _local(inbox, after_read=after_read)
     handler = _Recorder(on_first=lambda: _append_tail(drop))
     src._handler = handler
+    await _settle(src)
     with filtered_sink(_FILE_LOGGER) as sink:
         await src._scan_once()
     assert handler.got == [_HEAD]  # handed off before the change; the source cannot recall it
@@ -123,7 +131,8 @@ async def test_a_file_that_grows_after_the_read_is_neither_archived_nor_deleted(
     assert list((inbox / ".processed").iterdir()) == []
     assert "changed after it was read" in sink.text
     _assert_no_name(sink, caplog, name, strip=str(inbox))
-    # The next poll reads the settled file whole and only then disposes of it: nothing is lost.
+    # The grown file settles again (#1811), then is read whole and only then disposed of.
+    await _settle(src)
     await src._scan_once()
     assert handler.got == [_HEAD, _WHOLE]
     assert not drop.exists()
@@ -149,6 +158,7 @@ async def test_a_file_that_grows_during_the_read_is_not_emitted(
     src = _local(inbox)
     handler = _Recorder()
     src._handler = handler
+    await _settle(src)
     with filtered_sink(_FILE_LOGGER) as sink:
         await src._scan_once()
     monkeypatch.undo()
@@ -156,6 +166,7 @@ async def test_a_file_that_grows_during_the_read_is_not_emitted(
     assert drop.read_bytes() == _WHOLE  # left in place for the next poll
     assert "changed while it was read" in sink.text
     _assert_no_name(sink, caplog, name, strip=str(inbox))
+    # The skip recorded the post-read stat, so the next poll finds it settled and reads it whole.
     await src._scan_once()
     assert handler.got == [_WHOLE]
 
@@ -180,9 +191,14 @@ async def test_a_same_length_rewrite_during_the_read_is_caught_by_the_mtime(
     src = _local(inbox)
     handler = _Recorder()
     src._handler = handler
-    await src._scan_once()
+    await _settle(src)
+    # The settle poll reads nothing, so it proves nothing; the next scan is the one under test.
+    assert handler.got == [] and drop.exists()
+    with filtered_sink(_FILE_LOGGER) as sink:
+        await src._scan_once()
     assert handler.got == []
     assert drop.exists()
+    assert "changed while it was read" in sink.text  # the mtime arm fired, not the settle gate
 
 
 @pytest.mark.parametrize("after_read", ["move", "delete", "leave"])
@@ -198,8 +214,9 @@ async def test_a_stable_file_is_processed_exactly_as_before(
     handler = _Recorder()
     src._handler = handler
     with filtered_sink(_FILE_LOGGER) as sink:
+        await _settle(src)
         await src._scan_once()
-        await src._scan_once()  # a second poll must not re-emit it, in any mode
+        await src._scan_once()  # a later poll must not re-emit it, in any mode
     assert handler.got == [_WHOLE]
     assert "changed" not in sink.text
     archived = inbox / ".processed" / "a.hl7"
@@ -223,13 +240,168 @@ async def test_leave_mode_warns_and_reingests_a_file_that_grew_after_the_read(
     src = _local(inbox, after_read="leave")
     handler = _Recorder(on_first=lambda: _append_tail(drop))
     src._handler = handler
+    await _settle(src)
     with filtered_sink(_FILE_LOGGER) as sink:
         await src._scan_once()
     assert "changed after it was read" in sink.text
+    await _settle(src)  # the grown file has a new dedup key and settles again (#1811)
     await src._scan_once()
     await src._scan_once()  # the settled file is ingested once, then deduplicated
     assert handler.got == [_HEAD, _WHOLE]
     assert drop.read_bytes() == _WHOLE
+
+
+# === the settle gate across polls (BACKLOG #1811) =================================================
+# #116 above compares a stat taken before and after ONE read. A partner that writes, pauses, and writes
+# again leaves the file still for the whole read, so #116 alone passes the first part as complete.
+
+
+@pytest.mark.parametrize("after_read", ["move", "delete", "leave"])
+async def test_a_file_that_grows_between_polls_is_never_emitted_until_two_polls_agree(
+    tmp_path: Path, after_read: str
+) -> None:
+    """The writer pauses between writes, across three polls, and no part of the file is emitted.
+
+    Red mutation: make ``_settled`` return True. The first poll then emits ``_HEAD`` and the second a
+    longer prefix, which is the row's "N corrupt messages followed by a complete one"."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    drop = inbox / "a.hl7"
+    drop.write_bytes(_HEAD)
+    src = _local(inbox, after_read=after_read)
+    handler = _Recorder()
+    src._handler = handler
+    await src._scan_once()  # first sighting of the head
+    with drop.open("ab") as fh:
+        fh.write(_TAIL[:5])  # the partner's second write, between polls
+    await src._scan_once()  # the size moved, so it must settle again
+    _append_tail_rest(drop)
+    await src._scan_once()  # and again
+    assert handler.got == [], "a file still being written between polls was emitted"
+    assert drop.read_bytes() == _WHOLE
+    await src._scan_once()  # two polls now agree
+    assert handler.got == [_WHOLE]
+    await src._scan_once()
+    assert handler.got == [_WHOLE]  # once, in every mode
+
+
+def _append_tail_rest(path: Path) -> None:
+    with path.open("ab") as fh:
+        fh.write(_TAIL[5:])
+
+
+async def test_a_same_length_rewrite_between_polls_waits_on_the_mtime(tmp_path: Path) -> None:
+    """The settle key carries the mtime, so a rewrite that keeps the length still has to settle."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    drop = inbox / "a.hl7"
+    drop.write_bytes(_WHOLE)
+    src = _local(inbox)
+    handler = _Recorder()
+    src._handler = handler
+    await src._scan_once()
+    st = drop.stat()
+    os.utime(drop, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+    await src._scan_once()
+    assert handler.got == []
+    await src._scan_once()
+    assert handler.got == [_WHOLE]
+
+
+async def test_the_settle_memory_forgets_a_file_after_it_is_missing_for_several_scans(
+    tmp_path: Path,
+) -> None:
+    """The poll-to-poll map forgets a file once ``SETTLE_MISS_LIMIT`` scans in a row have not listed
+    it, so it is bounded by the directory rather than by every name it ever held.
+
+    Red mutation: delete the ``_prune_settle`` call. The removed file's entry is never forgotten."""
+    from messagefoundry.transports.file import SETTLE_MISS_LIMIT
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    for n in range(3):
+        (inbox / f"m{n}.hl7").write_bytes(_WHOLE)
+    src = _local(inbox)
+    src._handler = _Recorder()
+    await src._scan_once()
+    assert sorted(Path(k).name for k in src._settle_seen) == ["m0.hl7", "m1.hl7", "m2.hl7"]
+    (inbox / "m1.hl7").unlink()  # renamed away or taken by someone else before it settled
+    for _ in range(SETTLE_MISS_LIMIT - 1):
+        await src._scan_once()
+        assert "m1.hl7" in [Path(k).name for k in src._settle_seen]  # one miss is not enough
+    await src._scan_once()
+    assert src._settle_seen == {}  # m1 forgotten; m0 and m2 were admitted and left on their own
+
+
+async def test_a_failed_listing_does_not_restart_the_wait(tmp_path: Path) -> None:
+    """A listing that fails returns no candidates rather than raising (a missing directory globs to
+    nothing). Forgetting on that would wipe every sighting, and a share whose listing failed every
+    other poll would never let a file settle.
+
+    Red mutation: set ``SETTLE_MISS_LIMIT`` to 1. The sighting is gone after the outage and the next
+    poll re-records the file instead of admitting it."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(_WHOLE)
+    src = _local(inbox)
+    handler = _Recorder()
+    src._handler = handler
+    await src._scan_once()
+    away = tmp_path / "away"
+    inbox.rename(away)  # the share drops out for one poll
+    await src._scan_once()
+    away.rename(inbox)
+    assert [Path(k).name for k in src._settle_seen] == ["a.hl7"]
+    await src._scan_once()
+    assert handler.got == [_WHOLE]
+
+
+async def test_a_left_file_already_ingested_never_enters_the_settle_memory(tmp_path: Path) -> None:
+    """Under ``leave`` the dedup check runs before the settle gate, so an ingested file that stays on
+    the share does not cycle through the map on every poll and crowd out new files at the cap.
+
+    Red mutation: move the ``_settled`` check above the leave-mode dedup. The ingested file is recorded
+    again on the next poll and the map is not empty."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(_WHOLE)
+    src = _local(inbox, after_read="leave")
+    handler = _Recorder()
+    src._handler = handler
+    await src._scan_once()
+    await src._scan_once()
+    assert handler.got == [_WHOLE]
+    await src._scan_once()
+    assert src._settle_seen == {}
+    assert handler.got == [_WHOLE]
+
+
+async def test_the_settle_memory_cap_makes_new_files_wait_rather_than_evicting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At the cap a new file is not recorded, and every file still settles in turn.
+
+    Red mutation: evict the oldest entry to make room instead. With a cap of one and two files, each
+    first sighting pushes the other out, neither ever settles, and nothing is emitted on any poll."""
+    from messagefoundry.transports import file as file_mod
+
+    monkeypatch.setattr(file_mod, "SETTLE_SEEN_MAX", 1)
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(_WHOLE)
+    (inbox / "b.hl7").write_bytes(_WHOLE)
+    src = _local(inbox)
+    handler = _Recorder()
+    src._handler = handler
+    with caplog.at_level(logging.DEBUG, logger=_FILE_LOGGER):
+        await src._scan_once()
+    assert [Path(k).name for k in src._settle_seen] == ["a.hl7"]  # b waits for room
+    assert "settle memory is full" in caplog.text  # and the log does not promise the next poll
+    await src._scan_once()  # a is admitted, which makes room for b's first sighting
+    assert handler.got == [_WHOLE]
+    await src._scan_once()
+    assert handler.got == [_WHOLE, _WHOLE]
+    assert src._settle_seen == {}
 
 
 # === REMOTEFILE source ============================================================================

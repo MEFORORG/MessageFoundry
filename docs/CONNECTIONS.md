@@ -146,6 +146,12 @@ transport = "mllp"
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
   an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
+  **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
+  cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
+  those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
+  spelling. The one cap with no "off", the HTTP listener's `max_header_bytes`, refuses `0` in either
+  spelling. Not every numeric setting has the negative refusal yet: at least DICOM `max_pdu_size`,
+  `max_associations` and `timeout_seconds` do not.
   A setting whose type is a **table** or an **array** — `headers`, `odbc_params`,
   `capture_response_headers`, `proxy_no_proxy` — is held to its shape, so `headers = 5` is refused;
   where the entries have a readable type it is held to those too, one level in, so
@@ -605,7 +611,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
 | `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited. |
-| `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). A falsy value falls back to the 64 KiB default — this one cap can't be switched off. |
+| `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). This one cap can't be switched off: unset or `None` takes the 64 KiB default, and `0` (or `"0"`) is refused at load rather than silently becoming the default (BACKLOG #1872). |
 | `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe and a refused request wait behind an outstanding debt but **charge nothing** — only a committed message spends budget, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so the listener can always make progress. |
 | `tls` | `false` | serve **HTTPS** (TLS 1.2+, the same per-connection inbound TLS builder MLLP uses). |
@@ -712,8 +718,8 @@ def route(msg):
 |---------|-----|---------|---------|
 | `directory` | both | — (required) | folder to poll / write into |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
-| `poll_seconds` | in | `1.0` | poll interval |
-| `min_age_seconds` | in | `0` | skip files modified within this window (partial writes) |
+| `poll_seconds` | in | `1.0` | poll interval. It is also the **settle window**: a file is read only once its size and modification time are unchanged since the last poll that saw it (BACKLOG #1811), so every file waits at least one poll. The settle gate is always on and has no setting, but a very small `poll_seconds` narrows its window to almost nothing. |
+| `min_age_seconds` | in | `0` | skip files modified within this window. This is an extra wait on top of the settle gate, not the gate itself; set it for a partner that pauses between writes for longer than `poll_seconds`. |
 | `after_read` | in | `move` | `move` (→ `.processed`), `delete`, or `leave` (process **in place** — never move/delete the source file, for a read-only share / a directory another system owns; a hashed dedup ledger ensures a left file is ingested **once**, #142) |
 | `sort` | in | `name` | process order: `name` or `mtime` |
 | `recursive` | in | `false` | also scan subdirectories |
@@ -958,8 +964,16 @@ its own policy block below):
   the operator) and logged. A *textual-but-non-conformant* HL7 file still flows through and is recorded
   as an `ERROR`-status message by the parser (raw preserved in the store). A **transient** read failure
   (file locked / mid-write) or an **infrastructure** failure (store unavailable) **leaves the file in
-  place to retry** next scan — never an accept-and-drop. Use `min_age_seconds` to skip files still being
-  written. As a backstop, the source compares a file's size and modification time on each side of the
+  place to retry** next scan — never an accept-and-drop. A local File source reads a file only once its
+  size and modification time are **unchanged since the last poll that saw it** (the settle gate,
+  BACKLOG #1811), so a partner that pauses between writes for less than `poll_seconds` is waited out. It
+  is always on. The cost is one poll of latency per file, and one more poll before a retry of a file
+  left in place after a read, scan-hook or hand-off failure. It cannot see at least these: a partner
+  that pauses for longer than `poll_seconds`, a same-length rewrite inside the share's modification-time
+  resolution, and a copier that sets the final size first and holds the modification time fixed while
+  it fills the file in. For those, use the partner's write-then-rename, or for the first a
+  `min_age_seconds` longer than its pause. The SFTP/FTP source has no settle gate yet. As a backstop, the source also compares a file's
+  size and modification time on each side of the
   read (BACKLOG #116). A file that changes **during** the read is not emitted that scan. One that
   changes **after** it is not moved or deleted, so the next scan reads it whole, and a WARNING says the
   message already handed off may be cut short. That message is **not a duplicate**: the pipeline treats
@@ -2948,8 +2962,8 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 ### Per-tick poll ceilings
 
 The three **poll** sources — `File(...)`, `Sftp(...)`/`Ftp(...)` and `DatabasePoll(...)` — each take at
-most **500 items per tick** (`poll_max_files`, `poll_max_rows`). The ceiling **ships on**, and a falsy
-value (`None`/`0`) turns it off.
+most **500 items per tick** (`poll_max_files`, `poll_max_rows`). The ceiling **ships on**, and `None` or `0`
+(in any spelling, including the text `"0"`) turns it off.
 
 **It is a deferral, not a drop.** A file the scan does not reach is still in the drop directory; a row
 the poll does not fetch is still in the table, unmarked. The next tick takes it. Nothing is quarantined,

@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -170,6 +173,45 @@ async def test_config_reload_audits_both_identities(engine: Engine) -> None:
     assert reload_rows, "expected a config_reload audit row from the released reload"
     detail = json.loads(reload_rows[-1]["detail"])
     assert "fingerprint" in detail and detail["dry_run"] is False
+
+
+# --- BACKLOG #1940: a failed trailing audit row does not relabel a swap as failed ----
+
+
+async def test_released_reload_whose_audit_row_fails_is_not_compensated_to_failed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The graph swaps, then the executor's config_reload row fails. Pre-fix the raise reached the
+    gate's compensation, so the request read 'failed' for a reload that ran."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, GATED) as c:
+        approval_id = (
+            await c.post("/config/reload", json={}, headers=await _token(c, "op"))
+        ).json()["approval_id"]
+        admin = await _token(c, "approver")
+        real = engine.store.record_audit
+
+        async def _record(action: str, **kwargs: Any) -> None:
+            if action == "config_reload":
+                raise sqlite3.OperationalError("disk I/O error")
+            await real(action, **kwargs)
+
+        monkeypatch.setattr(engine.store, "record_audit", _record)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+            ok = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["result"]["inbound"] == 1  # the reload really swapped the graph
+
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "approved"
+    assert await engine.store.list_audit(action="approval.failed") == []
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+    assert any(
+        r.levelno == logging.ERROR and "reload swapped the graph" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # --- AC-8: ungated reload executes inline (deny-by-default) --------------------

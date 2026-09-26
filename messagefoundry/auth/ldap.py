@@ -29,6 +29,7 @@ from messagefoundry.config.secretprovider import SecretProvider, resolve_connect
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AuthSettings,
+    split_kerberos_spn,
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, assert_ldap3_tls_suites
@@ -643,6 +644,21 @@ class LdapAuthenticator:
         return _principal_from(info, user_dn, groups)
 
 
+def _kerberos_acceptor(settings: AuthSettings) -> Any:
+    """Build the SPNEGO acceptor for ``kerberos_spn`` -- the one place both call sites share.
+
+    pyspnego takes the SPN as two arguments, ``hostname`` and ``service``, and joins them itself.
+    Passing the whole ``HTTP/host`` as ``service=`` built ``HTTP/host/unspecified`` (BACKLOG #275).
+    A malformed value raises ``ValueError``; the settings validator refuses it at load first.
+    """
+    import spnego
+
+    if not settings.kerberos_spn:
+        return spnego.server()
+    service, hostname = split_kerberos_spn(settings.kerberos_spn)
+    return spnego.server(hostname=hostname, service=service)
+
+
 def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     """Complete one SPNEGO server step and return the authenticated sAMAccountName, or ``None``.
 
@@ -656,15 +672,11 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
 
     import spnego
 
-    try:  # pragma: no cover - requires a domain-joined server + keytab
-        server = (
-            spnego.server(service=settings.kerberos_spn)
-            if settings.kerberos_spn
-            else spnego.server()
-        )
+    try:
+        server = _kerberos_acceptor(settings)
         server.step(token)
         principal = server.client_principal
-    except (spnego.exceptions.SpnegoError, ValueError, struct.error) as exc:  # pragma: no cover
+    except (spnego.exceptions.SpnegoError, ValueError, struct.error) as exc:
         # SpnegoError is the SSPI/GSSAPI (Windows/Linux-krb5) rejection; the pure-Python provider
         # instead raises a bare ValueError/struct.error while parsing an untrusted token. Both are
         # a failed SSO attempt — map to LdapError so authenticate_kerberos audits an
@@ -716,10 +728,7 @@ def kerberos_acceptor_preflight(settings: AuthSettings) -> None:
             "no Kerberos-capable SPNEGO provider on this host — SSPI (Windows) or the GSSAPI/krb5 "
             "libraries (Linux) are required; the pure-Python NTLM fallback cannot validate a ticket"
         )
-    try:  # pragma: no cover - requires a domain-joined server + keytab
-        if settings.kerberos_spn:
-            spnego.server(service=settings.kerberos_spn)
-        else:
-            spnego.server()
-    except spnego.exceptions.SpnegoError as exc:  # pragma: no cover
+    try:
+        _kerberos_acceptor(settings)
+    except (spnego.exceptions.SpnegoError, ValueError) as exc:
         raise LdapError(str(exc)) from exc

@@ -241,6 +241,8 @@ def _member_codec_errors() -> tuple[type[Exception], ...]:
 # What a corrupt archive or member raises. ValueError covers a member name flagged UTF-8 that is not
 # (UnicodeDecodeError). A corrupt offset that would make zipfile seek to a negative position is a
 # ValueError too, though _zip_layout_reason refuses that archive before any member is opened.
+# A zip64 member offset at or above 2**63 makes that seek raise OverflowError, which is not a
+# ValueError (BACKLOG #1598).
 # CompressionError is a ValueError too, so zip_decompress re-raises it in an arm AHEAD of this one;
 # without that arm the refusals its loop raises would be caught here and relabelled.
 _ZIP_CORRUPT_ERRORS: tuple[type[Exception], ...] = (
@@ -249,6 +251,7 @@ _ZIP_CORRUPT_ERRORS: tuple[type[Exception], ...] = (
     EOFError,
     zlib.error,
     ValueError,
+    OverflowError,
     *_member_codec_errors(),
 )
 
@@ -269,7 +272,8 @@ def zip_decompress(
     over-ceiling total, or a member that uses a zip feature ``zipfile`` cannot read (encryption, a
     compression method, a format version) raises :class:`CompressionError`, which names a member by
     its position and never by its filename. Duplicate file member names also refuse the whole
-    archive, since the returned mapping cannot preserve repeated names.
+    archive, since the returned mapping cannot preserve repeated names. So do two members that share
+    one local header, the overlapped-entries zip-bomb shape (BACKLOG #1598).
 
     Each member is also **admitted or refused** (ASVS 5.2.2 / 5.3.2, BACKLOG #1128) — its name must be a
     safe relative path and its bytes must correspond to the type its own extension names. Both checks are
@@ -302,6 +306,9 @@ def zip_decompress(
             layout_reason = _zip_layout_reason(data, zf)
             if layout_reason is not None:
                 raise CompressionError(layout_reason)
+            overlap_reason = _zip_overlap_reason(zf)
+            if overlap_reason is not None:
+                raise CompressionError(overlap_reason)
             names = zf.namelist()
             if len(names) > max_entries:
                 raise CompressionError(
@@ -343,6 +350,11 @@ def zip_decompress(
     except _ZIP_CORRUPT_ERRORS as exc:
         # The class name is a diagnostic that carries no member name; the message may carry one.
         failure = f"is corrupt or truncated ({type(exc).__name__})"
+    except RecursionError:
+        # A RuntimeError too, so it needs its own arm AHEAD of the next one. Nothing in the archive
+        # recurses; the caller's stack was already near the limit, so say that rather than blame the
+        # archive for a feature it may not use.
+        failure = "could not be read (the interpreter recursion limit was reached)"
     except RuntimeError:
         # NotImplementedError is a RuntimeError. zipfile raises RuntimeError for a member flagged as
         # encrypted and NotImplementedError for a compression method, a flag or a format version it
@@ -360,6 +372,38 @@ def zip_decompress(
         where = f"zip archive member {position}" if position else "zip archive"
         raise CompressionError(f"{where} {failure}")
     return result
+
+
+def _zip_overlap_reason(zf: zipfile.ZipFile) -> str | None:
+    """Why two central-directory entries of ``zf`` share one local header, or ``None`` when none do.
+    The reason names members by position only.
+
+    The format gives each entry its own local header, and no writer this project knows of shares
+    one. Entries that share one are overlapped: each name expands the same stored bytes, which is
+    the zip-bomb shape. The names can still differ through the Unicode path extra field, so the
+    duplicate-name check does not catch it. A placeholder offset that several entries repeat without
+    its zip64 field is refused here too, as overlapped rather than as corrupt. This check
+    also closes a PHI leak (BACKLOG #1598). :mod:`zipfile` does not refuse this shape; it warns
+    ``Overlapped entries: '<name>'`` and reads on, and that warning prints the archive-chosen member
+    name to stderr, which the service log captures. It warns only when an entry's local header is
+    where its successor's is, and a header at the central directory's own offset fails its signature
+    check first. So no archive this check admits can raise that warning.
+
+    The refusal is by construction rather than by a ``warnings.catch_warnings`` filter: that filter
+    edits process-global state, and transforms run on worker threads.
+
+    Every offset counts, including one past the central directory's start. The central directory
+    holds archive-chosen bytes, so a forged local header can sit inside it, and two entries pointing
+    there would reach the warning if this check skipped them."""
+    first_at: dict[int, int] = {}
+    for position, info in enumerate(zf.infolist(), start=1):
+        earlier = first_at.setdefault(info.header_offset, position)
+        if earlier != position:
+            return (
+                f"zip archive member {position} refused: it shares member {earlier}'s local "
+                "header (overlapped entries, a zip-bomb shape)"
+            )
+    return None
 
 
 def _zip_layout_reason(data: bytes, zf: zipfile.ZipFile) -> str | None:
