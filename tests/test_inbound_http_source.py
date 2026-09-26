@@ -216,14 +216,17 @@ async def test_a_body_refused_at_ingress_is_422_with_one_error_row(
     ic = build_inbound_connection(
         "IB_HTTP", Http(port=0), router="r", content_type=ContentType.JSON
     )
-    src = await _start_source(store, ic)
+    events: list[tuple] = []
+    src = await _start_source(store, ic, events=events)
     try:
         resp = await _http(src.sockport, body=body)
     finally:
         await src.stop()
     assert resp.status == 422
     assert resp.body == b'{"error":"message was not accepted"}'
-    assert "message_id" not in resp.body.decode()
+    # A post-record refusal has no connection-event kind of its own, so the connection still closes
+    # normally in the log rather than being left open-ended.
+    assert [e[0] for e in events] == ["established", "closed"]
     cur = await store._db.execute("SELECT status FROM messages")
     rows = await cur.fetchall()
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]

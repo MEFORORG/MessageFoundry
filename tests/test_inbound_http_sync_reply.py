@@ -260,8 +260,45 @@ async def test_a_declined_handler_gets_the_same_422_on_both_paths() -> None:
     # same status and the same bytes, so a caller cannot tell which mode refused it.
     sync = await _serve(InboundReply(ReplyOutcome.REPLY, body="x"), _decline=True)
     receipt = await _serve(None, _decline=True)
-    assert receipt[0] == sync[0] == 422
-    assert receipt[2] == sync[2] == b'{"error":"message was not accepted"}'
+    assert receipt == sync  # status, headers and body alike
+    assert receipt[0] == 422
+    assert receipt[2] == b'{"error":"message was not accepted"}'
+
+
+async def test_a_declined_handler_on_the_sync_path_still_logs_closed() -> None:
+    # The sync path's 422 used to return True from _serve_one, which suppresses the outer "closed"
+    # event. A post-record refusal emits no event kind of its own, so the connection log showed
+    # "established" with no end. It now closes like the receipt path does.
+    src = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={"host": "127.0.0.1", "port": 0, "reply_from": "OB_PARTNER"},
+        )
+    )
+    events: list[str] = []
+
+    async def sink(kind: str, peer_host: str | None, reason: str | None) -> None:
+        events.append(kind)
+
+    async def declining_handler(raw: bytes) -> str | None:
+        return None
+
+    async def resolver(message_id: str) -> InboundReply:
+        raise AssertionError("a refused body must never reach the resolver")
+
+    src.on_connection_event = sink
+    src.sync_reply = resolver
+    await src.start(declining_handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
+        writer.write(b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}")
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(-1), 5.0)
+        writer.close()
+    finally:
+        await src.stop()
+    assert data.startswith(b"HTTP/1.1 422 ")
+    assert events == ["established", "closed"]
 
 
 async def test_a_hostile_partner_content_type_cannot_take_the_turn_down() -> None:

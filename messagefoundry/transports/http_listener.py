@@ -192,9 +192,9 @@ _HEALTH_PROBE_METHODS = frozenset({"GET", "HEAD"})
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 #: The answer when the receipt handler returns ``None``: it refused the body AFTER recording it with
-#: status ERROR (a decode, NUL, size, content-type, parse or strict-validation guard). Both the
-#: ``202`` receipt path and the sync-reply path answer this, so a caller is never told a refused body
-#: was accepted (owner ruling 2026-09-26, the ADR 0154 amendment of that date, BACKLOG #1960).
+#: status ERROR. ``RegistryRunner._handle_inbound_http`` holds the guards that do this. The receipt
+#: path and the sync-reply path both answer it, so a caller is never told a refused body was accepted
+#: (owner ruling 2026-09-26, the ADR 0154 amendment of that date, BACKLOG #1960).
 _NOT_ACCEPTED_BODY = '{"error":"message was not accepted"}'
 
 #: A ``Content-Length`` with more significant digits than this is refused. It is far past any body
@@ -1064,46 +1064,45 @@ class HttpSource(SourceConnector):
         # persisted before the response is written — as a RECEIVED ingress row, or as an ERROR row when
         # the handler refuses it and returns None.
         message_id = await self._handler(request.body)
-        # Charge one token AFTER the body is committed, so the debt is settled by the NEXT request's
-        # pre-read wait and never by withholding this partner's receipt. A GET/HEAD health probe and
-        # a refused request charge nothing — they return above — which keeps a peer that sends no
-        # message from spending the budget of one that does.
+        # Charge one token AFTER the handler has recorded the body, so the debt is settled by the NEXT
+        # request's pre-read wait and never by withholding this partner's answer. A GET/HEAD health
+        # probe and a pre-ingress refusal charge nothing — they return above — which keeps a peer
+        # that sends no message from spending the budget of one that does. A body the handler refuses
+        # IS charged: it was read and recorded, which is the work the budget paces.
         if self._pacer is not None:
             self._pacer.charge(1, now=time.monotonic())
-
-        if self.reply_from and self.sync_reply is not None:
-            return await self._respond_with_sync_reply(writer, message_id, peer_host=peer_host)
 
         if message_id is None:
             # The handler refused the body AFTER recording it with status ERROR, so that row is the
             # count-and-log record and only the answer changes here. A 202 would tell the caller its
-            # body was accepted when it was not (owner ruling 2026-09-26, BACKLOG #1960).
+            # body was accepted when it was not, and a reply_from caller would wait for a reply to a
+            # message that never entered the pipeline. One branch answers both modes, so they cannot
+            # drift (owner ruling 2026-09-26, BACKLOG #1960). Returns False: this is a post-record
+            # refusal with no connection-event kind of its own, so the outer ``closed`` still fires.
             await self._respond(writer, build_response(422, _NOT_ACCEPTED_BODY))
             return False
+
+        if self.reply_from and self.sync_reply is not None:
+            return await self._respond_with_sync_reply(writer, message_id, peer_host=peer_host)
+
         receipt = {"status": "accepted", "message_id": message_id}
         await self._respond(writer, build_response(202, json.dumps(receipt)))
         return False
 
     async def _respond_with_sync_reply(
-        self, writer: asyncio.StreamWriter, message_id: str | None, *, peer_host: str | None
+        self, writer: asyncio.StreamWriter, message_id: str, *, peer_host: str | None
     ) -> bool:
         """Block on the captured downstream reply and answer with it (ADR 0154 D5).
 
         Reached only when ``reply_from`` is set **and** the runner injected a resolver, so an inbound
         without it never takes this path — that is what makes AC-8's "unchanged" true rather than
-        aspirational.
+        aspirational. Reached only with a committed ``message_id``: a body the handler refused is
+        answered ``422`` by the caller before this is chosen.
 
         **The HTTP status is never a second disposition channel.** Whatever is returned here, the
         message stays committed and keeps flowing; its disposition is decided by the finalizer alone.
         A ``504`` does not cancel a delivery, and a ``200`` does not complete one.
         """
-        if message_id is None:
-            # The handler declined AFTER recording the message with status ERROR — that write IS the
-            # count-and-log record, so nothing is dropped here. A caller waiting for a reply is told
-            # the submission itself failed, with the same 422 the receipt path answers.
-            await self._respond(writer, build_response(422, _NOT_ACCEPTED_BODY))
-            return True
-
         resolver = self.sync_reply
         assert resolver is not None  # guarded by the caller, as _handler is above
         reply = await resolver(message_id)
@@ -1182,8 +1181,9 @@ class HttpSource(SourceConnector):
         the console's filter tuple as an exact set, so minting one is a three-file change, and
         "the peer stopped reading" is what ``peer_reset`` already means to an operator.
 
-        The message is unaffected either way — it was durably committed to ingress before this write
-        (ACK-on-receipt), so a lost 202 costs the sender a retry, never a message.
+        The message is unaffected either way — it was recorded before this write (ACK-on-receipt),
+        so a lost answer costs the sender a retry, never a message. For a ``202`` that record is the
+        committed ingress row; for the ``422`` on a refused body it is the ``ERROR`` row.
         """
         writer.write(data)
         await asyncio.wait_for(writer.drain(), self._drain_budget())
