@@ -452,6 +452,110 @@ def test_cli_warns_when_no_notification_address_is_given(
     assert "WARNING: no notification address" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("username", "printed"),
+    [("site-admin", '--username="site-admin"'), ("site admin", '--username="site admin"')],
+)
+def test_the_warning_prints_a_username_every_shell_reads_the_same(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    username: str,
+    printed: str,
+) -> None:
+    """BACKLOG #1985. The command used to print ``--username 'site admin'``, Python's repr. cmd.exe
+    does not read single quotes as quoting, so a pasted name kept its quotes, or split at the space,
+    and the setter answered that no such user exists. Double quotes are read by cmd.exe, PowerShell
+    and POSIX shells alike. The printed command is then run as a POSIX shell would split it, and on
+    Windows it must split the same way under the Windows argv rules.
+
+    The printed command names no store, as before; ``--db`` is added here by hand, so this test
+    says nothing about whether a pasted command finds the store ``provision-admin`` wrote to."""
+    import shlex
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    db = str(tmp_path / "p.db")
+    assert main(["provision-admin", "--username", username, "--db", db]) == 0
+    out = capsys.readouterr().out
+    assert f"admin-set-notify-email {printed} --email <address>" in out
+    assert "type it quoted" not in out
+
+    command = next(part for part in out.split("`") if part.startswith("messagefoundry "))
+    posix = shlex.split(command)
+    if sys.platform == "win32":
+        assert _windows_argv(command) == posix
+    argv = [arg.replace("<address>", "ops@example.invalid") for arg in posix[1:]]
+    assert main([*argv, "--db", db]) == 0
+    assert "OK" in capsys.readouterr().out
+
+
+def _windows_argv(command: str) -> list[str]:
+    """``command`` split by ``CommandLineToArgvW``, the rules a Windows process reads argv by."""
+    if sys.platform != "win32":  # also tells mypy on another platform to skip the rest
+        raise AssertionError("CommandLineToArgvW exists only on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    split = ctypes.windll.shell32.CommandLineToArgvW
+    split.restype = ctypes.POINTER(wintypes.LPWSTR)
+    split.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    count = ctypes.c_int()
+    argv = split(command, ctypes.byref(count))
+    try:
+        return [argv[i] for i in range(count.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
+
+
+def test_a_username_no_one_quoting_reads_the_same_is_not_printed_as_if_it_were(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``%`` expands inside cmd.exe's double quotes, so no single spelling works everywhere. The
+    warning prints a placeholder and says to quote the name for the shell in use."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    assert main(["provision-admin", "--username", "ops%team", "--db", str(tmp_path / "p.db")]) == 0
+    out = capsys.readouterr().out
+    assert "admin-set-notify-email --username <username> --email <address>" in out
+    assert "type it quoted for the shell in use" in out
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        'a"b',
+        "a$b",
+        "a`b",
+        "%USERNAME%",
+        "a!b",
+        "a\u201cb",
+        "caf\u00e9",
+        "/ops",
+        "a\\\\b",
+        "trail\\",
+        "tab\tname",
+    ],
+)
+def test_paste_safe_option_refuses_a_value_some_shell_would_change(value: str) -> None:
+    from messagefoundry.__main__ import _paste_safe_option
+
+    assert _paste_safe_option("--username", value) is None
+
+
+@pytest.mark.parametrize(
+    "value", ["site admin", "DOMAIN\\user", "o'brien", "a&b|c<d>e^f", "-leading", "a=b"]
+)
+def test_paste_safe_option_double_quotes_a_value_every_shell_passes_unchanged(value: str) -> None:
+    """Checked by hand on cmd.exe, PowerShell 7.6, Windows PowerShell 5.1 and bash for this set.
+    ``=`` keeps ``-leading`` from being read as a flag."""
+    from messagefoundry.__main__ import _paste_safe_option
+
+    assert _paste_safe_option("--username", value) == f'--username="{value}"'
+
+
 # --- AC-15: refuse before prompting where it can, and leave no new store file ------------------
 
 
