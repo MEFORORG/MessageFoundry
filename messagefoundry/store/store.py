@@ -9225,20 +9225,25 @@ class MessageStore:
         any decrypt; rows are walked newest-first and decrypt+match runs **off the event loop** (the
         per-row AES-GCM decrypt + HL7 parse is CPU work). The scan stops after ``spec.scan_limit``
         decrypts (``truncated=True``) or ``limit`` matches, whichever first — the hard cost ceiling that
-        keeps this slow-by-construction read safe to expose. The candidate ``SELECT`` is itself capped
-        at ``spec.fetch_limit`` rows, so the cap bounds the rows read into memory, not only the
-        decrypts (BACKLOG #2068)."""
+        keeps this slow-by-construction read safe to expose. The candidate ``SELECT`` returns at most
+        ``spec.fetch_limit`` rows and loads bodies for those rows only, so the cap bounds memory, not
+        only the decrypts (BACKLOG #2068). Choosing those rows can still visit every candidate when
+        the plan must sort, but that sort carries ids, not bodies."""
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
-        # Read candidates newest-first under one read snapshot; decrypt+match each off the loop. Each
-        # candidate carries the list-view columns plus `raw`, hence the LIMIT (see the docstring).
+        # Read candidates newest-first under one read snapshot; decrypt+match each off the loop. The
+        # inner SELECT picks the newest `fetch_limit` ids without touching `raw`; only those rows are
+        # then read whole. A single LIMIT on the outer SELECT is not enough: a multi-channel RBAC
+        # scope (`channel_id IN (...)`) sorts in a temp B-tree, which reads every candidate's body and
+        # last event before the LIMIT applies (BACKLOG #2068).
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
                 f" status, error, summary, metadata, raw, {_LAST_EVENT_COLUMN}"
-                f" FROM messages{where}"
-                " ORDER BY received_at DESC, id DESC LIMIT ?",
+                " FROM messages WHERE id IN"
+                f" (SELECT id FROM messages{where} ORDER BY received_at DESC, id DESC LIMIT ?)"
+                " ORDER BY received_at DESC, id DESC",
                 (*params, spec.fetch_limit),
             )
             candidates = list(await cur.fetchall())

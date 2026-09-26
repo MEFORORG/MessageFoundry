@@ -60,8 +60,9 @@ class SearchSpec:
     def fetch_limit(self) -> int:
         """How many candidate rows a backend's ``SELECT`` may read (BACKLOG #2068): the scan cap plus
         one. The extra row is never decrypted; its presence is how ``_scan_rows`` tells "stopped at
-        the cap" (``truncated``) from "saw every candidate"."""
-        return self.scan_limit + 1
+        the cap" (``truncated``) from "saw every candidate". Floored like :func:`make_spec` clamps, so
+        a directly built spec can never hand SQLite ``LIMIT -1``, which means no limit at all."""
+        return max(1, self.scan_limit) + 1
 
 
 class ContentSearchError(ValueError):

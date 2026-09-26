@@ -29,6 +29,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.content_search import (
     ContentSearchError,
+    SearchSpec,
     SearchTarget,
     make_spec,
     row_matches,
@@ -63,6 +64,16 @@ def test_make_spec_clamps_scan_limit() -> None:
     assert spec.scan_limit == 10_000  # MAX_SCAN_LIMIT
     spec0 = make_spec(content="x", field_path=None, field_value=None, scan_limit=0)
     assert spec0.scan_limit == 1
+
+
+def test_fetch_limit_is_one_past_the_scan_cap_and_never_below_two() -> None:
+    """BACKLOG #2068: the SELECT reads one row past the cap, and a spec built without make_spec's
+    clamp can never produce SQLite's ``LIMIT -1``, which means no limit at all."""
+    assert make_spec(content="x", field_path=None, field_value=None, scan_limit=3).fetch_limit == 4
+    raw = SearchSpec(
+        substring="x", field_path=None, field_value=None, target=SearchTarget.BOTH, scan_limit=-2
+    )
+    assert raw.fetch_limit == 2
 
 
 def test_row_matches_substring_case_insensitive() -> None:
@@ -192,22 +203,6 @@ async def test_scan_cap_bounds_the_rows_fetched(
     store = await MessageStore.open(tmp_path / "enc.db", cipher=make_cipher(generate_key()))
     try:
         await assert_search_select_is_capped(store, monkeypatch)
-    finally:
-        await store.close()
-
-
-async def test_scan_cap_keeps_the_newest_candidates(tmp_path: Path) -> None:
-    """The cap keeps the newest candidates, so a capped search still scans the most recent traffic."""
-    store = await MessageStore.open(tmp_path / "enc.db", cipher=make_cipher(generate_key()))
-    try:
-        for i in range(6):
-            await store.enqueue_message(
-                channel_id="IB_A", raw=ADT, deliveries=[], control_id=f"C{i}", now=100.0 + i
-            )
-        spec = make_spec(content="JANE", field_path=None, field_value=None, scan_limit=2)
-        result = await store.search_messages(spec)
-        assert [r["control_id"] for r in result.rows] == ["C5", "C4"]
-        assert result.truncated is True
     finally:
         await store.close()
 

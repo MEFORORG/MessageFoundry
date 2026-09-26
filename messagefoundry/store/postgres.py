@@ -6095,14 +6095,17 @@ class PostgresStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
-        # Capped at spec.fetch_limit rows because each candidate carries `raw` (BACKLOG #2068).
+        # The inner SELECT picks the newest `fetch_limit` ids without `raw`; only those rows are read
+        # whole (BACKLOG #2068, see ``MessageStore.search_messages``).
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata, raw,"
             " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
             "  ORDER BY e.id DESC LIMIT 1) AS last_event"
-            f" FROM messages{where}"
-            f" ORDER BY received_at DESC, id DESC LIMIT ${len(params) + 1}",
+            " FROM messages WHERE id IN"
+            f" (SELECT id FROM messages{where}"
+            f"  ORDER BY received_at DESC, id DESC LIMIT ${len(params) + 1})"
+            " ORDER BY received_at DESC, id DESC",
             *params,
             spec.fetch_limit,
         )
