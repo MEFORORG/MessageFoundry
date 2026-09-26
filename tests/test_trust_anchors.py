@@ -1072,9 +1072,8 @@ async def test_the_start_and_the_reload_refuse_an_ad_trusted_certificate_block_a
     """BACKLOG #2034 changed this deliberately. The AD consumer used to read cafile=, which loads a
     TRUSTED CERTIFICATE block, so the reload let one through. It now loads cadata=, which skips the
     block silently, so the bind refuses it at construction and the reload must refuse it too."""
-    from test_tls_cipher_assertion_sites import _ad_settings
-
     from messagefoundry.auth.ldap import LdapAuthenticator
+    from tests.test_tls_cipher_assertion_sites import _ad_settings
 
     p = _pem(tmp_path, b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n")
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)

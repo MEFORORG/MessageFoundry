@@ -40,7 +40,6 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-from test_tls_cipher_assertion_sites import _ad_settings, _context_ldap3_builds
 
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.auth import trust_anchors as ta
@@ -57,6 +56,7 @@ from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import MLLPSource, _mllp_ssl_context
 from messagefoundry.verify.federation import run_federation_checks
 from messagefoundry.verify.model import Status
+from tests.test_tls_cipher_assertion_sites import _ad_settings, _context_ldap3_builds
 
 _NB = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
 _NA = datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC)
