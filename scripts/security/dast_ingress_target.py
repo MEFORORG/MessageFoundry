@@ -31,7 +31,7 @@ import asyncio
 import logging
 import socket
 import tempfile
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,16 +88,26 @@ class IngressTarget:
     ports: dict[str, int]
     posture: dict[str, str]
     canary: str | None
-    #: Called by the sweep after every case with the zero-based case index. A no-op except under the
-    #: ``listener-down`` canary, where it stops the MLLP listener after the first case.
-    after_case: Callable[[int], Awaitable[None]]
     #: What the ``leak`` canary retains. Released at teardown.
     leaked: list[Any] = field(default_factory=list)
 
+    async def after_case(self, index: int) -> None:
+        """Called by the sweep after every case with its zero-based index. A no-op except under the
+        ``listener-down`` canary, which stops the MLLP listener after the first case."""
+        if self.canary == "listener-down" and index == 0:
+            await self.runner.stop_inbound(MLLP_INBOUND)
+
     def active_connections(self, plane: str) -> int:
-        """Live client connections the plane's listener holds -- the sweep's settle point."""
+        """Live client connections the plane's listener holds -- the sweep's settle point.
+
+        Read off the listener's own counter with no default, so a rename raises rather than making
+        every settle return at once. A stopped listener is absent and holds nothing.
+        """
         source = self.runner._sources.get(PLANES[plane])
-        return int(getattr(source, "_active", 0)) if source is not None else 0
+        if source is None:
+            return 0
+        assert isinstance(source, MLLPSource | TcpSource | X12Source), type(source)
+        return source._active
 
 
 def _free_ports(count: int) -> list[int]:
@@ -227,41 +237,40 @@ def _wrap(
 
 @asynccontextmanager
 async def ingress_target(
-    settings: Mapping[str, Any], *, canary: str | None = None, db_dir: Path | None = None
+    settings: Mapping[str, Any], *, canary: str | None = None
 ) -> AsyncIterator[IngressTarget]:
     """Bring up engine + listeners, yield the handle, tear it all down. Every wait is bounded."""
     if canary is not None and canary not in CANARY_DETECTOR:
         raise ValueError(f"unknown canary {canary!r}; expected one of {CANARIES}")
     tmp = tempfile.TemporaryDirectory(prefix="mefor-dast-ingress-", ignore_cleanup_errors=True)
-    root = db_dir if db_dir is not None else Path(tmp.name)
-    engine = await Engine.create(root / "dast-ingress.db", poll_interval=0.02)
+    engine = await Engine.create(Path(tmp.name) / "dast-ingress.db", poll_interval=0.02)
     target: IngressTarget | None = None
     try:
         runner = engine.add_registry(_registry(settings, canary=canary))
         await engine.start()
-        sources = {plane: runner._sources.get(name) for plane, name in PLANES.items()}
-        expected = {"mllp": MLLPSource, "tcp": TcpSource, "x12": X12Source}
-        missing = [p for p, s in sources.items() if not isinstance(s, expected[p])]
-        if missing:
+        mllp = runner._sources.get(MLLP_INBOUND)
+        tcp = runner._sources.get(TCP_INBOUND)
+        x12 = runner._sources.get(X12_INBOUND)
+        if not (
+            isinstance(mllp, MLLPSource)
+            and isinstance(tcp, TcpSource)
+            and isinstance(x12, X12Source)
+        ):
             raise IngressTargetUnusable(
-                f"the engine did not bind the {', '.join(missing)} listener(s); nothing to scan"
+                "the engine did not bind all three listeners; nothing to scan"
             )
-        ports = {plane: int(getattr(source, "sockport")) for plane, source in sources.items()}  # noqa: B009
-
-        async def after_case(index: int) -> None:
-            if canary == "listener-down" and index == 0:
-                await runner.stop_inbound(MLLP_INBOUND)
-
+        ports = {"mllp": mllp.sockport, "tcp": tcp.sockport, "x12": x12.sockport}
         target = IngressTarget(
             engine=engine,
             runner=runner,
             ports=ports,
             posture=_posture(settings, canary=canary),
             canary=canary,
-            after_case=after_case,
         )
-        mllp = sources["mllp"]
-        assert isinstance(mllp, MLLPSource) and mllp._handler is not None
+        # The listener reads `_handler` afresh for every decoded frame, so the swap takes effect at
+        # once. If that ever changes, the four wrapped canaries go blind and exit 2, which reds
+        # tests/test_dast_ingress_sweep.py::test_each_canary_trips_its_own_detector.
+        assert mllp._handler is not None
         mllp._handler = _wrap(mllp._handler, target, settings)
         yield target
     finally:

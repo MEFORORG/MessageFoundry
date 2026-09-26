@@ -34,7 +34,6 @@ from scripts.security.dast_ingress_sweep import (
     evaluate,
     load_policy,
     main,
-    mllp,
     mutation_cases,
     reference_frames,
     run_case,
@@ -51,16 +50,7 @@ def _policy() -> dict[str, Any]:
 
 
 def _budget(**overrides: Any) -> Budget:
-    b = _policy()["budget"]
-    budget = Budget(
-        case_seconds=b["case_seconds"],
-        stall_close_seconds=b["stall_close_seconds"],
-        trickle_delay=b["trickle_delay"],
-        settle_seconds=b["settle_seconds"],
-        cap=_CAP,
-        connect_seconds=b["connect_seconds"],
-    )
-    return replace(budget, **overrides)
+    return replace(Budget.from_policy(_policy()), **overrides)
 
 
 def _case(plane: str, name: str) -> Case:
@@ -153,7 +143,7 @@ async def test_the_stall_bound_fires_when_the_frame_deadline_is_off() -> None:
     ``max_frame_seconds`` off, a peer trickling inside a frame is never closed, and the case must say
     so. Without this, a stall check that could not fire would pass every slowloris case."""
     result = await _run_alone(
-        _case("mllp", "slowloris-in-frame"), _budget(stall_close_seconds=1.5), max_frame_seconds=0
+        _case("mllp", "slowloris-in-frame"), _budget(stall_close_seconds=1.0), max_frame_seconds=0
     )
     assert any(f["detector"] == "time" for f in result.findings), result.findings
 
@@ -230,7 +220,7 @@ def _ack(code: str) -> bytes:
     [
         (_result(rows=1), b"", "reply"),  # silence
         (_result(rows=1), _ack("AA") * 2, "reply"),  # a spare reply
-        (_result(rows=1), mllp(b"MSH|^~\\&|\rMSA\r"), "reply"),  # no readable MSA-1
+        (_result(rows=1), frame(b"MSH|^~\\&|\rMSA\r"), "reply"),  # no readable MSA-1
         (_result(rows=0), _ack("AA"), "count_and_log"),  # accepted and dropped
         (_result(rows=1, error_rows=0), _ack("AR"), "count_and_log"),  # NAK with no ERROR row
         (_result(plane="tcp", rows=1), b"x", "reply"),  # a reply from a listener that never replies
@@ -239,17 +229,17 @@ def _ack(code: str) -> bytes:
     ],
 )
 def test_the_oracle_names_each_violation(result: CaseResult, got: bytes, detector: str) -> None:
-    _judge(Case("c", result.plane, b""), result, got)
+    _judge(result, got)
     assert detector in {f["detector"] for f in result.findings}, result.findings
 
 
 def test_the_oracle_is_silent_on_a_correct_exchange() -> None:
     accepted = _result(rows=1)
-    _judge(Case("c", "mllp", b""), accepted, _ack("AA"))
+    _judge(accepted, _ack("AA"))
     rejected = _result(rows=1, error_rows=1)
-    _judge(Case("c", "mllp", b""), rejected, _ack("AR"))
+    _judge(rejected, _ack("AR"))
     oversize = _result(frames=0, overflow=True, oversize_events=1)
-    _judge(Case("c", "mllp", b""), oversize, b"")
+    _judge(oversize, b"")
     assert not (accepted.findings or rejected.findings or oversize.findings)
 
 
@@ -329,7 +319,7 @@ _TRICKLE = Case("trickle", "tcp", b"\x02", stall=True, trickle=b"ISA*00*" * 40)
     ),
 )
 async def test_the_raw_tcp_listener_closes_a_trickling_peer() -> None:
-    result = await _run_alone(_TRICKLE, _budget(stall_close_seconds=1.5))
+    result = await _run_alone(_TRICKLE, _budget(stall_close_seconds=1.0))
     assert not result.findings, result.findings
 
 
@@ -342,7 +332,7 @@ async def test_the_raw_tcp_listener_closes_a_trickling_peer() -> None:
 )
 async def test_the_x12_listener_closes_a_trickling_peer() -> None:
     trickle = replace(_TRICKLE, plane="x12", payload=b"ISA")
-    result = await _run_alone(trickle, _budget(stall_close_seconds=1.5))
+    result = await _run_alone(trickle, _budget(stall_close_seconds=1.0))
     assert not result.findings, result.findings
 
 
@@ -358,13 +348,11 @@ def _ingress_job() -> dict[str, Any]:
     return job
 
 
-def test_the_ingress_job_can_go_red_and_installs_no_scanner() -> None:
-    job = _ingress_job()
-    assert "continue-on-error" not in job
-    for step in job["steps"]:
-        assert "continue-on-error" not in step, step
+def test_the_ingress_job_installs_no_scanner() -> None:
+    """Its can-go-red half is checked for every dast.yml job by
+    tests/test_dast_auth_sweep.py::test_the_dast_job_can_actually_go_red."""
+    for step in _ingress_job()["steps"]:
         run = str(step.get("run", ""))
-        assert "|| true" not in run and "--exit-zero" not in run, step
         assert "pip install" not in run.replace("uv pip install --system --constraint", ""), step
 
 

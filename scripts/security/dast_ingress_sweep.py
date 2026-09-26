@@ -49,12 +49,11 @@ import random
 import sys
 import time
 import tracemalloc
-from collections.abc import Callable, Coroutine, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import psutil
 
@@ -64,12 +63,13 @@ if str(_ROOT) not in sys.path:
 
 from fuzz.targets import KNOWN_FINDINGS, TARGETS  # noqa: E402
 from messagefoundry.logging_setup import _install_phi_filters  # noqa: E402
-from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError  # noqa: E402
+from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, frame  # noqa: E402
 from messagefoundry.parsing.peek import Peek, normalize  # noqa: E402
 from messagefoundry.parsing.x12.errors import X12FrameError  # noqa: E402
 from messagefoundry.parsing.x12.interchange import X12FrameReader  # noqa: E402
 from messagefoundry.store import MessageStatus  # noqa: E402
 from messagefoundry.transports.framing import STX_ETX_CODEC, FrameDecoder, FrameError  # noqa: E402
+from scripts.security.dast_auth_sweep import _run, annotation_level  # noqa: E402
 from scripts.security.dast_ingress_target import (  # noqa: E402
     CANARY_DETECTOR,
     PLANES,
@@ -117,10 +117,6 @@ class Case:
     origin: str = "catalogue"
 
 
-def mllp(body: bytes) -> bytes:
-    return VT + body + FS + CR
-
-
 def hl7(
     control_id: str, sentinel: str, *, fs: str = "|", enc: str = "^~\\&", extra: str = ""
 ) -> str:
@@ -147,49 +143,49 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
     pad = cap - len(good) - len("NTE|1||\r")
     exact = _b(hl7("DAST-CAP", sentinel, extra="NTE|1||" + "X" * pad + "\r"))
     cases = [
-        Case("well-formed", "mllp", mllp(good)),
+        Case("well-formed", "mllp", frame(good)),
         Case("missing-start-vt", "mllp", good + FS + CR),
         Case("missing-end-fs", "mllp", VT + good, stall=True),
         Case("missing-trailer-cr", "mllp", VT + good + FS),
-        Case("extra-trailers", "mllp", mllp(good) + CR * 8),
-        Case("double-start", "mllp", VT + mllp(good)),
+        Case("extra-trailers", "mllp", frame(good) + CR * 8),
+        Case("double-start", "mllp", VT + frame(good)),
         Case("empty-frame", "mllp", VT + FS + CR),
-        Case("start-byte-mid-body", "mllp", mllp(good[:40] + VT + good[40:])),
-        Case("end-byte-mid-body", "mllp", mllp(good[:40] + FS + good[40:])),
-        Case("pipelined-three", "mllp", mllp(msg("P1")) + mllp(msg("P2")) + mllp(msg("P3"))),
-        Case("split-seven-bytes", "mllp", mllp(msg("SPLIT")), split=7),
-        Case("noise-then-frame", "mllp", b"\x00\xffGARBAGE\r\n" * 16 + mllp(good)),
-        Case("binary-garbage-frame", "mllp", mllp(bytes(range(32, 256)) * 4)),
+        Case("start-byte-mid-body", "mllp", frame(good[:40] + VT + good[40:])),
+        Case("end-byte-mid-body", "mllp", frame(good[:40] + FS + good[40:])),
+        Case("pipelined-three", "mllp", frame(msg("P1")) + frame(msg("P2")) + frame(msg("P3"))),
+        Case("split-seven-bytes", "mllp", frame(msg("SPLIT")), split=7),
+        Case("noise-then-frame", "mllp", b"\x00\xffGARBAGE\r\n" * 16 + frame(good)),
+        Case("binary-garbage-frame", "mllp", frame(bytes(range(32, 256)) * 4)),
         Case("idle-after-connect", "mllp", b"", stall=True),
         Case("slowloris-in-frame", "mllp", VT, stall=True, trickle=good * 8),
-        Case("frame-then-truncated-drop", "mllp", mllp(good), tail=VT + good[:30], abort=True),
+        Case("frame-then-truncated-drop", "mllp", frame(good), tail=VT + good[:30], abort=True),
         Case("drop-mid-frame", "mllp", b"", tail=VT + good[:30], abort=True),
         Case("oversize-frame", "mllp", VT + b"A" * (cap + 1)),
-        Case("frame-then-oversize", "mllp", mllp(good) + VT + b"A" * (cap + 1)),
-        Case("exactly-at-cap", "mllp", mllp(exact)),
+        Case("frame-then-oversize", "mllp", frame(good) + VT + b"A" * (cap + 1)),
+        Case("exactly-at-cap", "mllp", frame(exact)),
         # Hostile HL7 inside a well-formed frame.
-        Case("letter-field-separator", "mllp", mllp(msg("SEP1", fs="A"))),
-        Case("separator-collision", "mllp", mllp(msg("SEP2", enc="||||"))),
-        Case("short-encoding-chars", "mllp", mllp(msg("SEP3", enc="^"))),
-        Case("truncation-char-27", "mllp", mllp(msg("SEP4", enc="^~\\&#"))),
-        Case("missing-msh", "mllp", mllp(_b(f"PID|1||X||{sentinel}^CASE\r"))),
-        Case("msh-only", "mllp", mllp(b"MSH|^~\\&|")),
-        Case("blank-segment", "mllp", mllp(_BLANK_SEGMENT)),
-        Case("blank-segment-invalid-utf8", "mllp", mllp(_BLANK_SEGMENT.replace(b"X", b"\xc0", 1))),
-        Case("huge-repeat-count", "mllp", mllp(msg("REP", extra="ZRP|" + "~" * 20000 + "\r"))),
-        Case("deep-components", "mllp", mllp(msg("DEEP", extra="ZDP|" + "^&" * 10000 + "\r"))),
-        Case("many-segments", "mllp", mllp(msg("SEGS", extra="NTE|1|\r" * 3000))),
+        Case("letter-field-separator", "mllp", frame(msg("SEP1", fs="A"))),
+        Case("separator-collision", "mllp", frame(msg("SEP2", enc="||||"))),
+        Case("short-encoding-chars", "mllp", frame(msg("SEP3", enc="^"))),
+        Case("truncation-char-27", "mllp", frame(msg("SEP4", enc="^~\\&#"))),
+        Case("missing-msh", "mllp", frame(_b(f"PID|1||X||{sentinel}^CASE\r"))),
+        Case("msh-only", "mllp", frame(b"MSH|^~\\&|")),
+        Case("blank-segment", "mllp", frame(_BLANK_SEGMENT)),
+        Case("blank-segment-invalid-utf8", "mllp", frame(_BLANK_SEGMENT.replace(b"X", b"\xc0", 1))),
+        Case("huge-repeat-count", "mllp", frame(msg("REP", extra="ZRP|" + "~" * 20000 + "\r"))),
+        Case("deep-components", "mllp", frame(msg("DEEP", extra="ZDP|" + "^&" * 10000 + "\r"))),
+        Case("many-segments", "mllp", frame(msg("SEGS", extra="NTE|1|\r" * 3000))),
         Case(
-            "escape-abuse", "mllp", mllp(msg("ESC", extra="NTE|1||" + "\\X0\\\\E\\" * 3000 + "\r"))
+            "escape-abuse", "mllp", frame(msg("ESC", extra="NTE|1||" + "\\X0\\\\E\\" * 3000 + "\r"))
         ),
-        Case("lf-only-segments", "mllp", mllp(good.replace(b"\r", b"\n"))),
-        Case("bom-prefixed", "mllp", mllp(b"\xef\xbb\xbf" + good)),
-        Case("latin1-not-utf8", "mllp", mllp(good.replace(b"CASE", b"CAS\xe9"))),
-        Case("overlong-utf8", "mllp", mllp(good.replace(b"CASE", b"CA\xc0\xafE"))),
-        Case("lone-surrogate-utf8", "mllp", mllp(good.replace(b"CASE", b"CA\xed\xa0\x80E"))),
-        Case("nul-in-body", "mllp", mllp(good.replace(b"CASE", b"CA\x00E"))),
-        Case("control-chars", "mllp", mllp(good.replace(b"CASE", bytes(range(1, 11)) + b"E"))),
-        Case("huge-single-field", "mllp", mllp(msg("BIG", extra="NTE|1||" + "Z" * 60000 + "\r"))),
+        Case("lf-only-segments", "mllp", frame(good.replace(b"\r", b"\n"))),
+        Case("bom-prefixed", "mllp", frame(b"\xef\xbb\xbf" + good)),
+        Case("latin1-not-utf8", "mllp", frame(good.replace(b"CASE", b"CAS\xe9"))),
+        Case("overlong-utf8", "mllp", frame(good.replace(b"CASE", b"CA\xc0\xafE"))),
+        Case("lone-surrogate-utf8", "mllp", frame(good.replace(b"CASE", b"CA\xed\xa0\x80E"))),
+        Case("nul-in-body", "mllp", frame(good.replace(b"CASE", b"CA\x00E"))),
+        Case("control-chars", "mllp", frame(good.replace(b"CASE", bytes(range(1, 11)) + b"E"))),
+        Case("huge-single-field", "mllp", frame(msg("BIG", extra="NTE|1||" + "Z" * 60000 + "\r"))),
     ]
     return cases
 
@@ -265,13 +261,10 @@ def mutation_cases(seed: int, count: int, cap: int) -> list[Case]:
     cases = []
     for index in range(count):
         if index % 4 == 3:
-            body = mutate(rng, _X12_SEED, limit)
-            cases.append(Case(f"mutation-{index}", "x12", body, origin=f"mutation:{seed}:{index}"))
+            plane, payload = "x12", mutate(rng, _X12_SEED, limit)
         else:
-            body = mutate(rng, rng.choice(_HL7_SEEDS), limit)
-            cases.append(
-                Case(f"mutation-{index}", "mllp", mllp(body), origin=f"mutation:{seed}:{index}")
-            )
+            plane, payload = "mllp", frame(mutate(rng, rng.choice(_HL7_SEEDS), limit))
+        cases.append(Case(f"mutation-{index}", plane, payload, origin=f"mutation:{seed}:{index}"))
     return cases
 
 
@@ -352,6 +345,19 @@ def classify_replies(data: bytes) -> tuple[int, int, int]:
 # =====================================================================================================
 
 
+def finding(
+    detector: str, plane: str, case: str, detail: str, known_defect: str = ""
+) -> dict[str, str]:
+    """The one shape every finding takes, in the receipt and in the evaluator."""
+    return {
+        "detector": detector,
+        "plane": plane,
+        "case": case,
+        "detail": detail,
+        "known_defect": known_defect,
+    }
+
+
 @dataclass
 class CaseResult:
     name: str
@@ -370,15 +376,7 @@ class CaseResult:
     findings: list[dict[str, str]] = field(default_factory=list)
 
     def find(self, detector: str, detail: str) -> None:
-        self.findings.append(
-            {
-                "detector": detector,
-                "plane": self.plane,
-                "case": self.name,
-                "detail": detail,
-                "known_defect": self.known_defect,
-            }
-        )
+        self.findings.append(finding(detector, self.plane, self.name, detail, self.known_defect))
 
 
 def _chunks(data: bytes, size: int) -> Iterator[bytes]:
@@ -434,6 +432,20 @@ class Budget:
     settle_seconds: float
     cap: int
     connect_seconds: float = 1.0
+
+    @classmethod
+    def from_policy(cls, policy: dict[str, Any], *, canary: str | None = None) -> Budget:
+        b = policy["budget"]
+        return cls(
+            case_seconds=float(
+                policy["canary"]["case_seconds"] if canary == "stall" else b["case_seconds"]
+            ),
+            stall_close_seconds=float(b["stall_close_seconds"]),
+            trickle_delay=float(b["trickle_delay"]),
+            settle_seconds=float(b["settle_seconds"]),
+            cap=int(policy["posture"]["max_frame_bytes"]),
+            connect_seconds=float(b["connect_seconds"]),
+        )
 
 
 async def _connect(
@@ -503,15 +515,25 @@ async def _drive(target: IngressTarget, case: Case, result: CaseResult, budget: 
             await asyncio.wait_for(writer.wait_closed(), 2.0)
 
 
-async def _counts(target: IngressTarget, plane: str) -> tuple[int, int, int]:
-    store = target.engine.store
-    name = PLANES[plane]
-    total = await store.count_messages(channel_id=name)
-    errors = await store.count_messages(channel_id=name, status=MessageStatus.ERROR.value)
-    events = len(
-        await store.list_connection_events(connection=name, kinds=["frame_oversize"], limit=1000)
+class Counts(NamedTuple):
+    rows: int
+    errors: int
+
+
+async def _counts(target: IngressTarget, plane: str) -> Counts:
+    store, name = target.engine.store, PLANES[plane]
+    return Counts(
+        await store.count_messages(channel_id=name),
+        await store.count_messages(channel_id=name, status=MessageStatus.ERROR.value),
     )
-    return total, errors, events
+
+
+async def _oversize_events(target: IngressTarget, plane: str) -> int:
+    """Read only for a case that overflows: most cases never need it."""
+    events = await target.engine.store.list_connection_events(
+        connection=PLANES[plane], kinds=["frame_oversize"], limit=1000
+    )
+    return len(events)
 
 
 async def _settle(target: IngressTarget, plane: str, seconds: float) -> bool:
@@ -530,6 +552,7 @@ async def run_case(target: IngressTarget, case: Case, budget: Budget) -> CaseRes
     )
     result = CaseResult(case.name, case.plane, case.origin, len(payloads), overflow, known)
     before = await _counts(target, case.plane)
+    events_before = await _oversize_events(target, case.plane) if overflow else 0
     started = time.monotonic()
     try:
         got = await asyncio.wait_for(_drive(target, case, result, budget), budget.case_seconds * 2)
@@ -549,21 +572,23 @@ async def run_case(target: IngressTarget, case: Case, budget: Budget) -> CaseRes
         result.find(
             "time", f"the listener did not release the connection in {budget.settle_seconds}s"
         )
-    after = await _counts(target, case.plane)
     if overflow:
+        # The event is written off the listener's path, so it may land a moment after the close.
         deadline = time.monotonic() + budget.settle_seconds
-        while after[2] <= before[2] and time.monotonic() < deadline:
+        while (events := await _oversize_events(target, case.plane)) <= events_before:
+            if time.monotonic() > deadline:
+                break
             await asyncio.sleep(0.02)
-            after = await _counts(target, case.plane)
-    result.rows, result.error_rows = after[0] - before[0], after[1] - before[1]
-    result.oversize_events = after[2] - before[2]
-    _judge(case, result, got)
+        result.oversize_events = events - events_before
+    after = await _counts(target, case.plane)
+    result.rows, result.error_rows = after.rows - before.rows, after.errors - before.errors
+    _judge(result, got)
     return result
 
 
-def _judge(case: Case, result: CaseResult, got: bytes) -> None:
+def _judge(result: CaseResult, got: bytes) -> None:
     frames = result.frames
-    if case.plane == "mllp":
+    if result.plane == "mllp":
         result.accepted, result.rejected, result.unreadable = classify_replies(got)
         replies = result.accepted + result.rejected + result.unreadable
         if replies < frames:
@@ -598,7 +623,7 @@ async def probe_liveness(
 ) -> str | None:
     """A well-formed message on a fresh connection must be accepted and persisted. ``None`` = alive."""
     if plane == "mllp":
-        payload = mllp(_b(hl7(f"LIVE{index}", "LIVENESS")))
+        payload = frame(_b(hl7(f"LIVE{index}", "LIVENESS")))
     elif plane == "tcp":
         payload = STX + _X12_SEED + ETX
     else:
@@ -621,7 +646,7 @@ async def probe_liveness(
             await asyncio.wait_for(writer.wait_closed(), 2.0)
     await _settle(target, plane, budget.settle_seconds)
     after = await _counts(target, plane)
-    accepted = after[0] - before[0] - (after[1] - before[1])
+    accepted = (after.rows - before.rows) - (after.errors - before.errors)
     if plane == "mllp" and classify_replies(got)[0] != 1:
         return "a well-formed message got no AA"
     if accepted != 1:
@@ -734,6 +759,8 @@ def load_policy(path: Path) -> dict[str, Any]:
         policy: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise PolicyError(f"cannot read the policy at {path}: {exc}") from exc
+    if not isinstance(policy, dict):
+        raise PolicyError(f"the policy at {path} is not a JSON object")
     for key in ("posture", "budget", "floors", "resource_bounds", "canary", "seed", "mutations"):
         if key not in policy:
             raise PolicyError(f"the policy at {path} has no {key!r} section")
@@ -753,21 +780,12 @@ async def run_sweep(
     mutation_seconds: float = 0.0,
 ) -> dict[str, Any]:
     posture = policy["posture"]
-    cap = int(posture["max_frame_bytes"])
-    b = policy["budget"]
-    budget = Budget(
-        case_seconds=float(
-            policy["canary"]["case_seconds"] if canary == "stall" else b["case_seconds"]
-        ),
-        stall_close_seconds=float(b["stall_close_seconds"]),
-        trickle_delay=float(b["trickle_delay"]),
-        settle_seconds=float(b["settle_seconds"]),
-        cap=cap,
-        connect_seconds=float(b["connect_seconds"]),
-    )
+    budget = Budget.from_policy(policy, canary=canary)
+    cap = budget.cap
     seed = int(policy["seed"]) if seed is None else seed
     sentinel = f"ZZDASTSENTINEL{seed:08X}"
-    cases = catalogue(sentinel, cap)
+    fixed = catalogue(sentinel, cap)
+    cases = fixed
     if canary is not None:
         wanted = policy["canary"].get("cases_by_canary", {}).get(canary, policy["canary"]["cases"])
         cases = [c for c in cases if f"{c.plane}:{c.name}" in wanted]
@@ -787,30 +805,19 @@ async def run_sweep(
     engine_logger.setLevel(logging.INFO)
     results: list[CaseResult] = []
     liveness: list[dict[str, str]] = []
-    probes = 0
     resources = Resources()
     started = time.monotonic()
     try:
         settings = dict(posture, canary_stall_seconds=policy["canary"]["stall_seconds"])
         async with ingress_target(settings, canary=canary) as target:
-            index = 0
 
             async def one(case: Case) -> None:
-                nonlocal index, probes
+                index = len(results)
                 results.append(await run_case(target, case, budget))
                 await target.after_case(index)
-                probes += 1
                 failure = await probe_liveness(target, case.plane, index, budget)
                 if failure is not None:
-                    liveness.append(
-                        {
-                            "detector": "liveness",
-                            "plane": case.plane,
-                            "case": case.name,
-                            "detail": failure,
-                        }
-                    )
-                index += 1
+                    liveness.append(finding("liveness", case.plane, case.name, failure))
 
             for case in cases:
                 await one(case)
@@ -820,11 +827,8 @@ async def run_sweep(
                 while time.monotonic() < deadline:
                     for case in mutation_cases(rng_seed, 16, cap):
                         await one(
-                            Case(
-                                f"timed-{extra}",
-                                case.plane,
-                                case.payload,
-                                origin=f"mutation:{rng_seed}:{extra}",
+                            replace(
+                                case, name=f"timed-{extra}", origin=f"mutation:{rng_seed}:{extra}"
                             )
                         )
                         extra += 1
@@ -833,7 +837,7 @@ async def run_sweep(
                 wanted_r = policy["canary"]["resource_cases"] if canary else None
                 resource_cases = [
                     c
-                    for c in catalogue(sentinel, cap)
+                    for c in fixed
                     if not c.stall and (wanted_r is None or f"{c.plane}:{c.name}" in wanted_r)
                 ]
                 passes = int(policy["resource_bounds"]["passes"])
@@ -851,18 +855,9 @@ async def run_sweep(
         ("tasks", resources.task_growth, bounds["max_task_growth"]),
     ):
         if observed > bound:
-            findings.append(
-                {
-                    "detector": "resources",
-                    "plane": "all",
-                    "case": label,
-                    "detail": f"{label} grew by {observed} across {resources.passes} passes (bound {bound})",
-                }
-            )
-    findings += [
-        {"detector": "log_body", "plane": "all", "case": hit["logger"], "detail": json.dumps(hit)}
-        for hit in watch.hits
-    ]
+            detail = f"{label} grew by {observed} across {resources.passes} passes (bound {bound})"
+            findings.append(finding("resources", "all", label, detail))
+    findings += [finding("log_body", "all", hit["logger"], json.dumps(hit)) for hit in watch.hits]
     return {
         "tool": "scripts/security/dast_ingress_sweep.py",
         "scope": "see docs/adr/0155-dast-dynamic-security-testing-of-the-running-engine.md, Scope boundary",
@@ -871,7 +866,7 @@ async def run_sweep(
         "posture": posture_out,
         "wall_seconds": round(time.monotonic() - started, 2),
         "planes": _plane_totals(results, liveness),
-        "liveness_probes": probes,
+        "liveness_probes": len(results),
         "mutation_cases": sum(1 for r in results if r.origin.startswith("mutation")),
         "log": {"records_seen": watch.seen, "sentinel_hits": len(watch.hits)},
         "resources": asdict(resources),
@@ -986,17 +981,6 @@ def receipt_lines(receipt: dict[str, Any], verdict: str) -> list[str]:
     return lines
 
 
-def _run(coro: Coroutine[Any, Any, dict[str, Any]]) -> dict[str, Any]:
-    """``asyncio.run`` from a sync caller, or on a private thread from inside a running loop (the
-    suite shares one session loop; see ``dast_auth_sweep._run`` for the same reasoning)."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Hostile-input pass over the live ingress listeners."
@@ -1040,7 +1024,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.summary is not None:
         with suppress(OSError), args.summary.open("a", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
-    level = "notice" if args.canary is not None and code == 1 else "error"
+    level = annotation_level(canary=args.canary, code=code)
     for message in messages:
         print(f"::{level}::{_PREFIX}: {message}", file=sys.stderr)
     if args.receipt is not None:
