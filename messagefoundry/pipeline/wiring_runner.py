@@ -1111,11 +1111,14 @@ class RegistryRunner:
         # #147 (ADR 0095): per-connection active-window scheduler. `_schedule_clock` is injectable for
         # deterministic tests (returns an AWARE UTC datetime); `_schedule_tick` is the reconcile
         # granularity. `_schedule_workers` holds one cooperatively-cancellable task per SCHEDULED
-        # connection, spawned in start() and cancelled in _teardown_unsafe (empty = no scheduled
-        # connections = byte-identical always-on lifecycle).
+        # (direction, name), spawned in start() and cancelled in _teardown_unsafe (empty = no scheduled
+        # connections = byte-identical always-on lifecycle). Keyed by direction for the reason _failed
+        # is (#1813); this map's own fix is #1819. A dual-role name can schedule BOTH halves, and a
+        # bare-name key let whichever half spawned first hold the slot while the other's calendar
+        # silently never ran.
         self._schedule_tick = schedule_tick
         self._schedule_clock: Callable[[], datetime] = schedule_clock or (lambda: datetime.now(UTC))
-        self._schedule_workers: dict[str, asyncio.Task[None]] = {}
+        self._schedule_workers: dict[tuple[Direction, str], asyncio.Task[None]] = {}
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
         # resolved in _start_pooled_dispatchers AFTER trying to open the sync pools + build the per-stage
@@ -2045,7 +2048,7 @@ class RegistryRunner:
         )
         return True
 
-    def _auto_start_enabled(self, name: str, kind: str) -> bool:
+    def _auto_start_enabled(self, name: str, kind: Direction) -> bool:
         """The connection's declared ``auto_start`` (#115), by role. ``True`` for a name the registry no
         longer declares (a reload-dropped outbound that is only draining) — there is nothing left to
         gate, and defaulting to False would park a lane the graph never asked to disable."""
@@ -2055,7 +2058,7 @@ class RegistryRunner:
         oc = self.registry.outbound.get(name)
         return oc.auto_start if oc is not None else True
 
-    def _deployed(self, name: str, kind: str) -> bool:
+    def _deployed(self, name: str, kind: Direction) -> bool:
         """The connection's declared ``deployed`` (#233, ADR 0111), by role — read from the REGISTRY (the
         graph), never from live runner state, because at-least-once (ADR 0001) requires a crash re-run to
         re-derive an identical decision.
@@ -2450,8 +2453,8 @@ class RegistryRunner:
 
     def _start_schedulers(self) -> None:
         """Spawn one active-window scheduler task per scheduled inbound/outbound connection. Called
-        once from :meth:`start` under the reload lock; idempotent per name (a live task is not
-        re-spawned). Byte-identical no-op when no connection declares a ``schedule``."""
+        once from :meth:`start` under the reload lock; idempotent per (direction, name) (a live task
+        is not re-spawned). Byte-identical no-op when no connection declares a ``schedule``."""
         for ic in self.registry.inbound.values():
             if ic.schedule is not None:
                 self._spawn_scheduler(ic.name, "inbound", ic.schedule)
@@ -2459,15 +2462,16 @@ class RegistryRunner:
             if oc.schedule is not None:
                 self._spawn_scheduler(oc.name, "outbound", oc.schedule)
 
-    def _spawn_scheduler(self, name: str, kind: str, schedule: Schedule) -> None:
-        existing = self._schedule_workers.get(name)
+    def _spawn_scheduler(self, name: str, kind: Direction, schedule: Schedule) -> None:
+        key = (kind, name)
+        existing = self._schedule_workers.get(key)
         if existing is not None and not existing.done():
             return
-        self._schedule_workers[name] = asyncio.create_task(
+        self._schedule_workers[key] = asyncio.create_task(
             self._schedule_worker(name, kind, schedule)
         )
 
-    async def _schedule_worker(self, name: str, kind: str, schedule: Schedule) -> None:
+    async def _schedule_worker(self, name: str, kind: Direction, schedule: Schedule) -> None:
         """Reconcile ``name``'s live listen/deliver state against its active-window ``schedule`` every
         ``_schedule_tick`` seconds until the runner stops. Cooperatively cancellable (it sleeps via
         :meth:`_stop_or_sleep`, which returns True on stop). A reconcile error is logged and swallowed —
@@ -2479,11 +2483,13 @@ class RegistryRunner:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("schedule worker %r: reconcile failed; will retry next tick", name)
+                log.exception(
+                    "schedule worker %s %r: reconcile failed; will retry next tick", kind, name
+                )
             if await self._stop_or_sleep(self._schedule_tick):
                 return
 
-    async def _reconcile_schedule(self, name: str, kind: str, schedule: Schedule) -> None:
+    async def _reconcile_schedule(self, name: str, kind: Direction, schedule: Schedule) -> None:
         """Bring ``name`` up or park it to match its schedule at the current (injectable) clock — one
         idempotent step. Reuses the SAME per-connection lifecycle the API uses: an inbound is
         started/stopped by binding/unbinding its listener (its router/transform workers keep draining
@@ -2514,13 +2520,17 @@ class RegistryRunner:
             # its calendar and closes the window cleanly.
             if not self._auto_start_enabled(name, kind):
                 return
-            log.info("schedule: connection %r entering active window — starting", name)
+            log.info("schedule: %s connection %r entering active window — starting", kind, name)
             if kind == "inbound":
                 await self.start_inbound(name)
             else:
                 await self.start_outbound(name)
         elif not active and running:
-            log.info("schedule: connection %r leaving active window — parking (clean stop)", name)
+            log.info(
+                "schedule: %s connection %r leaving active window — parking (clean stop)",
+                kind,
+                name,
+            )
             if kind == "inbound":
                 await self.stop_inbound(name)
             else:

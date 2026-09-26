@@ -183,7 +183,7 @@ async def test_scheduler_task_autonomously_parks_out_of_window(store: MessageSto
     )
     await runner.start()
     try:
-        assert "in_sched" in runner._schedule_workers
+        assert ("inbound", "in_sched") in runner._schedule_workers
         # The scheduler autonomously parks the out-of-window listener that auto_start bound.
         await _wait_until(lambda: not runner.inbound_running("in_sched"))
         # Move into the window → the scheduler brings it up.
@@ -221,6 +221,61 @@ async def test_outbound_schedule_pauses_and_resumes_delivery(
         await _wait_until(lambda: runner.outbound_running("OB_FILE"))
     finally:
         await runner.stop()
+
+
+async def test_dual_role_name_gets_one_scheduler_per_direction(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # BACKLOG #1819: the registry keeps inbounds and outbounds in separate tables, so one name can be
+    # both. When both halves declare a schedule, each needs its own scheduler task. Keyed by bare name,
+    # the inbound's task claimed the slot and the outbound's schedule silently never ran: the
+    # outbound stayed up outside its window, with no log line saying why.
+    # The halves get OPPOSITE calendars (the outbound's is the maintenance inverse), so a task that
+    # read the other half's schedule, or drove the other half's lifecycle, would show up as both
+    # halves moving together instead of apart.
+    in_schedule = _weekday_window()
+    out_schedule = Schedule(windows=in_schedule.windows, invert=True)
+    clock = _Clock(_utc(2026, 7, 13, 20))  # Mon 20:00 - inbound out of window, outbound in it
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection(
+            "SHARED", MLLP(port=_free_port()), router="r", schedule=in_schedule
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    reg.add_outbound(
+        build_outbound_connection(
+            "SHARED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "filename": "x.hl7"}),
+            schedule=out_schedule,
+        )
+    )
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, schedule_clock=clock.now, schedule_tick=0.02
+    )
+    await runner.start()
+    try:
+        # One task per (direction, name), not one per name.
+        assert set(runner._schedule_workers) == {("inbound", "SHARED"), ("outbound", "SHARED")}
+        tasks = list(runner._schedule_workers.values())
+        await _wait_until(
+            lambda: not runner.inbound_running("SHARED") and runner.outbound_running("SHARED")
+        )
+        clock.set(_utc(2026, 7, 14, 9))  # Tue 09:00 - inbound in window, outbound parked
+        await _wait_until(
+            lambda: runner.inbound_running("SHARED") and not runner.outbound_running("SHARED")
+        )
+        # Tue 20:00 - the outbound's scheduler must RESUME it (start branch, not auto_start at boot)
+        # while the inbound's parks, so each half's start and park branch has run at least once.
+        clock.set(_utc(2026, 7, 14, 20))
+        await _wait_until(
+            lambda: not runner.inbound_running("SHARED") and runner.outbound_running("SHARED")
+        )
+    finally:
+        await runner.stop()
+    # Stop clears the map BEFORE it cancels, so an empty map alone proves nothing about the tasks.
+    assert runner._schedule_workers == {}
+    assert all(t.done() for t in tasks)
 
 
 def test_schedule_field_defaults_none_and_plumbs() -> None:
