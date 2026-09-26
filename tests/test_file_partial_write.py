@@ -325,6 +325,54 @@ async def test_the_settle_memory_forgets_files_that_left(tmp_path: Path) -> None
     assert sorted(Path(k).name for k in src._settle_seen) == ["m3.hl7"]
 
 
+async def test_a_failed_listing_keeps_the_settle_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A listing that fails returns no candidates. Pruning on it would wipe every sighting, and a share
+    whose listing failed every other poll would then never let a file settle.
+
+    Red mutation: prune on an empty candidate list. The sighting is gone and the next poll re-records it
+    instead of admitting the file."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(_WHOLE)
+    src = _local(inbox)
+    handler = _Recorder()
+    src._handler = handler
+    await src._scan_once()
+    real_glob = Path.glob
+
+    def failing_glob(self: Path, pattern: str) -> Any:
+        raise OSError("share unreachable")
+
+    monkeypatch.setattr(Path, "glob", failing_glob)
+    await src._scan_once()  # the listing fails; nothing is read and nothing is forgotten
+    monkeypatch.setattr(Path, "glob", real_glob)
+    assert [Path(k).name for k in src._settle_seen] == ["a.hl7"]
+    await src._scan_once()
+    assert handler.got == [_WHOLE]
+
+
+async def test_a_left_file_already_ingested_never_enters_the_settle_memory(tmp_path: Path) -> None:
+    """Under ``leave`` the dedup check runs before the settle gate, so an ingested file that stays on
+    the share does not cycle through the map on every poll and crowd out new files at the cap.
+
+    Red mutation: move the ``_settled`` check above the leave-mode dedup. The ingested file is recorded
+    again on the next poll and the map is not empty."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(_WHOLE)
+    src = _local(inbox, after_read="leave")
+    handler = _Recorder()
+    src._handler = handler
+    await src._scan_once()
+    await src._scan_once()
+    assert handler.got == [_WHOLE]
+    await src._scan_once()
+    assert src._settle_seen == {}
+    assert handler.got == [_WHOLE]
+
+
 async def test_the_settle_memory_cap_makes_new_files_wait_rather_than_evicting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

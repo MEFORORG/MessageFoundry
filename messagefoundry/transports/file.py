@@ -581,7 +581,13 @@ class FileSource(SourceConnector):
             0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
         )
         candidates = await self._run_fs(self._candidates)
-        self._prune_settle(candidates)
+        if candidates:
+            # Not on an empty listing: _candidates also returns [] when the listing FAILED, and pruning
+            # then would wipe every sighting, so a share whose listing fails every other poll would
+            # never let a file settle. A really empty directory keeps its few stale entries until the
+            # next non-empty listing prunes them. A stale entry can only admit a new file at the same
+            # path whose size and mtime both match it exactly.
+            self._prune_settle(candidates)
         disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, path in enumerate(candidates):
             if self._stop.is_set():
@@ -812,9 +818,11 @@ class FileSource(SourceConnector):
             self._processed_seen.popitem(last=False)
 
     def _settled(self, path: Path, sig: _FileSig) -> bool:
-        """True when ``path`` shows the same ``(size, mtime_ns)`` it showed at the previous poll, which
-        admits it for reading (BACKLOG #1811). Otherwise remember ``sig`` and return False, so the file
-        waits for the next poll.
+        """True when ``path`` shows the same ``(size, mtime_ns)`` it showed at the last poll that looked
+        at it, which admits it for reading (BACKLOG #1811). Otherwise remember ``sig`` and return False,
+        so the file waits for a later poll. "The last poll that looked at it" is usually the previous
+        one; a file past the per-tick ceiling's break keeps an older sighting, which is only ever
+        compared as "unchanged since then" and so is still safe.
 
         **Why this and not #116 alone.** #116 compares a stat before and after the read inside ONE scan,
         so it only sees a write that lands during the read. A partner that writes, pauses, then writes
@@ -828,31 +836,48 @@ class FileSource(SourceConnector):
         ``min_age_seconds`` is not this gate: it defaults to 0, and even when set it compares the mtime
         with the clock rather than with an earlier sighting.
 
-        **What it cannot see.** A writer that pauses for longer than ``poll_seconds``, and a same-length
-        rewrite inside the share's mtime resolution. The partner's write-then-rename, or a wider
-        ``min_age_seconds``, covers those.
+        **What it cannot see.** At least these three:
+
+        - a writer that pauses for longer than ``poll_seconds``. The window is ``poll_seconds`` wide,
+          so a very small ``poll_seconds`` narrows it to almost nothing;
+        - a same-length rewrite inside the share's mtime resolution;
+        - a copier that sets the final size first and holds the mtime fixed while it fills the file
+          in, which leaves both size and mtime unchanged between polls.
+
+        The partner's write-then-rename covers all of them. A ``min_age_seconds`` longer than the
+        partner's pause covers the first.
 
         An admitted file leaves the map. If it is then left in place for a retry, it settles again
-        before the next attempt, which is the safe reading of a file nobody finished with."""
+        before the next attempt, which is the safe reading of a file nobody finished with. It also
+        means each retry waits one extra poll."""
         key = str(path)
         if self._settle_seen.get(key) == sig:
             del self._settle_seen[key]
             return True
-        self._remember_sig(path, sig)
-        logger.debug(
-            "file source %s: %s not yet settled (%d bytes); waiting for the next poll to agree",
-            self.directory,
-            safe_name(path.name),
-            sig[0],
-        )
+        recorded = self._remember_sig(path, sig)
+        if logger.isEnabledFor(
+            logging.DEBUG
+        ):  # safe_name hashes; skip it when nobody reads the line
+            logger.debug(
+                "file source %s: %s not yet settled (%d bytes); %s",
+                self.directory,
+                safe_name(path.name),
+                sig[0],
+                "waiting for the next poll to agree"
+                if recorded
+                else f"settle memory is full ({SETTLE_SEEN_MAX}), so it waits for room",
+            )
         return False
 
-    def _remember_sig(self, path: Path, sig: _FileSig) -> None:
-        """Record ``sig`` as this poll's sighting of ``path``. At ``SETTLE_SEEN_MAX`` a path not already
-        recorded is left out, so it waits for room (see that constant for why this is not eviction)."""
+    def _remember_sig(self, path: Path, sig: _FileSig) -> bool:
+        """Record ``sig`` as this poll's sighting of ``path`` and return True. At ``SETTLE_SEEN_MAX`` a
+        path not already recorded is left out and this returns False, so it waits for room (see that
+        constant for why this is not eviction)."""
         key = str(path)
         if key in self._settle_seen or len(self._settle_seen) < SETTLE_SEEN_MAX:
             self._settle_seen[key] = sig
+            return True
+        return False
 
     def _prune_settle(self, candidates: list[Path]) -> None:
         """Forget files that are no longer listed (moved, deleted, renamed away), so the settle map is
