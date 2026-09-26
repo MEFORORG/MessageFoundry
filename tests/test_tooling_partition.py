@@ -125,7 +125,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # NOT engine source either, so this entry widens the list's stated rule and the claim is
         # spelled out for review, as test_conftest_name_collision_guard.py above does. Its subject is
         # the DEPENDENCY CLOSURE: it holds docs/RISKY-COMPONENTS.md closed over
-        # security/runtime-closure-core.txt and cross-checks that against requirements.lock. The
+        # security/runtime-closure-core.txt and holds that to two exported locks. The
         # gating argument is the one that keeps the repo-wide scanners here. A dependency bump edits
         # pyproject.toml / uv.lock / requirements.lock, which sets `code=true` but NOT `tooling=true`
         # -- that gate names only three tests/ files. Listed as tooling this would be deselected by

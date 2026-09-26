@@ -23,7 +23,7 @@ That is **41 distributions**, recorded in
 | Names in `pyproject.toml`, core only | 19 | Misses everything transitive. Over half of what runs is absent. |
 | Names in `pyproject.toml`, core plus every extra | 42 | Still direct-only, and mixes in extras nobody enabled. |
 | **Core runtime closure** | **41** | **Used here.** What a default install actually executes. |
-| `requirements.lock` | 100 | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
+| `requirements.lock` | 101 | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
 
 An install that enables an extra (`postgres`, `sqlserver`, `sftp`, `dicom`, `fhir`, `xml`, `x12`,
 `webauthn`, `otel`, `vault`, `harness`) carries dependencies **outside** this set. Those are not
@@ -134,6 +134,10 @@ by policy. This page is derived independently and stands on its own.
 that enters the closure without being classified here, or a name here that is not in the closure,
 turns it red. The test is the reason the arithmetic above can be trusted after the next dependency
 bump.
+
+The same test holds the closure file to the lock it copies, in every name and version (BACKLOG
+#1812). A dependency bump that changes the closure turns it red in the same pull request. The closure
+file's header names that lock and the command that regenerates the file.
 
 Adding a dependency therefore means classifying it. Designating it is a judgement call; leaving it
 out of both tables is not available.

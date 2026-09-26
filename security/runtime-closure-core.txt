@@ -1,25 +1,29 @@
 # The CORE runtime closure: every distribution a default engine install carries, transitive
 # dependencies included, with NO optional extras and NO development toolchain.
 #
-# This file is the denominator for docs/RISKY-COMPONENTS.md (BACKLOG #1189, ASVS 15.1.4). It exists
-# because that denominator is not recoverable from any other tracked artifact: requirements.lock is
-# exported with --all-extras and therefore carries the dev toolchain, and pyproject.toml names only
-# the direct dependencies, which is roughly half of what actually runs.
+# This file is the denominator for docs/RISKY-COMPONENTS.md (BACKLOG #1189, ASVS 15.1.4).
+# requirements.lock cannot serve: it is exported with --all-extras and carries the dev toolchain.
+# pyproject.toml names only the direct dependencies, which is roughly half of what actually runs.
 #
-# Regenerate with, from the repository root:
-#     uv export --no-emit-project --format requirements.txt -o <tmp>
-# then take the name==version pairs, lowercase and sort them.
+# Each line below is a copy of a pin line in docker/locks/requirements-core.lock. That file is
+# `uv export --no-emit-project --no-dev` of uv.lock, and the DEP-1 gate in security.yml fails when
+# it differs from a fresh export. Lines are name==version, lowercase and sorted, with markers and
+# hashes dropped. A test holds this copy to that lock in every name and version (BACKLOG #1812).
+# A version edited here by hand changes nothing that installs, and the test refuses it.
 #
-# tests/test_risky_component_designation.py fails when this file and the designation document
-# disagree, so a dependency added here without being classified there is a loud failure.
+# Regenerate after the lock moves, from the repository root:
+#     python tests/test_risky_component_designation.py
+#
+# The same test file fails when this file and the designation document disagree, so a dependency
+# that enters the lock without being classified there is a loud failure.
 aiosqlite==0.22.1
-annotated-doc==0.0.5
+annotated-doc==0.0.4
 annotated-types==0.7.0
-anyio==4.15.1
+anyio==4.14.2
 argon2-cffi==25.1.0
-argon2-cffi-bindings==26.1.0
-certifi==2026.7.22
-cffi==2.1.1
+argon2-cffi-bindings==25.1.0
+certifi==2026.6.17
+cffi==2.0.0
 click==8.5.0
 colorama==0.4.6
 cryptography==50.0.1
@@ -31,25 +35,25 @@ hl7apy==1.3.5
 httpcore==1.0.9
 httptools==0.8.0
 httpx==0.28.1
-idna==3.19
+idna==3.18
 ldap3==2.9.1
 prometheus-client==0.26.0
 psutil==7.2.2
 pyasn1==0.6.4
 pycparser==3.0
 pydantic==2.13.5
-pydantic-core==2.49.0
+pydantic-core==2.46.5
 pyspnego==0.12.2
-python-dotenv==1.2.3
+python-dotenv==1.2.2
 pyyaml==6.0.3
-sspilib==0.6.0
+sspilib==0.5.0
 starlette==1.6.0
 tomlkit==0.15.1
 truststore==0.10.4
-typing-extensions==4.16.0
-typing-inspection==0.4.4
+typing-extensions==4.15.0
+typing-inspection==0.4.2
 tzdata==2026.4
-uvicorn==0.52.4
+uvicorn==0.49.0
 uvloop==0.22.1
 watchfiles==1.2.0
-websockets==17.1
+websockets==16.0

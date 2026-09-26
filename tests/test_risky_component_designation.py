@@ -7,9 +7,8 @@ components. ``docs/RISKY-COMPONENTS.md`` is that highlight, and a highlight is o
 while it is complete over a stated denominator.
 
 The denominator is ``security/runtime-closure-core.txt``: the core runtime closure, no extras, no dev
-toolchain. It is a tracked file because that set is not recoverable from any other tracked artifact
--- ``requirements.lock`` is an ``--all-extras`` export carrying the dev toolchain, and
-``pyproject.toml`` names only the direct dependencies.
+toolchain. It is a copy of the pin lines in a DEP-1 lock; its own header says which one, and how to
+regenerate it. Tests below hold the copy to that lock in name and version (BACKLOG #1812).
 
 **The property under test is CLOSURE, not correctness of judgement.** Whether ``pyyaml`` belongs in
 tier 1 is an argument for a reviewer. Whether it appears in exactly one of the two tables is a fact,
@@ -21,14 +20,18 @@ Each test names the mutation that must turn it RED.
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 import pytest
+from packaging.utils import canonicalize_name
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "RISKY-COMPONENTS.md"
 _CLOSURE = _ROOT / "security" / "runtime-closure-core.txt"
 _LOCK = _ROOT / "requirements.lock"
+#: The lock the closure file copies. The closure file's header says what it is.
+_CORE_LOCK = _ROOT / "docker" / "locks" / "requirements-core.lock"
 
 #: A distribution named in a markdown table cell as `name`. The designation tables put the
 #: distribution in the FIRST cell of each row, so anchoring on the row start keeps prose mentions of
@@ -41,15 +44,91 @@ _ROW_NAME_GROUP = re.compile(
 )
 
 
+def _closure_lines() -> list[str]:
+    """The closure file's pin lines, stripped, in file order. Comments and blanks are skipped."""
+    return [
+        s
+        for s in (raw.strip() for raw in _CLOSURE.read_text(encoding="utf-8").splitlines())
+        if s and not s.startswith("#")
+    ]
+
+
+def _closure_pins() -> dict[str, str]:
+    """Name to version for every pin in the tracked core runtime closure.
+
+    A name listed twice fails here. A dict keeps only the last line, so a stale first line would
+    stay in the file for a reader to find while every comparison passed.
+    """
+    pins: dict[str, str] = {}
+    for line in _closure_lines():
+        if "==" not in line:
+            continue
+        name, _, version = line.partition("==")
+        key = canonicalize_name(name.strip())
+        assert key not in pins, f"{_CLOSURE.name} lists {key} twice"
+        pins[key] = version.strip()
+    return pins
+
+
 def _closure() -> set[str]:
     """Distribution names in the tracked core runtime closure."""
-    names: set[str] = set()
-    for line in _CLOSURE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "==" not in line:
+    return set(_closure_pins())
+
+
+def _lock_versions(path: Path, *, strict: bool = False) -> dict[str, list[str]]:
+    """Name to every version an exported lock pins for it, in file order.
+
+    A pin line reads ``name==version ; marker \\`` and the hash lines under it are indented. A list,
+    because an export writes one line per marker fork. Each caller decides which names must be
+    unambiguous, so a fork in a package it never reads is not its failure.
+
+    With ``strict``, a top-level line that is not an ``==`` pin fails. A URL or ``===`` requirement
+    would otherwise vanish from the parsed set, and so from the denominator, with nothing reporting it.
+    """
+    pins: dict[str, list[str]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith((" ", "#")):
             continue
-        names.add(line.partition("==")[0].strip().lower())
-    return names
+        if "==" not in line or "===" in line:
+            assert not strict, f"{path.name} has a requirement this parser cannot read: {line!r}"
+            continue
+        name, _, rest = line.partition("==")
+        version = re.split(r"[\s;\\]", rest.strip(), maxsplit=1)[0]
+        pins.setdefault(canonicalize_name(name.strip()), []).append(version)
+    return pins
+
+
+def _core_lock_pins() -> dict[str, str]:
+    """Name to version for the core closure, read from the DEP-1 core lock (BACKLOG #1812)."""
+    pins: dict[str, str] = {}
+    for name, versions in _lock_versions(_CORE_LOCK, strict=True).items():
+        assert len(set(versions)) == 1, (
+            f"{_CORE_LOCK.name} pins {name} at {versions}, a per-platform fork. The closure file "
+            "records one version per name, so it cannot say which one a default install takes."
+        )
+        pins[name] = versions[0]
+    return pins
+
+
+def _diff_pins(label: str, recorded: dict[str, str], actual: dict[str, str]) -> list[str]:
+    """One line per package where the closure file and ``actual`` disagree, naming both values."""
+    lines = [
+        f"{n}: in the closure file, absent from {label}" for n in sorted(recorded.keys() - actual)
+    ]
+    lines += [
+        f"{n}: in {label}, absent from the closure file" for n in sorted(actual.keys() - recorded)
+    ]
+    lines += [
+        f"{n}: closure file says {recorded[n]}, {label} says {actual[n]}"
+        for n in sorted(recorded.keys() & actual)
+        if recorded[n] != actual[n]
+    ]
+    return lines
+
+
+def _expected_closure_lines(core: dict[str, str]) -> list[str]:
+    """The closure file's pin lines as the core lock says they must read: sorted ``name==version``."""
+    return [f"{name}=={version}" for name, version in sorted(core.items())]
 
 
 def _designated_and_excluded() -> tuple[set[str], set[str]]:
@@ -68,9 +147,11 @@ def _designated_and_excluded() -> tuple[set[str], set[str]]:
     tail = tail.partition("## What this page is not")[0]
 
     def names(block: str) -> set[str]:
-        out = {m.group(1).lower() for m in _ROW_NAME.finditer(block)}
+        # The same PEP 503 form the closure side uses, so `ruamel.yaml` in a table row matches
+        # `ruamel-yaml` in the lock.
+        out: set[str] = {canonicalize_name(m.group(1)) for m in _ROW_NAME.finditer(block)}
         for m in _ROW_NAME_GROUP.finditer(block):
-            out |= {n.strip(" `").lower() for n in m.group(1).split(",")}
+            out |= {canonicalize_name(n.strip(" `")) for n in m.group(1).split(",")}
         return out
 
     return names(head), names(tail)
@@ -155,35 +236,123 @@ def test_the_counts_printed_on_the_page_are_the_real_ones() -> None:
     assert len(designated) + len(excluded) == len(_closure()), (
         "the two tables do not sum to the closure size"
     )
+    # The scope section's denominator counts. The requirements.lock row drifted from 100 to 101
+    # with nothing reporting it, which is why these are pinned too.
+    closure_size = len(_closure())
+    assert f"That is **{closure_size} distributions**" in text, (
+        f"the scope section does not state the closure size, {closure_size}"
+    )
+    lock_size = len(_lock_versions(_LOCK))
+    assert f"| `requirements.lock` | {lock_size} |" in text, (
+        f"the denominator table's requirements.lock row does not say {lock_size}"
+    )
 
 
-def test_every_closure_member_is_pinned_in_the_lock() -> None:
-    """RED when: the closure file drifts from the hash-locked dependency set.
+def test_the_version_comparison_can_fail() -> None:
+    """RED when: the pin comparison stops seeing a version change.
 
-    A cross-check against the OTHER tracked artifact, so the closure file cannot quietly become
-    fiction. requirements.lock is a superset (it is an --all-extras export), so containment is the
-    only relation that holds -- asserting equality here would be wrong and would fail forever.
+    THE POSITIVE CONTROL FOR THE TWO VERSION GATES BELOW. They pass whenever the comparison
+    returns nothing, so a refactor that compared names only would turn both into guards that
+    cannot fail. That is how this inventory drifted before (BACKLOG #1812).
     """
-    lock_names = {
-        line.partition("==")[0].strip().lower()
-        for line in _LOCK.read_text(encoding="utf-8").splitlines()
-        if line and not line.startswith((" ", "#")) and "==" in line
-    }
-    assert len(lock_names) > len(_closure()), (
+    drift = _diff_pins("the lock", {"anyio": "4.15.1", "hl7": "0.4.5"}, {"anyio": "4.14.2"})
+    assert drift == [
+        "hl7: in the closure file, absent from the lock",
+        "anyio: closure file says 4.15.1, the lock says 4.14.2",
+    ]
+
+
+def test_the_core_lock_parses_to_a_real_closure() -> None:
+    """RED when: the core lock parser stops finding a real closure.
+
+    THE POSITIVE CONTROL FOR THE CORE-LOCK GATE. A parser that finds nothing would make the gate
+    fail for the wrong reason, or pass against a closure file emptied in the same change.
+    """
+    pins = _core_lock_pins()
+    assert len(pins) >= 20, f"{_CORE_LOCK.name} parsed to {len(pins)} pins, too few to be real"
+    # One transitive (cffi, via cryptography) and one reached only through an extra a core
+    # dependency requests (uvloop, via uvicorn[standard]).
+    assert {"hl7", "cryptography", "cffi", "uvloop"} <= pins.keys(), (
+        f"{_CORE_LOCK.name} misses a known transitive or extra-requested core package"
+    )
+
+
+def test_the_closure_file_is_the_core_lock() -> None:
+    """RED when: the closure file stops matching the core lock, in any name, version or line.
+
+    This is the regeneration gate (BACKLOG #1812). The closure file is a copy of the pin lines in
+    the core lock, and a copy with no check drifts silently. The designation tests above only see
+    what someone remembered to add here. A dependency PR once wrote fourteen bumps into this file
+    and not into the lock. The inventory then showed ``anyio`` at a release with no advisories. The
+    lock installed one carrying three.
+
+    The whole line list is compared, so a duplicate, an unsorted line or a stray format also fails.
+    To fix it, run this module as a script, which rewrites the pin lines from the lock.
+    """
+    core = _core_lock_pins()
+    drift = _diff_pins(_CORE_LOCK.name, _closure_pins(), core)
+    expected = _expected_closure_lines(core)
+    assert not drift and _closure_lines() == expected, (
+        f"security/runtime-closure-core.txt does not match {_CORE_LOCK.name}. The lock is what "
+        "installs; never edit it to match this file. Differences:\n  "
+        + ("\n  ".join(drift) or "none by name or version; the lines are unsorted or malformed")
+        + "\nRegenerate with: python tests/test_risky_component_designation.py"
+    )
+
+
+def test_every_closure_pin_is_the_version_requirements_lock_installs() -> None:
+    """RED when: requirements.lock installs a different version of a closure package.
+
+    requirements.lock is the file pip-audit audits and the install guides tell an operator to use.
+    It is a superset (an --all-extras export), so only the closure's own names are compared, and a
+    lock-only name is expected.
+
+    Both locks are exports of uv.lock, so this fails only when one of them is stale. The DEP-1 gate
+    catches that too, but in another workflow; this check holds the closure file to the audited lock
+    on the same test run. The fix is to re-export both locks, then regenerate the closure file.
+    """
+    lock = _lock_versions(_LOCK)
+    closure = _closure_pins()
+    assert len(lock) > len(closure), (
         "requirements.lock parsed to no more names than the core closure; it is an --all-extras "
         "export and must be a strict superset, so the parser has broken"
     )
-    orphans = sorted(_closure() - lock_names)
-    assert not orphans, (
-        f"{len(orphans)} name(s) in the core closure are absent from requirements.lock: {orphans}"
+    forked = sorted(n for n in closure if len(set(lock.get(n, []))) > 1)
+    assert not forked, f"requirements.lock pins these closure packages twice: {forked}"
+    installed = {n: lock[n][0] for n in closure if n in lock}
+    drift = _diff_pins("requirements.lock", closure, installed)
+    assert not drift, (
+        f"{len(drift)} closure pin(s) disagree with requirements.lock. Re-export the locks from "
+        "uv.lock (DEP-1), then regenerate the closure file:\n  " + "\n  ".join(drift)
     )
 
 
-@pytest.mark.parametrize("path", [_DOC, _CLOSURE])
+@pytest.mark.parametrize("path", [_DOC, _CLOSURE, _CORE_LOCK])
 def test_the_tracked_paths_exist(path: Path) -> None:
-    """RED when: either half of the pair is deleted or moved.
+    """RED when: any file the guard grades or grades against is deleted or moved.
 
     The guard is worthless if it silently stops finding what it grades, and a missing-file error
     reads very differently from a passing suite.
     """
     assert path.is_file(), f"{path} is missing; the designation guard cannot run"
+
+
+def _rewrite_closure() -> int:
+    """Replace the closure file's pin lines with the core lock's.
+
+    Keeps the leading comment block and drops everything after it, so a comment placed between
+    pins is lost. The file's contract is header, then pins.
+    """
+    header: list[str] = []
+    for raw in _CLOSURE.read_text(encoding="utf-8").splitlines():
+        if raw.strip() and not raw.lstrip().startswith("#"):
+            break
+        header.append(raw)
+    lines = _expected_closure_lines(_core_lock_pins())
+    _CLOSURE.write_bytes(("\n".join([*header, *lines]) + "\n").encode("utf-8"))
+    print(f"wrote {len(lines)} pins to {_CLOSURE.relative_to(_ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_rewrite_closure())
