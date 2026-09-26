@@ -136,6 +136,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **The shared redactor now scrubs FHIR JSON, DICOM tag dumps and XML, not only HL7.** Its passes
+  were HL7-shaped, so a structured payload handed them single tokens and a family name, an MRN or a
+  DICOM patient id went through a stored error, a log line, the support bundle and `GET /logs/tail`
+  unredacted. Three label-anchored passes now run after the HL7 ones, so they only add redaction.
+  JSON (and Python dict repr) values under `family`, `given`, `name`, `birthDate` and `address` are
+  scrubbed, and so is the `value` of an `identifier` or `telecom`, keeping `system` and `use`. DICOM
+  `(0010,00xx)` tag values and `PatientName=`/`PatientID=` labels are scrubbed, and so are XML
+  elements with the same vocabulary. Keys, tags and element names stay, so a reader sees which field
+  was withheld. A `<name>` placeholder in a usage hint is left alone. JSON escaped inside a JSON
+  string and DICOM identifiers outside `(0010,00xx)` are not covered.
+  ([BACKLOG #1711](docs/BACKLOG.md))
 - **A dual-control release can no longer run without an audit row, or be recorded as failed after
   it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
   that refused writes would have let a replay or a reload complete with no record of the release,
