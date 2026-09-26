@@ -22,8 +22,11 @@ clients, and some of their jobs are only doable against the store directly. In
 Each goes through the ``Store`` protocol via ``open_store``, lazily imported inside the function so
 the import graph of everything else is unchanged, and each is a read/reset path on a store the rig
 itself provisioned — never a shortcut around the API for something the API could answer. Those two
-rigs are the named entries on the client allow-list in ``tests/test_dependency_boundaries.py``
-(BACKLOG #1697); ``AckMode`` now comes from :mod:`messagefoundry.mllpcodec`, not ``config``. The
+rigs are named entries on the client allow-list in ``tests/test_dependency_boundaries.py`` (BACKLOG
+#1697), and the list grants more than this store carve-out: ``shardcert`` also runs the config
+loader and the sharding planner at module top, and ``connscale.runner`` opens the SQL Server and
+Postgres stores by class. The list's entries, not this paragraph, say what each may import.
+``AckMode`` now comes from :mod:`messagefoundry.mllpcodec`, not ``config``. The
 Qt-free client rule itself is unchanged: nothing here imports PySide6, and the monitoring path is
 still the HTTP API.
 """

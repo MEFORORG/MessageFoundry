@@ -14,8 +14,10 @@ ACKs are built from the inbound MSH (echoing its encoding characters, swapping
 sender/receiver, copying the original control id into MSA-2). ``ack_mode`` selects the
 MSA-1 code family: ``original`` → AA/AE/AR, ``enhanced`` → CA/CE/CR.
 
-**Why this module exists (BACKLOG #1697).** A client may import ``parsing/`` and nothing else from
-the engine (CLAUDE.md section 4). The test harness, the load tools and ``samples/send_mllp.py`` all
+**Why this module exists (BACKLOG #1697).** A client may not import the engine's runtime packages
+(CLAUDE.md section 4; the enforced form is the client walk in ``tests/test_dependency_boundaries.py``,
+which forbids ``config``, ``pipeline``, ``store`` and ``transports``). The test harness, the load
+tools and ``samples/send_mllp.py`` all
 need to frame, decode and acknowledge MLLP, and the only home these had was
 :mod:`messagefoundry.transports.mllp`, whose import registers every connector and loads the
 configuration layer. So they live here, and ``transports.mllp`` and ``config.models`` re-export them.

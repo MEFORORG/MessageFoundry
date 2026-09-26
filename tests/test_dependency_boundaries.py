@@ -750,6 +750,40 @@ def test_a_nested_file_entry_wins_over_its_directory_entry() -> None:
         assert _allowance_key("hx.py", allowed) is None
 
 
+#: What the two MLLP leaves may import from this tree. Everything else they import must be stdlib.
+#: The static half of the leaf promise: the engine walk never reads these top-level modules, and the
+#: runtime probe below sees only import time, so without this a `from messagefoundry import X` or an
+#: `import fastapi` added to a leaf would reach every engine package through `config.models`.
+_LEAF_ALLOWED = frozenset(
+    {"messagefoundry.framing", "messagefoundry.timezone", "messagefoundry.parsing.peek"}
+)
+
+
+def _leaf_violations(path: Path) -> list[str]:
+    """Imports in `path` that are neither stdlib nor in `_LEAF_ALLOWED`."""
+    bad = []
+    for module in sorted(_imported_modules(path, path.parent)):
+        if module not in _LEAF_ALLOWED and module.split(".")[0] not in sys.stdlib_module_names:
+            bad.append(module)
+    return bad
+
+
+@pytest.mark.parametrize("leaf", ["mllpcodec.py", "framing.py"])
+def test_the_mllp_leaves_import_only_stdlib_and_their_named_siblings(leaf: str) -> None:
+    assert _leaf_violations(_ENGINE_ROOT / leaf) == []
+
+
+def test_the_leaf_check_fires_on_a_root_import_and_a_third_party_one(tmp_path: Path) -> None:
+    planted = tmp_path / "messagefoundry" / "leaf.py"
+    planted.parent.mkdir()
+    planted.write_text(
+        "import json\nfrom messagefoundry.timezone import hl7_now\n"
+        "from messagefoundry import MLLP\nimport fastapi\n",
+        encoding="utf-8",
+    )
+    assert _leaf_violations(planted) == ["fastapi", "messagefoundry", "messagefoundry.MLLP"]
+
+
 def test_the_mllp_leaf_loads_no_engine_runtime_package() -> None:
     # The leaf's own promise, in a fresh interpreter for the reason the api test below gives: importing
     # `messagefoundry.mllpcodec` (which brings `messagefoundry.framing`) loads none of the four runtime
