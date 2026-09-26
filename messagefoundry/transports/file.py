@@ -129,7 +129,16 @@ def render_filename(template: str, payload: str, *, fallback: str) -> str:
         peek = None
 
     def repl(match: re.Match[str]) -> str:
-        value = peek.field(match.group(1)) if peek else None
+        if peek is None:
+            return fallback
+        try:
+            value = peek.field(match.group(1))
+        except (IndexError, ValueError):
+            # A payload that parses can still fault a field READ: a blank segment makes the peek
+            # raise IndexError by design (python-hl7 parity), and ValueError covers a malformed
+            # escape. Uncaught, that escaped send() as a bare IndexError outside the DeliveryError
+            # contract (BACKLOG #1623). A name that cannot be read takes the fallback.
+            value = None
         return _sanitize(value) if value else fallback
 
     name = _sanitize(_PLACEHOLDER.sub(repl, template))
