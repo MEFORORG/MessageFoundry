@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.exceptions import InternalError, InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
@@ -99,6 +99,17 @@ _CONTENT_CIPHER: pkcs7.ContentEncryptionAlgorithm = algorithms.AES256
 #: The fixed synthetic body :meth:`DirectDestination._probe_build` signs and encrypts at construction.
 #: ASCII, so every codec an operator could configure represents it.
 _PROBE_BODY = "MessageFoundry DIRECT construction probe"
+
+#: What a failed S/MIME build raises, named once so the construction probe and the send-time arm
+#: cannot drift apart. ``UnsupportedAlgorithm`` and ``InternalError`` subclass ``Exception`` rather
+#: than ``ValueError``; the first is the reported FIPS refusal (#1921), and the second is how
+#: ``cryptography`` surfaces an OpenSSL error it does not map. Neither is reproduced here.
+_BUILD_ERRORS: tuple[type[Exception], ...] = (
+    ValueError,
+    TypeError,
+    UnsupportedAlgorithm,
+    InternalError,
+)
 
 
 def _as_recipients(value: Any) -> list[str]:
@@ -528,11 +539,14 @@ class DirectDestination(DestinationConnector):
         and codec. A fault in any of them would repeat on every send, and the send-time arm maps a
         build failure to a permanent per-message dead-letter, so without this a connection-wide fault
         (a FIPS OpenSSL refusing the envelope builder, a library that stopped accepting a key, a
-        line break inside the subject, an unknown codec name) would quietly drain the whole queue into
-        the dead-letter store. The body is synthetic, so the library's own text is safe to show."""
+        line break inside the subject) would quietly drain the whole queue into the dead-letter
+        store. The body is synthetic, so the library's own text is safe to show.
+
+        An unknown ``encoding`` never gets this far on a config path: ``build_check_registry``
+        refuses it first (``resolved_encoding_problems``)."""
         try:
             self._build_smime(_PROBE_BODY)
-        except (ValueError, TypeError, LookupError, UnsupportedAlgorithm) as exc:
+        except _BUILD_ERRORS as exc:
             raise ValueError(
                 "Direct destination could not build an S/MIME message from its settings: "
                 f"{type(exc).__name__}: {exc}"
@@ -643,7 +657,7 @@ class DirectDestination(DestinationConnector):
         failure = ""
         try:
             msg = self._build_smime(payload)
-        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+        except _BUILD_ERRORS as exc:
             failure = type(exc).__name__
         if msg is None:
             # The worker's permanent path dead-letters without a log line, so say it here. Type name

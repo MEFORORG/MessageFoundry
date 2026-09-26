@@ -1836,9 +1836,10 @@ these messages, and the SMTP relay accepts them before anyone tries.
 is built — so `messagefoundry check` / dry-run / start catches it, never the first message: a malformed
 key/cert, a `signing_key` whose public half **does not match** `signing_cert`, a `recipient_cert` whose key
 is **not RSA**, and a `recipient_cert` **not issued by** any supplied `trust_anchor` (PHI is never encrypted
-to a certificate from an untrusted issuer). The connector then signs and encrypts one fixed synthetic body,
-so anything else that would fail every send also fails here: a crypto library or OpenSSL build that refuses
-the algorithms, a line break inside `subject`, or an unknown `encoding` name.
+to a certificate from an untrusted issuer). The connector then signs and encrypts one fixed synthetic body.
+So a fault that would fail every S/MIME build also fails here. That covers at least a crypto library or
+OpenSSL build that refuses the algorithms, and a line break inside `subject`. It does not cover the SMTP hop:
+the relay can still refuse a `sender` or recipient at send time.
 The trust check is deliberately **one level** (the recipient cert chains directly to a supplied anchor, or is
 a self-signed correspondent cert pinned as its own anchor) — full multi-level path building is deferred. No
 hostname/SAN match is done: a Direct address is an email, not a TLS SNI. Errors name the *setting* only,

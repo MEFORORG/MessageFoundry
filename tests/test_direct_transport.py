@@ -36,7 +36,7 @@ from typing import Any
 
 import pytest
 from cryptography import x509
-from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.exceptions import InternalError, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
@@ -449,7 +449,7 @@ async def test_encode_failure_is_permanent(
 
 
 async def test_crypto_build_failure_is_permanent_and_content_free(
-    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], caplog: pytest.LogCaptureFixture
 ) -> None:
     # A real library failure, not a stub: an EC recipient cert reaching the envelope builder raises
     # `TypeError: Only RSA keys are supported at this time` on the pinned cryptography. Construction
@@ -459,7 +459,10 @@ async def test_crypto_build_failure_is_permanent_and_content_free(
     d = DirectDestination(_dest(pki))
     _, ec_cert = _mint_ec_leaf("ec-recipient@hisp.example", pki["ca_key"], pki["ca_cert"])
     d._recipient_cert = ec_cert
-    with pytest.raises(NegativeAckError) as ei:
+    with (
+        caplog.at_level("WARNING", logger="messagefoundry.transports.direct"),
+        pytest.raises(NegativeAckError) as ei,
+    ):
         await d.send(_SYNTHETIC_HL7)
     exc = ei.value
     assert exc.permanent is True
@@ -468,6 +471,11 @@ async def test_crypto_build_failure_is_permanent_and_content_free(
     assert exc.__cause__ is None and exc.__context__ is None  # the #1920 shape holds here too
     assert "SYN123" not in "".join(traceback.format_exception(exc))  # no body content
     assert _FakeSMTP.instances == []
+    # The dead-letter is logged, by type name only: neither the body nor the library's own text.
+    [record] = [r for r in caplog.records if "S/MIME build failed" in r.getMessage()]
+    assert "TypeError" in record.getMessage()
+    assert "SYN123" not in record.getMessage()
+    assert "Only RSA" not in record.getMessage()
 
 
 async def test_unsupported_algorithm_from_the_envelope_build_is_permanent(
@@ -516,16 +524,26 @@ def test_construction_probe_refuses_an_unsupported_algorithm(
 
 
 def test_construction_probe_refuses_a_subject_with_a_line_break(pki: dict[str, Any]) -> None:
-    # email.message refuses a header value with CR or LF INSIDE it, on every build. A single trailing
-    # newline is stripped and accepted, so the break here is embedded (header injection shape).
+    # email.message refuses a header value with CR or LF INSIDE it, on every build. A lone TRAILING
+    # newline is not refused (it is RFC 2047-encoded into the Subject), so the break here is embedded,
+    # which is the header-injection shape.
     with pytest.raises(ValueError, match="could not build an S/MIME message.*ValueError"):
         DirectDestination(_dest(pki, subject="Referral\nBcc: someone@hisp.example"))
 
 
-def test_construction_probe_refuses_an_unknown_encoding(pki: dict[str, Any]) -> None:
-    # An unknown codec name raises LookupError, which no send-time arm catches.
-    with pytest.raises(ValueError, match="could not build an S/MIME message.*LookupError"):
-        DirectDestination(_dest(pki, encoding="not-a-codec"))
+def test_construction_probe_refuses_a_cryptography_internal_error(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    # InternalError is how cryptography surfaces an OpenSSL error it does not map. Like
+    # UnsupportedAlgorithm it subclasses Exception, not ValueError. Simulated, not reproduced.
+    def _openssl_refusal() -> Any:
+        raise InternalError("synthetic unmapped OpenSSL error", [])
+
+    monkeypatch.setattr(
+        "messagefoundry.transports.direct.pkcs7.PKCS7EnvelopeBuilder", _openssl_refusal
+    )
+    with pytest.raises(ValueError, match="could not build an S/MIME message.*InternalError"):
+        DirectDestination(_dest(pki))
 
 
 # --- test_connection probe: connect + EHLO + NOOP only, no MAIL FROM / DATA --------------------------
