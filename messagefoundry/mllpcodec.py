@@ -62,7 +62,7 @@ EB = 0x1C  # end block    (FS)
 CR = 0x0D  # carriage return
 
 #: The default MLLP frame cap (a DoS guard). Overridable per connection via MLLP() settings; see
-#: docs/CONNECTIONS.md. A falsy value (None/0) in settings disables the cap explicitly.
+#: docs/CONNECTIONS.md. None/0 in settings, in any spelling, disables the cap explicitly.
 DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024  # 16 MiB — fits embedded base64 docs, bounds OOM
 
 

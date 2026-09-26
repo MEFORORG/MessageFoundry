@@ -1182,6 +1182,34 @@ async def test_connections_standalone_row_reads_stopped_when_the_graph_is_down(
     assert {r["role"]: r["status"] for r in rows} == {"source": "stopped", "destination": "stopped"}
 
 
+async def test_connections_traffic_edge_row_reads_stopped_when_the_graph_is_down(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """BACKLOG #1814: the TRAFFIC-EDGE row carries the same gate as the standalone row above.
+
+    Once an outbound has carried traffic its row comes from the edge metrics, not the standalone loop,
+    and that branch read ``outbound_status`` ungated. With the graph torn down (the ADR 0157 demote
+    shape) the edge row said "running" beside a "stopped" source row. The positive control first: the
+    same edge row reads "running" while the graph is up, so the "stopped" below is the gate firing and
+    not a row that can only ever say one thing."""
+    await _started_outbound_engine(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
+    [up] = await _await_out1_edges(client, {"in1"})
+    assert up["channel_id"] == "in1"  # the traffic-edge row, not the standalone one
+    assert up["status"] == "running"
+
+    await rr.stop()  # the demote shape: graph down, store + API still serving
+    assert rr.outbound_status("out1") == "running"  # the raw tri-state, ungated — the trap itself
+
+    [down] = await _out1_rows(client)
+    assert down["channel_id"] == "in1"  # still the edge row: the metrics outlive the teardown
+    assert down["status"] == "stopped"
+    rows = (await client.get("/connections")).json()
+    assert {r["role"]: r["status"] for r in rows} == {"source": "stopped", "destination": "stopped"}
+
+
 async def test_connections_standalone_row_reports_measured_zeros_not_nulls(
     engine: Engine, client: httpx.AsyncClient, tmp_path: Path
 ) -> None:

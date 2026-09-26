@@ -469,7 +469,7 @@ class ClusterCoordinator(Protocol):
         The epoch is bumped **only on a fresh acquire** (a node taking the lease — not a renew), so a
         superseded ex-leader holds a strictly *older* epoch than the live leader. The engine reads this
         synchronously on promotion and pushes it into the store (:meth:`Store.set_leader_epoch`), where
-        the FIFO claim validates ``held_epoch >= leader_lease.leader_epoch`` inside the single claim
+        every claim path validates ``held_epoch >= leader_lease.leader_epoch`` inside its own claim
         transaction so a paused/superseded ex-leader **claims 0 rows** (Kleppmann fencing token; store ↔
         coordinator import direction is one-way — the engine pushes, the store never
         imports the coordinator, ARCH-6). Cheap + synchronous (cached state). :class:`NullCoordinator`
@@ -486,10 +486,10 @@ class ClusterCoordinator(Protocol):
         as the first statement of the same claim transaction, the bring-up dead-letter sweeps, and the
         operator paths.
 
-        On **SQL Server**: only the three FIFO claim paths carry the guard. ``claim_ready`` and every
-        terminal resolve are still unfenced there (ADR 0157 Inc 3 closes that), so a demoted SQL Server
-        node stops claiming FIFO lanes but can still drain an UNORDERED lane and still write over a row
-        the live leader has resolved.
+        On **SQL Server** (ADR 0157 Inc 3): the same split. Every claim path, ``claim_ready`` included,
+        carries the fail-closed guard, and every terminal resolve carries the fail-open guard with the
+        same roll-back-then-re-pend fallback. The same writes are deliberately unguarded, less the
+        cross-owner reclaim, which SQL Server's claims do not have.
 
         The residual case that passes on **both** backends: promote → demote → re-promote *in the same
         process*. ``leader_epoch`` bumps only on a fresh acquire, so the re-promoted node's held epoch

@@ -56,6 +56,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: `serve` now refuses to start when the credential reminders have no `[alerts]`
+  recipient.** The unclaimed-temporary-password and cert-expiry reminders go to the `[alerts]`
+  notifier. That notifier needs `webhook_url`, or `email_to` beside `email_smtp_host` and
+  `email_from`. The start gate checked only host and sender, so the smallest admitted configuration
+  sent every reminder to the log alone. With sign-in on, it now refuses under `enforce` and warns
+  under `warn`. The existing `[alerts].security_notifications_required = false` waiver covers it
+  and is audited. (`BACKLOG #2008`)
 - **BREAKING — `length_of_stay` needs a zone for admit and discharge times that carry no offset.**
   It used to subtract the two wall clocks. A stay spanning a daylight-saving change came back an hour
   wrong, with no error: 48 hours for a 47-hour stay across the March change, 48 for a 49-hour stay
@@ -130,6 +137,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   was withheld. A `<name>` placeholder in a usage hint is left alone. JSON escaped inside a JSON
   string and DICOM identifiers outside `(0010,00xx)` are not covered.
   ([BACKLOG #1711](docs/BACKLOG.md))
+- **A dual-control release can no longer run without an audit row, or be recorded as failed after
+  it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
+  that refused writes would have let a replay or a reload complete with no record of the release,
+  and handed the approver a 500. The gate now writes a new `approval.release_attempted` row, naming
+  both identities, before it moves the request. If that write fails, the approve returns 503, the
+  operation does not run, and the request stays pending. After the operation has run, a failed
+  `approval.approved` write is logged at ERROR and the release still succeeds. The replay and
+  reload executors had the mirror defect: their own audit row failing after the action ran made
+  the gate mark the request `failed`. They now log that failure at ERROR instead. (`BACKLOG #1940`)
 - **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
   stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
   stage stopped draining while intake kept acknowledging, and the engine still read healthy. The
@@ -263,6 +279,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a federated link on an account with no directory id no longer signs anyone in.** The
+  link-time refusal further down this section (`BACKLOG #1143` slice C) stops new links on such an
+  account. This closes the ones made before it.
+  A federated sign-in whose `(issuer, sub)` selects an account with no `directory_object_id` is now
+  refused before the directory is asked. The login page shows the generic failure, and the
+  `auth.login_failed` audit row carries `directory_object_id_missing`. The directory recheck no
+  longer asks about such an account by its username either. It skips it and writes one
+  `auth.ad_reconcile_binding_unkeyed` row with the same reason, once per account per process. That
+  is a new audit action, separate from the outage's `auth.ad_reconcile_skipped`, because it is not
+  benign. On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds
+  such an account by its username, as it finds any account with no directory id there.
+  - **Why.** The username is the only key such an account has. A directory can give a freed
+    username to a new person, and the linked account would then take that person's groups (ADR
+    0184 AC-5).
+  - **The cost.** The recheck no longer ends that account's sessions when the directory disables
+    or demotes it; they end at their own expiry. The fix is to remove the link with
+    `DELETE /users/{user_id}/federated-identity`. The account is then an ordinary directory
+    account and the recheck covers it again. The link is never removed automatically.
+
+  Federation still ships off. (`BACKLOG #2027`, ADR 0184)
 - **A connection can now attest its hop secure, and the attestation is reported.** `inbound()`,
   `outbound()`, `FhirLookup()`, `DatabaseLookup()` and `DatabaseRef()` take `tls_hop_attested` with a
   mandatory `tls_hop_attested_reason`. So do `connections.toml` inbound and outbound tables, as
@@ -479,10 +515,12 @@ All notable changes to MessageFoundry are documented here. The format follows
     `objectGUID`, turn Windows SSO on if it is off, delete the account, and have the person sign in
     once with Windows SSO. Nothing else creates a directory account. The new account has a new
     `user_id`, so the old one's uploads, upload quota and saved searches do not follow.
-  - **A link made before this change on such an account is left in place.** This change adds no
-    sign-in refusal for it, and it can still be removed. It cannot be moved to another `sub`. On a
-    directory that now returns `objectGUID`, its sign-in is already refused as
-    `directory_identity_conflict`, as it was before this change.
+  - **A link made before this change on such an account is left in place.** It can still be
+    removed, and it cannot be moved to another `sub`. This change added no sign-in refusal for it;
+    the `BACKLOG #2027` entry at the top of this section does. On a directory that now
+    returns `objectGUID`, its Windows SSO sign-in is refused as `directory_identity_conflict`, as
+    it was before this change. Its federated sign-in is now refused as
+    `directory_object_id_missing`, which that entry checks first.
 
   Federation still ships off. (`BACKLOG #1143`, slice C, ADR 0184)
 - **BREAKING: an administrator's save no longer moves the notification address as a side effect.**

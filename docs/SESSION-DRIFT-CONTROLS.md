@@ -114,6 +114,10 @@ Frequently forgotten in discussions of "the gate", but it is the same problem cl
   *subject* declares `BACKLOG #N` with a code-touching diff must hold a claim on N **for this worktree**.
   Motivated by a recorded incident: three sessions independently fixed one npm advisory; two PRs were
   closed as duplicates and the one that merged had not tested the failure mode the others found.
+  The same gate refuses, on every commit, a subject `#N` that no `BACKLOG #` token governs, unless it
+  is labelled `PR #N` or is the trailing `(#N)` of a squash merge (BACKLOG #1347). Write items as
+  `(BACKLOG #a, #b)`, the prefix once: a bare `(#1318, #1320)` read as unbuilt to every citation
+  check and escaped the claim rule.
 - **One registry can serve two repositories, and before BACKLOG #1346 it could not.** Set
   `git config mefor.claimsRoot <path>` in the repository that does *not* host the registry — the
   separate `MessageFoundry-vault` clone is the case it was built for. Both halves then resolve from the

@@ -133,7 +133,7 @@ only. The correctness pivots are closed and **must not be re-decided here**:
   leader_lease_ttl_seconds` (defaults 10s/20s/30s; `ClusterSettings._fence_ordering`) **guarantees a
   partitioned old leader stops processing before a standby can acquire** — the split-brain guard.
 
-  > ⚠️ **CORRECTION (2026-08-01).** That ordering guarantees the old leader stops **reporting itself
+  > **CORRECTION (2026-08-01).** That ordering guarantees the old leader stops **reporting itself
   > leader**, not that it stops **processing**. `_check_fence` sets an in-memory flag and cancels
   > nothing; graph teardown (sequential inbound stops, each with its own shutdown grace) is not budgeted
   > against the remaining margin, and the margin itself is smaller than `ttl − fence` because the fence
@@ -333,7 +333,7 @@ is wrong by ~2×. The new ordering rule of this ADR is therefore:
 shrink the timings for faster failover **shrink this budget too** and must keep it larger than the
 worst-case local release latency (below).
 
-> ⚠️ **CORRECTION (2026-08-01).** "Always positive" is true of the *nominal* `ttl − fence_timeout` and
+> **CORRECTION (2026-08-01).** "Always positive" is true of the *nominal* `ttl − fence_timeout` and
 > not of the budget actually available. Two terms are unaccounted: the renew round trip (the fence
 > baseline is taken after the renew returns, the expiry is stamped on the DB clock at statement
 > execution) and up to one `_fence_tick` of detection lag. On the shipped `10/20/30` the remainder is
