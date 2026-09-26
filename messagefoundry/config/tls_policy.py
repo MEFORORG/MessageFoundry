@@ -1412,7 +1412,7 @@ def cleartext_acceptance_audit_sink(
 
 def _audit_connection(connection: str | None) -> str:
     """Render a declaring connection's name for an audit record, or ``(unnamed)`` for a hop that is not
-    a connection (or an empty name, which the loader does not refuse).
+    a connection (or an empty name).
 
     It goes at the FRONT of the record: the detail after it runs to several hundred characters, and a
     relay or SIEM that truncates a long line would otherwise cut the name first.
@@ -1424,8 +1424,10 @@ def _audit_connection(connection: str | None) -> str:
     ``LABEL: value`` as a credential pair when the label ends in a credential word, and it allows a
     quote between the two. So ``connection 'IB_LAB_PASS': MLLP inbound`` ships as
     ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``.
-    Residual: a name that itself contains a space, ``:`` or ``=`` can still be scrubbed, because
-    connection names are not validated for characters at load."""
+    Inbound and outbound names cannot reach that shape: registration refuses any name outside
+    ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space, ``:`` or
+    ``=``. Residual: a ``FhirLookup`` name is not held to that rule, so a lookup name that contains
+    one of those characters can still be scrubbed from its SMART token hop's record."""
     return repr(connection) if connection else "(unnamed)"
 
 

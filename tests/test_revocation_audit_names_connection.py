@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
     HopPosture,
@@ -31,10 +32,20 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
     cleartext_acceptance_audit_sink,
 )
-from messagefoundry.config.wiring import FHIR, ConnectionSpec, DICOMweb, Rest, Soap, load_config
+from messagefoundry.config.wiring import (
+    FHIR,
+    ConnectionSpec,
+    DICOMweb,
+    Registry,
+    Rest,
+    Soap,
+    WiringError,
+    load_config,
+)
 from messagefoundry.pipeline.wiring_runner import (
     _dest_config,
     _source_config,
+    build_check_registry,
     check_inbound_revocation,
 )
 from messagefoundry.redaction import redact
@@ -313,6 +324,61 @@ outbound(
     assert declared["tls_revocation_attested_connection"] == "OB_DECLARED"
     assert declared["tls_revocation_attested_reason"] == "declared"
     assert "cleartext_connection" not in declared  # its raw key went; nothing declared it
+
+
+_SPOOF: dict[str, object] = {
+    "tls_revocation_attested": True,
+    "tls_revocation_attested_reason": "spoofed",
+    "tls_revocation_attested_connection": "OB_OTHER",
+}
+
+
+def _lookup_registry(tmp_path: Path, smart_key: str, *, declared: bool) -> Registry:
+    # One FhirLookup, declared or not, whose settings then gain SMART auth and the three raw keys --
+    # the same dict a code-first `spec.settings.update(...)` in a config module would write.
+    attest = f', tls_revocation_attested=True, tls_revocation_attested_reason="{_REASON}"'
+    (tmp_path / "lookup.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        f'FhirLookup("epic", url="https://ehr.example.org/fhir"{attest if declared else ""})\n',
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    reg.fhir_lookups["epic"].settings.update({**_smart(smart_key), **_SPOOF})
+    return reg
+
+
+def _build_check(reg: Registry) -> None:
+    # The real call site: build_check_registry constructs the FhirLookupExecutor, whose __init__ hands
+    # the resolved settings to token_provider_from_settings for the SMART token hop.
+    build_check_registry(
+        reg,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(),
+        posture=_ENFORCING,
+    )
+
+
+def test_raw_lookup_keys_cannot_attest_the_real_executors_smart_hop(
+    tmp_path: Path, smart_key: str
+) -> None:
+    # Undeclared lookup plus raw keys: the SMART token hop is refused, as an undeclared one is.
+    reg = _lookup_registry(tmp_path, smart_key, declared=False)
+    with pytest.raises(WiringError, match="revocation"):
+        _build_check(reg)
+
+
+def test_raw_lookup_keys_cannot_rename_or_reword_a_declared_lookups_audit_line(
+    tmp_path: Path, smart_key: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Declared lookup plus raw keys: the hop crosses on the DECLARATION, so the line names the lookup
+    # and its declared reason, never the connection or reason the raw keys chose.
+    reg = _lookup_registry(tmp_path, smart_key, declared=True)
+    with caplog.at_level(logging.WARNING):
+        _build_check(reg)
+    audit = _audit(caplog)
+    assert "connection 'epic';" in audit and _REASON in audit
+    assert "OB_OTHER" not in audit and "spoofed" not in audit
 
 
 def test_an_empty_name_renders_unnamed(caplog: pytest.LogCaptureFixture) -> None:

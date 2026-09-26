@@ -722,10 +722,17 @@ class FhirLookupSpec:
     :class:`EnvRef` values (put secrets like ``bearer_token`` / ``smart_private_key`` in :func:`env`).
 
     Mutable ``settings`` dict so :func:`~messagefoundry.transports.smart.with_smart_backend` can compose
-    SMART auth onto it (the dataclass stays frozen — only the dict is mutated)."""
+    SMART auth onto it (the dataclass stays frozen — only the dict is mutated).
+
+    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) are the declaration
+    :func:`FhirLookup` validated, held OUTSIDE the mutable ``settings`` so a raw settings key cannot
+    forge one. The runner strips the raw keys and re-mirrors these fields before the read executor
+    sees the settings, as ``_dest_config`` does for an outbound."""
 
     name: str
     settings: dict[str, Any]
+    tls_revocation_attested: bool = False
+    tls_revocation_attested_reason: str | None = None
 
 
 def FhirLookup(
@@ -822,11 +829,18 @@ def FhirLookup(
         settings["cleartext_reason"] = cleartext_reason
         settings["cleartext_connection"] = name
     if tls_revocation_attested:
-        # The same keys _dest_config mirrors for an outbound, read by token_provider_from_settings.
+        # A copy for the readers of spec.settings (the settings view, reload impact, the loosening
+        # reader). The executor never trusts it: the runner strips these keys and re-mirrors the typed
+        # fields below, so a raw write here after load neither attests nor renames the SMART hop.
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
         settings["tls_revocation_attested_connection"] = name
-    spec = FhirLookupSpec(name, settings)
+    spec = FhirLookupSpec(
+        name,
+        settings,
+        tls_revocation_attested=tls_revocation_attested,
+        tls_revocation_attested_reason=tls_revocation_attested_reason,
+    )
     _active_registry().add_fhir_lookup(spec)
     return spec
 
