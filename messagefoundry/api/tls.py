@@ -461,7 +461,7 @@ def _unlock(fd: int) -> None:
 def _generated_pair_lock(state_dir: Path) -> Iterator[None]:
     """Hold the ONE-WRITER lock for the generated pair in ``state_dir``, waiting a bounded time.
 
-    **Why the pair needs one.** ``serve --shards`` starts N engine processes that all derive the
+    **Why the pair needs one.** ``supervise`` starts N engine processes that all derive the
     same state dir, so on a first run they all find no pair at once. Unserialised, one process won
     the key's ``O_EXCL`` create and every other died with ``FileExistsError``; worse, a process
     arriving between another's key and cert writes read a lone key as debris, deleted it, and minted
@@ -575,7 +575,7 @@ def ensure_api_tls_material(
     fails in between leaves the WARNING line as the only record, because the next start finds a
     fresh pair and has nothing to report.
 
-    **ONE WRITER (BACKLOG #1276).** Every ``serve --shards`` shard shares this state dir, so any
+    **ONE WRITER (BACKLOG #1276).** Every ``supervise`` shard shares this state dir, so any
     discard, mint and renewal runs under :func:`_generated_pair_lock`, after the reuse check is
     repeated there. A process that loses the race waits, then reuses the winner's pair; it neither
     crashes, nor deletes a key another process is still writing, nor renews a second time. A fresh

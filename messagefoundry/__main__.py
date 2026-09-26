@@ -3860,10 +3860,18 @@ def _serve(args: argparse.Namespace) -> int:
 def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> None:
     """Renew the shared generated API pair, if due, before any engine shard starts (#1276).
 
-    Every shard serves this one pair from the state dir beside ``db_base``, and a shard never
-    renews it (``serve --shard`` passes ``renew=False``), so this is the fleet's only renewal: all
-    shards then start together on the same certificate. A re-mint is audited like serve's, by
-    opening the store once for the row; the store is the one the shards are about to open.
+    Every shard serves this one pair from the state dir beside its store, and a shard never renews
+    it (``serve --shard`` passes ``renew=False``), so this is the fleet's only renewal: all shards
+    then start together on the same certificate.
+
+    **The state dir is derived the way each shard derives it.** A shard anchors a relative
+    ``[store].path`` under the merged ``[environments].base_dir`` (``--project-root``, which the
+    supervisor forwards, or the settings file). ``db_base`` is anchored only by ``--project-root``
+    here, so a base_dir set in the file is applied too, or the two would name different pairs.
+
+    A re-mint is audited like serve's, in the store the shards are about to open, over the same
+    derived store-hop posture serve's lifespan opens it with. A failure to open propagates, as it
+    would in serve: the WARNING the renewal logged, with both fingerprints, is then its record.
     """
     import asyncio
 
@@ -3873,29 +3881,39 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> N
         generated_state_dir,
         record_generated_pair_replacements,
     )
+    from messagefoundry.config.anchor import resolve_project_root
+    from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.store import open_store
+
+    store_path = Path(db_base)
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=Path.cwd())
+    if root is not None and not store_path.is_absolute():
+        store_path = root / store_path
 
     replaced: list[GeneratedPairReplaced] = []
     ensure_api_tls_material(
-        settings.api, state_dir=generated_state_dir(db_base), replacements=replaced
+        settings.api, state_dir=generated_state_dir(str(store_path)), replacements=replaced
     )
     if not replaced:
         return
+    posture = (
+        hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+        if settings.ai is not None
+        else None
+    )
 
     async def _audit() -> None:
-        store = await open_store(settings.store.model_copy(update={"path": db_base}), create=True)
+        store = await open_store(
+            settings.store.model_copy(update={"path": str(store_path)}),
+            create=True,
+            posture=posture,
+        )
         try:
             await record_generated_pair_replacements(store, replaced)
         finally:
             await store.close()
 
-    try:
-        asyncio.run(_audit())
-    except Exception:  # the store would not open; the replacement must still not be silent
-        logging.getLogger(__name__).exception(
-            "could not open the store to audit the API TLS pair replacement; the record is: %s",
-            "; ".join(event.audit_detail() for event in replaced),
-        )
+    asyncio.run(_audit())
 
 
 def _supervise(args: argparse.Namespace) -> int:

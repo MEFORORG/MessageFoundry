@@ -3583,6 +3583,48 @@ def test_supervise_renews_once_before_it_spawns_any_shard(
     assert len(asyncio.run(rows())) == 1
 
 
+def test_supervise_renews_the_pair_the_shards_will_serve_under_a_file_set_base_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shard anchors a relative store path under ``[environments].base_dir`` from the settings
+    file, even with no ``--project-root``. The supervisor must renew THAT pair, not one beside its
+    own working directory, or the shards would serve a pair that never renews.
+
+    Mutation: derive the state dir from ``db_base`` alone. Red: the pair under base_dir is untouched
+    and a new pair appears in the working directory."""
+    import argparse
+
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.crypto import generate_key
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    base = tmp_path / "base"
+    elsewhere = tmp_path / "cwd"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    cert, _ = _plant_generated_pair(base, lived_days=300, left_days=65)
+    old = cert.read_bytes()
+    service = tmp_path / "messagefoundry.toml"
+    service.write_text(f'[environments]\nbase_dir = "{base.as_posix()}"\n', encoding="utf-8")
+
+    async def fake_supervise(config: str, **kwargs: Any) -> int:
+        return 0
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
+    args = argparse.Namespace(
+        config=str(SAMPLES_CONFIG),
+        db="mefor.db",  # relative, so the shards anchor it under base_dir
+        base_port=8765,
+        env="dev",
+        service_config=str(service),
+        project_root=None,
+    )
+    assert cli._supervise(args) == 0
+    assert cert.read_bytes() != old
+    assert not (elsewhere / _GENERATED_CERT_NAME).exists()
+    assert (base / "mefor.db").exists()  # the audit row went to the store the shards will open
+
+
 def test_a_shard_with_a_due_pair_reuses_it_and_reports_nothing(tmp_path: Path) -> None:
     """The unit form of the shard rule: ``renew=False`` reuses a due pair that loads. The control
     is the same pair with ``renew`` left on, which renews."""

@@ -174,7 +174,8 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
    together** (Manager decision 2026-09-26, within the owner ruling above). A plain `serve` renews
    at its own start. A sharded fleet renews in `supervise`, under the same one-writer lock, before
    it spawns any shard, and passes the shards nothing new; the renewal is audited by opening the
-   store once for the row. An engine shard (`serve --shard`, which is how the supervisor starts
+   store once for the row, with the store-hop posture serve would use. The supervisor finds the
+   pair where the shards will, anchoring the store path under `[environments].base_dir` as they do. An engine shard (`serve --shard`, which is how the supervisor starts
    every shard, a lone restart after a crash included) never renews: it reuses a pair that loads,
    due or not. The expiry monitor, which watches the served certificate, stays the alarm for an
    engine or fleet that is never restarted.
@@ -200,7 +201,7 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
    opening, for example on an unreachable database, leaves the WARNING line as the only record,
    because the next start finds a fresh pair and has nothing to report. A first-run mint replaces
    nothing and writes no row.
-7. **One pair for all engine shards is now DECIDED, not accidental.** `serve --shards` gives every
+7. **One pair for all engine shards is now DECIDED, not accidental.** `supervise` gives every
    shard the same state directory, which is why they already shared one pair; BACKLOG #1276 called
    that accidentally correct. It is correct because the minted identity is `[api].host` and the
    shards differ only by port. Item 4 is what keeps it one pair in memory as well as on disk: a
