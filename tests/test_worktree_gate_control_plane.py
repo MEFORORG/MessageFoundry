@@ -1658,7 +1658,7 @@ def test_the_tokens_rule_3_excludes_really_cannot_move_a_governed_tree(
 #: The one line that turns on rule 3's verb split (BACKLOG #1869). Rewriting it to ``if ($false) {``
 #: rebuilds the gate as it stood before the split, byte for byte everywhere else, so a control can
 #: measure that a deny STARTED firing rather than assert it (the BACKLOG #1229 discipline).
-VERB_SPLIT_GUARD = "if (-not $headRoot -and (Test-VerbMovesHead $segVerb $seg.Raw)) {"
+VERB_SPLIT_GUARD = "if (-not $headRoot) {"
 
 
 @pytest.fixture
@@ -1779,6 +1779,54 @@ def test_every_HEAD_moving_verb_denies_through_a_repository_token(
     assert "would move that checkout's HEAD" in reason, command
 
 
+#: Spellings the first cut of the split let through, each measured ALLOW by review before the repair.
+#: Every one really moves the governed HEAD (the trailing `--` was checked against real git).
+REPOSITORY_TOKEN_SPELLINGS_THAT_MOVE_HEAD = [
+    # A tree-only verb earlier on the line used to be the only verb the split judged.
+    'git stash list && git --git-dir="{gitdir}" checkout sidebranch',
+    "git clean -n; git --git-dir={gitdir} checkout sidebranch",
+    'git checkout -- seed.txt && git --git-dir="{gitdir}" checkout sidebranch',
+    # A TRAILING `--` has no pathspec after it, so git switches branches.
+    'git --git-dir "{gitdir}" checkout sidebranch --',
+    # Single-quoted repository tokens.
+    "git --git-dir='{gitdir}' checkout sidebranch",
+    "GIT_DIR='{gitdir}' git checkout sidebranch",
+    # A `--` inside a quoted message on an EARLIER command, or inside a comment, is not an argument.
+    'git commit -m "fix checkout -- x" && git --git-dir="{gitdir}" checkout sidebranch',
+    'git --git-dir "{gitdir}" checkout sidebranch # -- note',
+    # A quoted commit survives blanking as a positional.
+    'git --git-dir "{gitdir}" reset --hard "sidebranch"',
+]
+
+
+@pytest.mark.parametrize("template", REPOSITORY_TOKEN_SPELLINGS_THAT_MOVE_HEAD)
+def test_the_split_reads_every_verb_and_every_quote_spelling(
+    repo: SimpleNamespace, tmp_path: Path, template: str
+) -> None:
+    """The review round's fail-opens, one row each, so a later narrowing reopens a named row."""
+    command = template.format(gitdir=f"{repo.primary}/.git")
+    ungoverned = tmp_path / "Ungoverned-spellings"
+    ungoverned.mkdir()
+    reason = assert_denied(run_gate(shell(command, cwd=ungoverned), repo.repos))
+    assert "would move that checkout's HEAD" in reason, command
+
+
+def test_a_trailing_double_dash_really_switches_branches(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """Why `checkout <branch> --` is on the deny side: git reads it as a branch switch, not a restore."""
+    _side_branch(repo)
+    ungoverned = tmp_path / "Ungoverned-dashdash"
+    ungoverned.mkdir()
+    subprocess.run(
+        ["git", "--git-dir", f"{repo.primary}/.git", "checkout", "-q", "sidebranch", "--"],
+        cwd=str(ungoverned),
+        check=True,
+        capture_output=True,
+    )
+    assert _primary_head(repo)[0] == "refs/heads/sidebranch"
+
+
 def test_a_reset_that_names_a_commit_really_moves_the_governed_HEAD(
     repo: SimpleNamespace, tmp_path: Path
 ) -> None:
@@ -1816,6 +1864,9 @@ REPOSITORY_TOKEN_STILL_ALLOWED = [
     'git --git-dir "{gitdir}" checkout sidebranch -- seed.txt',
     'git --git-dir "{gitdir}" stash list',
     'git --git-dir "{gitdir}" restore seed.txt',
+    # A redirection is not a commit argument.
+    'git --git-dir "{gitdir}" reset --hard 2>&1',
+    'git --git-dir "{gitdir}" reset --hard > out.txt',
     # The token belongs to an EARLIER command; the checkout acts on the ungoverned cwd.
     'git --git-dir "{gitdir}" log -1 && git checkout sidebranch',
     # The token is inside a quoted message, which is data and not a repository selection.
@@ -1852,11 +1903,15 @@ def test_a_repository_token_from_a_LINKED_worktree_cwd_denies_a_HEAD_move(
 ) -> None:
     """The cwd the tree rows use for their linked-worktree arm. ``clean`` from here is allowed (pinned
     above by test_GIT_DIR_does_not_reach_rules_3_and_3d); ``checkout`` through the same token moves the
-    PRIMARY's HEAD, which the linked worktree the session stands in does not protect."""
+    PRIMARY's HEAD, which the linked worktree the session stands in does not protect.
+
+    The branch is one checked out NOWHERE, so git would really perform the switch; a branch live in
+    another worktree would be refused by git itself and the row would pin no consequence."""
+    _side_branch(repo)
     gitdir = f"{repo.primary}/.git"
     assert run_gate(shell(f'GIT_DIR="{gitdir}" git clean -fd', cwd=repo.other), repo.repos) is None
     reason = assert_denied(
-        run_gate(shell(f'GIT_DIR="{gitdir}" git checkout wt-branch', cwd=repo.other), repo.repos)
+        run_gate(shell(f'GIT_DIR="{gitdir}" git checkout sidebranch', cwd=repo.other), repo.repos)
     )
     assert "would move that checkout's HEAD" in reason
 
