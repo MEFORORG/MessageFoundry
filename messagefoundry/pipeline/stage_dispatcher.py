@@ -31,8 +31,9 @@ in :attr:`StageDispatcher.claimer_faults`, which the runner reports as a degrade
 
 **Concurrency discipline.** All dispatcher state is mutated **only on the event loop, never under a
 lock** (mirroring the runner's ``_lane_events`` / ``EmptyClaimCounters``): every transition is
-synchronous except a claimer's single ``await claim_fifo_heads`` and a serializer's ``await
-process_item`` / ``await release_claimed``. A state read must never be separated from its mutation by an
+synchronous except a claimer's single ``await claim_fifo_heads`` (plus, only on a supervisor respawn,
+its opening backoff sleep and ``await release_claimed`` in ``_adopt_abandoned``) and a serializer's
+``await process_item`` / ``await release_claimed``. A state read must never be separated from its mutation by an
 ``await`` — the conservation law (``slots_free + processing_lanes + reserved == max_processing_lanes``)
 and the ``busy_violations`` counter assert this holds.
 """
@@ -69,9 +70,10 @@ _LANE_ERROR_BACKOFF_SECONDS = 1.0
 # pauses ~this long (chunk-scoped; raise K to shrink the blast radius). ADR 0066 §11 item 1.
 _CLAIM_ERROR_BACKOFF_SECONDS = 1.0
 # BACKLOG #1609: claimer/sweep respawn pacing. The FIRST respawn is immediate, matching the per_lane
-# worker supervisors (wiring_runner._on_worker_done). A replacement that dies again within
-# _RESPAWN_STABLE_SECONDS of its spawn waits base * 2**(streak - 1), capped, so a fault that kills every
-# replacement at once backs off instead of spinning. Surviving the stable window resets the streak.
+# worker supervisors (wiring_runner._on_worker_done). A replacement that dies again before it has run
+# cleanly (iterated, then kept running) for _RESPAWN_STABLE_SECONDS waits base * 2**(streak - 1),
+# capped, so a fault that kills every replacement at once backs off instead of spinning. The window is
+# measured from the first healthy iteration, never from the spawn, so a capped wait cannot pass it.
 _RESPAWN_BACKOFF_BASE_SECONDS = 0.5
 _RESPAWN_BACKOFF_CAP_SECONDS = 30.0
 _RESPAWN_STABLE_SECONDS = 30.0
@@ -624,8 +626,10 @@ class StageDispatcher:
             watched.update(live)
             if not live:
                 self._reap(watched)
-                # A dead claimer's rows that its replacement had not yet released are INFLIGHT too.
-                return await self._release_pending_orphans()
+                # A dead claimer's rows that its replacement had not yet released are INFLIGHT too, so
+                # the contract is not met. They are NOT released here: this path runs because the
+                # lease may be lost, and an unfenced release could re-pend a row a successor holds.
+                return not any(claimer.orphan_ids for claimer in self._claimers)
             remaining = deadline - loop.time()
             if remaining <= 0:
                 self._reap(watched)
@@ -672,9 +676,8 @@ class StageDispatcher:
         for handle in self._timers.values():
             handle.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        # A dead claimer's rows that its replacement had not yet released would otherwise wait for
-        # the next start's reset_stale_inflight. Best effort, BEFORE the lists are cleared below.
-        await self._release_pending_orphans()
+        # Rows a dead claimer left claimed and its replacement had not yet released stay INFLIGHT
+        # for reset_stale_inflight, exactly like a cancelled serializer's (the rule above).
         # POST-gather clear — safe now that every task is done (mirrors _teardown_unsafe:1187-1204).
         self._states.clear()
         self._timers.clear()
@@ -690,27 +693,6 @@ class StageDispatcher:
         # A start()-after-stop() begins with a clean supervision record: every task is new.
         self._supervised.clear()
         self._running = False
-
-    async def _release_pending_orphans(self) -> bool:
-        """One best-effort ``release_claimed`` of every claimer's not-yet-released orphan rows (the
-        stop / quiesce path, where no replacement will run to do it). True iff none remain."""
-        ids = [row_id for claimer in self._claimers for row_id in claimer.orphan_ids]
-        if not ids:
-            return True
-        try:
-            await self._store.release_claimed(ids)
-        except Exception:  # noqa: BLE001 — teardown must not raise; reset_stale_inflight is the backstop
-            log.warning(
-                "StageDispatcher %s could not release %d row(s) a dead claimer left claimed; "
-                "they stay in flight until the next start recovers them",
-                self._stage.value,
-                len(ids),
-                exc_info=True,
-            )
-            return False
-        for claimer in self._claimers:
-            claimer.orphan_ids.clear()
-        return True
 
     def _on_task_done(self, index: int | None, task: asyncio.Task[None]) -> None:
         """Claimer/sweep supervision (BACKLOG #1609). These tasks should finish only on shutdown:
@@ -734,9 +716,8 @@ class StageDispatcher:
             return  # already replaced
         name = self._task_name(index)
         sup = self._supervised.setdefault(name, _Supervised(is_claimer=index is not None))
-        if (
-            sup.healthy_since is not None
-            and self._clock() - sup.healthy_since >= _RESPAWN_STABLE_SECONDS
+        if sup.healthy_since is not None and (
+            time.monotonic() - sup.healthy_since >= _RESPAWN_STABLE_SECONDS
         ):
             sup.streak = 0  # it had run cleanly for the stable window: this is a fresh fault
         delay = (
@@ -750,9 +731,23 @@ class StageDispatcher:
         sup.healthy_since = None
         self._respawns += 1
         # The exception TYPE only: this string reaches /status, and a message could carry anything.
-        sup.fault = f"{name} exited unexpectedly ({type(exc).__name__}); respawn " + (
-            f"backing off {delay:.2f}s" if delay else "immediate"
+        # No backoff figure: the text outlives the wait it would describe.
+        sup.fault = (
+            f"{name} exited unexpectedly ({type(exc).__name__}); {sup.streak} consecutive death(s)"
         )
+        if index is not None:
+            # A death OUTSIDE the dispatch loop (the claim-error handler, _assemble_chunk) records no
+            # abandonment of its own. Only this claimer's task moves its lanes into CLAIMING, and it
+            # is dead, so every such lane is abandoned by definition. Neither path holds claimed rows.
+            claimer = self._claimers[index]
+            held = set(claimer.abandoned)
+            for lane, st in self._states.items():
+                if (
+                    st.phase is _LanePhase.CLAIMING
+                    and lane not in held
+                    and self._owning_claimer(lane) is claimer
+                ):
+                    claimer.abandoned.append(lane)
         log.error(
             "StageDispatcher %s task %r exited unexpectedly; respawning (consecutive death %d, "
             "delay %.2fs)",
@@ -795,7 +790,8 @@ class StageDispatcher:
         stranded head, a per-lane FIFO break, while the head waited for a restart.
         ``release_claimed`` undoes the claim's ``attempts`` increment and keeps each row's ``seq``, so
         the rows come back as the lane's head in their original order. It is retried until it
-        succeeds or the dispatcher stops; a stop leaves the rows to :meth:`_release_pending_orphans`.
+        succeeds or the dispatcher stops; a stop leaves the rows INFLIGHT for
+        ``reset_stale_inflight``, as it does a cancelled serializer's.
 
         Each abandoned lane then leaves CLAIMING exactly as an empty claim does: slot released, and
         PAUSED if an operator pause landed meanwhile, else READY."""
@@ -842,23 +838,23 @@ class StageDispatcher:
         claimer.abandoned.clear()
 
     def _mark_task_healthy(self, name: str) -> None:
-        """The task named ``name`` is iterating. A task that never died has no record, so this is one
-        failed dict get on the hot path.
-
-        After a single death the fault clears at the replacement's first iteration. After repeated
-        deaths it clears only once the task has run cleanly for ``_RESPAWN_STABLE_SECONDS``.
-        Otherwise a fault that kills the claimer on some round-trips and not others would read
-        healthy on most polls. The streak itself is reset only at the next death, and only if the
-        stable window had passed by then (:meth:`_on_task_done`), so a clear does not re-arm an
-        immediate respawn."""
+        """The task named ``name`` is iterating: stamp when its current incarnation was first seen
+        doing so. A task that never died has no record, so this is one failed dict get on the hot
+        path. Whether the fault still counts is decided at READ time (:meth:`_fault_active`), so an
+        idle claimer that never iterates again still ages out of it."""
         sup = self._supervised.get(name)
-        if sup is None or sup.fault is None:
-            return
-        now = self._clock()
-        if sup.healthy_since is None:
-            sup.healthy_since = now
-        if sup.streak <= 1 or now - sup.healthy_since >= _RESPAWN_STABLE_SECONDS:
-            sup.fault = None
+        if sup is not None and sup.healthy_since is None:
+            sup.healthy_since = time.monotonic()
+
+    @staticmethod
+    def _fault_active(sup: _Supervised) -> bool:
+        """After a single death the fault clears at the replacement's first healthy iteration. After
+        repeated deaths it clears only once that replacement has run for ``_RESPAWN_STABLE_SECONDS``,
+        so a fault that kills the claimer on some round-trips and not others does not read healthy on
+        most polls. Monotonic time: a wall-clock step must not move either window."""
+        if sup.fault is None or sup.healthy_since is None:
+            return sup.fault is not None
+        return sup.streak > 1 and time.monotonic() - sup.healthy_since < _RESPAWN_STABLE_SECONDS
 
     # --- claimer loop (T8-T12) ----------------------------------------------
 
@@ -1634,7 +1630,7 @@ class StageDispatcher:
         return {
             name: sup.fault
             for name, sup in self._supervised.items()
-            if sup.is_claimer and sup.fault is not None
+            if sup.is_claimer and sup.fault is not None and self._fault_active(sup)
         }
 
     @property

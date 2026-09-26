@@ -498,11 +498,12 @@ async def test_pooled_claimer_death_shows_on_status_while_the_respawn_is_backing
         assert fired["n"] == 2 and dispatcher.respawns == 2
         # The runner still reads running -- which is exactly why the degraded surface must exist.
         assert runner.running
-        # The waiting replacement never got to release M1609C's claimed row. A stop in that window
-        # releases it itself, rather than leaving it in flight until the next start.
-        assert await _inflight_rows(store) >= 1
+        # The waiting replacement has not yet released M1609C's claimed row. A stop in that window
+        # deliberately leaves it INFLIGHT for reset_stale_inflight, like a cancelled serializer's:
+        # stop runs on demotion too, where an unfenced release could re-pend a successor's row.
+        assert await _inflight_rows(store) == 1
         await runner.stop()
-        assert await _inflight_rows(store) == 0
+        assert await _inflight_rows(store) == 1
     finally:
         await runner.stop()
         await store.close()
@@ -646,9 +647,73 @@ async def test_a_claimer_that_keeps_dying_backs_off_and_never_resets_to_an_immed
         assert respawn_delays[0] == 0.0  # the first respawn is immediate, like per_lane
         assert respawn_delays[1:6] == [0.01, 0.02, 0.04, 0.04, 0.04], respawn_delays
         assert d.claimer_faults, "a claimer that keeps dying must keep reading degraded"
+        # Every replacement released its predecessor's row before claiming it again: never more
+        # than the one claim of the current (dying) round-trip is in flight.
+        assert store.inflight <= {"L-1"}
+        releases = [ids for kind, ids in store.events if kind == "release"]
+        assert len(releases) >= 6 and all(ids == ["L-1"] for ids in releases)
     finally:
         await d.stop()
-    assert store.inflight == set()  # stop released whatever the last replacement had not
+
+
+async def test_after_repeated_deaths_an_idle_claimer_ages_out_of_the_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two quick deaths keep the fault reported past the replacement's first iteration. A claimer
+    that then drains and IDLES never iterates again, and must still stop reading degraded once the
+    stable window has passed -- a quiet feed overnight must not hold the heart at down."""
+    from messagefoundry.pipeline import stage_dispatcher
+
+    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_BACKOFF_BASE_SECONDS", 0.01)
+    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_STABLE_SECONDS", 0.3)
+    store = _LaneStore(["L"])
+    processed: list[str] = []
+    d = _dispatcher(store, ["L"], processed)
+    fired = _kill_next_claims(d, monkeypatch, times=2)
+    await d.start()
+    try:
+        await _until(lambda: processed == ["L-1"] and fired["n"] == 2, timeout=5.0)
+        assert d.claimer_faults  # repeated deaths: still reported right after recovery
+        await asyncio.sleep(0.45)  # idle, with no further iteration, past the stable window
+        assert d.claimer_faults == {}
+    finally:
+        await d.stop()
+
+
+async def test_a_claimer_that_dies_outside_the_dispatch_loop_still_frees_its_reserved_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A death in the claim-ERROR handler records no abandonment of its own. The lanes it reserved
+    are CLAIMING, which nothing but their claimer can move, so the respawn must free them."""
+    store = _LaneStore(["L"])
+    processed: list[str] = []
+    d = _dispatcher(store, ["L"], processed)
+    real_claim = store.claim_fifo_heads
+    calls = {"n": 0}
+
+    async def failing_claim(*a: Any, **k: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("store fault")
+        return await real_claim(*a, **k)
+
+    monkeypatch.setattr(store, "claim_fifo_heads", failing_claim)
+    real_release = d._release_slot
+    released = {"n": 0}
+
+    def die_in_the_error_handler() -> None:
+        released["n"] += 1
+        if released["n"] == 1:
+            raise RuntimeError("injected death inside the claim-error handler")
+        real_release()
+
+    monkeypatch.setattr(d, "_release_slot", die_in_the_error_handler)
+    await d.start()
+    try:
+        await _until(lambda: processed == ["L-1"], timeout=5.0)
+        assert d.respawns == 1
+    finally:
+        await d.stop()
 
 
 async def test_status_names_a_pooled_stage_whose_claimer_is_down(

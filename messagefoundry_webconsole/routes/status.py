@@ -116,7 +116,7 @@ def _derive_health(
       ``unwritable`` state for it that nothing in this function reads yet.
     - server DB connection pool saturated (``idle == 0``) → **warn**.
     - running on the DR failover box (``dr.active``) → **warn**; a clustered engine with no leader → **down**.
-    - a pooled pipeline stage whose claimer or sweep died and has not recovered → **down**, naming
+    - a pooled pipeline stage whose claimer died and has not recovered → **down**, naming
       the stage (BACKLOG #1609).
     - any deployed inbound that failed to start → **warn**, naming it (BACKLOG #1741).
     - zero deployed inbounds on a STARTED engine → **warn** (BACKLOG #1741).
