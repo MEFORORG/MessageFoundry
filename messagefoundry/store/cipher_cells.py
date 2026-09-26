@@ -30,9 +30,12 @@ __all__ = ["COMPOSITE_CIPHER_CELLS", "SQLITE_CIPHER_CELLS", "CipherCell"]
 class CipherCell:
     """One cipher-covered cell: its table, its column, and the columns its AAD binds, in bind order.
 
-    ``locator`` is the column a failure message may name to point an operator at the row. It is
-    ``rowid`` unless the cell's key is a synthetic id: a composite key can itself be PHI (a ``state``
-    or ``reference`` key is whatever the transform chose), so it is never printed."""
+    ``locator`` is the column a failure message may name to point an operator at the row: a synthetic
+    id where the table has one. Otherwise it is the snapshot's own ``rowid``, which a VACUUM may have
+    renumbered, so it locates the row in the snapshot and not necessarily in the live store. A key
+    column is never the locator when it can itself be PHI: a ``state`` or ``reference`` key is
+    whatever the transform chose, and ``shared_body.hash`` and ``attachment_chunk.attachment_id``
+    are digests of the plaintext."""
 
     table: str
     column: str
@@ -49,18 +52,19 @@ _RESPONSE_KEY = ("message_id", "destination_name", "response_seq")
 #: Every cipher-covered cell in ``store.py`` that ``_CIPHER_COLUMNS`` does not carry. The AAD columns
 #: are copied from each cell's writer, and the round-trip test proves they match it.
 COMPOSITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
-    CipherCell("response", "body", _RESPONSE_KEY),
-    CipherCell("response", "detail", _RESPONSE_KEY),
-    CipherCell("response", "resp_headers", _RESPONSE_KEY),
+    CipherCell("response", "body", _RESPONSE_KEY, locator="message_id"),
+    CipherCell("response", "detail", _RESPONSE_KEY, locator="message_id"),
+    CipherCell("response", "resp_headers", _RESPONSE_KEY, locator="message_id"),
     CipherCell("state", "value", ("namespace", "key")),
     CipherCell("reference", "value", ("name", "version", "key")),
     CipherCell("shared_body", "body", ("hash",)),
     CipherCell("attachment_chunk", "ciphertext", ("attachment_id", "seq")),
     # These three have an AUTOINCREMENT id the encrypting INSERT cannot know, so their AAD binds the
-    # natural columns the writer has in hand instead.
-    CipherCell("message_events", "detail", ("message_id", "ts", "event")),
-    CipherCell("connection_event", "reason", ("connection", "ts", "kind")),
-    CipherCell("alert_instance", "reason", ("event_type", "connection")),
+    # natural columns the writer has in hand instead. alert_instance binds only its de-dup grain, which
+    # its resolved and open rows can share, so a reason moved between those rows still opens.
+    CipherCell("message_events", "detail", ("message_id", "ts", "event"), locator="id"),
+    CipherCell("connection_event", "reason", ("connection", "ts", "kind"), locator="id"),
+    CipherCell("alert_instance", "reason", ("event_type", "connection"), locator="id"),
 )
 
 #: Every cipher-covered cell of the SQLite store: the id-keyed ones from the store's own tuple, then

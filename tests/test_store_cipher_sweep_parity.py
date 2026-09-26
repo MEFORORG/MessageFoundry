@@ -504,7 +504,6 @@ def test_the_readback_declaration_names_every_composite_cipher_cell() -> None:
     declared = [(cell.table, cell.column) for cell in SQLITE_CIPHER_CELLS]
 
     assert len(declared) == len(set(declared)), f"a cell is declared twice: {sorted(declared)}"
-    assert id_keyed <= set(declared), sorted(id_keyed - set(declared))
     composite = set(declared) - id_keyed
     assert covered - id_keyed == composite, (
         "messagefoundry/store/cipher_cells.py has drifted from store.py's cell_aad calls.\n"

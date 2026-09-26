@@ -148,19 +148,19 @@ def _sealed_count(conn: sqlite3.Connection, cell: CipherCell, prefix: str = MARK
     return int(row[0])
 
 
-def _flip_one_aead_byte(db: Path, cell: CipherCell) -> int:
-    """Flip one bit inside the GCM tag of one sealed value in ``cell``; return that row's ``rowid``.
+def _flip_one_aead_byte(db: Path, cell: CipherCell) -> str:
+    """Flip one bit inside the GCM tag of one sealed value in ``cell``; return that row's locator.
 
     Written through a separate connection, so it also works under a store that is still open."""
     conn = sqlite3.connect(db)
     try:
         row = conn.execute(
-            f"SELECT rowid, {cell.column} FROM {cell.table} WHERE {cell.column} LIKE ?"
-            " ORDER BY rowid LIMIT 1",  # declared constants
+            f"SELECT rowid, {cell.locator}, {cell.column} FROM {cell.table}"
+            f" WHERE {cell.column} LIKE ? ORDER BY rowid LIMIT 1",  # declared constants
             (f"{MARKER_PREFIX}%",),
         ).fetchone()
         assert row is not None, f"no sealed value in {cell.table}.{cell.column} to corrupt"
-        rowid, stored = row
+        rowid, locator, stored = row
         head, _, payload = str(stored).rpartition(":")
         blob = bytearray(base64.b64decode(payload))
         blob[-1] ^= 0x01  # the last byte is inside the GCM tag
@@ -171,7 +171,7 @@ def _flip_one_aead_byte(db: Path, cell: CipherCell) -> int:
         conn.commit()
     finally:
         conn.close()
-    return int(rowid)
+    return str(locator)
 
 
 async def _backup(store: MessageStore, settings: StoreSettings, dest: Path) -> str:
@@ -247,7 +247,7 @@ async def test_a_flipped_byte_in_each_composite_cell_fails_the_full_verify(
     assert res.status == "FAIL", res.reason
     reason = res.reason or ""
     if cell.table not in ("state", "reference"):
-        assert f"{cell.table}.{cell.column} rowid=" in reason, reason
+        assert f"{cell.table}.{cell.column} {cell.locator}=" in reason, reason
     assert _SYNTH not in reason, f"the FAIL reason leaked a plaintext or a key: {reason}"
 
 
@@ -262,10 +262,12 @@ def test_the_decrypt_pass_itself_names_each_corrupted_cell(
     is the first test above.
     """
     db, settings = _copy(_template, tmp_path)
-    rowid = _flip_one_aead_byte(db, cell)
+    locator = _flip_one_aead_byte(db, cell)
     status, message, _ = dr_backup._decrypt_check(db, settings)
     assert status == "FAIL", message
-    assert f"{cell.table}.{cell.column} rowid={rowid} did not decrypt" in message, message
+    assert f"{cell.table}.{cell.column} {cell.locator}={locator} did not decrypt" in message, (
+        message
+    )
     assert _SYNTH not in message, f"the FAIL reason leaked a plaintext or a key: {message}"
 
 
@@ -273,19 +275,36 @@ def test_an_id_keyed_failure_still_names_the_row_id(
     tmp_path: Path, _template: tuple[Path, StoreSettings]
 ) -> None:
     """An id-keyed cell keeps naming its synthetic ``id``, which an operator can look up, rather than
-    an internal ``rowid``. Only a composite key is withheld."""
+    the snapshot's ``rowid``. Only a key that can itself be PHI is withheld."""
     db, settings = _copy(_template, tmp_path)
     raw = next(c for c in SQLITE_CIPHER_CELLS if (c.table, c.column) == ("messages", "raw"))
-    rowid = _flip_one_aead_byte(db, raw)
-    conn = sqlite3.connect(db)
-    try:
-        (mid,) = conn.execute("SELECT id FROM messages WHERE rowid = ?", (rowid,)).fetchone()
-    finally:
-        conn.close()
+    assert raw.locator == "id"
+    mid = _flip_one_aead_byte(db, raw)
 
     status, message, _ = dr_backup._decrypt_check(db, settings)
     assert status == "FAIL", message
     assert f"messages.raw id={mid} did not decrypt" in message, message
+
+
+async def test_a_reply_that_looks_sealed_is_not_a_key_mismatch(tmp_path: Path) -> None:
+    """A partner reply can begin with the at-rest marker. Sealed and opened under the right key it is
+    a good cell, so the verify must PASS; reading the decrypted PLAINTEXT's prefix as "no key" would
+    send the operator to fix a key configuration that is fine."""
+    db = tmp_path / "msg.db"
+    settings = StoreSettings(path=str(db), encryption_key=generate_key())
+    store = await _open(db, settings)
+    try:
+        await store.enqueue_message(channel_id="IB_SYNTH", raw=_RAW, deliveries=[("OB_A", "X")])
+        item = (await store.claim_ready())[0]
+        await store.complete_with_response(
+            item.id, body=f"{MARKER_PREFIX}SYNTH-looks-sealed", outcome="accepted"
+        )
+    finally:
+        await store.close()
+
+    status, message, cells = dr_backup._decrypt_check(db, settings)
+    assert status == "PASS", message
+    assert cells >= 1
 
 
 async def test_a_value_moved_between_rows_fails_its_tag(

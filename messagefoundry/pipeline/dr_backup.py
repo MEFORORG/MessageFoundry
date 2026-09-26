@@ -1301,17 +1301,18 @@ def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[str, str, int]:
     same cell-bound AAD the store writes (ASVS 11.3.3), so a ciphertext moved between cells fails its tag
     here exactly as it would at a live read.
 
-    The cell list is :data:`~messagefoundry.store.cipher_cells.SQLITE_CIPHER_CELLS`: the store's own
-    id-keyed ``MessageStore._CIPHER_COLUMNS`` plus the cells whose AAD binds a composite or natural
-    key (``response``, ``state``, ``reference``, ``shared_body``, ``attachment_chunk``,
-    ``message_events``, ``connection_event``, ``alert_instance``). It is declared beside the store
-    rather than here, and a parity test pins it to the ``cell_aad`` calls in ``store.py``, so a cell
-    added to the cipher's coverage cannot be missed by this pass (BACKLOG #1719). A failure names the
-    table, the column and each cell's ``locator`` (its id, or the SQLite ``rowid``): never a composite
-    key column, which for ``state`` or ``reference`` can itself be PHI."""
+    The cell list is :data:`~messagefoundry.store.cipher_cells.SQLITE_CIPHER_CELLS`, the id-keyed and
+    the composite-key cells alike (BACKLOG #1719). It is declared beside the store rather than here,
+    and a parity test pins it to at least every literal ``cell_aad`` call in ``store.py``. A failure
+    names the table, the column and the cell's ``locator``, never a key column that can itself be PHI.
+    """
     import sqlite3
 
     cipher = build_store_cipher(settings)
+    # Keylessness is a fact about the CIPHER, never about a plaintext: a decrypted value may itself
+    # begin with the marker (a partner reply, a transformed body), and reading that as "no key" would
+    # send the operator to fix a key configuration that is fine.
+    keyless = not cipher.encrypts
     cells = 0
     conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
     try:
@@ -1330,26 +1331,26 @@ def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[str, str, int]:
                 (f"{MARKER_PREFIX}%",),
             )
             for locator, *key, stored in rows:
-                try:
-                    plain = cipher.decrypt(str(stored), aad=spec.aad(*key))
-                except CipherError as exc:
-                    # FAIL, not KEY_MISMATCH: CipherError cannot separate a corrupted ciphertext from a
-                    # key that was never supplied, and the keyring here is not empty (the keyless case
-                    # is the branch below). Reporting the softer verdict on a bit-flipped PHI cell is
-                    # the reading that must not be talked down.
-                    return (
-                        "FAIL",
-                        f"{table}.{column} {spec.locator}={locator} did not decrypt: {safe_exc(exc)}",
-                        cells,
-                    )
-                if cipher.is_encrypted(plain):
-                    # The identity cipher hands an mfenc: value straight back (the #241 F2 keyless-open
-                    # trap): the snapshot holds sealed cells and this open resolved no key for them.
-                    # Nothing could have opened them, so the keyring is unambiguously the cause.
+                if keyless:
+                    # The #241 F2 keyless-open trap: the snapshot holds sealed cells and these settings
+                    # resolved no key for them. Nothing could have opened them, so the keyring is
+                    # unambiguously the cause.
                     return (
                         "KEY_MISMATCH",
                         f"{table}.{column} is encrypted at rest but the store settings resolved no key "
                         "to open it (keyless open of an encrypted snapshot)",
+                        cells,
+                    )
+                try:
+                    cipher.decrypt(str(stored), aad=spec.aad(*key))
+                except CipherError as exc:
+                    # FAIL, not KEY_MISMATCH: CipherError cannot separate a corrupted ciphertext from a
+                    # key that was never supplied, and the keyring here is not empty (the keyless case
+                    # is the branch above). Reporting the softer verdict on a bit-flipped PHI cell is
+                    # the reading that must not be talked down.
+                    return (
+                        "FAIL",
+                        f"{table}.{column} {spec.locator}={locator} did not decrypt: {safe_exc(exc)}",
                         cells,
                     )
                 cells += 1
