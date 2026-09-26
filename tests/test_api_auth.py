@@ -493,17 +493,23 @@ async def test_admin_user_crud_and_audit(engine: Engine) -> None:
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "root")).json()["token"])
         created = await c.post(
-            "/users", headers=h, json={"username": "newbie", "password": PW, "roles": ["viewer"]}
+            "/users",
+            headers=h,
+            json={"username": "newbie", "password": PW, "roles": ["viewer"], "email": "n@x.org"},
         )
         assert created.status_code == 201 and created.json()["roles"] == ["viewer"]
         uid = created.json()["id"]
         # weak password + unknown role are rejected
         assert (
-            await c.post("/users", headers=h, json={"username": "w", "password": "short"})
+            await c.post(
+                "/users", headers=h, json={"username": "w", "password": "short", "email": "w@x.org"}
+            )
         ).status_code == 400
         assert (
             await c.post(
-                "/users", headers=h, json={"username": "x", "password": PW, "roles": ["wizard"]}
+                "/users",
+                headers=h,
+                json={"username": "x", "password": PW, "roles": ["wizard"], "email": "x@x.org"},
             )
         ).status_code == 400
         # role change, listing, self-delete guard, delete
@@ -539,7 +545,9 @@ async def test_a_create_that_loses_the_username_race_is_a_409_not_a_500(
         h = _auth((await _login(c, "root")).json()["token"])
         monkeypatch.setattr(engine.store, "create_user", racing)
         r = await c.post(
-            "/users", headers=h, json={"username": "contested", "password": PW, "roles": []}
+            "/users",
+            headers=h,
+            json={"username": "contested", "password": PW, "roles": [], "email": "c@x.org"},
         )
         assert r.status_code == 409, r.text
         assert r.json()["detail"] == "username already exists"
@@ -1447,7 +1455,9 @@ async def test_admin_created_account_forces_first_login_rotation(engine: Engine)
     async with _client(engine, service) as c:
         admin = _auth((await _login(c, "root")).json()["token"])
         created = await c.post(
-            "/users", headers=admin, json={"username": "carol", "password": PW, "roles": ["viewer"]}
+            "/users",
+            headers=admin,
+            json={"username": "carol", "password": PW, "roles": ["viewer"], "email": "c@x.org"},
         )
         assert created.status_code == 201
         first = await _login(c, "carol")
@@ -2067,7 +2077,7 @@ async def test_the_create_user_response_states_the_initial_password_deadline(
         created = await c.post(
             "/users",
             headers=admin,
-            json={"username": "gail", "password": PW, "roles": ["viewer"]},
+            json={"username": "gail", "password": PW, "roles": ["viewer"], "email": "g@x.org"},
         )
         assert created.status_code == 201, created.text
         gail_id = created.json()["id"]

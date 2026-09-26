@@ -178,7 +178,13 @@ def user_new_page(
         ),
         el("p", hint, class_="muted"),
         el("label", "Display name", el("input", name="display_name", value=display_name)),
-        el("label", "Email", el("input", name="email", value=email)),
+        # BACKLOG #2018 (ASVS 6.3.7): required. It becomes the account's notification address, so
+        # the holder is told about a change made before their first sign-in.
+        el(
+            "label",
+            "Notification email",
+            el("input", name="email", value=email, required=True),
+        ),
         el("fieldset", el("legend", "Roles"), *_role_checkboxes(roles, checked)),
         el("button", "Create user", type="submit"),
         method="post",

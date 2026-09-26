@@ -159,7 +159,12 @@ class UserCreateRequest(RequestModel):
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
-    email: str | None = Field(default=None, max_length=_NAME_MAX)
+    #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,
+    #: where every security notice goes. An account born without one is told nothing about a change
+    #: made to it before its holder's first sign-in, an administrator's password reset included. The
+    #: service refuses a blank value or anything but one plain mailbox, with the check the PATCH
+    #: route applies to ``notify_email``.
+    email: str = Field(max_length=_NAME_MAX)
     roles: list[RoleId] = Field(default=[], max_length=64)
 
 

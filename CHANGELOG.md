@@ -56,6 +56,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: an administrator must give a notification address to create an account.**
+  `POST /users` now requires `email`, and the web console's create-user form requires it too. The
+  address becomes the account's notification address, so its holder is told about changes made
+  before their first sign-in, an administrator's password reset included. A blank value, or anything
+  but one plain mailbox, is refused with 400, the same check `PATCH /users/{id}` applies to
+  `notify_email`. A body with no `email` is refused with 422. `EngineClient.create_user` takes `email`
+  as a required keyword. An existing account with no address can be given one through
+  `PATCH /users/{id}` with `notify_email`, which notifies the new address. (`BACKLOG #2018`)
 - **BREAKING — the `Http()` inbound listener answers 400 to a request with no `Host` or with two.**
   RFC 9112 section 3.2 requires a server to refuse both shapes. In the shipped code an HTTP/1.1
   request with no `Host` was accepted, and a second `Host` silently replaced the first. The listener

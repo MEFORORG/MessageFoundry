@@ -3543,6 +3543,7 @@ async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:
                 "username": "hostile",
                 "password": PW,
                 "display_name": "<script>alert(9)</script>",
+                "email": "hostile@x.org",
             },
             headers={"Sec-Fetch-Site": "same-origin"},
         )
@@ -3551,6 +3552,32 @@ async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:
             body = (await c.get(url)).text
             assert "<script>alert(9)</script>" not in body
             assert "&lt;script&gt;alert(9)&lt;/script&gt;" in body
+
+
+async def test_the_create_form_requires_a_notification_address(engine: Engine) -> None:
+    """BACKLOG #2018 (ASVS 6.3.7): the console refuses a create with no address, as the API does,
+    and re-renders the form with the service's reason. The control is the same form with one."""
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        form = await c.get("/ui/users/new")
+        assert 'name="email"' in form.text and "required" in form.text
+        for email in ("", "a@b.org, c@d.org"):
+            r = await c.post(
+                "/ui/users",
+                data={"username": "nomail", "password": PW, "email": email},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+            assert r.status_code == 400, email
+            assert "notification address" in r.text or "one email address" in r.text
+            assert await service.store.get_user_by_username("nomail") is None
+        r = await c.post(
+            "/ui/users",
+            data={"username": "nomail", "password": PW, "email": "nomail@x.org"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user_by_username("nomail")
+        assert user is not None and user.notify_email == "nomail@x.org"
 
 
 # --- L4a review-driven regressions (adversarial review PR2: 1 high, 1 medium, test gaps) -----------
@@ -7061,7 +7088,9 @@ async def test_the_page_after_create_states_the_initial_password_deadline(engine
     # (a) The create POST lands on the user's page, which states the instant off the stored stamp.
     service = await _expiring_service(engine)
     async with _boss_client(engine, service) as c:
-        r = await _post_pairs(c, "/ui/users", [("username", "hana"), ("password", PW)])
+        r = await _post_pairs(
+            c, "/ui/users", [("username", "hana"), ("password", PW), ("email", "hana@x.org")]
+        )
         assert r.status_code == 303
         hana = await _uid(service, "hana")
         page = await c.get(r.headers["location"])

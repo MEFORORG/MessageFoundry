@@ -1100,7 +1100,7 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 | `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
 | `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, or `PUT /ad-group-map` newly maps a group to it | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator |
 | `client` on the `user.created` audit row | An account created through `POST /users` | The creating administrator's address, like the approval rows |
-| `account_created` notice | An account created through `POST /users` with a notification address | The new account's own notification address |
+| `account_created` notice | An account created through `POST /users`, which requires a notification address (BACKLOG #2018) | The new account's own notification address |
 
 **These signals miss at least five routes.** Each ends in one person holding two approver accounts
 with no page.
@@ -2080,6 +2080,10 @@ Users are notified of security-relevant changes to their account through **two**
   page says where it came from, and nothing is written until the holder submits it. The
   `auth.notify_email_set` row puts the change in the holder's own feed, and a `notify_email_set`
   notice goes to the new address. A site with no mail relay notifies nobody, so it is not confined.
+  An administrator's create cannot give birth to such an account: `POST /users` and the console
+  form require an address and refuse anything but one plain mailbox (BACKLOG #2018). An
+  administrator reaches an existing account with none, before its next sign-in, by setting one with
+  `PATCH /users/{id}` `notify_email`.
 - **`GET /me/security-events`** — a pull-based feed of the caller's own audited `auth.*` events
   (sign-ins, lockouts, password changes), most-recent-first, for accounts without a deliverable mailbox.
   Both 6.3.5 signals are in it, as `auth.account_locked` and `auth.login_after_failures`, whichever leg

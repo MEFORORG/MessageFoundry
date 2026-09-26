@@ -31,7 +31,12 @@ from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
-NEW_USER = {"username": "newbie", "password": PW, "roles": ["viewer"]}
+NEW_USER = {
+    "username": "newbie",
+    "password": PW,
+    "roles": ["viewer"],
+    "email": "newbie@example.org",
+}
 
 
 class _FakeNotifier:
@@ -309,7 +314,7 @@ async def test_admin_route_from_new_ip_forces_step_up_then_clears(engine: Engine
         # From the SAME address the fresh login may act (network-location + step-up freshness hold).
         assert (await a.post("/users", headers=_auth(token), json=NEW_USER)).status_code == 201
     # Same token, a DIFFERENT client address → forced step-up.
-    n2 = {"username": "n2", "password": PW, "roles": ["viewer"]}
+    n2 = {"username": "n2", "password": PW, "roles": ["viewer"], "email": "n2@example.org"}
     async with _client_at(engine, service, "10.9.9.9") as b:
         blocked = await b.post("/users", headers=_auth(token), json=n2)
         assert blocked.status_code == 403

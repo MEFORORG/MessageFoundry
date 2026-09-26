@@ -86,7 +86,9 @@ async def _reauth_update(c: httpx.AsyncClient, h: dict[str, str]) -> dict[str, s
 
 async def _create_user(c: httpx.AsyncClient, h: dict[str, str], username: str, role: str) -> str:
     r = await c.post(
-        "/users", headers=h, json={"username": username, "password": PW, "roles": [role]}
+        "/users",
+        headers=h,
+        json={"username": username, "password": PW, "roles": [role], "email": f"{username}@x.org"},
     )
     assert r.status_code == 201, r.text
     return str(r.json()["id"])

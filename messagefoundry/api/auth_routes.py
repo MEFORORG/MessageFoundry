@@ -860,6 +860,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         except UsernameTaken as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except InvalidNotifyEmail as exc:
+            # BACKLOG #2018: raised before any write, as on PATCH /users/{id}. The message names the
+            # rule and never echoes the value.
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         # Only after the create succeeded: a lost username race (409 above) granted nobody anything.
         if Role.ADMINISTRATOR.value in body.roles:
             _alert_administrator_granted(

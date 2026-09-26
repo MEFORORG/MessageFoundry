@@ -5022,8 +5022,20 @@ class AuthService:
         attributed to a host like the approval rows are. The new account's notification address is
         told it was created (``ACCOUNT_CREATED``).
 
+        **``email`` IS CHECKED BEFORE ANYTHING IS WRITTEN (BACKLOG #2018, ASVS 6.3.7).** It seeds
+        ``notify_email``, so it must pass the check an administrator's explicit ``notify_email``
+        change passes (:func:`_require_single_mailbox`). A blank or malformed value raises
+        :class:`InvalidNotifyEmail`. ``None`` is still accepted here, for internal callers: both admin
+        surfaces require an address before they reach this method (``UserCreateRequest.email``).
+
         Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
         own check (BACKLOG #1808)."""
+        if email is not None:
+            if not email.strip():
+                raise InvalidNotifyEmail(
+                    "a new account needs a notification address, such as name@example.org"
+                )
+            email = _require_single_mailbox(email)
         user_id = uuid4().hex
         # Hashed before the insert so the handler below covers the store call alone.
         password_hash = await self._argon2(hash_password, password)
@@ -5055,7 +5067,8 @@ class AuthService:
             client=client,
         )
         # The address create_user seeded. None means nobody to tell yet: the holder is asked for one
-        # at first sign-in (the NOTIFY_EMAIL_SET path) rather than told about this afterwards.
+        # at first sign-in (the NOTIFY_EMAIL_SET path) rather than told about this afterwards. Only an
+        # internal caller reaches that arm now; both admin surfaces require an address (#2018).
         notify = seed_notify_email(email)
         if notify:
             await self._notify_security(

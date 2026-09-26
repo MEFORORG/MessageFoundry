@@ -29,8 +29,8 @@ from messagefoundry.api.security import NOTIFY_EMAIL_REQUIRED_DETAIL, authorize_
 from messagefoundry.auth import Permission, Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import NOTIFY_EMAIL_SET, SecurityEvent
-from messagefoundry.auth.service import AuthService, NotifyEmailAlreadySet
+from messagefoundry.auth.notifications import ACCOUNT_CREATED, NOTIFY_EMAIL_SET, SecurityEvent
+from messagefoundry.auth.service import AuthService, InvalidNotifyEmail, NotifyEmailAlreadySet
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
@@ -383,6 +383,88 @@ async def test_the_api_does_not_confine_without_a_notice_channel(engine: Engine)
     async with _client(engine, service) as c:
         tok = (await _login(c, "bare"))["token"]
         assert (await c.get("/users", headers=_auth(tok))).status_code == 200
+
+
+# --- an administrator's create requires an address (BACKLOG #2018) ------------------------------
+
+
+async def _addressed_admin(engine: Engine, notifier: _FakeNotifier) -> AuthService:
+    """A service with a notice channel wired, holding an addressed Administrator named ``root``."""
+    service = AuthService(engine.store, _no_mfa(), security_notifier=notifier)
+    await service.initialize()
+    await _add_local(service, "root", email=ADDRESS)
+    notifier.events.clear()  # the fixture's own ACCOUNT_CREATED notice is not under test
+    return service
+
+
+async def test_the_api_create_seeds_the_address_and_tells_it(engine: Engine) -> None:
+    """The control for the refusals below: a plain address is seeded as the notification address,
+    and that address is told the account was created."""
+    notifier = _FakeNotifier()
+    service = await _addressed_admin(engine, notifier)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "root"))["token"]
+        r = await c.post(
+            "/users",
+            headers=_auth(tok),
+            json={"username": "newbie", "password": PW, "email": "newbie@example.org"},
+        )
+        assert r.status_code == 201, r.text
+    user = await engine.store.get_user_by_username("newbie")
+    assert user is not None and user.notify_email == "newbie@example.org"
+    sent = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
+    assert [e.email for e in sent] == ["newbie@example.org"]
+
+
+async def test_the_api_create_refuses_a_missing_blank_or_malformed_address(engine: Engine) -> None:
+    """An account born with no address is told nothing before its holder's first sign-in, an
+    administrator's password reset included. So the create is refused, and nothing is written."""
+    notifier = _FakeNotifier()
+    service = await _addressed_admin(engine, notifier)
+    before = len(await engine.store.list_audit(action="user.created", limit=100_000))
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "root"))["token"]
+        missing = await c.post("/users", headers=_auth(tok), json={"username": "a", "password": PW})
+        assert missing.status_code == 422, missing.text
+        for i, bad in enumerate((" ", "x", "a@b.org, c@d.org", "Name <a@b.org>")):
+            r = await c.post(
+                "/users",
+                headers=_auth(tok),
+                json={"username": f"bad{i}", "password": PW, "email": bad},
+            )
+            assert r.status_code == 400, (bad, r.text)
+            if "@" in bad:  # the refusal never echoes the value
+                assert bad not in r.text
+            assert await engine.store.get_user_by_username(f"bad{i}") is None
+    assert await engine.store.get_user_by_username("a") is None
+    assert len(await engine.store.list_audit(action="user.created", limit=100_000)) == before
+    assert [e for e in notifier.events if e.event_type == ACCOUNT_CREATED] == []
+
+
+async def test_the_service_refuses_a_malformed_address_before_any_write() -> None:
+    """The check sits on the service, so a surface that forgets it still cannot seed a bad value.
+    ``None`` stays accepted there for internal callers; the admin surfaces never pass it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _no_mfa(), security_notifier=_FakeNotifier())
+        await service.initialize()
+        for bad in ("", "  ", "a@b.org; c@d.org"):
+            with pytest.raises(InvalidNotifyEmail):
+                await service.create_local_user(
+                    username="bad",
+                    password=PW,
+                    display_name=None,
+                    email=bad,
+                    roles=[],
+                    actor="test",
+                )
+            assert await store.get_user_by_username("bad") is None
+        # Surrounding spaces are trimmed rather than refused, as the PATCH path trims them.
+        user_id = await _add_local(service, "trimmed", email=f"  {ADDRESS} ")
+        user = await store.get_user(user_id)
+        assert user is not None and user.notify_email == ADDRESS and user.email == ADDRESS
+    finally:
+        await store.close()
 
 
 async def test_a_session_owing_its_factor_cannot_choose_the_address_and_nothing_deadlocks(
