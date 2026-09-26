@@ -1845,8 +1845,8 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
         f"SERVER={settings.server},{settings.port}",  # server validated; port is an int
         f"DATABASE={_odbc_brace(settings.database or '')}",
         # No login-timeout keyword here, on purpose (BACKLOG #1626). `Connection Timeout=` is an
-        # ADO.NET keyword that ODBC Driver 18 silently ignores: measured, a DSN carrying
-        # `Connection Timeout=2` still waited the OS TCP timeout (15.1 s) against a black-hole address.
+        # ADO.NET keyword that ODBC Driver 18 silently ignores: measured against a black-hole address,
+        # a DSN carrying `Connection Timeout=2` still waited 15.1 s, the same as no timeout at all.
         # The driver's login timeout is SQL_ATTR_LOGIN_TIMEOUT, which pyodbc sets from its `timeout=`
         # argument, so every connect site passes `timeout=settings.connect_timeout` instead.
         f"APP={_odbc_brace(settings.application_name)}",

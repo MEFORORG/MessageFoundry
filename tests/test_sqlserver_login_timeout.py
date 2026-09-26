@@ -4,8 +4,8 @@
 
 The store used to put ``Connection Timeout=<n>`` in the DSN. That is an ADO.NET keyword, and ODBC
 Driver 18 ignores it: measured against a black-hole address, a DSN with ``Connection Timeout=2`` still
-waited the operating system's TCP timeout (15.1 s), while ``pyodbc.connect(..., timeout=2)`` gave up
-in 2.1 s. pyodbc maps its ``timeout=`` argument to ``SQL_ATTR_LOGIN_TIMEOUT``, and aioodbc forwards
+waited 15.1 s, exactly as long as with no timeout set at all, while ``pyodbc.connect(..., timeout=2)``
+gave up in 2.1 s. pyodbc maps its ``timeout=`` argument to ``SQL_ATTR_LOGIN_TIMEOUT``, and aioodbc forwards
 it to ``pyodbc.connect``. So the fix is to pass ``timeout=`` at every connect site.
 
 **Why the fakes.** ``aioodbc``/``pyodbc`` are the optional ``sqlserver`` extra, not installed on every
