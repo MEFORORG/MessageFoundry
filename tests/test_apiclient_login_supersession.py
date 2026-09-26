@@ -134,11 +134,20 @@ async def test_a_second_login_ends_only_the_session_it_replaced(engine: Engine) 
 # --- stubbed transport: the edges an end-to-end run cannot force --------------------------------
 
 
-def _login_body(token: str, **flags: bool) -> dict[str, object]:
+def _login_body(
+    token: str, *, mfa_required: bool = False, must_change_password: bool = False
+) -> dict[str, object]:
+    # The flags are named rather than splatted: ``LoginResponse`` also takes ``token_type: str``,
+    # so strict mypy refuses a ``**dict[str, bool]`` into it.
     user = CurrentUser(
         user_id="0" * 32, username="op", auth_provider="local", roles=[], permissions=[]
     )
-    return LoginResponse(token=token, user=user, **flags).model_dump(mode="json")
+    return LoginResponse(
+        token=token,
+        user=user,
+        mfa_required=mfa_required,
+        must_change_password=must_change_password,
+    ).model_dump(mode="json")
 
 
 def _scripted(
@@ -321,3 +330,90 @@ def test_the_revoke_never_prompts_for_mfa_or_step_up() -> None:
         client.close()
     assert prompted == []
     assert len(_logouts(sent)) == 1, "the refused revoke was retried"
+
+
+def test_the_new_token_is_held_before_the_replaced_one_is_revoked() -> None:
+    """RED when: ``login`` revokes the replaced token BEFORE it adopts the new one.
+
+    A poll clone reads the token through the cell it shares with this client. While the revoke is
+    in flight, a clone that still read the replaced token would send a token the engine is ending,
+    and its background reads would fail. The stub records what the clone reads at that moment."""
+    client = EngineClient(_BASE)
+    poll = client.for_polling()
+    seen_by_poll: list[str | None] = []
+
+    def _logout(request: httpx.Request) -> httpx.Response:
+        seen_by_poll.append(poll.token)
+        return _ok(request)
+
+    _scripted(client, _logout)
+    try:
+        client.login("op", PW)
+        held = client.token
+        result = client.login("op", PW)
+    finally:
+        poll.close()
+        client.close()
+    assert held != result.token
+    assert seen_by_poll == [result.token], "the revoke ran while the replaced token was held"
+
+
+def _engine(request: httpx.Request) -> httpx.Response:
+    """Answer the calls a ``set_token`` or a rotation makes, and accept every ``/auth/logout``."""
+    if request.url.path == "/auth/me":
+        user = CurrentUser(
+            user_id="0" * 32, username="op", auth_provider="local", roles=[], permissions=[]
+        )
+        return httpx.Response(200, json=user.model_dump(mode="json"), request=request)
+    if request.url.path == "/auth/mfa-verify":
+        return httpx.Response(200, json={"token": "tok-rotated"}, request=request)
+    return _ok(request)
+
+
+def _held_by_login(client: EngineClient) -> None:
+    client.login("op", PW)
+
+
+def _held_by_set_token(client: EngineClient) -> None:
+    client.set_token("tok-shared")
+
+
+def _set_token_after_login(client: EngineClient) -> None:
+    client.login("op", PW)
+    client.set_token("tok-shared")
+
+
+def _rotated_from_set_token(client: EngineClient) -> None:
+    client.set_token("tok-shared")
+    client.verify_mfa("123456")
+
+
+@pytest.mark.parametrize(
+    ("hold", "revoked"),
+    [
+        (_held_by_login, True),
+        (_held_by_set_token, False),
+        (_set_token_after_login, False),
+        (_rotated_from_set_token, True),
+    ],
+    ids=["login", "set-token", "set-token-after-login", "rotated-from-set-token"],
+)
+def test_login_revokes_only_a_token_the_engine_issued_to_this_client(
+    hold: Callable[[EngineClient], None], revoked: bool
+) -> None:
+    """RED when: ``login`` revokes a token adopted with ``set_token``, or stops revoking one the
+    engine issued to this client.
+
+    A ``set_token`` token comes from outside, such as a keyring or a shared ``--token``, and another
+    process may be using it. Revoking it would sign that process out. A rotation is different: it
+    already ended the adopted token for every holder, so the rotated token is this client's alone."""
+    client = EngineClient(_BASE)
+    sent = _scripted(client, _engine)
+    try:
+        hold(client)
+        held = client.token
+        result = client.login("op", PW)
+    finally:
+        client.close()
+    assert client.token == result.token != held
+    assert _logouts(sent) == ([f"Bearer {held}"] if revoked else [])

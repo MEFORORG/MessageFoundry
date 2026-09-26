@@ -450,12 +450,18 @@ class _TokenCell:
 
     This does not widen who may WRITE the token: the clones still have no step-up/MFA handlers and
     never call an entry point that sets one. The primary remains the only writer.
+
+    ``issued_here`` records where ``value`` came from. It is True only when the engine handed the
+    token to THIS client, by a sign-in or a rotation, and False for a token adopted from outside
+    (:meth:`EngineClient.set_token`). :meth:`EngineClient.login` revokes the token it replaces only
+    when it is True, because a token from outside may be in use by another process.
     """
 
-    __slots__ = ("value",)
+    __slots__ = ("issued_here", "value")
 
     def __init__(self, value: str | None = None) -> None:
         self.value = value
+        self.issued_here = False
 
 
 class EngineClient:
@@ -562,12 +568,22 @@ class EngineClient:
         """The bearer token, read through the shared cell (see :class:`_TokenCell`).
 
         Kept as an attribute-shaped property so every existing read and write is unchanged; only
-        WHERE the value lives moved."""
+        WHERE the value lives moved.
+
+        Writing it marks the token as NOT issued to this client (see :class:`_TokenCell`), so a
+        write that forgets provenance errs toward revoking nothing. A token the engine just issued
+        goes through :meth:`_hold_issued` instead."""
         return self._token_cell.value
 
     @_token.setter
     def _token(self, token: str | None) -> None:
+        self._token_cell.issued_here = False
         self._token_cell.value = token
+
+    def _hold_issued(self, token: str) -> None:
+        """Hold ``token`` as one the engine issued to this client, by a sign-in or a rotation."""
+        self._token_cell.value = token
+        self._token_cell.issued_here = True
 
     def __enter__(self) -> EngineClient:
         return self
@@ -843,6 +859,8 @@ class EngineClient:
                 _allow_step_up=_allow_step_up,
                 _allow_mfa=False,
                 _follow_pin=True,
+                # Always None here, since a ``_bearer`` call disarms this retry. Keep it: strict
+                # mypy refuses to let ``**kw: object`` fill the typed ``_bearer`` parameter.
                 _bearer=_bearer,
                 **kw,
             )
@@ -867,7 +885,7 @@ class EngineClient:
                     _allow_step_up=False,
                     _allow_mfa=_allow_mfa,
                     _follow_pin=True,
-                    _bearer=_bearer,
+                    _bearer=_bearer,  # always None here; kept for mypy, as in the MFA retry above
                     **kw,
                 )
         if response.status_code >= 400:
@@ -886,13 +904,17 @@ class EngineClient:
         background poll clients too. A body without a usable ``token`` leaves the current one in
         place rather than clearing it: that is an engine older than this contract, and dropping the
         token there would turn a version skew into a sign-out.
+
+        A rotated token counts as issued to this client even when the one it replaced came from
+        :meth:`set_token`: the rotation already ended that one for every holder, so only this client
+        holds the new one.
         """
         try:
             token = response.json().get("token")
         except (JSONDecodeError, AttributeError):
             return
         if isinstance(token, str) and token:
-            self._token = token
+            self._hold_issued(token)
 
     def set_step_up_handler(self, handler: Callable[[], bool] | None) -> None:
         """Register the callback invoked when the engine demands step-up re-verification (403 +
@@ -1287,6 +1309,13 @@ class EngineClient:
         token it held, as the IDE's ``signIn`` does. Without that, the replaced session would stay
         valid on first deployment, unreachable from here, until it idled out or expired.
 
+        It ends that token only when the engine issued it to this client, by an earlier ``login`` or
+        a rotation. A token adopted with :meth:`set_token` came from outside, such as a keyring or a
+        ``--token`` flag, and another process may be using it. Revoking it would sign that process
+        out, so it is dropped here and left live. This is where the client parts from the IDE,
+        which also ends a cached token. The rule protects only the adopting side: a token this
+        client issued and then handed to another client is still ended on its next ``login``.
+
         The order matters. The prior token is ended only AFTER the engine accepted the new
         credential, so a refused sign-in signs nobody out. The new token is adopted FIRST, so the
         poll clients sharing the cell move to it before the old one dies. That holds when the answer
@@ -1302,6 +1331,7 @@ class EngineClient:
         IDE. Ending the old session inside the mint needs an engine-side change."""
         self._refuse_credential_on_cleartext("a password")
         prior = self._token
+        prior_issued_here = self._token_cell.issued_here
         result = _decode(
             self._request(
                 "POST",
@@ -1310,11 +1340,11 @@ class EngineClient:
             ),
             LoginResponse,
         )
-        self._token = result.token
+        self._hold_issued(result.token)
         self._user = result.user
         # A step-up purpose stashed for the old session must not bind the new one's next reauth().
         self._pending_step_up_action = None
-        if prior and prior != result.token:
+        if prior and prior_issued_here and prior != result.token:
             self._end_replaced_session(prior)
         return result
 
@@ -1322,13 +1352,17 @@ class EngineClient:
         """Revoke ``prior`` with ``POST /auth/logout``, presenting it as the bearer.
 
         Only that one token is ended, never the user's other sessions: a bearer caller may run
-        several at once, one per tool. The call installs no MFA or step-up retry, so it can never
-        prompt the user; ``/auth/logout`` is exempt from both gates anyway.
+        several at once, one per tool. :meth:`login` calls this only for a token the engine issued
+        to this client, so a token shared with another process through :meth:`set_token` is never
+        ended here. The call installs no MFA or step-up retry, so it can never prompt the user;
+        ``/auth/logout`` is exempt from both gates anyway.
 
         A failure is logged and swallowed, because the sign-in it follows has already succeeded. A
-        401 is the common case (the old token had already expired or been revoked), so it logs at
-        INFO. Anything else may leave a live session behind, so it logs a WARNING with the error,
-        which tells a certificate failure from a timeout from a local refusal.
+        401 is the common case (usually the old token had already expired or been revoked), so it
+        logs at INFO. The engine refuses with 401 for other reasons too, so the line says the
+        engine refused rather than that the session had ended. Anything else may leave a live
+        session behind, so it logs a WARNING with the error, which tells a certificate failure from
+        a timeout from a local refusal.
 
         That error text can carry an engine-supplied detail, so three things happen to it first. The
         token is scrubbed out, because a bearer must never reach a log. It is cut to
@@ -1344,7 +1378,9 @@ class EngineClient:
         except (RuntimeError, ValueError, httpx.HTTPError) as exc:
             if isinstance(exc, ApiError) and exc.status == 401:
                 _log.info(
-                    "the session this sign-in replaced on %s had already ended", self.base_url
+                    "%s refused to end the session this sign-in replaced (401); it has most likely "
+                    "already ended",
+                    self.base_url,
                 )
             else:
                 _log.warning(

@@ -139,8 +139,11 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **The Python engine client now ends the session a new sign-in replaces.** `EngineClient.login`
   used to overwrite the bearer token it held and never revoke it, so the old session would have
   stayed valid on first deployment until it idled out. It now calls `POST /auth/logout` with the
-  old token after the engine accepts the new sign-in, matching the IDE. A refused sign-in ends
-  nothing, and a revoke that fails is logged without the token and never fails the sign-in.
+  old token after the engine accepts the new sign-in, as the IDE does. Unlike the IDE, it ends only
+  a token the engine issued to that client. A token adopted with `set_token`, such as one from a
+  keyring or `--token`, may be shared with another process, so the client drops it and leaves it
+  live. A refused sign-in ends nothing, and a revoke that fails is logged without the token and
+  never fails the sign-in.
   (`BACKLOG #1901`)
 - **The shared redactor now scrubs FHIR JSON, DICOM tag dumps and XML, not only HL7.** Its passes
   were HL7-shaped, so a structured payload handed them single tokens and a family name, an MRN or a
