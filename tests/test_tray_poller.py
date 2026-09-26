@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
+import ssl
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -845,15 +847,18 @@ def test_a_pin_minted_after_start_is_picked_up_without_a_restart(
     from messagefoundry import pki
 
     pin = tmp_path / "api-generated-cert.pem"
-    built: list[str | None] = []
+    built: list[tuple[str | None, ssl.SSLContext | None]] = []
 
-    def factory(url: str, *, cacert: str | None = None) -> httpx.Client:
-        built.append(cacert)
+    def factory(
+        url: str, *, cacert: str | None = None, pinned: ssl.SSLContext | None = None
+    ) -> httpx.Client:
+        built.append((cacert, pinned))
         return httpx.Client(base_url=url)
 
     monkeypatch.setattr("messagefoundry.tray.poller.make_probe_client", factory)
     poller = StatusPoller(
-        TrayConfig(engine_url=_ENGINE_URL, engine_cacert=str(pin)),
+        # https, because a pin is followed only there: httpx ignores `verify` for plain http.
+        TrayConfig(engine_url="https://127.0.0.1:8765", engine_cacert=str(pin)),
         on_update=lambda _r: None,
         scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
         health_probe=lambda _c: HealthProbe.OK,
@@ -877,3 +882,256 @@ def test_a_pin_minted_after_start_is_picked_up_without_a_restart(
         if poller._client is not None:
             poller._client.close()
     assert len(built) == 2
+    # The rebuild pins the loaded context itself rather than falling back to the OS trust store.
+    assert built[0] == (str(pin), None)
+    assert built[1][0] == str(pin)
+    assert isinstance(built[1][1], ssl.SSLContext)
+
+
+# --- Following a renewed pin (BACKLOG #1276) --------------------------------------------------------
+
+
+class _RenewableEngine:
+    """A loopback https server presenting a minted self-signed pair, which it can swap for a new one.
+
+    It answers ``GET /health`` with the stock body, so a probe that completes the handshake reads
+    the engine as up. It speaks HTTP/1.0, so every probe is a fresh handshake: a renewed engine has
+    restarted and dropped its connections, and a pooled connection surviving the swap would let a
+    client pinned to the OLD certificate pass without ever meeting the new one.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        import http.server
+        import threading
+
+        self._dir = directory
+        self._minted = 0
+        self.pin = directory / "api-generated-cert.pem"
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.serve(self.renew_pin())
+        body = json.dumps({"status": "ok", "version": None, "observed_client": None}).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.socket = self._ctx.wrap_socket(self._server.socket, server_side=True)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        self.url = f"https://127.0.0.1:{self._server.server_address[1]}"
+
+    def mint(self) -> tuple[bytes, Path]:
+        """A new key and a new self-signed certificate: the cert PEM, and where the pair is kept."""
+        from messagefoundry import pki
+
+        self._minted += 1
+        cert, key = pki.make_self_signed("127.0.0.1", ["127.0.0.1"], 1)
+        stem = self._dir / f"pair-{self._minted}"
+        stem.with_suffix(".crt").write_bytes(cert)
+        stem.with_suffix(".key").write_bytes(key)
+        return cert, stem
+
+    def renew_pin(self) -> Path:
+        """Mint a pair and write its certificate to the pinned path, as the engine's renewal does."""
+        cert, stem = self.mint()
+        self.pin.write_bytes(cert)
+        return stem
+
+    def serve(self, stem: Path) -> None:
+        """Present the pair kept at ``stem`` on every handshake from now on."""
+        self._ctx.load_cert_chain(str(stem.with_suffix(".crt")), str(stem.with_suffix(".key")))
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.fixture
+def renewable_engine(tmp_path: Path) -> Iterator[_RenewableEngine]:
+    engine = _RenewableEngine(tmp_path)
+    try:
+        yield engine
+    finally:
+        engine.close()
+
+
+@contextmanager
+def _pinned_poller(engine: _RenewableEngine) -> Iterator[StatusPoller]:
+    """A poller with the DEFAULT client factory and the real probes, pinned to the engine's cert."""
+    poller = StatusPoller(
+        TrayConfig(engine_url=engine.url, engine_cacert=str(engine.pin)),
+        on_update=lambda _r: None,
+        scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
+    )
+    poller._open_client()  # what start() does, minus the thread
+    try:
+        yield poller
+    finally:
+        poller.stop()
+
+
+def _health(poller: StatusPoller, now: float) -> HealthProbe:
+    return poller.poll_once(now).inputs.health
+
+
+def test_a_renewed_certificate_is_followed_without_restarting_the_poller(
+    renewable_engine: _RenewableEngine,
+) -> None:
+    """The defect: a client pinned at start kept the OLD certificate and read a live engine as DOWN.
+
+    The renewal writes a new pair, new key and new certificate, to the pinned path while the engine
+    presents it. The poller is not restarted, and the engine reads as up again on the next tick.
+    """
+    with _pinned_poller(renewable_engine) as poller:
+        assert _health(poller, 0.0) is HealthProbe.OK
+        renewable_engine.serve(renewable_engine.renew_pin())
+        assert _health(poller, 1.0) is HealthProbe.OK
+
+
+def test_an_unchanged_pin_never_rebuilds_the_client(renewable_engine: _RenewableEngine) -> None:
+    """Control: no churn. Rewriting the SAME bytes is not a renewal, so the client is kept."""
+    with _pinned_poller(renewable_engine) as poller:
+        first = poller._client
+        for tick in range(3):
+            assert _health(poller, float(tick)) is HealthProbe.OK
+        renewable_engine.pin.write_bytes(renewable_engine.pin.read_bytes())
+        assert _health(poller, 3.0) is HealthProbe.OK
+        assert poller._client is first
+
+
+@pytest.mark.parametrize("mid_renewal", ["missing", "empty", "half-written", "not a certificate"])
+def test_a_pin_caught_mid_renewal_keeps_the_current_client(
+    renewable_engine: _RenewableEngine, mid_renewal: str
+) -> None:
+    """Control: a file that does not load keeps the old context, and the pin is not dropped.
+
+    The engine writes the file non-atomically, so a tick can land while it is gone or partial.
+    """
+    with _pinned_poller(renewable_engine) as poller:
+        first = poller._client
+        good = renewable_engine.pin.read_bytes()
+        if mid_renewal == "missing":
+            renewable_engine.pin.unlink()
+        elif mid_renewal == "empty":
+            renewable_engine.pin.write_bytes(b"")
+        elif mid_renewal == "half-written":
+            renewable_engine.pin.write_bytes(good[: len(good) // 2])
+        else:
+            renewable_engine.pin.write_bytes(b"-----BEGIN CERTIFICATE-----\nnope\n")
+        assert _health(poller, 1.0) is HealthProbe.OK  # still pinned to the served certificate
+        assert poller._client is first
+
+
+def test_a_pin_rewritten_during_its_load_is_not_recorded(
+    renewable_engine: _RenewableEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file that changes across the load is refused for that tick, and adopted on the next.
+
+    This pins that the second read exists and refuses a mismatch. It rewrites AFTER the load, so
+    the context and the first read agree here; the case the second read guards against, a rewrite
+    between the first read and the load, is not driven directly.
+    """
+    from messagefoundry.tray import probe
+
+    with _pinned_poller(renewable_engine) as poller:
+        first = poller._client
+        renewable_engine.renew_pin()
+        real = probe._pinned_context
+        next_cert, _ = renewable_engine.mint()
+
+        def racing(cacert: str) -> ssl.SSLContext:
+            context = real(cacert)
+            Path(cacert).write_bytes(next_cert)  # the file moves on after the load read it
+            return context
+
+        monkeypatch.setattr(probe, "_pinned_context", racing)
+        poller.poll_once(1.0)
+        assert poller._client is first
+        monkeypatch.setattr(probe, "_pinned_context", real)
+        poller.poll_once(2.0)
+        assert poller._client is not first
+        assert poller._pin_pem == next_cert
+
+
+def test_the_pin_is_still_enforced_after_a_rebuild(renewable_engine: _RenewableEngine) -> None:
+    """The follow must not become trust-anything: a pin naming ANOTHER certificate still refuses.
+
+    The pinned file changes to a certificate the engine does not present. The client follows the
+    file, and the handshake then fails, so the engine reads DOWN rather than up.
+    """
+    with _pinned_poller(renewable_engine) as poller:
+        first = poller._client
+        assert _health(poller, 0.0) is HealthProbe.OK
+        renewable_engine.renew_pin()  # written to the pin, NOT served
+        assert _health(poller, 1.0) is HealthProbe.DOWN
+        assert poller._client is not first  # it did follow the file; the pin is what refused
+
+
+def test_a_pin_that_will_not_load_is_retried_but_logged_once(
+    renewable_engine: _RenewableEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Changed bytes that do not load: one log line, but the load is retried every tick.
+
+    Retrying matters because the bytes a tick reads and the bytes its load saw can differ, so
+    bytes once logged as refused may be a good certificate. The last step is that case: the
+    refused bytes' load is made to fail, then the same bytes load and are adopted.
+    """
+    from messagefoundry.tray.probe import load_pin
+
+    loads: list[str] = []
+
+    def counting(cacert: str) -> object:
+        loads.append(cacert)
+        return load_pin(cacert)
+
+    with _pinned_poller(renewable_engine) as poller:
+        monkeypatch.setattr("messagefoundry.tray.poller.load_pin", counting)
+        renewable_engine.pin.write_bytes(b"")
+        with caplog.at_level(logging.INFO, logger=_POLLER_LOGGER):
+            for tick in range(3):
+                assert _health(poller, float(tick)) is HealthProbe.OK
+        assert len(loads) == 3
+        assert caplog.text.count("does not load") == 1
+
+        # A good certificate whose first load fails (as a mid-load rewrite would) is still adopted.
+        first = poller._client
+        renewable_engine.serve(renewable_engine.renew_pin())
+        monkeypatch.setattr("messagefoundry.tray.poller.load_pin", lambda _c: None)
+        poller.poll_once(3.0)
+        assert poller._client is first
+        monkeypatch.setattr("messagefoundry.tray.poller.load_pin", counting)
+        assert _health(poller, 4.0) is HealthProbe.OK
+        assert poller._client is not first
+
+
+def test_a_pin_on_a_plain_http_url_is_not_followed(tmp_path: Path) -> None:
+    """httpx ignores `verify` for http, so the file is never read and nothing is rebuilt."""
+    pin = tmp_path / "api-generated-cert.pem"
+    poller = StatusPoller(
+        TrayConfig(engine_url=_ENGINE_URL, engine_cacert=str(pin)),
+        on_update=lambda _r: None,
+        scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
+        health_probe=lambda _c: HealthProbe.OK,
+        ui_probe=lambda _c: UiProbe.ENABLED,
+    )
+    poller._open_client()
+    first = poller._client
+    try:
+        from messagefoundry import pki
+
+        pin.write_bytes(pki.make_self_signed("127.0.0.1", ["127.0.0.1"], 1)[0])
+        poller.poll_once(0.0)
+        assert poller._client is first
+    finally:
+        poller.stop()

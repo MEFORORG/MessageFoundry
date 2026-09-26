@@ -335,7 +335,7 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `tls_key_file` | both | — | private key for `tls_cert_file`. |
 | `tls_ca_file` | both | — | trust anchor — **in:** verify client certs (opt-in mTLS → require a client cert); **out:** verify the server cert. |
 | `tls_ca_pin` | in | - | the SHA-256 of the inbound `tls_ca_file`, hex, `:` separators allowed. Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. It pins `tls_ca_file` only. A `tls_crl_file` is read by path with no pin, and a certificate in it that `tls_ca_file` does not already hold refuses the build (BACKLOG #1890). Set on an outbound connection, or without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
-| `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able and is **refused at construction**. `MEFOR_ALLOW_INSECURE_TLS=1` downgrades that refusal to a loud warning **only where the clamp allows it** (#200, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2): the escape is inert on an instance that is **both** PHI-classified **and** at `[security].enforcement = enforce`. That is the shipped default, so **on a stock instance the refusal stands with the variable set** — treat the env var as a lab tool, not a deployment option. Nothing else opens this hop: `cleartext_accepted` deliberately does **not** reach a verify-off hop (it has TLS — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted)), and `tls_hop_attested` has no authoring surface. If the partner's certificate has merely lapsed, `tls_allow_expired` below is the narrower lever — read that row before reaching for it. |
+| `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able and is **refused at construction**. `MEFOR_ALLOW_INSECURE_TLS=1` downgrades that refusal to a loud warning **only where the clamp allows it** (#200, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2): the escape is inert on an instance that is **both** PHI-classified **and** at `[security].enforcement = enforce`. That is the shipped default, so **on a stock instance the refusal stands with the variable set** — treat the env var as a lab tool, not a deployment option. Nothing else opens this hop: `cleartext_accepted` deliberately does **not** reach a verify-off hop (it has TLS — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted)), and the MLLP verify-off refusal does not read [`tls_hop_attested`](#attesting-a-hop-secure-tls_hop_attested) either. If the partner's certificate has merely lapsed, `tls_allow_expired` below is the narrower lever — read that row before reaching for it. |
 | `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). |
 | `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain + hostname + key-usage — the **granular** alternative to `tls_verify=false` for the narrow expired-cert case. It is genuinely narrower (a wrong-host or untrusted-chain peer is still rejected), but do not book it as "not MITM-able": **expiry is the control that retires a certificate**, so a hop that ignores it will keep authenticating a **compromised key indefinitely** — and on the two connectors with no revocation gate (**DICOM-SCU, FTPS**) nothing else would catch that certificate either. **No posture gate covers this setting at all.** It needs no `MEFOR_ALLOW_INSECURE_TLS`; `[security].enforcement = enforce` does not clamp it; verification stays on, so no #200 cleartext/verify-off refusal keys on it; and it is **absent from `security_loosenings()`**, so `GET /security/posture`, the serve-time loosening warning and `messagefoundry check` will **not** report a connection that has it set. The only disclosure is the WARNING logged at each connector build — so a "two-week bridge" set when a partner's cert lapses has nothing that expires it or surfaces it: record the connection name and a removal date in your own risk register. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). It is a factory parameter on **six** outbound connectors only — **MLLP, FTPS (`Ftp(tls=True)`), DICOM C-STORE SCU, REST, SOAP, FHIR** — and is **not** honoured by the engine's other verifying TLS hops, including **`DICOMweb()`** (which reuses the REST client but does not read it), the `Database(...)` destination / `DatabasePoll(...)` source, and the `Email()`/`Direct()` SMTP TLS legs. |
 | `encoding_characters` | out | — (off) | **(Corepoint `-override` parity)** re-encode each outgoing message with a different set of HL7 delimiters (the 5 MSH chars in MSH order — MSH-1 + the 4 MSH-2 chars, e.g. `"#@*!%"`) before framing. Validated at build (exactly 5, all distinct). Unset = payload **byte-identical**. |
@@ -872,8 +872,10 @@ row only. The two export rows are made safe as their own row says.
 - A Handler's live lookup result is data it reads to shape its output, not content the product keeps
   as a message ([ADR 0010](adr/0010-handler-callable-db-lookup.md),
   [ADR 0043](adr/0043-fhir-read-lookup.md)). `fhir_lookup` reads are capped at
-  `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB. `db_lookup` returns every row its statement selects, and the
-  engine sets no row cap, so the Handler's statement is the bound.
+  `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB. `db_lookup` reads are capped at `max_rows` rows per call,
+  default `DEFAULT_DB_LOOKUP_MAX_ROWS` = 500, charged at the fetch. A larger result fails the lookup
+  rather than being truncated. There is no byte cap, so a row's own width is still the statement's
+  bound.
 - `/ui/static` serves first-party assets that ship in the package. `AllowlistedStaticFiles` serves
   only `ALLOWED_STATIC_EXTENSIONS` (`.css`, `.js`), and it sends no `Content-Disposition`.
 - The API routes not listed above that take a body are treated as parameter routes, capped by
@@ -1197,7 +1199,7 @@ one.
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — supply via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and `tls_hop_attested` has no authoring surface. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab |
+| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract and the same reporting gap as the [MLLP row](#mllp--mllp): **no posture gate, no escape variable, and `security_loosenings()` never reports it** |
 | `encoding` | `utf-8` | request-body charset |
 
@@ -1338,7 +1340,7 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > The warning above used to be the whole control, so a generic connection with no TLS keyword would
 > cross in plaintext with nothing stopping it. That arm now goes through the same cleartext-hop
 > authority every other cleartext transport uses, with the same owner-ratified precedence: an on-box
-> hop is allowed, a per-connection `tls_hop_attested` allows it (audited; no supported surface sets it),
+> hop is allowed, a per-connection `tls_hop_attested` with its `tls_hop_attested_reason` allows it (audited, and reported),
 > `cleartext_accepted` warns
 > and audits, a non-enforcing instance warns, and an **enforcing** instance **refuses** it. The refusal
 > lands at construction, so it fails `messagefoundry check` / dry-run / reload / the `serve` pre-flight
@@ -1347,8 +1349,9 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > What is gated is the case the classifier can judge: **no** ssl/tls/encrypt keyword, or one pinned to
 > a no-TLS value. A keyword set to anything outside that deny-list is still delegated, because the
 > engine cannot tell whether an arbitrary driver's value verifies the certificate — that residual is
-> unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound has no
-> supported per-connection relaxation: set a verifying keyword, or run at `[security].enforcement = warn`.
+> unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound's only
+> per-connection relaxation is `tls_hop_attested` with a `tls_hop_attested_reason`, for a hop secured by
+> other means. Otherwise set a verifying keyword, or run at `[security].enforcement = warn`.
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
@@ -1379,6 +1382,23 @@ reads through a stored procedure — which this gate refuses anyway.
 > database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
 > a credential the operator configures per connection.
 
+#### A lookup that selects too many rows fails the message
+
+Each `DatabaseLookup(...)` takes `max_rows`, default `500`. A `db_lookup` call whose statement selects
+more rows than that raises `DbLookupError`, and the Handler's message goes to `ERROR` like any other
+lookup failure. The engine never hands the Handler a truncated result, because a Handler shaping a
+message from the first 500 rows of a larger set would be wrong with nothing to say so.
+
+The ceiling is charged at the fetch (BACKLOG #1730). The executor asks the driver for at most
+`max_rows + 1` rows, so a broad predicate is refused with at most one row past the ceiling held in the
+transform worker, not the whole result set. The driver may still spend time discarding the unread rows
+when the cursor closes. The error names the connection and the ceiling, never the statement or a row.
+
+A lookup that shapes one message rarely needs more than a handful of rows. If a feed needs a large
+table, a synced `Reference(...)` is the better fit. `max_rows=0` removes the ceiling. A negative
+or fractional value stops `serve` building the lookup. `messagefoundry check` refuses it in its build
+leg, which runs when the config has a `messagefoundry.toml`. The ceiling counts rows, not bytes.
+
 #### Static credentials on every backend hop
 
 ASVS 13.2.1 asks that every backend hop authenticate with an individual service account, a short-term
@@ -1394,8 +1414,7 @@ Three surfaces read that one list, so they cannot disagree:
 - `GET /security/posture` returns it as `static_credential_hops`, one entry per hop.
 - `serve` refuses on it, but only when you turn the refusal on.
 
-The list covers the hops named in the table below. It is not a promise about hops added later, or
-about plugin connector types.
+The list covers the hops named in the table below. It is not a promise about hops added later.
 
 **The refusal ships off.** Set `[security].require_nonstatic_credentials = true` to turn it on. `serve`
 then refuses to start while any listed hop has no opt-out. To keep a hop, name it with a reason:
@@ -1730,7 +1749,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
 | `username` | str / `env()` / None | `None` | SMTP `AUTH` user — put the secret in `env()`. |
 | `password` | str / `env()` / None | `None` | SMTP `AUTH` password — `env()` only. AUTH is sent **over TLS only**; a cleartext-credential config is refused. |
-| `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated. **The opt-in** is one of exactly two things you can actually set: `MEFOR_ALLOW_INSECURE_TLS` (process-global — it weakens *every* connector in the process, and it is read through the **clamped** check, so it cannot relax an enforcing production-PHI hop), or this connection's `cleartext_accepted = true` with its mandatory `cleartext_reason` (per-hop, audited — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted), and prefer it). **And** the hop then goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback ALLOWs, a `cleartext_accepted` hop **WARNs + audits** (never a silent allow), a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. The engine also honours a connection-level `tls_hop_attested` on this gate, but **no factory keyword and no `connections.toml` key sets it**, so it is not a route you can take — see the note in that section. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
+| `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated. **The opt-in** is one of exactly two things you can actually set: `MEFOR_ALLOW_INSECURE_TLS` (process-global — it weakens *every* connector in the process, and it is read through the **clamped** check, so it cannot relax an enforcing production-PHI hop), or this connection's `cleartext_accepted = true` with its mandatory `cleartext_reason` (per-hop, audited — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted), and prefer it). **And** the hop then goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback ALLOWs, a `cleartext_accepted` hop **WARNs + audits** (never a silent allow), a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. A connection whose hop is secured by other means can [attest it](#attesting-a-hop-secure-tls_hop_attested) instead, which ALLOWs it. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
 | `timeout_seconds` | float | `30.0` | |
 | `encoding` | str | `"utf-8"` | |
 
@@ -1968,7 +1987,7 @@ a generic partner — the `RS384` default below is SMART's own requirement, not 
 | `key_id` | `None` | the JWT `kid` → the public key registered with the server (for rotation) |
 | `audience` | = `token_url` | the assertion `aud`, if the server documents a different audience |
 | `private_key_password` | `None` | passphrase for an encrypted key (secret — use `env()`) |
-| `expiry_skew_seconds` | `60` | re-mint this many seconds before the server's stated expiry |
+| `expiry_skew_seconds` | `60` | re-mint this many seconds before the server's stated expiry. The engine caches a token for at most one hour after this skew, whatever `expires_in` says |
 
 ```python
 from messagefoundry import FHIR, env, outbound
@@ -2361,12 +2380,10 @@ does. There are exactly three ways such a hop crosses:
 | `cleartext_accepted = true` + `cleartext_reason` | this hop is **not** secure, and we accept that | **WARN** — crossed, loudly logged **and recorded at every construction** |
 | `[security].enforcement = warn` | the instance-wide refuse/warn dial is at `warn` | WARN — but **only for the raw transports** (`MLLP()`, `Tcp()`, `X12()`, `DICOM()`, `Email()`, `Ftp()`). The HTTP family (`Rest()`, `Soap()`, `FHIR()`, `DICOMweb()`, `FhirLookup()`) shipped these refusals unconditionally, and ADR 0092 decision 5 forbids a cell getting weaker, so a no-loosen floor turns that WARN back into a REFUSE there. The dial is **not** a substitute for the declaration |
 
-A fourth route exists in the engine but has **no authoring surface on a connection today**:
-`tls_hop_attested` ("this hop *is* secure by means the engine cannot see" — proxy-terminated TLS, a
-genuinely isolated segment) yields a silent ALLOW, but no transport factory takes it and it is not a
-`connections.toml` key, so you cannot set it on an inbound or outbound. Do **not** reach for it; use
-`cleartext_accepted`. (The `[logging].forward_hop_attested` sibling in `messagefoundry.toml` *is*
-settable — see [CONFIGURATION.md](CONFIGURATION.md).)
+A fourth route makes the opposite claim: the hop *is* secure, by means the engine cannot see. That is
+[`tls_hop_attested`](#attesting-a-hop-secure-tls_hop_attested), below. (The `[logging].forward_hop_attested`
+sibling in `messagefoundry.toml` is the same claim for the log forwarder — see
+[CONFIGURATION.md](CONFIGURATION.md).)
 
 The two claims are deliberately **separate fields with opposite meanings**. Do not describe a peer that
 simply cannot do TLS as attested: that writes a false statement into the one field that exists to be
@@ -2424,6 +2441,54 @@ listing the **whole** accepted set, so a broad rollout is obvious in review), in
 construction WARN + audit record, and in `GET /security/posture`'s loosening list — with a deviation
 entry in [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). That visibility is the mitigation: nothing stops
 an operator declaring it on every destination, and the engine does not try to.
+
+## Attesting a hop secure (`tls_hop_attested`)
+
+`tls_hop_attested = true` with a mandatory `tls_hop_attested_reason` says a hop **is** secure, by means
+the engine cannot see. A TLS-terminating proxy or sidecar in front of the connection is the usual case.
+An isolated segment with its own link-layer encryption is the other. An enforcing refusal of a
+cleartext or verify-off hop then **ALLOWs** it
+([ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md), owner ruling
+2026-09-24). That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a
+verify-off HTTP-family egress hop and a weakened database TLS hop. It does **not** reach every
+verify-off refusal: at least the MLLP, FTPS and email `tls_verify = false` refusals do not read it.
+
+Set it on the declaration that owns the hop:
+
+```python
+inbound("IB_ACME_ADT", MLLP(port=2575), router="acme_adt_router", bind_address="0.0.0.0",
+        tls_hop_attested=True, tls_hop_attested_reason="TLS terminates at the stunnel sidecar")
+```
+
+```toml
+[[inbound]]
+name = "IB_ACME_ADT"
+transport = "mllp"
+router = "acme_adt_router"
+bind_address = "0.0.0.0"
+tls_hop_attested = true
+tls_hop_attested_reason = "TLS terminates at the stunnel sidecar"
+  [inbound.settings]
+  port = 2575
+```
+
+`outbound()` and a `[[outbound]]` table take the same pair, and so do `FhirLookup()`,
+`DatabaseLookup()` and `DatabaseRef()`. It is a top-level key, **not** a transport setting. Under
+`[settings]`, or written into a factory's settings dict from Python, it is refused at load. A flag with
+no reason, a blank reason, or a reason with no flag also fail at load. So does an `env()` value, and so
+does declaring it together with `cleartext_accepted`, which is the opposite claim.
+
+**Do not attest a hop that is not secure.** A peer that simply cannot do TLS is
+[`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted), which WARNs at every
+construction. An attested hop is recorded as secure, so a false attestation hides a plaintext hop.
+
+**It is reported.** `messagefoundry check` prints a `tls-hop-attested` line listing every attested hop
+with its reason, and `GET /security/posture` names them in a `tls_hop_attested` loosening. At least
+the inbound bind gates and the raw-TCP/MLLP hop guard also log a WARNING with the reason when they
+suppress a refusal. Not every cell does: the database weakened-TLS audit line omits the reason, and a
+`DatabaseRef` sync logs nothing. So those two reports are the complete record. The risk entry is in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). It does not reach a revocation refusal, which is
+`tls_revocation_attested`, or SMTP `AUTH` over cleartext, which is refused outright.
 
 ## Per-connection retention, document pruning & diagnostics overrides
 
@@ -2959,7 +3024,7 @@ reading this page already applies to a file the scan never opened.
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
-| DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
+| DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings); a `db_lookup` call fetches at most `max_rows` (500) plus one, and [refuses a larger result](#a-lookup-that-selects-too-many-rows-fails-the-message) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
 | Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | a borrow that cannot be satisfied within `DatabaseRef(acquire_timeout=…)` (default 30 s) raises `StoreAcquireTimeout`, failing that set's sync | the sync task is isolated per reference set; the previous snapshot keeps serving reads and the AlertSink fires. The bound also keeps one wedged source from stalling the sequential pass over the other sets |
 | Internal sources — Timer / Loopback / PassThrough | n/a — they open no socket and reach no external system | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn's own defaults (no `limit_concurrency` / `timeout_keep_alive` is passed); per-actor 429 throttles bound abuse: login 10 per IP and 60 global per 60 s, PHI reads 120 per actor per 60 s, admin writes 12 per actor per second | over a throttle the request gets `429` and an audit row; the connection stays usable | the caller backs off; the window rolls |
@@ -2972,8 +3037,8 @@ reading this page already applies to a file the scan never opened.
 | Kerberos / SPNEGO SSO (`kerberos_spn`) | no engine socket — one SPNEGO server step per login against the OS provider | the OS provider's own limits apply | a failed step is an audited login reject; a boot preflight degrades SSO legibly when no provider exists |
 | OIDC IdP — token endpoint (`oidc_token_endpoint`) | one POST per login, bounded by the login rate limiter | the IdP's own limit surfaces as an HTTP error | the login fails closed; the user retries |
 | OIDC IdP — JWKS fetch (`oidc_jwks_uri`) | one GET per cache miss, bounded by `oidc_jwks_ttl_seconds` (3600) and the amplification floor `oidc_jwks_min_refetch_seconds` (300) | a refetch inside the floor is not made; the cached key set is used | a fetch failure fails the verification closed |
-| SMART token endpoint (`smart_token_url`) | one POST per token mint; the token is cached until expiry minus `smart_expiry_skew_seconds` | the delivery fails and re-queues | re-minted on the next attempt or on a `401` via `invalidate()` |
-| OAuth2 token endpoint (`oauth2_token_url`) | one POST per token mint, cached the same way | the delivery fails and re-queues | re-minted on the next attempt or on a `401` |
+| SMART token endpoint (`smart_token_url`) | one POST per token mint; the token is cached until expiry minus `smart_expiry_skew_seconds`, for at most one hour | the delivery fails and re-queues | re-minted on the next attempt or on a `401` via `invalidate()` |
+| OAuth2 token endpoint (`oauth2_token_url`) | one POST per token mint, cached until expiry minus its skew, with no one-hour ceiling | the delivery fails and re-queues | re-minted on the next attempt or on a `401` |
 | AI broker (`[ai].endpoint`) | one POST per assist request; bounded at the API route by the `ai:assist` RBAC gate, the fail-closed `[ai].allowed_endpoints` SSRF allow-list and the 60 s per-request timeout. **There is NO per-actor pacing on `POST /ai/chat`** — it depends on plain `require(Permission.AI_ASSIST)`, not `require_paced`/`require_step_up`, so a holder of `ai:assist` can loop assist POSTs unthrottled | the LLM's own 429/503 surfaces as an `AiBrokerError` → HTTP `502` to the caller | the assist call fails; nothing is queued or retried |
 | DR backup destination (`[backup].destination`, ADR 0049) | **one writer** — leader-gated under `[cluster].enabled`, so exactly one node writes the shared destination; once per `schedule_at` pass plus any on-demand run. No engine-side cap: the OS/SMB redirector queues | a slow or full destination stretches the run; nothing is dropped and the next scheduled pass still fires | a failed or verify-failed run is logged + audited and is **never** counted as a good backup when pruning to `retention_keep` |
 | Vault Transit — store DEK unwrap (`MEFOR_STORE_VAULT_ADDR`, `[store].key_provider = vault`, ADR 0019) | one HTTPS request per DEK unwrap (startup / rotation), not per message | a failure is fail-closed — the store does not open | operator fixes Vault and restarts |
@@ -2991,7 +3056,7 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset` | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |

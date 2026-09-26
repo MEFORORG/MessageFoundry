@@ -60,6 +60,7 @@ def _names(
     cleartext_hops: tuple[str, ...] = (),
     expiry_hops: tuple[str, ...] = (),
     db_hops: tuple[str, ...] = (),
+    attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
 ) -> list[str]:
     """The loosening SWITCH NAMES for a settings combination (defaults where not overridden)."""
@@ -71,12 +72,13 @@ def _names(
             auth or AuthSettings(),
             alerts or AlertsSettings(),
             rotation or SecretRotationSettings(),
-            cleartext_hops,
-            expiry_hops,
-            db_hops,
-            revocation_hops,
-            None,
-            None,
+            cleartext_hops=cleartext_hops,
+            expiry_relaxed_hops=expiry_hops,
+            unverified_db_hops=db_hops,
+            attested_hops=attested_hops,
+            revocation_attested_hops=revocation_hops,
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     ]
 
@@ -108,12 +110,13 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "aad_bind" in named
@@ -134,12 +137,13 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "no effect without a store key" in named["aad_bind"]
@@ -157,12 +161,13 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             auth,
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "ad_session_recheck_seconds" in named
@@ -342,6 +347,8 @@ def test_every_security_bool_at_its_insecure_value_is_reported() -> None:
 _CONNECTION_DEVIATIONS_REPORTED = {
     "cleartext_accepted": "accepted_cleartext_hops",
     "tls_allow_expired": "expiry_relaxed_hops",
+    # Owner ruling 2026-09-24: the hop attestation got a factory surface, so it is reported.
+    "tls_hop_attested": "attested_secure_hops",
     "tls_revocation_attested": "revocation_attested_hops",
 }
 
@@ -351,6 +358,7 @@ _CONNECTION_DEVIATIONS_REPORTED = {
 _CONNECTION_DEVIATIONS_EXEMPT = {
     # Not switches — the reason string beside a declaration, and TLS key/cert material or paths.
     "cleartext_reason": "the reason text for cleartext_accepted, not a second switch",
+    "tls_hop_attested_reason": "the reason text for tls_hop_attested, not a second switch",
     "tls_cert_file": "material/path, not a posture switch",
     "tls_key_file": "material/path, not a posture switch",
     "tls_key_password": "material/path, not a posture switch",
@@ -439,7 +447,7 @@ def test_every_per_connection_tls_parameter_is_reported_or_exempt() -> None:
 
 
 def test_the_reported_connection_deviations_are_actually_wired() -> None:
-    """The other half of the floor: the map above claims two parameters are REPORTED, and a claim that
+    """The other half of the floor: the map above claims parameters are REPORTED, and a claim that
     nothing executes is exactly what this lane exists to prevent. Drive each through its reader AND
     through `security_loosenings`, so "reported" means reported."""
     from messagefoundry.config.models import ConnectorType
@@ -447,6 +455,7 @@ def test_the_reported_connection_deviations_are_actually_wired() -> None:
         ConnectionSpec,
         Registry,
         accepted_cleartext_hops,
+        attested_secure_hops,
         build_outbound_connection,
         expiry_relaxed_hops,
     )
@@ -469,17 +478,28 @@ def test_the_reported_connection_deviations_are_actually_wired() -> None:
             cleartext_reason="vendor firmware predates TLS",
         )
     )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ATTESTED",
+            ConnectionSpec(type=ConnectorType.TCP, settings={"host": "h", "port": 3}),
+            tls_hop_attested=True,
+            tls_hop_attested_reason="TLS terminates at the site's stunnel sidecar",
+        )
+    )
     assert _CONNECTION_DEVIATIONS_REPORTED["tls_allow_expired"] == "expiry_relaxed_hops"
+    assert _CONNECTION_DEVIATIONS_REPORTED["tls_hop_attested"] == "attested_secure_hops"
     assert _CONNECTION_DEVIATIONS_REPORTED["cleartext_accepted"] == "accepted_cleartext_hops"
     names = _names(
         expiry_hops=tuple(n for n, _ in expiry_relaxed_hops(reg)),
         cleartext_hops=tuple(n for n, _ in accepted_cleartext_hops(reg)),
+        attested_hops=tuple(n for n, _ in attested_secure_hops(reg)),
     )
     assert "tls_allow_expired" in names and "cleartext_accepted" in names
+    assert "tls_hop_attested" in names
 
 
 def test_the_revocation_attestation_is_actually_wired() -> None:
-    """The third REPORTED entry, driven the same way as the two above: through its reader AND through
+    """Another REPORTED entry, driven the same way as the ones above: through its reader AND through
     `security_loosenings`. ADR 0173 made the pair authorable on an outbound, so the reader must see it
     there and the registry must name it."""
     from messagefoundry.config.models import ConnectorType
@@ -558,12 +578,13 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            ("OB_LEGACY", "OB_LAB"),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=("OB_LEGACY", "OB_LAB"),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "cleartext_accepted" in named
@@ -596,12 +617,13 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            ("OB_PARTNER_ADT", "OB_LAB_ORU"),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=("OB_PARTNER_ADT", "OB_LAB_ORU"),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "tls_allow_expired" in named
@@ -625,12 +647,13 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            ("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "generic_odbc_tls_unenforced" in named
@@ -651,12 +674,13 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            ("OB_PARTNER", "inbound:IB_LAB"),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "tls_revocation_attested" in named

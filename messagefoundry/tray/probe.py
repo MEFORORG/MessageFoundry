@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import logging
 import ssl
+from pathlib import Path
 
 import httpx
 
@@ -225,17 +226,42 @@ def _pinned_context(cacert: str) -> ssl.SSLContext:
     return ssl.create_default_context(cafile=cacert)
 
 
-def pin_loads(cacert: str) -> bool:
-    """True when ``cacert`` loads as a trust anchor now. Quiet, for a caller that retries.
-
-    It tests loading rather than existence, because the engine writes the file non-atomically: a
-    file that exists can still be empty or half-written, and an unreadable one exists too.
-    """
+def read_pin(cacert: str) -> bytes | None:
+    """The pin file's bytes now, or ``None`` when it cannot be read. Quiet, for a caller that polls."""
     try:
-        _pinned_context(cacert)
+        return Path(cacert).read_bytes()
+    except OSError:
+        return None
+
+
+#: What :func:`load_pin` returns: the pin's bytes, and a context built from exactly those bytes.
+type LoadedPin = tuple[bytes, ssl.SSLContext]
+
+
+def load_pin(cacert: str) -> LoadedPin | None:
+    """The pin's bytes and a context built from exactly those bytes, or ``None`` if it will not load.
+
+    Quiet, for a caller that retries on its next tick. It tests LOADING rather than existence,
+    because the engine writes the file non-atomically: a file that exists can still be empty or
+    half-written, and an unreadable one exists too.
+
+    The file is read on both sides of the load, and a difference returns ``None``. Without that, a
+    rewrite landing between the read and the load would leave the caller recording one certificate
+    for a tick while its context trusts another. A caller that rebuilds on a change of bytes would
+    correct that on its next tick, so the second read saves a spare rebuild rather than closing a
+    permanent gap. It cannot see a file that changes and changes back within the load. The context
+    still loads through ``cafile``, so what a pin may hold is unchanged.
+    """
+    before = read_pin(cacert)
+    if before is None:
+        return None
+    try:
+        context = _pinned_context(cacert)
     except (OSError, ssl.SSLError):
-        return False
-    return True
+        return None
+    if read_pin(cacert) != before:
+        return None  # rewritten mid-load: which bytes the context holds is unknown
+    return before, context
 
 
 def build_verify(engine_url: str, cacert: str | None = None) -> ssl.SSLContext | bool:
@@ -248,7 +274,7 @@ def build_verify(engine_url: str, cacert: str | None = None) -> ssl.SSLContext |
     ``cacert`` pins trust to exactly that PEM. **A pin that cannot be loaded falls back to the OS
     trust store, which still verifies.** The common cause is a tray started before the engine's
     first run, when the pair is not minted yet. The poller rebuilds its client once the pin loads
-    (see :func:`pin_loads`); until then the engine reads as down, and the warning names the path.
+    (see :func:`load_pin`); until then the engine reads as down, and the warning names the path.
     """
     if not is_tls_url(engine_url):
         return True
@@ -272,9 +298,18 @@ def build_verify(engine_url: str, cacert: str | None = None) -> ssl.SSLContext |
 
 
 def make_probe_client(
-    engine_url: str, timeout: float = DEFAULT_TIMEOUT_S, *, cacert: str | None = None
+    engine_url: str,
+    timeout: float = DEFAULT_TIMEOUT_S,
+    *,
+    cacert: str | None = None,
+    pinned: ssl.SSLContext | None = None,
 ) -> httpx.Client:
     """A tokenless httpx client for probing: short timeout, no redirect-follow by default.
+
+    ``pinned`` is a context :func:`load_pin` already built from ``cacert``, and it is used as it is.
+    That is how the poller keeps the context tied to the exact bytes it recorded: letting this
+    function load the file again would reopen the gap :func:`load_pin` closes, and a half-written
+    file at that moment would silently swap the pin for the OS trust store.
 
     Never carries an ``Authorization`` header — the whole point of the tray's boundary. An https
     engine URL gets a verifying TLS context (see :func:`build_verify`); a failed verification
@@ -294,5 +329,5 @@ def make_probe_client(
         base_url=engine_url.rstrip("/"),
         timeout=timeout,
         follow_redirects=False,
-        verify=build_verify(engine_url, cacert),
+        verify=pinned if pinned is not None else build_verify(engine_url, cacert),
     )

@@ -168,3 +168,76 @@ jobs:
           # which is the one outcome that must be loud rather than quietly tolerated: every other upload
           # here retains a best-effort artifact, this one carries the PROOF that the scan happened.
           if-no-files-found: error
+
+  dast-ingress:
+    # INCREMENT 2, THE UNAUTHENTICATED INGRESS PLANE (ADR 0155, 2026-09-26 amendment). Hostile bytes at
+    # live MLLP, raw-TCP and X12 listeners in front of a real engine, judged against the engine's own
+    # invariants: a reply for every decoded MLLP frame, a row for every decoded frame, a listener that
+    # stays up, bounded time, bounded heap/handle/task growth, and no message content at INFO+.
+    #
+    # Same posture as dast-auth above, for the same reasons: advisory by PLACEMENT (no pull_request
+    # trigger, so it never reports on a PR), never continue-on-error, and a unique template-free job
+    # name because that name is the status-check context. The seeded, fixed-catalogue half runs in the
+    # REQUIRED pytest legs (tests/test_dast_ingress_sweep.py); this nightly adds a randomized budget
+    # seeded from the run id, which the receipt records so any finding can be replayed with --seed.
+    #
+    # NO PHI: every message is synthetic, and the receipt records case names, counts, codes and
+    # timings, never a body.
+    name: dast-ingress-sweep (unauthenticated ingress plane)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # No cache, for the release-tag cache-poisoning reason given on dast-auth's copy above.
+          enable-cache: false
+      - name: Install the engine (base deps only, NO scanner)
+        run: |
+          uv pip install --system --constraint constraints.lock -e "."
+
+      - name: Canary - prove every ingress detector can fire
+        run: |
+          # Each canary injects one real defect at the runtime seam (never a source patch) and must
+          # exit EXACTLY 1 with a receipt on disk. 0 means the detector is blind and 2 means the run
+          # could not measure; either way the real scan below proves nothing and is not run.
+          for c in no-reply ack-and-drop log-body stall leak listener-down; do
+            rc=0
+            python scripts/security/dast_ingress_sweep.py \
+              --canary "$c" --receipt "ingress-canary-$c.json" || rc=$?
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::ingress canary $c exited $rc, expected exit code 1 (findings). 0 means the detector is BLIND; 2 means the run could not measure. The real scan is not run."
+              exit 1
+            fi
+            if [ ! -f "ingress-canary-$c.json" ]; then
+              echo "::error::ingress canary $c exited 1 but wrote no receipt, so the proof of detection is missing"
+              exit 1
+            fi
+          done
+
+      - name: Ingress sweep (fixed catalogue plus a randomized budget)
+        env:
+          # Through env, not a `${{ }}` in the shell body (zizmor's template-injection audit).
+          SWEEP_SEED: ${{ github.run_id }}
+        run: |
+          # Exit contract as dast-auth: 0 clean and above every floor, 1 findings, 2 could not measure.
+          python scripts/security/dast_ingress_sweep.py \
+            --seed "$SWEEP_SEED" --mutation-seconds 240 \
+            --receipt dast-ingress-receipt.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the ingress receipts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: dast-ingress-receipts
+          path: |
+            dast-ingress-receipt.json
+            ingress-canary-*.json
+          if-no-files-found: error

@@ -46,7 +46,11 @@ import urllib.request
 from collections.abc import Mapping
 from typing import Any
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    hop_attestation_from_settings,
+)
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
@@ -431,6 +435,7 @@ class FhirDestination(DestinationConnector):
                 connector="FHIR destination",
                 revocation_attested=config.tls_revocation_attested,
                 revocation_attested_reason=config.tls_revocation_attested_reason,
+                connection=config.name,
             )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
@@ -874,6 +879,30 @@ def _resolve_read_url(
     return url
 
 
+def _mint_bearer(token: Any, prefix: str) -> str:
+    """Mint the SMART bearer for a lookup, raising :class:`FhirLookupError` if the mint fails.
+
+    The mint runs before the GET's own ``try``. The provider raises ``DeliveryError`` for a failed
+    mint: a refused or unreachable endpoint, an unparseable reply, or a refused reply body (an
+    ``EgressReplyError``, which is a subclass). It raises ``ValueError`` when a configured value is
+    over the length limit. Neither is a lookup error, so a Handler that caught ``FhirLookupError``
+    missed it (BACKLOG #1980). The ``DeliveryError`` text names only the redacted token URL and a
+    status or reason. It never carries the client assertion or the reply body, so it is echoed like
+    the sibling mappings. The ``ValueError`` is summarised with a fixed message."""
+    from messagefoundry.config.fhir_lookup import FhirLookupError
+
+    try:
+        bearer: str = token.access_token()
+    except DeliveryError as exc:
+        raise FhirLookupError(f"{prefix}: {exc}") from exc
+    except ValueError as exc:
+        raise FhirLookupError(
+            f"{prefix}: the SMART token request could not be built (check smart_token_url and the "
+            "proxy credential)"
+        ) from exc
+    return bearer
+
+
 class FhirLookupExecutor:
     """GET-only executor for handler-callable **live** FHIR reads (``fhir_lookup``, ADR 0043).
 
@@ -930,7 +959,9 @@ class FhirLookupExecutor:
             self._timeout[cname] = float(s.get("timeout_seconds", 30.0))
             self._encoding[cname] = str(s.get("encoding", "utf-8"))
             # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
-            attested = bool(s.get("tls_hop_attested", False))
+            # Validated like the DB lookups': a flag written into this mutable dict without its
+            # reason is refused here rather than crossing unexplained.
+            attested = hop_attestation_from_settings(s)
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
             # rides the spec settings, written there by the FhirLookup() factory (which load-validates
             # the flag/reason coherence, exactly as build_outbound_connection does for an outbound).
@@ -1082,7 +1113,8 @@ class FhirLookupExecutor:
         headers = dict(self._headers[connection])
         token = self._token[connection]
         if token is not None:
-            headers["Authorization"] = f"Bearer {token.access_token()}"
+            bearer = _mint_bearer(token, f"fhir_lookup on {connection!r}")
+            headers["Authorization"] = f"Bearer {bearer}"
         # ASVS 4.2.5. ``url`` here is built per call, so it is the most message-derived URL in the
         # engine, and the minted bearer is added just above -- neither was ever measured. A
         # FhirLookupError (not a delivery error) because this read runs inside a Handler: there is no
@@ -1140,6 +1172,14 @@ class FhirLookupExecutor:
             raise FhirLookupError(
                 f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} failed: {exc}"
             ) from exc
+        except http.client.HTTPException as exc:
+            # A malformed status or header line (BadStatusLine, LineTooLong) is neither an OSError
+            # nor a URLError (BACKLOG #1980). Named by class only: its text can echo reply bytes.
+            # After the OSError arm, so RemoteDisconnected (both kinds) keeps the OSError wording.
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} sent a malformed HTTP "
+                f"reply ({type(exc).__name__})"
+            ) from exc
 
     def _parse(self, connection: str, body: str, status: int) -> dict[str, Any]:
         """Parse a 2xx reply body into a resource / searchset ``Bundle`` dict via the pure codec. PHI-safe:
@@ -1149,7 +1189,9 @@ class FhirLookupExecutor:
 
         try:
             return FhirPeek.parse(body).obj
-        except FhirPeekError as exc:
+        # RecursionError: a deeply nested body (BACKLOG #1980). FhirPeek maps it to FhirPeekError
+        # since BACKLOG #1600; this arm keeps the lookup safe if that mapping ever regresses.
+        except (FhirPeekError, RecursionError) as exc:
             raise FhirLookupError(
                 f"fhir_lookup on {connection!r}: FHIR server returned an unparseable body (HTTP {status})"
             ) from exc
@@ -1169,7 +1211,8 @@ class FhirLookupExecutor:
         headers = dict(self._headers[connection])
         token = self._token[connection]
         if token is not None:
-            headers["Authorization"] = f"Bearer {token.access_token()}"
+            bearer = _mint_bearer(token, f"FhirLookup {connection!r}")
+            headers["Authorization"] = f"Bearer {bearer}"
         # ASVS 4.2.5. ``url`` here is built per call, so it is the most message-derived URL in the
         # engine, and the minted bearer is added just above -- neither was ever measured. A
         # FhirLookupError (not a delivery error) because this read runs inside a Handler: there is no
@@ -1212,4 +1255,10 @@ class FhirLookupExecutor:
         except (TimeoutError, OSError) as exc:
             raise FhirLookupError(
                 f"FhirLookup {connection!r}: FHIR {_redact_url(base)} failed: {exc}"
+            ) from exc
+        except http.client.HTTPException as exc:
+            # As in _get: named by class only, and after the OSError arm (BACKLOG #1980).
+            raise FhirLookupError(
+                f"FhirLookup {connection!r}: FHIR {_redact_url(base)} sent a malformed HTTP reply "
+                f"({type(exc).__name__})"
             ) from exc

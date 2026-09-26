@@ -650,8 +650,9 @@ class StatsResponse(BaseModel):
     # backend reports 0 (counting is wired on SQLite + SQL Server).
     committed_txns: int = 0
     body_copies: int = 0
-    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres only; 0
-    # elsewhere). Non-zero == a superseded ex-leader was stopped mid-write. MUST be declared here:
+    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres and SQL
+    # Server; 0 on SQLite). Non-zero == a superseded ex-leader was stopped mid-write. MUST be
+    # declared here, because
     # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
     # and /stats would never grow the field.
     fenced_writes: int = 0
@@ -759,7 +760,13 @@ class EngineInfo(BaseModel):
     never the failure reason — a reason is a raw exception string and this field renders into a
     tooltip.
 
-    Both are additive + defaulted, so an older client deserializes ``/status`` unchanged."""
+    ``stages_degraded`` maps a pooled pipeline stage (``ingress``/``routed``/``outbound``/
+    ``response``) to why it is not draining: its claimer task died and has not recovered (BACKLOG
+    #1609). The engine respawns the claimer itself, so after one death the entry is brief; after
+    repeated deaths it stays until the claimer has run cleanly for a while. No connection names, and
+    the reason names only the task and the exception TYPE, so it needs no channel scoping.
+
+    All three are additive + defaulted, so an older client deserializes ``/status`` unchanged."""
 
     version: str
     uptime_seconds: float
@@ -770,6 +777,7 @@ class EngineInfo(BaseModel):
     outbox_by_status: dict[str, int]
     channels_failed: int = 0  # deployed inbounds that failed to start (ADR 0031), estate-wide
     channels_failed_names: list[str] = Field(default_factory=list)  # the caller-visible subset
+    stages_degraded: dict[str, str] = Field(default_factory=dict)  # BACKLOG #1609
 
 
 class EngineKpis(BaseModel):

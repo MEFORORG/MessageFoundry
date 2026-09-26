@@ -9,6 +9,7 @@ wiring.py), the fail-closed egress gate, and the end-to-end dry-run-raises behav
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -33,20 +34,44 @@ from messagefoundry.transports.database import DatabaseLookupExecutor
 
 
 class _FakeCursor:
-    def __init__(self, rows: list[tuple[Any, ...]], columns: list[str], error: Exception | None):
+    """A cursor over ``rows`` that counts every row it hands out, so a test can see how much of a
+    result left the driver, not only what the executor returned. ``max_batch`` makes ``fetchmany``
+    return fewer rows than asked, as a real driver may while more remain."""
+
+    def __init__(
+        self,
+        rows: list[tuple[Any, ...]],
+        columns: list[str],
+        error: Exception | None,
+        max_batch: int | None = None,
+    ):
         self._rows = rows
         self._columns = columns
         self._error = error
+        self._max_batch = max_batch
+        self._pos = 0
         self.description = [(c,) for c in columns] if columns else None
         self.executed: tuple[str, tuple[Any, ...]] | None = None
+        self.fetched = 0
+        self.fetchall_calls = 0
 
     async def execute(self, sql: str, params: tuple[Any, ...]) -> None:
         self.executed = (sql, params)
         if self._error is not None:
             raise self._error
 
+    def _take(self, n: int) -> list[tuple[Any, ...]]:
+        out = self._rows[self._pos : self._pos + n]
+        self._pos += len(out)
+        self.fetched += len(out)
+        return out
+
     async def fetchall(self) -> list[tuple[Any, ...]]:
-        return list(self._rows)
+        self.fetchall_calls += 1
+        return self._take(len(self._rows))
+
+    async def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        return self._take(min(size, self._max_batch) if self._max_batch else size)
 
 
 class _FakeConn:
@@ -84,9 +109,10 @@ def _patch_pool(
     rows: list[tuple[Any, ...]] | None = None,
     columns: list[str] | None = None,
     error: Exception | None = None,
+    max_batch: int | None = None,
 ) -> _FakePool:
     """Replace the module-level _make_pool so the executor gets a fake pool (no aioodbc, no DB)."""
-    pool = _FakePool(_FakeCursor(rows or [], columns or [], error))
+    pool = _FakePool(_FakeCursor(rows or [], columns or [], error, max_batch))
 
     async def fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> _FakePool:
         return pool
@@ -186,6 +212,100 @@ async def test_executor_aclose_closes_pools(monkeypatch: pytest.MonkeyPatch) -> 
 def test_executor_requires_server_and_database() -> None:
     with pytest.raises(ValueError, match="requires a 'database'"):
         DatabaseLookupExecutor({"bad": {"server": "db.local"}})
+
+
+# --- the row ceiling, charged at the fetch (BACKLOG #1730) --------------------
+
+
+def _capped(max_rows: Any) -> dict[str, dict[str, Any]]:
+    return {"clarity": {"server": "db.local", "database": "Clarity", "max_rows": max_rows}}
+
+
+async def test_executor_refuses_a_result_over_max_rows_at_the_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 10,000 matching rows against a ceiling of 3: the lookup is refused, and the driver handed out
+    # max_rows + 1 rows, not the whole result. Before #1730 the executor ran fetchall and returned
+    # all 10,000.
+    rows = [(f"NPI{i}", f"SSN-{i}") for i in range(10_000)]
+    pool = _patch_pool(monkeypatch, rows=rows, columns=["npi", "ssn"])
+    ex = DatabaseLookupExecutor(_capped(3))
+    with pytest.raises(DbLookupError) as ei:
+        await ex.query("clarity", "SELECT npi, ssn FROM patient WHERE mrn = :mrn", {"mrn": "M1"})
+    msg = str(ei.value)
+    assert "clarity" in msg and "max_rows=3" in msg
+    # PHI-free: no row value, no statement text, no parameter.
+    assert "NPI0" not in msg and "SSN-" not in msg and "patient" not in msg and "M1" not in msg
+    assert pool.cursor_obj.fetched == 4
+    assert pool.cursor_obj.fetchall_calls == 0
+    assert pool.released == 1  # the connection goes back even on a refusal
+
+
+async def test_executor_returns_a_result_of_exactly_max_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The boundary: max_rows rows is a full answer, not an overflow.
+    pool = _patch_pool(monkeypatch, rows=[("1",), ("2",), ("3",)], columns=["npi"])
+    ex = DatabaseLookupExecutor(_capped(3))
+    rows = await ex.query("clarity", "SELECT npi FROM p", {})
+    assert rows == [{"npi": "1"}, {"npi": "2"}, {"npi": "3"}]
+    assert pool.cursor_obj.fetched == 3
+
+
+async def test_executor_ceiling_holds_when_the_driver_returns_short_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A driver may return fewer rows than asked while more remain. The executor keeps asking, so a
+    # short batch neither hides an overflow nor cuts a legal result short.
+    under = _patch_pool(monkeypatch, rows=[(i,) for i in range(5)], columns=["n"], max_batch=2)
+    assert (
+        len(await DatabaseLookupExecutor(_capped(5)).query("clarity", "SELECT n FROM t", {})) == 5
+    )
+    assert under.cursor_obj.fetched == 5
+
+    over = _patch_pool(monkeypatch, rows=[(i,) for i in range(50)], columns=["n"], max_batch=2)
+    with pytest.raises(DbLookupError, match="max_rows=5"):
+        await DatabaseLookupExecutor(_capped(5)).query("clarity", "SELECT n FROM t", {})
+    assert over.cursor_obj.fetched == 6
+
+
+async def test_executor_default_ceiling_is_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A lookup that sets no max_rows gets DEFAULT_DB_LOOKUP_MAX_ROWS: 500 rows pass, 501 refuse.
+    assert database.DEFAULT_DB_LOOKUP_MAX_ROWS == 500
+    _patch_pool(monkeypatch, rows=[(i,) for i in range(500)], columns=["n"])
+    assert len(await DatabaseLookupExecutor(_CONN).query("clarity", "SELECT n FROM t", {})) == 500
+
+    pool = _patch_pool(monkeypatch, rows=[(i,) for i in range(5_000)], columns=["n"])
+    with pytest.raises(DbLookupError, match="max_rows=500"):
+        await DatabaseLookupExecutor(_CONN).query("clarity", "SELECT n FROM t", {})
+    assert pool.cursor_obj.fetched == 501
+
+
+async def test_executor_max_rows_zero_removes_the_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The documented opt-out, same convention as poll_max_rows: 0 means no ceiling, read by fetchall.
+    pool = _patch_pool(monkeypatch, rows=[(i,) for i in range(2_000)], columns=["n"])
+    rows = await DatabaseLookupExecutor(_capped(0)).query("clarity", "SELECT n FROM t", {})
+    assert len(rows) == 2_000
+    assert pool.cursor_obj.fetchall_calls == 1
+
+
+@pytest.mark.parametrize(
+    "bad", [-1, -1234, True, "many-9876", 2.5, float("inf"), float("nan"), Decimal("2.5")]
+)
+def test_executor_refuses_a_bad_max_rows_at_construction(bad: Any) -> None:
+    # Refused where serve and messagefoundry check build the executor, not at the first message. A
+    # bool is an int to Python, so True would otherwise mean a ceiling of one row, and int(2.5) is 2.
+    with pytest.raises(ValueError, match="DatabaseLookup 'clarity' max_rows") as ei:
+        DatabaseLookupExecutor(_capped(bad))
+    # The value arrives env()-resolved, so the refusal withholds it, chain included (BACKLOG #1183).
+    assert str(bad) not in str(ei.value)
+    assert ei.value.__cause__ is None
+
+
+@pytest.mark.parametrize(("given", "rows_allowed"), [("7", 7), (7.0, 7), ("0", None)])
+def test_executor_reads_an_env_resolved_max_rows(given: Any, rows_allowed: int | None) -> None:
+    # env() values arrive as strings; a whole float is a whole number.
+    assert DatabaseLookupExecutor(_capped(given))._max_rows["clarity"] == rows_allowed
 
 
 # --- read-only statement gate, defence in depth (SEC-009 / ADR 0010) ---------
@@ -355,6 +475,10 @@ def test_database_lookup_factory_registers(monkeypatch: pytest.MonkeyPatch) -> N
     DatabaseLookup("clarity", server="db.local", database="Clarity")
     assert "clarity" in reg.lookups
     assert reg.lookups["clarity"].settings["server"] == "db.local"
+    # The factory writes the shipped ceiling explicitly (BACKLOG #1730), and it matches the executor's.
+    assert reg.lookups["clarity"].settings["max_rows"] == database.DEFAULT_DB_LOOKUP_MAX_ROWS
+    DatabaseLookup("epic", server="db.local", database="Epic", max_rows=25)
+    assert reg.lookups["epic"].settings["max_rows"] == 25
 
 
 def test_database_lookup_duplicate_name(monkeypatch: pytest.MonkeyPatch) -> None:

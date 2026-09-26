@@ -116,6 +116,8 @@ def _derive_health(
       ``unwritable`` state for it that nothing in this function reads yet.
     - server DB connection pool saturated (``idle == 0``) → **warn**.
     - running on the DR failover box (``dr.active``) → **warn**; a clustered engine with no leader → **down**.
+    - a pooled pipeline stage whose claimer died and has not recovered → **down**, naming
+      the stage (BACKLOG #1609).
     - any deployed inbound that failed to start → **warn**, naming it (BACKLOG #1741).
     - zero deployed inbounds on a STARTED engine → **warn** (BACKLOG #1741).
 
@@ -129,10 +131,18 @@ def _derive_health(
         issues.append((2, "store unreachable"))
     else:
         eng = sysinfo.engine
-        # Both connection rules are appended FIRST, and ``reason`` below takes the first issue at
-        # the worst level — so at equal severity a connection problem wins the tooltip over low
-        # disk, a saturated pool or DR-active. Deliberate: a feed that is not listening is the more
-        # actionable message. Insertion order IS the warn-level tie-break; moving these moves it.
+        # BACKLOG #1609: a pooled stage that is not draining is DOWN, not warn. Intake keeps
+        # acknowledging while nothing moves past that stage, and every other signal reads healthy.
+        # The engine respawns the dead claimer itself; see EngineInfo.stages_degraded for when the
+        # entry clears. Appended first, so at the down level it wins the tooltip over low disk.
+        if eng.stages_degraded:
+            stages = ", ".join(sorted(eng.stages_degraded))
+            issues.append((2, f"pipeline stage not draining: {stages}"))
+        # Both connection rules are appended before every warn-level rule below, and ``reason``
+        # takes the first issue at the worst level — so at equal severity a connection problem wins
+        # the tooltip over low disk, a saturated pool or DR-active. Deliberate: a feed that is not
+        # listening is the more actionable message. Insertion order IS the warn-level tie-break;
+        # moving these moves it.
         if eng.channels_failed:
             issues.append(
                 (1, _failed_inbound_reason(eng.channels_failed, eng.channels_failed_names))

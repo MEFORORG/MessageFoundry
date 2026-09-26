@@ -93,6 +93,10 @@ _SCALAR_FIELDS = (
     # nothing in their edit explains. `cleartext_reason` rides with it; the pair is validated together.
     "cleartext_accepted",
     "cleartext_reason",
+    # ADR 0092, owner ruling 2026-09-24: the per-connection hop attestation (both directions). Dropping
+    # it on a save would turn an attested hop into a REFUSED one at the next reload, as above.
+    "tls_hop_attested",
+    "tls_hop_attested_reason",
     # ADR 0173: the per-connection revocation attestation (both directions). Dropping it on a save
     # would turn an attested hop into a REFUSED one at the next reload, the same failure as above.
     "tls_revocation_attested",

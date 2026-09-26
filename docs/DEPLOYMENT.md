@@ -455,10 +455,9 @@ With it set, these otherwise-refused settings become permitted (each logs a loud
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
 nor the instance's data label — so cleartext credentials over `http`, cleartext MLLP/DICOM/DICOMweb and the
 cleartext HTTP family are now governed only by a per-connection `cleartext_accepted` + `cleartext_reason`
-(warn + audit) or a loopback hop. (The engine also honours a `tls_hop_attested` hop — the opposite claim,
-"secure by other means", a silent ALLOW — but that field has **no supported authoring surface on a
-connection**: no factory parameter and no `connections.toml` key. No refusal offers it as a
-remedy.) *(b)* Where it does still apply it is mostly
+(warn + audit) or a loopback hop. (A per-connection `tls_hop_attested` + `tls_hop_attested_reason` makes
+the opposite claim, "secure by other means", and ALLOWs the hop. It is reported as a loosening; see
+[CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested).) *(b)* Where it does still apply it is mostly
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`, and for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP/FTPS and plain-FTP cells and, since #329,
@@ -579,10 +578,10 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
   [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
   removed the PHI conjunct — `wiring_runner.py` reads `return not posture.enforcing` — and `enforce` is
   the default, so on a stock instance the flag changes nothing. The recorded loosening is
-  `[security].enforcement = warn`. The
-  gates also read `tls_hop_attested`, but that field has no supported authoring surface on a connection
-  today, so the bind refusals do not name it (see
-  [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
+  `[security].enforcement = warn`. These
+  refusals also name `tls_hop_attested`: a per-connection attestation, with its mandatory reason, that
+  the hop is secured by other means. It ALLOWs the bind on an enforcing instance and is reported as a
+  loosening ([CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested)).
 - **Browser console (`/ui`)**: an off-loopback `/ui` additionally requires in-process TLS or a declared
   terminator and is refused without one — `--allow-insecure-bind` does not cover it.
 
@@ -739,10 +738,12 @@ ungated, never covered by an "every verifying hop" sentence; a weakening with no
 (`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no refusal keys
 on it — **reported is not gated**, and the two must never be written as if either implied the other;
 and a field with no factory parameter and no `connections.toml`
-key (`tls_hop_attested`) must never be offered as an operator lever. (`tls_revocation_attested` left
-this list when it gained both, under ADR 0173. `tests/test_hop_refusal_revocation.py` and
-`tests/test_hop_refusal_wiring.py` pin that this one lever is settable wherever the connection
-refusals name it; they do not check the other levers those refusals name.)
+key must never be offered as an operator lever. No field is on that list today:
+`tls_revocation_attested` left it when it gained both, under ADR 0173, and `tls_hop_attested` left it
+when it gained both, under the owner ruling of 2026-09-24. `tests/test_hop_refusal_revocation.py` and
+`tests/test_hop_refusal_wiring.py` pin that the revocation lever is settable wherever the connection
+refusals name it, and `tests/test_hop_attested_not_offered.py` pins the same for `tls_hop_attested`.
+Neither checks the other levers those refusals name.
 Two more rules of thumb: state a control **with its default and its off-switch** (`require_sign_in`,
 `enforcement`), and never describe `[egress]` as bounding a *transform* —
 it bounds declared **destinations**.

@@ -324,7 +324,9 @@ recency.
 **The fleet wiki is the memory every seat on every account can search.** Query it for the subject
 of your work before you act, and write a lesson, decision, gotcha or correction after; a miss never
 blocks. A note is advice: where it disagrees with the tree or an owner instruction, the tree wins,
-and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how.
+and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how. Where
+`install-coordination.ps1` has wired `mefor-wiki`, a Stop hook prompts for a note after substantive
+work, and `wiki: nothing to record` is a fine answer.
 
 **Run korus's wiki scripts by path, FROM YOUR ENGINE WORKTREE.** This repository has no
 `ccx.config.json`, so without `-StateRoot` a query reads no inbox and still prints `no note`. Work
@@ -567,10 +569,11 @@ no account roster and still cannot reach another Manager: spawning makes a NEW s
 address an existing one, so the shape still dissolves the cross-account problem rather than solving
 it.
 
-**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing reads a red
-PR -- `failure-signal.yml` sets a `ci-red` label no workflow reads back, and `stalled-prs.yml`
-reports green-but-unmergeable PRs rather than red ones -- so the work stops until somebody happens
-to look. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
+**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing sends a
+red PR to a seat -- `failure-signal.yml` sets a `ci-red` label that only an advisory daily report
+reads back, and `stalled-prs.yml` reports green-but-unmergeable PRs rather than red ones -- so the
+work stops until somebody happens to look. **CORRECTED 2026-09-26:** this read "a `ci-red` label no
+workflow reads back"; `ci-red-report.yml` (PR 1240) reads it daily into its own run summary. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
 landing means nobody checked it, and a fix written to turn CI green is checked by the very signal it
 was written against.
 
@@ -586,7 +589,9 @@ The brief is disposable. The BACKLOG item is the record.
 
 No seat may rely on a notice arriving -- the Manager finds state by asking. `stalled-prs.yml` reports
 green-but-unmergeable PRs on a daily 07:05 UTC cron. `failure-signal.yml` adds a `ci-red` label to a
-PR whose required check went red, and no workflow reads that label back. Some workflows do comment on
+PR whose required check went red, and only an advisory daily report reads that label back, into a run
+summary no seat is sent. **CORRECTED 2026-09-26:** this read "no workflow reads that label back";
+`ci-red-report.yml` (PR 1240) reads it. Some workflows do comment on
 a PR -- at least `failure-signal.yml` and `nightly-notice.yml` -- but **no label any of them applies
 gates a merge**, and no seat has to clear one.
 
@@ -601,10 +606,15 @@ gates a merge**, and no seat has to clear one.
    PR body when it opens the PR.
 2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
    push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at
-   tool-call time: `worktree_gate.ps1`, installed to `%USERPROFILE%\.claude\hooks\` by
-   `scripts/worktree/install-gate.ps1`, and `collision_gate.ps1`, wired by
-   `scripts/coord/install-coordination.ps1`, deny the Write, Edit or
-   Bash call itself. CI arrives later, when the process is gone.
+   tool-call time and deny the tool call itself. Each one sees only some tools.
+   `collision_gate.ps1`, wired by `scripts/coord/install-coordination.ps1`, sees Write, Edit,
+   MultiEdit and NotebookEdit, and nothing else. `worktree_gate.ps1`, installed to
+   `%USERPROFILE%\.claude\hooks\` by `scripts/worktree/install-gate.ps1`, sees at least those four
+   tools and Bash and PowerShell. On the four edit tools it judges the file being written. On a
+   shell call it judges only git commands, by verb, config key and the repository or worktree they
+   target. **So neither guard intercepts an ordinary shell write, such as a redirect into a
+   file.** The worktree gate's own deny text says a shell route around a denied write still breaks
+   its rule. CI arrives later, when the process is gone.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
 4. Its process exits when it has pushed and reported. The Manager opens the PR, often one PR for
    several Builders' branches. The worktree stays behind. **A Builder in its own session -- started

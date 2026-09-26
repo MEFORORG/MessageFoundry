@@ -46,6 +46,7 @@ tests/test_ci_merge_group_gate.py
 tests/test_ci_odbc_installer_pipefail.py
 tests/test_ci_red_clearer.py
 tests/test_ci_red_reader.py
+tests/test_ci_refused_subjects.py
 tests/test_ci_retry_native_crash.py
 tests/test_ci_step_margin.py
 tests/test_ci_tooling_gate.py
@@ -167,6 +168,7 @@ tests/test_stalled_prs.py
 tests/test_steer_inject.py
 tests/test_testpaths_webconsole_coverage.py
 tests/test_unbounded_fs_scan_guard.py
+tests/test_wiki_write_prompt_hook.py
 tests/test_workflow_concurrency_keys.py
 tests/test_workflow_local_action_check.py
 tests/test_workflow_pipefail_screen.py

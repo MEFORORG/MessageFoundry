@@ -181,10 +181,8 @@ def test_assert_send_hop_permitted_when_attested() -> None:
 #
 # Both cells build their DSN through `_build_dsn` and both dropped the per-connection attestation, so
 # a weakened-TLS hop the operator HAD attested was refused on the live-read and reference-sync paths
-# while the destination and the poll source crossed it. The setting stays UNAUTHORABLE either way --
-# neither `DatabaseLookup()` nor `DatabaseRef()` takes it and neither has a TOML surface, so only a
-# direct embedding reaches the mapping. Giving a factory the parameter is a separate, owner-gated
-# question, not this.
+# while the destination and the poll source crossed it. Since the owner's 2026-09-24 ruling both
+# factories take the parameter and write it into this mapping; these tests drive the mapping directly.
 
 _ATTESTED_DB = {
     **_WEAK_DB,

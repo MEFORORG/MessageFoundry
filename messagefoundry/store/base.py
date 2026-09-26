@@ -259,8 +259,8 @@ class QueueStore(StoreLifecycle, Protocol):
 
     #: ``fenced_writes`` = TERMINAL queue resolves REJECTED by the H1 leader-epoch fence since store open
     #: (ADR 0157 C3). Additive and monotone like the two above, read the same ``getattr(store, name, 0)``
-    #: way, and **Postgres-only**: it is the one backend where terminal resolves carry the fence, so the
-    #: SQLite and SQL Server handles expose it at a permanent 0 for protocol / ``/stats`` uniformity. A
+    #: way. Postgres (Inc 1) and SQL Server (Inc 3) fence their terminal resolves and count here; the
+    #: single-node SQLite handle exposes it at a permanent 0 for protocol / ``/stats`` uniformity. A
     #: non-zero value means a superseded ex-leader tried to resolve a row the current leader owns and was
     #: stopped — the split-brain signal an operator actually wants paged on.
     fenced_writes: int
@@ -1109,6 +1109,10 @@ class QueueStore(StoreLifecycle, Protocol):
         """Append one **metadata-only** connection event to the ``connection_event`` log (#46): the
         inbound lifecycle (``established``/``closed``) + the pre-ingress failures
         (``peer_not_allowlisted``/``at_capacity``/``frame_oversize``/``peer_reset``/``framing_error``)
+        + the MLLP listener's ``handler_error`` (#1619: the inbound handler faulted on a frame it read
+        cleanly, such as a store outage at the ingress commit)
+        + the poll sources' rejects (``row_undecodable``; the FILE source's ``file_oversize``/
+        ``file_decompress_failed``/``file_content_mismatch``/``file_scan_rejected``, #1621)
         + the outbound lane transitions (``connection_lost``/``connection_restored``).
 
         It is a **pure observer**: a single short INSERT in its own transaction, touching no ``queue``
