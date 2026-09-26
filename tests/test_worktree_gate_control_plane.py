@@ -1655,35 +1655,288 @@ def test_the_tokens_rule_3_excludes_really_cannot_move_a_governed_tree(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "KNOWN FAIL-OPEN, not an accepted behaviour. Withholding the promoted repository token from "
-        "rule 3 fixes the false deny on tree-only verbs and leaves `--git-dir <governed> checkout "
-        "<branch>` allowed, which really moves the primary's HEAD. Attributed by measurement: the "
-        "pre-correction resolver denied it. Closing it needs a verb split rule 3 does not have -- "
-        "`clean` and `reset --hard` must keep allowing. strict=True so the day it is fixed this row "
-        "goes XPASS and forces its own removal rather than rotting green."
-    ),
-)
-def test_a_repository_token_cannot_move_a_governed_HEAD_either(
-    repo: SimpleNamespace, tmp_path: Path
-) -> None:
-    """The gap the row above stops short of, pinned so it cannot be forgotten or re-derived.
+#: The one line that turns on rule 3's verb split (BACKLOG #1869). Rewriting it to ``if ($false) {``
+#: rebuilds the gate as it stood before the split, byte for byte everywhere else, so a control can
+#: measure that a deny STARTED firing rather than assert it (the BACKLOG #1229 discipline).
+VERB_SPLIT_GUARD = "if (-not $headRoot) {"
 
-    ``checkout`` moves HEAD without rewriting the files, so a co-tenant session standing in the
-    primary sees modifications it never made -- verbatim the harm rule 3's own deny text describes.
-    The row above proves the tree is safe; this one records that the same token class is NOT safe for
-    HEAD, and that rule 3b does not cover it (3b judges a linked worktree's HEAD, not a repository
-    named by ``--git-dir`` from outside).
+
+@pytest.fixture
+def pre_split_gate(tmp_path: Path) -> Path:
+    """The gate with the #1869 verb split switched off, rebuilt from the shipped file.
+
+    The rewrite is ASSERTED to have happened: a pattern that silently matched nothing would hand back
+    the gate under test, and the pair would then agree for the wrong reason.
     """
-    subprocess.run(
-        ["git", "branch", "sidebranch"], cwd=str(repo.primary), check=True, capture_output=True
+    src = GATE.read_text(encoding="utf-8")
+    assert src.count(VERB_SPLIT_GUARD) == 1, (
+        "the verb-split guard moved or was reformatted, so this control no longer rebuilds the "
+        "pre-#1869 gate. Fix VERB_SPLIT_GUARD rather than deleting the control."
     )
+    dst = tmp_path / "worktree_gate_pre_split.ps1"
+    dst.write_text(src.replace(VERB_SPLIT_GUARD, "if ($false) {"), encoding="utf-8")
+    return dst
+
+
+def _side_branch(repo: SimpleNamespace) -> str:
+    """A branch one commit ahead of main that ADDS a file and touches none, so a checkout or reset
+    run from an empty ungoverned cwd succeeds instead of refusing over local changes. Returns its SHA."""
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=str(repo.primary), check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("checkout", "-q", "-b", "sidebranch")
+    (repo.primary / "side.txt").write_text("side\n", encoding="utf-8")
+    git("add", "side.txt")
+    git("commit", "-qm", "side")
+    git("checkout", "-q", "main")
+    return git("rev-parse", "sidebranch")
+
+
+def _primary_head(repo: SimpleNamespace) -> tuple[str, str]:
+    """(the ref HEAD names, the commit it names) -- the two things a HEAD move can change."""
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=str(repo.primary), check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    return git("symbolic-ref", "-q", "HEAD"), git("rev-parse", "HEAD")
+
+
+def test_a_repository_token_cannot_move_a_governed_HEAD_either(
+    repo: SimpleNamespace, tmp_path: Path, pre_split_gate: Path
+) -> None:
+    """The gap the tree row above stops short of, now CLOSED by rule 3's verb split (BACKLOG #1869).
+
+    ``checkout`` moves HEAD without rewriting the primary's files, so a co-tenant session standing in
+    the primary sees modifications it never made. This row shipped as a strict xfail under an owner
+    ruling of 2026-09-21 until the split existed; it is a plain row now.
+
+    Three legs, and each one guards a different way the row could pass for the wrong reason:
+      * the pre-split gate ALLOWS, so the deny is attributable to the split and not to something else;
+      * the shipped gate DENIES, with text that names the HEAD and not the working tree;
+      * run for real, the command really moves the primary's HEAD, so the deny is not a false one.
+    """
+    before = _primary_head(repo)
+    _side_branch(repo)
     ungoverned = tmp_path / "Ungoverned-head"
     ungoverned.mkdir()
     command = f'git --git-dir "{repo.primary}/.git" checkout sidebranch'
+    payload = shell(command, cwd=ungoverned)
+
+    assert run_gate(payload, repo.repos, gate=pre_split_gate) is None, (
+        "the pre-split gate already denied this, so the row no longer measures the split"
+    )
+    reason = assert_denied(run_gate(payload, repo.repos))
+    assert "would move that checkout's HEAD" in reason
+    assert "working tree of the SHARED PRIMARY" not in reason  # the tree is not what moves
+
+    subprocess.run(
+        ["git", "--git-dir", f"{repo.primary}/.git", "checkout", "-q", "sidebranch"],
+        cwd=str(ungoverned),
+        check=True,
+        capture_output=True,
+    )
+    after = _primary_head(repo)
+    assert before[0] == "refs/heads/main"
+    assert after[0] == "refs/heads/sidebranch", "the command did not move the governed HEAD"
+
+
+#: HEAD-moving verbs, each with its argument shape, driven through a repository token from an
+#: ungoverned cwd. The value is everything after the verb.
+REPOSITORY_TOKEN_HEAD_MOVES = [
+    ("checkout", "sidebranch"),
+    ("switch", "sidebranch"),
+    ("reset", "--hard sidebranch"),
+    ("reset", "--soft HEAD~1"),
+    ("rebase", "sidebranch"),
+    ("merge", "sidebranch"),
+    ("cherry-pick", "sidebranch"),
+    ("revert", "HEAD"),
+    ("am", "patch.mbox"),
+]
+
+
+@pytest.mark.parametrize(("verb", "args"), REPOSITORY_TOKEN_HEAD_MOVES)
+@pytest.mark.parametrize("spelling", ["flag", "equals", "env-prefix"])
+def test_every_HEAD_moving_verb_denies_through_a_repository_token(
+    repo: SimpleNamespace, tmp_path: Path, verb: str, args: str, spelling: str
+) -> None:
+    """The split, verb by verb and spelling by spelling. One launch per row, which is the budget unit
+    the harness diagnostic above sizes its timeout in."""
+    gitdir = f"{repo.primary}/.git"
+    command = {
+        "flag": f'git --git-dir "{gitdir}" {verb} {args}',
+        "equals": f'git --git-dir="{gitdir}" {verb} {args}',
+        "env-prefix": f'GIT_DIR="{gitdir}" git {verb} {args}',
+    }[spelling]
+    ungoverned = tmp_path / "Ungoverned-verbs"
+    ungoverned.mkdir()
+    reason = assert_denied(run_gate(shell(command, cwd=ungoverned), repo.repos))
+    assert "would move that checkout's HEAD" in reason, command
+
+
+#: Spellings the first cut of the split let through, each measured ALLOW by review before the repair.
+#: Every one really moves the governed HEAD (the trailing `--` was checked against real git).
+REPOSITORY_TOKEN_SPELLINGS_THAT_MOVE_HEAD = [
+    # A tree-only verb earlier on the line used to be the only verb the split judged.
+    'git stash list && git --git-dir="{gitdir}" checkout sidebranch',
+    "git clean -n; git --git-dir={gitdir} checkout sidebranch",
+    'git checkout -- seed.txt && git --git-dir="{gitdir}" checkout sidebranch',
+    # A TRAILING `--` has no pathspec after it, so git switches branches.
+    'git --git-dir "{gitdir}" checkout sidebranch --',
+    # Single-quoted repository tokens.
+    "git --git-dir='{gitdir}' checkout sidebranch",
+    "GIT_DIR='{gitdir}' git checkout sidebranch",
+    # A `--` inside a quoted message on an EARLIER command, or inside a comment, is not an argument.
+    'git commit -m "fix checkout -- x" && git --git-dir="{gitdir}" checkout sidebranch',
+    'git --git-dir "{gitdir}" checkout sidebranch # -- note',
+    # A quoted commit survives blanking as a positional.
+    'git --git-dir "{gitdir}" reset --hard "sidebranch"',
+]
+
+
+@pytest.mark.parametrize("template", REPOSITORY_TOKEN_SPELLINGS_THAT_MOVE_HEAD)
+def test_the_split_reads_every_verb_and_every_quote_spelling(
+    repo: SimpleNamespace, tmp_path: Path, template: str
+) -> None:
+    """The review round's fail-opens, one row each, so a later narrowing reopens a named row."""
+    command = template.format(gitdir=f"{repo.primary}/.git")
+    ungoverned = tmp_path / "Ungoverned-spellings"
+    ungoverned.mkdir()
+    reason = assert_denied(run_gate(shell(command, cwd=ungoverned), repo.repos))
+    assert "would move that checkout's HEAD" in reason, command
+
+
+def test_a_trailing_double_dash_really_switches_branches(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """Why `checkout <branch> --` is on the deny side: git reads it as a branch switch, not a restore."""
+    _side_branch(repo)
+    ungoverned = tmp_path / "Ungoverned-dashdash"
+    ungoverned.mkdir()
+    subprocess.run(
+        ["git", "--git-dir", f"{repo.primary}/.git", "checkout", "-q", "sidebranch", "--"],
+        cwd=str(ungoverned),
+        check=True,
+        capture_output=True,
+    )
+    assert _primary_head(repo)[0] == "refs/heads/sidebranch"
+
+
+def test_a_reset_that_names_a_commit_really_moves_the_governed_HEAD(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """Why ``reset <commit>`` is on the deny side of the split while bare ``reset --hard`` is not.
+
+    Pinned by consequence: the same token that leaves the primary's TREE alone repoints the branch its
+    HEAD names, so the primary's files silently stop matching its commit.
+    """
+    side = _side_branch(repo)
+    ungoverned = tmp_path / "Ungoverned-reset"
+    ungoverned.mkdir()
+    command = f'git --git-dir "{repo.primary}/.git" reset --hard sidebranch'
     assert_denied(run_gate(shell(command, cwd=ungoverned), repo.repos))
+    subprocess.run(
+        ["git", "--git-dir", f"{repo.primary}/.git", "reset", "-q", "--hard", "sidebranch"],
+        cwd=str(ungoverned),
+        check=True,
+        capture_output=True,
+    )
+    ref, commit = _primary_head(repo)
+    assert ref == "refs/heads/main" and commit == side, "the reset did not move the governed HEAD"
+    assert not (repo.primary / "side.txt").exists(), (
+        "the tree moved, so this is not a HEAD-only row"
+    )
+
+
+#: Shapes the split must NOT refuse. Every one is either tree-only, names no commit, or carries its
+#: repository token somewhere other than the invocation that owns the verb.
+REPOSITORY_TOKEN_STILL_ALLOWED = [
+    'git --git-dir "{gitdir}" clean -fd',
+    'git --git-dir="{gitdir}" reset --hard',
+    'GIT_DIR="{gitdir}" git reset --hard',
+    'git --git-dir "{gitdir}" reset -q --mixed',
+    'git --git-dir "{gitdir}" reset -- seed.txt',
+    'git --git-dir "{gitdir}" checkout sidebranch -- seed.txt',
+    'git --git-dir "{gitdir}" stash list',
+    'git --git-dir "{gitdir}" restore seed.txt',
+    # A redirection is not a commit argument.
+    'git --git-dir "{gitdir}" reset --hard 2>&1',
+    'git --git-dir "{gitdir}" reset --hard > out.txt',
+    # The token belongs to an EARLIER command; the checkout acts on the ungoverned cwd.
+    'git --git-dir "{gitdir}" log -1 && git checkout sidebranch',
+    # The token is inside a quoted message, which is data and not a repository selection.
+    'git merge -m "see --git-dir={gitdir}" sidebranch',
+]
+
+
+@pytest.mark.parametrize("template", REPOSITORY_TOKEN_STILL_ALLOWED)
+def test_the_split_leaves_tree_only_and_unowned_tokens_allowed(
+    repo: SimpleNamespace, tmp_path: Path, template: str
+) -> None:
+    """The other direction, and the reason the split is a split rather than a revert.
+
+    Handing the repository token back to rule 3 wholesale is what the tree row above measured as a
+    false deny. These rows fail if the split is quietly widened into that revert.
+    """
+    command = template.format(gitdir=f"{repo.primary}/.git")
+    ungoverned = tmp_path / "Ungoverned-allowed"
+    ungoverned.mkdir()
+    assert run_gate(shell(command, cwd=ungoverned), repo.repos) is None, command
+
+
+def test_a_repository_token_at_an_UNRELATED_repo_still_allows_a_HEAD_move(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The split judges WHICH repository the token names. A HEAD move in an ungoverned repository is
+    not this gate's business, from any cwd -- including a governed linked worktree."""
+    command = f'git --git-dir "{unrelated}/.git" checkout -b elsewhere'
+    assert run_gate(shell(command, cwd=repo.other), repo.repos) is None
+
+
+def test_a_repository_token_from_a_LINKED_worktree_cwd_denies_a_HEAD_move(
+    repo: SimpleNamespace,
+) -> None:
+    """The cwd the tree rows use for their linked-worktree arm. ``clean`` from here is allowed (pinned
+    above by test_GIT_DIR_does_not_reach_rules_3_and_3d); ``checkout`` through the same token moves the
+    PRIMARY's HEAD, which the linked worktree the session stands in does not protect.
+
+    The branch is one checked out NOWHERE, so git would really perform the switch; a branch live in
+    another worktree would be refused by git itself and the row would pin no consequence."""
+    _side_branch(repo)
+    gitdir = f"{repo.primary}/.git"
+    assert run_gate(shell(f'GIT_DIR="{gitdir}" git clean -fd', cwd=repo.other), repo.repos) is None
+    reason = assert_denied(
+        run_gate(shell(f'GIT_DIR="{gitdir}" git checkout sidebranch', cwd=repo.other), repo.repos)
+    )
+    assert "would move that checkout's HEAD" in reason
+
+
+@pytest.mark.parametrize(
+    ("tool", "template"),
+    [
+        ("Bash", 'export GIT_DIR="{gitdir}"; git checkout sidebranch'),
+        ("PowerShell", '$env:GIT_DIR="{gitdir}"; git checkout sidebranch'),
+    ],
+)
+def test_a_CARRIED_repository_token_denies_a_HEAD_move(
+    repo: SimpleNamespace, tmp_path: Path, tool: str, template: str
+) -> None:
+    """The environment spelling set by an EARLIER statement, which the invocation's own window cannot
+    see. Read the same way rule 3c reads it; the paired clean shows the carried value still reaches
+    only the HEAD-moving verbs."""
+    gitdir = f"{repo.primary}/.git"
+    ungoverned = tmp_path / "Ungoverned-carried"
+    ungoverned.mkdir()
+    command = template.format(gitdir=gitdir)
+    reason = assert_denied(run_gate(shell(command, cwd=ungoverned, tool=tool), repo.repos))
+    assert "would move that checkout's HEAD" in reason
+    tree_only = command.replace("git checkout sidebranch", "git clean -fd")
+    assert run_gate(shell(tree_only, cwd=ungoverned, tool=tool), repo.repos) is None
 
 
 def test_a_repository_token_owned_by_an_EARLIER_command_is_not_the_disarm_s_target(
