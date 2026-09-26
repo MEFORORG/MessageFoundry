@@ -615,6 +615,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   code drifts from it. The doc names the parts kept by hand, and the test does not check those for
   gaps. **Migration:** split a fixture file over the cap into smaller files.
   (`BACKLOG #1127`)
+- **The test harness's MLLP receivers, the IDE's Steps view sample, and `check`'s `.expect`
+  sidecars are now capped (ASVS 5.1.1).** The harness Receive tab, load sink and reconcile capture sink
+  each bound a frame at `DEFAULT_MAX_FRAME_BYTES` (16 MiB) and drop an over-cap frame's connection with
+  no ACK. The VS Code extension refuses a Steps view sample over 16 MiB when it is picked, and its own
+  read of that sample is capped. `messagefoundry check` reads each `.expect` sidecar under its
+  fixture's cap. A frame the harness accepts before a refusal in the same read still gets its ACK
+  before the connection drops, a delayed Receive-tab ACK included. `max_frame_bytes` and
+  `harness.reconcile capture --max-frame-bytes` read `0` as no cap, as the engine does, and refuse a
+  negative value. The File tab's watch pane caps each file at `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB),
+  checks the size before it reads, and skips an over-cap file with a logged, counted reason. The
+  inventory in [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) now lists the harness receivers and watch
+  pane as one upload row. It lists the live-debug sample choice as an IDE picker, and its test
+  checks both rows. ([BACKLOG #1127](docs/BACKLOG.md))
 - **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
   `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
   that topology the engine mints no certificate (ADR 0172 decision 3). So the

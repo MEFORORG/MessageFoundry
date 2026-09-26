@@ -103,6 +103,7 @@ Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTIN
 "../../harness/compose.py" = "harness/compose.py"
 "../../harness/file_panel.py" = "harness/file_panel.py"
 "../../harness/file_transport.py" = "harness/file_transport.py"
+"../../harness/frame_cap.py" = "harness/frame_cap.py"
 "../../harness/mllp.py" = "harness/mllp.py"
 "../../harness/monitor.py" = "harness/monitor.py"
 "../../harness/receive.py" = "harness/receive.py"

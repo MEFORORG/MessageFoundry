@@ -1328,20 +1328,26 @@ _DISPOSITION_ALIASES = {
 }
 
 
-def _expected_disposition(fixture_path: str | Path) -> str | None:
+def _expected_disposition(fixture_path: str | Path, *, cap: int) -> str | None:
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
     Returns the normalized disposition name (one of :data:`_DRYRUN_DISPOSITIONS`), or
     ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
-    Raises ``ValueError`` for an unreadable or unrecognized declaration (a fixture-authoring mistake).
+    Raises ``ValueError`` for an unreadable, over-cap or unrecognized declaration (a fixture-authoring
+    mistake). The sidecar is read under its fixture's ``cap``, so it never lands in memory whole
+    (ASVS 5.1.1, BACKLOG #1127).
     """
+    from messagefoundry.pipeline.dryrun import read_fixture
+
     sidecar = Path(f"{fixture_path}.expect")
     if not sidecar.is_file():
         return None
-    try:
-        raw = sidecar.read_text(encoding="utf-8").strip().upper()
-    except OSError as exc:
-        raise ValueError(f"cannot read {sidecar.name}: {exc}") from exc
+    data = read_fixture(
+        sidecar,
+        cap,
+        advice="an .expect sidecar holds one disposition name",
+    )
+    raw = data.decode("utf-8").strip().upper()
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:
         valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
@@ -1452,7 +1458,8 @@ def _check_dryrun(
         n for n, ic in reg.inbound.items() if ic.deployed and not ic.content_type.is_binary
     ]
     try:
-        message_sets = read_message_sets(mpath, inbound_names, cap=fixture_cap(reg))
+        cap = fixture_cap(reg)
+        message_sets = read_message_sets(mpath, inbound_names, cap=cap)
     except ValueError as exc:
         # An over-cap or unreadable fixture file (BACKLOG #1127) fails the gate with the reader's own
         # message rather than escaping as a traceback.
@@ -1470,7 +1477,7 @@ def _check_dryrun(
     )
     for label, path, raw, target in message_sets:
         try:
-            expected = _expected_disposition(path)
+            expected = _expected_disposition(path, cap=cap)
         except ValueError as exc:
             errors.append(f"{label}: {exc}")
             continue
