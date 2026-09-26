@@ -30,6 +30,7 @@ from messagefoundry.config.wiring import (  # noqa: E402
     Registry,
     build_inbound_connection,
 )
+from messagefoundry.parsing.dicom._inflate import DEFAULT_MAX_INFLATED_BYTES  # noqa: E402
 from messagefoundry.pipeline import wiring_runner  # noqa: E402
 from messagefoundry.pipeline.wiring_runner import RegistryRunner  # noqa: E402
 from messagefoundry.store import MessageStatus, MessageStore  # noqa: E402
@@ -187,17 +188,22 @@ def _clamp_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]
 
 
 @pytest.mark.parametrize(
-    ("configured", "shown"),
+    ("configured", "shown", "inflate"),
     [
-        (64 * _MIB, str(64 * _MIB)),
-        (wiring_runner._INGRESS_MAX_BYTES + 1, str(wiring_runner._INGRESS_MAX_BYTES + 1)),
-        # An explicit uncapped setting is the widest clamp of all: "no limit" becomes 16 MiB.
-        (None, "uncapped"),
-        (0, "uncapped"),
+        (64 * _MIB, str(64 * _MIB), 64 * _MIB),
+        (
+            wiring_runner._INGRESS_MAX_BYTES + 1,
+            str(wiring_runner._INGRESS_MAX_BYTES + 1),
+            wiring_runner._INGRESS_MAX_BYTES + 1,
+        ),
+        # An explicit uncapped setting is the widest clamp of all: "no limit" becomes 16 MiB, and
+        # the inflate bound falls to the codec default.
+        (None, "uncapped", DEFAULT_MAX_INFLATED_BYTES),
+        (0, "uncapped", DEFAULT_MAX_INFLATED_BYTES),
     ],
 )
 def test_a_clamped_cap_is_logged_at_build(
-    configured: int | None, shown: str, caplog: pytest.LogCaptureFixture
+    configured: int | None, shown: str, inflate: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #1962: an operator whose cap is clamped to the ingress ceiling is told so at build,
     with the connection name, the value they set and the ceiling."""
@@ -211,6 +217,27 @@ def test_a_clamped_cap_is_logged_at_build(
     assert repr(_NAME) in message
     assert f"max_object_bytes {shown} " in message
     assert f"ceiling of {wiring_runner._INGRESS_MAX_BYTES} bytes" in message
+    assert f"inflate bound is {inflate} bytes" in message
+
+
+def test_a_connection_that_is_refused_logs_no_clamp_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-loopback SCP with no peer control is refused at construction. It never runs, so it must
+    not also log a warning about its object limit."""
+    settings: dict[str, object] = {
+        "ae_title": _SCP_AE,
+        "host": "10.0.0.5",
+        "port": 0,
+        "max_object_bytes": 64 * _MIB,
+    }
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"),
+        pytest.raises(ValueError, match="no verifiable peer control"),
+    ):
+        DicomScpSource(Source(type=ConnectorType.DIMSE, name=_NAME, settings=settings))
+
+    assert _clamp_warnings(caplog) == []
 
 
 @pytest.mark.parametrize(
