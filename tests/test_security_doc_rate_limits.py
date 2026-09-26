@@ -573,7 +573,11 @@ def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
                 f"{factory}() now accepts the pacing keys, so the ingest row must name the "
                 f"{label} intake as covered rather than leave the reader to assume it is not"
             )
-            assert f"Not covered even when set:** the {label} inbound" not in block, (
+            # Lower-cased: the landmark is "**Still not covered even when set:**", which a
+            # capitalised "Not covered" never matched (BACKLOG #1518 review).
+            assert (
+                f"not covered even when set:** the {label.lower()} inbound" not in block.lower()
+            ), (
                 f"{factory}() now accepts the pacing keys, so the row may no longer list the "
                 f"{label} intake as uncovered"
             )

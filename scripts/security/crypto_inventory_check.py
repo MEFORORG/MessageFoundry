@@ -1242,6 +1242,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry_webconsole/_security.py": frozenset({"csprng:secrets.token_urlsafe"}),
     "scripts/asvs/anchor_report.py": frozenset({"hash:hashlib.sha256"}),
     "scripts/asvs/prove_report.py": frozenset({"hash:hashlib.sha256"}),
+    # BACKLOG #1396: the restatement report's header reuses anchor_report.provenance, the same
+    # truncated SHA-256 of the scorecard file. An identifier in a log line, nothing secret.
+    "scripts/asvs/restatement_report.py": frozenset({"hash:via scripts.asvs.anchor_report"}),
     "scripts/asvs/scorecard.py": frozenset({"hash:hashlib.sha256"}),
     "scripts/security/build_cla_action_provenance.py": frozenset(
         {"hash:hashlib.sha1", "hash:hashlib.sha256"}

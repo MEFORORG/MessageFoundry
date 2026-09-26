@@ -75,6 +75,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: the Windows config-source guard now refuses to load when it cannot finish reading an
+  ACL.** It used to log a WARNING and load the config Python unchecked. At least these now refuse the
+  load: a `GetNamedSecurityInfoW` error, an owner SID it cannot resolve, a DACL it cannot enumerate,
+  and an unreadable process token. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
+  WARNING for a dev/CI checkout, as it does every refusal from this guard. A `*.py` deleted between
+  the listing and the read is still skipped. The refusal now names the Windows error text. The
+  guard's decisions now run in tests on every platform; the ctypes reader itself still does not.
+  See ADR 0036 Amendment B. (`BACKLOG #1654`)
 - **BREAKING: `[api].serve_ui_explicit` is removed and refused at load, in the file and as
   `MEFOR_API_SERVE_UI_EXPLICIT`.** The loader set it when `[security].serve_web_console` was
   provided, so `serve` could tell an explicit console request from the default. It was an ordinary
@@ -180,6 +188,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
+  re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
+  binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on
+  first deployment. The step now runs the listeners' size check. It counts the bytes that binary
+  carriage holds and the characters of any other reply. The engine records an oversize reply as one
+  `ERROR` message with the listeners' wording and does not route it. The step gains the size check
+  only; the listeners' NUL and declared-type checks still do not run there. An HL7 loopback keeps
+  its peek check and its wording. SQL Server now also encrypts the error text of a re-ingress
+  `ERROR` message, as it does every other message error. (`BACKLOG #1914`)
 - **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
   is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
   handle still open on the extracted store, such as a scanner's, made the removal fail. The
@@ -382,6 +399,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   got that answer. On those two backends the insert is refused by the foreign key to the account.
   The engine now re-reads the account to tell the two refusals apart. SQL Server has no such foreign
   key, so there the insert is not refused and this change does not apply. (`BACKLOG #1807`)
+- **A missing or blank CRL path is now refused at load, naming the setting the operator wrote.**
+  Before, `[api].tls_client_crl_file`, `[logging].forward_tls_crl_file`, `[auth].oidc_tls_crl_file`
+  and `[tls].crl_file` had no load-time check. A missing path failed closed only if a hop's TLS
+  context was built, and that refusal began `[tls] crl file` for every one of them. Each now has its
+  own validator, the shape `[store].ssl_crl_file` already had, and all five refuse a blank value.
+  The refusal names the setting and the path, and nothing else. It applies even where the setting
+  has no effect, such as `[auth].oidc_tls_crl_file` with OIDC off. A CRL that exists but is expired
+  or unloadable is still refused when the context is built, under the old `[tls] crl file` prefix.
+  (`BACKLOG #1997`)
 - **An SFTP server that is slow to connect is now retried, not dead-lettered or treated as a bad
   credential.** A server that did not finish the SSH banner or key exchange within the connect
   timeout was classed as a permanent error, so the delivery would dead-letter on first deployment.
