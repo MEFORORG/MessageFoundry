@@ -55,6 +55,7 @@ from a pass — a control that cannot report its own inertness (ADR 0158's class
 
 from __future__ import annotations
 
+import functools
 import io
 import os
 import re
@@ -336,8 +337,11 @@ def _code_only(text: str) -> str:
     could not fire for a module whose prose names its own call: ``service.py`` names
     ``ShellExecute`` in prose and ``checks.py`` names ``subprocess.run`` in prose, so deleting the
     real call left each one in the set. Positions are kept, so a dotted spelling stays contiguous.
+
+    The lines are split the way tokenize splits them, on ``\n`` only. ``str.splitlines`` also
+    breaks on a form feed and other separators, which shifts every later row onto the wrong line.
     """
-    lines = text.splitlines(keepends=True)
+    lines = io.StringIO(text).readlines()
     for tok in tokenize.generate_tokens(io.StringIO(text).readline):
         if tok.type not in _PROSE_TOKENS:
             continue
@@ -348,6 +352,12 @@ def _code_only(text: str) -> str:
             end = col1 if row == row1 else len(line.rstrip("\r\n"))
             lines[row - 1] = line[:start] + " " * (end - start) + line[end:]
     return "".join(lines)
+
+
+@functools.cache
+def _code_text(path: Path) -> str:
+    """``_code_only`` of one engine file, cached: both site scans tokenize the whole package."""
+    return _code_only(path.read_text(encoding="utf-8"))
 
 
 # --- helpers ------------------------------------------------------------------------------------
@@ -952,7 +962,7 @@ def test_shell_execution_sites_are_exactly_the_documented_set() -> None:
     """
     found: set[str] = set()
     for path in _package_py_files():
-        text = _code_only(path.read_text(encoding="utf-8"))
+        text = _code_text(path)
         if any(token in text for token in _SHELL_TOKENS):
             found.add(path.relative_to(_PKG).as_posix())
     expected = set(_ALLOWED_SHELL_SITES)
@@ -1061,9 +1071,10 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
 #: subprocess inventory is COMPLETE and that "a CI guard asserts that set cannot grow silently" — a
 #: claim that was false while ``subprocess.call`` / ``check_call`` / ``check_output``, ``os.popen`` /
 #: ``posix_spawn`` / ``exec*``, ``multiprocessing.Process``, ``ProcessPoolExecutor`` and ``pty.spawn``
-#: were all invisible to it. (``pipeline/sandbox.py`` lists a bare ``"multiprocessing"`` in its
-#: FORBIDDEN-import set, which the ``multiprocessing\.Process`` alternative deliberately does not
-#: match; ``checks.py`` carries ``"os.popen"`` as a lint-trigger STRING and is already allow-listed.)
+#: were all invisible to it. The regex runs over ``_code_only`` text, so string literals such as
+#: ``pipeline/sandbox.py``'s FORBIDDEN-import ``"multiprocessing"`` and ``checks.py``'s lint-trigger
+#: ``"os.popen"`` never reach it (BACKLOG #1818). ``checks.py`` is listed for its real ``subprocess``
+#: call, not for that string.
 _SUBPROCESS_RE = re.compile(
     r"subprocess\.(?:run|Popen|call|check_call|check_output)"
     r"|create_subprocess_(?:exec|shell)"
@@ -1078,7 +1089,7 @@ def _subprocess_sites() -> set[str]:
     return {
         path.relative_to(_PKG).as_posix()
         for path in sorted(_PKG.rglob("*.py"))
-        if _SUBPROCESS_RE.search(_code_only(path.read_text(encoding="utf-8")))
+        if _SUBPROCESS_RE.search(_code_text(path))
     }
 
 
@@ -1093,6 +1104,8 @@ def test_site_scans_ignore_mentions() -> None:
     code = _code_only(mention)
     assert not _SUBPROCESS_RE.search(code), "a mention was read as a process spawn"
     assert not any(token in code for token in _SHELL_TOKENS), "a mention was read as a shell site"
+    # A form feed is legal Python. Before it, tokenize rows and the blanking rows disagreed.
+    assert not _SUBPROCESS_RE.search(_code_only("import os\n\x0c\n# x\nM = 'subprocess.run'\n"))
     real = "subprocess.run(argv, shell=True, check=True)\nos.system(cmd)\n"
     code = _code_only(real)
     assert _SUBPROCESS_RE.search(code), "a real subprocess.run call was not found"
