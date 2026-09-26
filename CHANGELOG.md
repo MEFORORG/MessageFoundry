@@ -147,6 +147,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   removed nor emptied, the verify names the directory to delete: a `PASS` becomes `FAIL`, another
   verdict keeps its status, and an exception carries it as a note.
   `docs/PHI.md` says the same. (`BACKLOG #1721`)
+- **A failed federated sign-in now answers at the same fixed deadline as the other sign-in
+  paths.** `complete_oidc_login` and `authenticate_oidc` returned their refusals as soon as they
+  were decided. A refusal after the token exchange, such as an unlinked identity, a disabled or
+  locked account, or an account the directory no longer holds, costs more store and directory work
+  than one before it, so its timing could tell them apart. Both now hold every failed outcome to
+  the deadline the password and Windows SSO paths already use (ASVS 6.3.8). A success is not
+  delayed.
+  (`BACKLOG #1947`)
 - **A bad authorization code no longer hides the federated sign-in link.** A token endpoint that
   refuses the code a caller presents answers with HTTP 400, and the engine used to read that as
   an identity provider outage. That set `oidc_available` to false, which hides the link on

@@ -60,6 +60,16 @@ NONCE = "n-oidc-1"
 # --- helpers ---------------------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_failure_pad(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A failed federated sign-in is padded to a deadline in real time (BACKLOG #1947);
+    # tests/test_asvs_login_deadline.py owns that property and nothing here asserts on timing.
+    async def _no_sleep(deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
+
+
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
     return rsa.generate_private_key(public_exponent=65537, key_size=3072)
@@ -1447,7 +1457,7 @@ async def test_an_unbind_tells_the_holder(rsa_key: rsa.RSAPrivateKey) -> None:
 
 
 class _PadSpy:
-    """Records each seam the service padded under, and replaces the sleep so nothing waits."""
+    """Records each seam the service padded under. The module's autouse fixture stops the wait."""
 
     def __init__(self, service: AuthService, monkeypatch: pytest.MonkeyPatch) -> None:
         self.seams: list[str] = []
@@ -1458,11 +1468,7 @@ class _PadSpy:
                 self.seams.append(seam)
             return await real(outcome, started, seam=seam)
 
-        async def no_sleep(_deadline: float) -> None:
-            return None
-
         monkeypatch.setattr(service, "_equalize_failure", spy)
-        monkeypatch.setattr("messagefoundry.auth.service._sleep_until", no_sleep)
 
 
 def _verified(subject: str = DEFAULT_SUB) -> oidc.FederatedPrincipal:

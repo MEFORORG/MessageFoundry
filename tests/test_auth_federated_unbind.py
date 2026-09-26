@@ -32,6 +32,16 @@ from messagefoundry.store.store import MessageStore
 from tests.test_auth_oidc_service import _oidc_login, _service
 
 
+@pytest.fixture(autouse=True)
+def _no_failure_pad(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A failed federated sign-in is padded to a deadline in real time (BACKLOG #1947);
+    # tests/test_asvs_login_deadline.py owns that property and nothing here asserts on timing.
+    async def _no_sleep(deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
+
+
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
     """Local rather than imported: a fixture resolves by name in the module that requests it, so
