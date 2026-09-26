@@ -9,8 +9,9 @@ authentication path:
   one opener both legs share (:func:`messagefoundry.auth.oidc_http.build_idp_opener`). Substituting this
   PEM permits JWKS substitution and forged id_tokens.
 * ``[auth].ad_tls_ca_cert_file`` — trusts the AD LDAPS bind (:mod:`messagefoundry.auth.ldap`).
-  Substituting this PEM permits an LDAPS MITM. It has **no** opener-construction seam, so its check
-  lives in the central preflight below (per the #285 binding correction).
+  Substituting this PEM permits an LDAPS MITM. ``LdapAuthenticator`` checks it at construction and
+  hands ``ldap3`` the checked bytes (BACKLOG #2034), and the central preflight below checks it again at
+  start and at every reload.
 * ``[api].tls_client_ca_file`` — the in-process mTLS console client-CA (:mod:`messagefoundry.api.tls`),
   which maps a verified peer cert to a principal with no bearer token. Substituting it admits a forged
   client cert.
@@ -41,9 +42,10 @@ runs, no audit rows, no new settings effects):
 5. **The checked bytes are the loaded bytes** (BACKLOG #1142, slice 2). :func:`evaluate_anchor` reads
    the file once and keeps the bytes it hashed. :func:`verified_anchor_cadata` hands those bytes to the
    TLS context as ``cadata=``, so no consumer that builds a context opens the file a second time.
-   Before this, a file swapped between the check and the load was trusted unchecked. **Not
-   covered:** the AD anchor, which ``ldap3`` still reads by path on every bind, and the audit row of
-   the central preflight, which records its own read rather than the consumer's.
+   Before this, a file swapped between the check and the load was trusted unchecked. The AD anchor
+   joined in BACKLOG #2034: ``ldap3`` used to read it by path on every bind, and now gets the checked
+   bytes as ``ca_certs_data``. **Not covered:** the audit row of the central preflight, which records
+   its own read rather than the consumer's.
 6. **An indeterminate read refuses at ``enforce``, and a matching pin is the escape** (BACKLOG #1142,
    slice 3). When the ACL or the path could not be settled, the engine cannot say who else can
    replace the anchor, so ``enforce`` refuses to load it. A configured SHA-256 pin that matches the
@@ -113,17 +115,16 @@ class AnchorSpec:
     the configured PEM; ``pin`` is the optional configured SHA-256 pin (any case, optional ``:``
     separators); ``pin_setting`` names where that pin is set, so a refusal can name the escape.
 
-    ``loads_verified_bytes`` says whether the consumer loads the bytes the check read (slice 2's
-    ``cadata=``). It is ``False`` for the AD anchor alone, which ``ldap3`` reads by path on every
-    bind. A pin cannot stand in for an unreadable ACL or path there, and the PEM shape checks
-    (:func:`anchor_cadata`) do not apply, because ``cafile=`` reads what ``cadata=`` refuses."""
+    Every consumer loads the bytes the check read (slice 2's ``cadata=``), never the file again. That
+    is what lets a matching pin stand in for an unreadable ACL or path, and why every anchor takes
+    the PEM shape checks of :func:`anchor_cadata`. The AD anchor was the one exception, read by path
+    on every bind, until BACKLOG #2034; a consumer that reads by path again must not reuse this."""
 
     label: str
     setting: str
     path: str
     pin: str | None = None
     pin_setting: str | None = None
-    loads_verified_bytes: bool = True
 
 
 @dataclass(frozen=True)
@@ -741,12 +742,6 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
         if windows
         else "a root-owned 755 folder like /etc/messagefoundry/"
     )
-    if not spec.loads_verified_bytes:
-        return (
-            f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-            f"{folder}. A pin does not help here: this anchor is read again by path each time it "
-            "is used, so a pin cannot vouch for the bytes loaded."
-        )
     pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
     return (
         f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
@@ -765,9 +760,7 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
       replace is a finding, not an unknown.
     * An ACL or path that could not be read refuses at ``enforce`` and warns at ``warn`` (BACKLOG
       #1142, slice 3). **A configured pin that matches is the escape**: it warns and loads, at either
-      dial, because the bytes it matched are the bytes the context loads. Not for an anchor whose
-      consumer reads the file again (``loads_verified_bytes`` False, the AD anchor): there the pin
-      matched bytes nobody loads."""
+      dial, because the bytes it matched are the bytes the context loads."""
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
@@ -789,7 +782,7 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
     # BACKLOG #1142, slice 3. Slice 2 made the checked bytes the loaded bytes, which is what lets a
     # pin stand in for a read the file system would not give.
     unknown = _indeterminate_message(spec, verdict)
-    if verdict.pin_ok is True and spec.loads_verified_bytes:
+    if verdict.pin_ok is True:
         log.warning(
             "%s\n%s matches the bytes read, and those are the bytes loaded, so it is loaded anyway",
             unknown,
@@ -849,6 +842,21 @@ def api_client_anchor_spec(api: ApiSettings) -> AnchorSpec | None:
         api.tls_client_ca_file,
         api.tls_client_ca_pin,
         "[api].tls_client_ca_pin",
+    )
+
+
+def ad_anchor_spec(auth: AuthSettings) -> AnchorSpec | None:
+    """The ``[auth].ad_tls_ca_cert_file`` anchor spec, or ``None`` when unset. One spelling for the
+    central preflight and for :class:`~messagefoundry.auth.ldap.LdapAuthenticator`, which loads the
+    bytes it checks (BACKLOG #2034)."""
+    if not auth.ad_tls_ca_cert_file:
+        return None
+    return AnchorSpec(
+        "ad",
+        "[auth].ad_tls_ca_cert_file",
+        auth.ad_tls_ca_cert_file,
+        auth.ad_tls_ca_cert_pin,
+        "[auth].ad_tls_ca_cert_pin",
     )
 
 
@@ -994,17 +1002,9 @@ def collect_anchor_specs(auth: AuthSettings, api: ApiSettings) -> list[AnchorSpe
     specs: list[AnchorSpec] = []
     if auth.oidc_tls_ca_cert_file:
         specs.append(oidc_anchor_spec(auth.oidc_tls_ca_cert_file, auth.oidc_tls_ca_cert_pin))
-    if auth.ad_tls_ca_cert_file:
-        specs.append(
-            AnchorSpec(
-                "ad",
-                "[auth].ad_tls_ca_cert_file",
-                auth.ad_tls_ca_cert_file,
-                auth.ad_tls_ca_cert_pin,
-                "[auth].ad_tls_ca_cert_pin",
-                loads_verified_bytes=False,  # ldap3 reads it by path on every bind
-            )
-        )
+    ad_spec = ad_anchor_spec(auth)
+    if ad_spec is not None:
+        specs.append(ad_spec)
     api_spec = api_client_anchor_spec(api)
     if api_spec is not None:
         specs.append(api_spec)
@@ -1062,15 +1062,14 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     **It applies every check a consumer applies**, the PEM shape of :func:`anchor_cadata` included
     (BACKLOG #1142, slice 3). The reload route runs this and builds no context, so before this a
     reload accepted an anchor with no PEM block, or a ``TRUSTED CERTIFICATE`` block, that the next
-    start refuses. The AD anchor skips the shape check: its consumer reads ``cafile=``, which loads
-    a ``TRUSTED CERTIFICATE`` block, so refusing one here would refuse what the start accepts."""
+    start refuses. The AD anchor takes it too since BACKLOG #2034, when its bind moved to the
+    checked bytes."""
     verdict = await asyncio.to_thread(evaluate_anchor, spec)
     shape_error: TrustAnchorError | None = None
-    if spec.loads_verified_bytes:  # the AD anchor's consumer reads cafile=, which has no such rule
-        try:
-            anchor_cadata(verdict.data, spec)
-        except TrustAnchorError as exc:
-            shape_error = exc
+    try:
+        anchor_cadata(verdict.data, spec)
+    except TrustAnchorError as exc:
+        shape_error = exc
     previous = await _last_fingerprint(store, spec.label)
     if previous is None:
         await _record(store, spec, "observed", fingerprint=verdict.fingerprint)
@@ -1133,6 +1132,40 @@ async def run_anchor_preflight(
     the reload."""
     for spec in specs:
         await _preflight_one(store, spec, enforcing=enforcing)
+
+
+def make_settings_anchor_preflight(
+    specs: Sequence[AnchorSpec], store: Store, *, enforcing: bool
+) -> Callable[[], Awaitable[None]] | None:
+    """The engine's ``settings_preflight`` for ``serve``: :func:`run_anchor_preflight` over the
+    settings anchors (:func:`collect_anchor_specs`), run by the engine on EVERY real reload. That is
+    the direct ``/config/reload`` route, a held reload a second approver releases, a cluster
+    convergence reload and a DR profile reload (BACKLOG #2034). Before this only the direct route ran
+    it, from ``api/``, where the other three never pass.
+
+    ``None`` when no settings anchor is configured, so the engine skips it: no store call, no audit
+    row. A refusal is re-raised as ``WiringError`` caused by a :class:`TrustAnchorError`, so the reload
+    route answers 422 and audits ``reason="trust_anchor"``, as it did when it ran this itself. An
+    unreadable anchor (``OSError``, or ``ValueError`` from a NUL in its path) counts as a refused
+    anchor, as it did there."""
+    if not specs:
+        return None
+    from messagefoundry.config.wiring import WiringError
+
+    frozen = tuple(specs)
+
+    async def preflight() -> None:
+        try:
+            await run_anchor_preflight(frozen, store, enforcing=enforcing)
+        except TrustAnchorError as exc:
+            raise WiringError(f"a settings trust anchor was refused: {exc}") from exc
+        except (OSError, ValueError) as exc:
+            # An unreadable anchor is a refused anchor, as it was when the reload route ran this.
+            unreadable = TrustAnchorError(f"a trust anchor could not be read: {exc}")
+            unreadable.__cause__ = exc
+            raise WiringError(f"a settings trust anchor was refused: {unreadable}") from unreadable
+
+    return preflight
 
 
 def make_registry_anchor_preflight(

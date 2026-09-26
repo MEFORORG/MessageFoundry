@@ -11,6 +11,7 @@ import os
 import re
 import ssl
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1041,10 +1042,12 @@ async def test_the_graph_preflight_is_dormant_without_an_inbound_ca(
 # --- QA round one (BACKLOG #1142, slice 3) ---------------------------------------------------------
 
 
-def test_the_ad_anchor_has_no_pin_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """ldap3 reads [auth].ad_tls_ca_cert_file by path on every bind, so the bytes a pin matched are
-    not the bytes loaded, and the pin cannot stand in for an unreadable ACL or path. Red under: the
-    escape keyed on pin_ok alone."""
+def test_the_ad_anchor_has_the_pin_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #2034 changed this deliberately. Until then ldap3 read [auth].ad_tls_ca_cert_file by
+    path on every bind, so the bytes a pin matched were not the bytes loaded, and this test pinned
+    the AD anchor OUT of the pin escape. The bind now loads the checked bytes as ca_certs_data, so a
+    matching pin vouches for what is loaded, exactly as it does for every other anchor. Red under:
+    the pin escape still refusing the AD anchor."""
     body = _block(b"body")
     p = _pem(tmp_path, body)
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
@@ -1053,29 +1056,34 @@ def test_the_ad_anchor_has_no_pin_escape(tmp_path: Path, monkeypatch: pytest.Mon
         ad_tls_ca_cert_file=str(p), ad_tls_ca_cert_pin=hashlib.sha256(body).hexdigest()
     )
     (spec,) = collect_anchor_specs(auth, ApiSettings())
-    assert spec.label == "ad" and spec.loads_verified_bytes is False
+    assert spec.label == "ad"
+    enforce_anchor(spec, enforcing=True)
+    # The control: with no pin, the same unjudged anchor still refuses at enforce and offers the pin.
+    (unpinned,) = collect_anchor_specs(AuthSettings(ad_tls_ca_cert_file=str(p)), ApiSettings())
     with pytest.raises(TrustAnchorError) as err:
-        enforce_anchor(spec, enforcing=True)
+        enforce_anchor(unpinned, enforcing=True)
     text = str(err.value)
-    assert "A pin does not help here" in text and "tls_ca_cert_pin to" not in text
-    # The control: the same verdict and pin on an anchor whose consumer loads the checked bytes.
-    api = AnchorSpec("api_client", "[x]", str(p), hashlib.sha256(body).hexdigest())
-    enforce_anchor(api, enforcing=True)
+    assert "set [auth].ad_tls_ca_cert_pin to" in text and "A pin does not help here" not in text
 
 
-async def test_the_reload_does_not_refuse_an_ad_trusted_certificate_block(
+async def test_the_start_and_the_reload_refuse_an_ad_trusted_certificate_block_alike(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The AD consumer reads cafile=, which loads a TRUSTED CERTIFICATE block, so the reload must not
-    refuse what the start accepts there. The same file on a cadata= anchor refuses."""
+    """BACKLOG #2034 changed this deliberately. The AD consumer used to read cafile=, which loads a
+    TRUSTED CERTIFICATE block, so the reload let one through. It now loads cadata=, which skips the
+    block silently, so the bind refuses it at construction and the reload must refuse it too."""
+    from messagefoundry.auth.ldap import LdapAuthenticator
+    from tests.test_tls_cipher_assertion_sites import _ad_settings
+
     p = _pem(tmp_path, b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n")
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
-    (ad,) = collect_anchor_specs(AuthSettings(ad_tls_ca_cert_file=str(p)), ApiSettings())
-    await run_anchor_preflight([ad], store, enforcing=True)
-    api = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
+    settings = _ad_settings(ad_tls_ca_cert_file=str(p))
+    (ad,) = collect_anchor_specs(settings, ApiSettings())
     with pytest.raises(TrustAnchorError, match="TRUSTED CERTIFICATE"):
-        await run_anchor_preflight([api], store, enforcing=True)
+        await run_anchor_preflight([ad], store, enforcing=True)
+    with pytest.raises(TrustAnchorError, match="TRUSTED CERTIFICATE"):
+        LdapAuthenticator(settings)
 
 
 @pytest.mark.parametrize(
@@ -1166,6 +1174,203 @@ async def test_the_reload_route_audits_an_inbound_anchor_refusal_as_trust_anchor
         assert reasons == ["invalid_config", "trust_anchor"]
     finally:
         await engine.stop()
+
+
+# --- every reload route runs the settings-anchor preflight (BACKLOG #2034) -------------------------
+#
+# Before #2034 only the direct /config/reload route ran it, from api/, so a held reload a second
+# approver released, a cluster convergence reload and a DR profile reload all skipped it. The engine
+# now runs it first on every real reload, through a callback `serve` hands it, since pipeline/ must
+# never import api/. Each test swaps a pinned AD anchor after "startup" and drives one route.
+
+
+def _file_graph(cfg: Path) -> None:
+    """A graph with a File inbound: going live binds no port, so a control can run it in parallel."""
+    cfg.mkdir()
+    (cfg.parent / "in").mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import File, Send, handler, inbound, outbound, router\n"
+        f"inbound('IB_IN', File(directory={str(cfg.parent / 'in')!r}, poll_seconds=1.0), "
+        "router='r')\n"
+        f"outbound('OUT', File(directory={str(cfg.parent / 'out')!r}))\n" + _GRAPH_TAIL,
+        encoding="utf-8",
+    )
+
+
+def _pinned_ad_anchor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[AnchorSpec, Path]:
+    """The AD settings anchor, pinned to the bytes on disk, with its ACL and path judged clean."""
+    good = _block(b"good")
+    p = tmp_path / "ad-ca.pem"
+    p.write_bytes(good)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    auth = AuthSettings(
+        ad_tls_ca_cert_file=str(p), ad_tls_ca_cert_pin=hashlib.sha256(good).hexdigest()
+    )
+    (spec,) = collect_anchor_specs(auth, ApiSettings())
+    return spec, p
+
+
+async def _anchored_engine(
+    tmp_path: Path, spec: AnchorSpec, *, with_config_dir: bool = True
+) -> tuple[Any, Path]:
+    from messagefoundry.pipeline import Engine
+
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    store = await MessageStore.open(tmp_path / "e.db")
+    engine = Engine(
+        store,
+        config_dir=cfg if with_config_dir else None,
+        settings_preflight=ta.make_settings_anchor_preflight([spec], store, enforcing=True),
+    )
+    return engine, cfg
+
+
+async def _convergence(engine: Any, _cfg: Path) -> None:
+    await engine._converge_reload()
+
+
+async def _dr_profile(engine: Any, _cfg: Path) -> None:
+    await engine._dr_activate_profile()
+
+
+async def _direct(engine: Any, cfg: Path) -> None:
+    await engine.reload_detail(cfg, propagate=True)
+
+
+_ROUTES = [
+    pytest.param(_direct, id="direct"),
+    pytest.param(_convergence, id="convergence"),
+    pytest.param(_dr_profile, id="dr"),
+]
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+async def test_every_reload_route_refuses_a_swapped_settings_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: Any
+) -> None:
+    """Red under: the engine not running the settings preflight (the convergence and DR routes then
+    go live on a substituted anchor). The control is the same route before the swap, which goes
+    live and records no pin mismatch."""
+    from messagefoundry.config.wiring import WiringError
+
+    spec, anchor = _pinned_ad_anchor(tmp_path, monkeypatch)
+    engine, cfg = await _anchored_engine(tmp_path, spec)
+    try:
+        await engine.reload_detail(cfg)  # a graph goes live; the DR route only acts on a live one
+        before = engine.registry_runner.registry
+        await route(engine, cfg)  # the control: an unchanged anchor reloads
+        live = engine.registry_runner.registry
+        assert live is not before  # the control really reloaded
+        assert "pin_mismatch" not in {r["event"] for r in await _rows(engine.store, "ad")}
+
+        anchor.write_bytes(_block(b"evil"))  # swapped after the check that started it
+        with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+            await route(engine, cfg)
+        assert isinstance(err.value.__cause__, TrustAnchorError)
+        assert engine.registry_runner.registry is live  # nothing was swapped
+        assert "pin_mismatch" in {r["event"] for r in await _rows(engine.store, "ad")}
+    finally:
+        await engine.stop()
+
+
+async def test_the_dr_profile_reload_without_a_config_dir_refuses_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DR profile reload re-runs the live graph in place when the engine has no config dir, and
+    that branch never reaches reload_detail, so it runs the preflight itself. A refusal also leaves
+    the DR latch off, or the next reload would park feeds on a box that is not DR-active."""
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    spec, anchor = _pinned_ad_anchor(tmp_path, monkeypatch)
+    good = anchor.read_bytes()
+    engine, cfg = await _anchored_engine(tmp_path, spec, with_config_dir=False)
+    reloaded: list[object] = []
+    try:
+        rr = engine.add_registry(load_config(cfg))
+
+        async def spy(registry: object) -> None:
+            reloaded.append(registry)
+
+        monkeypatch.setattr(rr, "reload", spy)
+        anchor.write_bytes(_block(b"evil"))
+        with pytest.raises(WiringError, match="a settings trust anchor was refused"):
+            await engine._dr_activate_profile()
+        assert reloaded == []  # the graph was not re-applied
+        assert engine.dr_active is False  # and the latch did not stay on
+
+        anchor.write_bytes(good)  # the control: the pinned anchor back, and it re-applies
+        await engine._dr_activate_profile()
+        assert len(reloaded) == 1 and engine.dr_active is True
+    finally:
+        await engine.stop()
+
+
+async def test_a_dry_run_skips_the_settings_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As the reload route always did: a dry run swaps nothing, and the preflight writes audit rows."""
+    spec, anchor = _pinned_ad_anchor(tmp_path, monkeypatch)
+    anchor.write_bytes(_block(b"evil"))
+    engine, cfg = await _anchored_engine(tmp_path, spec)
+    try:
+        outcome = await engine.reload_detail(cfg, dry_run=True)
+        assert outcome.applied is False
+        assert await _rows(engine.store) == []
+    finally:
+        await engine.stop()
+
+
+def test_the_settings_preflight_is_dormant_without_a_settings_anchor(tmp_path: Path) -> None:
+    assert ta.make_settings_anchor_preflight([], object(), enforcing=True) is None  # type: ignore[arg-type]
+
+
+async def test_the_settings_preflight_refuses_an_unreadable_anchor_as_an_anchor(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The reload route counted a missing anchor file as reason="trust_anchor"; it still does."""
+    from messagefoundry.config.wiring import WiringError
+
+    missing = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(tmp_path / "gone.pem"), None)
+    preflight = ta.make_settings_anchor_preflight([missing], store, enforcing=True)
+    assert preflight is not None
+    with pytest.raises(WiringError) as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert isinstance(err.value.__cause__.__cause__, OSError)
+
+
+async def test_the_reload_route_still_refuses_a_swapped_settings_anchor_the_same_way(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the move: the direct route, through the real managed-app wiring, refuses a
+    swapped settings anchor with a 422 and a config_reload_failed row whose reason is trust_anchor,
+    exactly as it did when it ran the preflight itself. A dry run still passes."""
+    import httpx
+
+    from messagefoundry.api.app import create_managed_app
+
+    spec, anchor = _pinned_ad_anchor(tmp_path, monkeypatch)
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(db_path=tmp_path / "m.db", config_dir=cfg, trust_anchor_specs=[spec])
+    async with app.router.lifespan_context(app):
+        engine = app.state.engine
+        live = engine.registry_runner.registry
+        anchor.write_bytes(_block(b"evil"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post("/config/reload", json={})
+            assert r.status_code == 422, r.text
+            assert r.json()["detail"] == "invalid configuration"
+            dry = await client.post("/config/reload", json={"dry_run": True})
+            assert dry.status_code == 200, dry.text
+        assert engine.registry_runner.registry is live
+        rows = await engine.store.list_audit(action="config_reload_failed", limit=10)
+        assert [json.loads(r["detail"]) for r in rows] == [
+            {"requested": None, "dry_run": False, "reason": "trust_anchor"}
+        ]
 
 
 # --- QA round two: a blank pin refuses, never reads as no pin (BACKLOG #1142) ----------------------

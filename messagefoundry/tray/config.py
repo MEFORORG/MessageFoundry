@@ -115,6 +115,27 @@ def is_local_engine(url: str) -> bool:
     return parts.scheme in _ENGINE_SCHEMES and host in _LOOPBACK_HOSTS
 
 
+def is_engine_url(url: str) -> bool:
+    """True when ``url`` is safe to hand to the OS URL handler as the engine's URL (BACKLOG #1993).
+
+    It needs an ``http`` or ``https`` scheme and a host. It must also hold no
+    whitespace, no backslash and no unprintable character. :func:`urlsplit` strips some of those
+    before it reads the scheme, and a browser reads a backslash as a slash, while the OS handler
+    gets the raw string. So ``" https://h"`` parses as https, yet ``os.startfile`` would not treat
+    it as a web address.
+    """
+    if any(ch.isspace() or ch == "\\" or not ch.isprintable() for ch in url):
+        return False
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        return False
+    # The host is not held to _VALID_HOST: httpx accepts an IDN host or an IPv6 zone id, and the
+    # scheme, not the host, decides which handler the OS launches.
+    return parts.scheme in _ENGINE_SCHEMES and bool(host)
+
+
 def is_tls_url(url: str) -> bool:
     """True when the engine URL is ``https`` — i.e. the probe client must verify a server cert."""
     try:
@@ -298,7 +319,9 @@ def _clean_path_hint(value: object) -> str | None:
 
 
 def _normalize_url(url: str) -> str:
-    return url.rstrip("/")
+    # Outer whitespace too: httpx strips it when it probes, so a stray space in tray.toml would
+    # otherwise show the engine UP while Open Console refuses the same URL (BACKLOG #1993).
+    return url.strip().rstrip("/").rstrip()
 
 
 def engine_serves_https(service_toml: dict[str, object] | None) -> bool:

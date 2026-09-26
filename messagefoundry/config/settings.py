@@ -2198,7 +2198,8 @@ class AuthSettings(_Section):
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
-    # active session. 0 = unlimited. Default 5 (WP-10): generous for a few devices/console instances.
+    # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). 0 = unlimited.
+    # Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
     # re-verified its credential -- at login, via POST /me/reauth, or with a code at

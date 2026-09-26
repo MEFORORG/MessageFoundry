@@ -18,6 +18,8 @@ import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 
+from messagefoundry.tray.config import is_engine_url
+
 # Common VS Code install locations to try if `code` is not on PATH (user + machine installs).
 _VSCODE_FALLBACKS = (
     r"%LOCALAPPDATA%\Programs\Microsoft VS Code\bin\code.cmd",
@@ -72,9 +74,30 @@ def log_available(log_path: str | None, *, is_file: Callable[[str], bool] = _is_
     return bool(log_path) and is_file(log_path or "")
 
 
-def open_console(engine_url: str, *, opener: Callable[[str], object] = webbrowser.open) -> None:
-    """Open ``<engine_url>/ui`` in the default browser."""
-    opener(console_url(engine_url))
+class ConsoleUrlRefused(ValueError):
+    """Open Console refused ``engine_url`` because it is not a plain http or https URL.
+
+    The message is fixed text. The URL comes from ``tray.toml`` and could carry a secret, and even
+    its parsed "scheme" can be a username (``admin:pw@host`` parses as scheme ``admin``), so no
+    part of it is echoed.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("engine_url in tray.toml is not a plain http or https URL with a host")
+
+
+def open_console(engine_url: str, *, opener: Callable[[str], object] | None = None) -> None:
+    """Open ``<engine_url>/ui`` in the default browser, or raise :class:`ConsoleUrlRefused`.
+
+    ``engine_url`` comes from ``tray.toml``, and on Windows ``webbrowser.open`` reaches
+    ``os.startfile``, which launches whatever handler owns the scheme. So anything but an http or
+    https URL is refused before it reaches the opener (BACKLOG #1993, ASVS 1.2.2). The default
+    opener is looked up at call time, so a test can replace ``webbrowser.open``.
+    """
+    url = console_url(engine_url)
+    if not is_engine_url(url):
+        raise ConsoleUrlRefused
+    (opener or webbrowser.open)(url)
 
 
 def _run_detached(args: list[str]) -> None:

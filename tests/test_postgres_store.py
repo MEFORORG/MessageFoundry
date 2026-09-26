@@ -4656,6 +4656,15 @@ async def test_session_rotation_contract(store) -> None:
     await assert_session_rotation_contract(store)
 
 
+async def test_session_cap_contract(store) -> None:
+    """BACKLOG #1900: the per-user cap counts only LIVE sessions. What this leg executes that no
+    other does: the liveness clauses respelled for ``$n``, with ``$1`` reused in the UPDATE and in
+    its LIMIT subquery. Extra-free shared contract, so it actually runs."""
+    from tests._session_cap_contract import assert_session_cap_contract
+
+    await assert_session_cap_contract(store)
+
+
 # --- the per-message finalize lock + the audit chain, under real concurrency ------------------------
 
 
