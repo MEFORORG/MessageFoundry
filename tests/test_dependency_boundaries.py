@@ -814,8 +814,8 @@ def test_the_mllp_leaf_loads_no_engine_runtime_package() -> None:
 
 
 def test_a_first_build_ack_call_loads_no_engine_runtime_package() -> None:
-    # Where BACKLOG #1697 and #1596 meet: the call loads `parsing` and nothing it may not reach, so a
-    # client that acknowledges MLLP still loads none of the four runtime packages.
+    # Where BACKLOG #1697 and #1596 meet: the call loads `parsing` and none of the four runtime
+    # packages, so a client that acknowledges MLLP stays inside the client rule.
     code = (
         "import sys\n"
         "from messagefoundry.mllpcodec import build_ack\n"
