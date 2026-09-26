@@ -14,7 +14,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import sqlite3
+import stat
 import tarfile
 import tempfile
 from collections.abc import Callable
@@ -511,7 +513,9 @@ def test_full_verify_passes_on_an_archive_written_under_a_since_retired_key(tmp_
     assert not live.exists()
 
 
-def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error(tmp_path) -> None:
+def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error(
+    tmp_path, monkeypatch
+) -> None:
     """A full open that FAILS must report why it failed. The snapshot lives in a temp directory the
     verify unwinds on the way out, and ``MessageStore.open`` used to leave its aiosqlite handle open
     when a warm-up raised — on Windows that handle holds the file, the unlink is refused, and the
@@ -540,6 +544,7 @@ def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error
         return result.archive_path
 
     archive = asyncio.run(_setup())
+    iso = _isolate_tempdir(tmp_path, monkeypatch)
 
     res = _verify_archive_blocking(
         archive_path=archive,
@@ -554,6 +559,8 @@ def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error
     assert "encryption key" in reason, reason
     # The negative half, and the point of the test: no leaked handle, so no cleanup error over the top.
     assert "another process" not in reason and "WinError" not in reason, reason
+    # And the staging directory, which held the decrypted archive, is gone (BACKLOG #1721).
+    assert _verify_leftovers(iso) == []
 
 
 async def test_full_verify_passes_on_a_good_unencrypted_archive(tmp_path) -> None:
@@ -608,3 +615,269 @@ def test_cumulative_ceiling_stays_above_the_per_member_ceiling() -> None:
     cumulative ceiling must sit strictly above the member one. Pinned because the two constants are
     edited independently."""
     assert dr_backup._MAX_RESTORE_PLAINTEXT_BYTES > dr_backup._MAX_RESTORE_MEMBER_BYTES
+
+
+# --- BACKLOG #1721: the decrypted staging directory must not outlive the verify ---------------------
+#
+# The verify decrypts the whole archive into a `mefor-verify-*` directory under the OS temp dir. These
+# tests point the temp dir at `tmp_path` so what the verify leaves behind can be listed exactly, and
+# they measure what matters to PHI at rest: whether any file there still holds bytes.
+
+
+def _isolate_tempdir(tmp_path: Path, monkeypatch) -> Path:
+    iso = tmp_path / "ostemp"
+    iso.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(iso))
+    return iso
+
+
+def _verify_leftovers(iso: Path) -> list[Path]:
+    return sorted(iso.glob("mefor-verify-*"))
+
+
+def _non_empty_files(root: Path) -> list[Path]:
+    """Every regular file under ``root`` holding bytes. ``os.walk`` with a raising ``onerror`` and
+    ``lstat``, not ``Path.rglob``: on Python 3.14 that swallows a listing error, and an assertion that
+    nothing is left would then pass over a directory it never read."""
+
+    def _raise(exc: OSError) -> None:
+        raise exc
+
+    found: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(root, onerror=_raise):
+        for name in filenames:
+            path = Path(dirpath) / name
+            st = os.lstat(path)
+            if stat.S_ISREG(st.st_mode) and st.st_size > 0:
+                found.append(path)
+    return sorted(found)
+
+
+def _keyed_archive(tmp_path: Path) -> tuple[str, str]:
+    import asyncio
+
+    key_b64 = generate_key()
+
+    async def _setup() -> str:
+        store, archive, _ = await _backup(tmp_path, key_b64)
+        await store.close()
+        return archive
+
+    return asyncio.run(_setup()), key_b64
+
+
+def _hold_the_extracted_store(monkeypatch) -> list[io.BufferedReader]:
+    """Open the extracted store mid-verify and keep the handle, the shape of a scanner or indexer
+    holding a freshly written file. On Windows an open handle refuses the unlink (WinError 32)."""
+    held: list[io.BufferedReader] = []
+    real = dr_backup._count_tables
+
+    def holding(db_path: Path) -> dict[str, int]:
+        held.append(open(db_path, "rb"))  # noqa: SIM115 - held open on purpose, closed by the test
+        return real(db_path)
+
+    monkeypatch.setattr(dr_backup, "_count_tables", holding)
+    return held
+
+
+def test_a_handle_held_at_teardown_leaves_no_plaintext(tmp_path, monkeypatch) -> None:
+    """Limb 2 of #1721: a handle something else still holds when the verify tears down. The verdict is
+    about the archive and stands; what must not survive is a byte of the decrypted archive.
+
+    It bites on Windows, where an open handle refuses the unlink. Elsewhere the unlink succeeds and
+    this passes without reaching the fail-safe; the two tests that make removal fail outright cover
+    that branch on every platform."""
+    archive, key_b64 = _keyed_archive(tmp_path)
+    iso = _isolate_tempdir(tmp_path, monkeypatch)
+    monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", (0.01,))
+    held = _hold_the_extracted_store(monkeypatch)
+    try:
+        res = _verify_archive_blocking(
+            archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+        )
+        assert held, "the holder never ran, so this measured nothing"
+        assert res.status == "PASS", res.reason
+        assert _non_empty_files(iso) == []
+    finally:
+        for fh in held:
+            fh.close()
+
+
+def test_an_exception_after_extraction_with_a_held_handle_leaves_no_plaintext(
+    tmp_path, monkeypatch
+) -> None:
+    """Limb 2 of #1721 on the exception path: the error that escapes is the verify's own, never the
+    teardown's, and the plaintext is gone either way. Bites on Windows, like the test above."""
+    import pytest
+
+    archive, key_b64 = _keyed_archive(tmp_path)
+    iso = _isolate_tempdir(tmp_path, monkeypatch)
+    monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", (0.01,))
+    held = _hold_the_extracted_store(monkeypatch)
+    holding_count = dr_backup._count_tables
+
+    def count_then_raise(db_path: Path) -> dict[str, int]:
+        holding_count(db_path)
+        raise RuntimeError("synthetic failure after extraction")
+
+    monkeypatch.setattr(dr_backup, "_count_tables", count_then_raise)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic failure after extraction"):
+            _verify_archive_blocking(
+                archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+            )
+        assert held, "the holder never ran, so this measured nothing"
+        assert _non_empty_files(iso) == []
+    finally:
+        for fh in held:
+            fh.close()
+
+
+def test_a_briefly_held_handle_is_waited_out(tmp_path, monkeypatch) -> None:
+    """The ordinary Windows case: a scanner opens the freshly written store and lets go. The retry
+    outlasts it, so the directory goes entirely. Off Windows an open handle never blocks an unlink."""
+    import threading
+
+    archive, key_b64 = _keyed_archive(tmp_path)
+    iso = _isolate_tempdir(tmp_path, monkeypatch)
+    held: list[io.BufferedReader] = []
+    real_count = dr_backup._count_tables
+
+    def hold_then_schedule_release(db_path: Path) -> dict[str, int]:
+        fh = open(db_path, "rb")  # noqa: SIM115 - released by the timer, or by the test
+        held.append(fh)
+        # Scheduled only once the handle exists, so the release can never run first.
+        threading.Timer(0.1, fh.close).start()
+        return real_count(db_path)
+
+    monkeypatch.setattr(dr_backup, "_count_tables", hold_then_schedule_release)
+    try:
+        res = _verify_archive_blocking(
+            archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+        )
+        assert held, "the holder never ran, so this measured nothing"
+        assert res.status == "PASS", res.reason
+        assert _verify_leftovers(iso) == []
+    finally:
+        for fh in held:
+            fh.close()
+
+
+def test_an_undeletable_directory_is_emptied_and_the_verdict_stands(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """The fail-safe, on every platform: when removal keeps failing, every file is emptied in place.
+    No plaintext survives, so the verdict about the archive is left alone and a WARNING names the
+    empty directory."""
+    import logging
+
+    archive, key_b64 = _keyed_archive(tmp_path)
+    iso = _isolate_tempdir(tmp_path, monkeypatch)
+    monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", (0.0,))
+    attempts: list[Path] = []
+
+    def refuse(path: Path) -> bool:
+        attempts.append(path)
+        return False
+
+    monkeypatch.setattr(dr_backup, "_remove_tree", refuse)
+    with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
+        res = _verify_archive_blocking(
+            archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+        )
+    assert res.status == "PASS", res.reason
+    # The first try, then one retry after emptying.
+    assert len(attempts) == 2
+    (leftover,) = _verify_leftovers(iso)
+    assert sorted(p.name for p in leftover.iterdir()) == ["archive.tar", "extracted_store.db"]
+    assert _non_empty_files(iso) == []
+    assert any("no file in it holds decrypted bytes" in r.getMessage() for r in caplog.records)
+
+
+def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """When a file can neither be removed nor emptied, decrypted PHI is left on disk. The archive
+    still verified, but the operator must hear it, so the verdict says FAIL and names the directory."""
+    import logging
+
+    archive, key_b64 = _keyed_archive(tmp_path)
+    iso = _isolate_tempdir(tmp_path, monkeypatch)
+    monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
+    monkeypatch.setattr(dr_backup, "_remove_tree", lambda path: False)
+    real_open = open
+
+    def open_refusing_writes(file, mode="r", *args, **kwargs):  # type: ignore[no-untyped-def]
+        if mode == "r+b":
+            raise PermissionError(13, "synthetic sharing violation", str(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(dr_backup, "open", open_refusing_writes, raising=False)
+    with caplog.at_level(logging.ERROR, logger=dr_backup.__name__):
+        res = _verify_archive_blocking(
+            archive_path=archive, keys=[base64.b64decode(key_b64)], full=False
+        )
+    (leftover,) = _verify_leftovers(iso)
+    assert res.status == "FAIL", res.reason
+    assert res.integrity_ok is True  # the archive itself was fine
+    reason = res.reason or ""
+    assert reason.startswith("the archive verified, but"), reason
+    assert str(leftover) in reason and "could not be emptied" in reason, reason
+    assert "archive.tar" in reason and "extracted_store.db" in reason, reason
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+
+def test_an_interrupt_after_extraction_still_removes_the_directory(tmp_path, monkeypatch) -> None:
+    """``KeyboardInterrupt`` is not an ``Exception``: the teardown must run for it too, and it must
+    reach the caller unchanged."""
+    import pytest
+
+    archive, key_b64 = _keyed_archive(tmp_path)
+    iso = _isolate_tempdir(tmp_path, monkeypatch)
+
+    def interrupted(db_path: Path) -> dict[str, int]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dr_backup, "_count_tables", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        _verify_archive_blocking(archive_path=archive, keys=[base64.b64decode(key_b64)], full=False)
+    assert _verify_leftovers(iso) == []
+
+
+def test_an_exception_carries_the_directory_it_could_not_clear(tmp_path, monkeypatch) -> None:
+    """An exception escaping the verify keeps its own type, and a staging directory that still holds
+    decrypted bytes is named on it as a note, not only in the log."""
+    import pytest
+
+    archive, key_b64 = _keyed_archive(tmp_path)
+    iso = _isolate_tempdir(tmp_path, monkeypatch)
+    monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
+    monkeypatch.setattr(dr_backup, "_remove_tree", lambda path: False)
+    monkeypatch.setattr(dr_backup, "_empty_files_in_place", lambda staging: ["extracted_store.db"])
+
+    def interrupted(db_path: Path) -> dict[str, int]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dr_backup, "_count_tables", interrupted)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _verify_archive_blocking(archive_path=archive, keys=[base64.b64decode(key_b64)], full=False)
+    (leftover,) = _verify_leftovers(iso)
+    notes = getattr(caught.value, "__notes__", [])
+    assert len(notes) == 1 and str(leftover) in notes[0], notes
+
+
+def test_a_directory_that_cannot_be_listed_is_not_reported_empty(tmp_path, monkeypatch) -> None:
+    """``Path.rglob`` swallows a listing error on Python 3.14 and would call such a directory empty.
+    The walk the fail-safe uses reports it as not shown empty instead."""
+    staging = tmp_path / "mefor-verify-x"
+    staging.mkdir()
+    (staging / "extracted_store.db").write_bytes(b"synthetic")
+
+    def walk_refusing(top, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
+        assert onerror is not None
+        onerror(PermissionError(13, "synthetic listing refusal", str(top)))
+        return iter(())
+
+    monkeypatch.setattr(dr_backup, "_walk", walk_refusing)
+    unproven = dr_backup._empty_files_in_place(staging)
+    assert unproven == ["mefor-verify-x/ (not listed)"]
