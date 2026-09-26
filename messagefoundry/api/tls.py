@@ -527,6 +527,7 @@ def ensure_api_tls_material(
     *,
     state_dir: Path,
     replacements: list[GeneratedPairReplaced] | None = None,
+    renew: bool = True,
 ) -> tuple[str, str | None] | None:
     """Return the ``(cert_path, key_path)`` the API should serve with, minting on first run.
 
@@ -555,6 +556,12 @@ def ensure_api_tls_material(
     ``CA=false``). Anything else at the generated path is served as found and never replaced.
     Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because ``serve``
     hands it the path this function RETURNS, and it stays the alarm for an engine never restarted.
+
+    **``renew=False`` is for an engine shard (``serve --shard``).** Every process that serves the
+    pair must start together when it is renewed, or a lone restarted shard would serve a new
+    certificate while its siblings keep the old one in memory. So ``supervise`` renews before it
+    spawns any shard, and a shard only reuses a pair that loads, due or not. It still mints on a
+    first run and still recovers a pair that does not load, because it has nothing else to serve.
     **A file or lock failure never costs a start the old pair can still serve**: any ``OSError`` on
     the locked path -- including a lock it could not take -- falls back to that pair with a WARNING,
     and only a pair that does not load or has expired lets the error propagate. Other errors, such
@@ -601,13 +608,13 @@ def ensure_api_tls_material(
         return plan.material()
 
     cert_path, key_path = _generated_pair(state_dir)
-    if _reusable_without_the_lock(cert_path, key_path):
+    if _reusable_without_the_lock(cert_path, key_path, renew=renew):
         return str(cert_path), str(key_path)
     events = replacements if replacements is not None else []
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         with _generated_pair_lock(state_dir):
-            _settle_under_the_lock(api, cert_path, key_path, events)
+            _settle_under_the_lock(api, cert_path, key_path, events, renew=renew)
     except OSError as exc:
         # A RENEWAL IS EARLY, SO ITS FAILURE MUST NOT STOP A START THE OLD PAIR CAN SERVE. That
         # covers a failed stage or first replace, a state dir the engine may read but not write,
@@ -627,7 +634,12 @@ def ensure_api_tls_material(
 
 
 def _settle_under_the_lock(
-    api: ApiSettings, cert_path: Path, key_path: Path, events: list[GeneratedPairReplaced]
+    api: ApiSettings,
+    cert_path: Path,
+    key_path: Path,
+    events: list[GeneratedPairReplaced],
+    *,
+    renew: bool,
 ) -> None:
     """Reuse, renew, recover or mint the generated pair. Call only under the lock.
 
@@ -638,7 +650,7 @@ def _settle_under_the_lock(
     if cert_path.exists() and key_path.exists():
         reason = _why_generated_pair_is_unusable(cert_path, key_path)
         if reason is None:
-            due = _renewal_due(cert_path)
+            due = _renewal_due(cert_path) if renew else None
             if due is not None:
                 _renew_generated_pair(api, cert_path, key_path, due, events)
             return
@@ -665,8 +677,8 @@ def _still_serves(cert_path: Path, key_path: Path) -> bool:
     return facts is None or facts.not_after > time.time()
 
 
-def _reusable_without_the_lock(cert_path: Path, key_path: Path) -> bool:
-    """True when the pair loads and is not due for renewal, read WITHOUT the lock.
+def _reusable_without_the_lock(cert_path: Path, key_path: Path, *, renew: bool) -> bool:
+    """True when the pair loads and, if ``renew``, is not due for renewal, read WITHOUT the lock.
 
     Every other answer is ``False``, and the caller then decides again under the lock. A read that
     races a mint or renewal in progress sees a partial, vanishing or mismatched file and answers
@@ -683,7 +695,7 @@ def _reusable_without_the_lock(cert_path: Path, key_path: Path) -> bool:
             cert_path.exists()
             and key_path.exists()
             and _why_generated_pair_is_unusable(cert_path, key_path) is None
-            and _renewal_due(cert_path) is None
+            and (not renew or _renewal_due(cert_path) is None)
         )
     except OSError:
         return False

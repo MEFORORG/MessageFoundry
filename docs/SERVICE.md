@@ -521,8 +521,9 @@ configured in `[api].tls_cert_file`, and it never renews while running: the expi
 for an engine that is never restarted. Each renewal is logged at WARNING and written to the audit
 log as `api.tls_generated_pair_replaced`, with the old and new SHA-256 fingerprints. **After a
 renewal, import the new `api-generated-cert.pem` into the browser trust store again, and replace
-any copy of it you pass to `--cacert`.** Under `serve --shards`, restart the whole service after a
-renewal, so every shard serves the new certificate. See
+any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews once, before it
+starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
+See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)
 

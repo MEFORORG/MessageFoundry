@@ -399,7 +399,7 @@ def _serve_capturing_monitored_api_cert(
 
 
 def _serve_capturing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, extra: tuple[str, ...] = ()
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run ``serve`` and return every kwarg it handed ``create_managed_app``, plus uvicorn's.
 
@@ -422,7 +422,7 @@ def _serve_capturing(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     monkeypatch.setattr(api_pkg, "create_managed_app", _spy)
     (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev", *extra]) == 0
     assert "api_tls_cert_file" in handed  # the spy saw the call, so a None below is a real None
     return handed, captured
 
@@ -3489,17 +3489,124 @@ def test_a_cert_held_open_by_a_reader_is_waited_out_during_renewal(tmp_path: Pat
     _load_pair(cert, key)
 
 
-def test_serve_hands_the_renewal_to_the_app_for_auditing(
+@pytest.mark.parametrize("shard", [None, "a"])
+def test_plain_serve_renews_and_an_engine_shard_never_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shard: str | None
+) -> None:
+    """End to end on the serve path, same due pair. A plain ``serve`` renews it before the app is
+    built and hands the report to `create_managed_app`, whose lifespan audits it. An engine shard
+    (``serve --shard``, which is how the supervisor starts every shard, a lone restart included)
+    reuses it untouched: `supervise` renews for the whole fleet before spawning, so one restarted
+    shard can never serve a certificate its siblings do not.
+
+    Mutation: drop ``renew=args.shard is None``. Red: the shard row renews."""
+    cert = tmp_path / _GENERATED_CERT_NAME
+    _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    old = cert.read_bytes()
+    old_sha = _sha256(cert)
+    extra = () if shard is None else ("--shard", shard)
+    handed, _ = _serve_capturing(tmp_path, monkeypatch, _SYNTHETIC_LOOPBACK_TOML, extra)
+    events = handed["api_tls_replacements"]
+    if shard is not None:
+        assert events == []
+        assert cert.read_bytes() == old
+        return
+    assert [(e.reason, e.old_sha256) for e in events] == [("renewal", old_sha)]
+    assert events[0].new_sha256 == _sha256(cert)
+
+
+def test_supervise_renews_once_before_it_spawns_any_shard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """End to end on the serve path: a due pair beside the store is renewed before the app is built,
-    and the report reaches `create_managed_app`, whose lifespan audits it."""
+    """`supervise` is where a sharded fleet's pair is renewed: once, before the first shard starts,
+    so every shard then serves the new certificate. It passes nothing new to the shards. The
+    renewal is audited in the store the shards are about to open.
+
+    Mutation: drop the call in `_supervise`. Red: the pair is unchanged at spawn and no row."""
+    import argparse
+    import asyncio
+
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store import open_store, sqlite_settings
+    from messagefoundry.store.crypto import generate_key
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    cert = tmp_path / _GENERATED_CERT_NAME
     _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
-    old_sha = _sha256(tmp_path / _GENERATED_CERT_NAME)
-    handed, _ = _serve_capturing(tmp_path, monkeypatch, _SYNTHETIC_LOOPBACK_TOML)
-    events = handed["api_tls_replacements"]
-    assert [(e.reason, e.old_sha256) for e in events] == [("renewal", old_sha)]
-    assert events[0].new_sha256 == _sha256(tmp_path / _GENERATED_CERT_NAME)
+    old = cert.read_bytes()
+    old_sha = _sha256(cert)
+    at_spawn: dict[str, Any] = {}
+
+    async def fake_supervise(config: str, **kwargs: Any) -> int:
+        at_spawn["cert"] = cert.read_bytes()
+        at_spawn["kwargs"] = set(kwargs)
+        return 0
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
+    db = tmp_path / "mefor.db"
+    args = argparse.Namespace(
+        config=str(SAMPLES_CONFIG),
+        db=str(db),
+        base_port=8765,
+        env="dev",
+        service_config=None,
+        project_root=str(tmp_path),
+    )
+    assert cli._supervise(args) == 0
+
+    assert at_spawn["cert"] != old  # renewed BEFORE the fleet was spawned
+    assert at_spawn["kwargs"] == {
+        "store_backend",
+        "db_base",
+        "base_port",
+        "env",
+        "service_config",
+        "project_root",
+    }  # nothing new handed to the shards
+    _load_pair(cert, tmp_path / "api-generated-key.pem")
+
+    async def rows() -> list[Any]:
+        store = await open_store(sqlite_settings(db))
+        try:
+            return list(await store.list_audit(action=GENERATED_PAIR_REPLACED, limit=10))
+        finally:
+            await store.close()
+
+    found = asyncio.run(rows())
+    assert len(found) == 1
+    detail = json.loads(found[0]["detail"])
+    assert (detail["reason"], detail["old_sha256"]) == ("renewal", old_sha)
+    assert detail["new_sha256"] == _sha256(cert)
+
+    # A second supervise start finds a fresh pair: nothing renewed, no second row.
+    assert cli._supervise(args) == 0
+    assert len(asyncio.run(rows())) == 1
+
+
+def test_a_shard_with_a_due_pair_reuses_it_and_reports_nothing(tmp_path: Path) -> None:
+    """The unit form of the shard rule: ``renew=False`` reuses a due pair that loads. The control
+    is the same pair with ``renew`` left on, which renews."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    before = _snapshot(cert, key)
+    events: list[GeneratedPairReplaced] = []
+    material = ensure_api_tls_material(
+        ApiSettings(), state_dir=tmp_path, replacements=events, renew=False
+    )
+    assert material == (str(cert), str(key))
+    assert _snapshot(cert, key) == before and events == []
+    ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+    assert [e.reason for e in events] == ["renewal"]
+
+
+def test_a_shard_still_recovers_a_pair_that_does_not_load(tmp_path: Path) -> None:
+    """A shard never renews, but a shard that finds no loadable pair has nothing to serve, so the
+    first-run mint and the unloadable-pair recovery still run there, and are still reported."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    cert.write_bytes(b"")
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events, renew=False)
+    _load_pair(cert, key)
+    assert [e.reason for e in events] == ["unusable"]
 
 
 def test_the_lifespan_writes_one_audit_row_per_replacement(tmp_path: Path) -> None:

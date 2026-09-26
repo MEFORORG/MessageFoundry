@@ -170,18 +170,22 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
    engine mints. That shape is subject equal to issuer, a signature its own key verifies, and
    `CA=false`. Anything else at that path is served as found, and a WARNING says why it was not
    renewed. Under `tls_terminated_upstream` the engine serves no certificate, so it renews none.
-4. **At startup only, never mid-run.** Renewal runs under the one-writer lock that already
-   serialises the first-run mint, so N engine shards starting together renew once and the rest
-   reuse the result. The expiry monitor, which watches the served certificate, stays the alarm for
-   an engine that is never restarted.
+4. **At startup only, never mid-run, and only where every process serving the pair starts
+   together** (Manager decision 2026-09-26, within the owner ruling above). A plain `serve` renews
+   at its own start. A sharded fleet renews in `supervise`, under the same one-writer lock, before
+   it spawns any shard, and passes the shards nothing new; the renewal is audited by opening the
+   store once for the row. An engine shard (`serve --shard`, which is how the supervisor starts
+   every shard, a lone restart after a crash included) never renews: it reuses a pair that loads,
+   due or not. The expiry monitor, which watches the served certificate, stays the alarm for an
+   engine or fleet that is never restarted.
 5. **How it replaces.** The new key is staged under a temporary name with `_write_private_key`
    (`O_EXCL`, `0o600`, Windows DACL), and the new certificate beside it with the local-users read
    grant the tray needs. The certificate is then moved over the live name first, and the key second.
    A file-system or lock failure (an `OSError`) that leaves an old pair which still loads and has
    not expired keeps that pair, and the next start tries again. That includes a failed first move,
    a state directory the engine can read but not write, and a lock it could not take. An expired or
-   unloadable pair has nothing to fall back on, so the start fails, as does any other error. A crash between the two moves leaves a new certificate beside
-   the old key. That pair does not load, so the next start discards it, mints a fresh one, and
+   unloadable pair has nothing to fall back on, so the start fails, as does any other error. A
+   crash between the two moves leaves a new certificate beside the old key. That pair does not load, so the next start discards it, mints a fresh one, and
    reports it as an unusable pair. That row's old fingerprint is the half-installed certificate,
    not the one clients trusted, whose fingerprint only the earlier WARNING line carries.
 6. **Decision 6, realised: every re-mint of an existing pair is audited.** A renewal, a replaced
@@ -199,13 +203,14 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
 7. **One pair for all engine shards is now DECIDED, not accidental.** `serve --shards` gives every
    shard the same state directory, which is why they already shared one pair; BACKLOG #1276 called
    that accidentally correct. It is correct because the minted identity is `[api].host` and the
-   shards differ only by port. **The consequence to know:** a shard restarted alone inside the
-   renewal window, such as a crashed shard the supervisor restarts, renews the pair on disk while
-   its siblings keep serving the old certificate from memory. Both are valid, but a client pinning
-   one sees the other as unknown until the siblings restart. The expiry monitor reads the file, so
-   in a sibling it now reports the new certificate, not the old one still served from memory.
-   Restart the whole service after a renewal to bring them together.
+   shards differ only by port. Item 4 is what keeps it one pair in memory as well as on disk: a
+   shard restarted alone reuses the pair its siblings serve. **The one remaining way to split
+   them:** a shard that finds NO loadable pair still mints or recovers one, because it has nothing
+   else to serve. Its siblings keep the old certificate in memory, a client pinning one sees the
+   other as unknown, and each sibling's expiry monitor reads the new file rather than the
+   certificate it serves. The remedy is to restart the whole fleet, by restarting the service that
+   runs `supervise`.
 8. **What an operator does after a renewal.** The renewed certificate is a new certificate. A
    browser trust-store import and any copied `--cacert` file must be done again with the new
-   `api-generated-cert.pem`. The tray pins that file from the data directory; teaching it to notice
-   a changed fingerprint while it runs is separate work under BACKLOG #1276.
+   `api-generated-cert.pem`. The tray pins that file from the data directory and follows a renewed
+   certificate without a restart (PR 1596).
