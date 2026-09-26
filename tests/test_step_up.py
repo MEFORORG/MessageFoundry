@@ -24,7 +24,12 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
-NEW_USER = {"username": "newbie", "password": PW, "roles": ["viewer"]}
+NEW_USER = {
+    "username": "newbie",
+    "password": PW,
+    "roles": ["viewer"],
+    "email": "newbie@example.org",
+}
 
 
 @pytest.fixture

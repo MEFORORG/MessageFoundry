@@ -9,7 +9,8 @@ to the pipeline's :class:`~messagefoundry.transports.base.InboundHandler` exactl
 ingress stage — mirroring MLLP's AA-on-receipt (ACK-on-receipt, ADR 0001). A post-ingress
 routing/transform/delivery failure happens *after* the ``202`` and is **not** reflected in the HTTP
 status — it surfaces only as the message's ``ERROR``/dead-letter disposition + the AlertSink, exactly
-as a post-ACK MLLP failure does.
+as a post-ACK MLLP failure does. A body the pipeline handler refuses at ingress (recorded ``ERROR``,
+no ingress row) is answered ``422``, never ``202`` (ADR 0154 amendment 2026-09-26).
 
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;
@@ -189,6 +190,12 @@ _HEALTH_PROBE_METHODS = frozenset({"GET", "HEAD"})
 #: and desyncs nothing, and it is the shape a health checker actually sends. A non-zero length is
 #: refused, because those are the declared bytes this listener would never read.
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+#: The answer when the receipt handler returns ``None``: it refused the body AFTER recording it with
+#: status ERROR. ``RegistryRunner._handle_inbound_http`` holds the guards that do this. The receipt
+#: path and the sync-reply path both answer it, so a caller is never told a refused body was accepted
+#: (owner ruling 2026-09-26, the ADR 0154 amendment of that date, BACKLOG #1960).
+_NOT_ACCEPTED_BODY = '{"error":"message was not accepted"}'
 
 #: A ``Content-Length`` with more significant digits than this is refused. It is far past any body
 #: cap, and ``int()`` raises past 4300 digits (CPython's ``sys.int_info.default_max_str_digits``),
@@ -1054,45 +1061,51 @@ class HttpSource(SourceConnector):
         # and returns the engine message_id. The 202 is the receipt-and-persistence signal (NOT a final
         # disposition) — a post-ingress routing/transform/delivery failure does NOT change this status
         # (it becomes the message's ERROR/dead-letter + AlertSink). count-and-log holds: the body is
-        # persisted before the response is written.
+        # persisted before the response is written — as a RECEIVED ingress row, or as an ERROR row when
+        # the handler refuses it and returns None.
         message_id = await self._handler(request.body)
-        # Charge one token AFTER the body is committed, so the debt is settled by the NEXT request's
-        # pre-read wait and never by withholding this partner's receipt. A GET/HEAD health probe and
-        # a refused request charge nothing — they return above — which keeps a peer that sends no
-        # message from spending the budget of one that does.
+        # Charge one token AFTER the handler has recorded the body, so the debt is settled by the NEXT
+        # request's pre-read wait and never by withholding this partner's answer. A GET/HEAD health
+        # probe and a pre-ingress refusal charge nothing — they return above — which keeps a peer
+        # that sends no message from spending the budget of one that does. A body the handler refuses
+        # IS charged: it was read and recorded, which is the work the budget paces.
         if self._pacer is not None:
             self._pacer.charge(1, now=time.monotonic())
 
-        if self.reply_from and self.sync_reply is not None:
-            return await self._respond_with_sync_reply(writer, message_id, peer_host=peer_host)
+        if message_id is None:
+            # The handler refused the body AFTER recording it with status ERROR, so that row is the
+            # count-and-log record and only the answer changes here. A 202 would tell the caller its
+            # body was accepted when it was not, and a reply_from caller would wait for a reply to a
+            # message that never entered the pipeline. One branch answers both modes, so they cannot
+            # drift (owner ruling 2026-09-26, BACKLOG #1960). Returns False: this is a post-record
+            # refusal with no connection-event kind of its own, so the outer ``closed`` still fires.
+            # The drain gets the receipt-sized budget in both modes: this is a fixed few dozen bytes,
+            # never the partner-sized body reply_write_timeout exists for.
+            await self._respond(
+                writer, build_response(422, _NOT_ACCEPTED_BODY), budget=_CLIENT_SHUTDOWN_GRACE
+            )
+            return False
 
-        receipt = {"status": "accepted"}
-        if message_id is not None:
-            receipt["message_id"] = message_id
+        if self.reply_from and self.sync_reply is not None:
+            await self._respond_with_sync_reply(writer, message_id)
+            return False
+
+        receipt = {"status": "accepted", "message_id": message_id}
         await self._respond(writer, build_response(202, json.dumps(receipt)))
         return False
 
-    async def _respond_with_sync_reply(
-        self, writer: asyncio.StreamWriter, message_id: str | None, *, peer_host: str | None
-    ) -> bool:
+    async def _respond_with_sync_reply(self, writer: asyncio.StreamWriter, message_id: str) -> None:
         """Block on the captured downstream reply and answer with it (ADR 0154 D5).
 
         Reached only when ``reply_from`` is set **and** the runner injected a resolver, so an inbound
         without it never takes this path — that is what makes AC-8's "unchanged" true rather than
-        aspirational.
+        aspirational. Reached only with a committed ``message_id``: a body the handler refused is
+        answered ``422`` by the caller before this is chosen.
 
         **The HTTP status is never a second disposition channel.** Whatever is returned here, the
         message stays committed and keeps flowing; its disposition is decided by the finalizer alone.
         A ``504`` does not cancel a delivery, and a ``200`` does not complete one.
         """
-        if message_id is None:
-            # The handler declined AFTER recording the message with status ERROR — that write IS the
-            # count-and-log record, so nothing is dropped here. On the 202 path this answers
-            # "202 without a message_id", which is a lie to a proxy client; on the sync path a
-            # caller waiting for a reply deserves to be told the submission itself failed.
-            await self._respond(writer, build_response(422, '{"error":"message was not accepted"}'))
-            return True
-
         resolver = self.sync_reply
         assert resolver is not None  # guarded by the caller, as _handler is above
         reply = await resolver(message_id)
@@ -1116,7 +1129,6 @@ class HttpSource(SourceConnector):
             # A partner Content-Type that fails the header guard must not take the turn down with
             # it: the body is still good, so fall back to our own type rather than 500 the caller.
             await self._respond(writer, build_response(status, body, extra_headers=extra))
-        return False
 
     def _reply_to_wire(
         self, reply: InboundReply, message_id: str
@@ -1157,8 +1169,13 @@ class HttpSource(SourceConnector):
         payload = json.dumps({"status": "delivery_failed", "message_id": message_id})
         return 502, payload, None
 
-    async def _respond(self, writer: asyncio.StreamWriter, data: bytes) -> None:
+    async def _respond(
+        self, writer: asyncio.StreamWriter, data: bytes, *, budget: float | None = None
+    ) -> None:
         """Write the success-path response, bounding the drain.
+
+        ``budget`` overrides :meth:`_drain_budget` for a response whose size does not depend on the
+        mode, such as the fixed ``422`` on a refused body.
 
         The drain was unbounded: a peer that stops reading held the connection — and its
         ``max_connections`` slot, since ``_active`` spans all of ``_serve_one`` — for as long as it
@@ -1171,11 +1188,12 @@ class HttpSource(SourceConnector):
         the console's filter tuple as an exact set, so minting one is a three-file change, and
         "the peer stopped reading" is what ``peer_reset`` already means to an operator.
 
-        The message is unaffected either way — it was durably committed to ingress before this write
-        (ACK-on-receipt), so a lost 202 costs the sender a retry, never a message.
+        The message is unaffected either way — it was recorded before this write (ACK-on-receipt),
+        so a lost answer costs the sender a retry, never a message. For a ``202`` that record is the
+        committed ingress row; for the ``422`` on a refused body it is the ``ERROR`` row.
         """
         writer.write(data)
-        await asyncio.wait_for(writer.drain(), self._drain_budget())
+        await asyncio.wait_for(writer.drain(), self._drain_budget() if budget is None else budget)
 
     def _drain_budget(self) -> float:
         """Seconds allowed to drain a response to the caller.

@@ -291,7 +291,12 @@ async def test_cannot_remove_last_administrator(engine: Engine) -> None:
             await c.post(
                 "/users",
                 headers=h,
-                json={"username": "root2", "password": PW, "roles": ["administrator"]},
+                json={
+                    "username": "root2",
+                    "password": PW,
+                    "roles": ["administrator"],
+                    "email": "root2@example.org",
+                },
             )
         ).status_code == 201
         assert (

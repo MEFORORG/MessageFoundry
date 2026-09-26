@@ -302,7 +302,12 @@ async def test_an_administrator_create_that_loses_the_username_race_pages_nobody
         r = await c.post(
             "/users",
             headers=headers,
-            json={"username": "contested", "password": PW, "roles": [Role.ADMINISTRATOR.value]},
+            json={
+                "username": "contested",
+                "password": PW,
+                "roles": [Role.ADMINISTRATOR.value],
+                "email": "contested@x.org",
+            },
         )
         assert r.status_code == 409, r.text
     assert sink.events == []

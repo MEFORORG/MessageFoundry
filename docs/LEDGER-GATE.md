@@ -180,13 +180,23 @@ worktree gate does not have.**
 It blocks a commit that:
 
 1. **reuses an ADR number already on `origin/main`** — unless the file is a **declared companion** (its
-   basename is named inside that number's existing index row; ADR 0013 is exactly this, and is *correct* —
-   one number, one row, two files, deliberately);
+   basename is a link target inside that number's existing index row; ADR 0013 is exactly this, and is
+   *correct* — one number, one row, two files, deliberately);
 2. **adds an ADR or BACKLOG number that was not allocated to this worktree** — unless the staged bytes
    match a blob that path already carried on the base's history, which is a **restore** of a number the
    base lost rather than a new allocation ([below](#restoring-a-number-the-base-lost-backlog-1468));
-3. **adds an ADR with no row in `docs/adr/README.md`**; or
-4. leaves **duplicate index rows** for one number.
+3. **adds an ADR with no row in `docs/adr/README.md`**;
+4. **adds an ADR under a new number whose row does not link it** (BACKLOG #2002); or
+5. leaves **duplicate index rows** for one number.
+
+In every rule above, and in the corpus check, "names" and "links" mean the same thing. The file must be
+the target of a Markdown link in the row, not a substring of it (BACKLOG #2001). The gate reads one link
+form: `[text](NNNN-name.md)` or `[text](./NNNN-name.md)`, with an optional `#fragment`. It ignores a link
+inside inline code or an HTML comment, because none is rendered there. Any other form names nothing, so
+the gate refuses rather than guess. That includes an ADR file whose name holds a space.
+
+A row is a line that starts with `|`, optional whitespace, then `[NNNN]`. Every rule reads rows from one
+enumeration, so a row is seen by all of them or by none (BACKLOG #2003).
 
 It reads the **staged** tree (`git show :path`), never the working tree — otherwise an untracked
 work-in-progress ADR sitting in your checkout would block every unrelated commit. It checks the index row
