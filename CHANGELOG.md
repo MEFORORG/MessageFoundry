@@ -87,15 +87,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
-- **A `GET /connections` row for an outbound with no traffic edge now reports its counters instead
-  of `null`.** That standalone row gave `queue_depth`, `written`, `errored`, `backlog_seconds` and
-  `delivered_age_seconds` as `null`, which reads as "not measured" and cannot be told apart from a
-  real zero. The store's outbound totals cover every queued, delivered and dead-lettered row, so an
-  outbound with no edge measures as zero, and the row now says `0`. The row also sums any queue rows
-  the edge rows skip, such as those left by an inbound a reload removed. It used to show that
-  backlog as `null` while it drained. `idle_seconds` stays `null` until the first delivery, as on an
-  edge row. Not fixed here: when that outbound also has a live edge, the removed inbound's rows still
-  appear on no row. ([BACKLOG #1817](docs/BACKLOG.md))
+- **A `GET /connections` row for an outbound that has carried no traffic now reports `0`, not
+  `null`.** That standalone row gave `queue_depth`, `written` and `errored` as `null`, which means
+  "not measured" and cannot be told apart from a real zero. The store keeps a queue row for every
+  message sent to an outbound, so an outbound with no queue row at all measures as zero.
+  `backlog_seconds` now reads `0` there too. `idle_seconds` and `delivered_age_seconds` stay `null`,
+  since there is no delivery or queued message to age, as on an edge row before its first message.
+  The row still reports `null` when its outbound does have queue rows, but from an inbound this
+  node does not run: another engine shard's, or one a reload removed. Those rows are not this
+  row's to count. ([BACKLOG #1817](docs/BACKLOG.md))
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
   `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other

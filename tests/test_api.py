@@ -1203,25 +1203,25 @@ async def test_connections_standalone_row_reports_measured_zeros_not_nulls(
     assert row["read"] is None  # a source-only field stays null on a destination row
 
 
-async def test_connections_standalone_row_counts_an_unshown_edges_backlog(
+async def test_connections_standalone_row_stays_null_over_traffic_it_cannot_attribute(
     engine: Engine, client: httpx.AsyncClient, tmp_path: Path
 ) -> None:
-    """BACKLOG #1817: the standalone row's zero is a reading, so a real backlog must show through.
+    """BACKLOG #1817: the standalone row's zero is a reading, so it must not paper over real traffic.
 
-    A queue row whose inbound is not in the live graph (the shape a reload that drops an inbound
-    leaves behind) is skipped by the edge loop, so its outbound falls to a standalone row. The row
-    must report that queued message rather than a null (the old form) or a blanket zero (a constant
-    that would pass the test above without measuring anything)."""
+    A queue row whose inbound this node does not run is skipped by the edge loop, so its outbound
+    falls to a standalone row. That is the shape of another engine shard's inbound (the shard
+    registry keeps every outbound but only its own inbounds) and of an inbound a reload removed. The
+    row must say "not measured" (null) there. A blanket zero would hide a queued message; folding the
+    edge in would count a sibling shard's traffic once per shard. This arm is what stops a constant
+    zero from passing the test above."""
     await _started_outbound_engine(engine, tmp_path)
     # Stop the lane first so the queued row stays queued and the reading is stable.
     await _quiesced_stopped_outbound(engine, client)
     await engine.store.enqueue_message(channel_id="gone", raw=ADT, deliveries=[("out1", ADT)])
     [row] = await _out1_rows(client)
     assert row["channel_id"] == "out1" and row["status"] == "stopped"  # still the standalone row
-    assert row["queue_depth"] == 1
-    assert row["written"] == 0
-    assert row["delivered_age_seconds"] is not None  # the queued row has an age
-    assert row["backlog_seconds"] is None  # queued with nothing draining: the edge row's rule
+    for field in ("queue_depth", "written", "errored", "backlog_seconds"):
+        assert row[field] is None, field  # not measured on this row -- and never a false 0
 
 
 async def test_engine_not_started_returns_503(tmp_path: Path) -> None:

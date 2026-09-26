@@ -348,7 +348,6 @@ from messagefoundry.store.content_search import (
 )
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.store import DestinationMetrics
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -511,23 +510,6 @@ def _backlog(depth: int, recent: int) -> float | None:
     if depth == 0:
         return 0.0
     return depth * _RATE_WINDOW / recent if recent > 0 else None
-
-
-def _fold_edges(edges: Sequence[DestinationMetrics]) -> DestinationMetrics:
-    """Fold one outbound's (inbound, outbound) edges into one reading (BACKLOG #1817).
-
-    No edges reads as zero, not as unknown: ``connection_metrics`` groups EVERY outbound-stage queue
-    row, whatever its status or age, so an outbound with no edge has no queue row at all."""
-    pending = [e.oldest_pending_at for e in edges if e.oldest_pending_at is not None]
-    done = [e.last_done_at for e in edges if e.last_done_at is not None]
-    return DestinationMetrics(
-        queue_depth=sum(e.queue_depth for e in edges),
-        written=sum(e.written for e in edges),
-        dead=sum(e.dead for e in edges),
-        oldest_pending_at=min(pending, default=None),
-        recent_done=sum(e.recent_done for e in edges),
-        last_done_at=max(done, default=None),
-    )
 
 
 def _log_storage(log_dir: str | None) -> LogInfo | None:
@@ -2451,13 +2433,14 @@ def create_app(
                     else (rr.outbound_status(oname) if rr.running else "stopped")
                 )
                 standalone[oname] = (status, None)
-            # BACKLOG #1817: a standalone row reports MEASURED counters, never null ("not measured"). Its
-            # outbound has no edge row, so any edges it does have are ones the edge loop skipped (an
-            # inbound a reload removed); fold them in, and no edges at all reads as zero (`_fold_edges`).
-            edges_by_out: dict[str, list[DestinationMetrics]] = {}
-            if not scoped:  # a scoped caller gets no standalone rows, so skip the pass
-                for (_cid, ename), edge in metrics.destinations.items():
-                    edges_by_out.setdefault(ename, []).append(edge)
+            # BACKLOG #1817: `null` on a count means "not measured" and `0` means "measured as zero", and
+            # a standalone row can be either. The metrics above group EVERY outbound-stage queue row, so
+            # an outbound with no edge at all has no queue row: its counters are a measured zero. An
+            # outbound WITH edges, none of them shown here, keeps null: those edges belong to an inbound
+            # this node does not run (another engine shard's, or one a reload removed). Folding them in
+            # would count a sibling shard's live traffic on every shard, and a per-row stats reset keys
+            # on this row's name, so it could never zero what the row showed.
+            edged_outbounds = {ename for (_cid, ename) in metrics.destinations}
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:
                     continue  # channel-scoped users never see shared-outbound topology (see above)
@@ -2466,7 +2449,7 @@ def create_app(
                     continue  # a removed/draining outbound has no spec to render; shown dests are covered
                 dmethod = _method_label(oc.spec.type.value)
                 dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
-                sm = _fold_edges(edges_by_out.get(dname, []))
+                count: int | None = None if dname in edged_outbounds else 0
                 rows.append(
                     ConnectionRow(
                         role="destination",
@@ -2479,17 +2462,16 @@ def create_app(
                         method=dmethod,
                         peer=dpeer,
                         port=dport,
-                        # Keep these six in step with the edge row's derivation above.
-                        queue_depth=sm.queue_depth,
-                        idle_seconds=(now - sm.last_done_at) if sm.last_done_at else None,
+                        # The ages stay None either way. Measured, there is no queue row to age (no
+                        # delivery yet, nothing queued), as on an edge row before its first message.
+                        queue_depth=count,
+                        idle_seconds=None,
                         alerts_active=open_alerts.get(dname, 0),
-                        errored=sm.dead,
+                        errored=count,
                         read=None,
-                        written=sm.written,
-                        backlog_seconds=_backlog(sm.queue_depth, sm.recent_done),
-                        delivered_age_seconds=(
-                            (now - sm.oldest_pending_at) if sm.oldest_pending_at else None
-                        ),
+                        written=count,
+                        backlog_seconds=None if count is None else _backlog(count, 0),
+                        delivered_age_seconds=None,
                         simulated=rr.outbound_simulated(dname),
                         paused=rr.outbound_quiesced(dname),
                         error=dreason,
