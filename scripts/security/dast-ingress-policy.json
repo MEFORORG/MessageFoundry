@@ -1,0 +1,62 @@
+{
+  "_about": "Tunables for scripts/security/dast_ingress_sweep.py (ADR 0155, increment 2, ingress plane). Every floor is a MINIMUM with headroom under a measured value; below one the run exits 2 (could not measure), never 0. Every resource bound is a MAXIMUM with headroom over a measured value. Raise a floor when the real number grows; NEVER lower a floor or raise a bound to make a run pass.",
+  "_provenance": {
+    "measured": "2026-09-26 on Windows 11 against origin/main 58f15e31f, seed 318, 24 mutations",
+    "cases_per_plane": "measured mllp 57 (39 catalogue + 18 mutations), tcp 9, x12 15 (9 catalogue + 6 mutations)",
+    "min_mllp_frames_decoded": "measured 81",
+    "min_mllp_accepted_replies": "measured 37",
+    "min_mllp_rejected_replies": "measured 41",
+    "min_liveness_probes": "measured 81, one per case",
+    "min_log_records_seen": "measured 31 INFO+ engine records; the floor only proves the watch was fed",
+    "resource_bounds": "measured heap growth -29171 to -50695 bytes, handles +0, tasks +0 over 2 passes; the leak canary measured heap +8413697 and handles +32",
+    "wall_seconds": "measured 6.3 for the seeded run and about 15 for the whole required-leg test module"
+  },
+  "posture": {
+    "max_frame_bytes": 65536,
+    "receive_timeout": 0.5,
+    "max_frame_seconds": 1.0
+  },
+  "budget": {
+    "case_seconds": 5.0,
+    "stall_close_seconds": 3.0,
+    "trickle_delay": 0.1,
+    "settle_seconds": 3.0,
+    "connect_seconds": 1.0
+  },
+  "seed": 318,
+  "mutations": 24,
+  "floors": {
+    "cases_per_plane": {"mllp": 30, "tcp": 8, "x12": 8},
+    "min_mllp_frames_decoded": 50,
+    "min_mllp_accepted_replies": 20,
+    "min_mllp_rejected_replies": 20,
+    "min_liveness_probes": 50,
+    "min_log_records_seen": 1
+  },
+  "known_defects": {
+    "blank-segment": "Engine defect found by this pass on 2026-09-26: an HL7 frame carrying an empty segment (a bare CR run) makes the MLLP listener's pre-ACK path raise IndexError. A frame that decodes is dropped with no NAK and no ERROR row; a frame that fails UTF-8 decode is recorded ERROR and then gets no NAK, because the NAK builder re-parses it and raises. ADR 0191 recorded the parser half and scoped the impact to loopback re-ingress; the live listener is affected too. Pinned by a strict xfail in tests/test_dast_ingress_sweep.py.",
+    "alphanumeric-field-separator": "Engine defect found by this pass on 2026-09-26: a message whose MSH-1 is a letter or digit is accepted, and the ACK echoes that separator, so MSA-1 (AA/AE/AR, themselves letters) cannot be read back by the sender. Pinned by a strict xfail in tests/test_dast_ingress_sweep.py."
+  },
+  "resource_bounds": {
+    "passes": 2,
+    "max_heap_growth_bytes": 4194304,
+    "max_handle_growth": 16,
+    "max_task_growth": 2
+  },
+  "canary": {
+    "case_seconds": 0.75,
+    "stall_seconds": 1.75,
+    "cases": ["mllp:well-formed", "mllp:empty-frame", "mllp:pipelined-three"],
+    "_cases_note": "listener-down runs only the first two: every probe after the stop costs connect_seconds, and two refused probes plus one refused case already clear its floor.",
+    "cases_by_canary": {"listener-down": ["mllp:well-formed", "mllp:empty-frame"]},
+    "resource_cases": ["mllp:well-formed", "mllp:pipelined-three"],
+    "floors": {
+      "no-reply": 3,
+      "ack-and-drop": 3,
+      "log-body": 3,
+      "stall": 1,
+      "leak": 1,
+      "listener-down": 2
+    }
+  }
+}
