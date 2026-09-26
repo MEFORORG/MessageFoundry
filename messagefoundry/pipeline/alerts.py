@@ -190,6 +190,30 @@ class AlertSink(Protocol):
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""
         ...
 
+    def approval_approver_provenance(
+        self, name: str, *, operation: str, changed: tuple[str, ...]
+    ) -> None:
+        """A held dual-control request was RELEASED by an approver whose account changed after the
+        request was made (BACKLOG #315). The release went ahead: this flags it and refuses nothing.
+        One Administrator can mint or take over a second approver account, so this is the signal
+        that the two identities on the release may be one person. ``name`` is
+        ``approval:<approval id>``, which no connection name can match. ``changed`` holds one or more
+        of ``account_created``, ``password_changed`` and ``totp_enrolled``. Carries the key, the
+        operation key and the slugs only: no username, no params, no PHI. The
+        ``approval.approver_provenance`` audit row is the durable record. Emitted by
+        :class:`~messagefoundry.api.approvals.ApprovalGate`."""
+        ...
+
+    def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        """An account was given the built-in Administrator role, by creating it with the role or by a
+        role change that adds it (BACKLOG #315). Every approver is an Administrator, so this is how a
+        second approver gets minted. ``name`` is ``user:<username>``, which no connection name can
+        match. ``via`` is ``account_created`` or ``roles_changed``; ``granted_by`` is the acting
+        administrator's username. No PHI. Emitted by the API's user-administration routes, never from
+        ``auth/``. A directory account that gains the role from the AD group map at sign-in is NOT
+        this event."""
+        ...
+
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         """A directory reconciliation pass tripped the mass-revoke circuit breaker and revoked
         NOTHING (ADR 0079 mechanism 2). The same event as the ``auth.ad_reconcile_aborted`` audit
@@ -469,6 +493,25 @@ class LoggingAlertSink:
             operation,
             approval_id,
             reason,
+        )
+
+    def approval_approver_provenance(
+        self, name: str, *, operation: str, changed: tuple[str, ...]
+    ) -> None:
+        log.warning(
+            "ALERT approval_approver_provenance: %s request %r was released by an approver whose "
+            "account changed after the request (%s)",
+            operation,
+            name,
+            ", ".join(changed),
+        )
+
+    def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        log.warning(
+            "ALERT administrator_granted: %r was given the Administrator role (%s) by %r",
+            name,
+            via,
+            granted_by,
         )
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
