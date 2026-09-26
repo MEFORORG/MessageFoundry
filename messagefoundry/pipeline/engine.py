@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -240,8 +240,10 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
+        registry_guard: Callable[[Registry], None] | None = None,
         sandbox_settings: SandboxSettings | None = None,
         log_dir: str | None = None,
+        registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
     ) -> None:
         self.store = store
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
@@ -254,6 +256,17 @@ class Engine:
         # reload here — so a `serve --shard X` process keeps owning only shard X's inbounds across
         # reloads. None = identity (the whole graph, unchanged default).
         self._registry_filter = registry_filter
+        # An optional refusal over every graph this engine is about to run, called at the first load
+        # (by the managed app) and on every reload, dry runs included, before anything is swapped and
+        # before the shard filter, so it sees the whole graph. It raises WiringError to refuse. `serve` passes the opt-in
+        # [security].require_nonstatic_credentials gate here (BACKLOG #1182); None = no guard.
+        self._registry_guard = registry_guard
+        # An optional async check over every graph this engine is about to RUN: the first load (by the
+        # managed app) and every real reload, after the shard filter, before the swap. Dry runs skip
+        # it, because it writes audit rows. It gets the graph and this instance's env() values and
+        # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
+        # (BACKLOG #1142, slice 3); None = no preflight.
+        self._registry_preflight = registry_preflight
         # Cluster coordination seam (Track B Step 3). None → the no-op NullCoordinator, so single-node
         # (SQLite and single-node Postgres) is byte-identical: is_leader() is always True and
         # start()/stop() do nothing. A DbCoordinator (built by build_coordinator on an enabled [cluster]
@@ -568,6 +581,7 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
+        registry_guard: Callable[[Registry], None] | None = None,
     ) -> Engine:
         """Open a SQLite-backed engine from a path (convenience for tests/embedding). The service
         path goes through :func:`~messagefoundry.store.open_store` (backend-agnostic). The SQLite
@@ -629,6 +643,7 @@ class Engine:
             coordinator=coordinator,
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
+            registry_guard=registry_guard,
         )
 
     # --- code-first wiring ---------------------------------------------------
@@ -1727,6 +1742,22 @@ class Engine:
                         rr.registry.outbound[name], flagged=flagged
                     )
 
+    def guard_registry(self, registry: Registry) -> None:
+        """Run the engine's registry guard over ``registry``; raises ``WiringError`` to refuse it.
+
+        A no-op when no guard was configured. Public because the managed app calls it on the first
+        load, which reaches ``add_registry`` directly rather than through :meth:`reload_detail`."""
+        if self._registry_guard is not None:
+            self._registry_guard(registry)
+
+    async def preflight_registry(self, registry: Registry) -> None:
+        """Run the engine's registry preflight over ``registry``; raises ``WiringError`` to refuse it.
+
+        A no-op when none was configured. Public for the same reason as :meth:`guard_registry`: the
+        managed app's first load reaches ``add_registry`` directly."""
+        if self._registry_preflight is not None:
+            await self._registry_preflight(registry, self._env_values)
+
     async def reload(
         self,
         config_dir: str | Path | None = None,
@@ -1840,6 +1871,9 @@ class Engine:
         # Off the event loop: load_config executes user config modules (arbitrary, potentially heavy
         # imports), which would otherwise stall every listener mid-reload (review low-3).
         registry = await asyncio.to_thread(load_config, path)  # raises WiringError on a bad config
+        # Before the shard filter, so a guard judges the WHOLE graph: an engine-shard process then
+        # reaches the same verdict as its siblings, over one shared config (BACKLOG #1182).
+        self.guard_registry(registry)
         if self._registry_filter is not None:
             # Re-apply this process's shard filter so a reload keeps owning only its shard's inbounds
             # (outbound/routers/handlers stay shared). Pure + cheap (sharding.filter_registry_for_shard).
@@ -1876,6 +1910,10 @@ class Engine:
                 "refusing to reload to an empty graph"
             )
         runner = self._registry_runner
+        if not dry_run:
+            # The graph this process will run, so after the shard filter. Before anything is swapped,
+            # so a refusal leaves the live graph as it was (BACKLOG #1142, slice 3).
+            await self.preflight_registry(registry)
         if dry_run:
             # Validate against THIS environment without swapping: build-check every connector (which
             # resolves env() refs against this instance's values and raises on a missing key or bad
@@ -2031,8 +2069,8 @@ class Engine:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-ingress an EDITED body as a fresh
         correlated ``RECEIVED`` message on the ORIGIN's channel, then wake the workers so the router
         drains the new ingress row promptly. The store (:meth:`QueueStore.reingress`) does the idempotent,
-        original-immutable, correlated insert; RBAC + step-up are the API's job. The original message row
-        is never written."""
+        original-immutable, correlated insert; RBAC + step-up are the API's job, and so are the origin
+        inbound's ingress guards (BACKLOG #1911). The original message row is never written."""
         outcome = await self.store.reingress(
             origin_message_id=message_id, raw=raw, idempotency_key=idempotency_key
         )
@@ -2060,7 +2098,8 @@ class Engine:
         This is deliberately **not** :meth:`edit_resend_reroute`/``reingress``: that presupposes an
         origin ``messages`` row (for its channel + correlation), which an uploaded, never-ingested file
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
-        validation (registered/running) + RBAC + audit are the API's job. Returns the new message id."""
+        validation (registered/running) + RBAC + audit are the API's job, and so are the target inbound's
+        ingress guards (BACKLOG #1911). Returns the new message id."""
         mid = await self.store.enqueue_ingress(
             channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata
         )
@@ -2073,8 +2112,9 @@ class Engine:
     ) -> ResendOutcome:
         """Edit-and-resubmit DIRECT power-path (ADR 0090 §9, BACKLOG #153): deliver an EDITED body
         straight to a chosen alternate outbound ``to`` (reusing #123's :meth:`QueueStore.resend_to` with
-        a ``body_override``), then wake the alternate lane. Target validation + RBAC are the API's job;
-        the origin row is only read, never written."""
+        a ``body_override``), then wake the alternate lane. Target validation + RBAC are the API's job,
+        and so are the engine-wide ingress guards (BACKLOG #1911); the origin row is only read, never
+        written."""
         outcome = await self.store.resend_to(
             message_id=message_id, to=to, idempotency_key=idempotency_key, body_override=raw
         )

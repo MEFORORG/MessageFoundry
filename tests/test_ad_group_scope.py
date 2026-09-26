@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from collections.abc import AsyncIterator
+from contextlib import closing
 from pathlib import Path
 
 import httpx
@@ -17,7 +19,7 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, _allowed_channels
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL, MessageStore
 
 PW = "Sup3rSecret!!"
 
@@ -38,6 +40,63 @@ async def test_scope_map_roundtrip_and_lookup(tmp_path: Path) -> None:
         assert await s.channels_for_ad_groups(["GRP-A"]) == {"IB_A", "IB_B"}
         assert await s.channels_for_ad_groups(["grp-all"]) == {"*"}
         assert await s.channels_for_ad_groups(["unmapped"]) == set()
+    finally:
+        await s.close()
+
+
+async def test_scope_writes_record_their_source(tmp_path: Path) -> None:
+    """Every scope write carries its writer, in the same statement (BACKLOG #1927)."""
+    s = await MessageStore.open(tmp_path / "src.db")
+    try:
+        await s.create_user(user_id="u", username="u", auth_provider="ad")
+        assert (await s.get_user("u")).channel_scope_source is None  # never written
+        await s.set_user_channel_scope("u", json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
+        got = await s.get_user("u")
+        assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+        await s.set_user_channel_scope("u", None, source=SCOPE_SOURCE_MANUAL)
+        got = await s.get_user("u")
+        assert (got.channel_scope, got.channel_scope_source) == (None, SCOPE_SOURCE_MANUAL)
+    finally:
+        await s.close()
+
+
+async def test_the_scope_source_column_upgrade_reruns_clean(tmp_path: Path) -> None:
+    """A database opened before BACKLOG #1927 lacks ``channel_scope_source``; the ALTER adds it.
+
+    Driven against a table that really lacks the column, because a fresh open runs the CREATE
+    TABLE that already has it and would never reach the guarded ALTER. The existing scope survives
+    with NULL provenance, and a second open must not raise ``duplicate column name``."""
+    db = tmp_path / "pre-source.db"
+    s = await MessageStore.open(str(db))
+    try:
+        await s.create_user(user_id="u", username="u", auth_provider="ad")
+        await s.set_user_channel_scope("u", json.dumps(["IB_A"]), source=SCOPE_SOURCE_MANUAL)
+    finally:
+        await s.close()
+    with closing(sqlite3.connect(db)) as raw:
+        raw.execute("ALTER TABLE users DROP COLUMN channel_scope_source")
+        raw.commit()
+        cols = {r[1] for r in raw.execute("PRAGMA table_info(users)")}
+        assert "channel_scope_source" not in cols  # positive control: the column really is gone
+
+    for _ in range(2):
+        s = await MessageStore.open(str(db))
+        try:
+            row = await s.get_user("u")
+            assert row is not None and row.channel_scope == '["IB_A"]'
+            assert row.channel_scope_source is None  # no backfill: nothing recorded the writer
+        finally:
+            await s.close()
+        # Read the CATALOGUE, not the record: ``from_mapping`` decodes a missing column to None,
+        # so the assertion above would still hold if the ALTER were deleted.
+        with closing(sqlite3.connect(db)) as raw:
+            cols = {r[1] for r in raw.execute("PRAGMA table_info(users)")}
+        assert "channel_scope_source" in cols
+
+    s = await MessageStore.open(str(db))
+    try:  # and the restored column takes a write, which every AD login now makes
+        await s.set_user_channel_scope("u", json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD)
+        assert (await s.get_user("u")).channel_scope_source == SCOPE_SOURCE_AD
     finally:
         await s.close()
 
@@ -73,7 +132,9 @@ async def test_sync_star_means_all_and_admin_is_untouched(tmp_path: Path) -> Non
         await store.set_ad_group_scope_map([("grp-all", "*"), ("grp-a", "IB_A")])
 
         await _ad_user(store, "eve")
-        await store.set_user_channel_scope("eve", json.dumps(["IB_A"]))  # previously scoped
+        await store.set_user_channel_scope(
+            "eve", json.dumps(["IB_A"]), source=SCOPE_SOURCE_MANUAL
+        )  # previously scoped
         scoped = await store.get_user("eve")
         refreshed = await service._sync_ad_channel_scope(scoped, frozenset(), ["grp-all"])
         # BACKLOG #1152: '*' persists the EXPLICIT all-channels grant. It used to persist SQL NULL
@@ -98,12 +159,239 @@ async def test_sync_no_matching_group_leaves_scope_untouched(tmp_path: Path) -> 
         await service.initialize()
         await store.set_ad_group_scope_map([("grp-a", "IB_A")])
         await store.create_user(user_id="u", username="u", auth_provider="ad")
-        await store.set_user_channel_scope("u", json.dumps(["MANUAL"]))  # a manual per-user scope
+        # A manual per-user scope, set the way an administrator sets one.
+        await service.set_channel_scope("u", ["MANUAL"], actor="admin")
         user = await store.get_user("u")
+        assert user is not None and user.channel_scope_source == SCOPE_SOURCE_MANUAL
         out = await service._sync_ad_channel_scope(user, frozenset(), ["other-group"])
         assert json.loads(out.channel_scope) == [
             "MANUAL"
-        ]  # opt-in: untouched when no group matches
+        ]  # opt-in: an administrator's scope is untouched when no group matches
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1927: a scope the DIRECTORY granted is withdrawn when no mapped group matches ---
+
+
+async def test_leaving_the_last_mapped_group_withdraws_the_ad_derived_scope(
+    tmp_path: Path,
+) -> None:
+    """The directory granted the scope, so the directory can take it back.
+
+    Before BACKLOG #1927 a no-match login returned early, so a user removed from their LAST
+    scope-mapped group kept the channels an earlier login derived from it, for as long as the
+    account existed. The session is the control on the revoke: it must be live before the sync and
+    gone after, so a sync that wrote the scope but skipped the revoke fails here."""
+    store = await MessageStore.open(tmp_path / "svc4.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        user = await _ad_user(store, "ada")
+
+        granted = await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+        assert json.loads(granted.channel_scope) == ["IB_A"]
+        assert granted.channel_scope_source == SCOPE_SOURCE_AD
+        await _session_for(store, "ada", "h-ada-1927")
+        assert await store.list_sessions("ada"), "no session to revoke -- test proves nothing"
+
+        # The directory now reports no mapped group for this user.
+        out = await service._sync_ad_channel_scope(granted, frozenset(), ["other-group"])
+
+        assert out.channel_scope is None, "the directory-granted scope survived leaving the group"
+        assert _allowed_channels(out, frozenset()) == frozenset()  # and it resolves to a deny
+        assert await store.list_sessions("ada") == [], "a stale-scope session is still live"
+        rows = [a for a in await store.list_audit() if a["action"] == "auth.ad_scope_resynced"]
+        assert len(rows) == 2, "the grant and the withdrawal must each write one audit row"
+        # list_audit is newest first, so rows[0] is the withdrawal.
+        assert json.loads(rows[0]["detail"]) == {"channels": None, "withdrawn": '["IB_A"]'}
+    finally:
+        await store.close()
+
+
+async def test_a_withdrawn_scope_is_not_rewritten_on_the_next_login(tmp_path: Path) -> None:
+    """Idempotence: once withdrawn, a second no-match login writes, revokes and audits nothing."""
+    store = await MessageStore.open(tmp_path / "svc5.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        user = await _ad_user(store, "ada")
+        user = await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+        user = await service._sync_ad_channel_scope(user, frozenset(), [])
+        assert user.channel_scope is None
+        action = "auth.ad_scope_resynced"
+        before = len(await store.list_audit(action=action))
+        assert before == 2  # the grant and the withdrawal; also keeps clear of the list cap
+        await _session_for(store, "ada", "h-ada-1927-b")
+
+        await service._sync_ad_channel_scope(user, frozenset(), [])
+
+        assert len(await store.list_audit(action=action)) == before
+        assert await store.list_sessions("ada"), "a no-op sync revoked a session"
+    finally:
+        await store.close()
+
+
+async def test_a_scope_with_no_recorded_source_is_withdrawn(tmp_path: Path) -> None:
+    """A scope nobody recorded a writer for is treated as the directory's, which fails CLOSED.
+
+    Only a scope marked as an administrator's survives a no-match login. Every writer records its
+    source, so an unmarked scope can only be a row written before the column existed; withdrawing
+    it denies until an administrator re-grants, rather than keeping a grant nobody can vouch for."""
+    store = await MessageStore.open(tmp_path / "svc6.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        await _ad_user(store, "old")
+        await store._db.execute(
+            "UPDATE users SET channel_scope=?, channel_scope_source=NULL WHERE id=?",
+            (json.dumps(["IB_A"]), "old"),
+        )
+        await store._db.commit()
+        user = await store.get_user("old")
+        assert user is not None and user.channel_scope is not None  # positive control
+        assert user.channel_scope_source is None
+
+        out = await service._sync_ad_channel_scope(user, frozenset(), [])
+
+        assert out.channel_scope is None
+    finally:
+        await store.close()
+
+
+async def test_an_admin_scope_set_during_the_login_is_not_withdrawn(tmp_path: Path) -> None:
+    """The withdrawal is a compare-and-set, so it cannot overwrite a scope set after the read.
+
+    The login reads the user row, then spends several awaits before the scope sync. An
+    administrator who sets a scope in that window must keep it. Passing the STALE record, read
+    before the administrator's write, reproduces the window deterministically."""
+    store = await MessageStore.open(tmp_path / "svc9.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        await _ad_user(store, "ada")
+        stale = await service._sync_ad_channel_scope(
+            await store.get_user("ada"), frozenset(), ["grp-a"]
+        )
+        assert stale.channel_scope_source == SCOPE_SOURCE_AD  # what the login read
+
+        await service.set_channel_scope("ada", ["MANUAL"], actor="admin")  # lands mid-login
+        await _session_for(store, "ada", "h-ada-1927-d")
+
+        out = await service._sync_ad_channel_scope(stale, frozenset(), [])
+
+        assert json.loads(out.channel_scope) == ["MANUAL"], "the withdrawal overwrote the admin"
+        assert out.channel_scope_source == SCOPE_SOURCE_MANUAL
+        assert await store.list_sessions("ada"), "a withdrawal that did not happen revoked"
+    finally:
+        await store.close()
+
+
+async def test_the_withdrawal_is_bound_to_the_scope_it_was_decided_on(tmp_path: Path) -> None:
+    """A concurrent login's fresh directory grant is not withdrawn by a login that read the old one.
+
+    Login A reads ``["IB_A"]`` and finds no mapped group. Before A writes, login B finds the user in
+    a mapped group and writes ``["IB_B"]``, also marked ``"ad"``. A's withdrawal must miss, because
+    the value it decided on is gone."""
+    store = await MessageStore.open(tmp_path / "svc11.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A"), ("grp-b", "IB_B")])
+        await _ad_user(store, "ada")
+        stale = await service._sync_ad_channel_scope(
+            await store.get_user("ada"), frozenset(), ["grp-a"]
+        )
+        await service._sync_ad_channel_scope(stale, frozenset(), ["grp-b"])  # login B
+
+        out = await service._sync_ad_channel_scope(stale, frozenset(), [])  # login A, late
+
+        assert json.loads(out.channel_scope) == ["IB_B"], "a stale login withdrew a fresh grant"
+    finally:
+        await store.close()
+
+
+async def test_a_scope_that_already_denies_is_left_alone(tmp_path: Path) -> None:
+    """An unmarked ``[]`` already denies, so a no-match login rewrites nothing and revokes nothing.
+
+    Rewriting it to NULL would change no decision, erase the "somebody chose this" meaning that
+    ``[]`` carries over NULL, and sign the user out of every other session for no reason."""
+    store = await MessageStore.open(tmp_path / "svc10.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await _ad_user(store, "old")
+        await store._db.execute(
+            "UPDATE users SET channel_scope='[]', channel_scope_source=NULL WHERE id=?", ("old",)
+        )
+        await store._db.commit()
+        await _session_for(store, "old", "h-old-1927")
+        user = await store.get_user("old")
+        assert user is not None and user.channel_scope == "[]"  # positive control
+
+        out = await service._sync_ad_channel_scope(user, frozenset(), [])
+
+        assert out.channel_scope == "[]"
+        assert await store.list_sessions("old")
+        assert await store.list_audit(action="auth.ad_scope_resynced") == []
+    finally:
+        await store.close()
+
+
+async def test_a_directory_grant_replaces_a_manual_scope_and_is_then_withdrawable(
+    tmp_path: Path,
+) -> None:
+    """A matching group still overrides a manual scope, as it always did, and takes its provenance.
+
+    This pins the existing half of the rule: the directory is authoritative whenever a mapped group
+    matches. Once it has written the scope the scope is the directory's, so leaving the group then
+    withdraws it rather than restoring the administrator's earlier value."""
+    store = await MessageStore.open(tmp_path / "svc7.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        await _ad_user(store, "ada")
+        await service.set_channel_scope("ada", ["MANUAL"], actor="admin")
+        user = await store.get_user("ada")
+        assert user is not None
+
+        user = await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+        assert json.loads(user.channel_scope) == ["IB_A"]
+        assert user.channel_scope_source == SCOPE_SOURCE_AD
+
+        user = await service._sync_ad_channel_scope(user, frozenset(), [])
+        assert user.channel_scope is None
+    finally:
+        await store.close()
+
+
+async def test_an_identical_manual_scope_is_taken_over_without_a_revoke(tmp_path: Path) -> None:
+    """A matching group whose scope equals an administrator's takes provenance and revokes nothing.
+
+    The effective scope does not change, so no live session holds a stale grant. The write is still
+    audited, because it changes whether a later group removal will withdraw the scope."""
+    store = await MessageStore.open(tmp_path / "svc8.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        await _ad_user(store, "ada")
+        await service.set_channel_scope("ada", ["IB_A"], actor="admin")
+        user = await store.get_user("ada")
+        assert user is not None and user.channel_scope_source == SCOPE_SOURCE_MANUAL
+        await _session_for(store, "ada", "h-ada-1927-c")
+
+        out = await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+
+        assert out.channel_scope_source == SCOPE_SOURCE_AD
+        assert json.loads(out.channel_scope) == ["IB_A"]
+        assert await store.list_sessions("ada"), "an unchanged scope revoked a live session"
+        assert any(a["action"] == "auth.ad_scope_resynced" for a in await store.list_audit())
     finally:
         await store.close()
 

@@ -2,7 +2,7 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
   "serialNumber": "urn:uuid:79d3f7c1-f856-5ae2-a522-2302551ac609",
-  "version": 1,
+  "version": 2,
   "metadata": {
     "timestamp": "2026-09-18T00:00:00Z",
     "lifecycles": [
@@ -75,6 +75,10 @@
           "value": "The vendored file is the upstream blob with a 176-byte two-line header prepended and nothing else changed. Strip the first two lines and the SHA-256 of what remains is the upstream digest above -- reproducible offline, no network and no Node."
         },
         {
+          "name": "messagefoundry:vendored:action-yml-local-change",
+          "value": "action.yml is NOT the upstream file. BACKLOG #1868 changed runs.using from node20 to node24 and added a comment above it saying why; diffed against upstream on 2026-09-25, no other line differed. Its recorded digest below pins the changed file, not the upstream one."
+        },
+        {
           "name": "messagefoundry:upstream:lock-blob-id",
           "value": "5700fc1014797e967a7a5395c1198643634cf204"
         },
@@ -100,7 +104,7 @@
         },
         {
           "name": "messagefoundry:recorded-files:sha256:.github/actions/cla-assistant-lite/action.yml",
-          "value": "8acc29dc1f1559b9c5117eee0ffb24710233459ddff6e068fcdd3c04486e2a4f"
+          "value": "596d61eb19f2ffca22fee1fb31cb68d2a6511fe2f7f69e600640675f7c67489c"
         },
         {
           "name": "messagefoundry:recorded-files:sha256:.github/actions/cla-assistant-lite/dist/index.js",
@@ -135,7 +139,7 @@
       },
       {
         "name": "messagefoundry:provenance:ledger-rows",
-        "value": "BACKLOG #1381 (vendoring), BACKLOG #1578 (this record)"
+        "value": "BACKLOG #1381 (vendoring), BACKLOG #1578 (this record), BACKLOG #1868 (action.yml runtime changed from upstream)"
       },
       {
         "name": "messagefoundry:provenance:generator",

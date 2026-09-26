@@ -229,31 +229,94 @@ def _secret_row(settings: ServiceSettings) -> CheckResult:
     return CheckResult(rid, title, Status.PASS, f"resolved from the {source} (value not shown)")
 
 
+_ACL_WORDS = {True: "owner-only", False: "writable by a non-owner", None: "could not be read"}
+_PATH_WORDS = {
+    True: "no untrusted principal can replace it",
+    False: "replaceable through its path",
+    None: "could not be settled",
+}
+
+
 def _tls_row(settings: ServiceSettings) -> CheckResult:
-    """Build the real IdP TLS context. A bad/unreadable CA path fails here rather than at the last
-    hop of a live login. No socket is opened."""
+    """Build the real IdP TLS context, with the pin, the CRL file and the enforcement dial the engine
+    uses, and say what it trusts. A bad/unreadable CA path, a pin mismatch, a CRL file the engine
+    refuses, or an anchor ``enforce`` refuses fails here rather than at the last hop of a live login.
+    No socket is opened.
+
+    **No anchor is MANUAL, never PASS** (BACKLOG #1142). The context then trusts every root in the
+    host's OS store, so any of those CAs can issue a certificate the engine accepts for the IdP.
+    There is no WARN status, and MANUAL is the one that means "a person must confirm this" without
+    failing the run.
+
+    **An anchor reports its ACL and path verdict.** Only owner-only and not replaceable earns PASS.
+    The verdict belongs to the account that ran ``verify``, not the service account, and the row says
+    so: the path check trusts its own account as the engine's."""
     from messagefoundry.auth.oidc_http import build_idp_opener
+    from messagefoundry.auth.trust_anchors import (
+        TrustAnchorError,
+        evaluate_anchor,
+        oidc_anchor_spec,
+    )
+    from messagefoundry.config.settings import SecurityEnforcement
 
     rid, title = "fed.idp_tls", "IdP TLS trust"
     ca = settings.auth.oidc_tls_ca_cert_file
+    pin = settings.auth.oidc_tls_ca_cert_pin
+    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
     try:
-        build_idp_opener(ca)
+        build_idp_opener(ca, pin=pin, enforcing=enforcing, crl_file=settings.auth.oidc_tls_crl_file)
+        # A second read of the file, for the report only: the opener above loaded its own checked
+        # bytes, and this verdict is what the row prints. Taking the opener's own verdict would
+        # widen build_idp_opener's signature for a diagnostic.
+        spec = oidc_anchor_spec(ca, pin) if ca else None
+        verdict = evaluate_anchor(spec) if spec is not None else None
     except OSError as exc:
         return CheckResult(
             rid, title, Status.FAIL, f"could not build the pinned TLS context: {exc}"
         )
+    except TrustAnchorError as exc:
+        return CheckResult(rid, title, Status.FAIL, f"the engine refuses this anchor: {exc}")
+    except ValueError as exc:  # harden_crl_check: a missing, expired, CRL-less or cert-bearing file
+        return CheckResult(rid, title, Status.FAIL, f"the engine refuses this CRL file: {exc}")
     except Exception as exc:
         return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")
-    if ca:
+    if verdict is None:
         return CheckResult(
-            rid, title, Status.PASS, f"pinned to {ca} (that PEM is the ENTIRE trust anchor set)"
+            rid,
+            title,
+            Status.MANUAL,
+            "no anchor set, so the IdP hop trusts EVERY root in this host's OS trust store: any of "
+            "those CAs can issue a certificate the engine accepts for the IdP. Confirm that is "
+            "intended, or pin the IdP's CA with [auth].oidc_tls_ca_cert_file",
+        )
+    check = verdict.path_check
+    account = check.engine if check is not None and check.engine else "the account running verify"
+    evidence = (
+        f"sha256={verdict.fingerprint}; pin="
+        f"{'not set' if verdict.pin_ok is None else 'matches'}; "
+        f"acl={_ACL_WORDS[verdict.acl_ok]}; path={_PATH_WORDS[verdict.path_ok]}; checked as {account}"
+    )
+    caller = (
+        f" Checked as {account}, not as the service account, and the path check trusts the "
+        "account it runs as. Run verify as the service account to read the engine's own answer."
+    )
+    if verdict.acl_ok is True and verdict.path_ok is True:
+        return CheckResult(
+            rid,
+            title,
+            Status.PASS,
+            f"pinned to {ca} (that PEM is the ENTIRE trust anchor set); owner-only and not "
+            "replaceable through its path." + caller,
+            evidence=evidence,
         )
     return CheckResult(
         rid,
         title,
-        Status.PASS,
-        "using the OS trust store (a private/AD-CS IdP certificate must be installed there, or set "
-        "[auth].oidc_tls_ca_cert_file)",
+        Status.MANUAL,
+        f"pinned to {ca}, but ACL: {_ACL_WORDS[verdict.acl_ok]}; path: "
+        f"{_PATH_WORDS[verdict.path_ok]}. The engine loads it without refusing at this "
+        "[security].enforcement setting, so a person must confirm it." + caller,
+        evidence=evidence,
     )
 
 

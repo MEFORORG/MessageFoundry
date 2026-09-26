@@ -27,7 +27,9 @@ from messagefoundry.config.settings import ApprovalsSettings, AuthSettings
 from messagefoundry.pipeline import Engine
 
 PW = "a-strong-test-passphrase"
-GATED = ApprovalsSettings(enabled=True, operations=["config_reload"])
+# min_dwell_seconds=0: this suite releases a reload within milliseconds of holding it, which the
+# shipped ASVS 2.4.2 floor would refuse. tests/test_approval_min_dwell.py covers the floor.
+GATED = ApprovalsSettings(enabled=True, operations=["config_reload"], min_dwell_seconds=0.0)
 NOT_GATED = ApprovalsSettings(enabled=True, operations=["dead_letter_replay"])  # reload NOT held
 
 

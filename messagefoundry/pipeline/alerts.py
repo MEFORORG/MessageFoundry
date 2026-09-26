@@ -155,16 +155,28 @@ class AlertSink(Protocol):
         :meth:`cert_expiry`) so an operator can route a rotation reminder apart from a cert-expiry alert."""
         ...
 
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
-        """The first-run **bootstrap admin** is still UNCLAIMED (never password-changed) and now sits
-        inside its retirement warn window — an operator must sign in and change the password (or stand
-        up a second administrator) before the unclaimed credential is auto-disabled (ASVS 6.4.5). ``name``
-        labels the credential (``"bootstrap-admin"``); ``expires_at`` is the ISO instant it is disabled;
-        ``hours_remaining`` is the whole hours left (``0`` in the final hour). Carries **only** the
-        deadline + hours — **never** the password or any secret, and no message content (no PHI). Emitted
-        once per process (an in-memory latch on :class:`~messagefoundry.auth.service.AuthService`) by the
-        API-lifespan reminder task. Dedicated (not reusing :meth:`secret_rotation_due`) so an operator can
-        route a first-run-credential reminder apart from a long-lived-secret rotation reminder."""
+    def initial_credential_expiring(
+        self, name: str, *, expires_at: str, hours_remaining: int
+    ) -> None:
+        """An **admin-issued temporary password** (a create-user or reset credential, still
+        ``must_change_password``) is UNCLAIMED and near the instant the login gate stops accepting it
+        (ASVS 6.4.5, BACKLOG #1141). ``name`` is ``user:<holder's username>``, so the throttle and
+        the alert instance key per account; ``expires_at`` is the ISO instant; ``hours_remaining`` is
+        the whole hours left (``0`` in the final hour).
+
+        The prefix does not hide the event from rules. ``AlertRule.connection`` defaults to ``"*"``,
+        so a catch-all rule matches it. Where a catch-all rule is the first match, its ``mute`` or
+        ``transports=[]`` silences this reminder. Its ``control_action`` is dispatched at ``name``,
+        or, when the rule sets ``control_target``, at that real connection, which it restarts. Scope
+        such rules to real connection names or to one ``event_type``. Rules apply only where
+        ``[alerts]`` has a transport; without one, :class:`LoggingAlertSink` logs every event.
+
+        The engine cannot reach the holder of a credential it handed to an administrator, so this goes
+        to the operator: tell the holder, or, if the credential lapses unclaimed, reset it again. The
+        alert does not resolve itself when the holder claims it, so check the account before a
+        reset. Carries **only** the
+        username, the deadline and the hours: never the password, and no message content (no PHI).
+        Emitted once per credential per process by the API-lifespan reminder task."""
         ...
 
     def approval_stale_requester(self, approval_id: str, *, operation: str, reason: str) -> None:
@@ -439,10 +451,13 @@ class LoggingAlertSink:
                 last_rotated,
             )
 
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
+    def initial_credential_expiring(
+        self, name: str, *, expires_at: str, hours_remaining: int
+    ) -> None:
         log.warning(
-            "ALERT bootstrap_admin_expiring: %r is UNCLAIMED and is auto-disabled in %d hour(s) "
-            "(expires %s) — sign in and change the password, or add a second admin, before then",
+            "ALERT initial_credential_expiring: the temporary password issued to %r is UNCLAIMED and "
+            "stops working in %d hour(s) (expires %s) -- the holder must sign in and change it, or "
+            "an administrator must reset it again after it lapses",
             name,
             hours_remaining,
             expires_at,
@@ -545,18 +560,42 @@ class LoggingAlertSink:
 #: throttles and routes apart from engine attestation and the audit-chain check.
 STORE_CIPHER_SUBJECT = "store-cipher"
 
+#: The cell-AAD table name the uploaded-file store seals under (``uploads.py``). Spelled here so this
+#: module does not import the uploads store for one string; a test pins the two spellings together.
+UPLOADED_FILE_TABLE = "uploaded_file"
+
+#: The ``integrity_drift`` subject for a refused plaintext UPLOAD (BACKLOG #1169). Apart from
+#: ``store-cipher`` on purpose. Legacy plaintext uploads are expected after a first key-enable and
+#: refuse on every listing, so on the store's subject they would share its throttle, escalation and
+#: suspend key. A real planted store row could then be throttled behind them, or muted along with
+#: them.
+UPLOAD_CIPHER_SUBJECT = "upload-cipher"
+
 
 def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None:
-    """Raise the ``store-cipher`` alert for an unmarked value in ``table.column``.
+    """Raise the refusal alert for an unmarked value in ``table.column``: ``upload-cipher`` for the
+    uploaded-file store, ``store-cipher`` for everything else.
 
     Names only the cell, which the cipher took from the AAD: never the row key and never the value,
     so it carries no PHI. Never raises: an alert failure must not change what a read or an open does."""
-    reason = (
-        f"the keyed store found an unmarked value in cipher column {table}.{column} (a stripped "
-        "marker or a planted plaintext row); every read of it is refused"
-    )
+    if table == UPLOADED_FILE_TABLE:
+        # The uploaded-file store (BACKLOG #1169, owner ruling 2026-09-23). Unlike a store column, a
+        # plaintext file here is usually legitimate: one written before the key was enabled. So the
+        # reason says what fixes it. Still the surface only: never a file id and never a filename.
+        subject = UPLOAD_CIPHER_SUBJECT
+        reason = (
+            f"the keyed store refused a plaintext uploaded file ({table}.{column}): one stored before "
+            "the key was enabled, or a planted one; it stays refused until 'messagefoundry "
+            "rotate-key' seals it"
+        )
+    else:
+        subject = STORE_CIPHER_SUBJECT
+        reason = (
+            f"the keyed store found an unmarked value in cipher column {table}.{column} (a stripped "
+            "marker or a planted plaintext row); every read of it is refused"
+        )
     try:
-        sink.integrity_drift(STORE_CIPHER_SUBJECT, reason=reason, drift_count=1)
+        sink.integrity_drift(subject, reason=reason, drift_count=1)
     except Exception:  # noqa: BLE001 — an alert-sink failure must never break a read path
         log.warning("store-cipher integrity alert could not be delivered")
 

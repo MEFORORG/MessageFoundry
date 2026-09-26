@@ -69,6 +69,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchor,
     build_verifying_client_context,
     harden_cipher_suites,
+    narrow_to_approved_suites,
     relax_verify_expiry,
 )
 from messagefoundry.transports.base import (
@@ -221,6 +222,7 @@ def _client_cert_opener(
     # Assert forward secrecy LAST, so it sees the final suite list (ASVS 12.1.2). The docstring above
     # already claimed parity with mllp.py / api/tls.py on the TLS floor; this makes the claim true of
     # the cipher assertion those siblings also carry.
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="SOAP destination (mutual TLS)")
     return urllib.request.build_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers

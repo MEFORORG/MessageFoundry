@@ -44,6 +44,29 @@ than feeding it. Four facts, each measured, that are not obvious from the code b
   registered here and the ``pipeline/`` call sites stay ``ssl``-free. That is centralization, not
   evasion: one place decides the TLS policy for every SMTP hop in the product.
 
+**AN OPERATION ARM READS THE SAME PYTHON AT FINER GRAIN (BACKLOG #1164, ASVS 11.1.3).** Import
+discovery cannot see a new operation inside a file that is already registered, and it sees a file
+that reaches crypto through a first-party helper only if that helper is on the seam list. The
+operation arm (:func:`check_operations`, instrument in ``scripts/security/crypto_operations.py``)
+resolves every CALL to a qualified name and classifies it by what it does: encrypt/decrypt, hash,
+MAC, constant-time compare, sign/verify, KDF, CSPRNG draw, TLS-context construction or posture, key
+or certificate handling. It follows first-party module-level helpers without a list, so a new one is
+covered the day it is written. It diffs against :data:`OPERATION_INVENTORY` bidirectionally, and it
+diffs :data:`INVENTORY` against :data:`IMPORT_ONLY` so a file that imports crypto but performs no
+visible operation has to say why. Three properties, each pinned in
+``tests/test_crypto_inventory_scanner.py``:
+
+* it prints what it read (files, and operations per class, a zero included) BEFORE the verdict;
+* a positive control (:data:`_SELF_TEST_SOURCES`) runs first on every invocation and reds the gate
+  if any of the matchers it exercises stops finding its planted operation;
+* a NAMED algorithm change reds even when the file, its imports and its operation classes are
+  unchanged, because the token carries the algorithm wherever the call names it: ``hashlib.md5``
+  planted in a file that already hashes with ``hashlib.sha256`` reds here and passes the import arm,
+  and so does ``hmac.new(k, m, hashlib.md5)`` beside ``hmac.new(k, m, hashlib.sha256)``.
+
+**What no arm sees is stated ONCE**, in the module docstring of ``crypto_operations.py`` under THE
+RESIDUAL. Read it there; every arm's green reads "at least" because of it.
+
 **A SECOND ARM COVERS THE NON-PYTHON TREE (BACKLOG #1172, ASVS 11.5.1).** Everything above is an
 ``import ast`` walk of ``*.py``, so it is Python-only *by construction* and cannot see a randomness
 draw in another language however the walk-set is spelled. :func:`check_non_python_randomness` scans
@@ -67,14 +90,23 @@ properties are the point of it, and each is pinned by a test in
   names it.
 
 This is a *randomness* inventory, and that is the whole claim it supports. The other first-party
-crypto in ``ide/`` - the TLS floor ``ide/src/engineClient.ts`` applies to every https request - is
-still not discoverable from here.
+crypto in the non-Python roots (the TLS floor and suite pin ``ide/src/engineClient.ts`` applies to
+every https request, and the console's WebAuthn ceremony in ``static/app.js``) is found by a THIRD arm,
+:func:`check_non_python_operations` (BACKLOG #1164). A FOURTH arm,
+:func:`check_powershell_operations`, reads the ``.ps1`` and ``.psm1`` files under ``scripts/``,
+including the
+operator deployment path that installs a trust anchor and verifies a pinned service binary. Both
+run only under ``--non-python-operations``, from their own ``crypto-operations`` CI job. Where that
+job runs, and what decides whether it blocks a merge, is stated once, at
+``NON_PYTHON_OPERATION_PATTERNS``.
 
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
 
     python scripts/security/crypto_inventory_check.py            # scan the five real roots
     python scripts/security/crypto_inventory_check.py --package DIR   # scan an arbitrary package (tests)
+    python scripts/security/crypto_inventory_check.py --list-operations   # also print every operation
+    python scripts/security/crypto_inventory_check.py --non-python-operations   # TS/JS + PowerShell
 """
 
 from __future__ import annotations
@@ -83,7 +115,18 @@ import argparse
 import ast
 import re
 import sys
+from collections.abc import Callable, Iterable
 from pathlib import Path
+
+# The operation instrument is a sibling file rather than part of this one so its taxonomy and
+# resolver can be read (and tested) on their own. scripts/ is not a package, hence the path entry.
+# APPENDED, and only once: the tests re-execute this file dozens of times per session, and a
+# prepend each time would stack copies of this directory in front of the stdlib, where any future
+# file here named like a stdlib module would shadow it for the rest of the run.
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.append(_HERE)
+import crypto_operations  # noqa: E402
 
 # The five first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
@@ -96,8 +139,9 @@ from pathlib import Path
 # NOT a finding that ``ide/`` is crypto-free. Zero ``.py`` files is a fact about the LANGUAGE, and the
 # question this gate exists to answer is whether a tree contains cryptography. ``ide/`` does:
 # ``ide/src/cspNonce.ts`` imports ``randomBytes`` from ``node:crypto`` and draws CSPRNG bytes consumed
-# across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor it applies to every https
-# request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from here.
+# across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor and suite list it applies to
+# every https request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from the
+# Python walk. The non-Python arms below find both.
 #
 # ADDING ``ide/`` TO WALK_ROOTS WOULD STILL BE A NO-OP THAT LOOKS LIKE A FIX, and that has not
 # changed: the Python AST scanner would find zero ``.py`` there, report clean, and the TypeScript
@@ -106,7 +150,9 @@ from pathlib import Path
 # which reads ``.ts``/``.js`` by pattern rather than by AST and rides this same required context. So
 # this gate's green now means "no undocumented crypto in the PYTHON of five roots, AND no
 # undocumented or weak RANDOMNESS source in the non-Python roots". The randomness half is the only
-# claim the second arm supports - the extension's TLS floor is still outside both.
+# non-Python claim the REQUIRED run supports. The extension's TLS floor is found by the operation arm
+# (:func:`check_non_python_operations`, BACKLOG #1164), which runs in its own CI job; see
+# ``NON_PYTHON_OPERATION_PATTERNS`` for where, and for who answers whether it gates a merge.
 # ``samples/`` is absent by design too, on the SAME rationale as the ``ide/`` exclusion (ASVS 11.1.3):
 # it is author-space EXAMPLE config, not shipped engine code, so its crypto (e.g. a content-fingerprint
 # ``hashlib.sha256`` in a sample Handler) is out of the deployed-system inventory scope — the gate
@@ -296,7 +342,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # engine-client verifies the engine API server cert — the OS trust store (truststore.SSLContext,
     # a CRYPTO_LIBRARY_MODULES trigger) by default, or a pinned PEM via --cacert
     # (ssl.create_default_context), plus opt-in client-cert mTLS (load_cert_chain). Builds the
-    # client-side TLS verification context.
+    # client-side TLS verification context, and on either branch pins the TLS 1.2 suites to
+    # _APPROVED_TLS12_SUITES with set_ciphers (BACKLOG #300), so it offers nothing wider than
+    # the engine listener's AEAD default.
     "messagefoundry/apiclient/client.py": frozenset({"ssl", "truststore"}),
     # BACKLOG #1276 part A: the engine always serves TLS now and mints a self-signed placeholder when
     # no operator cert is configured. This harness supplies its own certificate instead — one pair
@@ -405,7 +453,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # row-writer without the store DEK cannot forge — and, since BACKLOG #1904, the constant-time walk
     # all three backends share (verify_audit_rows); hashlib = the keyless SHA-256 chain, the audit
     # key-range digest (ADR 0193) + delivery/body digests. The HMAC key is HKDF-derived (in crypto.py) from the DEK. store.crypto seam = the at-rest
-    # cipher (MARKER_PREFIX/cell_aad/CipherError) it drives over the PHI columns.
+    # cipher (MARKER_PREFIX/cell_aad/CipherError) it drives over the PHI columns. BACKLOG #1904
+    # (ADR 0193): it also names each audit key by store.crypto.audit_key_id, a one-way SHA-256 id of
+    # the DERIVED audit key, so a verify after a rotation picks the key each keyed range was MAC'd
+    # under. The id is non-secret: neither key can be recovered from it.
     "messagefoundry/store/store.py": frozenset({"hashlib", "hmac", "messagefoundry.store.crypto"}),
     # BACKLOG #1178 (ASVS 12.3.1): probe_tcp_reachable builds NO context -- it accepts the caller's
     # and hands it to asyncio.open_connection, so the connection test crosses the same hop the send
@@ -480,11 +531,13 @@ INVENTORY: dict[str, frozenset[str]] = {
         {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
     ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
-    # engine's server cert when [api].tls_cert_file makes the loopback bind serve https. Builds the
-    # same OS-trust-store context the engine client uses (truststore.SSLContext, lazily imported) —
-    # https only, no pinned-PEM option, and no verify=False escape at all (the tray holds no
-    # credential to protect, but an unverified probe could not tell the engine from an impostor).
-    # truststore (a CRYPTO_LIBRARY_MODULES trigger) supplies that OS-trust-store context.
+    # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
+    # engine's cert, it pins trust to exactly that PEM (ssl.create_default_context with cafile=);
+    # otherwise, or while the pin cannot load yet, it builds the same OS-trust-store context the
+    # engine client uses (truststore.SSLContext, lazily imported). https only, and no verify=False
+    # escape at all (the tray holds no credential to protect, but an unverified probe could not
+    # tell the engine from an impostor). truststore (a CRYPTO_LIBRARY_MODULES trigger) supplies the
+    # OS-trust-store context.
     "messagefoundry/tray/probe.py": frozenset({"ssl", "truststore"}),
     # ADR 0134 (#125/#126): secrets = the random 32-hex uploaded-file id (secrets.token_hex, the
     # path-traversal-safe on-disk identity + tmp-file suffix); hashlib = sha256 of an uploaded file's
@@ -501,7 +554,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # --- BACKLOG #282: modules the seam / library / non-messagefoundry-root widening newly surfaces ---
     # The CLI (gen-key / rotate-key / serve): mints the store DEK (store.crypto.generate_key),
     # gates a keyless PHI start, and surfaces KeyProviderError — all delegated through the store seams,
-    # with zero direct stdlib-crypto import in the module.
+    # with zero direct stdlib-crypto import in the module. rotate-key stamps a new DEK key-id only
+    # when it CHANGED, and compares it to the stored fingerprint through
+    # pipeline.secret_rotation.fingerprints_equal: constant-time over bytes, the same compare the
+    # rotation watcher uses (ASVS 11.2.4, BACKLOG #1167), never a bare `!=`.
     "messagefoundry/__main__.py": frozenset(
         {
             "messagefoundry.config.tls_policy",
@@ -660,6 +716,601 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/http_auth.py": frozenset({"messagefoundry.config.tls_policy"}),
 }
 
+# --------------------------------------------------------------------------------------------
+# The OPERATION arm (BACKLOG #1164, ASVS 11.1.3).
+# --------------------------------------------------------------------------------------------
+# The import arm above answers "which files import crypto". The operation arm answers the finer
+# question the ASVS verb asks, "where are the instances": every call that encrypts, hashes, MACs,
+# signs or verifies, derives a key, draws from a CSPRNG, builds or configures a TLS context, or
+# generates or loads a key or certificate, keyed path:line -> operation class. The instrument and its
+# taxonomy live in scripts/security/crypto_operations.py; the expected state lives here, beside the
+# import inventory it refines.
+#
+# THE TOKEN is defined by crypto_operations.operation_token: ``class:callee`` for a direct call, with
+# any algorithm the call NAMES in brackets, a TLS posture value where it is a literal or named
+# constant, and ``class:via <module>`` for a call through a first-party provider. What a token
+# cannot carry is in that module's docstring, under THE RESIDUAL.
+#
+# REGENERATING THIS TABLE IS NOT A FIX. The bidirectional diff below is the point: a token the tree
+# gains is an operation somebody should look at, and adding it here is the record that somebody did.
+
+#: Files the IMPORT inventory lists but in which the operation arm finds no operation, and why. The
+#: diff is bidirectional here too: an INVENTORY row with no operation and no entry here reds, and an
+#: entry here whose file DOES show an operation reds. Several entries are the instrument's own named
+#: limits, and they are the most useful lines in this table: each is a first-party crypto decision
+#: that no call-pattern instrument can see.
+IMPORT_ONLY: dict[str, str] = {
+    "messagefoundry/config/models.py": (
+        "imports TrustAnchorPolicy, a value type, to declare and validate the operator's setting"
+    ),
+    "messagefoundry/config/secretprovider_vault.py": (
+        "INSTRUMENT LIMIT. hvac is lazy-imported through a helper and reached as a local variable, "
+        "which the resolver cannot follow, and the Vault hop's TLS posture is resolved as DATA "
+        "(verify kwargs) handed to hvac. A real TLS decision this arm does not see"
+    ),
+    "messagefoundry/parsing/xml/_deps.py": (
+        "a lazy loader that returns the signxml module; the verification it enables is counted "
+        "where the module is used, in parsing/xml/signature.py"
+    ),
+    "messagefoundry/pipeline/gcm_invocations.py": (
+        "reads the AES-GCM invocation-bound constants and a cipher TYPE; performs no operation"
+    ),
+    "messagefoundry/pipeline/security_notify.py": (
+        "carries the trust-anchor policy through to the alert sink it constructs; the SMTP hop's "
+        "TLS context is built inside that sink, in pipeline/alert_sinks.py, which is inventoried"
+    ),
+    "messagefoundry/pipeline/wiring_runner.py": (
+        "INSTRUMENT LIMIT. Decides whether a plaintext hop is allowed (is_loopback_hop_host, "
+        "active_hop_posture): a TLS posture decision with no crypto-shaped call in it"
+    ),
+    "messagefoundry/store/base.py": (
+        "INSTRUMENT LIMIT. Builds the store cipher and key provider through factories that "
+        "construct objects rather than call a primitive; the operations run later as METHODS on "
+        "those objects, which the store backends' rows count"
+    ),
+    "messagefoundry/store/gcm_bound.py": (
+        "reads the cipher's reserve-block size and cipher TYPES; performs no operation"
+    ),
+    "messagefoundry/transports/ai_broker.py": (
+        "carries a HopPosture value to the refusal check; builds no context"
+    ),
+    "messagefoundry/transports/base.py": (
+        "hands a caller's ssl context to asyncio.open_connection and tells an SSLError from an "
+        "OSError; builds and decides nothing (its INVENTORY row says why that is the right shape)"
+    ),
+    "messagefoundry/transports/database.py": (
+        "INSTRUMENT LIMIT, named in BACKLOG #1164. Appends Encrypt= and TrustServerCertificate= "
+        "to a DSN string and refuses an insecure hop: a first-party TLS posture decision with no "
+        "crypto-shaped expression for any pattern instrument to match"
+    ),
+    "tee/mefor_api.py": (
+        "accepts an ssl context as a parameter and hands it to urlopen; tee/__main__.py builds it"
+    ),
+}
+
+#: The maintained operation inventory: repo-relative path -> the operation tokens it is documented
+#: to perform. Rationale for a file's crypto lives on its INVENTORY row above; rows for files the
+#: import arm never saw carry their own.
+OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    "harness/load/tlsmat.py": frozenset(
+        {
+            "key_cert:via messagefoundry.pki",
+            "sign_verify:via messagefoundry.pki",
+            "tls_context:ssl.create_default_context",
+        }
+    ),
+    "messagefoundry/__main__.py": frozenset(
+        {
+            "compare:via messagefoundry.pipeline.secret_rotation",
+            "csprng:via messagefoundry.store.crypto",
+            "hash:via messagefoundry.api.tls",
+            "key_cert:via messagefoundry.api.tls",
+            "key_cert:via messagefoundry.logging_setup",
+            "key_cert:via messagefoundry.pki",
+            "sign_verify:via messagefoundry.api.tls",
+            "sign_verify:via messagefoundry.pki",
+            "tls_context:via messagefoundry.api.tls",
+            "tls_context:via messagefoundry.config.tls_probe",
+            "tls_context:via messagefoundry.logging_setup",
+        }
+    ),
+    "messagefoundry/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
+    "messagefoundry/api/app.py": frozenset({"tls_context:via messagefoundry.config.tls_policy"}),
+    "messagefoundry/api/security.py": frozenset(
+        {"key_cert:via messagefoundry.pipeline.cert_expiry"}
+    ),
+    "messagefoundry/api/tls.py": frozenset(
+        {
+            "hash:via messagefoundry.auth.trust_anchors",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.pki",
+            "sign_verify:via messagefoundry.pki",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.load_verify_locations()",
+            "tls_context:.minimum_version =",
+            "tls_context:.set_ciphers()",
+            "tls_context:.verify_mode = CERT_REQUIRED",
+            "tls_context:ssl.SSLContext",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/apiclient/client.py": frozenset(
+        {
+            "tls_context:.load_cert_chain()",
+            "tls_context:.set_ciphers()",
+            "tls_context:ssl.create_default_context",
+            "tls_context:truststore.SSLContext",
+        }
+    ),
+    "messagefoundry/auth/ldap.py": frozenset({"tls_context:via messagefoundry.config.tls_policy"}),
+    "messagefoundry/auth/oidc/claims.py": frozenset(
+        {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}
+    ),
+    "messagefoundry/auth/oidc/flow.py": frozenset(
+        {"compare:hmac.compare_digest", "csprng:secrets.token_bytes", "hash:hashlib.sha256"}
+    ),
+    "messagefoundry/auth/oidc/jwks.py": frozenset(
+        {
+            "key_cert:.public_key()",
+            "key_cert:cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePublicNumbers",
+            "key_cert:cryptography.hazmat.primitives.asymmetric.rsa.RSAPublicNumbers",
+        }
+    ),
+    "messagefoundry/auth/oidc_http.py": frozenset(
+        {
+            "hash:via messagefoundry.auth.trust_anchors",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname = True",
+            "tls_context:.verify_mode = CERT_REQUIRED",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/auth/passwords.py": frozenset({"kdf:.verify()", "kdf:argon2.PasswordHasher"}),
+    "messagefoundry/auth/policy.py": frozenset({"hash:hashlib.sha1"}),
+    "messagefoundry/auth/service.py": frozenset(
+        {
+            "compare:via messagefoundry.auth.oidc.claims",
+            "compare:via messagefoundry.auth.oidc.flow",
+            "compare:via messagefoundry.auth.totp",
+            "csprng:secrets.token_urlsafe",
+            "csprng:via messagefoundry.auth.oidc.flow",
+            "csprng:via messagefoundry.auth.tokens",
+            "csprng:via messagefoundry.auth.totp",
+            "csprng:via messagefoundry.auth.webauthn",
+            "hash:via messagefoundry.auth.oidc.flow",
+            "hash:via messagefoundry.auth.oidc_http",
+            "hash:via messagefoundry.auth.tokens",
+            "key_cert:via messagefoundry.auth.oidc_http",
+            "key_cert:via messagefoundry.auth.webauthn",
+            "mac:via messagefoundry.auth.totp",
+            "sign_verify:via messagefoundry.auth.oidc.claims",
+            "sign_verify:via messagefoundry.auth.webauthn",
+            "tls_context:via messagefoundry.auth.oidc_http",
+        }
+    ),
+    "messagefoundry/auth/tokens.py": frozenset(
+        {"csprng:secrets.token_urlsafe", "hash:hashlib.sha256"}
+    ),
+    "messagefoundry/auth/totp.py": frozenset(
+        {
+            "compare:hmac.compare_digest",
+            "csprng:secrets.choice",
+            "csprng:secrets.token_bytes",
+            "mac:hmac.new",
+        }
+    ),
+    "messagefoundry/auth/trust_anchors.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/auth/webauthn.py": frozenset(
+        {
+            "csprng:secrets.token_bytes",
+            "key_cert:webauthn.helpers.decode_credential_public_key",
+            "key_cert:webauthn.helpers.decoded_public_key_to_cryptography",
+            "sign_verify:webauthn.verify_authentication_response",
+            "sign_verify:webauthn.verify_registration_response",
+        }
+    ),
+    "messagefoundry/config/fingerprint.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/config/settings.py": frozenset(
+        {"tls_context:via messagefoundry.config.tls_policy"}
+    ),
+    "messagefoundry/config/tls_policy.py": frozenset(
+        {
+            "key_cert:via messagefoundry.pki",
+            "tls_context:.check_hostname =",
+            "tls_context:.check_hostname = False",
+            "tls_context:.load_verify_locations()",
+            "tls_context:.minimum_version = TLSv1_2",
+            "tls_context:.post_handshake_auth = True",
+            "tls_context:.set_ciphers()",
+            "tls_context:.verify_flags |=",
+            "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
+            "tls_context:.verify_mode =",
+            "tls_context:.verify_mode = CERT_NONE",
+            "tls_context:ssl.SSLContext",
+            "tls_context:ssl.create_default_context",
+        }
+    ),
+    "messagefoundry/config/tls_probe.py": frozenset(
+        {
+            "tls_context:.check_hostname = False",
+            "tls_context:.maximum_version =",
+            "tls_context:.minimum_version =",
+            "tls_context:.set_ciphers()",
+            "tls_context:.verify_mode = CERT_NONE",
+            "tls_context:.wrap_socket()",
+            "tls_context:ssl.SSLContext",
+        }
+    ),
+    "messagefoundry/config/wiring.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/credential.py": frozenset(
+        {"compare:hmac.compare_digest[sha256]", "hash:hashlib.sha256"}
+    ),
+    "messagefoundry/integrity.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/logging_setup.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname = False",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.verify_mode = CERT_NONE",
+            "tls_context:.wrap_socket()",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/parsing/xml/signature.py": frozenset({"sign_verify:.verify()"}),
+    "messagefoundry/pipeline/alert_sinks.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/pipeline/cert_expiry.py": frozenset(
+        {"key_cert:ssl.cert_time_to_seconds", "key_cert:via messagefoundry.pki"}
+    ),
+    "messagefoundry/pipeline/dr_backup.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:via messagefoundry.store.backup_codec",
+            "csprng:via messagefoundry.store.backup_codec",
+            "hash:hashlib.sha256",
+            "hash:via messagefoundry.config.fingerprint",
+            "hash:via messagefoundry.store.backup_codec",
+        }
+    ),
+    "messagefoundry/pipeline/engine.py": frozenset(
+        {
+            "compare:via messagefoundry.pipeline.secret_rotation",
+            "hash:via messagefoundry.config.fingerprint",
+            "mac:via messagefoundry.pipeline.secret_rotation",
+        }
+    ),
+    "messagefoundry/pipeline/sandbox.py": frozenset({"csprng:secrets.token_hex"}),
+    "messagefoundry/pipeline/secret_rotation.py": frozenset(
+        {"compare:hmac.compare_digest", "mac:hmac.new[sha256]"}
+    ),
+    "messagefoundry/pipeline/sharding.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/pki.py": frozenset(
+        {
+            "key_cert:.private_bytes()",
+            "key_cert:.public_bytes()",
+            "key_cert:.public_key()",
+            "key_cert:cryptography.hazmat.primitives.asymmetric.ec.generate_private_key",
+            "key_cert:cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates",
+            "key_cert:cryptography.x509.CertificateBuilder",
+            "key_cert:cryptography.x509.load_pem_x509_certificate",
+            "key_cert:cryptography.x509.load_pem_x509_crl",
+            "key_cert:cryptography.x509.random_serial_number",
+            "sign_verify:.sign()[sha256]",
+        }
+    ),
+    "messagefoundry/redaction.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/store/backup_codec.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
+            "csprng:os.urandom",
+            "hash:hashlib.sha256",
+        }
+    ),
+    "messagefoundry/store/crypto.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
+            "csprng:os.urandom",
+            "hash:hashlib.sha256",
+            "kdf:.derive()",
+            "kdf:cryptography.hazmat.primitives.kdf.hkdf.HKDF[sha256]",
+        }
+    ),
+    "messagefoundry/store/crypto_transit.py": frozenset(
+        {"cipher:.decrypt_data()", "cipher:.encrypt_data()", "mac:.generate_hmac()"}
+    ),
+    "messagefoundry/store/keyprovider_vault.py": frozenset({"cipher:.decrypt_data()"}),
+    "messagefoundry/store/postgres.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
+            "compare:via messagefoundry.store.store",
+            "hash:hashlib.sha256",
+            "hash:via messagefoundry.store.store",
+            "kdf:via messagefoundry.store.crypto",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "mac:via messagefoundry.store.store",
+            "tls_context:.check_hostname = False",
+            "tls_context:.verify_mode = CERT_NONE",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/store/sqlserver.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
+            "compare:via messagefoundry.store.store",
+            "hash:hashlib.sha256",
+            "hash:via messagefoundry.store.store",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:via messagefoundry.store.store",
+        }
+    ),
+    "messagefoundry/store/store.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
+            "compare:hmac.compare_digest",
+            "hash:hashlib.sha256",
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:hmac.new[sha256]",
+        }
+    ),
+    "messagefoundry/transports/dicom.py": frozenset(
+        {
+            # BACKLOG #1142, slice 3: the SCP's mTLS CA is hashed (pin, audit) before it loads.
+            "hash:via messagefoundry.auth.trust_anchors",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.load_verify_locations()",
+            "tls_context:.minimum_version = TLSv1_2",
+            "tls_context:.verify_mode = CERT_REQUIRED",
+            "tls_context:ssl.SSLContext",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/dicomweb.py": frozenset(
+        {
+            "csprng:secrets.token_hex",
+            "key_cert:via messagefoundry.transports.rest",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/transports/direct.py": frozenset(
+        {
+            "cipher:.encrypt()",
+            "cipher:cryptography.hazmat.primitives.serialization.pkcs7.PKCS7EnvelopeBuilder",
+            "key_cert:.public_bytes()",
+            "key_cert:.public_key()",
+            "key_cert:cryptography.hazmat.primitives.serialization.load_der_private_key",
+            "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
+            "key_cert:cryptography.x509.load_der_x509_certificate",
+            "key_cert:cryptography.x509.load_pem_x509_certificate",
+            "key_cert:cryptography.x509.load_pem_x509_certificates",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "sign_verify:.sign()",
+            "sign_verify:cryptography.hazmat.primitives.serialization.pkcs7.PKCS7SignatureBuilder",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/email.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/fhir.py": frozenset(
+        {
+            "key_cert:via messagefoundry.transports.rest",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/transports/file.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/transports/http_auth.py": frozenset(
+        {
+            "key_cert:via messagefoundry.transports.rest",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/transports/http_listener.py": frozenset(
+        {
+            "compare:via messagefoundry.credential",
+            "hash:via messagefoundry.credential",
+            # BACKLOG #1142, slice 3: the listener's mTLS CA goes through mllp's context builder.
+            "hash:via messagefoundry.transports.mllp",
+            "key_cert:via messagefoundry.transports.mllp",
+            "tls_context:via messagefoundry.transports.mllp",
+        }
+    ),
+    "messagefoundry/transports/mllp.py": frozenset(
+        {
+            # BACKLOG #1142, slice 3: the listener's mTLS CA is hashed (pin, audit) before it loads.
+            "hash:via messagefoundry.auth.trust_anchors",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname =",
+            "tls_context:.check_hostname = False",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.load_verify_locations()",
+            "tls_context:.minimum_version = TLSv1_2",
+            "tls_context:.verify_mode = CERT_NONE",
+            "tls_context:.verify_mode = CERT_REQUIRED",
+            "tls_context:ssl.SSLContext",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/remotefile.py": frozenset(
+        {
+            "hash:hashlib.sha256",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname =",
+            "tls_context:.check_hostname = False",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.minimum_version = TLSv1_2",
+            "tls_context:.verify_mode = CERT_NONE",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/rest.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "tls_context:.check_hostname = False",
+            "tls_context:.verify_mode = CERT_NONE",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry/transports/signing.py": frozenset(
+        {
+            "key_cert:.public_key()",
+            "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
+            "sign_verify:.sign()",
+            "sign_verify:.sign()[sha256]",
+            "sign_verify:.verify()",
+        }
+    ),
+    "messagefoundry/transports/smart.py": frozenset(
+        {
+            "csprng:secrets.token_urlsafe",
+            "key_cert:via messagefoundry.transports.rest",
+            "sign_verify:.sign()",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/transports/soap.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.transports.rest",
+            "tls_context:.load_cert_chain()",
+            "tls_context:.minimum_version = TLSv1_2",
+            "tls_context:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.transports.rest",
+        }
+    ),
+    "messagefoundry/tray/probe.py": frozenset(
+        {"tls_context:ssl.create_default_context", "tls_context:truststore.SSLContext"}
+    ),
+    "messagefoundry/uploads.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "csprng:secrets.token_hex",
+            "hash:hashlib.sha256",
+        }
+    ),
+    "messagefoundry/verify/smoke.py": frozenset(
+        {
+            "tls_context:.check_hostname = True",
+            "tls_context:.minimum_version = TLSv1_2",
+            "tls_context:.wrap_socket()",
+            "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
+    "messagefoundry_webconsole/_security.py": frozenset({"csprng:secrets.token_urlsafe"}),
+    "scripts/asvs/anchor_report.py": frozenset({"hash:hashlib.sha256"}),
+    "scripts/asvs/prove_report.py": frozenset({"hash:hashlib.sha256"}),
+    "scripts/asvs/scorecard.py": frozenset({"hash:hashlib.sha256"}),
+    "scripts/security/build_cla_action_provenance.py": frozenset(
+        {"hash:hashlib.sha1", "hash:hashlib.sha256"}
+    ),
+    "scripts/security/build_password_corpus.py": frozenset({"hash:hashlib.sha256"}),
+    "scripts/security/dast_target.py": frozenset({"csprng:secrets.token_urlsafe"}),
+    "scripts/webconsole_seam_snapshot.py": frozenset({"hash:hashlib.sha256"}),
+    "tee/__main__.py": frozenset(
+        {
+            "tls_context:.check_hostname = False",
+            "tls_context:.verify_mode = CERT_NONE",
+            "tls_context:ssl.create_default_context",
+        }
+    ),
+    "tee/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
+    # --- BACKLOG #1164: files the OPERATION arm found that the import arm could not see at all ---
+    # Each performs crypto through a first-party provider and imports no trigger, so no INVENTORY row
+    # was ever owed for it. They are the findings of operation-level discovery, listed rather than
+    # hidden, and the reason is the same for the whole group: the caller DECIDES something about the
+    # crypto it reaches. The token names the provider module, so the rationale lives there.
+    #   api/auth_routes.py, webconsole routes/account.py + routes/core.py -- hash a presented session
+    #     token (auth/tokens.hash_token) to look it up or revoke it: hashing a SECRET.
+    #   verify/federation.py -- the `verify` federation check builds the IdP opener, parses the JWKS
+    #     and validates an ID token, so it exercises the whole OIDC verification path.
+    #   verify/runner.py -- builds the live smoke's client TLS context (verify/smoke).
+    #   harness/load/* -- mint a per-run loopback certificate pair through harness/load/tlsmat, and
+    #     all but enginepoll.py also build the pinned client TLS context there (non-prod, loopback
+    #     only, per that row in INVENTORY).
+    #   scripts/security/dast_auth_sweep.py -- runs the DAST target, which draws a throwaway password.
+    #   tray/poller.py -- builds the tray's probe client and tests whether the pinned engine cert
+    #     loads yet (tray/probe), so it decides when the pinned context replaces the OS trust store.
+    "harness/load/connscale/runner.py": frozenset(
+        {
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.tlsmat",
+        }
+    ),
+    "harness/load/enginepoll.py": frozenset(
+        {"key_cert:via harness.load.tlsmat", "sign_verify:via harness.load.tlsmat"}
+    ),
+    "harness/load/estate/runner.py": frozenset(
+        {
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.tlsmat",
+        }
+    ),
+    "harness/load/failover.py": frozenset(
+        {
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.tlsmat",
+        }
+    ),
+    "harness/load/shardcert.py": frozenset(
+        {
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.tlsmat",
+        }
+    ),
+    "messagefoundry/api/auth_routes.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
+    "messagefoundry/tray/poller.py": frozenset({"tls_context:via messagefoundry.tray.probe"}),
+    "messagefoundry/verify/federation.py": frozenset(
+        {
+            "compare:via messagefoundry.auth.oidc.claims",
+            "hash:via messagefoundry.auth.oidc_http",
+            # BACKLOG #1142: the fed.idp_tls row reports the anchor's evaluate_anchor verdict, which
+            # fingerprints the anchor with SHA-256.
+            "hash:via messagefoundry.auth.trust_anchors",
+            "key_cert:via messagefoundry.auth.oidc.jwks",
+            "key_cert:via messagefoundry.auth.oidc_http",
+            "sign_verify:via messagefoundry.auth.oidc.claims",
+            "tls_context:via messagefoundry.auth.oidc_http",
+        }
+    ),
+    "messagefoundry/verify/runner.py": frozenset({"tls_context:via messagefoundry.verify.smoke"}),
+    "messagefoundry_webconsole/routes/account.py": frozenset(
+        {"hash:via messagefoundry.auth.tokens"}
+    ),
+    "messagefoundry_webconsole/routes/core.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
+    "scripts/security/dast_auth_sweep.py": frozenset({"csprng:via scripts.security.dast_target"}),
+}
+
 
 def crypto_imports_in(source: str) -> set[str]:
     """The crypto trigger tokens imported anywhere in a module (including function-local imports).
@@ -668,8 +1319,14 @@ def crypto_imports_in(source: str) -> set[str]:
     fully-qualified first-party seam path (:data:`CRYPTO_SEAM_MODULES`). Only top-level (``level ==
     0``) ``from`` imports are resolved — the seams have no in-package relative importers today, and
     the six-module scan has always been ``level``-0 only."""
+    return crypto_imports_in_nodes(ast.walk(ast.parse(source)))
+
+
+def crypto_imports_in_nodes(nodes: Iterable[ast.AST]) -> set[str]:
+    """:func:`crypto_imports_in` over an already-walked module, so the gate parses each file once
+    for both Python arms."""
     found: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
+    for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".", 1)[0] in _TOPLEVEL_TRIGGERS:
@@ -688,16 +1345,137 @@ def crypto_imports_in(source: str) -> set[str]:
     return found
 
 
+def python_sources(package: Path) -> list[Path]:
+    """Every ``.py`` file under ``package``, ``__pycache__`` pruned. Both Python arms read this list."""
+    return [path for path in sorted(package.rglob("*.py")) if "__pycache__" not in path.parts]
+
+
 def discover(package: Path) -> dict[str, frozenset[str]]:
     """Map repo-relative module path -> crypto modules it actually imports (only files that use crypto)."""
     out: dict[str, frozenset[str]] = {}
-    for path in sorted(package.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
+    for path in python_sources(package):
         mods = crypto_imports_in(path.read_text(encoding="utf-8"))
         if mods:
             out[path.relative_to(package.parent).as_posix()] = frozenset(mods)
     return out
+
+
+#: The operation arm's POSITIVE CONTROL, run on every gate invocation before the tree is read. A
+#: fixture that never touches the disk and exercises AT LEAST these matchers: an exact rule, a
+#: prefix rule, an algorithm carried by an ARGUMENT, a method rule, a TLS posture assignment with its
+#: value, a tuple-target, augmented and ``setattr`` posture assignment, a bare sibling import under
+#: ``scripts/``, and a first-party provider reached three ways (absolute import, package re-export,
+#: relative import) from modules with no crypto import of their own, which is the BACKLOG #1164
+#: shape. If the instrument does not report exactly this, one of those matchers is dead, and every
+#: clean result it gives about the tree is void.
+_SELF_TEST_SOURCES: dict[str, str] = {
+    "selftest/__init__.py": "from .seam import build\n",
+    "selftest/seam.py": (
+        "import ssl\n\n\n"
+        "def build():\n"
+        "    ctx = ssl.create_default_context()\n"
+        "    ctx.minimum_version = ssl.TLSVersion.TLSv1_2\n"
+        "    ctx.check_hostname, ctx.verify_mode = True, ssl.CERT_REQUIRED\n"
+        "    ctx.options |= ssl.OP_NO_COMPRESSION\n"
+        "    setattr(ctx, 'verify_flags', ssl.VERIFY_X509_STRICT)\n"
+        "    return ctx\n"
+    ),
+    "selftest/user.py": (
+        "import hashlib\n"
+        "import hmac\n"
+        "from selftest.seam import build\n\n\n"
+        "def go(cipher, key):\n"
+        "    build()\n"
+        "    cipher.encrypt(b'')\n"
+        "    hmac.new(key, b'', hashlib.sha256)\n"
+        "    return hashlib.sha256(b'').hexdigest()\n"
+    ),
+    "selftest/reexported.py": "from selftest import build\n\n\ndef go():\n    build()\n",
+    "selftest/relative.py": "from . import seam\n\n\ndef go():\n    seam.build()\n",
+    "scripts/st/helper.py": "import hashlib\n\n\ndef h(b):\n    return hashlib.sha1(b)\n",
+    "scripts/st/user.py": "import helper\n\n\ndef go(b):\n    return helper.h(b)\n",
+}
+_SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
+    "selftest/seam.py": frozenset(
+        {
+            "tls_context:ssl.create_default_context",
+            "tls_context:.minimum_version = TLSv1_2",
+            "tls_context:.check_hostname = True",
+            "tls_context:.verify_mode = CERT_REQUIRED",
+            "tls_context:.options |= OP_NO_COMPRESSION",
+            "tls_context:.verify_flags = VERIFY_X509_STRICT",
+        }
+    ),
+    "selftest/user.py": frozenset(
+        {
+            "hash:hashlib.sha256",
+            "mac:hmac.new[sha256]",
+            "cipher:.encrypt()",
+            "tls_context:via selftest.seam",
+        }
+    ),
+    "selftest/reexported.py": frozenset({"tls_context:via selftest.seam"}),
+    "selftest/relative.py": frozenset({"tls_context:via selftest.seam"}),
+    "scripts/st/helper.py": frozenset({"hash:hashlib.sha1"}),
+    "scripts/st/user.py": frozenset({"hash:via scripts.st.helper"}),
+}
+
+
+def operations_self_test() -> list[str]:
+    """Run the operation instrument over :data:`_SELF_TEST_SOURCES`. Returns violation lines."""
+    got = crypto_operations.aggregate(crypto_operations.discover_operations_in(_SELF_TEST_SOURCES))
+    if got == _SELF_TEST_EXPECTED:
+        return []
+    return [
+        f"operation arm POSITIVE CONTROL did not fire as planted: expected {_SELF_TEST_EXPECTED}, "
+        f"got {got}. The instrument is broken, so a clean result from it would mean nothing"
+    ]
+
+
+def check_operations(
+    files: list[Path],
+    repo: Path,
+    *,
+    check_stale: bool,
+    modules: list[crypto_operations.ParsedModule] | None = None,
+) -> tuple[list[str], list[crypto_operations.Operation]]:
+    """Run the operation arm (BACKLOG #1164). Returns ``(violation lines, operations found)``.
+
+    Three diffs, all bidirectional when ``check_stale``: the tree's operation tokens against
+    :data:`OPERATION_INVENTORY`, and the import inventory against :data:`IMPORT_ONLY` in both
+    directions, so an INVENTORY row whose file performs no operation has to say why. ``modules``,
+    when given, is ``files`` already parsed, so the caller's import arm and this one share a parse."""
+    violations = operations_self_test()
+    if modules is None:
+        modules = crypto_operations.parse_files(files, repo)
+    operations = crypto_operations.discover_operations_in_modules(modules)
+    actual = crypto_operations.aggregate(operations)
+    undocumented, stale = find_violations(
+        actual,
+        OPERATION_INVENTORY,
+        check_stale=check_stale,
+        noun="crypto operation",
+        stale_verb="performs",
+    )
+    violations += undocumented + stale
+    if check_stale:
+        for path in sorted(INVENTORY):
+            if path not in actual and path not in IMPORT_ONLY:
+                violations.append(
+                    f"{path}: INVENTORY lists crypto imports but the operation arm finds no "
+                    "operation here. Either the file stopped doing crypto (drop the INVENTORY row) "
+                    "or it does it in a shape the instrument cannot see (add an IMPORT_ONLY entry "
+                    "saying which)"
+                )
+        for path, _reason in sorted(IMPORT_ONLY.items()):
+            if path in actual:
+                violations.append(
+                    f"{path}: IMPORT_ONLY says no operation happens here, but the operation arm "
+                    f"finds {sorted(actual[path])}. Drop the IMPORT_ONLY entry"
+                )
+            if path not in INVENTORY:
+                violations.append(f"{path}: IMPORT_ONLY entry with no INVENTORY row to explain")
+    return violations, operations
 
 
 def find_violations(
@@ -841,6 +1619,441 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
     return violations, scanned
 
 
+# --------------------------------------------------------------------------------------------
+# The NON-PYTHON OPERATION arm (BACKLOG #1164, ASVS 11.1.3). ITS OWN CI JOB.
+# --------------------------------------------------------------------------------------------
+# The randomness arm above reads the non-Python roots for ONE operation class. This arm reads them
+# for every class in the operation taxonomy, by pattern, so the extension's TLS floor and the
+# console's WebAuthn ceremony stop being invisible. It runs only under ``--non-python-operations``,
+# which CI invokes from the ``crypto-operations`` job in ci.yml (owner decision 2026-09-24). That
+# job has no path gate, so it reports on every pull request, push to main and merge-queue entry.
+# It blocks a merge only while BRANCH PROTECTION requires its context, a server setting this file
+# cannot see; ``.github/required-contexts.txt`` is the checked-in record of that set. A job that
+# reports is not thereby a job that gates. So until protection names it, the required green still
+# says nothing about non-Python crypto beyond randomness.
+#
+# A PATTERN INSTRUMENT, NOT A PARSER. It matches option keys (``minVersion:``) anywhere, not only
+# inside a TLS options object, which errs toward reporting. What it cannot see is listed with every
+# other arm's limits, once, under THE RESIDUAL in crypto_operations.py.
+
+#: ``token -> (pattern, operation class)``. Every class must be one in the Python arm's taxonomy.
+#: The lookbehind stops a longer identifier ending in the same word from matching. A pattern with an
+#: ``alg`` group puts what it captured into the token (``hash:createHash[md5]``), so a changed
+#: algorithm or protocol value written as a literal changes the token.
+_B = r"(?<![A-Za-z0-9_$])"
+_LIT = r"""(?:\s*['"`](?P<alg>[\w.-]+)['"`])?"""
+NON_PYTHON_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
+    "createHash": (re.compile(_B + r"createHash\s*\(" + _LIT), "hash"),
+    "subtle.digest": (re.compile(r"subtle\s*\.\s*digest\s*\(" + _LIT), "hash"),
+    "createHmac": (re.compile(_B + r"createHmac\s*\(" + _LIT), "mac"),
+    "timingSafeEqual": (re.compile(_B + r"timingSafeEqual\s*\("), "compare"),
+    "createCipheriv": (re.compile(_B + r"createCipheriv\s*\(" + _LIT), "cipher"),
+    "createDecipheriv": (re.compile(_B + r"createDecipheriv\s*\(" + _LIT), "cipher"),
+    "publicEncrypt": (re.compile(_B + r"(publicEncrypt|privateEncrypt)\s*\("), "cipher"),
+    "privateDecrypt": (re.compile(_B + r"(privateDecrypt|publicDecrypt)\s*\("), "cipher"),
+    "subtle.encrypt": (
+        re.compile(r"subtle\s*\.\s*(encrypt|decrypt|wrapKey|unwrapKey)\s*\("),
+        "cipher",
+    ),
+    "createSign": (re.compile(_B + r"(createSign|createVerify)\s*\(" + _LIT), "sign_verify"),
+    "subtle.sign": (re.compile(r"subtle\s*\.\s*(sign|verify)\s*\("), "sign_verify"),
+    "navigator.credentials.create": (
+        re.compile(r"navigator\s*\.\s*credentials\s*\.\s*create\s*\("),
+        "sign_verify",
+    ),
+    "navigator.credentials.get": (
+        re.compile(r"navigator\s*\.\s*credentials\s*\.\s*get\s*\("),
+        "sign_verify",
+    ),
+    "pbkdf2": (re.compile(_B + r"(pbkdf2|pbkdf2Sync|scrypt|scryptSync|hkdf|hkdfSync)\s*\("), "kdf"),
+    "subtle.deriveKey": (re.compile(r"subtle\s*\.\s*(deriveKey|deriveBits)\s*\("), "kdf"),
+    "createKey": (
+        re.compile(
+            _B + r"(createPrivateKey|createPublicKey|createSecretKey|generateKeyPair|"
+            r"generateKeyPairSync|generateKey|generateKeySync)\s*\("
+        ),
+        "key_cert",
+    ),
+    "X509Certificate": (re.compile(_B + r"X509Certificate\s*\("), "key_cert"),
+    "subtle.importKey": (
+        re.compile(r"subtle\s*\.\s*(importKey|exportKey|generateKey)\s*\("),
+        "key_cert",
+    ),
+    "tls.connect": (re.compile(r"tls\s*\.\s*(connect|createSecureContext)\s*\("), "tls_context"),
+    "https.Agent": (re.compile(r"new\s+(https\s*\.\s*)?Agent\s*\("), "tls_context"),
+    # A floor and a cap are different decisions, so they are different tokens.
+    "minVersion": (re.compile(_B + r"minVersion\s*:" + _LIT), "tls_context"),
+    "maxVersion": (re.compile(_B + r"maxVersion\s*:" + _LIT), "tls_context"),
+    "rejectUnauthorized": (re.compile(_B + r"rejectUnauthorized\s*:"), "tls_context"),
+    "checkServerIdentity": (re.compile(_B + r"checkServerIdentity\s*:"), "tls_context"),
+    "secureProtocol": (
+        re.compile(_B + r"(secureProtocol|secureOptions|ecdhCurve)\s*:" + _LIT),
+        "tls_context",
+    ),
+    "ciphers": (re.compile(_B + r"ciphers\s*:" + _LIT), "tls_context"),
+    # The CSPRNG sources are the randomness arm's STRONG set, reused so the two arms cannot disagree
+    # about what a draw looks like. The WEAK set stays the randomness arm's alone: it has no row here
+    # to hide behind, and that arm is merge-gating.
+    **{name: (pattern, "csprng") for name, pattern in STRONG_RANDOMNESS_PATTERNS.items()},
+}
+
+#: The maintained non-Python operation inventory: repo-relative path -> ``class:token`` it performs.
+#: Bidirectional, like every inventory here, and the stale direction is again what lets it fail: a
+#: broken walk leaves these rows unbacked and reds rather than reporting a clean empty scan.
+NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    # The single source of CSP nonces for every webview the extension builds (see the randomness
+    # arm's row for the same file, which is where the entropy argument lives).
+    "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
+    # The TLS floor and suite pin the extension applies to every https request it makes to the engine:
+    # `tlsOptions` returns `{ minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS }`, plus the pinned
+    # engine CA as `ca` when one is configured. Certificate verification is never switched off. The
+    # floor is a named constant, not a literal, so the token does not carry it. `ciphers` is the
+    # BACKLOG #300 suite pin; `TLS_12_SUITES` in that file says which suites and what holds them.
+    # Its token is bare for ANY value, a colon-joined literal included, because the pattern captures
+    # no `:`. So this row records that a pin exists, not which suites it names.
+    "ide/src/engineClient.ts": frozenset({"tls_context:minVersion", "tls_context:ciphers"}),
+    # Not a TLS use: the extension test that PINS the floor and the suite list above, by asserting
+    # the options object `tlsOptions` returns. Listed rather than excluded, because pruning test
+    # directories from the walk would be a scope cut the randomness arm does not make either.
+    "ide/src/test/suite/engine-trust.test.ts": frozenset(
+        {"tls_context:minVersion[TLSv1.2]", "tls_context:ciphers"}
+    ),
+    # The operator console's WebAuthn ceremonies (ADR 0068): navigator.credentials.create enrolls a
+    # passkey and navigator.credentials.get asks the authenticator to SIGN the server's challenge.
+    # The signature is checked server-side in auth/webauthn.py; this row records where the browser
+    # half of that ceremony starts.
+    "messagefoundry_webconsole/static/app.js": frozenset(
+        {"sign_verify:navigator.credentials.create", "sign_verify:navigator.credentials.get"}
+    ),
+}
+
+
+def _pattern_tokens(
+    line: str, patterns: dict[str, tuple[re.Pattern[str], str]], *, fold_case: bool
+) -> set[str]:
+    """Every ``class:name`` (or ``class:name[alg]``) token the patterns find in one code line."""
+    found: set[str] = set()
+    for name, (pattern, op_class) in patterns.items():
+        for match in pattern.finditer(line):
+            alg = match.groupdict().get("alg")
+            if alg:
+                found.add(f"{op_class}:{name}[{alg.upper() if fold_case else alg}]")
+            else:
+                found.add(f"{op_class}:{name}")
+    return found
+
+
+def non_python_operation_tokens_in(text: str) -> set[str]:
+    """The ``class:token`` operations a TypeScript/JavaScript source performs. Comment-only lines
+    are skipped by the same conservative rule as the randomness arm (:func:`_is_comment_only`)."""
+    found: set[str] = set()
+    for line in text.splitlines():
+        if not _is_comment_only(line):
+            found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)
+    return found
+
+
+def _run_pattern_arm(
+    repo: Path,
+    roots: tuple[str, ...],
+    list_files: Callable[[Path], list[Path]],
+    tokens_in: Callable[[str], set[str]],
+    inventory: dict[str, frozenset[str]],
+    label: str,
+) -> tuple[list[str], int, dict[str, frozenset[str]]]:
+    """Walk ``roots``, tokenize every file, and diff against ``inventory`` both ways. Shared by the
+    two non-Python operation arms so they cannot drift into two subtly different diffs. An empty
+    walk is a violation, never a clean result."""
+    violations: list[str] = []
+    actual: dict[str, frozenset[str]] = {}
+    scanned = 0
+    for name in roots:
+        root = repo / name
+        files = list_files(root) if root.is_dir() else []
+        if not files:
+            violations.append(
+                f"{label} arm: the walk over {name}/ reached ZERO files, so a clean result would be "
+                "VACUOUS. Fix the walk; do not read this as a clean tree"
+            )
+            continue
+        scanned += len(files)
+        for path in files:
+            tokens = tokens_in(path.read_text(encoding="utf-8-sig"))
+            if tokens:
+                actual[path.relative_to(repo).as_posix()] = frozenset(tokens)
+    undocumented, stale = find_violations(
+        actual, inventory, check_stale=True, noun="crypto operation", stale_verb="performs"
+    )
+    return violations + undocumented + stale, scanned, actual
+
+
+def check_non_python_operations(repo: Path) -> tuple[list[str], int, dict[str, frozenset[str]]]:
+    """Run the TypeScript/JavaScript operation arm. Returns ``(violations, scanned, found)``."""
+    return _run_pattern_arm(
+        repo,
+        NON_PYTHON_WALK_ROOTS,
+        non_python_sources,
+        non_python_operation_tokens_in,
+        NON_PYTHON_OPERATION_INVENTORY,
+        "TypeScript/JavaScript",
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# The POWERSHELL operation arm (BACKLOG #1164). Same mode, same CI job as the arm above.
+# --------------------------------------------------------------------------------------------
+# ``scripts/`` is a Python walk root, and it also holds the repository's PowerShell: the coordination
+# tooling and, more to the point, the operator deployment path in ``scripts/service/``, which
+# installs a trust anchor into the machine root store and verifies a downloaded service binary
+# against a pinned SHA-256. The Python walk rglobs ``*.py`` and could never see any of it. This arm
+# reads ``.ps1`` and ``.psm1`` by pattern. PowerShell is case-insensitive, so the patterns are, and
+# a captured algorithm or protocol is upper-cased so ``sha256`` and ``SHA256`` are one token.
+#
+# The walk is ``scripts/`` only, because that is where every tracked PowerShell file lives today.
+# That is a fact measured at the time of writing and NOT enforced: a ``.ps1`` added elsewhere is
+# unread.
+#
+# NOT MATCHED ON PURPOSE: ``Get-Random``. It is not a cryptographic source, so it is not a crypto
+# operation, and the two sites that use it state why a weaker source is enough there. A reviewer
+# looking for where the tree CHOSE not to use a CSPRNG has to grep for it; this arm will not say.
+POWERSHELL_WALK_ROOTS = ("scripts",)
+POWERSHELL_SUFFIXES = (".ps1", ".psm1")
+
+_PS_HASHES = ("SHA1", "SHA256", "SHA384", "SHA512", "MD5")
+POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
+    # [SHA256]::Create(), [MD5CryptoServiceProvider]::new(), New-Object ...SHA1Managed.
+    **{
+        algo: (
+            re.compile(
+                rf"\b{algo}(CryptoServiceProvider|Managed|Cng)?\]::(Create|HashData|HashDataAsync|new)\b"
+                rf"|New-Object\s+\S*\b{algo}(CryptoServiceProvider|Managed|Cng)\b",
+                re.I,
+            ),
+            "hash",
+        )
+        for algo in _PS_HASHES
+    },
+    "HashAlgorithm": (
+        re.compile(r"\bHashAlgorithm\]::Create\(\s*(?:['\"](?P<alg>[\w.-]+)['\"])?", re.I),
+        "hash",
+    ),
+    # ``-A``, ``-Alg``, ``-Algorithm`` and ``-Algorithm:X`` are all the same parameter (PowerShell
+    # accepts any unique prefix). The search stops at ``;`` or ``|`` so a later call's algorithm on
+    # the same line is not credited to this one.
+    "Get-FileHash": (
+        re.compile(r"\bGet-FileHash\b(?:[^;|\n]*?-A\w*(?::|\s+)['\"]?(?P<alg>\w+))?", re.I),
+        "hash",
+    ),
+    # The type name, however it is reached ([...HMACSHA256]::new, New-Object ...HMACMD5).
+    "HMAC": (re.compile(r"\bHMAC(?P<alg>SHA1|SHA256|SHA384|SHA512|MD5)\b", re.I), "mac"),
+    "RandomNumberGenerator": (
+        re.compile(r"\b(RandomNumberGenerator|RNGCryptoServiceProvider)\]::", re.I),
+        "csprng",
+    ),
+    "Aes": (re.compile(r"\b(Aes|AesGcm|AesCcm)\]::(Create|new)\b", re.I), "cipher"),
+    "ProtectedData": (re.compile(r"\bProtectedData\]::(Protect|Unprotect)\b", re.I), "cipher"),
+    "ConvertFrom-SecureString": (re.compile(r"\bConvertFrom-SecureString\b", re.I), "cipher"),
+    "SignData": (
+        re.compile(
+            r"\b(RSA|ECDsa|DSA)\]::Create\b|\.(SignData|VerifyData|SignHash|VerifyHash)\(", re.I
+        ),
+        "sign_verify",
+    ),
+    "Rfc2898DeriveBytes": (re.compile(r"\bRfc2898DeriveBytes\b", re.I), "kdf"),
+    "X509": (
+        re.compile(r"\bX509Certificate2\]::new\b|New-Object\s+\S*X509Certificate2\b", re.I),
+        "key_cert",
+    ),
+    "X509Store": (
+        re.compile(r"\bX509Store\]::new\b|New-Object\s+\S*X509Store\b", re.I),
+        "key_cert",
+    ),
+    "Import-Certificate": (
+        re.compile(r"\b(Import-Certificate|Import-PfxCertificate)\b", re.I),
+        "key_cert",
+    ),
+    "certutil": (
+        re.compile(r"\bcertutil(\.exe)?\b[^\n]*-(addstore|importpfx)\b", re.I),
+        "key_cert",
+    ),
+    "New-SelfSignedCertificate": (
+        re.compile(r"\b(New-SelfSignedCertificate|Export-PfxCertificate)\b", re.I),
+        "key_cert",
+    ),
+    "SecurityProtocolType": (
+        re.compile(r"\bSecurityProtocolType\]::(?P<alg>\w+)", re.I),
+        "tls_context",
+    ),
+    "SslProtocol": (
+        re.compile(r"-SslProtocol\b(?:(?::|\s+)['\"]?(?P<alg>[A-Za-z]\w*))?", re.I),
+        "tls_context",
+    ),
+    "CertificateValidation": (
+        re.compile(
+            r"\bServerCertificateValidationCallback\b|-SkipCertificateCheck\b"
+            r"|\bCertificatePolicy\b|\bTrustAllCertsPolicy\b",
+            re.I,
+        ),
+        "tls_context",
+    ),
+}
+
+#: The maintained PowerShell operation inventory. Bidirectional, like the others.
+POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    # --- The operator deployment path (docs/SERVICE.md). These two are the reason this arm exists. ---
+    # Parses the operator's CA certificate (so a malformed file fails before anything is touched and
+    # the operator sees what they are about to trust), then INSTALLS it into the machine root store.
+    # A trust-anchor decision for the whole host, not only for the engine.
+    "scripts/service/import-db-ca.ps1": frozenset({"key_cert:X509", "key_cert:Import-Certificate"}),
+    # Downloads the NSSM service wrapper and checks it against a pinned SHA-256 before extracting it:
+    # supply-chain verification of a binary that then runs as a service. The download hop ADDS TLS
+    # 1.2 to the enabled protocol set with `-bor`; that is not a floor, so anything the machine
+    # already enables stays enabled, and under pwsh 7 ServicePointManager does not govern
+    # Invoke-WebRequest at all. The pinned hash is the control that holds either way.
+    "scripts/service/install-service.ps1": frozenset(
+        {"tls_context:SecurityProtocolType[TLS12]", "hash:Get-FileHash[SHA256]"}
+    ),
+    # CI-only measurement (ADR 0183 Wave 0, BACKLOG #1136), run by windows-service-smoke. It draws a
+    # synthetic per-run administrator password from the CSPRNG, which provision-admin and then a real
+    # sign-in use against a throwaway store. The CSPRNG, not Get-Random, because the account it
+    # protects is a real, enabled Administrator for the life of the run; the password is never printed,
+    # never on argv, and is masked in the Actions log.
+    "scripts/service/measure-store-access.ps1": frozenset({"csprng:RandomNumberGenerator"}),
+    # --- Coordination tooling. Identifiers and change detection; no secret is hashed. ---
+    # A per-attempt claim token from the CSPRNG, because it must be unmintable by a concurrent
+    # claimer (the file says why Get-Random is not enough), and a SHA-256 of the host name.
+    "scripts/coord/mail-claim.ps1": frozenset({"hash:SHA256", "csprng:RandomNumberGenerator"}),
+    # A SHA-256 of a CRLF-normalized hook file, to tell an installed copy from its source.
+    "scripts/coord/install-git-hooks.ps1": frozenset({"hash:SHA256"}),
+    # The same content-hash comparison for the installed worktree gate.
+    "scripts/worktree/install-gate.ps1": frozenset({"hash:SHA256"}),
+    # A stable identifier for a lane, from its sorted member keys.
+    "scripts/coord/lane.ps1": frozenset({"hash:SHA256"}),
+    # A mailbox key from a normalized worktree path.
+    "scripts/coord/mail-key.ps1": frozenset({"hash:SHA256"}),
+    # A SHA-256 of a handoff file, recorded in the seat record so a reader knows which version it saw.
+    "scripts/coord/seat.ps1": frozenset({"hash:Get-FileHash[SHA256]"}),
+    # Collision-free file names for a session id and for a working-directory key.
+    "scripts/hooks/announce-session.ps1": frozenset({"hash:SHA256"}),
+    # A fallback name for a branch whose name has no safe characters left.
+    "scripts/hooks/worktree_gate.ps1": frozenset({"hash:SHA256"}),
+}
+
+
+def _powershell_code(text: str) -> list[str]:
+    """The code of a PowerShell source, one entry per line, with comments removed.
+
+    A line whose code starts with ``#`` is a comment. A ``<#`` opens a block comment only where it
+    STARTS the remaining code on a line; code after the block's ``#>`` on the same line is kept. A
+    ``<#`` anywhere else (inside a trailing ``#`` comment, a string, or after code) never opens a
+    block, so it cannot hide the lines that follow. A single-line ``<# ... #>`` after code is left in
+    place and scanned. Every choice here errs toward scanning too much, never too little, except the
+    one the residual in crypto_operations.py names: a string that STARTS a line with ``<#``."""
+    code: list[str] = []
+    in_block = False
+    for raw in text.splitlines():
+        line = raw
+        if in_block:
+            end = line.find("#>")
+            if end < 0:
+                continue
+            line = line[end + 2 :]
+            in_block = False
+        while True:
+            stripped = line.lstrip()
+            if not stripped.startswith("<#"):
+                break
+            end = stripped.find("#>", 2)
+            if end < 0:
+                in_block = True
+                line = ""
+                break
+            line = stripped[end + 2 :]
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            code.append(line)
+    return code
+
+
+def powershell_operation_tokens_in(text: str) -> set[str]:
+    """The ``class:token`` operations a PowerShell source performs. Help text lives in ``<# #>``
+    blocks, which is where ``import-db-ca.ps1`` names ``Import-Certificate`` in an example, so
+    comments are removed first (:func:`_powershell_code`)."""
+    found: set[str] = set()
+    for line in _powershell_code(text):
+        found |= _pattern_tokens(line, POWERSHELL_OPERATION_PATTERNS, fold_case=True)
+    return found
+
+
+def powershell_sources(root: Path) -> list[Path]:
+    """Every PowerShell script or module under ``root``, matched on the suffix case-insensitively,
+    so a ``.PS1`` on a case-sensitive filesystem is still read."""
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.suffix.lower() in POWERSHELL_SUFFIXES and path.is_file()
+    )
+
+
+def check_powershell_operations(repo: Path) -> tuple[list[str], int, dict[str, frozenset[str]]]:
+    """Run the PowerShell operation arm. Returns ``(violations, files scanned, operations found)``."""
+    return _run_pattern_arm(
+        repo,
+        POWERSHELL_WALK_ROOTS,
+        powershell_sources,
+        powershell_operation_tokens_in,
+        POWERSHELL_OPERATION_INVENTORY,
+        "PowerShell",
+    )
+
+
+def _arm_line(label: str, scanned: int, what: str, actual: dict[str, frozenset[str]]) -> str:
+    counts = dict.fromkeys(crypto_operations.OPERATION_CLASSES, 0)
+    for tokens in actual.values():
+        for token in tokens:
+            counts[token.split(":", 1)[0]] += 1
+    per_class = ", ".join(f"{name}={count}" for name, count in counts.items())
+    return (
+        f"crypto-inventory ({label}): scanned {scanned} {what} file(s); "
+        f"{sum(counts.values())} distinct operation token(s) in {len(actual)} file(s) [{per_class}]"
+    )
+
+
+def _main_non_python_operations() -> int:
+    """``--non-python-operations``: the TypeScript/JavaScript and PowerShell operation arms."""
+    repo = Path(__file__).resolve().parents[2]
+    js_violations, js_scanned, js_actual = check_non_python_operations(repo)
+    ps_violations, ps_scanned, ps_actual = check_powershell_operations(repo)
+    # The corpus first, then the verdict.
+    print(
+        _arm_line(
+            f"TypeScript/JavaScript, {'+'.join(NON_PYTHON_WALK_ROOTS)}",
+            js_scanned,
+            "/".join(NON_PYTHON_SUFFIXES),
+            js_actual,
+        )
+    )
+    print(
+        _arm_line(
+            f"PowerShell, {'+'.join(POWERSHELL_WALK_ROOTS)}",
+            ps_scanned,
+            "/".join(POWERSHELL_SUFFIXES),
+            ps_actual,
+        )
+    )
+    violations = js_violations + ps_violations
+    if violations:
+        print("crypto-inventory: NON-PYTHON OPERATION arms (BACKLOG #1164) FAILED:")
+        for line in violations:
+            print(f"  - {line}")
+        return 1
+    print(
+        "crypto-inventory (non-Python operations): OK - no undocumented or stale operation. "
+        "Pattern-level, so AT LEAST this (see NON_PYTHON_OPERATION_PATTERNS)."
+    )
+    return 0
+
+
 def _assert_ide_is_typescript(repo: Path) -> list[str]:
     """``ide/`` is outside the PYTHON walk because it is TypeScript with zero ``.py`` files. Enforce
     that fact so a future ``.py`` there reds the gate (and forces a WALK_ROOTS + inventory update)
@@ -865,6 +2078,25 @@ def _assert_ide_is_typescript(repo: Path) -> list[str]:
     ]
 
 
+def scanned_line(
+    python_files: int, roots: int, operations: list[crypto_operations.Operation]
+) -> str:
+    """The operation arm's corpus line: what was read and what it found, per class.
+
+    Printed BEFORE any verdict, red or green. Every class is printed, a zero included, so a matcher
+    that died for one class shows up as a zero where there used to be a count rather than as nothing.
+    """
+    counts = crypto_operations.class_counts(operations)
+    per_class = ", ".join(f"{name}={count}" for name, count in counts.items())
+    via = sum(1 for op in operations if op.via is not None)
+    files = len({op.path for op in operations})
+    return (
+        f"crypto-inventory: scanned {python_files} Python file(s) across {roots} root(s); "
+        f"{len(operations)} crypto operation(s) in {files} file(s), {via} of them through a "
+        f"first-party provider [{per_class}]"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Cryptographic-discovery gate (ASVS 11.1.3).")
     parser.add_argument(
@@ -873,13 +2105,32 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="single package directory to scan (default: the five real WALK_ROOTS + built-in inventory)",
     )
+    parser.add_argument(
+        "--list-operations",
+        action="store_true",
+        help="also print every operation found, one path:line -> class per line, for review",
+    )
+    parser.add_argument(
+        "--non-python-operations",
+        action="store_true",
+        help=(
+            "run ONLY the TypeScript/JavaScript and PowerShell operation arms (BACKLOG #1164), "
+            "and nothing else: --package and --list-operations do not apply. Not part of the "
+            "default run, so the required crypto-inventory context is unchanged by it"
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.non_python_operations and (args.package is not None or args.list_operations):
+        parser.error("--non-python-operations runs alone; drop --package and --list-operations")
+    if args.non_python_operations:
+        return _main_non_python_operations()
 
     scanning_default = args.package is None
     actual: dict[str, frozenset[str]] = {}
     ide_violations: list[str] = []
     randomness_violations: list[str] = []
     randomness_scanned = 0
+    files: list[Path] = []
     if scanning_default:
         repo = Path(__file__).resolve().parents[2]
         roots = [repo / name for name in WALK_ROOTS]
@@ -888,7 +2139,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"crypto-inventory: walk root(s) not found: {missing}", file=sys.stderr)
             return 2
         for root in roots:
-            actual |= discover(root)
+            files += python_sources(root)
+        # One parse for both Python arms: the import arm reads the same walked nodes the operation
+        # arm does, rather than parsing all ~460 files a second time on every commit.
+        modules = crypto_operations.parse_files(files, repo)
+        for module in modules:
+            tokens = crypto_imports_in_nodes(module.nodes)
+            if tokens:
+                actual[module.path] = frozenset(tokens)
         ide_violations = _assert_ide_is_typescript(repo)
         randomness_violations, randomness_scanned = check_non_python_randomness(repo)
     else:
@@ -897,8 +2155,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"crypto-inventory: package not found: {package}", file=sys.stderr)
             return 2
         actual = discover(package)
+        files = python_sources(package)
+        repo = package.parent
+        roots = [package]
+        modules = crypto_operations.parse_files(files, repo)
 
     undocumented, stale = find_violations(actual, INVENTORY, check_stale=scanning_default)
+    operation_violations, operations = check_operations(
+        files, repo, check_stale=scanning_default, modules=modules
+    )
+
+    # The corpus first, then the verdict: a red must say what was read as plainly as a green does.
+    print(scanned_line(len(files), len(roots), operations))
+    if args.list_operations:
+        for op in operations:
+            print(f"  {op.render()}")
 
     if ide_violations:
         print("crypto-inventory: ide/ TypeScript-only invariant VIOLATED:")
@@ -912,19 +2183,29 @@ def main(argv: list[str] | None = None) -> int:
         print("crypto-inventory: STALE inventory entries (remove them from INVENTORY):")
         for line in stale:
             print(f"  - {line}")
+    if operation_violations:
+        print(
+            "crypto-inventory: OPERATION arm (ASVS 11.1.3, BACKLOG #1164) FAILED "
+            "(review each operation, then update OPERATION_INVENTORY or IMPORT_ONLY):"
+        )
+        for line in operation_violations:
+            print(f"  - {line}")
     if randomness_violations:
         print("crypto-inventory: NON-PYTHON RANDOMNESS arm (ASVS 11.5.1, BACKLOG #1172) FAILED:")
         for line in randomness_violations:
             print(f"  - {line}")
-    if undocumented or stale or ide_violations or randomness_violations:
+    if undocumented or stale or ide_violations or operation_violations or randomness_violations:
         return 1
 
     # Print the corpus, not just the verdict: "clean" means nothing without what was read.
     print(
         f"crypto-inventory: OK - {len(actual)} documented crypto call site(s) across "
         f"{len(WALK_ROOTS)} Python root(s), no drift; "
+        f"{len(crypto_operations.aggregate(operations))} file(s) of documented crypto OPERATIONS, "
+        "no drift, positive control fired; "
         f"{randomness_scanned} non-Python source(s) scanned for randomness across "
-        f"{len(NON_PYTHON_WALK_ROOTS)} root(s), no weak source and no inventory drift."
+        f"{len(NON_PYTHON_WALK_ROOTS)} root(s), no weak source and no inventory drift. "
+        "Coverage is AT LEAST this: THE RESIDUAL in crypto_operations.py says what no arm sees."
     )
     return 0
 

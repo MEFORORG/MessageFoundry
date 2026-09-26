@@ -321,6 +321,21 @@ korus `roles/COMMON.md`, section *"The seat registry is the only channel that cr
 carries the read side: how to find a live seat from any account, and why that search must sort by
 recency.
 
+**The fleet wiki is the memory every seat on every account can search.** Query it for the subject
+of your work before you act, and write a lesson, decision, gotcha or correction after; a miss never
+blocks. A note is advice: where it disagrees with the tree or an owner instruction, the tree wins,
+and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how.
+
+**Run korus's wiki scripts by path, FROM YOUR ENGINE WORKTREE.** This repository has no
+`ccx.config.json`, so without `-StateRoot` a query reads no inbox and still prints `no note`. Work
+the path out here, never in korus: from a korus directory it names korus's own coordination
+directory, where a write lands unseen. A query also takes `-RecordRepo` with a vault checkout at
+`origin/main`.
+
+    pwsh -NoProfile -File <korus checkout>/scripts/wiki/query.ps1 -Text "<subject>" `
+      -StateRoot "$(git rev-parse --path-format=absolute --git-common-dir)/mefor-coord" `
+      -RecordRepo <vault checkout>
+
 
 ### The KORUS roster, and only these seats
 
@@ -1057,7 +1072,7 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 - When asked for tabular results, provide the final table directly — not code that generates it.
 - **Review security prose by asking what a reader would DO with it, not whether it is accurate**
   (**SDS-3.4**). The rules below are instances of it. Reasoning, evidence and dates:
-  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.8**,
+  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.10**,
   under *"Reviewing security prose"* — the source of record.
 - **State a load-bearing fact ONCE and link to it; never restate it** (**SDS-3.5**).
 - **A completeness claim is a liability — prefer "at least" to an enumeration** (**SDS-3.6**).
@@ -1066,6 +1081,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   `git diff` on a staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job*
   conclusion for a *step* question. Name the question and what the tool returns; check they are the
   same sentence.
+- **Before clearing a suspect from what a record says, ask whether that record could hold the state
+  at all** (**SDS-3.10**). Then name the suspects that step leaves open.
 
 ---
 

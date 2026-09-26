@@ -59,6 +59,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     insecure_hop_disposition,
     is_loopback_hop_host,
+    narrow_to_approved_suites,
     relax_verify_expiry,
     resolve_trust_anchor,
     urllib_handler_context,
@@ -366,6 +367,7 @@ def _insecure_opener(
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     # Verification is off, but the traffic is still encrypted, so the suite list still matters: assert
     # forward secrecy here too (ASVS 12.1.2), after the verify-off configuration is applied.
     harden_cipher_suites(ctx, connector="HTTP-family destination (TLS verification disabled)")
@@ -393,6 +395,7 @@ def _expiry_relaxed_opener(
     trust store, and vice versa."""
     ctx = build_verifying_client_context(trust_anchor)
     relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="HTTP-family destination (expired-certificate tolerance)")
     return urllib.request.build_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
@@ -1221,6 +1224,34 @@ def proxy_auth_handler_from_settings(
     raise ValueError(
         f"proxy_auth_type must be one of basic/digest/ntlm/windows, got {kind!r} (ADR 0126)"
     )
+
+
+def proxy_url_sends_userinfo(proxy_url: object) -> bool:
+    """Does this ``proxy_url`` put a credential of its own on the wire (BACKLOG #1182)?
+
+    ``ProxyHandler`` turns a user AND a password in the proxy URL into a pre-emptive
+    ``Proxy-authorization: Basic`` header, whether or not ``proxy_user`` is set. So this answers what
+    the engine sends, in the order :func:`proxy_config_from_settings` builds it: ``"default"`` hands
+    the proxy to the operating system and carries nothing from this URL; a scheme other than http or
+    https is refused before any request; and the userinfo is then read by ``_parse_proxy``, the
+    parser the handler runs. ``urlsplit`` would be the wrong reader: with an unencoded ``/``, ``?`` or
+    ``#`` in the password it ends the authority early and sees no ``@``, while the handler still
+    sends the password. A user with no password sends nothing. Never raises: a URL the transport
+    cannot parse is refused at build, so it sends nothing either. Not an ``env()`` reference: the
+    caller passes a value, and anything that is not a string answers ``False``."""
+    if not isinstance(proxy_url, str):
+        return False
+    proxy = proxy_url.strip()
+    if proxy.lower() == PROXY_DEFAULT:
+        return False
+    try:
+        if urllib.parse.urlsplit(proxy).scheme.lower() not in ("http", "https"):
+            return False
+        # Private, but it is exactly what ProxyHandler.proxy_open calls; a test pins the pairing.
+        _, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
+    except ValueError:
+        return False
+    return bool(user and password)
 
 
 def proxy_config_from_settings(

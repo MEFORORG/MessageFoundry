@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 
 import pytest
 
@@ -21,7 +22,11 @@ from webauthn.helpers import base64url_to_bytes, bytes_to_base64url  # noqa: E40
 
 from messagefoundry.auth import webauthn as wa  # noqa: E402
 from messagefoundry.auth.identity import Identity  # noqa: E402
-from messagefoundry.auth.notifications import MFA_DISABLED, SecurityEvent  # noqa: E402
+from messagefoundry.auth.notifications import (  # noqa: E402
+    MFA_CREDENTIAL_REMOVED,
+    MFA_DISABLED,
+    SecurityEvent,
+)
 from messagefoundry.auth.service import AuthService  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
@@ -256,7 +261,7 @@ async def test_a_p256_key_whose_curve_is_not_the_integer_1_is_refused_and_audite
 async def test_an_unusable_stored_key_fails_the_assertion_audited_not_raised(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The backstop for a key that is already stored. Enrolment now refuses this shape, so the
+    """A key that is already stored is checked again at sign-in. Enrolment refuses this shape, so the
     stored row is substituted to stand in for one enrolled before that check or damaged since. The
     assertion must come back refused and audited, never as an exception out of the service."""
     store = await MessageStore.open(":memory:")
@@ -280,6 +285,67 @@ async def test_an_unusable_stored_key_fails_the_assertion_audited_not_raised(
         assert ok is False
         after = (await _events(service, identity.username)).count("auth.webauthn_failed")
         assert after == before + 1
+    finally:
+        await store.close()
+
+
+async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1166: sign-in re-screens the stored key with the registration rule.
+
+    The stored key is a REAL ES256 key on P-384 and the signature over it is good, so at engine
+    ``5ccff7cb3`` this signed in. The refusal is deliberate: audited with no detail, since the
+    detail slot carries nothing from the key, and no WARNING, which is kept for raw failures.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from webauthn.helpers import encode_cbor
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+
+        key = ec.generate_private_key(ec.SECP384R1())
+        nums = key.public_key().public_numbers()
+        p384 = encode_cbor(
+            {1: 2, 3: -7, -1: 2, -2: nums.x.to_bytes(48, "big"), -3: nums.y.to_bytes(48, "big")}
+        )
+        signer = dataclasses.replace(auth, _key=key)  # same credential id, P-384 signature
+        real_get = store.get_webauthn_credential
+
+        async def on_p384(credential_id_hash: str) -> WebAuthnCredential | None:
+            cred = await real_get(credential_id_hash)
+            if cred is None:
+                return None
+            return dataclasses.replace(cred, public_key=bytes_to_base64url(p384))
+
+        monkeypatch.setattr(store, "get_webauthn_credential", on_p384)
+        logger = "messagefoundry.auth.webauthn"
+        with caplog.at_level(logging.WARNING, logger=logger):
+            ok, _ = await _assert_once(service, token, signer)
+        assert ok is False
+        assert not [r for r in caplog.records if r.name == logger]
+        events = await service.security_events_for(identity.username)
+        failed = [e for e in events if e["action"] == "auth.webauthn_failed"]
+        assert len(failed) == 1 and not failed[0]["detail"]
+        assert "auth.webauthn_verified" not in [e["action"] for e in events]
+
+        # The witness that the signature is good, so the refusal above is the check and not a
+        # broken fixture: the library alone accepts this signer against the stored P-384 key.
+        from webauthn import verify_authentication_response
+
+        challenge = wa.new_challenge()
+        verified = verify_authentication_response(
+            credential=signer.get_response(challenge, sign_count=0),
+            expected_challenge=challenge,
+            expected_rp_id=RP,
+            expected_origin=ORIGIN,
+            credential_public_key=p384,
+            credential_current_sign_count=0,
+        )
+        assert verified.new_sign_count == 0
     finally:
         await store.close()
 
@@ -463,6 +529,45 @@ async def test_duplicate_label_and_duplicate_credential_rejected() -> None:
         await store.close()
 
 
+async def test_an_account_deleted_mid_enrolment_is_not_reported_as_a_label_clash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #1807: the integrity catch around the insert used to answer "label already in use" for
+    # every refusal. Deleting the account between the service's own read and the insert makes SQLite
+    # refuse the user_id foreign key instead, and that must be reported as the missing account.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        original = store.add_webauthn_credential
+
+        async def delete_first(cred: WebAuthnCredential) -> None:
+            await store.delete_user(identity.user_id)
+            await original(cred)
+
+        monkeypatch.setattr(store, "add_webauthn_credential", delete_first)
+        with pytest.raises(ValueError, match="no such user") as raised:
+            await service.finish_webauthn_registration(
+                identity,
+                SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(
+                    base64url_to_bytes(opts["challenge"])
+                ),
+                label="mykey",
+                token=token,
+                rp_id=RP,
+                origin=ORIGIN,
+            )
+        # The refusal really was the store's foreign key, not an early check.
+        assert "FOREIGN KEY" in str(raised.value.__cause__)
+    finally:
+        await store.close()
+
+
 async def test_last_factor_delete_refused_while_required() -> None:
     store = await MessageStore.open(":memory:")
     try:
@@ -497,6 +602,82 @@ async def test_last_factor_delete_notifies_when_not_required() -> None:
         assert await store.has_webauthn_credentials(identity.user_id) is False
         assert any(e.event_type == MFA_DISABLED for e in notifier.events)
         assert "auth.webauthn_removed" in await _events(service, identity.username)
+    finally:
+        await store.close()
+
+
+async def test_removing_a_passkey_notifies_even_when_another_factor_remains() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): removal parity. ``delete_webauthn_credential`` wrote its audit row
+    unconditionally but notified only ``if last_second_factor``, so removing a passkey while another
+    factor remained produced no out-of-band notice at all -- and that is exactly the removal someone
+    holding a stolen session makes, stripping the holder's own authenticator while keeping theirs.
+    Removing a passkey is an update to the account's authentication details either way, which is the
+    requirement's own verb.
+
+    The two arms stay DIFFERENT event types rather than one type carrying a flag: MFA_DISABLED
+    asserts the account has no second factor left, which is false while another passkey stands, and
+    existing consumers read it as that state change.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = await _service(store, notifier=notifier)  # require_mfa off
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token, label="first key")
+        _, token = await _enroll(service, identity, token, label="second key")
+        creds = await store.list_webauthn_credentials(identity.user_id)
+        assert len(creds) == 2
+
+        assert (
+            await service.delete_webauthn_credential(identity, creds[0].credential_id_hash) is True
+        )
+        removed = [e for e in notifier.events if e.event_type == MFA_CREDENTIAL_REMOVED]
+        assert len(removed) == 1, "a passkey removal must notify even when another factor remains"
+        assert removed[0].username == identity.username
+        # The account still HAS a second factor, so the disable event would be a false statement.
+        assert [e for e in notifier.events if e.event_type == MFA_DISABLED] == []
+        assert "auth.webauthn_removed" in await _events(service, identity.username)
+
+        # The last-factor arm is unchanged: it still fires MFA_DISABLED, and only once.
+        assert (
+            await service.delete_webauthn_credential(identity, creds[1].credential_id_hash) is True
+        )
+        assert len([e for e in notifier.events if e.event_type == MFA_DISABLED]) == 1
+        assert len([e for e in notifier.events if e.event_type == MFA_CREDENTIAL_REMOVED]) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_racing_removal_of_the_other_passkey_does_not_claim_a_factor_remains() -> None:
+    """The notice names the state AFTER the delete, not the one the method read before it.
+
+    Two passkeys, and a concurrent caller removes the second one between this removal's read and its
+    own delete. The read saw one left, so the old choice sent "at least one other factor remains" to
+    an account that now has none. Simulated deterministically by removing the other row inside the
+    store's delete, which is exactly the window a real race lands in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = await _service(store, notifier=notifier)  # require_mfa off
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token, label="first key")
+        _, token = await _enroll(service, identity, token, label="second key")
+        creds = await store.list_webauthn_credentials(identity.user_id)
+        assert len(creds) == 2
+
+        real_delete = store.delete_webauthn_credential
+
+        async def racing_delete(user_id: str, credential_id_hash: str) -> bool:
+            await real_delete(user_id, creds[1].credential_id_hash)  # the other caller wins first
+            return await real_delete(user_id, credential_id_hash)
+
+        store.delete_webauthn_credential = racing_delete  # type: ignore[method-assign]
+        assert (
+            await service.delete_webauthn_credential(identity, creds[0].credential_id_hash) is True
+        )
+        assert await store.has_webauthn_credentials(identity.user_id) is False
+        assert [e for e in notifier.events if e.event_type == MFA_CREDENTIAL_REMOVED] == []
+        assert len([e for e in notifier.events if e.event_type == MFA_DISABLED]) == 1
     finally:
         await store.close()
 

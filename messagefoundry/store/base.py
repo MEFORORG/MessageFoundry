@@ -50,6 +50,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     AlertSummary,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
@@ -1954,15 +1955,55 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
-    ) -> None: ...
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
+    ) -> None:
+        """Set a user's per-channel scope and record who wrote it, in one statement.
+
+        ``source`` is REQUIRED, not defaulted (BACKLOG #1927). Provenance decides whether the AD
+        login sync may later withdraw the scope (``UserRecord.channel_scope_source``), so a writer
+        that forgot to say who it was would misfile the scope one way or the other. A required
+        keyword turns that omission into a type error at every call site."""
+        ...
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (which denies), and report whether it did.
+
+        BACKLOG #1927. A COMPARE-AND-SET, not a read-then-write: the AD login sync decides to
+        withdraw from a user row it read several awaits earlier, and in between an administrator may
+        set a scope or a concurrent login may write a fresh directory grant. The WHERE clause binds
+        the withdrawal to ``expected_scope``, the value the decision was made on, and re-checks that
+        it is not marked ``"manual"``, all in one statement. If either no longer holds, nothing is
+        written and this returns ``False``. The withdrawn row is marked ``"ad"``."""
+        ...
 
     async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
-        """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the
-        first federated login so a later login whose reassignable username resolves to this account but
-        carries a different subject is refused, not handed the account."""
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
+        """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Returns
+        whether a row was written.
+
+        ``expect_unbound`` makes the write conditional on the row holding NO pair, in the same
+        statement (BACKLOG #1143). The admin bind clears and then sets in two transactions, so
+        without it a second bind landing between them would be overwritten with no audit row and its
+        sessions left live. ``False`` when the row is unknown, or bound while ``expect_unbound``.
+
+        Its one caller is :meth:`AuthService.bind_federated_subject`, the administrative bind (BACKLOG
+        #1143, ADR 0184). A federated login selects its account by this pair and never writes it.
+        **Until #1143 this was recorded on the account's first federated login**, which is the
+        bind-on-first-presentation the owner's 2026-09-06 ruling forbids."""
         ...
 
     async def clear_user_federated_subject(

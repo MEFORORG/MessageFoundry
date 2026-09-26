@@ -30,9 +30,10 @@ rules:
       #
       # Upstream is ARCHIVED. That residual is recorded in docs/adr/0034 (amendment, 2026-08-01) and
       # no longer as an archived-uses entry in this file -- a local `uses:` gives that audit nothing
-      # to fire on, so an entry here would be a suppression that can never match. Its deadline is
-      # LIVE and is what forces fork-or-replace: the vendored action.yml declares `runs.using:
-      # node20`, and GitHub removes Node20 in fall 2026. Re-check before then.
+      # to fire on, so an entry here would be a suppression that can never match. The Node 20
+      # deadline is DISCHARGED (BACKLOG #1868, ADR 0034 amendment 2026-09-25): the vendored
+      # action.yml now declares `runs.using: node24`, and the local-action checker refuses a
+      # retired runtime and names the date to revisit node24.
       - cla.yml
       # A notice that a SCHEDULED run failed can only be written by something observing that run AFTER
       # it finishes — no other trigger sees another workflow's conclusion, so `workflow_run` is not a

@@ -109,11 +109,37 @@
     // authorizes it via that cookie, CSWSH-guarded by a same-origin Origin check + SameSite=Strict.
     // Every update is a server-rendered, already-escaped fragment / store counts — no client-side
     // markup building.
+    //
+    // BOUNDED RECONNECT (ASVS 7.2.4). Completing MFA or a step-up ROTATES the session token, and the
+    // server then closes this socket at its next re-check, because the token it captured at the
+    // handshake no longer resolves. That close is correct, and the server grants no grace window to
+    // soften it. Instead the page re-opens the socket, and the new handshake carries the NEW cookie.
+    // The retry budget is small and fixed, with a doubling delay, so a session that really ended
+    // cannot turn this into a handshake loop: its retries fail, the budget runs out, and the HTTP
+    // poll's own 303 check takes the page to the login screen. The budget refills only after a socket
+    // stayed up for WS_STABLE_MS, which a refused or dead session never achieves.
     var livestats = document.getElementById("livestats");
-    try {
-      var proto = location.protocol === "https:" ? "wss:" : "ws:";
-      var ws = new WebSocket(proto + "//" + location.host + "/ws/stats");
+    var WS_RECONNECT_LIMIT = 3;
+    var WS_RECONNECT_BASE_MS = 1000;
+    var WS_STABLE_MS = 30000;
+    var wsRetries = 0;
+    var resumePoll = function () {
+      if (!pollTimer) {
+        pollTimer = setInterval(tick, intervalMs);
+      }
+    };
+    var openLiveSocket = function () {
+      var ws;
+      try {
+        var proto = location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(proto + "//" + location.host + "/ws/stats");
+      } catch (_) {
+        return; // WebSocket unavailable — the polled table remains the live view
+      }
+      var openedAt = 0;
+      var down = false;
       ws.onopen = function () {
+        openedAt = Date.now();
         if (pollTimer) {
           clearInterval(pollTimer);
           pollTimer = null;
@@ -141,16 +167,22 @@
           /* ignore a malformed frame */
         }
       };
-      var resumePoll = function () {
-        if (!pollTimer) {
-          pollTimer = setInterval(tick, intervalMs);
+      // onerror is followed by onclose, so `down` makes the pair count as ONE loss of the socket.
+      var onDown = function () {
+        if (down) return;
+        down = true;
+        resumePoll();
+        if (openedAt && Date.now() - openedAt >= WS_STABLE_MS) {
+          wsRetries = 0;
         }
+        if (wsRetries >= WS_RECONNECT_LIMIT) return;
+        wsRetries += 1;
+        setTimeout(openLiveSocket, WS_RECONNECT_BASE_MS * Math.pow(2, wsRetries - 1));
       };
-      ws.onclose = resumePoll;
-      ws.onerror = resumePoll;
-    } catch (_) {
-      /* WebSocket unavailable — the polled table remains the live view */
-    }
+      ws.onclose = onDown;
+      ws.onerror = onDown;
+    };
+    openLiveSocket();
   });
 
   // --- Connection controls: bulk-action toolbar over a checkbox selection ----------------------

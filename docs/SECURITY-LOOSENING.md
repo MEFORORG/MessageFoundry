@@ -53,9 +53,11 @@ section reference.
 | Sign-in & identity | `require_sign_in` | `true` |
 | | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
-| Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
 | | `sign_out_after_idle_minutes` | `30` |
 | | `max_session_hours` | `12` |
+| Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
+| Backend credentials | `require_nonstatic_credentials` | `false` (*not* a loosening — it TIGHTENS, refusing backend hops on a static credential or none. Opt-in by owner decision, because several hops have no compliant kind in the product) |
+| | `static_credential_accepted` | `{}` (each opt-out is a loosening while `require_nonstatic_credentials` is on, and is reported as `static_credential_accepted`; with the refusal off an opt-out does nothing and is not reported) |
 | Data handling | `block_unlisted_outbound` | `true` |
 | | `delete_message_bodies_after_days` | `30` (`0` = keep forever) |
 | | `allow_keeping_phi_indefinitely` | `false` |
@@ -157,13 +159,20 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   restart ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)).
 - **Still refused:** nothing — this is advisory only. An exposed bind with an empty list starts normally.
 
-### `require_encryption_for_remote = false` — accept cleartext for off-machine access
-- **What you lose:** bearer tokens and PHI cross the network **in cleartext**. This is the config-file twin
-  of the `--allow-insecure-bind` dev escape.
+### `require_encryption_for_remote = false` — accept off-machine access without an operator certificate
+- **What you lose:** it differs by surface. This is the config-file twin of the `--allow-insecure-bind`
+  dev escape.
+  - **The API** still serves TLS, on the engine's generated self-signed placeholder
+    ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+    No trust store vouches for it, so a remote client can authenticate the engine only by pinning that
+    exact certificate. Any other client cannot tell the engine from an on-path attacker.
+  - **An inbound MLLP, HTTP, DICOM SCP, raw-TCP or X12 listener** without `tls` binds in cleartext, so
+    PHI crosses the network unencrypted.
 - **When acceptable:** a lab/loopback-adjacent trusted, firewalled segment; never for real remote PHI.
 - **Compensating controls:** network isolation; prefer in-process TLS (`[api].tls_cert_file`) or a
   TLS-terminating proxy instead.
-- **Still refused:** a **production-PHI** cleartext bind — the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
+- **Still refused:** either bind under `[security].enforcement = enforce`, the shipped default — the
+  [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
   clamp cannot be relaxed by this switch or by `--allow-insecure-bind`.
 
 ### `serve_web_console = false` — do **not** mount the browser ops console at `/ui` (surface-reducing opt-out)
@@ -329,6 +338,26 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   gets an explicit `[security]` acknowledgment instead — the first verify-off hop governed that way.
 - **Still refused:** nothing here relaxes the connectors. This switch reaches the `[alerts]` cell only.
 
+### `static_credential_accepted` — a backend hop runs on an unchanging credential while the refusal is on
+This deviation exists only while `require_nonstatic_credentials = true`. With the refusal off, nothing
+is refused, so an opt-out does nothing and is not reported.
+
+- **What you lose:** for each hop you name, ASVS 13.2.1's ask that a backend hop use a service
+  account, a short-term token or a certificate. The named hop presents a password, an API key, a static
+  bearer token or a Vault token, or presents nothing at all. Whoever holds that credential can use it
+  until someone rotates it by hand.
+- **When acceptable:** the hop has no compliant credential kind in the product. Each hop's
+  `compliant_kind` says so. The alert webhook, DICOMweb, `Tcp`, `X12`, FTP, SMTP AUTH, a forward proxy,
+  a Postgres store, the Vault tokens, the AI broker key, the OIDC `client_secret` and the LDAP bind are
+  at least some of these. Where a compliant kind exists, move the hop to it rather than opting out.
+- **Compensating controls:** every opt-out needs a written reason, and a blank one is refused at load.
+  Serve logs each honoured opt-out at WARNING with the hop name and the reason, and it also logs an
+  opt-out that matches no hop. `security_loosenings()` names the opt-outs.
+  `GET /security/posture` marks each opted-out hop `accepted`, and `messagefoundry check` marks it
+  `[opted out]`.
+- **What the reports show:** each hop's detail names what it presents and its peer, as scheme, host
+  and port only. It never shows the credential, a URL path or a query.
+
 ### `enforcement = warn` — warn instead of refuse on the PHI serve-gate floor
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
@@ -407,8 +436,10 @@ This section is kept rather than deleted, because the claim it used to make is t
   access. Nothing in the engine detects the plant once this is on.
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
   it sealed while on stays sealed.
-- **Not covered either way:** the uploaded-file store, whose behaviour at first key-enable awaits an
-  owner ruling, and the DIRECT S/MIME connector's enveloped body.
+- **Uploads too:** on a keyed store a plaintext uploaded file is refused until `rotate-key` seals it
+  (owner ruling 2026-09-23), alerting under its own subject `upload-cipher`. With this on, it is served as plaintext instead. Under
+  `cipher_provider = "vault_transit"` uploads pass through either way; [PHI.md](PHI.md) §3 says why.
+- **Not covered either way:** the DIRECT S/MIME connector's enveloped body.
 
 ### `[secret_rotation].enforce_store_key_expiry = false` — the store DEK's calendar expiry stops the engine no more
 - **What you lose:** the **hard stop** on a calendar-expired data-encryption key. With it on, a DEK past

@@ -654,8 +654,8 @@ The page's one live control is a **planned failover** ("Step down primary"), spe
 | **Summary** | The current leader **voluntarily releases its leadership lease** so a standby promotes promptly (planned failover / maintenance drain). |
 | **Permission** | **`CLUSTER_CONTROL`** (new), gated via `require_step_up(Permission.CLUSTER_CONTROL)` |
 | **Request** | `ClusterStepdownRequest` — `{ "force": bool = false }`. Both values are a clean lease release. `true` waives only the `412` below, so an operator can drain the last promotable node on purpose (BACKLOG #1509; see [Decisions taken](#decisions-taken-2026-06-27)). It is not the immediate fence this row first sketched. |
-| **Success** | `200` `ClusterStepdownResult` — `{ node_id, was_leader, released_at, new_leader_eligible, force }`. `new_leader_eligible` says whether another promotable node had a fresh heartbeat in the one membership read taken before the release; it names no successor. `force` is echoed so the audit row, which is this body, records the override. |
-| **Errors** | `400` not clustered (single-node — gated **before** the coordinator is called; `force` does not override it) · `403` missing `CLUSTER_CONTROL` · `403` step-up/MFA not satisfied · `409` **this node is not the current leader**. Two causes share it: the caller addressed a node that does not lead, or a retry re-sent a lease-expiring write that an earlier `release-unconfirmed` `503` left owed. That retry answers `409` for as long as this node is not the leader, because the first call already cleared its in-memory leader flag and `was_leader` reports that flag, so the `409` is the retry completing, not operator error; [CLUSTERING.md](../CLUSTERING.md) §"Planned failover" says when it is the failover having worked. `force` overrides neither. · `412` **no other node could take the lease**: no other member is `active`, `promotable` and fresh by the heartbeat rule `cluster_members()` applies (BACKLOG #1509). Refused before the release, and the only refusal `force` waives. · `503` engine not started / auth not configured, and at least three conditions the handler raises itself: a membership read that raised (`members-unreadable`, which is what an unreachable store turns the `412` check into; nothing is released), a leadership lock still held at the fence timeout (`lock-timeout`), and a lease-expiring write the node cannot confirm (`release-unconfirmed`) |
+| **Success** | `200` `ClusterStepdownResult` — `{ node_id, was_leader, released_at, lease_released, new_leader_eligible, force }`, answered when `was_leader` or `lease_released` is true. `lease_released` says whether the release expired a lease row naming this node; it is what lets a node that has already self-fenced, with its leader flag clear and its row still live, be drained (BACKLOG #1508). `new_leader_eligible` says whether another promotable node had a fresh heartbeat in the one membership read taken before the release; it names no successor. `force` is echoed so the audit row, which is this body, records the override. |
+| **Errors** | `400` not clustered (single-node — gated **before** the coordinator is called; `force` does not override it) · `403` missing `CLUSTER_CONTROL` · `403` step-up/MFA not satisfied · `409` **this node neither leads nor owns a lease row to release**. Two causes share it: the caller addressed a node that does not lead, or a retry re-sent a lease-expiring write that an earlier `release-unconfirmed` `503` left owed and a standby had already taken the lease, so the write matched nothing. That second `409` is the failover having worked, not operator error; a retry whose write still finds this node's row answers `200` (BACKLOG #1508). [CLUSTERING.md](../CLUSTERING.md) §"Planned failover" has the detail. `force` overrides neither. · `412` **no other node could take the lease**: no other member is `active`, `promotable` and fresh by the heartbeat rule `cluster_members()` applies (BACKLOG #1509). Refused before the release, and the only refusal `force` waives. · `503` engine not started / auth not configured, and at least three conditions the handler raises itself: a membership read that raised (`members-unreadable`, which is what an unreachable store turns the `412` check into; nothing is released), a leadership lock still held at the fence timeout (`lock-timeout`), and a lease-expiring write the node cannot confirm (`release-unconfirmed`) |
 
 ### Coordinator seam
 
@@ -667,9 +667,10 @@ only difference for a planned failover is that the node keeps **running and hear
 (demoted to standby).
 
 **Seam to add:** lift this into a **public protocol method** —
-`async def step_down_leadership() -> tuple[bool, float | None]` returning `(was_leader, released_at)` —
+`async def step_down_leadership() -> StepdownOutcome` returning `(was_leader, released_at,
+lease_released)` (the third field added by BACKLOG #1508) —
 `DbCoordinator` reusing the existing release body, the SQL Server coordinator mirroring it, and the
-single-node `NullCoordinator` returning `(False, None)` (it is never reached — the endpoint returns `400`
+single-node `NullCoordinator` returning all-false (it is never reached — the endpoint returns `400`
 for single-node first). This is a **visibility lift of existing logic, not a new mechanism**.
 
 **Audit the return value, not a pre-read.** The handler **must** audit the tuple
@@ -693,13 +694,13 @@ promotion; this API contract is unchanged by it.
   `MESSAGES_REPLAY`, `MESSAGES_PURGE`): recent password re-prove within the step-up window, plus **TOTP
   MFA** when enrolled or `[auth].require_mfa` is on.
 - **Granted** audit: action `cluster_stepdown`, `detail={node_id, was_leader, released_at,
-  new_leader_eligible, force}` (the response body itself, so a forced drain is on the record), via the
+  lease_released, new_leader_eligible, force}` (the response body itself, so a forced drain is on the record), via the
   standard `store.record_audit(actor=identity.username, channel_id=None, …)` into the hash-chained
   `audit_log`. **Do not** hand-roll a denied-audit for permission/step-up 403s — `require_step_up()`
   already records those (`auth.permission_denied`) and the handler body never runs on that denial. If a
   distinct denied signal is wanted, scope it to denials the **handler actually reaches**. As built, the
   `400`, the `412` and the three `503`s write `cluster_stepdown_denied` with a reason, and the `409`
-  needs none because its granted row already reads `was_leader: false`.
+  needs none because its granted row already reads `was_leader: false, lease_released: false`.
 - **PHI-free by construction:** the page and the audit detail carry only cluster/node metadata
   (`node_id`/`host`/`pid`/lease state) — never message bodies. Keep confirm-dialog and error copy limited
   to node identifiers.
@@ -793,7 +794,9 @@ The failover button follows the established **privileged-write** pattern, not th
   → `tests/test_settings.py::test_vip_requires_clustered_server_db_and_one_mask_form`
 - **AC-9** — WHEN `POST /cluster/stepdown` is called on the current leader with `CLUSTER_CONTROL` + step-up
   satisfied, THE SYSTEM SHALL release leadership, audit the **returned** `was_leader`/`released_at` with
-  the acting user, and SHALL return `200`; on a non-leader it SHALL return `409`; single-node `400`;
+  the acting user, and SHALL return `200`; on a node that neither leads nor owns a lease row it SHALL
+  return `409`, and on a self-fenced node that still owns its row it SHALL expire that row and return
+  `200` (BACKLOG #1508); single-node `400`;
   missing permission/step-up `403`. IF no other promotable node has a fresh heartbeat, THEN THE SYSTEM
   SHALL refuse with `412` before releasing anything, unless the request sets `force` (BACKLOG
   #1509); and IF that membership read raises, THEN THE SYSTEM SHALL return `503` and change nothing.

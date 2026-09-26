@@ -54,9 +54,10 @@ def uploaded_logs(data: UploadedFileList, *, error: str = "") -> Markup:
     """The uploaded-files list: an upload link + a table of files (metadata only), each linking to the
     offline browse view and a guarded delete.
 
-    ``error`` is the refused-mutation banner (a resend or delete that did NOT run). The route resolves
-    it from an allow-list of fixed module text, so nothing caller-supplied reaches here — but it goes
-    through ``text()`` like every other dynamic value regardless."""
+    ``error`` is the refusal banner (a resend or delete that did NOT run, or a browse the store cipher
+    refused). The route resolves it from an allow-list of fixed module text, so nothing
+    caller-supplied reaches here — but it goes through ``text()`` like every other dynamic value
+    regardless."""
     rows = [
         [
             el("a", f.filename, href=f"/ui/uploaded-logs/file/{f.file_id}"),

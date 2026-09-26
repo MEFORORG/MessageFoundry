@@ -42,9 +42,11 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import (
@@ -64,6 +66,7 @@ from types import MappingProxyType
 from typing import (
     Any,
     Final,
+    Literal,
     NoReturn,
     NotRequired,
     Protocol,
@@ -1211,6 +1214,33 @@ class DbStatus:
     synchronous: str | None = None
 
 
+#: Who last wrote ``users.channel_scope`` (BACKLOG #1927). The AD login sync writes
+#: :data:`SCOPE_SOURCE_AD`; an administrator's ``PUT /users/{id}/channel-scope`` writes
+#: :data:`SCOPE_SOURCE_MANUAL`. What that decides is on ``UserRecord.channel_scope_source``.
+ChannelScopeSource = Literal["ad", "manual"]
+SCOPE_SOURCE_AD: Final[ChannelScopeSource] = "ad"
+SCOPE_SOURCE_MANUAL: Final[ChannelScopeSource] = "manual"
+
+#: The compare-and-set behind ``withdraw_ad_channel_scope`` on SQLite. Postgres carries a ``$n``
+#: twin and SQL Server a collation-pinned one. Binds: new source, now, user id, the expected scope,
+#: the manual marker.
+WITHDRAW_AD_SCOPE_SQL: Final = (
+    "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"
+    " WHERE id=? AND channel_scope = ?"
+    " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
+)
+
+#: ``set_user_federated_subject``'s two statements on SQLite: unconditional, and conditional on the
+#: row holding no pair (``expect_unbound``, BACKLOG #1143). Both literal, so no SQL is assembled.
+_SET_FEDERATED_SQL: Final = (
+    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
+)
+_SET_FEDERATED_IF_UNBOUND_SQL: Final = (
+    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
+    " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
+)
+
+
 @dataclass(frozen=True)
 class UserRecord:
     """A user account (local or AD). ``password_hash`` + lockout fields are NULL for AD users."""
@@ -1243,10 +1273,11 @@ class UserRecord:
     totp_enrolled_at: float | None = None
     # Federated-account identity (BACKLOG #1015, ADR 0142): the verified OIDC ``(issuer, sub)`` this
     # AD-backed account's federated identity is PINNED to. Non-reassignable, unlike the display username.
-    # The account is still resolved by its username; this binding only refuses a login whose username
-    # resolves here but carries a different subject. NULL on a local account and on an AD account that
-    # has never completed a federated login. Set on the first federated login and enforced on every
-    # subsequent one, so a reassigned username cannot hand the account to a new subject.
+    # Since BACKLOG #1143 (ADR 0184) a federated login SELECTS its account by this pair, before any
+    # username is read, and an unbound pair is refused. NULL on a local account and on an AD account
+    # nobody has bound. Written only by the administrative bind (``AuthService.bind_federated_subject``),
+    # never by a login. Until #1143 the account was resolved by its username, this pair only vetoed a
+    # mismatch, and it was set on the account's first federated login.
     oidc_issuer: str | None = None
     oidc_subject: str | None = None
     # THE DIRECTORY'S IMMUTABLE IDENTIFIER FOR THIS ACCOUNT (BACKLOG #1471): the normalised AD
@@ -1298,6 +1329,13 @@ class UserRecord:
     # to meet the durability rule and is deliberately not taken: accounts may still be created without
     # an address, so the column would need a placeholder the notifier treats as absent anyway.
     notify_email: str | None = None
+    # WHO LAST WROTE ``channel_scope`` (BACKLOG #1927), and the one place this rule is stated; the
+    # other comments point here. ``"ad"`` for the AD login sync, ``"manual"`` for an administrator,
+    # written in the same statement as the scope by every scope writer. NULL means no scope writer
+    # has run: a fresh account (``create_user`` writes neither column), or a row written before
+    # this column existed. When no mapped group matches, the AD login sync withdraws every scope
+    # not marked ``"manual"``, so an unvouched grant fails closed.
+    channel_scope_source: ChannelScopeSource | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -1337,6 +1375,9 @@ class UserRecord:
             # silently excluded from every security notice. A loud failure on a mapping that lacks the
             # column beats a quiet, permanent loss of the notification channel.
             notify_email=d["notify_email"],
+            # A ``.get()``: a missing key decodes to NULL, which the login sync withdraws. The quiet
+            # direction is the closed one.
+            channel_scope_source=d.get("channel_scope_source"),
         )
 
 
@@ -2771,15 +2812,15 @@ def _grant_read(path: Path, principal: str) -> None:
 
 
 async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
-    """:func:`_secure_file` dispatched off the event loop — for the two callers that run ON one.
+    """:func:`_secure_file` dispatched off the event loop, for a caller that runs ON one.
 
     On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
     straight from a coroutine, that span is dead time for every other task on the loop: a deploying
     site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
     DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
     ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
-    off it). ``MessageStore.open`` secures three files, but it completes before the API serves and
-    before any listener binds, so its stall has nothing to stall.
+    off it). ``MessageStore.open`` secures its three files through :func:`_secure_store_file`, also
+    dispatched off the loop.
 
     The synchronous :func:`_secure_file` stays the callable for every caller that is NOT on a loop —
     the CLI key/cert writers, the lifespan bootstrap admin, and the ``config/*_edit.py`` writers
@@ -2791,6 +2832,442 @@ async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | N
     patches the name is honoured through this wrapper too.
     """
     await asyncio.to_thread(_secure_file, path, extra_read_grants=extra_read_grants)
+
+
+# --- the store trio in a HARDENED data directory (ADR 0183 Wave 0b, ADR 0163 consequences 1-2) ------
+#
+# `_secure_file` rewrites a file to its opener ALONE. For the store trio that made whichever identity
+# opened a fresh store first its only principal, measured on hosted windows-2022 and windows-2025 (CI
+# run 36026471545): an operator's `provision-admin` locked the NSSM service account out, and the
+# service locked the operator out. Neither process can name the other -- the CLI cannot see the
+# service's account, the service cannot know which administrator comes later -- so no grant keyed on
+# the OPENER fixes both orders.
+#
+# The data directory already names the right set. install-service.ps1 removes its inheritance and
+# grants SYSTEM, BUILTIN\Administrators and the run-as account. So where the store's directory is
+# HARDENED like that, every open writes the SAME explicit, protected DACL on the trio: SYSTEM and
+# Administrators full control, and the one per-service account Modify. It does not depend on who
+# opens, so the second opener finds it already exact and needs no WRITE_DAC; it is protected, so a
+# later edit to the directory does not reach the store. Anywhere else -- a developer checkout, a temp
+# directory, a directory admitting anyone else, one reached through a link, or one this code cannot
+# read -- the owner-only rewrite applies exactly as before. Every test below is an ALLOW-list.
+
+#: SDDL aliases the hardening test resolves. Any other alias names a principal outside the set.
+_SDDL_SID_ALIASES: Mapping[str, str] = MappingProxyType({"SY": "S-1-5-18", "BA": "S-1-5-32-544"})
+#: NT AUTHORITY\SYSTEM and BUILTIN\Administrators.
+_STORE_DIR_TRUSTED_SIDS = ("S-1-5-18", "S-1-5-32-544")
+#: One per-service virtual account, NT SERVICE\<name>: S-1-5-80 plus exactly five sub-authorities.
+#: NT SERVICE\ALL SERVICES is S-1-5-80-0 and does NOT match, because it admits every service.
+_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+")
+_SDDL_DENY_TYPES = frozenset({"D", "OD", "XD"})
+_SDDL_ACE = re.compile(r"\(([^()]*)\)")
+_SDDL_OWNER = re.compile(r"O:(S-[0-9-]+|[A-Z]{2})")
+#: The SDDL right for each principal of the trio: full control (FA) for SYSTEM and Administrators,
+#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for the service.
+_TRIO_RIGHTS: Mapping[str, str] = MappingProxyType({"S-1-5-18": "FA", "S-1-5-32-544": "FA"})
+_SERVICE_RIGHTS = "0x1301bf"
+
+
+def _trio_right(sid: str) -> str:
+    """The one SDDL right the trio carries for ``sid``, upper-cased as the parser keeps rights. The
+    writer and both checks use this, so they cannot drift apart."""
+    return _TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS).upper()
+
+
+@dataclass(frozen=True)
+class _SddlDacl:
+    """A security descriptor read from SDDL: its owner (when requested), whether the DACL blocks
+    inheritance, and each ACE as (type, flags, rights, sid) with SYSTEM/Administrators aliases
+    resolved. Rights are kept upper-cased (``FA``, ``0X1301BF``), because the hardening test and the
+    exactness test both compare them against :func:`_trio_right`."""
+
+    protected: bool
+    aces: tuple[tuple[str, str, str, str], ...]
+    owner: str | None = None
+
+
+def _resolve_sid(sid: str) -> str:
+    return _SDDL_SID_ALIASES.get(sid, sid)
+
+
+def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
+    """The owner and ``D:`` section of an SDDL string, or ``None`` when the DACL is absent or not
+    plainly parseable.
+
+    ``None`` is the fail-closed answer: every caller treats it as "not hardened", so a shape this does
+    not understand (a callback ACE, a resource attribute, a null DACL) gets the owner-only rewrite."""
+    owner_match = _SDDL_OWNER.search(sddl)
+    owner = _resolve_sid(owner_match.group(1)) if owner_match else None
+    start = sddl.find("D:")
+    if start < 0:
+        return None
+    body = sddl[start + 2 :]
+    end = body.find("S:")  # a SACL section, if one was included, follows the DACL
+    if end >= 0:
+        body = body[:end]
+    first = body.find("(")
+    flags = body if first < 0 else body[:first]
+    if "NO_ACCESS_CONTROL" in flags:
+        return None
+    aces: list[tuple[str, str, str, str]] = []
+    rest = body[first:] if first >= 0 else ""
+    for match in _SDDL_ACE.finditer(rest):
+        parts = match.group(1).split(";")
+        if len(parts) != 6:
+            return None
+        aces.append((parts[0], parts[1], parts[2].upper(), _resolve_sid(parts[5])))
+    # Anything left over once the ACEs are removed is a shape this parser does not model.
+    if _SDDL_ACE.sub("", rest).strip():
+        return None
+    return _SddlDacl(protected="P" in flags, aces=tuple(aces), owner=owner)
+
+
+def _hardening_refusal(directory: _SddlDacl) -> str | None:
+    """Why ``directory`` is NOT hardened, or ``None`` when it is (see :func:`_hardened_trio_grants`).
+
+    The first failing condition, in a fixed order, as one operator-readable sentence. The checks read
+    the whole DACL, so a directory that fails two ways is refused whichever entry comes first."""
+    if not directory.protected:
+        return "it does not block inheritance"
+    if not directory.aces:  # defence in depth: the both-built-ins check below also refuses this
+        return "its DACL is empty"
+    named: set[str] = set()
+    services: set[str] = set()
+    for ace_type, flags, rights, sid in directory.aces:
+        trusted = sid in _STORE_DIR_TRUSTED_SIDS
+        service = not trusted and bool(_SERVICE_SID.fullmatch(sid))
+        if ace_type != "A":
+            return f"it carries a {ace_type} entry for {sid}, which the trio would not carry over"
+        if not (trusted or service):
+            return f"it grants {sid}, which is not SYSTEM, Administrators or one service account"
+        if _sddl_flag_set(flags) != {"OI", "CI"} or rights != _trio_right(sid):
+            return (
+                f"it grants {sid} ({flags};{rights}), not the installer's shape "
+                f"(OICI;{_trio_right(sid)})"
+            )
+        (named if trusted else services).add(sid)
+    # Both built-in principals are required, as the installer always writes them: without
+    # Administrators among the grants, a file it owns could never be made exact, and would be
+    # rewritten -- and warned about -- on every start.
+    if named != set(_STORE_DIR_TRUSTED_SIDS):
+        return "it does not grant both SYSTEM and Administrators"
+    if len(services) > 1:
+        return "it grants more than one service account"
+    if directory.owner is None or (
+        directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
+    ):
+        return f"it is owned by {directory.owner}, which keeps WRITE_DAC over it"
+    return None
+
+
+def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
+    """The principals the trio is granted when ``directory`` is HARDENED, else ``None``.
+
+    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
+    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
+    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
+    present, and Modify (``0x1301bf``) for at most ONE per-service account -- and nothing else; no
+    deny ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM,
+    Administrators or that service account, because an owner keeps WRITE_DAC over the directory.
+
+    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
+    written with FA/Modify: a directory granting Administrators read, or a service container-only,
+    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
+    but the installer's falls back to the owner-only rewrite. The answer names only principals the
+    directory allows, never who happens to be opening."""
+    if _hardening_refusal(directory) is not None:
+        return None
+    services = sorted(
+        sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS
+    )
+    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(services))
+
+
+def _sddl_flag_set(flags: str) -> set[str]:
+    """SDDL ACE flags are two-letter tokens run together (``OICI``, ``OICIID``); split them."""
+    return {flags[i : i + 2] for i in range(0, len(flags), 2)}
+
+
+def _trio_dacl_is_exact(dacl: _SddlDacl, grants: Sequence[str]) -> bool:
+    """Does this file already carry exactly ``grants``: a protected DACL of explicit allow ACEs (no
+    inheritance flags), one per principal, each with exactly the right the trio writes, and an OWNER
+    among them? Rights are compared so a broadened entry (the service holding FA, say) is rewritten
+    rather than accepted. The owner matters because an owner keeps READ_CONTROL and WRITE_DAC
+    whatever the DACL says, so a file owned by anyone else could be re-granted by that owner
+    (measured). ``dacl.owner`` is ``None`` when the owner was not read, which is never exact."""
+    if not dacl.protected or len(dacl.aces) != len(grants):
+        return False
+    if dacl.owner is None or dacl.owner not in grants:
+        return False
+    for ace_type, flags, rights, sid in dacl.aces:
+        if ace_type != "A" or flags:
+            return False
+        if rights != _trio_right(sid):
+            return False
+    return {sid for _t, _f, _r, sid in dacl.aces} == set(grants)
+
+
+def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
+    """The DACL of ``path`` (and its owner, when asked) as SDDL, or ``None`` when it cannot be read.
+    Windows only.
+
+    GetNamedSecurityInfoW asks for the DACL and owner alone, so it needs only READ_CONTROL, and SDDL
+    names principals by SID, so the answer does not depend on the display language. A failure is
+    logged with its Win32 status, because the caller then falls back to the owner-only rewrite."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.c_void_p,
+    ]
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    se_file_object = 1
+    info = 0x4 | (0x1 if owner else 0)  # DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION
+    sddl_revision_1 = 1
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        str(path), se_file_object, info, None, None, None, None, ctypes.byref(descriptor)
+    )
+    if status != 0:
+        log.warning("could not read the DACL of %s (Win32 status %s)", path, status)
+        return None
+    try:
+        text = wintypes.LPWSTR()
+        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor, sddl_revision_1, info, ctypes.byref(text), None
+        ):
+            log.warning(
+                "could not render the DACL of %s (Win32 status %s)", path, ctypes.get_last_error()
+            )
+            return None
+        try:
+            return text.value
+        finally:
+            kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _is_windows() -> bool:
+    """A seam the tests patch, instead of patching the process-wide ``os.name``."""
+    return os.name == "nt"
+
+
+def _reaches_through_a_link(path: Path) -> bool:
+    """Is ``path``, or any directory above it, a reparse point (a junction, a symlink, a mount point)?
+
+    A link has its OWN security descriptor: measured, GetNamedSecurityInfoW on a junction returns the
+    junction's DACL while files created through it inherit the target's. So a hardened link over a
+    broad target would pass the test while the store landed in the broad directory. Read from each
+    component's own attributes rather than by comparing resolved paths, which also flagged an 8.3
+    short name as a link (measured). A component that cannot be read counts as a link."""
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    current = Path(os.path.abspath(path))
+    for component in (current, *current.parents):
+        try:
+            attributes = getattr(os.lstat(component), "st_file_attributes", 0)
+        except OSError:
+            return True
+        if attributes & reparse:
+            log.warning(
+                "%s is reached through a link, so the store there is restricted owner-only", path
+            )
+            return True
+    return False
+
+
+def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
+    """The trio grants for a store in ``directory`` (see :func:`_hardened_trio_grants`), or ``None``
+    for the owner-only rewrite: off Windows, through a link, or when the DACL cannot be read or
+    parsed."""
+    if not _is_windows() or _reaches_through_a_link(directory):
+        return None
+    sddl = _read_dacl_sddl(directory, owner=True)
+    if sddl is None:
+        return None
+    parsed = _parse_sddl_dacl(sddl)
+    if parsed is None:
+        return None
+    reason = _hardening_refusal(parsed)
+    if reason is not None:
+        # A locked-down directory (inheritance off) that still fails the test is the case an operator
+        # needs to hear about: the fallback brings back the Wave 0 lockout, whose only other symptom
+        # is "unable to open database file". The one exception is CPython's own temp-directory DACL,
+        # recognised by its OWNER RIGHTS entry, which install-service.ps1 strips from a data
+        # directory; why it is exempt is stated once, in the ADR 0163 note. An inheriting directory
+        # (a developer checkout) is the expected fallback. Both keep the reason at DEBUG.
+        if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
+            log.warning(
+                "%s is locked down but %s, so the store there is restricted owner-only; the service "
+                "account and an operator's provision-admin cannot then both open it (ADR 0163 note "
+                "of 2026-09-24)",
+                directory,
+                reason,
+            )
+        else:
+            log.debug("%s is not a hardened store directory: %s", directory, reason)
+        return None
+    return _hardened_trio_grants(parsed)
+
+
+def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:
+    """Replace the DACL of ``path`` with a PROTECTED one naming exactly ``grants``, and its owner with
+    ``owner`` when one is given, in one call; log and return ``False`` on failure. Windows only. A
+    seam for tests.
+
+    One SetNamedSecurityInfoW call rather than icacls, for two measured reasons: icacls cannot drop
+    an unnamed principal's explicit entry while granting, so it takes two calls, and after the first
+    of them a caller whose access was only that entry is refused by the second (exit 5). Setting the
+    whole DACL at once needs only WRITE_DAC, which the owner always holds, and leaves no intermediate
+    state. Setting the owner needs more (an elevated Administrator may name Administrators); when that
+    is refused the DACL alone is still written, and the refusal is logged."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    # Written in the canonical SDDL spelling (lower-case ``0x`` hex); only COMPARISONS upper-case.
+    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS)};;;{sid})" for sid in grants)
+    sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+    ]
+    convert.restype = wintypes.BOOL
+    get_dacl = advapi32.GetSecurityDescriptorDacl
+    get_dacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_dacl.restype = wintypes.BOOL
+    get_owner = advapi32.GetSecurityDescriptorOwner
+    get_owner.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_owner.restype = wintypes.BOOL
+    set_info = advapi32.SetNamedSecurityInfoW
+    set_info.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    set_info.restype = wintypes.DWORD
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    descriptor = ctypes.c_void_p()
+    if not convert(sddl, 1, ctypes.byref(descriptor), None):
+        log.warning(
+            "could not restrict %s: its DACL %s did not convert (Win32 status %s)",
+            path,
+            sddl,
+            ctypes.get_last_error(),
+        )
+        return False
+    try:
+        present, defaulted = wintypes.BOOL(), wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        ok = get_dacl(
+            descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)
+        )
+        # A NULL DACL grants Everyone full control, so it must never reach SetNamedSecurityInfoW.
+        if not ok or not present or not dacl.value:
+            log.warning(
+                "could not restrict %s: no DACL was built (Win32 status %s)",
+                path,
+                ctypes.get_last_error(),
+            )
+            return False
+        se_file_object = 1
+        dacl_info = (
+            0x4 | 0x80000000
+        )  # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        if owner:
+            owner_sid = ctypes.c_void_p()
+            owner_defaulted = wintypes.BOOL()
+            if (
+                get_owner(descriptor, ctypes.byref(owner_sid), ctypes.byref(owner_defaulted))
+                and owner_sid.value
+            ):
+                status = set_info(
+                    str(path), se_file_object, dacl_info | 0x1, owner_sid, None, dacl, None
+                )
+                if status == 0:
+                    return True
+                log.warning(
+                    "could not restrict %s: its owner is outside the hardened directory's principals "
+                    "and could not be changed (Win32 status %s); an owner keeps WRITE_DAC",
+                    path,
+                    status,
+                )
+        status = set_info(str(path), se_file_object, dacl_info, None, None, dacl, None)
+        if status != 0:
+            log.warning(
+                "could not restrict %s to its hardened directory's principals (Win32 status %s)",
+                path,
+                status,
+            )
+            return False
+        return not owner
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
+    """Restrict one file of the SQLite store trio, or a restored store.
+
+    ``dir_grants`` is :func:`_store_dir_grants` of the file's directory. ``None`` -- off Windows, or
+    outside a hardened directory -- is :func:`_secure_file`, owner-only, exactly as before. Otherwise
+    the file gets an explicit, protected DACL naming exactly those principals, which is the same
+    whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
+    one). An owner outside those principals is moved to Administrators where the opener may do that,
+    because an owner could otherwise re-grant itself access. A file already exact is left untouched:
+    the service account holds Modify, not WRITE_DAC, so rewriting a correct DACL it does not own would
+    fail and warn on every start. A file that is itself a link gets the old owner-only rewrite, as
+    before this change. Best-effort, like :func:`_secure_file`: it logs rather than raises."""
+    if dir_grants is None or not _is_windows() or _reaches_through_a_link(path):
+        _secure_file(path)
+        return
+    current = _read_dacl_sddl(path, owner=True)
+    parsed = _parse_sddl_dacl(current) if current is not None else None
+    if parsed is not None and _trio_dacl_is_exact(parsed, dir_grants):
+        return
+    owner_ok = parsed is not None and parsed.owner is not None and parsed.owner in dir_grants
+    new_owner = None if owner_ok else ("BA" if "S-1-5-32-544" in dir_grants else None)
+    _write_trio_dacl(path, dir_grants, owner=new_owner)
 
 
 def _opt_float(value: Any) -> float | None:
@@ -3346,7 +3823,8 @@ CREATE TABLE IF NOT EXISTS users (
     oidc_issuer          TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC issuer; NULL = not federated / never federated-logged-in
     oidc_subject         TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC sub; the account's federated login is pinned to (issuer, sub), refusing a reassigned username
     directory_object_id  TEXT,                 -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID); what an AD login resolves this row by, because sAMAccountName is recyclable. NULL = no directory binding, and an unbound row is never adopted by a login presenting an id
-    password_claimed_at  REAL                  -- BACKLOG #1245: when the holder set their OWN credential via authenticated self-service rotation; NULL = never claimed. Write-once (COALESCE in set_password); an admin reset must neither set nor clear it
+    password_claimed_at  REAL,                 -- BACKLOG #1245: when the holder set their OWN credential via authenticated self-service rotation; NULL = never claimed. Write-once (COALESCE in set_password); an admin reset must neither set nor clear it
+    channel_scope_source TEXT                  -- BACKLOG #1927: who last wrote channel_scope ('ad' or 'manual'). The rule is on UserRecord.channel_scope_source. NO COMMA in this comment: SQLite DROP COLUMN scans back for one
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -3776,13 +4254,18 @@ class MessageStore:
             # completes before anything is serving, so this one is consistency rather than a fix.
             if str(path) != ":memory:":
                 main = Path(path)
+                # ADR 0183 Wave 0b: in a HARDENED data directory each trio file gets the same explicit,
+                # protected DACL naming the directory's principals, so the service account and the
+                # provisioning operator can both open it in either order; elsewhere it is rewritten
+                # owner-only as before. See _secure_store_file.
+                grants = await asyncio.to_thread(_store_dir_grants, main.parent)
                 for f in (
                     main,
                     main.with_name(main.name + "-wal"),
                     main.with_name(main.name + "-shm"),
                 ):
                     if f.exists():
-                        await _secure_file_async(f)
+                        await asyncio.to_thread(_secure_store_file, f, dir_grants=grants)
             store = cls(
                 db,
                 path=path,
@@ -4798,6 +5281,9 @@ class MessageStore:
             # in since the upgrade. No backfill is possible anyway; nothing in the store has ever
             # held the directory's identifier.
             ("directory_object_id", "TEXT"),
+            # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source). No
+            # backfill: nothing recorded which writer set a scope until now.
+            ("channel_scope_source", "TEXT"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -10248,34 +10734,61 @@ class MessageStore:
             await self._commit()
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
         """Set a user's per-channel scope. ``scope_json`` is a JSON list of granted connection names
-        (``'["*"]'`` for every channel), or ``None`` to clear it — which denies (BACKLOG #1152)."""
+        (``'["*"]'`` for every channel), or ``None`` to clear it — which denies (BACKLOG #1152).
+        ``source`` records who wrote it, in the same statement (BACKLOG #1927)."""
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(
-                "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
-                (scope_json, now, user_id),
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
+                (scope_json, source, now, user_id),
             )
             await self._commit()
 
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            cur = await self._db.execute(
+                WITHDRAW_AD_SCOPE_SQL,
+                (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
+            )
+            await self._commit()
+            return int(cur.rowcount) > 0
+
     async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the first
-        federated login so a later login carrying a different ``sub`` for a reassigned username is
-        refused rather than handed the prior subject's account."""
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Written only by the
+        administrative bind since BACKLOG #1143; see :meth:`AuthStore.set_user_federated_subject`."""
         now = time.time() if now is None else now
         # _writer_txn, not a bare lock: ux_users_federated_subject refusing this UPDATE is EXPECTED
         # (the #1256 race loser), and the unwind rolls back the transaction the refusal would
         # otherwise leave open for the next writer's BEGIN to fail on (BACKLOG #1801).
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
-                (issuer, subject, now, user_id),
-            )
+            if expect_unbound:
+                cur = await self._db.execute(
+                    _SET_FEDERATED_IF_UNBOUND_SQL, (issuer, subject, now, user_id)
+                )
+            else:
+                cur = await self._db.execute(_SET_FEDERATED_SQL, (issuer, subject, now, user_id))
             await self._commit()
+            return int(cur.rowcount) > 0
 
     async def clear_user_federated_subject(
         self, user_id: str, *, now: float | None = None
@@ -10350,7 +10863,8 @@ class MessageStore:
 
     async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         """Channels mapped to a user's AD groups (per-channel RBAC C3). May include the sentinel
-        ``'*'`` (all). Empty = no group mapping matched (caller falls back to the per-user scope)."""
+        ``'*'`` (all). Empty = no group mapping matched; the AD login sync then keeps a manual scope
+        and withdraws any other (BACKLOG #1927)."""
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
         if not normalized:
             return set()

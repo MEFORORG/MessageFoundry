@@ -238,6 +238,11 @@ never-clobbering (`if not channels: return user`), so replicating that rule insi
 complicate the breaker's exactness for a narrower residual. Scope still re-syncs on next login —
 a recorded, narrower residual.
 
+*Update, BACKLOG #1927:* the quoted early return is gone. A no-match login now withdraws any stored
+scope that `users.channel_scope_source` does not mark as an administrator's, so login does narrow.
+The reconciler decision above is unchanged: it still does not re-diff scope, so the scope stays in
+place until that user's next login.
+
 ### Directory load
 
 One `resolve_principal` per **distinct signed-in directory user** per pass — a service-account bind
@@ -290,3 +295,14 @@ anyway — does not.
 `GET /security/posture`, with an entry in [docs/SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md). It is
 deliberately conditional — with no directory to reconcile against, `0` is not a weaker choice, it is the
 only meaningful one, so it is not reported as a deviation on a non-AD instance.
+
+## Amendment (2026-09-25) -- a directory login no longer seeds the window (BACKLOG #1144 step 5)
+
+The residual under *Why now* named `_complete_ad_login(seed_reauth=True)`. That parameter is gone:
+every directory login is now born with no step-up window, on both Kerberos routes and the OIDC
+callback. So a fresh directory session no longer carries a login-stamped window into a disable.
+
+The residual shrinks but does not vanish. A window the holder opened by `POST /me/reauth`, or by a
+TOTP or recovery code at the MFA gate, can still run after a directory disable until it lapses
+or mechanism 2 revokes the session, because `require_step_up` still reads only the stored
+timestamp.
