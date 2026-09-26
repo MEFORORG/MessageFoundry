@@ -136,6 +136,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **The OIDC revocation refusal now stops startup before any connection starts, and `verify`
+  reports it.** On an enforcing instance, an off-box OIDC token or JWKS leg with no
+  `[auth].oidc_tls_crl_file` refuses to start. That refusal fired when the API lifespan built the
+  auth service, which was after the engine had started its connections. The lifespan now builds the
+  service before `engine.start()`, so the engine starts nothing. Any other refusal the service's
+  constructor raises moved with it. `verify --section federation` has a new `fed.idp_revocation`
+  row. It runs the engine's own guard and FAILs where the engine would refuse. `messagefoundry
+  check` still does not report it. (`BACKLOG #1923`)
 - **The Python engine client now ends the session a new sign-in replaces.** `EngineClient.login`
   used to overwrite the bearer token it held and never revoke it, so the old session would have
   stayed valid on first deployment until it idled out. It now calls `POST /auth/logout` with the

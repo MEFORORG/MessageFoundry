@@ -785,7 +785,42 @@ _IDP_WAYS_ACROSS = (
 _NO_HOST = "(no host)"
 
 
-def _refuse_idp_revocation(
+def idp_revocation_guards(
+    settings: AuthSettings, opener: urllib.request.OpenerDirector, posture: HopPosture | None
+) -> tuple[RevocationHopGuard, ...]:
+    """Capture the #201 revocation guard for each OIDC leg, token endpoint first (BACKLOG #1887).
+
+    Pure: it decides nothing and logs nothing. :func:`refuse_idp_revocation` enforces what it
+    returns, and ``messagefoundry verify`` reads each guard's
+    :meth:`~messagefoundry.config.tls_policy.RevocationHopGuard.disposition` (BACKLOG #1923), so the
+    report and the engine read one rule rather than two copies of it."""
+    context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
+    legs = (
+        (
+            settings.oidc_token_endpoint,
+            "token endpoint",
+            "the client secret and authorization code",
+        ),
+        (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
+    )
+    return tuple(
+        RevocationHopGuard.capture(
+            # _NO_HOST is reached only by unvalidated settings: the validator refuses a missing URL.
+            host=urllib.parse.urlsplit(url or "").hostname or _NO_HOST,
+            cell=f"[auth] OIDC {leg} (verified TLS, no revocation check)",
+            description=(
+                f"carries {carries} over verified TLS but performs no certificate revocation checking"
+            ),
+            attested=False,
+            context=context,
+            posture=posture,
+            ways_across=_IDP_WAYS_ACROSS,
+        )
+        for url, leg, carries in legs
+    )
+
+
+def refuse_idp_revocation(
     settings: AuthSettings, opener: urllib.request.OpenerDirector, posture: HopPosture | None
 ) -> None:
     """Apply the #201 posture-keyed revocation guard to BOTH OIDC legs (BACKLOG #1887, ADR 0173 §4.3).
@@ -807,32 +842,14 @@ def _refuse_idp_revocation(
     ``attested=False`` because no per-hop revocation attestation exists for these legs. There is no
     ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
 
-    Known limits of this placement (it fires after ``engine.start()``, and ``check``/``verify`` do
-    not reach it) are recorded once, in ADR 0173 AC-4. Two more are recorded only here: when both
-    legs refuse, only the token leg is named, because it is checked first; and the WARN arm logs with
-    no audit sink after ``configure_logging`` has set the root level, so a level above WARNING would
-    likely filter it, as ``logging_setup._refuse_forward_revocation`` measured for its hop."""
-    context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
-    for url, leg, carries in (
-        (
-            settings.oidc_token_endpoint,
-            "token endpoint",
-            "the client secret and authorization code",
-        ),
-        (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
-    ):
-        # _NO_HOST is reached only by unvalidated settings: the validator refuses a missing URL.
-        RevocationHopGuard.capture(
-            host=urllib.parse.urlsplit(url or "").hostname or _NO_HOST,
-            cell=f"[auth] OIDC {leg} (verified TLS, no revocation check)",
-            description=(
-                f"carries {carries} over verified TLS but performs no certificate revocation checking"
-            ),
-            attested=False,
-            context=context,
-            posture=posture,
-            ways_across=_IDP_WAYS_ACROSS,
-        ).enforce_construction()
+    The API lifespan builds ``AuthService`` before ``engine.start()`` (BACKLOG #1923), so this refusal
+    comes before any connection starts. ``messagefoundry check`` still does not reach it; ADR 0173
+    AC-4 records that limit. Two more are recorded only here: when both legs refuse, only the token
+    leg is named, because it is checked first; and the WARN arm logs with no audit sink after
+    ``configure_logging`` has set the root level, so a level above WARNING would likely filter it, as
+    ``logging_setup._refuse_forward_revocation`` measured for its hop."""
+    for guard in idp_revocation_guards(settings, opener, posture):
+        guard.enforce_construction()
 
 
 class AuthService:
@@ -1004,7 +1021,7 @@ class AuthService:
                 crl_file=settings.oidc_tls_crl_file,
             )
             # BACKLOG #1887: must follow the opener, whose finished context it reads.
-            _refuse_idp_revocation(settings, self._oidc_opener, hop_posture)
+            refuse_idp_revocation(settings, self._oidc_opener, hop_posture)
             self._oidc_jwks = oidc.JwksCache(
                 jwks_fetcher(settings.oidc_jwks_uri or "", self._oidc_opener),
                 ttl_seconds=settings.oidc_jwks_ttl_seconds,

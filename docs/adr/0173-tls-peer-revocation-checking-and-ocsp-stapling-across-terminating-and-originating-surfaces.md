@@ -223,7 +223,7 @@ false-premise defect:
    `email.py:239`, and `store/postgres.py:745` via `_refuse_store_revocation` (`:763`).
    **Nine sites since BACKLOG #1498 (2026-09-22), not seven** — `transports/smart.py` (the SMART
    token endpoint) and `logging_setup.py:_refuse_forward_revocation` (the syslog forwarder) joined
-   under §4.3. `auth/service.py:_refuse_idp_revocation` (the OIDC token and JWKS legs, two guards)
+   under §4.3. `auth/service.py:refuse_idp_revocation` (the OIDC token and JWKS legs, two guards)
    joined under BACKLOG #1887 (2026-09-23). Read the list as *"at least these"* and locate each by symbol: these line numbers were
    written in August and the §4.3 build moved several of them.
 2. **Terminating `[api]` TLS — `in_process_tls_revocation_refused`** (`config/tls_policy.py:344`),
@@ -500,6 +500,21 @@ Do not restate it as one. §6 names what would flip it.
   would-refuse. On a first deployment an enforcing instance with an off-box IdP and no CRL would
   therefore start the engine and then stop. Moving the check into the lifespan's pre-listener
   preflight, or into `verify`, is not done here.
+
+  **TWO OF THOSE LIMITS WERE CLOSED ON 2026-09-26 UNDER BACKLOG #1923. THE PARAGRAPH ABOVE IS KEPT
+  AS THE RECORD OF THE GAP.** The API lifespan now constructs `AuthService` before `engine.start()`,
+  so the refusal comes before any connection starts. Only the construction moved. `initialize()`
+  and everything else that uses the service still run after the start. Any other refusal the
+  constructor raises moved with it, such as a client secret that does not resolve. `messagefoundry
+  verify --section federation` now carries a `fed.idp_revocation` row. It captures the engine's own
+  guards through `auth/service.py:idp_revocation_guards`, split out of `_refuse_idp_revocation`,
+  which is now the public `refuse_idp_revocation`. It uses the context `fed.idp_tls` built and the
+  posture `serve` derives. The row reads each guard's decision and FAILs where the engine would
+  refuse. `messagefoundry check` still does not build the service, so it still does not report a
+  would-refuse. Pinned by
+  `tests/test_hop_refusal_revocation.py::test_the_lifespan_refuses_the_oidc_legs_before_engine_start`,
+  with `::test_the_lifespan_reaches_engine_start_when_the_oidc_legs_cross` as its control, and by
+  the `fed.idp_revocation` arms in `tests/test_verify_federation.py`.
 - **AC-5** — THE SYSTEM SHALL NOT assert in code, docstring, error text or documentation that it
   performs certificate revocation checking on either graded direction, and any prose naming the
   shipped client-certificate CRL SHALL state that it is the peer's certificate on a terminating

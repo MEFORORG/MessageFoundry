@@ -26,12 +26,15 @@ hop — the two gates key on disjoint conditions and never double-refuse one hop
 from __future__ import annotations
 
 import ssl
+from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 
+from messagefoundry.api import create_managed_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import AiSettings, AuthSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
     HopDisposition,
@@ -47,6 +50,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.logging_setup import SyslogForward, _build_tls_context
+from messagefoundry.pipeline.engine import Engine
 from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination
@@ -1115,6 +1119,19 @@ def test_the_verifying_forwarder_context_asserts_strict_path_validation(crl_bund
 # no posture must all construct.
 
 
+def _oidc_leg_settings(*, token_host: str, jwks_host: str, **over: object) -> AuthSettings:
+    """OIDC settings with each leg on its own host. Shared by the guard arms and the lifespan arms,
+    so both describe the same two legs."""
+    return _oidc_settings(
+        oidc_issuer=f"https://{REMOTE}",
+        oidc_authorization_endpoint=f"https://{REMOTE}/authorize",
+        oidc_token_endpoint=f"https://{token_host}:8443/token",
+        oidc_jwks_uri=f"https://{jwks_host}:8443/jwks",
+        oidc_allowed_endpoints=[REMOTE, LOOPBACK],
+        **over,
+    )
+
+
 async def _oidc_service(
     *,
     token_host: str = REMOTE,
@@ -1128,14 +1145,7 @@ async def _oidc_service(
     earlier construction check can stand in for their verdict. The opener opens no socket, so an
     unreachable host is fine here. The directory is the OIDC suite's fake: a real LdapAuthenticator
     would bring its own LDAPS hop into these arms, a second guard that could fire in place of these."""
-    settings = _oidc_settings(
-        oidc_issuer=f"https://{REMOTE}",
-        oidc_authorization_endpoint=f"https://{REMOTE}/authorize",
-        oidc_token_endpoint=f"https://{token_host}:8443/token",
-        oidc_jwks_uri=f"https://{jwks_host}:8443/jwks",
-        oidc_allowed_endpoints=[REMOTE, LOOPBACK],
-        **over,
-    )
+    settings = _oidc_leg_settings(token_host=token_host, jwks_host=jwks_host, **over)
     store = await MessageStore.open(":memory:")
     try:
         return AuthService(store, settings, ldap=_FakeLdap(), hop_posture=posture)  # type: ignore[arg-type]
@@ -1257,6 +1267,71 @@ async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> 
             AuthService(store, settings, ldap=_FakeLdap(), hop_posture=PROD_PHI)  # type: ignore[arg-type]
     finally:
         await store.close()
+
+
+def _oidc_managed_app(tmp_path: Path, *, host: str) -> FastAPI:
+    """A serve-shaped managed app with OIDC on and both legs on ``host``. ``ai_settings`` is what
+    makes the lifespan derive a posture at all, and the default enforcement is enforce. The AD
+    server is on loopback so the directory's own hop cannot be the thing that refuses."""
+    settings = _oidc_leg_settings(
+        token_host=host, jwks_host=host, enabled=True, ad_server=f"ldaps://{LOOPBACK}"
+    )
+    return create_managed_app(
+        db_path=tmp_path / "oidc1923.db",
+        poll_interval=0.05,
+        auth_settings=settings,
+        ai_settings=AiSettings(),
+        public_origin="https://ops.example",
+    )
+
+
+def _record_engine_start(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace ``Engine.start`` with a probe that records the call and then fails startup, and wrap
+    ``Engine.stop`` to record it. Failing is what lets the control arm stop before any connection
+    or listener, while still proving that the lifespan reached the start."""
+    calls: list[str] = []
+    real_stop = Engine.stop
+
+    async def _probe(self: Engine) -> None:
+        calls.append("engine.start")
+        raise RuntimeError("PROBE: engine.start reached")
+
+    async def _stop(self: Engine) -> None:
+        # Recorded, then the real stop, which closes the store (the #1257 teardown).
+        calls.append("engine.stop")
+        await real_stop(self)
+
+    monkeypatch.setattr(Engine, "start", _probe)
+    monkeypatch.setattr(Engine, "stop", _stop)
+    return calls
+
+
+async def test_the_lifespan_refuses_the_oidc_legs_before_engine_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1923. The refusal used to fire when the lifespan built AuthService, AFTER
+    ``engine.start()`` had started every connection. It must now come first."""
+    calls = _record_engine_start(monkeypatch)
+    app = _oidc_managed_app(tmp_path, host=REMOTE)
+    with pytest.raises(InsecureHopRefused, match="OIDC token endpoint"):
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover -- startup must not reach here
+    # Never started, and still torn down: the refusal now fires on a path inside the teardown's
+    # span that no earlier test reached with auth on, and a skipped stop leaves the store open.
+    assert calls == ["engine.stop"]
+
+
+async def test_the_lifespan_reaches_engine_start_when_the_oidc_legs_cross(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE CONTROL for the arm above. Same app with both legs on loopback, so the guard lets them
+    cross. The probe must fire here, or the empty list above proves nothing about the ordering."""
+    calls = _record_engine_start(monkeypatch)
+    app = _oidc_managed_app(tmp_path, host=LOOPBACK)
+    with pytest.raises(RuntimeError, match="PROBE: engine.start reached"):
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover -- the probe fails startup
+    assert calls == ["engine.start", "engine.stop"]
 
 
 async def test_the_oidc_refusal_names_a_lever_that_exists_for_it() -> None:

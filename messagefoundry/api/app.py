@@ -7428,6 +7428,45 @@ def create_managed_app(
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
         try:
+            # BACKLOG #1923: CONSTRUCTED before engine.start(), so a refusal its constructor raises
+            # (the OIDC revocation guard, #1887) stops startup before any connection starts. Only
+            # construction is here; initialize() and every use of the service stay below the start.
+            auth: AuthService | None = None
+            if auth_settings is not None and auth_settings.enabled:
+                # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
+                # transport, sent to each affected user's own address. The notifier is wired only when the
+                # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
+                # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
+                # fabricate a transport — then nothing is emailed; auth/notifications.py states which
+                # events the audited /me/security-events pull feed still shows.
+                # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
+                # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
+                # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
+                # conditions — not here. This task is owned by the lifespan (started here, drained + closed
+                # after the engine in the finally below).
+                if auth_settings.notify_security_events and alerts_settings is not None:
+                    security_notifier = security_notifier_from_settings(
+                        alerts_settings,
+                        secret_provider=secret_provider,
+                        trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                    )
+                    if security_notifier is not None:
+                        security_notifier.start()
+                auth = AuthService(
+                    store,
+                    auth_settings,
+                    security_notifier=security_notifier,
+                    secret_provider=secret_provider,
+                    # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
+                    # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
+                    # central run_anchor_preflight above) rather than refusing at enforce-only. Central
+                    # preflight already ran before any listener bound; this keeps the seam consistent.
+                    enforcing=trust_anchors_enforcing,
+                    # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
+                    # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
+                    # connector-construction gate, so the clamp is inert unless the posture arrives here).
+                    hop_posture=_hop_posture,
+                )
             await engine.start()
             # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
             # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
@@ -7521,41 +7560,8 @@ def create_managed_app(
             # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
-            if auth_settings is not None and auth_settings.enabled:
-                # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
-                # transport, sent to each affected user's own address. The notifier is wired only when the
-                # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
-                # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
-                # fabricate a transport — then nothing is emailed; auth/notifications.py states which
-                # events the audited /me/security-events pull feed still shows.
-                # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
-                # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
-                # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
-                # conditions — not here. This task is owned by the lifespan (started here, drained + closed
-                # after the engine in the finally below).
-                if auth_settings.notify_security_events and alerts_settings is not None:
-                    security_notifier = security_notifier_from_settings(
-                        alerts_settings,
-                        secret_provider=secret_provider,
-                        trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                    )
-                    if security_notifier is not None:
-                        security_notifier.start()
-                auth = AuthService(
-                    store,
-                    auth_settings,
-                    security_notifier=security_notifier,
-                    secret_provider=secret_provider,
-                    # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
-                    # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
-                    # central run_anchor_preflight above) rather than refusing at enforce-only. Central
-                    # preflight already ran before any listener bound; this keeps the seam consistent.
-                    enforcing=trust_anchors_enforcing,
-                    # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
-                    # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
-                    # connector-construction gate, so the clamp is inert unless the posture arrives here).
-                    hop_posture=_hop_posture,
-                )
+            # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
+            if auth is not None and auth_settings is not None:
                 await auth.initialize()
                 app.state.auth = auth
                 await _assert_security_notice_is_deliverable(
