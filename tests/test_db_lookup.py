@@ -409,8 +409,8 @@ def test_dry_run_raises_when_handler_calls_db_lookup() -> None:
 # --- S12 audit anchors (ADDED-4): HL7-as-untrusted-input at db_lookup ----------
 # The S12 audit verdict for the db_lookup boundary is CONFORMING (PHI-2/REL-2/NET-2/PROC-1). These pin
 # the load-bearing invariants. NOTE — *parameterization* keeps a hostile VALUE from injecting a write.
-# Read-only for the STATEMENT itself rests on the privilege of the account the lookup dials; the
-# `_require_read_only` statement gate and ApplicationIntent=ReadOnly are defence in depth only, and the
+# Read-only for the STATEMENT itself rests on the privilege of the account the lookup dials. The
+# `_require_read_only` statement gate and ApplicationIntent=ReadOnly are defence in depth only. The
 # autocommit pool adds no read-only property (BACKLOG #1574, #1791; docs/CONNECTIONS.md). A Handler
 # AUTHOR's literal statement is the author's contract, not an attacker-influenceable path. See the
 # audit memo + backlog note S12-1.

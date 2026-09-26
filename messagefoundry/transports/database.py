@@ -657,8 +657,8 @@ def _scan_sql_tokens(statement: str) -> list[tuple[str, str]]:
 
 
 def _require_read_only(statement: str) -> None:
-    """Test a db_lookup statement's shape for the ADR 0010 read-only carve-out. Defense-in-depth only,
-    with ``ApplicationIntent=ReadOnly``; the control is a read-only login (``docs/CONNECTIONS.md``).
+    """Test a db_lookup statement's shape for the ADR 0010 read-only carve-out. Defence in depth only,
+    like ``ApplicationIntent=ReadOnly``. A read-only login is the control (``docs/CONNECTIONS.md``).
 
     The statement is tokenized (:func:`_scan_sql_tokens`), so comments, string literals and quoted
     identifiers are skipped, and then three rules apply:
@@ -1643,9 +1643,9 @@ class DatabaseLookupExecutor:
             raise DbLookupError(
                 f"db_lookup: no DatabaseLookup connection named {connection!r} (declared: {known})"
             )
-        # ADR 0010: run the statement-layer read-only test before anything executes, so a
-        # write/EXEC the test recognises never reaches the autocommit pool (which would silently
-        # commit and re-apply on a crash-replay of the transform). PHI-free — never echoes the
+        # ADR 0010: run the statement-layer read-only test before anything executes. A write/EXEC
+        # the test recognises then never reaches the autocommit pool. That pool would silently
+        # commit it and re-apply it on a crash-replay of the transform. PHI-free — never echoes the
         # statement.
         _require_read_only(statement)
         sql, names = _parse_named_params(statement)

@@ -96,11 +96,11 @@ Add a synchronous, handler-callable `db_lookup(connection, statement, params)` r
 
   > **CORRECTION 2026-09-25 (BACKLOG #1791). "the executor neither commits nor exposes a write path" is
   > false.** The sentence above is kept as authored, because it records what was believed.
-  > `DatabaseLookupExecutor` opens its pool with `autocommit=True`. A write that got past the statement
-  > gate would therefore commit. A crash-replay of the transform would then apply it again. The
-  > executor has no write method, yet it runs whatever statement the gate admits.
+  > `DatabaseLookupExecutor` opens each lookup pool with `autocommit=True`. A write that got past the
+  > statement gate would therefore commit. A crash-replay of the transform would then apply it again.
+  > The executor has no write method, yet it runs whatever statement the gate admits.
   >
-  > The privilege of the account the lookup dials is what bounds it, and only the operator can set
-  > it. The `_require_read_only` statement gate and `ApplicationIntent=ReadOnly` are defence in depth
-  > only. The statement of record, with what each layer can and cannot do, is
+  > What bounds a lookup is the privilege of the account it dials. The engine cannot set that
+  > privilege; the account is provisioned outside it. The `_require_read_only` statement gate and
+  > `ApplicationIntent=ReadOnly` are defence in depth only. The statement of record, with what each layer can and cannot do, is
   > [`docs/CONNECTIONS.md`](../CONNECTIONS.md#give-db_lookup-a-read-only-login).
