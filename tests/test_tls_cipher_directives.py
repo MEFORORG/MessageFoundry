@@ -75,11 +75,20 @@ def _stock_level(protocol: ssl._SSLMethod) -> int:
 # --- the validator: every '@' token is refused, on both call shapes -------------------------------
 
 
-def test_the_build_default_is_level_two() -> None:
-    """The premise the handshake tests lean on: level 2 refuses an RSA-1024 key and level 1 would
-    not. The other tests compare against the stock level, so they hold on any build."""
-    assert _stock_level(ssl.PROTOCOL_TLS_SERVER) == 2
-    assert _stock_level(ssl.PROTOCOL_TLS_CLIENT) == 2
+#: The handshake tests need a stock level of at least 2, where an RSA-1024 key is refused. On a
+#: build whose default is lower they skip and say why, rather than report a product regression.
+needs_level_two = pytest.mark.skipif(
+    _stock_level(ssl.PROTOCOL_TLS_CLIENT) < 2,
+    reason=f"this build's stock security level is {_stock_level(ssl.PROTOCOL_TLS_CLIENT)}, below 2",
+)
+
+
+@needs_level_two
+def test_the_build_default_is_at_least_level_two() -> None:
+    """The premise the handshake tests lean on. The other tests compare against the stock
+    level, so they hold on any build."""
+    assert _stock_level(ssl.PROTOCOL_TLS_SERVER) >= 2
+    assert _stock_level(ssl.PROTOCOL_TLS_CLIENT) >= 2
 
 
 @pytest.mark.parametrize("value", DIRECTIVE_FORMS)
@@ -90,10 +99,13 @@ def test_every_directive_form_parses_on_this_build(value: str) -> None:
 
 
 def test_a_directive_with_no_separator_still_lowers_the_level() -> None:
-    """Why the check looks for ``@`` anywhere in a token, not only at its start."""
+    """Why the check looks for ``@`` anywhere in a token, not only at its start. The refusal
+    names the directive alone, so following it does not delete the suite in front."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.set_ciphers(f"{ECDSA_SUITE}@SECLEVEL=0")
     assert ctx.security_level == 0
+    with pytest.raises(ValueError, match=r"directive\(s\) @SECLEVEL=0\. "):
+        validate_tls_ciphers(f"{ECDSA_SUITE}@SECLEVEL=0")
 
 
 @pytest.mark.parametrize("require_approved", [True, False])
@@ -122,7 +134,7 @@ def test_the_refusal_tells_the_operator_what_to_do() -> None:
     message = str(excinfo.value)
     assert "@SECLEVEL=0" in message, "names the directive"
     assert "RSA-1024" in message, "says why it is refused"
-    assert "Remove" in message, "says what to do instead"
+    assert "Remove each directive" in message, "says what to do instead"
 
 
 def test_the_proxy_declaration_refuses_a_directive() -> None:
@@ -304,6 +316,7 @@ def _handshake(client_ctx: ssl.SSLContext, server_ctx: ssl.SSLContext) -> None:
     raise AssertionError("the in-memory handshake did not finish")
 
 
+@needs_level_two
 def test_control_a_stock_client_at_level_zero_accepts_an_rsa_1024_server(tmp_path: Path) -> None:
     """The harm, shown to exist on this build. Without this, the refusals below could be passing
     because the handshake fails for some other reason."""
@@ -313,6 +326,7 @@ def test_control_a_stock_client_at_level_zero_accepts_an_rsa_1024_server(tmp_pat
     _handshake(client, server)
 
 
+@needs_level_two
 def test_a_client_built_from_operator_input_refuses_an_rsa_1024_server(tmp_path: Path) -> None:
     server, pem = _rsa_1024_server(tmp_path)
     client = _client_trusting(pem)
@@ -322,6 +336,7 @@ def test_a_client_built_from_operator_input_refuses_an_rsa_1024_server(tmp_path:
         _handshake(client, server)
 
 
+@needs_level_two
 def test_operator_input_cannot_build_the_level_zero_client(tmp_path: Path) -> None:
     """The row's reproduction, closed: the string that lowered the level is refused before it
     reaches a context, so the client keeps refusing the key."""

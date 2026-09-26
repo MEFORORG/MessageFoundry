@@ -529,7 +529,10 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     peer-authenticating and rated at :data:`_MIN_TLS_STRENGTH_BITS` or above. Raises ``ValueError`` —
     surfaced as a config-load error — for an unparseable string or one failing any of those, closing
     the 11.6.2 gap that a misconfigured ``tls_ciphers`` could widen the key exchange below policy and
-    the 11.2.3 gap that it could drop the negotiated strength below 128 bits."""
+    the 11.2.3 gap that it could drop the negotiated strength below 128 bits.
+
+    It also refuses any OpenSSL ``@`` directive, on both call shapes, sound or not (BACKLOG #2106).
+    A directive names no suite, so none of the checks above can grade it."""
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
         probe.set_ciphers(value)
@@ -580,8 +583,7 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
             f"{', '.join(directives)}. A directive changes how OpenSSL applies the list, not which "
             "suites it holds, so the checks here cannot see it, and @SECLEVEL=0 lets a peer present "
             "an RSA-1024 certificate that the default security level refuses (BACKLOG #2106). "
-            "Remove every '@' token and list the suite names only; the context then keeps the "
-            "security level of this OpenSSL build."
+            "Remove each directive and list the suite names only."
         )
     if not require_approved_suites:
         return value
@@ -631,6 +633,9 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
 
     Raises :class:`ValueError` at construction — the same class the surrounding TLS config errors use,
     so it surfaces at ``check`` / dry-run / ``serve`` rather than as a wire-time surprise.
+
+    It also refuses a context below the stock OpenSSL security level, through
+    :func:`refuse_lowered_security_level` (BACKLOG #2106), on every caller.
     """
     resolved = ctx.get_ciphers()
     non_fs = sorted({str(c.get("name", "?")) for c in resolved if not _is_forward_secret(c)})
@@ -799,11 +804,12 @@ def _cipher_directives(value: str) -> list[str]:
 
     OpenSSL separates tokens with ``:``, ``,``, ``;`` or a space, and it ALSO starts a directive at an
     ``@`` with no separator: ``ECDHE-ECDSA-AES256-GCM-SHA384@SECLEVEL=0`` sets level 0, measured on
-    OpenSSL 3.5.7. So a token counts if it holds ``@`` anywhere, never only if it starts with one.
-    No suite or alias name holds ``@``."""
+    OpenSSL 3.5.7. So a token counts if it holds ``@`` anywhere, never only if it starts with one,
+    and the part from its first ``@`` is reported, so the suite in front is not named as the
+    directive. No suite or alias name holds ``@``."""
     for sep in ",; ":
         value = value.replace(sep, ":")
-    return [token for token in value.split(":") if "@" in token]
+    return ["@" + token.split("@", 1)[1] for token in value.split(":") if "@" in token]
 
 
 #: The security level OpenSSL gives a new context, per side, read once at import (BACKLOG #2106).
@@ -829,8 +835,8 @@ def refuse_lowered_security_level(ctx: ssl.SSLContext, *, connector: str) -> Non
         raise ValueError(
             f"{connector}: the TLS context runs at OpenSSL security level {ctx.security_level}, "
             f"below the level {floor} this build sets (BACKLOG #2106). A lower level accepts weaker "
-            "peer keys, such as an RSA-1024 certificate. Remove any @SECLEVEL directive from "
-            "tls_ciphers."
+            "peer keys, such as an RSA-1024 certificate. Something applied to this context lowered "
+            "it, such as an @SECLEVEL directive in a cipher string."
         )
 
 

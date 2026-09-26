@@ -223,6 +223,8 @@ def test_a_suite_the_shared_policy_refuses_is_refused_here(
     with pytest.raises(ValueError, match=re.escape(seam)) as excinfo:
         _build(seam, tmp_path, spec)
     assert "tls_ciphers" in str(excinfo.value), f"{seam}: refusal does not name the setting ({why})"
+    # The validator's own wrapper, so a row cannot pass on a later guard's message (BACKLOG #2106).
+    assert "tls_ciphers rejected" in str(excinfo.value), f"{seam}: not the validator ({why})"
 
 
 def test_the_refusal_is_the_shared_validator_and_not_a_second_copy(

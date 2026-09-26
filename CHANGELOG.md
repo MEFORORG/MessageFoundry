@@ -444,9 +444,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   no suite. Applied, it dropped the security level from 2 to 0. An MLLP or DICOM destination then
   accepted a server certificate with an RSA-1024 key, and a listener with mTLS accepted a client
   certificate with one. `proxy_tls_ciphers` builds no context; it is refused so a declared proxy
-  floor cannot claim level 0. To fix a refused config, remove every `@` token and list the suite
-  names only. Each TLS context the engine builds is also checked once built, and refused if it runs
-  below the build's default security level. ([BACKLOG #2106](docs/BACKLOG.md))
+  floor cannot claim level 0. To fix a refused config, remove each directive and list the suite
+  names only. Every context that `harden_cipher_suites` checks is now also refused if it runs below
+  the build's default security level. That is at least the API listener and the four MLLP and DICOM
+  seams. The startup TLS floor probe is not among them; it sets level 0 on purpose and carries no
+  data. ([BACKLOG #2106](docs/BACKLOG.md))
 - **BREAKING: a federated link on an account with no directory id no longer signs anyone in.** The
   link-time refusal further down this section (`BACKLOG #1143` slice C) stops new links on such an
   account. This closes the ones made before it.
