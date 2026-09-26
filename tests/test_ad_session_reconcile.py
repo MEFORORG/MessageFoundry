@@ -801,7 +801,7 @@ async def test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name() -> Non
         skipped = [
             json.loads(a["detail"])
             for a in await store.list_audit()
-            if a["action"] == "auth.ad_reconcile_skipped"
+            if a["action"] == "auth.ad_reconcile_binding_unkeyed"
         ]
         assert skipped == [
             {"reason": "directory_object_id_missing", "user_id": legacy.id, "username": "legacy"}
@@ -836,9 +836,52 @@ async def test_a_pass_whose_only_candidate_is_a_bound_id_less_row_is_not_an_outa
         details = [
             json.loads(a["detail"])
             for a in await store.list_audit()
-            if a["action"] == "auth.ad_reconcile_skipped"
+            if a["action"] == "auth.ad_reconcile_binding_unkeyed"
         ]
         assert [d["reason"] for d in details] == ["directory_object_id_missing"]
+        assert not any(a["action"] == "auth.ad_reconcile_skipped" for a in await store.list_audit())
+    finally:
+        await store.close()
+
+
+async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins() -> None:
+    """The once-per-process mark survives a gap with no session, and ends with the binding.
+
+    A mark kept only for signed-in rows would drop whenever the sessions lapse, and the account
+    would be reported again on its next sign-in. After the unbind the row is ordinary again, so its
+    mark goes, and the pass probes it by name like any unbound id-less row.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"legacy": replace(_principal("legacy"), directory_object_id=None)})
+        settings = _ad_settings(oidc_issuer="https://idp.test.invalid")
+        service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "legacy")
+        legacy = await store.get_user_by_username("legacy")
+        assert legacy is not None
+        assert await store.set_user_federated_subject(
+            legacy.id, "https://idp.test.invalid", "S-1-legacy"
+        )
+
+        async def reported() -> int:
+            return sum(
+                a["action"] == "auth.ad_reconcile_binding_unkeyed" for a in await store.list_audit()
+            )
+
+        await service.reconcile_directory_sessions()
+        await store.revoke_user_sessions(legacy.id)
+        await service.reconcile_directory_sessions()  # no session: not a candidate at all
+        await _signed_in_ad_user(service, store, "legacy")
+        await service.reconcile_directory_sessions()
+        assert await reported() == 1, "the account was reported again after a sign-in"
+
+        await service.unbind_federated_subject(legacy.id, actor="admin")
+        await _signed_in_ad_user(service, store, "legacy")
+        ldap.probe_keys.clear()
+        await service.reconcile_directory_sessions()
+        assert ldap.probe_keys == [("username", "legacy")]
+        assert await reported() == 1
     finally:
         await store.close()
 

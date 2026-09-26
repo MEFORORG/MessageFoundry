@@ -67,10 +67,15 @@
   exists outside a test.
 - **Slice C remainder BUILT 2026-09-26 (BACKLOG #2027). The paragraph above, "What holds for a
   binding made before slice C: nothing new", no longer describes the code; it is kept as the record
-  of slice C.** A binding on an id-less row is now never re-resolved by name. `authenticate_oidc`
-  refuses a pair that selects such a row as `directory_object_id_missing`, before the directory is
-  consulted, and leaves the binding in place. `reconcile_directory_sessions` skips the row, and
-  audits `auth.ad_reconcile_skipped` with that reason once per account per process. The lock-out
+  of slice C.** The federated login and the reconciler no longer re-resolve a binding on an id-less
+  row by name. `authenticate_oidc` refuses a pair that selects such a row as
+  `directory_object_id_missing`, before the directory is consulted, and leaves the binding in place.
+  That holds whatever the directory returns, so on a directory that now returns `objectGUID` the
+  federated refusal is this one and no longer `directory_identity_conflict`; a Windows SSO sign-in
+  there is still refused as `directory_identity_conflict`. `reconcile_directory_sessions` skips the
+  row, and audits `auth.ad_reconcile_binding_unkeyed` with that reason once per account per process.
+  A Windows SSO sign-in still finds an id-less row by its name, bound or not, as BACKLOG #1471 leaves
+  every id-less row on such a directory. The lock-out
   slice C avoided falls on nobody, under section 0. **The cost:** AC-5's second clause cannot hold
   for such a row, since it has no id to probe by, so a directory disable or demotion reaches its
   sessions only at their expiry. The remedy is the unbind, after which the row is an ordinary id-less

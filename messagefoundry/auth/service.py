@@ -529,12 +529,13 @@ class DirectoryObjectIdMissing(ValueError):
 
     **WHAT THE REFUSAL MAKES HOLD, AND WHAT IT DOES NOT.** Every binding the administrative bind
     writes sits on a row carrying an id, and the id is written at the row's creation and never
-    cleared, so both re-resolves above ask by the id for it. It does not reach two things: a direct
-    ``set_user_federated_subject`` call, which checks no id, and whose one caller is the bind; and
-    the step-up re-proof, which binds by name. A binding already on an id-less row, written before
-    this refusal existed or planted through that setter, is no longer re-resolved by name either
-    (BACKLOG #2027): the federated login refuses it with this same reason, and the reconciler
-    skips it (``_holds_unkeyed_federated_binding``).
+    cleared, so both re-resolves above ask by the id for it. It does not reach at least these: a
+    direct ``set_user_federated_subject`` call, which checks no id, and whose one caller is the
+    bind; the step-up re-proof, which binds by name; and a Windows SSO sign-in, which finds an
+    id-less row by its name whether or not the row is bound. For a binding already on an id-less
+    row, written before this refusal existed or planted through that setter, the two re-resolves
+    above no longer ask by name (BACKLOG #2027): the federated login refuses it with this same
+    reason, and the reconciler skips it (``_holds_unkeyed_federated_binding``).
     **The cost:** on a directory that returns no readable ``objectGUID``, no account can be bound.
     """
 
@@ -2653,12 +2654,19 @@ class AuthService:
         candidates: list[tuple[str, str]] = []
         users: dict[str, UserRecord] = {}
         unkeyed: list[UserRecord] = []
+        still_unkeyed: set[str] = set()
         for user in await self._store.list_users():
             if user.auth_provider != AuthProvider.AD.value or user.disabled:
                 continue
+            is_unkeyed = _holds_unkeyed_federated_binding(user)
+            if is_unkeyed:
+                # Recorded BEFORE the session filter, so an account whose sessions lapse between
+                # passes keeps its "already reported" mark and is not reported again on its next
+                # sign-in.
+                still_unkeyed.add(user.id)
             if not await self._store.list_sessions(user.id):
                 continue
-            if _holds_unkeyed_federated_binding(user):
+            if is_unkeyed:
                 # BACKLOG #2027 (ADR 0184 AC-5): never probed by name. Filtered HERE rather than
                 # answered as UNAVAILABLE by the probe, so it neither inflates the pass's
                 # "directory unreachable" count nor, as a pass's only candidate, reads as an outage.
@@ -2666,7 +2674,7 @@ class AuthService:
                 continue
             candidates.append((user.id, user.username))
             users[user.id] = user
-        await self._report_unkeyed_bindings(unkeyed)
+        await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
         reconcile.prune_ledger(self._reconcile_strikes, users)
         reconcile.prune_ledger(self._reconcile_last_probed, users)
         if not candidates:
@@ -2921,9 +2929,17 @@ class AuthService:
             client=client,
         )
 
-    async def _report_unkeyed_bindings(self, unkeyed: Sequence[UserRecord]) -> None:
+    async def _report_unkeyed_bindings(
+        self, unkeyed: Sequence[UserRecord], *, still_unkeyed: set[str]
+    ) -> None:
         """Log and audit, once per account per process, each bound id-less row a pass skipped
-        (BACKLOG #2027).
+        (BACKLOG #2027). ``still_unkeyed`` is every such row, signed in or not; a mark is dropped
+        only when its row stops being one (unbound, disabled or removed).
+
+        **Its own audit action, ``auth.ad_reconcile_binding_unkeyed``, not the outage row.**
+        ``auth.ad_reconcile_skipped`` means the directory was unreachable and the accounts are fine.
+        This row means one account's directory disable will not be enforced, which is the opposite
+        reading, so a rule filing the outage row as benign must not also file this one.
 
         **THE SKIP HAS A COST, AND THIS IS WHERE IT IS MADE VISIBLE.** ADR 0184 AC-5 forbids a name
         probe of a bound row, and this row has no other key, so a directory disable or demotion no
@@ -2936,21 +2952,20 @@ class AuthService:
         The row is left bound on purpose. Clearing a binding is an administrator's audited act,
         and this loop has no administrator behind it.
         """
-        current = {user.id for user in unkeyed}
-        self._reconcile_unkeyed_reported &= current
+        self._reconcile_unkeyed_reported &= still_unkeyed
         for user in unkeyed:
             if user.id in self._reconcile_unkeyed_reported:
                 continue
-            self._reconcile_unkeyed_reported.add(user.id)
             _log.warning(
                 "directory reconcile: %s carries a federated binding but no directory object id, "
                 "so it is not probed by name and a directory disable will not end its sessions "
-                "before they expire. Unbind it (DELETE /users/{user_id}/federated-identity) to "
-                "return it to the reconciler.",
+                "before they expire. Unbind it (DELETE /users/%s/federated-identity) to return it "
+                "to the reconciler.",
                 user.username,
+                user.id,
             )
             await self._audit(
-                "auth.ad_reconcile_skipped",
+                "auth.ad_reconcile_binding_unkeyed",
                 actor="<reconciler>",
                 detail=_json(
                     {
@@ -2960,6 +2975,8 @@ class AuthService:
                     }
                 ),
             )
+            # Marked only once the audit row is written, so a failed write is retried next pass.
+            self._reconcile_unkeyed_reported.add(user.id)
 
     async def _abort_reconcile_pass(self, plan: reconcile.ReconcilePlan) -> None:
         """Record an aborted pass. Applies NOTHING — the point of the abort."""
