@@ -74,7 +74,7 @@ async def test_the_v032_search_presets_table_is_refused(tmp_path: Path) -> None:
     ) in text
     # The remedy leads, because the paths that print an uncaught error cut it at about 200 chars.
     assert text.startswith(
-        f"store {db} was created by an incompatible version and must be recreated"
+        f"store {db} is from an incompatible version; recreate it: move the file"
     )
     assert isinstance(info.value, sqlite3.DatabaseError)  # so the CLI reports it and exits 2
     # Only search_presets differs from what this version builds, so nothing else is named.
@@ -130,6 +130,54 @@ async def test_an_integer_primary_key_that_lost_its_row_id_is_refused(tmp_path: 
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     assert "table 'connection_event' column 'id' is not its INTEGER PRIMARY KEY" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        pytest.param("id INTEGER PRIMARY KEY DESC, {rest}) ", id="desc-key"),
+        pytest.param("id INTEGER PRIMARY KEY, {rest}) WITHOUT ROWID", id="without-rowid"),
+    ],
+)
+async def test_an_integer_key_that_is_not_the_row_id_is_refused(tmp_path: Path, ddl: str) -> None:
+    # Both spellings declare `id INTEGER PRIMARY KEY` and neither makes it the row id: SQLite gives
+    # each an ordinary column plus a key index, so an insert that omits `id` stores NULL or fails.
+    db = tmp_path / "notrowid.db"
+    await _fresh(db)
+    conn = sqlite3.connect(db)
+    try:
+        rest = ", ".join(
+            f"{r[1]} {r[2]}"
+            for r in conn.execute("PRAGMA table_info(connection_event)")
+            if r[1] != "id"
+        )
+    finally:
+        conn.close()
+    _sql(
+        db,
+        f"DROP TABLE connection_event; CREATE TABLE connection_event ({ddl.format(rest=rest)};",
+    )
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db)
+    assert "table 'connection_event' column 'id' is not its INTEGER PRIMARY KEY" in str(info.value)
+
+
+async def test_a_without_rowid_key_index_is_part_of_the_shape() -> None:
+    # A WITHOUT ROWID table's key index has no sqlite_master row; the shape must still carry it.
+    import aiosqlite
+
+    from messagefoundry.store.schema_verify import read_schema_shape
+    from messagefoundry.store.store import _await_connection_worker_exit
+
+    db = await aiosqlite.connect(":memory:")
+    try:
+        await db.execute("CREATE TABLE pair (a TEXT, b TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID")
+        shape = await read_schema_shape(db)
+    finally:
+        await db.close()
+        await _await_connection_worker_exit(db)
+    assert shape.constraint_indexes == {IndexShape("pair", ("a", "b"), True, False)}
+    assert shape.rowid_columns == {}
 
 
 async def test_an_index_with_a_different_collation_is_refused(tmp_path: Path) -> None:
@@ -250,8 +298,13 @@ async def test_a_table_whose_name_starts_with_sqlite_is_still_read(tmp_path: Pat
     import aiosqlite
 
     from messagefoundry.store.schema_verify import read_schema_shape
+    from messagefoundry.store.store import _await_connection_worker_exit
 
-    async with aiosqlite.connect(":memory:") as db:
+    db = await aiosqlite.connect(":memory:")
+    try:
         await db.execute("CREATE TABLE sqlitex_meta (a TEXT)")
         shape = await read_schema_shape(db)
+    finally:
+        await db.close()
+        await _await_connection_worker_exit(db)
     assert shape.columns == {"sqlitex_meta": frozenset({"a"})}
