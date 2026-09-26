@@ -1080,12 +1080,36 @@ async def test_get_approvals_lists_interrupted_beside_pending(engine: Engine) ->
         pending_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
         interrupted_id = await _interrupted_row(engine, "op", op_id)
         listed = (await c.get("/approvals", headers=await _token(c, "approver"))).json()
+    # Pending first, then interrupted, as GET /approvals documents.
+    assert [(a["id"], a["status"]) for a in listed["approvals"]] == [
+        (pending_id, "pending"),
+        (interrupted_id, "interrupted"),
+    ]
     by_id = {a["id"]: a for a in listed["approvals"]}
-    assert by_id[pending_id]["status"] == "pending"
-    assert by_id[interrupted_id]["status"] == "interrupted"
     assert by_id[interrupted_id]["approver"] == "releaser"
     assert by_id[interrupted_id]["decided_at"] is not None
     assert by_id[interrupted_id]["requester"] == "op"
+
+
+async def test_a_row_cut_off_between_the_two_reads_is_listed_once(engine: Engine) -> None:
+    """GET /approvals reads pending, then interrupted. A release cut off between the two reads
+    appears in both; it must be listed once, as interrupted, its later status."""
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    runs: list[str] = []
+    gate, c = _app_client(engine, service, runs)
+    async with c:
+        approval_id = await _interrupted_row(engine, "op", op_id)
+        cut_off = (await gate.list_interrupted())[0]
+        stale = {**cut_off, "status": "pending", "approver": None, "decided_at": None}
+
+        async def _stale_pending() -> list[dict[str, Any]]:
+            return [stale]
+
+        gate.list_pending = _stale_pending  # type: ignore[method-assign]
+        listed = (await c.get("/approvals", headers=await _token(c, "approver"))).json()
+    assert [(a["id"], a["status"]) for a in listed["approvals"]] == [(approval_id, "interrupted")]
 
 
 @pytest.mark.parametrize(
@@ -1122,10 +1146,7 @@ async def test_resolve_records_the_outcome_audits_it_and_never_runs(
     assert await _status_of(engine, approval_id) == status
     assert runs == [], "a resolve must never run the operation"
     assert await engine.store.list_audit(action="approval.approved") == []
-    resolved = await engine.store.list_audit(action="approval.resolved")
-    assert len(resolved) == 1
-    assert str(resolved[0]["actor"]) == "resolver"
-    assert json.loads(str(resolved[0]["detail"])) == {
+    expected = {
         "approval_id": approval_id,
         "operation": "dead_letter_replay",
         "requester": "op",
@@ -1133,6 +1154,14 @@ async def test_resolve_records_the_outcome_audits_it_and_never_runs(
         "outcome": outcome,
         "status": status,
     }
+    for action in ("approval.resolve_attempted", "approval.resolved"):
+        rows = await engine.store.list_audit(action=action)
+        assert len(rows) == 1, action
+        assert str(rows[0]["actor"]) == "resolver"
+        assert json.loads(str(rows[0]["detail"])) == expected
+    # The attempt row is written BEFORE the move (list_audit is newest-first).
+    actions = [str(r["action"]) for r in await engine.store.list_audit(limit=50)]
+    assert actions.index("approval.resolved") < actions.index("approval.resolve_attempted")
 
 
 async def test_requester_cannot_resolve_their_own_interrupted_request(engine: Engine) -> None:
@@ -1268,30 +1297,42 @@ async def test_a_resolve_that_loses_the_race_answers_409(engine: Engine) -> None
         await gate.resolve_interrupted(
             approval_id, outcome="effects_not_applied", resolver="b", resolver_user_id="b-id"
         )
-    assert caught.value.status == 409 and "already resolved" in caught.value.detail
+    assert (
+        caught.value.status == 409 and "another operator resolved it first" in caught.value.detail
+    )
     assert await _status_of(engine, approval_id) == "resolved_applied"
     assert len(await engine.store.list_audit(action="approval.resolved")) == 1
+    # The loser got as far as its attempt row; the row's status says who won.
+    attempted = await engine.store.list_audit(action="approval.resolve_attempted")
+    assert sorted(str(r["actor"]) for r in attempted) == ["a", "b"]
 
 
-async def test_an_audit_refusal_puts_the_row_back_to_interrupted(engine: Engine) -> None:
-    """A resolution with no audit row would be an unattributed change to a dual-control record, so
-    a refused audit write undoes the status write and answers 503."""
+class _AuditRefuses:
+    """The real store, with one audit action refused."""
+
+    def __init__(self, store: Any, refused: str) -> None:
+        self._store = store
+        self._refused = refused
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    async def record_audit(self, action: str, **kw: Any) -> Any:
+        if action == self._refused:
+            raise OSError("audit log unreachable")
+        return await self._store.record_audit(action, **kw)
+
+
+async def test_a_refused_attempt_row_leaves_the_request_interrupted(engine: Engine) -> None:
+    """The audit log must accept the resolution BEFORE the row moves (BACKLOG #1940's shape), so a
+    refused attempt row answers 503 and changes nothing."""
     from tests._pending_approval_store_contract import _resolve
 
     approval_id = await _interrupted_row(engine, "maker", "maker-id")
     before = await engine.store.get_pending_approval(approval_id)
     assert before is not None
-
-    class _AuditRefuses:
-        def __getattr__(self, name: str) -> Any:
-            return getattr(engine.store, name)
-
-        async def record_audit(self, action: str, **kw: Any) -> Any:
-            if action == "approval.resolved":
-                raise OSError("audit log unreachable")
-            return await engine.store.record_audit(action, **kw)
-
-    gate = ApprovalGate(_AuditRefuses(), ON, resolve_identity=_resolve)  # type: ignore[arg-type]
+    store = _AuditRefuses(engine.store, "approval.resolve_attempted")
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)  # type: ignore[arg-type]
     with pytest.raises(ApprovalError) as caught:
         await gate.resolve_interrupted(
             approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
@@ -1300,5 +1341,60 @@ async def test_an_audit_refusal_puts_the_row_back_to_interrupted(engine: Engine)
     after = await engine.store.get_pending_approval(approval_id)
     assert after is not None
     assert str(after["status"]) == "interrupted"
-    assert str(after["approver"]) == "releaser"
-    assert float(after["decided_at"]) == float(before["decided_at"])
+    assert float(after["decided_at"]) == float(before["decided_at"])  # never written
+    assert await engine.store.list_audit(action="approval.resolved") == []
+
+
+async def test_a_failed_resolved_row_still_resolves_and_is_logged(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Once the row has moved, a failed approval.resolved write must not turn into an error: the
+    attempt row already names the resolver and the outcome. The loss is logged at ERROR."""
+    from tests._pending_approval_store_contract import _resolve
+
+    approval_id = await _interrupted_row(engine, "maker", "maker-id")
+    store = _AuditRefuses(engine.store, "approval.resolved")
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)  # type: ignore[arg-type]
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        out = await gate.resolve_interrupted(
+            approval_id, outcome="effects_not_applied", resolver="a", resolver_user_id="a-id"
+        )
+    assert out["status"] == "resolved_not_applied"
+    assert await _status_of(engine, approval_id) == "resolved_not_applied"
+    attempted = await engine.store.list_audit(action="approval.resolve_attempted")
+    assert [str(r["actor"]) for r in attempted] == ["a"]
+    assert json.loads(str(attempted[0]["detail"]))["outcome"] == "effects_not_applied"
+    assert any(
+        r.levelno == logging.ERROR
+        and approval_id in r.getMessage()
+        and "approval.resolved audit row failed" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_a_cancel_during_the_status_write_still_records_the_resolution(
+    engine: Engine,
+) -> None:
+    """The status write and approval.resolved run shielded. A cancel landing in the status write
+    (a request timeout can do this) must not leave the row moved with no approval.resolved row."""
+    from tests._pending_approval_store_contract import _resolve
+
+    approval_id = await _interrupted_row(engine, "maker", "maker-id")
+    store = _held_store(engine, "decide:resolved_applied")
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
+    task = asyncio.create_task(
+        gate.resolve_interrupted(
+            approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
+        )
+    )
+    await asyncio.wait_for(store.entered.wait(), _WAIT_S)
+    task.cancel()
+    store.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _WAIT_S)
+
+    async def _recorded() -> bool:
+        return bool(await engine.store.list_audit(action="approval.resolved"))
+
+    await _eventually(_recorded)
+    assert await _status_of(engine, approval_id) == "resolved_applied"

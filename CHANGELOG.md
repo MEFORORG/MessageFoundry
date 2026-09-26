@@ -14,8 +14,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   `{"outcome": "effects_not_applied"}` and moves the row to `resolved_applied` or
   `resolved_not_applied`. It needs `approvals:approve` and a fresh step-up, refuses the original
   requester, and answers `409` for a row that is not `interrupted`. It never runs the operation
-  again. Each resolve writes an `approval.resolved` audit row naming the resolver and the outcome; if
-  the audit log refuses it, the row goes back to `interrupted` and the call answers `503`. The engine
+  again. Each resolve writes an `approval.resolve_attempted` audit row naming the resolver and the
+  outcome before the row moves, and `approval.resolved` after; if the audit log refuses the first,
+  the row stays `interrupted` and the call answers `503`. The engine
   client gains `list_approvals()` and `resolve_interrupted_approval()`. Not built yet: a web console
   page for it, a startup pass over rows left `executing`, and a way out for a row left `executing`
   by a failed status write. (`BACKLOG #1562`)

@@ -3495,7 +3495,12 @@ def create_app(
         releases awaiting a resolve (BACKLOG #1562). Each row carries its ``status``."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
-        rows = await gate.list_pending() + await gate.list_interrupted()
+        pending = await gate.list_pending()
+        interrupted = await gate.list_interrupted()
+        # Two reads, so a release cut off between them can appear in both. Its later status wins,
+        # and a row can only ever move from pending to interrupted, never back.
+        cut_off = {a["id"] for a in interrupted}
+        rows = [a for a in pending if a["id"] not in cut_off] + interrupted
         return ApprovalList(approvals=[PendingApprovalInfo(**a) for a in rows])
 
     @app.post("/approvals/{approval_id}/approve", response_model=ApprovalDecisionResult)

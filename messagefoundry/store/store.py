@@ -10013,14 +10013,14 @@ class MessageStore:
             return list(await cur.fetchall())
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> list[aiosqlite.Row]:
-        """Released requests cut off mid-run, newest-first (BACKLOG #1562). No expiry filter: the
-        Store protocol says why. Same projection as :meth:`list_pending_approvals`."""
+        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        order: the Store protocol says why. Same projection as :meth:`list_pending_approvals`."""
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
                 " expires_at FROM pending_approvals"
                 " WHERE status = 'interrupted'"
-                " ORDER BY requested_at DESC LIMIT ?",
+                " ORDER BY requested_at ASC LIMIT ?",
                 (limit,),
             )
             return list(await cur.fetchall())

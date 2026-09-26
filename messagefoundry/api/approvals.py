@@ -912,9 +912,16 @@ class ApprovalGate:
         The row keeps the releasing approver in its ``approver`` column, because that column says who
         released it. The resolver is recorded only in the audit row.
 
-        The status write and the audit row run shielded, as one unit: a cancel cannot leave a
-        resolved row with no audit row. If the audit log refuses the row, the status write is undone
-        and the call answers 503."""
+        **The audit log must accept the resolution before the row moves**, as it must a release
+        before the operation runs (BACKLOG #1940). An ``approval.resolve_attempted`` row naming the
+        resolver and the outcome is written first; if that write fails the call answers 503 and the
+        row stays ``interrupted``. So a resolved row always has an audit row, even if the process
+        dies between the status write and ``approval.resolved``. That later row failing is logged at
+        ERROR and the resolve still succeeds, because the row has already moved. A resolver who
+        loses a race to another leaves an attempted row with no ``approval.resolved`` after it; the
+        row's status says what won.
+
+        The status write and ``approval.resolved`` run shielded, so a cancel cannot split them."""
         status = RESOLVE_OUTCOMES.get(outcome)
         if status is None:
             raise ApprovalError(422, f"unknown outcome '{outcome}'")
@@ -937,34 +944,68 @@ class ApprovalGate:
             )
         if str(requester_user_id) == resolver_user_id:
             raise ApprovalError(403, "you cannot resolve your own request")
-        return await _shielded(
+        releaser = None if row["approver"] is None else str(row["approver"])
+        detail = json.dumps(
+            {
+                "approval_id": approval_id,
+                "operation": str(row["operation"]),
+                "requester": str(row["requester"]),
+                "approver": releaser,
+                "outcome": outcome,
+                "status": status,
+            }
+        )
+        try:
+            await self._store.record_audit(
+                "approval.resolve_attempted",
+                actor=resolver,
+                detail=detail,
+                client=client,  # ADR 0150: the resolver's address, matching this row's actor
+            )
+        except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+            log.exception(
+                "approval %s: the audit log refused the resolve row, so the request is still "
+                "interrupted",
+                approval_id,
+            )
+            raise ApprovalError(
+                503,
+                "the audit log could not record this resolution, so the request is still "
+                "interrupted; resolve it again once the audit log accepts writes",
+            ) from exc
+        await _shielded(
             self._record_resolution(
                 approval_id,
-                row=row,
-                outcome=outcome,
                 status=status,
+                releaser=releaser,
                 resolver=resolver,
+                detail=detail,
                 client=client,
             ),
             approval_id,
         )
+        return {
+            "operation": str(row["operation"]),
+            "requested_by": str(row["requester"]),
+            "approved_by": releaser,
+            "resolved_by": resolver,
+            "outcome": outcome,
+            "status": status,
+        }
 
     async def _record_resolution(
         self,
         approval_id: str,
         *,
-        row: Any,
-        outcome: str,
         status: str,
+        releaser: str | None,
         resolver: str,
+        detail: str,
         client: str | None,
-    ) -> dict[str, Any]:
-        """The status write and its audit row for :meth:`resolve_interrupted`."""
-        releaser = None if row["approver"] is None else str(row["approver"])
-        interrupted_at = float(row["decided_at"]) if row["decided_at"] is not None else None
-        operation = str(row["operation"])
-        requester = str(row["requester"])
-        # Guarded on 'interrupted', so two resolvers cannot both record an outcome.
+    ) -> None:
+        """The guarded status write and ``approval.resolved`` for :meth:`resolve_interrupted`."""
+        # Guarded on 'interrupted', so two resolvers cannot both record an outcome. The releaser is
+        # written back unchanged: the column says who released the request.
         if not await self._store.decide_pending_approval(
             approval_id,
             status=status,
@@ -972,70 +1013,24 @@ class ApprovalGate:
             decided_at=self._clock(),
             from_status="interrupted",
         ):
-            raise ApprovalError(409, "request was already resolved")
+            raise ApprovalError(
+                409, "request is no longer interrupted; another operator resolved it first"
+            )
         try:
             await self._store.record_audit(
                 "approval.resolved",
                 actor=resolver,
-                detail=json.dumps(
-                    {
-                        "approval_id": approval_id,
-                        "operation": operation,
-                        "requester": requester,
-                        "approver": releaser,
-                        "outcome": outcome,
-                        "status": status,
-                    }
-                ),
+                detail=detail,
                 client=client,  # ADR 0150: the resolver's address, matching this row's actor
             )
-        except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
-            # A resolution with no audit row would be an unattributed change to a dual-control
-            # record. Undo the status write, guarded on the status just written, so it can only move
-            # the row this call moved.
-            try:
-                restored = await self._store.decide_pending_approval(
-                    approval_id,
-                    status="interrupted",
-                    approver=releaser,
-                    decided_at=interrupted_at if interrupted_at is not None else self._clock(),
-                    from_status=status,
-                )
-            except Exception:  # noqa: BLE001 - the 503 below is raised either way
-                log.exception("approval %s: undoing an unaudited resolution failed", approval_id)
-                restored = False
-            if restored:
-                log.error(
-                    "approval %s: the audit log refused the resolution row, so the request was "
-                    "put back to 'interrupted'",
-                    approval_id,
-                    exc_info=exc,
-                )
-                raise ApprovalError(
-                    503,
-                    "the audit log could not record this resolution, so the request is still "
-                    "interrupted; resolve it again once the audit log accepts writes",
-                ) from exc
-            log.error(
-                "approval %s: the audit log refused the resolution row AND the row could not be "
-                "put back; it reads '%s' with no approval.resolved audit row",
+        except Exception:  # noqa: BLE001 - the row has moved; approval.resolve_attempted records it
+            log.exception(
+                "approval %s: the row moved to '%s', but its approval.resolved audit row failed; "
+                "the approval.resolve_attempted row still records the resolution. Lost detail: %s",
                 approval_id,
                 status,
-                exc_info=exc,
+                detail,
             )
-            raise ApprovalError(
-                503,
-                f"the audit log could not record this resolution, and the request could not be "
-                f"put back: it now reads '{status}' with no audit record of who resolved it",
-            ) from exc
-        return {
-            "operation": operation,
-            "requested_by": requester,
-            "approved_by": releaser,
-            "resolved_by": resolver,
-            "outcome": outcome,
-            "status": status,
-        }
 
     async def _require_pending(self, approval_id: str) -> Any:
         row = await self._store.get_pending_approval(approval_id)

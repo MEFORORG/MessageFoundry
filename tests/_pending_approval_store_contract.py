@@ -288,10 +288,17 @@ async def _interrupt(store: Any, runs: list[str]) -> tuple[Any, str]:
     return gate, approval_id
 
 
-async def _resolved_rows(store: Any, approval_id: str) -> list[Any]:
+#: Wider than the store's default cap, because the server legs share one table and the list is
+#: oldest-first: leftover interrupted rows from earlier tests would otherwise push this one out.
+_LIST_LIMIT = 10_000
+
+
+async def _resolved_rows(
+    store: Any, approval_id: str, action: str = "approval.resolved"
+) -> list[Any]:
     return [
         r
-        for r in await store.list_audit(action="approval.resolved", limit=500)
+        for r in await store.list_audit(action=action, limit=500)
         if json.loads(str(r["detail"])).get("approval_id") == approval_id
     ]
 
@@ -313,7 +320,9 @@ async def _assert_interrupted_resolution_contract(store: Any) -> None:
         # Listed as interrupted, with who released it and when it was cut off; NOT in the pending
         # queue, so "pending" still means awaiting a second approver.
         listed = [
-            r for r in await store.list_interrupted_approvals() if str(r["id"]) == approval_id
+            r
+            for r in await store.list_interrupted_approvals(limit=_LIST_LIMIT)
+            if str(r["id"]) == approval_id
         ]
         assert len(listed) == 1
         assert str(listed[0]["status"]) == "interrupted"
@@ -351,13 +360,12 @@ async def _assert_interrupted_resolution_contract(store: Any) -> None:
         assert caught.value.status == 409
 
         # Gone from the interrupted listing once resolved.
-        assert all(str(r["id"]) != approval_id for r in await store.list_interrupted_approvals())
+        assert all(
+            str(r["id"]) != approval_id
+            for r in await store.list_interrupted_approvals(limit=_LIST_LIMIT)
+        )
 
-        audited = await _resolved_rows(store, approval_id)
-        assert len(audited) == 1
-        assert str(audited[0]["actor"]) == _RESOLVER
-        detail = json.loads(str(audited[0]["detail"]))
-        assert detail == {
+        expected = {
             "approval_id": approval_id,
             "operation": "dead_letter_replay",
             "requester": _REQUESTER,
@@ -365,6 +373,16 @@ async def _assert_interrupted_resolution_contract(store: Any) -> None:
             "outcome": outcome,
             "status": status,
         }
+        audited = await _resolved_rows(store, approval_id)
+        assert len(audited) == 1
+        assert str(audited[0]["actor"]) == _RESOLVER
+        assert json.loads(str(audited[0]["detail"])) == expected
+        # One attempt row, written before the move. The second resolve above is refused on the
+        # status check, before it writes one.
+        attempted = await _resolved_rows(store, approval_id, "approval.resolve_attempted")
+        assert len(attempted) == 1
+        assert str(attempted[0]["actor"]) == _RESOLVER
+        assert json.loads(str(attempted[0]["detail"])) == expected
         # Resolving writes no second outcome row: the trail still says the release was cut off.
         actions = await _audit_actions(store, approval_id)
         assert actions == ["approval.interrupted"]

@@ -1205,9 +1205,7 @@ class EngineClient:
         :class:`ApiError` carrying the engine's ``status``: ``403`` for the original requester, a
         missing permission or a stale step-up, ``404`` for an unknown id, ``409`` for a row that is
         not ``interrupted`` (including one another operator resolved first), and ``503`` when the
-        audit log refused the record, in which case the row is left ``interrupted``, or, in the rare
-        case the engine could not undo its status write, left resolved with no audit row (the
-        message says which)."""
+        audit log refused the record, in which case the row is left ``interrupted``."""
         return _decode(
             self._request(
                 "POST", f"/approvals/{_seg(approval_id)}/resolve", json={"outcome": outcome}

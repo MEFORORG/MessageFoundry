@@ -10112,13 +10112,13 @@ class SqlServerStore:
         )
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        """Released requests cut off mid-run, newest-first (BACKLOG #1562). No expiry filter: the
-        Store protocol says why."""
+        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        order: the Store protocol says why."""
         return await self._fetchall(
             "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
             " decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'interrupted'"
-            " ORDER BY requested_at DESC",
+            " ORDER BY requested_at ASC",
             (limit,),
         )
 
