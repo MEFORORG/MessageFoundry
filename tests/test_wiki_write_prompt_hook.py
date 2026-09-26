@@ -122,9 +122,11 @@ class Env:
         env: dict[str, str] | None = None,
         session: dict[str, str] | None = None,
         transcript: str | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """``session`` is the CLAUDE_* set Claude Code would pass. The default is an attended
-        session; pass ``{}`` for a hook that sees none of them."""
+        session; pass ``{}`` for a hook that sees none of them. ``cwd`` is the hook process's
+        working directory; the default inherits the suite's."""
         payload = stdin
         if payload is None:
             payload = json.dumps(
@@ -150,6 +152,7 @@ class Env:
             encoding="utf-8",
             timeout=TIMEOUT,
             env=full_env,
+            cwd=cwd,
             check=False,
         )
         assert proc.returncode == 0, proc.stderr
@@ -396,9 +399,11 @@ def test_an_env_var_naming_no_checkout_falls_through(env: Env) -> None:
 def test_a_relative_env_var_is_printed_absolute(env: Env) -> None:
     chosen = make_korus(env.base / "pinned")
     env.append(tools(MIN_TOOLS))
-    # The hook inherits the suite's cwd, so name the checkout relative to that.
-    rel = os.path.relpath(env.base / "pinned")
-    reason = blocked(env.run(env={"MEFOR_KORUS_CHECKOUT": rel}))["reason"]
+    # The hook resolves a relative value against its own cwd. Run it from inside the temp tree
+    # rather than naming the checkout relative to the suite's cwd: a runner that checks out on D:
+    # with its temp dir on C: has no relative path between the two, and os.path.relpath raises.
+    rel = os.path.join("..", "pinned")
+    reason = blocked(env.run(env={"MEFOR_KORUS_CHECKOUT": rel}, cwd=env.repo))["reason"]
     assert f'"{chosen}/scripts/wiki/write.ps1"' in write_line(reason)
     assert "(from MEFOR_KORUS_CHECKOUT)" in reason
 
