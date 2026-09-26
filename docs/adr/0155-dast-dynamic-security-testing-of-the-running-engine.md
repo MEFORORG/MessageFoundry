@@ -292,6 +292,18 @@ which the run tolerates only for the `reply` and `count_and_log` detectors:
    tolerated. Open engine PR 1579 fixes the root cause. When it lands, the strict xfails start to
    pass, and strict mode turns each pass into a failure. Then the `blank-segment` policy entry, its
    discriminator and the tests built on it come out.
+
+   **Amendment 2026-09-26, defect 1 FIXED by engine PR 1579 (BACKLOG #1594).** `Peek.parse` and
+   `Message.parse` now drop an empty segment line before either parser backend sees it. Measured on
+   the seeded run with PR 1579 merged: the face that decodes is ACKed `AA` with a non-`ERROR` row, and
+   the invalid-UTF-8 face gets the runner's own `AR` and one `ERROR` row. Neither face gets the
+   handler-fault `AE`. The removals this paragraph promised are done in the same change: the
+   `blank-segment` policy entry, its discriminator, the handler-fault tolerance set and the tests
+   built on them. The two strict xfails became plain tests asserting the fixed behaviour. The pass no
+   longer tolerates any handler-fault NAK. The `blank-segment` catalogue cases stay on as regression
+   cases. One floor moved with the fix: the catalogue's NAK count fell from 10 to 9, because the
+   decoding face is now accepted, so `min_mllp_rejected_replies` is 9. The policy's provenance
+   records the measurement. The text above is kept as the record of what was found.
 2. **An alphanumeric MSH-1 gets an unreadable ACK.** The message is accepted, and the ACK echoes the
    letter separator, so MSA-1 (itself letters) cannot be read back.
 3. **The raw-TCP and X12 listeners have no frame deadline.** A peer trickling inside

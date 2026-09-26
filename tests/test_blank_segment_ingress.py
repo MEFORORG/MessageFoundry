@@ -21,6 +21,7 @@ Synthetic HL7 only (CLAUDE.md section 9).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -30,7 +31,7 @@ import hl7
 import pytest
 
 import messagefoundry.pipeline.wiring_runner as wiring_runner
-from messagefoundry.config.models import ConnectorType, ContentType
+from messagefoundry.config.models import ConnectorType, ContentType, Source
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing._backend import backend
 from messagefoundry.parsing.message import Message
@@ -38,7 +39,14 @@ from messagefoundry.parsing.peek import Peek, normalize
 from messagefoundry.parsing.summary import summarize
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
-from messagefoundry.transports.mllp import build_ack
+from messagefoundry.transports.mllp import (
+    _HANDLER_FAILURE_NAK_TEXT,
+    CR,
+    EB,
+    MLLPSource,
+    build_ack,
+    frame,
+)
 
 _INBOUND = "IB_HL7"
 _HEADER = "MSH|^~\\&|SEND|SFAC|RECV|RFAC|20260101||ADT^A01|CTRL1594|P|2.5.1"
@@ -257,6 +265,47 @@ async def test_a_faulting_peek_read_records_error_and_naks_ar_on_mllp(
     assert rows[0]["status"] == MessageStatus.ERROR.value
     assert rows[0]["error"] == "parse error: peek read failed (IndexError)"
     assert await _queue_depth(store) == 0  # recorded before any ingress row
+
+
+async def test_a_faulting_peek_read_is_the_runners_ar_not_the_listeners_handler_fault_ae(
+    runner: tuple[RegistryRunner, InboundConnection],
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over a real MLLP socket. The runner catches a peek-read fault itself and answers ``AR``: the
+    body cannot be read, so a resend cannot help. The listener's BACKLOG #1619 arm answers a fault
+    that ESCAPED the handler with a fixed ``AE`` and closes. This fault must never reach that arm."""
+    rr, ic = runner
+    _faulting_control_id(monkeypatch)
+    events: list[str] = []
+
+    async def _event(kind: str, peer_host: str | None, reason: str | None) -> None:
+        events.append(kind)
+
+    async def _handler(raw: bytes) -> str | None:
+        return await rr._handle_inbound(ic, raw)
+
+    source = MLLPSource(Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0}))
+    source.on_connection_event = _event
+    await source.start(_handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        replies = []
+        for _ in range(2):  # the second frame proves the connection stayed open
+            writer.write(frame(_SHAPES["control"]))
+            await writer.drain()
+            replies.append(await asyncio.wait_for(reader.readuntil(bytes([EB, CR])), 3.0))
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+
+    for reply in replies:
+        assert b"MSA|AR|" in reply and b"peek read failed" in reply, reply
+        assert _HANDLER_FAILURE_NAK_TEXT.encode() not in reply, reply
+    assert "handler_error" not in events, events
+    rows = await _rows(store)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
 
 
 async def test_a_faulting_peek_read_records_error_on_http(

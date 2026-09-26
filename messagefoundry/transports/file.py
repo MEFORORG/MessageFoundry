@@ -41,7 +41,7 @@ from messagefoundry.config.models import (
     WindowsCredential,
 )
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
-from messagefoundry.parsing.peek import HL7PeekError, Peek
+from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _content_matches_declared, _looks_like_hl7
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.redaction import safe_exc, safe_name
@@ -141,11 +141,12 @@ def render_filename(template: str, payload: str, *, fallback: str) -> str:
             return fallback
         try:
             value = peek.field(match.group(1))
-        except (IndexError, ValueError):
-            # A payload that parses can still fault a field READ: a blank segment makes the peek
-            # raise IndexError by design (python-hl7 parity), and ValueError covers a malformed
-            # escape. Uncaught, that escaped send() as a bare IndexError outside the DeliveryError
-            # contract (BACKLOG #1623). A name that cannot be read takes the fallback.
+        except PEEK_READ_FAULTS:
+            # A read on an accepted peek is not expected to raise. A blank segment once made it raise
+            # IndexError, and uncaught that escaped send() outside the DeliveryError contract
+            # (BACKLOG #1623). BACKLOG #1594 fixed the blank segment at the parse; this catch stays
+            # for any other parser fault, the same family the pre-ACK callers catch. A name that
+            # cannot be read takes the fallback.
             value = None
         return _sanitize(value) if value else fallback
 

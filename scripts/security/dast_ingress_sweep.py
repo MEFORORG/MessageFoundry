@@ -64,10 +64,9 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from fuzz.targets import TARGETS, _hl7_has_blank_segment  # noqa: E402
+from fuzz.targets import TARGETS  # noqa: E402
 from messagefoundry.logging_setup import _install_phi_filters  # noqa: E402
 from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, frame  # noqa: E402
-from messagefoundry.parsing.peek import Peek, normalize  # noqa: E402
 from messagefoundry.parsing.x12.errors import X12FrameError  # noqa: E402
 from messagefoundry.parsing.x12.interchange import X12FrameReader  # noqa: E402
 from messagefoundry.store import MessageStatus  # noqa: E402
@@ -178,7 +177,8 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
         Case("truncation-char-27", "mllp", frame(msg("SEP4", enc="^~\\&#"))),
         Case("missing-msh", "mllp", frame(_b(f"PID|1||X||{sentinel}^CASE\r"))),
         Case("msh-only", "mllp", frame(b"MSH|^~\\&|")),
-        # ADR 0191's recorded finding (an empty segment), rebuilt here around the sentinel.
+        # ADR 0191's recorded finding (an empty segment), rebuilt here around the sentinel. Fixed by
+        # BACKLOG #1594; kept as a regression case, since both faces must now get the runner's reply.
         Case("blank-segment", "mllp", frame(msg("BLANK", extra="\rPV1|1|I\r"))),
         Case(
             "blank-segment-invalid-utf8",
@@ -310,17 +310,6 @@ def reference_frames(plane: str, data: bytes, cap: int) -> tuple[list[bytes], bo
     return frames, False
 
 
-def _blank_segment(payload: bytes) -> bool:
-    """ADR 0191's known finding, by ADR 0191's own discriminator (reused, not copied): the frame
-    parses and carries a segment whose id is the empty string. Decoded with replacement, because
-    both faces of the defect, the one that decodes and the one that fails UTF-8 decode, still fault
-    the inbound handler. ADR 0155's 2026-09-26 amendment says what each face does today."""
-    try:
-        return _hl7_has_blank_segment(Peek.parse(normalize(payload, errors="replace")))
-    except ValueError:  # HL7PeekError is a ValueError
-        return False
-
-
 def _alphanumeric_field_separator(payload: bytes) -> bool:
     return payload[:3] == b"MSH" and payload[3:4].isalnum()
 
@@ -328,17 +317,15 @@ def _alphanumeric_field_separator(payload: bytes) -> bool:
 #: Known engine defects, each recognised by a NARROW structural condition on the frames a case sent,
 #: never by an exception type or a case name alone (a mutation can reproduce one by chance). Which of
 #: these a run tolerates is the policy's ``known_defects`` list; tests/test_dast_ingress_sweep.py holds
-#: a strict xfail per entry, so the day a defect is fixed its entry has to come out. A defect in
-#: HANDLER_FAULT_DEFECTS is matched against the frame the handler faulted on and explains that one
-#: frame; any other is matched against every frame and explains each frame it matches.
+#: a strict xfail per entry, so the day a defect is fixed its entry has to come out. Each is matched
+#: against every frame a case sent and explains each frame it matches. None is a handler fault: the
+#: one that was (a blank segment, BACKLOG #1594) is fixed, so a handler-fault NAK is never tolerated.
 KNOWN_DEFECT_DISCRIMINATORS: dict[str, Callable[[bytes], bool]] = {
-    "blank-segment": _blank_segment,
     "alphanumeric-field-separator": _alphanumeric_field_separator,
 }
 #: The only detectors a known defect may silence. A liveness, time, resource or log finding on the
 #: same case is never tolerated: those would be a SECOND defect riding on the known one.
 KNOWN_DEFECT_DETECTORS = frozenset({"reply", "count_and_log"})
-HANDLER_FAULT_DEFECTS = frozenset({"blank-segment"})
 
 
 class Replies(NamedTuple):
@@ -621,7 +608,7 @@ async def run_case(target: IngressTarget, case: Case, budget: Budget) -> CaseRes
     after = await _counts(target, case.plane)
     result.rows, result.error_rows = after.rows - before.rows, after.errors - before.errors
     _judge(result, got)
-    known, known_frames = known_defect_for(payloads, result)
+    known, known_frames = known_defect_for(payloads)
     if known and _explained(result, known_frames):
         # Only when the known frames account for the whole shortfall: anything more is a SECOND
         # defect riding on the known one, and then nothing on this case is tolerated.
@@ -631,20 +618,18 @@ async def run_case(target: IngressTarget, case: Case, budget: Budget) -> CaseRes
     return result
 
 
-def known_defect_for(payloads: Sequence[bytes], result: CaseResult) -> tuple[str, int]:
+def known_defect_for(payloads: Sequence[bytes]) -> tuple[str, int]:
     """``(defect, frames it explains)`` for this case, or ``("", 0)``."""
     for name, hit in KNOWN_DEFECT_DISCRIMINATORS.items():
-        if name in HANDLER_FAULT_DEFECTS:
-            faulted = result.first_fault
-            if faulted is not None and faulted < len(payloads) and hit(payloads[faulted]):
-                return name, 1
-        elif count := sum(map(hit, payloads)):
+        if count := sum(map(hit, payloads)):
             return name, count
     return "", 0
 
 
 def _explained(result: CaseResult, known_frames: int) -> bool:
-    """Whether ``known_frames`` defective frames can account for every reply and row mismatch."""
+    """Whether ``known_frames`` defective frames can account for every reply and row mismatch.
+
+    A handler-fault NAK is never accounted for: no known defect faults the handler any more."""
     replies = result.accepted + result.rejected + result.unreadable
     nonerror = result.rows - result.error_rows
     gaps = (
@@ -653,10 +638,11 @@ def _explained(result: CaseResult, known_frames: int) -> bool:
         abs(result.accepted - nonerror),
         abs(result.rejected - result.error_rows),
         result.unreadable,
-        result.faults,
     )
-    return all(0 <= gap <= known_frames for gap in gaps[:2]) and all(
-        gap <= known_frames for gap in gaps[2:]
+    return (
+        result.faults == 0
+        and all(0 <= gap <= known_frames for gap in gaps[:2])
+        and all(gap <= known_frames for gap in gaps[2:])
     )
 
 
