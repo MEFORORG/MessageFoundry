@@ -985,12 +985,31 @@ def test_users_manage_write_pacing_exemptions_are_named_exactly() -> None:
         )
 
 
-def test_ui_pacing_gap_wording_flips_with_the_code() -> None:
-    """Honest-interim wording, enforced both ways.
+#: At least these phrasings have said the console charges no admin-write floor. BACKLOG #1815: this
+#: guard once knew only the first two. SECURITY.md said it with the other three -- bolded, and one
+#: wrapped across a line -- and those sat beside a green test while the console already charged. So
+#: the match drops `*` emphasis and runs case-folded over whitespace-collapsed text. The last phrase
+#: names the floor on purpose: "charged on the JSON API only" alone also described the PHI-read hop.
+_UI_PACING_GAP_PHRASES = (
+    "no `/ui` route charges it",
+    "the `/ui` write path is not paced",
+    "no `/ui` route charges the per-actor admin-write",
+    "the `/ui` write path charges none",
+    "admin-write floor is charged on the json api only",
+)
 
-    While ``allow_admin_write`` has no console call site, the doc MUST state the gap. The moment
-    console parity (BACKLOG #287) lands a charge, this same test demands the sentence be removed — so
-    the interim wording can never become a stale falsehood.
+
+def _states_ui_pacing_gap(text: str) -> bool:
+    folded = " ".join(text.replace("*", "").split()).casefold()
+    return any(phrase in folded for phrase in _UI_PACING_GAP_PHRASES)
+
+
+def test_ui_pacing_gap_wording_flips_with_the_code() -> None:
+    """Gap wording, enforced both ways.
+
+    The console charges ``allow_admin_write`` today (``require_ui``, BACKLOG #287), so the live arm
+    is the first one: neither document may say the console is unpaced. Should the console ever stop
+    charging, the other arm demands that both documents say so.
     """
     console_charges = any(
         "allow_admin_write" in module.read_text(encoding="utf-8")
@@ -1000,11 +1019,8 @@ def test_ui_pacing_gap_wording_flips_with_the_code() -> None:
     # guarding only SECURITY.md would leave docs/CONFIGURATION.md asserting the gap forever once
     # console parity lands, which is precisely the rot this cell exists to close.
     surfaces = {
-        "docs/SECURITY.md": (
-            "no `/ui` route charges it" in _doc_text()
-            or "the `/ui` write path is not paced" in _doc_text()
-        ),
-        "docs/CONFIGURATION.md": "no `/ui` route charges it" in _config_section(),
+        "docs/SECURITY.md": _states_ui_pacing_gap(_doc_text()),
+        "docs/CONFIGURATION.md": _states_ui_pacing_gap(_config_section()),
     }
     for artefact, gap_stated in sorted(surfaces.items()):
         if console_charges:
