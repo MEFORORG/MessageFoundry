@@ -349,3 +349,16 @@ amendment above, precisely so "the tray/monitor need no per-PC CA wrangling"). `
 gains an `ssl` import and is registered in the ASVS 11.1.3 crypto inventory
 (`scripts/security/crypto_inventory_check.py` + [`docs/ASVS-L2-PHASE0-CHANGES.md`](../ASVS-L2-PHASE0-CHANGES.md) §4).
 **AC-7 is amended** (above) to state locality, not scheme.
+
+## Amendment (2026-09-26) — one more neutral, stdlib-only module: `messagefoundry.log_backoff` (BACKLOG #1844)
+
+§1 ratified two neutral, stdlib-only modules as tray-importable. This adds
+`messagefoundry.log_backoff` on the same terms. It holds `FailureRun`, the power-of-two log backoff the tray
+poller introduced for its two loop guards (BACKLOG #1712). #1844 lifted it out of `tray/poller.py` so the
+engine's pipeline workers share one copy instead of writing a second. It imports only `logging` and
+`dataclasses`, so it pulls in no `pipeline`/`store`/`transports`/`config`/`api`, Qt or FastAPI. The
+fresh-interpreter probe in `tests/test_dependency_boundaries.py` still guards what the tray drags in behind it.
+
+The **Must never import** list is unchanged. This amendment does not rule on one import found while
+writing it: `tray/config.py` also imports `messagefoundry.api_tls_source` (stdlib-only, since BACKLOG #1276
+part B), which §1 does not list either.

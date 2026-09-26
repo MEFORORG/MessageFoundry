@@ -98,6 +98,7 @@ from messagefoundry.config.wiring import (
     resolved_encoding_problems,
 )
 from messagefoundry.fhirsearch import FhirSearchParams
+from messagefoundry.log_backoff import FailureRun
 from messagefoundry.logging_guard import LogSinkEvent
 from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.parsing import (
@@ -338,6 +339,115 @@ class ShardLaneOwnershipError(RuntimeError):
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
 # unavailable) before retrying, so a transient failure logs once and recovers instead of hot-looping.
 _WORKER_ERROR_BACKOFF_SECONDS = 1.0
+
+
+# A per-lane worker's run of faults closes on the first healthy pass or empty claim at least this
+# long after its last fault (see _WorkerFaultLog).
+_FAULT_RUN_QUIET_SECONDS = 10.0
+
+# What a worker run counts. Not "consecutive": a run may span healthy passes (see _WorkerFaultLog).
+_WORKER_RUN_COUNT = "failures in this run"
+
+
+class _WorkerFaultLog:
+    """One per-lane worker's backoff on the log lines its loop writes for an UNEXPECTED error
+    (BACKLOG #1844).
+
+    Every per-lane worker survives a store fault by logging it, backing off
+    :data:`_WORKER_ERROR_BACKOFF_SECONDS`, and trying again. Surviving is right: a dead worker stops
+    its lane while inbound keeps ACKing. But one traceback per pass is a flood for as long as the
+    fault lasts, and a shared cause (the database locked, the disk full) fires every worker at once.
+    On a deploying site that would crowd out other evidence; which record a bounded sink loses is
+    set out in :mod:`messagefoundry.log_backoff`. So the worker logs through a
+    :class:`~messagefoundry.log_backoff.FailureRun`: its 1st, 2nd, 4th, 8th ... failure of a cause,
+    each with the traceback and the run's count, and one recovery line when the run closes.
+    **The bound is per worker, not per cause**: a shared cause across N workers still writes about
+    N times log2(T) records in T passes.
+
+    **A run closes on quiet, not on the next good pass.** It closes on the first healthy pass or
+    empty claim that comes at least :data:`_FAULT_RUN_QUIET_SECONDS` after its last fault. The next
+    good pass is no evidence the fault has gone: the except arm hands a held row back dated one
+    backoff ahead (#1611), so the claim after the backoff can come back empty for that reason alone,
+    and on an unordered lane other rows can deliver while that row keeps faulting. Closing on either
+    would log the same fault afresh, traceback and recovery line both, every time the row came back.
+    A row that re-faults every backoff keeps refreshing the clock and stays in one run. That is why
+    the count is ``failures in this run`` and not ``consecutive failures``: other rows may have
+    delivered in between. The worst case this allows is a new run, so one fresh traceback and one
+    recovery line, per :data:`_FAULT_RUN_QUIET_SECONDS` per worker.
+
+    The re-pend in the same except arm (:meth:`RegistryRunner._repend_claimed_on_fault`) keeps its
+    own run, because under a busy timeout it fails on the same passes as the fault it recovers
+    from. Both runs close together.
+
+    A worker that RETURNS (a STOP, a halt, the runner stopping) takes an open run with it and writes
+    no recovery line: the last record's count is then the last word, and it may be behind by up to
+    half the run. Mutable, one per worker task, touched only from that task."""
+
+    __slots__ = ("_last_fault", "_name", "_repend_run", "_run", "_worker")
+
+    def __init__(self, worker: str, name: str) -> None:
+        self._worker = worker
+        self._name = name
+        self._run = FailureRun()
+        self._repend_run = FailureRun()
+        self._last_fault = 0.0  # time.monotonic() of the last fault in either run
+
+    def healthy(self) -> None:
+        """Call on an empty claim and at the end of a pass that raised nothing."""
+        if (self._run.count or self._repend_run.count) and (
+            time.monotonic() - self._last_fault >= _FAULT_RUN_QUIET_SECONDS
+        ):
+            self._close()
+
+    def failed(self, exc: BaseException, message: str) -> None:
+        """Call from the loop's ``except Exception`` arm, before the backoff. ``message`` is a
+        ``%``-format taking the lane name."""
+        self._run = self._run.record(
+            log, exc, message, self._name, count_label=_WORKER_RUN_COUNT, stacklevel=2
+        )
+        self._last_fault = time.monotonic()
+
+    def repend_failed(self, exc: BaseException, message: str, *args: object) -> None:
+        """The except arm's re-pend raised; see :meth:`RegistryRunner._repend_claimed_on_fault`."""
+        self._repend_run = self._repend_run.record(
+            log,
+            exc,
+            message,
+            *args,
+            level=logging.WARNING,
+            count_label=_WORKER_RUN_COUNT,
+            stacklevel=2,
+        )
+        self._last_fault = time.monotonic()
+
+    def _close(self) -> None:
+        # stacklevel 3: _close -> healthy() -> the worker loop, so the record names the loop.
+        # WARNING, the level of the re-pend lines, so a site filtering there still sees the close.
+        prefix = "%s worker %r: no fault for %.0f s,"
+        quiet = _FAULT_RUN_QUIET_SECONDS
+        if self._run.count:
+            self._run = self._run.clear(
+                log,
+                prefix,
+                self._worker,
+                self._name,
+                quiet,
+                level=logging.WARNING,
+                count_label=_WORKER_RUN_COUNT,
+                stacklevel=3,
+            )
+        if self._repend_run.count:
+            self._repend_run = self._repend_run.clear(
+                log,
+                prefix + " reschedule_claimed",
+                self._worker,
+                self._name,
+                quiet,
+                level=logging.WARNING,
+                count_label=_WORKER_RUN_COUNT,
+                stacklevel=3,
+            )
+
 
 # A queue_buildup alert re-fires at most this often per connection while the lane stays over threshold,
 # so an ongoing stall reminds the operator without spamming on every backed-off retry.
@@ -5736,7 +5846,14 @@ class RegistryRunner:
 
     # --- delivery path -------------------------------------------------------
 
-    async def _repend_claimed_on_fault(self, worker: str, name: str, ids: Sequence[str]) -> None:
+    async def _repend_claimed_on_fault(
+        self,
+        worker: str,
+        name: str,
+        ids: Sequence[str],
+        *,
+        faults: _WorkerFaultLog | None = None,
+    ) -> None:
         """Best-effort re-pend of the rows a per-lane worker was holding when its loop faulted
         (BACKLOG #1611 step 1) — the per-lane analogue of the pooled T17 head re-pend in
         :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
@@ -5759,6 +5876,10 @@ class RegistryRunner:
         Wrapped in its own ``except`` because a re-pend that raises inside an except arm would kill the
         worker, which is strictly worse than the leak it fixes; a failure here simply falls back to the
         pre-existing recovery (``reset_stale_inflight`` at the next start).
+
+        A worker loop passes its ``faults`` (BACKLOG #1844), and a failure is then logged on that
+        worker's backoff rather than once per pass: a busy-timeout that fails the handoff tends to fail
+        this write on the same passes.
         """
         if not ids:
             return
@@ -5766,15 +5887,15 @@ class RegistryRunner:
             await self.store.reschedule_claimed(
                 list(ids), time.time() + _WORKER_ERROR_BACKOFF_SECONDS
             )
-        except Exception:  # noqa: BLE001 — recovery must never kill the worker; see the docstring
-            log.warning(
+        except Exception as exc:  # noqa: BLE001 — recovery must never kill the worker; see the docstring
+            message = (
                 "%s worker %r: reschedule_claimed failed for %d claimed row(s); they stay INFLIGHT "
-                "for reset_stale_inflight at the next start",
-                worker,
-                name,
-                len(ids),
-                exc_info=True,
+                "for reset_stale_inflight at the next start"
             )
+            if faults is None:
+                log.warning(message, worker, name, len(ids), exc_info=True)
+            else:
+                faults.repend_failed(exc, message, worker, name, len(ids))
 
     async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> None:
         """Best-effort release of the batch tail a per-lane worker still holds when it RETURNS on a
@@ -5819,6 +5940,7 @@ class RegistryRunner:
         # #1611: the rows THIS loop claimed, for the except arm's re-pend. A batching outbound
         # coalesces further rows inside _process_delivery_batch; those are not tracked here.
         claimed: list[str] = []
+        faults = _WorkerFaultLog("delivery", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
             # #122 (ADR 0189) THE CLAIM GATE, per_lane half: the application log is unwritable and this
             # process has fail-closed, so this lane must not deliver no matter which door started it.
@@ -5884,6 +6006,8 @@ class RegistryRunner:
                     items = await self.store.claim_ready(
                         limit=self.claim_limit, destination_name=name
                     )
+                # #1611: taken before anything else can raise, so the except arm re-pends THESE rows.
+                claimed = [it.id for it in items]
                 if self._delivery_phase_timing:
                     # One lane per claim in per_lane mode (this worker owns exactly `name`). Recorded
                     # synchronously; counts only, never the lane name (destination_name = PHI-adjacent).
@@ -5895,8 +6019,8 @@ class RegistryRunner:
                         time.perf_counter_ns() - _claim_t0, lanes=1, rows=len(items)
                     )
                     self._claim_phase_stats.maybe_emit(stage="outbound", claimers=1)
-                claimed = [it.id for it in items]  # #1611
                 if not items:
+                    faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
@@ -5910,23 +6034,26 @@ class RegistryRunner:
                     # due rows into ONE BHS…BTS envelope; the plain path delivers one message per send.
                     batch_cfg = self._batch.get(name)
                     if batch_cfg is not None:
-                        outcome = await self._process_delivery_batch(name, item, batch_cfg)
+                        outcome = await self._process_delivery_batch(
+                            name, item, batch_cfg, faults=faults
+                        )
                     else:
                         outcome = await self._process_delivery_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
                         await self._release_tail_on_stop("delivery", name, claimed[i + 1 :])
                         return
+                faults.healthy()
+                claimed = []  # #1844: resolved; a later claim fault holds nothing
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # A store error in the loop itself (claim_ready / mark_* failing — DB locked, disk
                 # full) must never kill the worker: that would silently stop THIS destination from
                 # draining while inbound keeps ACKing (review H-1). Log, back off, and keep going.
-                log.exception(
-                    "delivery worker %r: unexpected error; backing off and retrying", name
-                )
+                # #1844: log with a backoff, not a traceback per pass (see _WorkerFaultLog).
+                faults.failed(exc, "delivery worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("delivery", name, claimed)
+                await self._repend_claimed_on_fault("delivery", name, claimed, faults=faults)
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -6264,7 +6391,12 @@ class RegistryRunner:
         return _ItemOutcome.PROCESSED, retry_until
 
     async def _process_delivery_batch(
-        self, name: str, head: OutboxItem, cfg: BatchConfig
+        self,
+        name: str,
+        head: OutboxItem,
+        cfg: BatchConfig,
+        *,
+        faults: _WorkerFaultLog | None = None,
     ) -> tuple[_ItemOutcome, float | None]:
         """Deliver a contiguous FIFO head-prefix as ONE ``BHS``…``BTS`` envelope (#134 / ADR 0082) —
         the batch counterpart of :meth:`_process_delivery_item`, shared by the per_lane worker and the
@@ -6300,7 +6432,10 @@ class RegistryRunner:
         every claim path (all select ``status='pending'``) and to ``pending_depth``, waiting for
         ``reset_stale_inflight`` at the next service start. The guard below hands those extras back and
         re-raises. It re-pends **the extras only**: the head already has an owner in both claim modes,
-        and re-pending it twice would be a second defect."""
+        and re-pending it twice would be a second defect.
+
+        ``faults`` is the per-lane worker's :class:`_WorkerFaultLog`, so a failing re-pend here is
+        logged on that worker's backoff (BACKLOG #1844). The pooled adapter passes none."""
         members: list[OutboxItem] = [head]
         try:
             return await self._deliver_coalesced_batch(name, cfg, members)
@@ -6311,7 +6446,7 @@ class RegistryRunner:
             # ``status='inflight'``-guarded is what makes this safe over a PARTIALLY resolved set —
             # it is not a licence to run the re-pend unconditionally.
             await self._repend_claimed_on_fault(
-                "batch delivery", name, [it.id for it in members[1:]]
+                "batch delivery", name, [it.id for it in members[1:]], faults=faults
             )
             raise
 
@@ -6476,6 +6611,7 @@ class RegistryRunner:
             self._lane_event(Stage.INGRESS, name) if self._per_lane_wake else self._ingress_work
         )
         claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
+        faults = _WorkerFaultLog("router", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
             # #122 (ADR 0162): the application log is unwritable and this process has fail-closed.
             # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state a
@@ -6497,6 +6633,7 @@ class RegistryRunner:
                     )
                 claimed = [it.id for it in items]  # #1611
                 if not items:
+                    faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
@@ -6513,15 +6650,17 @@ class RegistryRunner:
                     await self._maybe_alert_buildup(
                         name, stage=Stage.INGRESS.value, threshold=self._buildup_default
                     )
+                faults.healthy()
+                claimed = []  # #1844: resolved; a later claim fault holds nothing
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # A store error in the loop itself (claim/handoff failing — DB locked, disk full) must
                 # never kill the worker: that would stall routing while the listener keeps ACKing. Log,
-                # back off, and keep going (mirrors the delivery worker).
-                log.exception("router worker %r: unexpected error; backing off and retrying", name)
+                # back off, and keep going (mirrors the delivery worker). #1844: with a backoff.
+                faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("router", name, claimed)
+                await self._repend_claimed_on_fault("router", name, claimed, faults=faults)
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -6824,6 +6963,7 @@ class RegistryRunner:
             self._lane_event(Stage.RESPONSE, name) if self._per_lane_wake else self._response_work
         )
         claimed: list[str] = []  # #1611: the row this loop claimed, for the except arm's re-pend
+        faults = _WorkerFaultLog("response", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
@@ -6831,22 +6971,23 @@ class RegistryRunner:
                 item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
                 claimed = [] if item is None else [item.id]  # #1611
                 if item is None:
+                    faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
                     woken = await self._wait_for_work(wait_ev)
                     continue
                 outcome = await self._process_response_item(name, item)
                 if outcome[0] is _ItemOutcome.STOPPED:
                     return
+                faults.healthy()
+                claimed = []  # #1844: resolved; a later claim fault holds nothing
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # A store error in the loop itself (claim/handoff failing) must never kill the worker —
-                # log, back off, keep going (mirrors the router/delivery workers).
-                log.exception(
-                    "response worker %r: unexpected error; backing off and retrying", name
-                )
+                # log, back off, keep going (mirrors the router/delivery workers). #1844: with a backoff.
+                faults.failed(exc, "response worker %r: unexpected error; backing off and retrying")
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("response", name, claimed)
+                await self._repend_claimed_on_fault("response", name, claimed, faults=faults)
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
@@ -6912,6 +7053,7 @@ class RegistryRunner:
         # shared singleton (byte-identical). Resolved once.
         wait_ev = self._lane_event(Stage.ROUTED, name) if self._per_lane_wake else self._routed_work
         claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
+        faults = _WorkerFaultLog("transform", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
@@ -6929,6 +7071,7 @@ class RegistryRunner:
                     )
                 claimed = [it.id for it in items]  # #1611
                 if not items:
+                    faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
@@ -6949,15 +7092,18 @@ class RegistryRunner:
                     await self._maybe_alert_buildup(
                         name, stage=Stage.ROUTED.value, threshold=self._buildup_default
                     )
+                faults.healthy()
+                claimed = []  # #1844: resolved; a later claim fault holds nothing
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # A store error in the loop itself must never kill the worker (mirrors the others).
-                log.exception(
-                    "transform worker %r: unexpected error; backing off and retrying", name
+                # #1844: logged with a backoff, not a traceback per pass (see _WorkerFaultLog).
+                faults.failed(
+                    exc, "transform worker %r: unexpected error; backing off and retrying"
                 )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
-                await self._repend_claimed_on_fault("transform", name, claimed)
+                await self._repend_claimed_on_fault("transform", name, claimed, faults=faults)
                 claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return

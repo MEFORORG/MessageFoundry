@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Protocol
 
+from messagefoundry.log_backoff import FailureRun
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.phase_timing import (
     _DELIVERY_PHASE_EMIT_INTERVAL,  # the ONE definition of this package's log-throttle window
@@ -199,6 +200,12 @@ class _Claimer:
     task: asyncio.Task[None] | None = None
     abandoned: list[str] = field(default_factory=list)
     orphan_ids: list[str] = field(default_factory=list)
+    # BACKLOG #1844: this claimer's run of failed claims, so a store outage logs on a backoff rather
+    # than a traceback per _CLAIM_ERROR_BACKOFF_SECONDS. Per claimer, because each retries on its own.
+    faults: FailureRun = field(default_factory=FailureRun)
+    # The same for a replacement's retried release of its predecessor's rows (_adopt_abandoned).
+    # On the partition, not local to that call, so stop() can close a run its cancel interrupted.
+    release_faults: FailureRun = field(default_factory=FailureRun)
 
 
 @dataclass
@@ -360,6 +367,9 @@ class StageDispatcher:
         self._lane_episode_stats = LaneEpisodeTiming(logger=log)
         self._sweep_task: asyncio.Task[None] | None = None
         self._sweep_now = asyncio.Event()
+        # BACKLOG #1844: the sweep retries every sweep_interval (0.25 s by default), so an outage would
+        # otherwise log four tracebacks a second per stage. See messagefoundry.log_backoff.
+        self._sweep_faults = FailureRun()
         # Per-lane coalesced timer handles + their armed deadlines (earliest-wins refresh).
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._timer_deadline: dict[str, float] = {}
@@ -683,16 +693,38 @@ class StageDispatcher:
         self._timers.clear()
         self._timer_deadline.clear()
         self._lane_tasks.clear()
-        for claimer in self._claimers:
+        for i, claimer in enumerate(self._claimers):
             claimer.ready.clear()
             claimer.ready_set.clear()
             claimer.task = None
             claimer.abandoned.clear()
             claimer.orphan_ids.clear()
+            claimer.faults = self._close_run_on_stop(claimer.faults, "claim")
+            claimer.release_faults = self._close_run_on_stop(
+                claimer.release_faults, f"{self._task_name(i)} release"
+            )
+        self._sweep_faults = self._close_run_on_stop(self._sweep_faults, "sweep")
         self._slots_free = self._max_processing_lanes
         # A start()-after-stop() begins with a clean supervision record: every task is new.
         self._supervised.clear()
         self._running = False
+
+    def _close_run_on_stop(self, run: FailureRun, what: str) -> FailureRun:
+        """The clean run a restart-in-place begins with (#1844), saying so if one was open: without
+        the line, the last word on a claimer or sweep stopped mid-outage is its last fault record,
+        which reads the same as a fault that never ended.
+
+        Called only at stop(), after the gather, so a run whose task the stop CANCELLED is closed
+        too. Never at a supervisor respawn (#1609): a partition outlives its task, so a replacement
+        claimer continues its predecessor's runs, as the sweep's replacement does."""
+        if run.count:
+            log.warning(
+                "StageDispatcher %s %s: stopped with %d consecutive failures and no recovery",
+                self._stage.value,
+                what,
+                run.count,
+            )
+        return FailureRun()
 
     def _on_task_done(self, index: int | None, task: asyncio.Task[None]) -> None:
         """Claimer/sweep supervision (BACKLOG #1609). These tasks should finish only on shutdown:
@@ -795,22 +827,30 @@ class StageDispatcher:
 
         Each abandoned lane then leaves CLAIMING exactly as an empty claim does: slot released, and
         PAUSED if an operator pause landed meanwhile, else READY."""
+        # BACKLOG #1844: this retry runs every _CLAIM_ERROR_BACKOFF_SECONDS for as long as the store
+        # is down, so its traceback goes on the same backoff as the claim it stands in front of. A
+        # stop leaves an open run on the partition, and stop() writes its closing line.
         while claimer.orphan_ids and not self._stop.is_set():
             ids = list(claimer.orphan_ids)
             try:
                 await self._store.release_claimed(ids)
-            except Exception:  # noqa: BLE001 — retry below; claiming past the head would break FIFO
-                log.warning(
+            except Exception as exc:  # noqa: BLE001 — retry; claiming past the head would break FIFO
+                claimer.release_faults = claimer.release_faults.record(
+                    log,
+                    exc,
                     "StageDispatcher %s %s could not release %d row(s) its predecessor claimed; "
                     "retrying in %.1fs",
                     self._stage.value,
                     name,
                     len(ids),
                     _CLAIM_ERROR_BACKOFF_SECONDS,
-                    exc_info=True,
+                    level=logging.WARNING,
                 )
                 await self._sleep_or_stop(_CLAIM_ERROR_BACKOFF_SECONDS)
                 continue
+            claimer.release_faults = claimer.release_faults.clear(
+                log, "StageDispatcher %s %s release", self._stage.value, name, level=logging.WARNING
+            )
             claimer.orphan_ids.clear()
             log.warning(
                 "StageDispatcher %s %s released %d row(s) its predecessor claimed but never "
@@ -940,7 +980,7 @@ class StageDispatcher:
             result: ClaimedHeads = await self._store.claim_fifo_heads(
                 self._stage.value, lanes, now=now, per_lane_limit=self._per_lane_limit
             )
-        except Exception:  # noqa: BLE001 — a store error must not kill the claimer loop
+        except Exception as exc:  # noqa: BLE001 — a store error must not kill the claimer loop
             # Return the whole chunk to READY, release the reserved slots, back off this partition.
             err_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
             for lane in lanes:
@@ -951,12 +991,15 @@ class StageDispatcher:
                 # so it is booked as `dropped` (occupancy), never as `episode` (service).
                 self._drop_lane_episode(st, err_ns)
                 self._to_ready(lane, woken=st.ready_woken)
-            log.warning(
+            # BACKLOG #1844: on a backoff, with the running count (messagefoundry.log_backoff).
+            claimer.faults = claimer.faults.record(
+                log,
+                exc,
                 "StageDispatcher %s claim failed for %d lane(s); backing off %.1fs",
                 self._stage.value,
                 len(lanes),
                 _CLAIM_ERROR_BACKOFF_SECONDS,
-                exc_info=True,
+                level=logging.WARNING,
             )
             await self._sleep_or_stop(_CLAIM_ERROR_BACKOFF_SECONDS)
             return
@@ -966,6 +1009,13 @@ class StageDispatcher:
         # the replacement before the exception kills the task (see _abandon_claim).
         dispatched = 0
         try:
+            if claimer.faults.count and result.lock_timeout is None:
+                # A claim that returned is the end of a run of RAISED claims -- unless it yielded on a
+                # lock timeout (#1270), which is the store still in trouble, reported on its own line.
+                # Inside the try (#1609): the rows are INFLIGHT from here, so even this line is covered.
+                claimer.faults = claimer.faults.clear(
+                    log, "StageDispatcher %s claim", self._stage.value, level=logging.WARNING
+                )
             if self._claim_phase_timing:
                 # Recorded synchronously (no await between the read and the counter writes), so a sibling
                 # claimer at K>1 can never interleave a partial update. Counts only — a lane is a
@@ -1557,8 +1607,19 @@ class StageDispatcher:
                 await self._run_sweep_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 — a sweep error must not kill the backstop
-                log.warning("StageDispatcher %s sweep failed", self._stage.value, exc_info=True)
+            except Exception as exc:  # noqa: BLE001 — a sweep error must not kill the backstop
+                self._sweep_faults = self._sweep_faults.record(
+                    log,
+                    exc,
+                    "StageDispatcher %s sweep failed",
+                    self._stage.value,
+                    level=logging.WARNING,
+                )
+            else:
+                if self._sweep_faults.count:
+                    self._sweep_faults = self._sweep_faults.clear(
+                        log, "StageDispatcher %s sweep", self._stage.value, level=logging.WARNING
+                    )
             self._mark_task_healthy(self._task_name(None))  # a pass completed, failed or not
 
     async def _run_sweep_once(self) -> None:
