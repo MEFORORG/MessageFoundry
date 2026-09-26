@@ -58,6 +58,33 @@ export class NetworkError extends Error {
 export const TLS_MIN_VERSION = "TLSv1.2";
 
 /**
+ * The TLS 1.2 suites every https request here offers, in preference order (BACKLOG #300).
+ *
+ * A COPY of `APPROVED_TLS12_SUITES` in the engine's `messagefoundry/config/tls_policy.py`, which is
+ * the source of record. The engine's API listener offers exactly these by default, so this client
+ * and the engine it talks to agree by construction. `tests/test_tls_default_suites.py` in the Python
+ * suite reads this array and pins it to the engine's tuple, order included, so the two cannot drift.
+ *
+ * TLS 1.2 names only, matching the engine: Python cannot restrict TLS 1.3 through its cipher string,
+ * and every TLS 1.3 suite is AEAD anyway. Measured on Node 22.17.1: a list with no TLS 1.3 names
+ * still negotiates TLS 1.3, refuses a TLS 1.2 server offering only `ECDHE-ECDSA-AES128-SHA256`
+ * (the unpinned control completed against that server), and accepts one offering the GCM suite.
+ */
+export const TLS_12_SUITES: readonly string[] = [
+  "ECDHE-ECDSA-AES256-GCM-SHA384",
+  "ECDHE-RSA-AES256-GCM-SHA384",
+  "ECDHE-ECDSA-AES128-GCM-SHA256",
+  "ECDHE-RSA-AES128-GCM-SHA256",
+  "ECDHE-ECDSA-CHACHA20-POLY1305",
+  "ECDHE-RSA-CHACHA20-POLY1305",
+  "DHE-RSA-AES256-GCM-SHA384",
+  "DHE-RSA-AES128-GCM-SHA256",
+];
+
+/** {@link TLS_12_SUITES} as the OpenSSL cipher string Node's `ciphers` option takes. */
+export const TLS_CIPHERS = TLS_12_SUITES.join(":");
+
+/**
  * Extra trust anchors, keyed by `host:port` (see {@link engineHostKey}) — BACKLOG #1695.
  *
  * Module-level because a trust anchor is a property of a SERVER, not of one request: every caller
@@ -101,12 +128,14 @@ export function clearEngineTrustAnchors(): boolean {
  * is why `rejectUnauthorized` is never touched. Verification stays on in every posture; the only
  * thing that changes is which anchors it may succeed against.
  *
- * NO explicit cipher list, deliberately, and this is a decision rather than an omission. Node's
- * default suite already excludes the weak families, is maintained upstream, and is negotiated against
- * whatever the operator's TLS terminator offers. A pinned list would freeze this client at today's
- * cryptographic opinion — ageing into weakness precisely because it can no longer track the runtime —
- * and can refuse a handshake a correctly configured proxy would have completed. That is real operator
- * cost paid for a narrower gain than the version floor above, so only the floor is pinned here.
+ * The TLS 1.2 suites are pinned to {@link TLS_CIPHERS} (BACKLOG #300). This comment used to record
+ * the opposite decision: no cipher list, so the client could track Node's upstream default and never
+ * refuse a handshake a correctly configured proxy would complete. Two things changed. The engine now
+ * serves exactly these suites by default, so pinning them refuses nothing a stock engine speaks. And
+ * Node's default still offers the CBC-SHA2 suites the engine's allow-list excludes, so an unpinned
+ * client kept offering them to the engine. The cost that argument named is real
+ * and now paid on purpose: a TLS terminator in front of the engine that speaks only CBC suites will
+ * fail the handshake, and the fix is on that terminator. TLS 1.3 is not constrained by this list.
  */
 export function tlsOptions(url: URL): https.RequestOptions {
   if (url.protocol !== "https:") {
@@ -116,7 +145,8 @@ export function tlsOptions(url: URL): https.RequestOptions {
   // helper in setEngineTrustAnchor would let a later change to one make every lookup silently miss.
   const key = engineHostKey(url.href);
   const ca = key === undefined ? undefined : trustAnchors.get(key);
-  return ca === undefined ? { minVersion: TLS_MIN_VERSION } : { minVersion: TLS_MIN_VERSION, ca };
+  const base: https.RequestOptions = { minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS };
+  return ca === undefined ? base : { ...base, ca };
 }
 
 /** Fold a Node request error into a {@link NetworkError}, preserving its errno. Shared by GET/POST so

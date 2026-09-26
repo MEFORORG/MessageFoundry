@@ -1,31 +1,32 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""ASVS 6.3.2 (BACKLOG #1136) — what a fresh install's user table actually holds.
+"""ASVS 6.3.2 (BACKLOG #1136) -- what a fresh install's user table actually holds.
 
 The pinned verb asks that default user accounts *"are not present in the application or are
-disabled"*. These tests pin the shipped answer rather than assert the desired one: on a fresh store
-the engine creates an **enabled** account named ``admin`` holding Administrator, so neither arm of
-the verb holds at creation. The first-run redesign is expected to turn them red — that is what they
-are for, and nothing here is a compensating control.
+disabled"*. ADR 0183 Amendment A takes the first arm: ``AuthService.initialize()`` seeds the built-in
+roles and creates no account, so a fresh store holds none until an operator runs
+``messagefoundry provision-admin`` at the host. These tests pin that end state (AC-10).
 
-Severity is conditional (CLAUDE.md §0): MessageFoundry has **zero deployments**, so this is what a
-deploying site would inherit on first run, never a live exposure. It is also not a default
-*credential* — the password is per-install CSPRNG and must-change.
+They used to pin the opposite, on purpose: before Wave 2 a fresh store got an ENABLED account named
+``admin`` holding Administrator, and these tests were written to turn red when that changed.
 
-See also ``tests/test_auth_service.py::test_bootstrap_admin_created_once_and_can_log_in``, which
-pins that the seeding happens once and the account can sign in. This module is complementary, not a
-duplicate: it adds the persisted ``disabled`` column, the cross-backend contract, and the directory
-precondition below.
+Severity is conditional (CLAUDE.md section 0): MessageFoundry has **zero deployments**, so this is
+what a deploying site would get on first run, never a live exposure.
+
+The persisted ``disabled`` column and the cross-backend contract below still matter: the disabled
+arm stays unexpressible, which is why the "not present" arm is the one taken.
 """
 
 from __future__ import annotations
 
 import inspect
 import re
+from pathlib import Path
 
+from messagefoundry.api import create_managed_app
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import MessageStore
@@ -64,29 +65,37 @@ async def _directory_signed_in(store: Store) -> str:
     return principal.username
 
 
-async def test_fresh_store_gets_an_enabled_account_named_admin() -> None:
-    """Neither arm of 6.3.2 holds at creation: the account is present AND enabled.
+async def test_a_fresh_store_gets_no_account(tmp_path: Path) -> None:
+    """AC-10: ``serve`` on a store with no users creates no account, so neither arm needs a knob.
 
-    Pins all three halves the cell turns on — the well-known name, the persisted ``disabled``
-    column, and the Administrator role — in one place, so a redesign cannot satisfy one and quietly
-    drop another.
+    Asserted at both altitudes. The service call is the unit; the lifespan is what ``serve`` runs,
+    and it is where the account used to be minted and written to ``bootstrap-admin.txt``. The
+    lifespan runs with sign-in required and the ADR 0167 gate skipped (notices off), so it starts on
+    the empty store rather than refusing, and the assertion is about what the start wrote.
     """
     store = await MessageStore.open(":memory:")
     try:
-        created = await AuthService(store, AuthSettings()).initialize()
-
-        assert created is not None, "a fresh store must have produced a bootstrap credential"
-        assert created.username == BOOTSTRAP_USERNAME == "admin"
-
-        row = await store.get_user_by_username(BOOTSTRAP_USERNAME)
-        assert row is not None, "the bootstrap account is PRESENT"
-        assert row.disabled is False, "and ENABLED — so the 'disabled' arm does not hold either"
-        assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(row.id)
-
-        # It is the ONLY account, so "a default account exists" describes the whole population.
-        assert await store.count_users() == 1
+        await AuthService(store, AuthSettings()).initialize()
+        assert await store.count_users() == 0, "initialize() created an account"
+        assert await store.get_user_by_username("admin") is None
+        # Positive control: initialize() really ran, so the zero is not an untouched store.
+        assert Role.ADMINISTRATOR.value in {r["id"] for r in await store.list_roles()}
     finally:
         await store.close()
+
+    db = tmp_path / "fresh.db"
+    app = create_managed_app(
+        db_path=db,
+        poll_interval=0.05,
+        auth_settings=AuthSettings(enabled=True, notify_security_events=False),
+    )
+    async with app.router.lifespan_context(app):
+        pass
+    served = await MessageStore.open(db)
+    try:
+        assert await served.count_users() == 0, "the serve lifespan created an account"
+    finally:
+        await served.close()
 
 
 def _disabled_values_slot(func: object) -> str:
@@ -136,20 +145,18 @@ async def test_a_directory_sign_in_creates_a_roleless_row() -> None:
     """A completed directory sign-in makes ``count_users()`` non-zero and grants no role.
 
     This is the measurement behind the correction to #1136's researched work list. That research
-    proposes provisioning the first administrator from an offline CLI command guarded by
-    ``count_users() == 0``, on the ground that reusing the existing bootstrap guard widens no
-    authority. The guard is only safe while nothing else can put the first row in the table, and a
-    directory sign-in can. So the refusal guard has to ask whether an **enabled administrator**
-    exists, not whether the table is empty.
+    proposed provisioning the first administrator from an offline CLI command guarded by
+    ``count_users() == 0``. The guard is only safe while nothing else can put the first row in the
+    table, and a directory sign-in can. So the refusal guard asks whether an **enabled
+    administrator** exists, not whether the table is empty.
 
-    Today this strands nothing, because ``initialize()`` seeds the bootstrap admin at startup before
-    any login can run. Removing the auto-create is what would open the window.
+    Since Wave 2 nothing seeds an administrator at startup, so this is the state an install with a
+    directory wired can reach before anyone provisions. ``provision-admin`` still proceeds there;
+    ``tests/test_provision_first_administrator.py`` pins that half.
     """
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
-        # Deliberately NOT preceded by initialize(): this is the store state the redesign creates,
-        # where nothing seeded an administrator first.
         username = await _directory_signed_in(store)
 
         user = await store.get_user_by_username(username)
@@ -157,23 +164,24 @@ async def test_a_directory_sign_in_creates_a_roleless_row() -> None:
         assert await store.count_users() == 1, "the table is no longer empty"
         assert await store.get_user_role_ids(user.id) == [], "and the row holds no role"
 
-        # The sharp end. Run the shipped seeding path against this store and it declines, because its
-        # guard asks the same "is the table empty" question the directory row already answered.
-        assert await service.initialize() is None
-        assert await store.get_user_by_username(BOOTSTRAP_USERNAME) is None
+        # A start after the sign-in adds nothing and grants nothing.
+        await service.initialize()
+        assert await store.count_users() == 1
+        assert await service.has_enabled_administrator() is False
     finally:
         await store.close()
 
-    # Control arm, on a separate fixture — the assertions above must be able to tell the two store
-    # states apart. Against an untouched store the same calls DO yield an enabled administrator, so
-    # the empty role list and the None above are findings about the directory path rather than about
-    # how this test reads roles. It cannot be folded into the test above without losing that, nor
-    # into the first test, which would leave this one uninterpretable when run alone.
+    # Control arm, on a separate fixture: the assertions above must be able to tell the two store
+    # states apart. Provisioned the one way an Administrator now comes to exist, the same role read
+    # DOES return Administrator, so the empty role list above is a finding about the directory path
+    # rather than about how this test reads roles.
     control = await MessageStore.open(":memory:")
     try:
-        assert await AuthService(control, AuthSettings()).initialize() is not None
-        seeded = await control.get_user_by_username(BOOTSTRAP_USERNAME)
-        assert seeded is not None
-        assert Role.ADMINISTRATOR.value in await control.get_user_role_ids(seeded.id)
+        service = AuthService(control, AuthSettings())
+        outcome = await service.provision_first_administrator(
+            username="site-admin", password="a-long-enough-operator-passphrase", actor="test"
+        )
+        assert Role.ADMINISTRATOR.value in await control.get_user_role_ids(outcome.user_id)
+        assert await service.has_enabled_administrator() is True
     finally:
         await control.close()

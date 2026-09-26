@@ -6,10 +6,11 @@ policy is set by whoever *operates* the install (ops/admin), not by the individu
 central "off" — or a cap on what data the assistant may see — is honored on every workstation that
 talks to the engine.
 
-> **Carries PHI implications.** This document covers the *policy model and its enforcement*. The
-> hard PHI guarantee (the MVP assistant only ever sends **code**, never message bodies) is restated
-> in [PHI.md](PHI.md#ai-coding-assistance); the RBAC permission that gates it is in
-> [SECURITY.md](SECURITY.md).
+> **Carries PHI implications.** This document covers the *policy model and its enforcement*. What
+> the assistant sends, and which part of that the engine enforces, is stated once, in
+> [*The IDE decides what the assistant sends*](#the-ide-decides-what-the-assistant-sends-and-the-engine-checks-only-a-label)
+> below; [PHI.md](PHI.md#ai-coding-assistance) links to it. The RBAC permission that gates the
+> assistant is in [SECURITY.md](SECURITY.md).
 
 > **Scope — product feature, not the dev process.** This governs the AI assistant the *shipped
 > product* offers operators. The maintainers' *own* discipline for using Claude Code to **build**
@@ -20,7 +21,7 @@ talks to the engine.
 > **Status (MVP).** The policy model + config + RBAC + the engine policy endpoint + the CLI + gating
 > of the existing **provider-agnostic, bring-your-own** IDE chat assistant are built. **One engine
 > broker IS built:** `managed_endpoint` ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md))
-> brokers a single `code_only` prompt to a customer-managed / self-hosted LLM over `POST /ai/chat`,
+> brokers a single prompt, labelled `code_only`, to a customer-managed / self-hosted LLM over `POST /ai/chat`,
 > audited per use; it never reaches `phi` scope. `managed_claude` / `managed_claude_baa` are accepted
 > as policy values but the IDE cannot service them, and the `deidentified` / `phi` scopes are not
 > reachable in the MVP (see *Future direction*).
@@ -37,8 +38,8 @@ The policy is two independent axes, then **clamped** by the instance's **product
   | `mode` | Meaning |
   |---|---|
   | `off` | No AI assistance at all. |
-  | `byo` | **Bring-your-own** provider, configured in the IDE; the engine never sees the traffic. Code-only by construction (PHI-safe). |
-  | `managed_endpoint` | **BUILT** ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)) — the engine brokers one `code_only` prompt to a **customer-managed / self-hosted** LLM over `POST /ai/chat`, audited per use, behind a fail-closed SSRF allowlist. Never reaches `phi` scope. |
+  | `byo` | **Bring-your-own** provider, configured in the IDE; the engine never sees the traffic. What the prompt holds is the IDE's own behaviour; the engine enforces nothing about it. |
+  | `managed_endpoint` | **BUILT** ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)) — the engine brokers one prompt, labelled `code_only`, to a **customer-managed / self-hosted** LLM over `POST /ai/chat`, audited per use, behind a fail-closed SSRF allowlist. Never reaches `phi` scope. |
   | `managed_claude` | Engine-brokered managed provider. **Future** — not serviceable by this IDE version. |
   | `managed_claude_baa` | Engine-brokered managed provider under a **BAA** + zero-data-retention connection — the only mode that can reach `phi` scope. **Future.** |
 
@@ -48,7 +49,7 @@ The policy is two independent axes, then **clamped** by the instance's **product
 
   | `data_scope` | Order | Meaning |
   |---|---|---|
-  | `code_only` | 0 | Graph names + the active editor's code. **The only scope the MVP ever sends.** |
+  | `code_only` | 0 | Graph names + the active editor's code. **The only scope the MVP IDE ever claims.** It is a label on the request, not a check on its content. |
   | `synthetic` | 1 | Plus synthetic (generated) HL7 — never real patient data. |
   | `deidentified` | 2 | De-identified message data. **Requires the (unbuilt) de-id framework** — never reached today. |
   | `phi` | 3 | Real message bodies / PHI. Reachable **only** under `managed_claude_baa`. |
@@ -203,8 +204,10 @@ Then it applies the effective policy:
 | `mode == unverified` (nothing could confirm a policy) | **Disabled.** Fail-closed; see above. |
 
 **The `assist_permitted == null` trust note.** Under BYO, `null` (RBAC not evaluable) is **allowed**.
-This is safe by construction: BYO sends only **code-only** context to the developer's own provider —
-it never sees the engine or any message data, so there is no PHI to protect with RBAC at this stage.
+The reasoning: under BYO the prompt goes straight to the developer's own provider, and the engine is
+not on that path, so engine RBAC could not protect it in any case. The IDE assembles no message data
+on its own, but nothing checks what a person types or keeps in an open file; see
+[*The IDE decides what the assistant sends*](#the-ide-decides-what-the-assistant-sends-and-the-engine-checks-only-a-label).
 The central *off* switch is honored regardless, because `mode` is identity-independent and is read
 straight from the policy, token or not.
 
@@ -231,15 +234,36 @@ resolved policy in the IDE.
 
 ---
 
-## PHI guarantee (MVP)
+## The IDE decides what the assistant sends, and the engine checks only a label
 
-In the MVP the assistant **only ever attaches `code_only` context** — the graph's connection/router/
-handler names and the active editor's code (capped by the `messagefoundry.ai.contextCharLimit` VS
-Code setting, **default 8000 chars**; oversized files are cut on a line boundary and a marker is
-appended so the truncation is never silent), nothing more. **No message bodies, no patient data, are
-ever sent — regardless of mode, provider, or that limit.** Scopes above `code_only` (`synthetic`,
-`deidentified`, `phi`) are not wired into the IDE; the resolver caps them and the chat path carries
-an explicit guard against attaching anything beyond code. See [PHI.md](PHI.md#ai-coding-assistance).
+In the MVP the IDE builds each prompt from these parts, several of them conditional:
+
+1. A fixed primer describing MessageFoundry.
+2. The graph's connection, router and handler names.
+3. The text of the active editor, only when it is a Python file: the selection if there is one, else
+   the whole file. The `messagefoundry.ai.contextCharLimit` VS Code setting caps it, **default 8000
+   chars**. An oversized file is cut, on a line boundary where one exists, and marked. A limit of `0`
+   sends no code at all.
+4. A fixed task text, for the slash commands that carry one.
+5. The request the user types.
+
+The IDE attaches no message body on its own, and the scopes above `code_only` (`synthetic`,
+`deidentified`, `phi`) are not wired into it. **That is how the IDE behaves, not an engine
+guarantee.** Nothing inspects the text before it goes, so at least these would reach the model:
+
+- a message body the user pastes into the chat request;
+- a message body held in the open Python file, such as a fixture string in a test.
+
+What the engine enforces depends on the mode:
+
+| Mode | Who sends the prompt | What the engine checks |
+|---|---|---|
+| `byo` | the IDE, straight to the user's own provider | nothing: the engine is not on the path |
+| `managed_endpoint` | the engine, on `POST /ai/chat` | the `ai:assist` permission; that the server-side policy is `managed_endpoint`; and that the request's `data_scope` **label** is `code_only`. An omitted label counts as `code_only`; another scope gets `403`. The prompt must be 1 to 200,000 characters. It never reads the prompt to check the label. It audits the prompt's length, never its text. |
+
+So the `code_only` scope says what the IDE puts in a prompt. It does not stop a person from putting a
+message body there. Keep real message bodies out of the chat and out of Python files open in the
+editor.
 
 ---
 

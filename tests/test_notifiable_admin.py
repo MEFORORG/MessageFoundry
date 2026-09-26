@@ -5,15 +5,17 @@
 The PHI startup gate computes notification readiness from the SMTP transport alone
 (``notify_security_events`` + ``email_smtp_host`` + ``email_from``). That answers *"is a transport
 configured"* and never *"can the account that matters actually receive"* -- and the two come apart on
-exactly the instance the gate is meant to protect: ``_ensure_bootstrap_admin`` creates the account
-holding ``frozenset(Permission)`` with no ``email=``, so every notice about it no-ops while the gate
-reports a healthy channel.
+exactly the instance the gate is meant to protect. ``provision-admin`` without ``--email`` creates the
+account holding ``frozenset(Permission)`` with no address, so every notice about it no-ops while the
+gate reports a healthy channel. (The item was found on the first-run bootstrap account, which ADR
+0183 Amendment A has since retired.)
 
 ``has_notifiable_admin`` is the missing half of that question. These arms are deliberately
 ASYMMETRIC -- a control that failed on everything would not distinguish *"the predicate keys on a
 deliverable admin"* from *"the predicate is just hard to satisfy"*:
 
-* the REAL bootstrap path yields False (the defect, reproduced rather than described);
+* the REAL first-administrator path, with no address, yields False (the defect, reproduced
+  rather than described);
 * an administrator WITH an address yields True;
 * a non-administrator with an address still yields False -- so the predicate keys on the ROLE, not
   on "some mailbox exists somewhere", which is the scope the item asks for (``email`` is optional
@@ -32,6 +34,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_admin
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
 
@@ -48,41 +51,49 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
-async def _admin_session(c: httpx.AsyncClient, service: AuthService) -> dict[str, str]:
-    """Bootstrap the first admin exactly as a first run does, and clear its must-change flag."""
-    boot = await service.initialize()
-    assert boot is not None
+async def _rotated_session(c: httpx.AsyncClient, username: str, password: str) -> dict[str, str]:
+    """Sign in, clear the must-change flag, and sign in again; return the auth headers."""
     tok = (
         await c.post(
             "/auth/login",
-            json={"username": "admin", "password": boot.password, "provider": "local"},
+            json={"username": username, "password": password, "provider": "local"},
         )
     ).json()["token"]
     h = {"Authorization": f"Bearer {tok}"}
     await c.post(
         "/me/password",
         headers=h,
-        json={"current_password": boot.password, "new_password": "a-rotated-passphrase-99"},
+        json={"current_password": password, "new_password": "a-rotated-passphrase-99"},
     )
     tok = (
         await c.post(
             "/auth/login",
-            json={"username": "admin", "password": "a-rotated-passphrase-99", "provider": "local"},
+            json={"username": username, "password": "a-rotated-passphrase-99", "provider": "local"},
         )
     ).json()["token"]
     return {"Authorization": f"Bearer {tok}"}
 
 
-async def test_the_bootstrap_admin_alone_is_not_notifiable(engine: Engine) -> None:
-    """The defect, on the REAL first-run path rather than a hand-built fixture.
+async def _admin_session(c: httpx.AsyncClient, service: AuthService) -> dict[str, str]:
+    """Create an addressless admin, which needs no bootstrap account, and clear its must-change flag."""
+    admin = await create_admin(service)
+    return await _rotated_session(c, admin.username, admin.password)
 
-    This is the state a deploying site is in at the moment the SMTP-only gate passes: one account,
-    holding every permission, with no address any notice could reach.
+
+async def test_an_administrator_provisioned_without_an_address_is_not_notifiable(
+    engine: Engine,
+) -> None:
+    """The defect, on the REAL first-administrator path rather than a hand-built fixture.
+
+    Since ADR 0183 the first administrator comes from ``provision-admin``, where ``--email`` is
+    optional. Without it the store holds one account, holding every permission, with no address any
+    notice could reach: the state a deploying site is in at the moment the SMTP-only gate passes.
     """
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    async with _client(engine, service) as c:
-        await _admin_session(c, service)
-        assert await service.has_notifiable_admin() is False
+    await service.initialize()
+    await service.provision_first_administrator(username="site-admin", password=PW, actor="test")
+    assert await service.has_enabled_administrator() is True  # control: the account is there
+    assert await service.has_notifiable_admin() is False
 
 
 async def test_an_administrator_with_an_address_is_notifiable(engine: Engine) -> None:

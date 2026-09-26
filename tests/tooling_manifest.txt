@@ -23,6 +23,7 @@
 # tests/test_tooling_partition.py pins this file against the tree and fails if a new non-engine test
 # lands in neither this list nor its explicit stay-list.
 tests/test_adr0071_crossing_count.py
+tests/test_adr_index_coverage.py
 tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_announce_wiring.py
@@ -52,6 +53,7 @@ tests/test_cla_action_provenance.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
 tests/test_codex_bridge.py
+tests/test_connscale_harvest.py
 tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_reentrancy.py
 tests/test_coord_fleet_fetch_clock.py

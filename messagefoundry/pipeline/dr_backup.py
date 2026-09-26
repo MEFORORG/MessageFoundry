@@ -1706,12 +1706,17 @@ def _restore_blocking(
         # shared temp volume that may be less protected than the store's own.
         #
         # "Less protected than the store's own" is a claim about the VOLUME, and it does not carry to
-        # the files. `TemporaryDirectory` restricts the directory on POSIX and inherits whatever the
-        # destination's parent grants on Windows, and the two files staged inside it are the whole
+        # the files. `TemporaryDirectory` restricts the directory on POSIX, and on Windows under Python
+        # 3.13+ writes its own protected DACL (SYSTEM, Administrators, OWNER RIGHTS -- measured on
+        # 3.14.6) rather than inheriting the parent's. The two files staged inside it are the whole
         # decrypted archive and the whole store -- both full-body PHI at rest (docs/PHI.md section 3).
         # So each is locked to its owner with the store's own primitive the moment it exists and
-        # before its first byte is written, the same call `_place_restored_store` makes on the file it
-        # publishes. Best-effort and non-fatal, per that primitive's contract.
+        # before its first byte is written. Best-effort and non-fatal, per that primitive's contract.
+        # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b).
+        # archive.tar and extracted_store.db keep what `_secure_file` leaves, which is NOT owner-only when
+        # a file carries the temp directory's entries explicitly (it removes inherited entries only;
+        # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
+        # published DACL. A follow-up recorded in ADR 0163.
         with tempfile.TemporaryDirectory(
             prefix="mefor-restore-", dir=dest_store_path.parent
         ) as tmp:
@@ -2066,8 +2071,10 @@ def _place_restored_store(src: Path, dest: Path) -> int:
     it is locked down the way ``Store.snapshot_to`` locks its own output down."""
     import shutil
 
-    # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path.
-    from messagefoundry.store.store import _secure_file
+    # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path. It is the
+    # store-trio rule, not bare _secure_file: restored into a hardened data directory, an owner-only
+    # file would lock the service account out of the store it is about to open (ADR 0183 Wave 0b).
+    from messagefoundry.store.store import _secure_store_file, _store_dir_grants
 
     size = src.stat().st_size
     try:
@@ -2094,7 +2101,7 @@ def _place_restored_store(src: Path, dest: Path) -> int:
             # has closed the handle, which Windows requires before an unlink.
             if not placed:
                 dest.unlink(missing_ok=True)
-    _secure_file(dest)
+    _secure_store_file(dest, dir_grants=_store_dir_grants(dest.parent))
     return size
 
 

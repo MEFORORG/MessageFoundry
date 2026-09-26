@@ -66,7 +66,8 @@ messagefoundry-harness = "harness.__main__:main"
 [project.urls]
 Homepage = "https://messagefoundry.org/"
 Source = "https://github.com/MEFORORG/MessageFoundry"
-Issues = "https://github.com/MEFORORG/MessageFoundry/issues"
+# Contributing, not Issues: CONTRIBUTING.md states the routes (BACKLOG #1755).
+Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTING.md"
 
 [tool.hatch.build.targets.wheel]
 # harness/ is two levels up (the repo root). This table used to carry the one mapping

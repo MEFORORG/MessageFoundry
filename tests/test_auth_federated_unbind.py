@@ -11,8 +11,10 @@ Two of the tests below are about what the transaction BOUNDARY buys, which is th
 that merely "works" gets wrong: the audited pair is read inside the same transaction that clears
 it, and a federated login already in flight cannot mint a session after the revocation has run.
 
-The bindings here are made by a REAL federated login through the shared OIDC helpers, so the state
-being unbound is the state the login path writes, not a hand-built row that might differ from it.
+The bindings here are made through the admin bind, ``AuthService.bind_federated_subject``, and then
+used by a REAL federated login through the shared OIDC helpers. Since BACKLOG #1143 (ADR 0184) that
+bind is the only path that writes one: a federated login selects its account by the pair and never
+binds. Until then these bindings were written by the login itself.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from typing import Any
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from messagefoundry.auth.service import FEDERATED_SUBJECT_NOT_BOUND
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.store.store import MessageStore
 from tests.test_auth_oidc_service import _oidc_login, _service
@@ -33,7 +36,7 @@ from tests.test_auth_oidc_service import _oidc_login, _service
 def rsa_key() -> rsa.RSAPrivateKey:
     """Local rather than imported: a fixture resolves by name in the module that requests it, so
     importing the sibling suite's function would not register it here."""
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 async def _unbound_rows(store: MessageStore) -> list[Mapping[str, Any]]:
@@ -45,7 +48,7 @@ async def test_unbind_clears_the_pair_revokes_sessions_and_audits_the_count(
 ) -> None:
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key)
+        service = await _service(store, rsa_key, bind="S-1-alice")
         login = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
         assert login.ok and login.token is not None
         account = await store.get_user_by_username("jdoe")
@@ -78,26 +81,42 @@ async def test_unbind_clears_the_pair_revokes_sessions_and_audits_the_count(
         await store.close()
 
 
-async def test_after_an_unbind_a_new_subject_binds_instead_of_conflicting(
+async def test_after_an_unbind_a_new_subject_binds_only_through_the_admin_path(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The point of an unbind: the account can take a different subject afterwards.
+    """The point of an unbind: the account can take a different subject afterwards -- through the
+    admin bind, and through nothing else.
 
-    The CONTROL runs first. Before the unbind the new subject is refused as
-    ``federated_subject_conflict``; without that, a pass below could mean the guard was never armed.
+    **REWRITTEN for BACKLOG #1143 / #295 (ADR 0184). Until then this test was
+    ``test_after_an_unbind_a_new_subject_binds_instead_of_conflicting``**, and it asserted that the
+    first federated login after an unbind bound whatever subject presented. That was
+    bind-on-first-presentation, which the owner's 2026-09-06 ruling forbids. It is also why no unbind
+    caller could ship before the AC-4 refusal did: an unbind followed by that login handed the
+    account to the next subject to arrive.
+
+    THE CONTROL runs first: before the unbind a new subject is refused, so a refusal after it cannot
+    be a guard that was never armed. Both subjects are refused after the unbind, the old one because
+    it was withdrawn and the new one because nothing bound it. Only the admin bind lets the new one in.
     """
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key)
+        service = await _service(store, rsa_key, bind="S-1-alice")
         assert (await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")).ok
 
         refused = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-bob")
-        assert not refused.ok and refused.reason == "federated_subject_conflict"
+        assert not refused.ok and refused.reason == FEDERATED_SUBJECT_NOT_BOUND
 
         account = await store.get_user_by_username("jdoe")
         assert account is not None
         await service.unbind_federated_subject(account.id, actor="admin")
 
+        for sub in ("S-1-alice", "S-1-bob"):
+            after_unbind = await _oidc_login(service, monkeypatch, rsa_key, sub=sub)
+            assert not after_unbind.ok and after_unbind.reason == FEDERATED_SUBJECT_NOT_BOUND, sub
+        still = await store.get_user(account.id)
+        assert still is not None and still.oidc_subject is None, "a login bound the unbound account"
+
+        await service.bind_federated_subject(account.id, "S-1-bob", actor="admin")
         rebound = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-bob")
         assert rebound.ok, rebound.reason
         after = await store.get_user_by_username("jdoe")
@@ -149,13 +168,14 @@ async def test_the_audit_row_names_the_pair_the_unbind_itself_cleared(
     afterwards clears ``S-1-carol``. The row has to name what was cleared; naming the pair that was
     there a moment earlier is a false record of whose access was withdrawn.
 
-    The wedge sits on ``get_user`` precisely BECAUSE the fixed code never calls it here: the test
-    fails loudly if that read comes back, and passes only while the reported pair is the
-    transaction's own.
+    The wedge sits on ``get_user`` BEFORE the clear, because the fixed code never reads the account
+    there: the test fails loudly if that read comes back, and passes only while the reported pair is
+    the transaction's own. The one read after the clear, for the holder's notice address, is let
+    through (BACKLOG #1143).
     """
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key)
+        service = await _service(store, rsa_key, bind="S-1-alice")
         assert (await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")).ok
         account = await store.get_user_by_username("jdoe")
         assert account is not None and account.oidc_subject == "S-1-alice"
@@ -167,13 +187,29 @@ async def test_the_audit_row_names_the_pair_the_unbind_itself_cleared(
         await store.clear_user_federated_subject(account.id, now=10.0)
         await store.set_user_federated_subject(account.id, issuer, "S-1-carol", now=11.0)
 
-        async def unexpected_get_user(user_id: str) -> Any:
-            raise AssertionError(
-                "unbind_federated_subject read the account outside its transaction; the pair it"
-                " audits can then be one a concurrent rebind has already replaced"
-            )
+        # The wedge refuses a read BEFORE the clear. Since BACKLOG #1143 the unbind reads the
+        # account once AFTER the clear and its audit row, for the holder's notice address only; that
+        # read cannot change what the row names, so it is allowed through.
+        real_get_user = store.get_user
+        real_clear = store.clear_user_federated_subject
+        cleared = False
 
-        monkeypatch.setattr(store, "get_user", unexpected_get_user)
+        async def clear_and_mark(*args: Any, **kwargs: Any) -> Any:
+            nonlocal cleared
+            result = await real_clear(*args, **kwargs)
+            cleared = True
+            return result
+
+        async def get_user_only_after_the_clear(user_id: str) -> Any:
+            if not cleared:
+                raise AssertionError(
+                    "unbind_federated_subject read the account outside its transaction; the pair it"
+                    " audits can then be one a concurrent rebind has already replaced"
+                )
+            return await real_get_user(user_id)
+
+        monkeypatch.setattr(store, "clear_user_federated_subject", clear_and_mark)
+        monkeypatch.setattr(store, "get_user", get_user_only_after_the_clear)
         await service.unbind_federated_subject(account.id, actor="admin")
         monkeypatch.undo()
 
@@ -200,7 +236,7 @@ async def test_an_unbind_racing_an_in_flight_login_refuses_the_session(
     """
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key)
+        service = await _service(store, rsa_key, bind="S-1-alice")
         control = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
         assert control.ok and control.token is not None
         account = await store.get_user_by_username("jdoe")

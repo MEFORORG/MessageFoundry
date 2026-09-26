@@ -49,18 +49,63 @@ jobs:
         env:
           MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
+          # THE PHI POSTURE'S GATES, provisioned the way ci.yml's `load test (smoke, sqlite)` leg does.
+          # `serve --env dev` runs the secure PHI posture, so a keyless start, an unbounded retention
+          # window and an unlisted egress each refuse at start. That leg's comment carries the reasoning;
+          # this leg copies its provisions and adds nothing. The store key is minted in `run:` below.
+          # The security-notification gate is skipped because auth is off (no accounts to notify).
+          MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
+          MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
+          MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
           set -o pipefail
+          # Mint a throwaway AES-256 store key at runtime; never a committed literal (gitleaks).
+          # 32 random bytes, base64 -- the MEFOR_STORE_ENCRYPTION_KEY format. serve refuses without one.
+          # Assigned before export: `export VAR="$(...)"` returns export's status and hides a failed mint.
+          store_key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          echo "::add-mask::$store_key"
+          export MEFOR_STORE_ENCRYPTION_KEY="$store_key"
+          # THE ENGINE ALWAYS SERVES TLS (ADR 0172) and mints a self-signed pair beside [store].path on
+          # first run. This step used to probe http://, so it talked cleartext at a TLS socket and never
+          # got an answer. With no project root set, the relative --db below resolves against the working
+          # directory, which for a step with no `working-directory:` is $GITHUB_WORKSPACE -- measured by
+          # ci.yml's sqlite load leg (run 33511381948), whose comment records the logged path. `-k`
+          # would also go green and is the wrong repair: verifying the certificate the engine actually
+          # serves is part of "the engine came up".
+          cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          # The harness pins that same pair through these two variables (harness/load/tlsmat.py,
+          # inherited branch), exactly as ci.yml's load legs do. PR 1502 adds a `--cacert PEM` flag for
+          # this; switch to `--cacert "$cert"` once it is on main.
+          export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
+          export MEFOR_HARNESS_TLS_KEY_FILE="$key"
           python -m messagefoundry serve --config harness/config/load --env dev --db ./bench.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
-          for _ in $(seq 1 60); do curl -sf http://127.0.0.1:8765/health > /dev/null && break || sleep 0.5; done
+          # The certificate is minted during startup, so a miss on the first turns is ordinary.
+          ready=
+          for _ in $(seq 1 60); do
+            curl -fsS --max-time 5 --cacert "$cert" https://127.0.0.1:8765/health > /dev/null 2>&1 && { ready=1; break; } || sleep 0.5
+          done
           set +e
-          python -m harness --load reference --engine http://127.0.0.1:8765 --sink-port 2700 \
-            --db-backend sqlite --report-json out/load/reference-sqlite.json --report-csv out/load/reference-sqlite.csv
+          if [ -n "$ready" ]; then
+            python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
+              --db-backend sqlite --report-json out/load/reference-sqlite.json --report-csv out/load/reference-sqlite.csv
+          else
+            echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
+          fi
           set -e
+          # Bounded reap, so the engine frees its ports and database before the next step. An unbounded
+          # `wait` could block to GitHub's 360-minute default on an engine that ignores SIGTERM.
           kill "$engine_pid" 2>/dev/null || true
+          for _ in $(seq 1 20); do kill -0 "$engine_pid" 2>/dev/null || break; sleep 0.5; done
+          kill -9 "$engine_pid" 2>/dev/null || true
+          wait "$engine_pid" 2>/dev/null || true
           echo "===== engine log (tail) ====="; tail -40 engine.log || true
+          # A never-ready engine fails the step. The old loop could not fail, so a dead engine produced a
+          # green run with no report. The harness's own exit stays unpropagated, as before.
+          [ -n "$ready" ]
       - name: Upload baseline report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -106,23 +151,105 @@ jobs:
         run: |
           mkdir -p out/load
           { echo "## postgres"; uname -a; python --version; psql --version 2>/dev/null || echo "psql n/a"; git rev-parse HEAD; } | tee out/load/env-postgres.txt
+      - name: Create a separate database for the failover profile
+        id: failover_db
+        # Why the failover profile needs its own database is at its step below. POSTGRES_DB creates
+        # only one, so this adds the second through asyncpg, which the postgres extra installs.
+        # continue-on-error so a failure here skips only the failover step, which gates on this
+        # step's `outcome`, and never the reference measurement.
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import asyncio
+          import os
+
+          import asyncpg
+
+
+          async def main() -> None:
+              conn = await asyncpg.connect(
+                  host=os.environ["MEFOR_STORE_SERVER"],
+                  port=int(os.environ["MEFOR_STORE_PORT"]),
+                  user=os.environ["MEFOR_STORE_USERNAME"],
+                  password=os.environ["MEFOR_STORE_PASSWORD"],
+                  database="postgres",
+              )
+              try:
+                  if not await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = 'messagefoundry_failover'"):
+                      await conn.execute("CREATE DATABASE messagefoundry_failover")
+              finally:
+                  await conn.close()
+
+
+          asyncio.run(main())
+          PY
       - name: Serve (Postgres) + reference rate-steps
         env:
           MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
+          # THE ENFORCEMENT DIAL, and why this leg needs it. The store hop to the Postgres container is
+          # weakened TLS (job env above). Under the shipped `enforce`, the MEFOR_ALLOW_INSECURE_TLS
+          # escape is clamped inert (ADR 0092 decision 2), so serve refuses at store open. `warn` honors
+          # the escape and still reports every gate. ci.yml's `load test (smoke, sqlserver)` leg carries
+          # the full reasoning, including why no narrower fix exists for a `services:` container.
+          MEFOR_SECURITY_ENFORCEMENT: "warn"
+          # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
+          MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
+          MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
+          MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
           set -o pipefail
+          # Mint a throwaway AES-256 store key at runtime; never a committed literal (gitleaks). Assigned
+          # before export: `export VAR="$(...)"` returns export's status and hides a failed mint.
+          store_key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          echo "::add-mask::$store_key"
+          export MEFOR_STORE_ENCRYPTION_KEY="$store_key"
+          # https + pinned, as in the sqlite leg. This step passes no --db, so [store].path keeps its
+          # default relative "messagefoundry.db" and the minted pair lands in the working directory,
+          # $GITHUB_WORKSPACE (measured on ci.yml's sqlserver load leg, run 33511381948). serve derives
+          # the pair's directory from [store].path whatever the backend, so this holds for Postgres as well.
+          # MEFOR_ALLOW_INSECURE_TLS in the job env is the engine's escape for the hop it DIALS to the
+          # database. It has no reach over this hop, which is a client reaching the engine's API.
+          cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
+          export MEFOR_HARNESS_TLS_KEY_FILE="$key"
           python -m messagefoundry serve --config harness/config/load --env dev \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
-          for _ in $(seq 1 60); do curl -sf http://127.0.0.1:8765/health > /dev/null && break || sleep 0.5; done
+          ready=
+          for _ in $(seq 1 60); do
+            curl -fsS --max-time 5 --cacert "$cert" https://127.0.0.1:8765/health > /dev/null 2>&1 && { ready=1; break; } || sleep 0.5
+          done
           set +e
-          python -m harness --load reference --engine http://127.0.0.1:8765 --sink-port 2700 \
-            --db-backend postgres --report-json out/load/reference-postgres.json --report-csv out/load/reference-postgres.csv
+          if [ -n "$ready" ]; then
+            python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
+              --db-backend postgres --report-json out/load/reference-postgres.json --report-csv out/load/reference-postgres.csv
+          else
+            echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
+          fi
           set -e
+          # Bounded reap, so the engine frees its ports and database before the next step. An unbounded
+          # `wait` could block to GitHub's 360-minute default on an engine that ignores SIGTERM.
           kill "$engine_pid" 2>/dev/null || true
+          for _ in $(seq 1 20); do kill -0 "$engine_pid" 2>/dev/null || break; sleep 0.5; done
+          kill -9 "$engine_pid" 2>/dev/null || true
+          wait "$engine_pid" 2>/dev/null || true
           echo "===== engine log (tail) ====="; tail -40 engine.log || true
+          [ -n "$ready" ]
       - name: Failover profile (two nodes, kill primary mid-load)
+        # Runs even when the reference step failed: it starts its own serve nodes, so a reference
+        # engine that never came up says nothing about it. It gates on the database step, which runs
+        # only once every earlier setup step has succeeded.
+        if: ${{ !cancelled() && steps.failover_db.outcome == 'success' }}
+        # ITS OWN DATABASE, created above. The reference step keys the database it opens, and a keyed
+        # audit chain refuses a later keyless append; these nodes run keyless on purpose
+        # (harness/load/failover.py). And its no-loss check reads ABSOLUTE counts
+        # (`final.in_pipeline == 0 and final.dead == 0`), so rows the reference run left undrained
+        # would be reported as failover's loss. A separate database keeps both out.
+        env:
+          MEFOR_STORE_DATABASE: messagefoundry_failover
         run: |
           set +e
           python -m harness --failover failover --db-backend postgres \
@@ -222,23 +349,79 @@ jobs:
         run: |
           mkdir -p out/load
           { echo "## sqlserver"; uname -a; python --version; git rev-parse HEAD; } | tee out/load/env-sqlserver.txt
+      - name: Create a separate database for the failover profile
+        id: failover_db
+        # As in the postgres leg: why is at the failover step, and continue-on-error keeps a failure
+        # here from skipping the reference measurement. -b makes a T-SQL error exit non-zero.
+        # ALLOW_SNAPSHOT_ISOLATION is set here so the two failover nodes do not both race to set it
+        # on first open of a fresh database.
+        continue-on-error: true
+        run: |
+          /opt/mssql-tools18/bin/sqlcmd -b -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
+            -Q "IF DB_ID('MessageFoundryFailover') IS NULL CREATE DATABASE MessageFoundryFailover; ALTER DATABASE MessageFoundryFailover SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE; ALTER DATABASE MessageFoundryFailover SET ALLOW_SNAPSHOT_ISOLATION ON;"
       - name: Serve (SQL Server) + reference rate-steps
         env:
           MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
+          # THE ENFORCEMENT DIAL, and why this leg needs it. The store hop to the SQL Server container is
+          # weakened TLS (job env above). Under the shipped `enforce`, the MEFOR_ALLOW_INSECURE_TLS
+          # escape is clamped inert (ADR 0092 decision 2), so serve refuses at store open. `warn` honors
+          # the escape and still reports every gate. ci.yml's `load test (smoke, sqlserver)` leg carries
+          # the full reasoning, including why no narrower fix exists for a `services:` container.
+          MEFOR_SECURITY_ENFORCEMENT: "warn"
+          # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
+          MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
+          MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
+          MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
           set -o pipefail
+          # Mint a throwaway AES-256 store key at runtime; never a committed literal (gitleaks). Assigned
+          # before export: `export VAR="$(...)"` returns export's status and hides a failed mint.
+          store_key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          echo "::add-mask::$store_key"
+          export MEFOR_STORE_ENCRYPTION_KEY="$store_key"
+          # https + pinned, as in the sqlite leg. This step passes no --db, so [store].path keeps its
+          # default relative "messagefoundry.db" and the minted pair lands in the working directory,
+          # $GITHUB_WORKSPACE (measured on ci.yml's sqlserver load leg, run 33511381948). serve derives
+          # the pair's directory from [store].path whatever the backend, so this holds for SQL Server as well.
+          # MEFOR_ALLOW_INSECURE_TLS in the job env is the engine's escape for the hop it DIALS to the
+          # database. It has no reach over this hop, which is a client reaching the engine's API.
+          cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
+          export MEFOR_HARNESS_TLS_KEY_FILE="$key"
           python -m messagefoundry serve --config harness/config/load --env dev \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
-          for _ in $(seq 1 60); do curl -sf http://127.0.0.1:8765/health > /dev/null && break || sleep 0.5; done
+          ready=
+          for _ in $(seq 1 60); do
+            curl -fsS --max-time 5 --cacert "$cert" https://127.0.0.1:8765/health > /dev/null 2>&1 && { ready=1; break; } || sleep 0.5
+          done
           set +e
-          python -m harness --load reference --engine http://127.0.0.1:8765 --sink-port 2700 \
-            --db-backend sqlserver --report-json out/load/reference-sqlserver.json --report-csv out/load/reference-sqlserver.csv
+          if [ -n "$ready" ]; then
+            python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
+              --db-backend sqlserver --report-json out/load/reference-sqlserver.json --report-csv out/load/reference-sqlserver.csv
+          else
+            echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
+          fi
           set -e
+          # Bounded reap, so the engine frees its ports and database before the next step. An unbounded
+          # `wait` could block to GitHub's 360-minute default on an engine that ignores SIGTERM.
           kill "$engine_pid" 2>/dev/null || true
+          for _ in $(seq 1 20); do kill -0 "$engine_pid" 2>/dev/null || break; sleep 0.5; done
+          kill -9 "$engine_pid" 2>/dev/null || true
+          wait "$engine_pid" 2>/dev/null || true
           echo "===== engine log (tail) ====="; tail -40 engine.log || true
+          [ -n "$ready" ]
       - name: Failover profile (two nodes, kill primary mid-load)
+        # Runs even when the reference step failed: it starts its own serve nodes, so a reference
+        # engine that never came up says nothing about it. It gates on the database step, which runs
+        # only once every earlier setup step has succeeded.
+        if: ${{ !cancelled() && steps.failover_db.outcome == 'success' }}
+        # Its own database, for the reasons at the postgres leg's failover step.
+        env:
+          MEFOR_STORE_DATABASE: MessageFoundryFailover
         run: |
           set +e
           python -m harness --failover failover --db-backend sqlserver \

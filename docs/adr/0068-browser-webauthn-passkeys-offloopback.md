@@ -549,3 +549,25 @@ This also retires two earlier sentences. Under "Both halves, deliberately", the 
 call is no longer the only place a credential is refused. Under "Residual closed", the
 assertion-side catch is no longer the backstop for a stored key; the check above is, and the
 catch now guards the response itself.
+
+## Amendment (2026-09-25) -- the JSON `/auth/negotiate` flip is made (BACKLOG #1144 step 5)
+
+The approved follow-up recorded under *Out of scope* and *Resolved on acceptance* is done. The JSON
+`POST /auth/negotiate` no longer seeds the step-up window at login, so both Kerberos routes mint the
+session the way `GET /ui/sso` always has: with no window.
+
+The choice also moved. `_complete_ad_login` passes `seed_reauth=False` itself, and
+`authenticate_kerberos` and `authenticate_oidc` no longer take the argument. A route cannot pick
+a posture any more, which is how the two routes came to disagree.
+
+**This retires half of AC-14.** Its first half still holds: a browser SSO session is born with no
+window. Its WHILE clause, that the JSON `/auth/negotiate` keeps seeding, is withdrawn, and so is
+the *Resolved on acceptance* item that kept `seed_reauth=True` for this lane. The test AC-14 cites,
+`test_sso_session_not_reauth_seeded`, now asserts that both Kerberos legs are born with no window.
+AD-password login, the clause's other subject, was retired by BACKLOG #1137.
+
+The step-up path is unchanged: a live directory re-bind at `POST /me/reauth` or `/ui/reauth`, or
+an engine TOTP or recovery code at the MFA gate. The accepted limit on smart-card-only and
+passwordless AD accounts, which cannot pass that re-bind, now reaches the JSON route too: its
+seeded window was the only thing that let such an account act there. Decision 9's text and AC-14
+above are left as written and dated by this amendment.
