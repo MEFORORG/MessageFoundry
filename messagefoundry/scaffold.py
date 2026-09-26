@@ -244,6 +244,8 @@ bootstrap-admin.txt
 # the API TLS pair the engine mints next to the store when no [api].tls_cert_file is set (ADR 0172)
 api-generated-key.pem
 api-generated-cert.pem
+# ...and the empty lock file that serialises that first-run mint across engine shards
+api-generated.lock
 .env
 .env.*
 /out/
