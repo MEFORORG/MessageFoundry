@@ -63,7 +63,8 @@ NONCE = "n-oidc-1"
 @pytest.fixture(autouse=True)
 def _no_failure_pad(monkeypatch: pytest.MonkeyPatch) -> None:
     # A failed federated sign-in is padded to a deadline in real time (BACKLOG #1947);
-    # tests/test_asvs_login_deadline.py owns that property and nothing here asserts on timing.
+    # the section for #1947 at the end of this file pins which seam pads and where its deadline
+    # counts from, without waiting.
     async def _no_sleep(deadline: float) -> None:
         return None
 
@@ -1461,11 +1462,13 @@ class _PadSpy:
 
     def __init__(self, service: AuthService, monkeypatch: pytest.MonkeyPatch) -> None:
         self.seams: list[str] = []
+        self.started: list[float] = []
         real = service._equalize_failure
 
         async def spy(outcome: LoginOutcome, started: float, *, seam: str) -> LoginOutcome:
             if not outcome.ok:
                 self.seams.append(seam)
+                self.started.append(started)
             return await real(outcome, started, seam=seam)
 
         monkeypatch.setattr(service, "_equalize_failure", spy)
@@ -1615,5 +1618,50 @@ async def test_a_refused_code_leaves_the_idp_flag_as_it_was(
         assert await _audit_rows(store, "auth.login_error") == []
         failed = await _audit_rows(store, "auth.login_failed")
         assert any('"reason": "token_refused"' in (r["detail"] or "") for r in failed)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("branch", "after_the_idp"),
+    [
+        ("flow_unknown", False),
+        ("not_bound", True),
+        ("not_in_directory", True),
+        ("idp_down", True),
+    ],
+)
+async def test_a_refusal_after_the_idp_round_trip_counts_from_its_end(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, branch: str, after_the_idp: bool
+) -> None:
+    """The IdP's latency is not the account's, and it can outrun the whole budget. Counted from the
+    call, it would split the refusals that follow it across slots by their own directory work. So a
+    refusal after the round trip is padded from the round trip's END, and one before it from the call.
+
+    Read off the ``started`` the seam hands the equaliser, compared with instants the test records
+    itself, so nothing here depends on how long anything took."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(None if branch == "not_in_directory" else PRINCIPAL)
+        service = await _service(store, rsa_key, ldap=ldap)
+        spy = _PadSpy(service, monkeypatch)
+        round_trip_ended: list[float] = []
+
+        def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
+            round_trip_ended.append(time.monotonic())
+            if branch == "idp_down":
+                raise urllib.error.URLError("idp down")
+            return _verified("S-1-nobody" if branch == "not_bound" else DEFAULT_SUB)
+
+        monkeypatch.setattr(service, "_exchange_and_validate", exchange)
+        before_call = time.monotonic()
+        out = await _callback(service, flow_id="no-such-flow" if branch == "flow_unknown" else None)
+        assert not out.ok
+        [started] = spy.started
+        if after_the_idp:
+            assert started >= round_trip_ended[0] > before_call
+        else:
+            # No round trip ran, so the deadline counts from the call itself.
+            assert round_trip_ended == [] and before_call <= started <= time.monotonic()
     finally:
         await store.close()

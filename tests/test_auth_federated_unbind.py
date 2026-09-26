@@ -35,7 +35,8 @@ from tests.test_auth_oidc_service import _oidc_login, _service
 @pytest.fixture(autouse=True)
 def _no_failure_pad(monkeypatch: pytest.MonkeyPatch) -> None:
     # A failed federated sign-in is padded to a deadline in real time (BACKLOG #1947);
-    # tests/test_asvs_login_deadline.py owns that property and nothing here asserts on timing.
+    # tests/test_auth_oidc_service.py pins where that pad counts from, and nothing here asserts on
+    # timing.
     async def _no_sleep(deadline: float) -> None:
         return None
 

@@ -793,7 +793,7 @@ def test_exchange_code_too_deep_reply_is_a_flow_error(monkeypatch: pytest.Monkey
     assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
 
 
-def _refusing_exchange(status: int) -> None:
+def _refusing_exchange(status: int, body: bytes = b'{"error":"invalid_grant"}') -> None:
     oidc.exchange_code(
         token_endpoint="https://idp.example/token",
         client_id="c",
@@ -807,31 +807,50 @@ def _refusing_exchange(status: int) -> None:
                 status,
                 "refused",
                 {},  # type: ignore[arg-type]
-                io.BytesIO(b'{"error":"invalid_grant"}'),
+                io.BytesIO(body),
             )
         ),
     )
 
 
-def test_a_400_grant_refusal_is_a_token_refusal() -> None:
+@pytest.mark.parametrize("status", [400, 403])
+def test_an_invalid_grant_refusal_is_a_token_refusal(status: int) -> None:
     """BACKLOG #1948. A signed-out caller chooses the ``code``, and RFC 6749 section 5.2 answers a
-    bad one with 400 ``invalid_grant``. It must be told apart from an outage, and stay a FlowError so
-    every existing ``except FlowError`` still catches it. The chain is severed as for its parent."""
-    with pytest.raises(oidc.TokenRefusedError, match="returned HTTP 400") as excinfo:
-        _refusing_exchange(400)
+    bad one with ``invalid_grant``: 400 by the RFC, 403 on at least one IdP. It must be told apart
+    from an outage, and stay a FlowError so every existing ``except FlowError`` still catches it. The
+    chain is severed as for its parent, and the body never reaches the message."""
+    with pytest.raises(oidc.TokenRefusedError, match=f"returned HTTP {status}") as excinfo:
+        _refusing_exchange(status)
     assert isinstance(excinfo.value, oidc.FlowError)
     assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+    assert "invalid_grant" not in str(excinfo.value)
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 407, 408, 429, 500, 502, 503, 302])
-def test_every_other_status_stays_an_outage(status: int) -> None:
-    """401 is ``invalid_client`` (the engine's own secret), 403 and 404 usually a firewall or a wrong
-    endpoint, 407 the engine's proxy, 408 and 429 the endpoint declining to serve, 5xx the IdP
-    failing, and a 3xx a redirect the no-redirect opener refuses. Section 5.2 gives none of them to a
-    grant error, so each stays a plain FlowError."""
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        # A 400 that is the ENGINE's fault. Under client_secret_post, section 5.2 lets an IdP answer
+        # a wrong secret with 400, so the status alone would read it as the caller's bad code.
+        (400, b'{"error":"invalid_client","hint":"client_secret=SYNTHETIC-SECRET"}'),
+        (400, b'{"error":"unauthorized_client"}'),
+        (400, b'{"error":"unsupported_grant_type"}'),
+        # A body that is not an RFC 6749 error object: a firewall page, nothing, or too long to be one.
+        (403, b"<html>blocked</html>"),
+        (400, b""),
+        (400, b'{"error":"invalid_grant","pad":"' + b"x" * 5000 + b'"}'),
+        # Not a 4xx, whatever the body says.
+        (500, b'{"error":"invalid_grant"}'),
+        (503, b'{"error":"invalid_grant"}'),
+        (302, b'{"error":"invalid_grant"}'),
+    ],
+)
+def test_every_other_refusal_stays_an_outage(status: int, body: bytes) -> None:
+    """Only ``invalid_grant`` is about the grant the caller presented. The rest fail every sign-in
+    alike, so each stays a plain FlowError and still marks the IdP unavailable."""
     with pytest.raises(oidc.FlowError, match=f"returned HTTP {status}") as excinfo:
-        _refusing_exchange(status)
+        _refusing_exchange(status, body)
     assert not isinstance(excinfo.value, oidc.TokenRefusedError)
+    assert "SYNTHETIC-SECRET" not in f"{excinfo.value!r}"
 
 
 class _TripwireOpener:

@@ -23,8 +23,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import secrets
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
@@ -63,12 +65,36 @@ class TokenRefusedError(FlowError):
     a signed-out caller chooses the ``code``. So this refusal must not read as an IdP outage, or any
     caller could hide the federated sign-in link.
 
-    Raised for HTTP 400 ONLY, which is the status section 5.2 gives every grant-level error. Every
-    other failure stays a plain :class:`FlowError` and so an outage: a 401 is ``invalid_client`` (the
-    engine's own secret, which fails every sign-in), a 404 or 403 is usually a wrong endpoint or a
-    firewall, and 408, 429 and 5xx are the endpoint declining to serve. The error body is never read
-    to refine this, because it may echo the request, client secret included.
+    Raised for a 4xx whose JSON ``error`` is ``invalid_grant``, the one section 5.2 code about the
+    grant the caller presented. The status alone cannot decide it. A 400 also carries
+    ``invalid_client`` under ``client_secret_post``, ``unauthorized_client`` and
+    ``unsupported_grant_type``, which are the engine's own configuration and fail every sign-in. And
+    at least one IdP answers ``invalid_grant`` with 403. Everything else stays a plain
+    :class:`FlowError`, and so an outage. See :func:`_refuses_the_grant` for how the body is read.
     """
+
+
+#: Enough for any RFC 6749 error object. A longer body is not read as one.
+_GRANT_ERROR_BODY_LIMIT = 4096
+
+
+def _refuses_the_grant(exc: urllib.error.HTTPError) -> bool:
+    """True when a 4xx token-endpoint reply names ``invalid_grant`` (BACKLOG #1948).
+
+    Only this boolean leaves the function. The body may echo the request, client secret included,
+    so it is compared against one fixed string and never stored, logged or put in a message. Every
+    failure to read or parse it answers False, which keeps the reply an outage.
+    """
+    if not 400 <= exc.code < 500:
+        return False
+    try:
+        raw = exc.read(_GRANT_ERROR_BODY_LIMIT + 1)
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+    if not isinstance(raw, bytes) or len(raw) > _GRANT_ERROR_BODY_LIMIT:
+        return False
+    payload, refusal = json_loads_or_refusal(raw)
+    return refusal is None and isinstance(payload, dict) and payload.get("error") == "invalid_grant"
 
 
 def pkce_challenge(verifier: str) -> str:
@@ -278,8 +304,8 @@ def exchange_code(
     confidential client sends ``client_secret_post``; a public client omits it and relies on PKCE.
     Raises :class:`FlowError` on a non-2xx, misframed, oversized or non-JSON response — PHI/secret-safe: the
     secret, the ``code``, and the tokens never enter an exception message.
-    An HTTP 400, which refuses the grant itself, raises the subclass :class:`TokenRefusedError`, so
-    the caller can tell a caller-chosen bad ``code`` from an IdP outage (BACKLOG #1948).
+    A 4xx naming ``invalid_grant`` raises the subclass :class:`TokenRefusedError`, so the caller can
+    tell a caller-chosen bad ``code`` from an IdP outage (BACKLOG #1948).
 
     The request line and header block are **measured before the POST** (ASVS 4.2.5, BACKLOG #1048).
     ``token_endpoint`` is operator-static config (validated https at load), so this is the weaker of
@@ -352,7 +378,7 @@ def exchange_code(
     except urllib.error.HTTPError as exc:
         # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
         refusal = f"token endpoint returned HTTP {exc.code}"
-        grant_refused = exc.code == 400
+        grant_refused = _refuses_the_grant(exc)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         refusal = f"token endpoint unreachable: {type(exc).__name__}"
     except AmbiguousFramingError:

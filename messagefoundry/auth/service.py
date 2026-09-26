@@ -229,6 +229,20 @@ def _failure_deadline(started: float, now: float, budget: float | None = None) -
     return started + slots * span
 
 
+@dataclass
+class _PadClock:
+    """The instant a failed federated challenge's deadline counts from (BACKLOG #1947).
+
+    It starts at the call and :meth:`AuthService._authenticate_oidc` moves it to the end of the IdP
+    round trip. That round trip's latency is the IdP's, not the account's, and it can run past the
+    whole budget. Counting from the call would then split the refusals that follow it across slots
+    by their own store and directory work, which is the difference the pad exists to hide. Counting
+    from the end of the round trip still fixes the deadline before any account-dependent work runs.
+    """
+
+    started: float
+
+
 async def _sleep_until(deadline: float) -> None:
     """Await until the monotonic instant ``deadline``, returning at once if it has already passed.
 
@@ -1805,22 +1819,29 @@ class AuthService:
 
         **This is the THIRD challenge seam, and every failed outcome is held to a fixed deadline**
         (BACKLOG #1947, ASVS 6.3.8), the same wrapper shape as :meth:`login` and
-        :meth:`authenticate_kerberos`. ``GET /ui/oidc/callback`` calls this method and nothing else,
-        so the pad is sited here rather than in the route. The inner leg calls
-        :meth:`_authenticate_oidc`, not the public wrapper, so one challenge is padded once.
+        :meth:`authenticate_kerberos`. ``GET /ui/oidc/callback`` reaches the service only through
+        this method, so the pad is sited here rather than in the route. The route's own earlier
+        refusals (no flow cookie, an IdP error, a malformed callback) read only the request and are
+        not padded, as ``/ui/sso``'s are not. The inner leg calls :meth:`_authenticate_oidc`, not
+        the public wrapper, so one challenge is padded once.
 
-        What it removes: the refusals after the token exchange (``federated_subject_not_bound``, the
+        What it removes: the refusals after the IdP round trip (``federated_subject_not_bound``, the
         disabled and locked checks, ``not_in_directory``, the directory outage) cost different store
-        and directory work, and each now answers at one instant. What it does NOT remove: a slow IdP
-        can push the post-exchange refusals into a later slot than the pre-exchange ones
-        (``state_unknown``, ``state_mismatch``). That split tells the caller whether its own flow
-        cookie and ``state`` were good, which it already knows, and nothing about any account.
+        and directory work, and each now answers at one deadline counted from the end of that round
+        trip (see :class:`_PadClock`). What it does NOT remove: the round trip itself, so those
+        refusals answer later than ``state_unknown`` and ``state_mismatch``. That split tells the
+        caller whether its own flow cookie and ``state`` were good, which it already knows.
         """
-        started = time.monotonic()
+        clock = _PadClock(time.monotonic())
         outcome = await self._complete_oidc_login(
-            flow_id=flow_id, state=state, code=code, client=client, public_origin=public_origin
+            flow_id=flow_id,
+            state=state,
+            code=code,
+            client=client,
+            public_origin=public_origin,
+            clock=clock,
         )
-        return await self._equalize_failure(outcome, started, seam="oidc")
+        return await self._equalize_failure(outcome, clock.started, seam="oidc")
 
     async def _complete_oidc_login(
         self,
@@ -1830,6 +1851,7 @@ class AuthService:
         code: str,
         client: str | None,
         public_origin: str,
+        clock: _PadClock,
     ) -> LoginOutcome:
         if not self.oidc_enabled or self._oidc_flows is None:
             await self._directory_reject_audit("<oidc>", "oidc", "not_configured")
@@ -1851,6 +1873,7 @@ class AuthService:
             flow,
             redirect_uri=self._oidc_redirect_uri(public_origin),
             client=client,
+            clock=clock,
         )
 
     async def authenticate_oidc(
@@ -1868,11 +1891,11 @@ class AuthService:
         :meth:`_authenticate_oidc`; the wrapper shape is :meth:`login`'s, so a refusal added there
         later inherits the pad instead of quietly escaping it.
         """
-        started = time.monotonic()
+        clock = _PadClock(time.monotonic())
         outcome = await self._authenticate_oidc(
-            code, flow, redirect_uri=redirect_uri, client=client
+            code, flow, redirect_uri=redirect_uri, client=client, clock=clock
         )
-        return await self._equalize_failure(outcome, started, seam="oidc")
+        return await self._equalize_failure(outcome, clock.started, seam="oidc")
 
     async def _authenticate_oidc(
         self,
@@ -1881,6 +1904,7 @@ class AuthService:
         *,
         redirect_uri: str,
         client: str | None = None,
+        clock: _PadClock,
     ) -> LoginOutcome:
         """Complete a federated login: exchange the code, verify the ``id_token``, then resolve the
         principal against on-prem AD and hand off to the shared directory-login path.
@@ -1900,9 +1924,14 @@ class AuthService:
                 ok=False, error="federated sign-in is not configured", reason="not_configured"
             )
         try:
-            principal_claims = await asyncio.to_thread(
-                self._exchange_and_validate, code, flow, redirect_uri
-            )
+            try:
+                principal_claims = await asyncio.to_thread(
+                    self._exchange_and_validate, code, flow, redirect_uri
+                )
+            finally:
+                # Every refusal from here on is padded from the end of the IdP round trip, however
+                # the round trip ended (see _PadClock).
+                clock.started = time.monotonic()
         except oidc.ClaimsError as exc:
             # A verification-rung failure: the token was reachable but did not satisfy the ladder.
             # exc.reason is closed-set, so nothing IdP-influenced reaches the audit row.
@@ -1914,11 +1943,19 @@ class AuthService:
             # hides the federated link on /ui/login and in /auth/providers for everyone, so marking
             # here would let any caller switch federated sign-in off. Nor does it clear the flag, as
             # no sign-in succeeded. It is a FlowError, so this arm must stay above the outage arm.
-            await self._directory_reject_audit("<oidc>", "oidc", "token_refused")
+            # Audited with the client address, as the outage arm is: a spray of junk codes is the
+            # abuse this arm exists for, and the operator needs to see where it comes from.
+            await self._audit(
+                "auth.login_failed",
+                actor="<oidc>",
+                detail=_json({"provider": "ad", "mech": "oidc", "reason": "token_refused"}),
+                client=client,
+            )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="token_refused")
         except (OSError, ValueError, http.client.HTTPException) as exc:
-            # IdP unreachable / a non-2xx that is not a grant refusal / malformed response. JwksCache's injected fetch raises RAW
-            # urllib errors (it is not wrapped in JwksError), so a narrow `except JwksError` here
+            # IdP unreachable / a non-2xx that is not a grant refusal / malformed response.
+            # JwksCache's injected fetch raises RAW urllib errors (not wrapped in JwksError), so a
+            # narrow `except JwksError` here
             # would let an IdP outage escape as an unhandled 500 instead of a degraded login.
             # http.client.HTTPException is neither an OSError nor a ValueError: a proxy answering the
             # token POST with a non-HTTP status line raises BadStatusLine, which would otherwise

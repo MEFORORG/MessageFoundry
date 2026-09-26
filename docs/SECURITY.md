@@ -2194,7 +2194,7 @@ client built against the older contract hides its AD password form instead of fa
 until restart (`AuthService.kerberos_available` in `auth/service.py`). `oidc` is `oidc_available` — `oidc_enabled` (which is
 `[auth].oidc_enabled` **and** a directory to resolve roles against, `AuthService.oidc_enabled`) **and** the last IdP
 interaction not having failed; that second term is deliberately **advisory and non-sticky**, set by an
-IdP outage (never by a token endpoint refusing a caller's bad code) and cleared by the next success, and *no login path gates on it* (`AuthService.oidc_available`). Neither
+IdP outage (not by a token endpoint answering `invalid_grant` to the code a caller presented) and cleared by the next success, and *no login path gates on it* (`AuthService.oidc_available`). Neither
 flag consults `settings.api.serve_ui`, so the route can still advertise `oidc: true` on a console-less
 engine that registers no OIDC route. The mTLS plane is deliberately absent from it, because it is not a
 sign-in offer.
