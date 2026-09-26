@@ -430,6 +430,7 @@ class FhirDestination(DestinationConnector):
                 self.base_url,
                 connector="FHIR destination",
                 revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
             )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
