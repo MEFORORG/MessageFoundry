@@ -526,7 +526,9 @@ def test_drive_report_renders_and_serializes() -> None:
     assert "advisory" in text and "NOT gated" in text
     js = r.to_json_dict()
     assert js["kind"] == "shardcert_drive" and js["verdict"] == "PASS"
-    assert js["traffic"]["acked"] == 150 and js["traffic"]["sink_received"] == 300
+    traffic = js["traffic"]
+    assert isinstance(traffic, dict)
+    assert traffic["acked"] == 150 and traffic["sink_received"] == 300
     # The gated correctness block is sink-truth only — the poller terms are NOT in it.
     correctness = js["correctness"]
     assert isinstance(correctness, dict)

@@ -347,7 +347,7 @@ def _walk(
     node: ast.AST, stack: list[str], where: str, file_responses: set[str], out: set[str]
 ) -> None:
     is_fn = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    if is_fn:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):  # narrows; `is_fn` cannot
         stack.append(node.name)
     if _is_emitter(node, file_responses):
         out.add(f"{where}::{stack[-1] if stack else '<module>'}")

@@ -20,7 +20,6 @@ binds. Until then these bindings were written by the login itself.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from typing import Any
 
 import pytest
@@ -28,6 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.auth.service import FEDERATED_SUBJECT_NOT_BOUND
 from messagefoundry.auth.tokens import hash_token
+from messagefoundry.store.base import Row
 from messagefoundry.store.store import MessageStore
 from tests.test_auth_oidc_service import _oidc_login, _service
 
@@ -39,7 +39,7 @@ def rsa_key() -> rsa.RSAPrivateKey:
     return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
-async def _unbound_rows(store: MessageStore) -> list[Mapping[str, Any]]:
+async def _unbound_rows(store: MessageStore) -> list[Row]:
     return [a for a in await store.list_audit() if a["action"] == "auth.federated_subject_unbound"]
 
 

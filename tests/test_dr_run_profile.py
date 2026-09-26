@@ -43,7 +43,7 @@ def _free_port() -> int:
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "dr.db")
     yield s
     await s.close()

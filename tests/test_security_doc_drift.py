@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -880,7 +881,7 @@ def test_every_engine_route_appears_in_the_route_map_with_its_permission_and_gat
 
 
 def _row_mismatches(
-    derived: dict[tuple[str, str], _DocRow], documented: dict[tuple[str, str], _DocRow]
+    derived: Mapping[tuple[str, str], _DocRow], documented: Mapping[tuple[str, str], _DocRow]
 ) -> list[str]:
     """Every route whose documented permission set or gate wrapper disagrees with the live app."""
     out: list[str] = []

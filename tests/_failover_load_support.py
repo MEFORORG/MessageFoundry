@@ -190,16 +190,16 @@ async def dump_queue_breakdown(db_backend: str) -> str:
     else:
         from messagefoundry.store.sqlserver import SqlServerStore
 
-        store = await SqlServerStore.open(settings)
+        ss_store = await SqlServerStore.open(settings)
         try:
-            async with store._pool.acquire() as conn:
+            async with ss_store._pool.acquire() as conn:
                 cur = await conn.cursor()
                 await cur.execute(sql_summary)
                 parts = [f"{row[0]}/{row[1]}={row[2]}" for row in await cur.fetchall()]
                 await cur.execute(sql_detail)
                 detail = [_fmt_detail(*row) for row in await cur.fetchall()]
         finally:
-            await store.close()
+            await ss_store.close()
     line = "QUEUE-BREAKDOWN " + (" ".join(parts) if parts else "<empty>")
     print(line)
     print(

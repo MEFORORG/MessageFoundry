@@ -3302,9 +3302,13 @@ class AlertRule(BaseModel):
     # --- match (all conditions must hold) ---
     event_type: str = "any"  # "any" | a member of _ALERT_EVENT_TYPES (validated below)
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
-    min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
+    # `default=` is spelled as a KEYWORD on every Field here, and must stay one: mypy's
+    # dataclass_transform support reads only the keyword, so a positional `Field(None, ...)` types
+    # the field as REQUIRED and every `AlertRule(...)` call that omits it reads as a missing
+    # argument. Runtime is identical either way (BACKLOG #1799 measured 207 such false errors).
+    min_depth: int | None = Field(default=None, ge=1)  # queue_buildup: match at/over this depth
     min_oldest_seconds: float | None = Field(
-        None, ge=0
+        default=None, ge=0
     )  # queue_buildup/message_stall: …or oldest-message age (s)
     # --- outcome ---
     severity: AlertSeverity = AlertSeverity.WARNING
@@ -3312,7 +3316,7 @@ class AlertRule(BaseModel):
         None  # None = every configured transport; [] = suppress entirely (event dropped, never sent)
     )
     cooldown_seconds: float | None = Field(
-        None, gt=0
+        default=None, gt=0
     )  # override realert_seconds for matching events
     # #146 (ADR 0014 amendment): per-rule EMAIL recipient override. None = the global [alerts].email_to
     # is used, byte-identical to before. A non-empty list re-targets the email transport for events this

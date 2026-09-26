@@ -78,7 +78,9 @@ def test_ack_expectation_match_logic(qapp: Any) -> None:
     def last_ok(expect: str, ack_code: str) -> str:
         panel._pending_expect = expect
         panel._on_mllp_result(SendResult(item, ack_code in ("AA", "CA"), ack_code, 1.0, ""))
-        return panel._results.item(panel._results.rowCount() - 1, _OK_COL).text()
+        cell = panel._results.item(panel._results.rowCount() - 1, _OK_COL)
+        assert cell is not None
+        return cell.text()
 
     assert last_ok(_ACCEPT, "AA") == "yes"
     assert last_ok(_ACCEPT, "AE") == "no"

@@ -70,8 +70,8 @@ class _FakeResp:
     def __enter__(self) -> _FakeResp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _FakeOpener:
@@ -148,7 +148,7 @@ def test_dicomweb_operator_header_control_char_rejected(
     dead-letter an unbounded stream of messages that were never at fault.
     """
     with pytest.raises(ValueError, match="illegal control character"):
-        _dest(**{setting: value})  # type: ignore[arg-type]
+        _dest(**{setting: value})
 
 
 def test_dicomweb_base_url_control_char_rejected() -> None:  # #1241
