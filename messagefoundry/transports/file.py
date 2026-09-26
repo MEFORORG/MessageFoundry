@@ -557,14 +557,21 @@ class FileSource(SourceConnector):
                     await self._scan_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # A scan error (watch dir vanished/unreadable, a bad glob, a move/read failure) must
                 # NOT kill the poller — that would silently stop the connection from receiving while
                 # it still reports running, and re-raise inside stop()/reload (review H-4). Log and
                 # retry on the next interval.
-                logger.exception(
-                    "file source scan failed for %s; retrying next poll", self.directory
+                #
+                # Scrubbed, as MLLP's last-resort arm is (BACKLOG #1625): an exception from this loop
+                # can render a partner-chosen file name into its message, and a traceback at ERROR
+                # would carry it unredacted. The traceback stays available at DEBUG.
+                logger.error(
+                    "file source scan failed for %s; retrying next poll: %s",
+                    self.directory,
+                    safe_exc(exc),
                 )
+                logger.debug("file source scan failure traceback", exc_info=True)
             try:  # noqa: SIM105
                 await asyncio.wait_for(self._stop.wait(), self.poll_seconds)
             except TimeoutError:
@@ -1028,7 +1035,10 @@ class FileSource(SourceConnector):
             # Watch dir vanished/unreadable, or an invalid glob pattern: treat as "nothing this
             # scan" (logged) rather than letting it propagate and kill the poller (review H-4).
             logger.warning(
-                "file source could not list %s (pattern %r): %s", self.directory, self.pattern, exc
+                "file source could not list %s (pattern %r): %s",
+                self.directory,
+                self.pattern,
+                _describe_listing_error(exc),
             )
             return []
         files = [
@@ -1364,11 +1374,30 @@ def _discard(path: Path) -> None:
 
     Cleanup must never DISPLACE the failure that caused it. A drop directory is one other processes
     watch by design, so a scanner or a reader holding the file open is ordinary here, and an escaping
-    unlink error would hide the full volume or dropped share behind a cleanup message."""
+    unlink error would hide the full volume or dropped share behind a cleanup message.
+
+    The name is logged as a safe label (BACKLOG #1625): on the archive move a placeholder carries the
+    partner's own file name, and the ``OSError`` renders that path into its message too."""
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        logger.warning("could not remove the file %s after a failed claim: %s", path, exc)
+        logger.warning(
+            "could not remove the file %s after a failed claim: %s",
+            safe_name(path.name),
+            safe_exc(exc, file_name=path.name),
+        )
+
+
+def _describe_listing_error(exc: OSError | ValueError) -> str:
+    """A log-safe account of a failed directory listing (BACKLOG #1625).
+
+    Under ``recursive`` the failing path can be a partner-created SUBDIRECTORY, whose name is as
+    partner-chosen as a file's and is not known here to swap for a label. So an ``OSError`` is
+    reported by its type, errno and OS text, never its path. A ``ValueError`` is an invalid glob
+    pattern, which is operator configuration."""
+    if isinstance(exc, OSError):
+        return f"{type(exc).__name__}: [Errno {exc.errno}] {exc.strerror or ''}".rstrip()
+    return safe_exc(exc)
 
 
 def _mtime(p: Path) -> float:
