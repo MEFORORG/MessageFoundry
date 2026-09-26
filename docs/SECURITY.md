@@ -997,6 +997,22 @@ server-side, not a client confirmation). On release the captured operation is **
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`.
 
+**A release records what happened to it (BACKLOG #1562).** The gate claims the request as
+`executing` before it runs the operation, so two approvers cannot both release it. It then settles
+the row to one of three outcomes:
+
+| Status | Meaning | Audit row (against the approver) |
+|---|---|---|
+| `approved` | The operation ran and returned | `approval.approved` |
+| `failed` | The operation raised, so it did not complete | `approval.failed` |
+| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
+
+Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
+worse than a stuck row, so an operator has to check the operation's own effects. The engine has no
+route to settle an `interrupted` row yet. A process that dies mid-operation leaves its row at
+`executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
+share one store, and each would see the others' live releases as leftovers.
+
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
 gets **409** and writes an `approval.too_early` audit row against the approver, with the request's age

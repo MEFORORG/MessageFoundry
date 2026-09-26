@@ -13,13 +13,25 @@ from the ``SELECT`` projection reads back as absent, which is indistinguishable 
 never having run. This body round-trips the value through the real store object instead, so the
 PostgreSQL and SQL Server legs execute their own SQL rather than having it read.
 
-Deliberately **extra-free**: it imports nothing outside the store object it is handed, so the live
-server legs can import it inside a test function.
+Deliberately **extra-free**: it imports nothing outside the core package and the store object it is
+handed, so the live server legs can import it inside a test function.
+
+The second half is the **release outcome** contract (BACKLOG #1562). ``ApprovalGate.approve`` claims
+a row as ``executing`` and settles it to ``approved``, ``failed`` or ``interrupted``, each through a
+``decide_pending_approval`` guarded on ``from_status="executing"``. That guard is backend SQL, so the
+real gate runs over each real store here. Only the two account reads are stubbed (see
+:class:`_StandingStore`), because they are not what this contract is about.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+from collections.abc import Awaitable, Callable, Mapping
+from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 #: Distinct from the username on purpose. A backend that returned the name where the id belongs --
 #: the exact confusion #1540 exists to remove -- would pass a check that let the two be equal.
@@ -66,3 +78,170 @@ async def _assert_pending_approval_contract(store: Any) -> None:
         await store.decide_pending_approval(
             approval_id, status="rejected", approver="contract-cleanup", decided_at=1_002.0
         )
+
+
+# --- BACKLOG #1562: the release outcome ------------------------------------------------------------
+
+_APPROVER = "contract-approver-name"
+_APPROVER_ID = "contract-approver-id-0001"
+#: Bounds every wait below, so a regression hangs for seconds rather than for the suite timeout.
+_WAIT_S = 10.0
+
+
+class _StandingStore:
+    """The real store, except for the two ACCOUNT reads the gate makes before it releases.
+
+    ``approve`` re-reads the requester (ASVS 8.3.2) and the approver (BACKLOG #315) through
+    ``get_user``. Provisioning real users on the shared server databases would need per-backend
+    cleanup and would test nothing this contract is about, so ``get_user`` answers an enabled
+    account with no credential change. Every approval and audit call reaches the real store."""
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    async def get_user(self, _user_id: str) -> Any:
+        return SimpleNamespace(
+            disabled=False, created_at=None, password_changed_at=None, totp_enrolled_at=None
+        )
+
+
+class _AnyPermission:
+    """A resolved requester who still holds every permission."""
+
+    def has(self, _permission: Any) -> bool:
+        return True
+
+
+async def _resolve(_user_id: str) -> Any:
+    return _AnyPermission()
+
+
+def _gate(store: Any, execute: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]) -> Any:
+    from messagefoundry.api.approvals import ApprovalGate
+    from messagefoundry.auth.permissions import Permission
+    from messagefoundry.config.settings import ApprovalsSettings
+
+    settings = ApprovalsSettings(
+        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
+    )
+    gate = ApprovalGate(_StandingStore(store), settings, resolve_identity=_resolve)
+    gate.register(
+        "dead_letter_replay", "contract op", execute, permission=Permission.MESSAGES_REPLAY
+    )
+    return gate
+
+
+async def _request(gate: Any) -> str:
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester=_REQUESTER, requester_user_id=_REQUESTER_ID
+    )
+    assert approval_id is not None
+    return str(approval_id)
+
+
+async def _status(store: Any, approval_id: str) -> str:
+    row = await store.get_pending_approval(approval_id)
+    assert row is not None
+    return str(row["status"])
+
+
+async def _audit_actions(store: Any, approval_id: str) -> list[str]:
+    """This request's audit actions. Filtered on the id, because the server legs share one log."""
+    rows = await store.list_audit(limit=500)
+    return [
+        str(r["action"])
+        for r in rows
+        if str(r["action"]).startswith("approval.")
+        and json.loads(str(r["detail"])).get("approval_id") == approval_id
+    ]
+
+
+async def _assert_release_success_contract(store: Any) -> None:
+    """The row reads ``executing`` WHILE the executor runs, and ``approved`` once it returns.
+
+    Pre-#1562 the executor saw ``approved``: the status asserted an outcome before there was one."""
+    seen: list[str] = []
+    approval_id = ""
+
+    async def _observes(_p: Mapping[str, Any]) -> dict[str, Any]:
+        seen.append(await _status(store, approval_id))
+        return {"ran": True}
+
+    gate = _gate(store, _observes)
+    approval_id = await _request(gate)
+    out = await gate.approve(approval_id, approver=_APPROVER, approver_user_id=_APPROVER_ID)
+    assert out["result"] == {"ran": True}
+    assert seen == ["executing"]
+    assert await _status(store, approval_id) == "approved"
+    actions = await _audit_actions(store, approval_id)
+    assert "approval.approved" in actions
+    assert "approval.failed" not in actions and "approval.interrupted" not in actions
+
+
+async def _assert_release_failure_contract(store: Any) -> None:
+    """A raising executor ends ``failed``, never stranded in ``executing``.
+
+    This is the compensation's ``from_status`` guard. Left on ``approved`` it would match no row once
+    the claim writes ``executing``, and the row would silently stay ``executing``."""
+
+    class _Boom(RuntimeError):
+        pass
+
+    async def _raises(_p: Mapping[str, Any]) -> dict[str, Any]:
+        raise _Boom("executor exploded")
+
+    gate = _gate(store, _raises)
+    approval_id = await _request(gate)
+    with pytest.raises(_Boom):
+        await gate.approve(approval_id, approver=_APPROVER, approver_user_id=_APPROVER_ID)
+    assert await _status(store, approval_id) == "failed"
+    actions = await _audit_actions(store, approval_id)
+    assert "approval.failed" in actions
+    assert "approval.approved" not in actions and "approval.interrupted" not in actions
+
+
+async def _assert_release_cancel_contract(store: Any) -> None:
+    """A release cancelled mid-execute ends ``interrupted`` with its own audit row.
+
+    Pre-#1562 it stayed ``approved`` with no outcome row: unretryable, unrejectable, and absent from
+    the pending list. ``interrupted`` says the outcome is unknown; nothing re-runs it."""
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def _hangs(_p: Mapping[str, Any]) -> dict[str, Any]:
+        started.set()
+        await never.wait()
+        return {"ran": True}
+
+    gate = _gate(store, _hangs)
+    approval_id = await _request(gate)
+    task = asyncio.create_task(
+        gate.approve(approval_id, approver=_APPROVER, approver_user_id=_APPROVER_ID)
+    )
+    await asyncio.wait_for(started.wait(), _WAIT_S)
+    assert await _status(store, approval_id) == "executing"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _WAIT_S)
+    assert await _status(store, approval_id) == "interrupted"
+    actions = await _audit_actions(store, approval_id)
+    assert actions.count("approval.interrupted") == 1
+    assert "approval.approved" not in actions and "approval.failed" not in actions
+    interrupted = [
+        r
+        for r in await store.list_audit(action="approval.interrupted", limit=500)
+        if json.loads(str(r["detail"])).get("approval_id") == approval_id
+    ]
+    assert str(interrupted[0]["actor"]) == _APPROVER
+    detail = json.loads(str(interrupted[0]["detail"]))
+    assert detail["requester"] == _REQUESTER and detail["recorded"] is True
+
+
+async def _assert_release_outcome_contract(store: Any) -> None:
+    """All three release outcomes, for a server leg that runs them as one test."""
+    await _assert_release_success_contract(store)
+    await _assert_release_failure_contract(store)
+    await _assert_release_cancel_contract(store)

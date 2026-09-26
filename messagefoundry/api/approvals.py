@@ -9,6 +9,10 @@ can never approve their own (enforced server-side). On approval the captured ope
 and **both identities** land in the hash-chained audit log. A request older than
 ``[approvals].expiry_hours`` can no longer be approved.
 
+A release claims the row as ``executing`` before it runs the operation, then settles it to
+``approved`` (it ran), ``failed`` (the executor raised) or ``interrupted`` (cancelled mid-run, outcome
+unknown, never retried). BACKLOG #1562; :meth:`ApprovalGate.approve` carries the reasoning.
+
 A request YOUNGER than ``[approvals].min_dwell_seconds`` cannot be approved yet (ASVS 2.4.2). The expiry
 is a ceiling; this is the floor. The refusal is a 409 with an ``approval.too_early`` audit row, and the
 request stays pending. Nothing retries it: the approver must approve again. Where the default comes
@@ -293,33 +297,55 @@ class ApprovalGate:
                 "request, and have an authorized user request it again if it is still needed",
             )
         # BACKLOG #315 (b): READ the approver's account now, before the transition, so no store read
-        # sits between 'approved' and the executor. The flag itself is written in the `finally` below.
+        # sits between the transition and the executor. The flag is written in the `finally` below.
         changed = await self._approver_changes(approver_user_id, float(row["requested_at"]))
-        # Transition to 'approved' FIRST (atomic, guards a double-approve race); only then execute.
+        requester = str(row["requester"])
+        # Claim the row FIRST (atomic, guards a double-approve race); only then execute. The claim
+        # moves it to 'executing', not 'approved' (BACKLOG #1562): 'approved' is written only once the
+        # executor has returned, so the status never asserts an outcome the gate has not seen.
         if not await self._store.decide_pending_approval(
-            approval_id, status="approved", approver=approver, decided_at=self._clock()
+            approval_id, status="executing", approver=approver, decided_at=self._clock()
         ):
             raise ApprovalError(409, "request was already decided")
         try:
             result = await op.execute(params)
+        except asyncio.CancelledError:
+            # BACKLOG #1562. The approve was cancelled while the executor ran -- at least a request
+            # timeout (RequestTimeoutMiddleware) does this. The executor may have finished none, some
+            # or all of its effects, so the outcome is UNKNOWN: record 'interrupted', never 'failed'
+            # (which says the operation did not happen) and never 'approved'. Nothing retries it; a
+            # blind re-run of an operation that may already have run is worse than the stuck row.
+            # Shielded, so a cancellation re-delivered here cannot cancel the record of the first one.
+            await asyncio.shield(
+                self._record_interrupted_execution(
+                    approval_id,
+                    operation=operation,
+                    approver=approver,
+                    requester=requester,
+                    client=client,
+                )
+            )
+            raise
         except Exception as exc:
-            # ASVS 2.3.3 COMPENSATING TRANSITION. The row moved to 'approved' BEFORE the executor ran
-            # (that ordering is load-bearing — it guards the double-approve race — and must stay). If
-            # the executor raises, the row would otherwise be stranded asserting an operation that
-            # never happened, and no approval.approved row is written either, so the store would carry
-            # an approval with no outcome at all. Roll it to 'failed' and audit the failure against
-            # both identities, then re-raise so the caller still sees the error.
+            # ASVS 2.3.3 COMPENSATING TRANSITION. The row was claimed BEFORE the executor ran (that
+            # ordering is load-bearing -- it guards the double-approve race -- and must stay). If the
+            # executor raises, the row would otherwise be stranded in 'executing' for an operation
+            # that did not complete, with no outcome recorded. Roll it to 'failed' and audit the
+            # failure against both identities, then re-raise so the caller still sees the error.
             #
             # `except Exception` is deliberate and is not a swallow: ANY executor failure has to
-            # compensate, and the original is re-raised below. BaseException (notably CancelledError)
-            # is intentionally NOT caught — a cancelled approve must not be recorded as a failure.
-            await self._compensate_failed_execution(
-                approval_id,
-                operation=operation,
-                approver=approver,
-                requester=str(row["requester"]),
-                error=exc,
-                client=client,
+            # compensate, and the original is re-raised below. CancelledError is handled above,
+            # because a cancelled approve has an unknown outcome and must not be recorded as a failure.
+            # Shielded for the same reason as the interrupted record above.
+            await asyncio.shield(
+                self._compensate_failed_execution(
+                    approval_id,
+                    operation=operation,
+                    approver=approver,
+                    requester=requester,
+                    error=exc,
+                    client=client,
+                )
             )
             raise
         finally:
@@ -333,11 +359,59 @@ class ApprovalGate:
                         approval_id,
                         operation=operation,
                         approver=approver,
-                        requester=str(row["requester"]),
+                        requester=requester,
                         changed=changed,
                         client=client,
                     )
                 )
+        # The executor returned, so the operation ran. Shielded (BACKLOG #1562): a cancellation that
+        # lands while the outcome is being written must not leave the row in 'executing' for an
+        # operation that completed. The caller still sees the cancellation; the record completes.
+        await asyncio.shield(
+            self._record_approved_execution(
+                approval_id,
+                operation=operation,
+                approver=approver,
+                requester=requester,
+                result=result,
+                client=client,
+            )
+        )
+        return {
+            "operation": operation,
+            "requested_by": requester,
+            "approved_by": approver,
+            "result": result,
+        }
+
+    async def _record_approved_execution(
+        self,
+        approval_id: str,
+        *,
+        operation: str,
+        approver: str,
+        requester: str,
+        result: dict[str, Any],
+        client: str | None,
+    ) -> None:
+        """Move a completed release from ``executing`` to ``approved`` and write ``approval.approved``.
+
+        A failure of either write still raises to the caller, as the audit write did before BACKLOG
+        #1562. Which record should win when the operation ran and its audit write fails is BACKLOG
+        #1940, and is not decided here."""
+        # Guarded on 'executing', so it can only move the row this call claimed.
+        if not await self._store.decide_pending_approval(
+            approval_id,
+            status="approved",
+            approver=approver,
+            decided_at=self._clock(),
+            from_status="executing",
+        ):
+            log.warning(
+                "approval %s: the operation ran but the row was no longer 'executing', so it was "
+                "not moved to 'approved'",
+                approval_id,
+            )
         await self._store.record_audit(
             "approval.approved",
             actor=approver,
@@ -345,7 +419,7 @@ class ApprovalGate:
                 {
                     "approval_id": approval_id,
                     "operation": operation,
-                    "requester": str(row["requester"]),
+                    "requester": requester,
                     "result": result,
                 }
             ),
@@ -354,12 +428,50 @@ class ApprovalGate:
             # halves of the ceremony from two independently-attributed hosts.
             client=client,
         )
-        return {
-            "operation": operation,
-            "requested_by": str(row["requester"]),
-            "approved_by": approver,
-            "result": result,
-        }
+
+    async def _record_interrupted_execution(
+        self,
+        approval_id: str,
+        *,
+        operation: str,
+        approver: str,
+        requester: str,
+        client: str | None,
+    ) -> None:
+        """Move a cancelled release from ``executing`` to ``interrupted`` and audit it (BACKLOG #1562).
+
+        ``interrupted`` means the outcome is unknown: the executor may have finished none, some or all
+        of its effects. The audit row is ``approval.interrupted``, so the trail tells an operation that
+        ran (``approval.approved``) apart from one that was cut off. Best effort, like
+        :meth:`_compensate_failed_execution`: the caller re-raises the cancellation either way."""
+        try:
+            # Guarded on 'executing' so it can only move the row this call claimed.
+            moved = await self._store.decide_pending_approval(
+                approval_id,
+                status="interrupted",
+                approver=approver,
+                decided_at=self._clock(),
+                from_status="executing",
+            )
+            await self._store.record_audit(
+                "approval.interrupted",
+                actor=approver,
+                detail=json.dumps(
+                    {
+                        "approval_id": approval_id,
+                        "operation": operation,
+                        "requester": requester,
+                        "recorded": moved,
+                    }
+                ),
+                client=client,  # ADR 0150: the approver's address, matching this row's actor
+            )
+        except Exception:  # noqa: BLE001 - the cancellation is re-raised by the caller either way
+            log.exception(
+                "approval %s: execution was cancelled AND recording it failed; the row may still "
+                "read 'executing' for an operation whose outcome is unknown",
+                approval_id,
+            )
 
     async def _requester_standing(
         self, requester_user_id: str, op: _Operation, params: Mapping[str, Any]
@@ -502,20 +614,20 @@ class ApprovalGate:
         error: BaseException,
         client: str | None,
     ) -> None:
-        """Roll a released-but-unexecuted request back out of ``approved`` (ASVS 2.3.3).
+        """Roll a released request whose executor raised out of ``executing`` (ASVS 2.3.3).
 
         Best effort by construction: the caller re-raises the ORIGINAL executor error either way, so
         a store that is itself unreachable here must not mask the error that actually explains the
         failure. A compensation failure is logged loudly rather than swallowed."""
         try:
-            # Guarded on 'approved' so this can never clobber a row another caller rejected or
+            # Guarded on 'executing' so this can never clobber a row another caller rejected or
             # expired, and so a re-drive of the same failure is idempotent (second call moves 0 rows).
             moved = await self._store.decide_pending_approval(
                 approval_id,
                 status="failed",
                 approver=approver,
                 decided_at=self._clock(),
-                from_status="approved",
+                from_status="executing",
             )
             await self._store.record_audit(
                 "approval.failed",
@@ -536,7 +648,7 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - see the docstring; the original error must win
             log.exception(
                 "approval %s: executor failed AND the compensating transition failed; the row may "
-                "still read 'approved' for an operation that did not run",
+                "still read 'executing' for an operation that did not complete",
                 approval_id,
             )
 

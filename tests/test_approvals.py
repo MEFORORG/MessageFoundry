@@ -460,8 +460,8 @@ async def test_raising_executor_audits_the_failure_against_both_identities(
 
 
 async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engine) -> None:
-    """The compensating transition is guarded on 'approved', so it can only ever move a row this
-    gate itself released -- never one another caller rejected or expired."""
+    """The compensating transition is guarded on 'executing' (BACKLOG #1562), so it can only ever
+    move a row this gate itself claimed -- never one another caller rejected or expired."""
     gate, _, maker_id = await _gate_with_failing_op(engine)
     approval_id = await gate.guard(
         "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
@@ -474,7 +474,7 @@ async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engin
         status="failed",
         approver="checker",
         decided_at=0.0,
-        from_status="approved",
+        from_status="executing",
     )
     assert moved is False
     row = await engine.store.get_pending_approval(approval_id)
@@ -490,6 +490,74 @@ async def test_pending_approval_store_contract(engine: Engine) -> None:
     from tests._pending_approval_store_contract import _assert_pending_approval_contract
 
     await _assert_pending_approval_contract(engine.store)
+
+
+# --- BACKLOG #1562: a release is 'executing' until its outcome is known ---------------------------
+# The SQLite legs of the shared release-outcome contract. The same bodies run against live
+# PostgreSQL and SQL Server, because the settling transitions are each backend's own SQL.
+
+
+async def test_release_reads_executing_while_it_runs_then_approved(engine: Engine) -> None:
+    from tests._pending_approval_store_contract import _assert_release_success_contract
+
+    await _assert_release_success_contract(engine.store)
+
+
+async def test_raising_release_ends_failed_not_executing(engine: Engine) -> None:
+    from tests._pending_approval_store_contract import _assert_release_failure_contract
+
+    await _assert_release_failure_contract(engine.store)
+
+
+async def test_cancelled_release_ends_interrupted_with_its_own_audit_row(engine: Engine) -> None:
+    from tests._pending_approval_store_contract import _assert_release_cancel_contract
+
+    await _assert_release_cancel_contract(engine.store)
+
+
+async def test_cancel_while_recording_success_still_records_approved(engine: Engine) -> None:
+    """The executor RETURNED, so the operation ran; a cancel that lands while that outcome is being
+    written must not strand the row in 'executing'. The caller still sees the cancellation."""
+    from tests._pending_approval_store_contract import _resolve, _StandingStore
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _SlowSettle(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            # Only the SETTLE out of 'executing', never the claim, is held open.
+            if kw.get("status") == "approved" and kw.get("from_status") == "executing":
+                entered.set()
+                await release.wait()
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    gate = ApprovalGate(_SlowSettle(engine.store), ON, resolve_identity=_resolve)
+
+    async def _runs(_p: Mapping[str, Any]) -> dict[str, Any]:
+        return {"ran": True}
+
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    task = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+    await asyncio.wait_for(entered.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    release.set()
+    # The shielded record finishes after the caller's cancellation; wait for it, bounded.
+    for _ in range(200):
+        if await engine.store.list_audit(action="approval.approved"):
+            break
+        await asyncio.sleep(0.01)
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "approved"
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+    assert await engine.store.list_audit(action="approval.interrupted") == []
 
 
 # --- BACKLOG #1540: the self-approval refusal keys on users.id, not on the username --------

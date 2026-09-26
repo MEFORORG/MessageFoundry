@@ -721,10 +721,10 @@ def _build_approval_gate(
 
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
         # Load-bearing dual-control guard (findings #1/#4/#11): ApprovalGate.approve runs THIS executor
-        # directly (purge_connection is NOT re-entered on the release path), and it flips the row to
-        # 'approved' BEFORE executing — so the require-quiesced precondition must be re-checked HERE, and
-        # a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise by rolling the row
-        # to 'failed' and auditing it, so a raise no longer strands it approved-but-unexecuted; skipping
+        # directly (purge_connection is NOT re-entered on the release path), and it claims the row
+        # ('executing', BACKLOG #1562) BEFORE executing — so the require-quiesced precondition must be
+        # re-checked HERE, and a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise
+        # by rolling the row to 'failed' and auditing it, so a raise no longer strands it; skipping
         # is still the better outcome HERE, because a non-quiesced outbound is a retryable precondition
         # miss the operator can clear, not a failed operation.) A non-quiesced
         # (running/stopping) outbound could have an INFLIGHT row cancel_queued cannot cancel, so purging
