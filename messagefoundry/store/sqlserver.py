@@ -3038,19 +3038,38 @@ class SqlServerStore:
         load (concurrency_fixes (a)). Runs on its OWN autocommit connection BEFORE the pool is
         created, so the momentary exclusivity of ``WITH ROLLBACK IMMEDIATE`` has no sibling MEFOR
         session to terminate; IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
-        (greenfield first boot) and every later open()/failover is a detect-and-skip no-op. Degrades
-        to a warning (never fails open()) when the principal lacks ALTER DATABASE or the lock cannot
-        be taken — emitting the exact statement for a DBA to run out-of-band."""
+        (greenfield first boot) and every later open()/failover is a detect-and-skip no-op.
+
+        **FAILS CLOSED when RCSI is off and cannot be turned on (BACKLOG #1628).** This used to degrade
+        to a warning when the principal lacked ``ALTER DATABASE``, which is exactly the least-privilege
+        login ``docs/DEPLOY-SERVER-DB.md`` §1.1 prescribes. Under locking READ COMMITTED the finalizer
+        deadlocks, whatever the claim mode: a caller UPDATEs its own queue row, then
+        :meth:`_maybe_finalize` takes the per-message applock and scans the message's rows, and that
+        scan waits for a SHARED lock on a sibling's row the sibling holds EXCLUSIVELY while it waits on
+        the same applock. Fable packet 4 (P4-05 / H-8) measured 29 of 30 concurrent fan-out finalizes
+        fail that way, the message left unfinalized. The fix it named first, taking the applock before
+        each caller's own row write, would move the lock in every finalizing primitive (about twenty,
+        with async, batched and sync twins); refusing the mode instead keeps one invariant in one place,
+        and every other correctness argument in this file already assumes RCSI on. So the open refuses,
+        naming the statement a DBA runs once. It also refuses when the probe cannot connect or cannot
+        read the state, since either way RCSI is unverified, and a pool opened after a transient probe
+        failure would run in exactly the mode this check exists to exclude.
+        ``ALLOW_SNAPSHOT_ISOLATION`` still only warns: no store path depends on it."""
         import aioodbc
 
         db = settings.database
+        remedy = (
+            f"a DBA must run once: ALTER DATABASE [{(db or '').replace(']', ']]')}] SET"
+            " READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
+        )
         try:
             conn = await aioodbc.connect(
                 dsn=connection_string(settings, posture=posture), autocommit=True
             )
-        except Exception as exc:  # noqa: BLE001 - the pool open below surfaces a real connect failure
-            log.warning("skipping the RCSI check on %r (could not connect): %s", db, exc)
-            return
+        except Exception as exc:
+            raise RuntimeError(
+                f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
+            ) from exc
         try:
             # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
             # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
@@ -3061,24 +3080,27 @@ class SqlServerStore:
                 "FROM sys.databases WHERE name = DB_NAME()"
             )
             row = await cur.fetchone()
-            # If we cannot read the state, do NOT attempt a disruptive ALTER.
-            rcsi_on = bool(row[0]) if row else True
-            snapshot_on = (row[1] in (1, 2)) if row else True
-            if not rcsi_on:
+            if row is None:
+                # The connected database is always visible to its own login in sys.databases, so a
+                # missing row is not a state to guess at. Do NOT attempt a disruptive ALTER; refuse.
+                raise RuntimeError(
+                    f"could not read the READ_COMMITTED_SNAPSHOT state of database {db!r}, so it is"
+                    f" unverified; {remedy}, and the login must be able to read its own"
+                    " sys.databases row -- refusing to open the store (fail closed)"
+                )
+            snapshot_on = row[1] in (1, 2)
+            if not row[0]:
                 try:
                     await cur.execute(
                         "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
-                except Exception as exc:  # noqa: BLE001 - permission/lock: degrade to a DBA pointer
-                    log.warning(
-                        "could not enable READ_COMMITTED_SNAPSHOT on %r (%s); a DBA should run once: "
-                        "ALTER DATABASE [%s] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE — "
-                        "without it the staged claim/finalize paths are more deadlock-prone under load",
-                        db,
-                        exc,
-                        db,
-                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could not"
+                        f" enable it ({exc}); {remedy} -- refusing to open the store, because under"
+                        " locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
+                    ) from exc
             if not snapshot_on:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
@@ -3092,10 +3114,12 @@ class SqlServerStore:
         """Hard-verify READ_COMMITTED_SNAPSHOT is ON — the pooled claim mode's startup gate (ADR 0066
         §3.3). :meth:`claim_fifo_heads`' STEP-1 discovery is a plain committed-snapshot read whose
         non-blocking guarantee (EMPTY-on-locked-head; a shared claimer connection never pinned in a
-        lock-wait) DEPENDS on RCSI. :meth:`_ensure_database_options` force-enables it at open but
-        deliberately degrades to a warning on a locked-down DB — acceptable for the per-lane claims
-        (they block by design), NOT for pooled mode, which must **fail closed** here rather than
-        silently claim with blocking discovery reads. Same state query as the open-time check. The
+        lock-wait) DEPENDS on RCSI. :meth:`_ensure_database_options` now fails the open itself when
+        RCSI is off and cannot be enabled (BACKLOG #1628: the finalizer deadlocks under locking READ
+        COMMITTED in EVERY claim mode, so the old per-lane warning fallback was not safe either). So
+        this gate can only fire when RCSI was switched off after this store opened, and
+        ``[pipeline].require_rcsi_for_pooled=false`` no longer lets a store open with RCSI off. Same
+        state query as the open-time check. The
         runner awaits this at pooled ``start()`` (ADR 0066 §5): under
         ``[pipeline].require_rcsi_for_pooled`` a raise unwinds the start; false downgrades it to a
         loud warning + a ``/stats`` degraded gauge. Raises with the exact DBA remediation statement."""

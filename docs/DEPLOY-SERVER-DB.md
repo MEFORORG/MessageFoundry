@@ -105,13 +105,15 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
 > `CREATE INDEX` / `ALTER TABLE ... ADD` / `DROP INDEX` / `DROP TABLE` (`db_ddladmin`), then only
 > `SELECT` (`db_datareader`) and `INSERT` / `UPDATE` / `DELETE` / `MERGE` (`db_datawriter`). It never
 > creates the database, never `TRUNCATE`s, calls no DMV and no extended procedure, and its two
-> `ALTER DATABASE ... SET` statements (`READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION`) each
-> degrade to a warning — §2.
+> `ALTER DATABASE ... SET` statements (`READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION`) run
+> only when that setting is off. A denied `ALLOW_SNAPSHOT_ISOLATION` is a warning; a denied
+> `READ_COMMITTED_SNAPSHOT` **fails the open** — §2.
 >
 > **The one thing a higher role would unlock — and why §2's RCSI pre-enable is a prerequisite, never a
 > tuning knob.** `db_owner` holds `ALTER` on the database, so it would let the engine turn RCSI on
-> itself at open; this login cannot, and the shipped default (`[pipeline].claim_mode = "pooled"` with
-> `require_rcsi_for_pooled = true`) **refuses to start** while RCSI is off. Have a DBA run the RCSI and
+> itself at open; this login cannot, and the store **refuses to open** while RCSI is off, in every
+> claim mode (BACKLOG #1628: under locking READ COMMITTED concurrent finalizers deadlock). Have a DBA
+> run the RCSI and
 > `ALLOW_SNAPSHOT_ISOLATION` statements once, before first start. That is the price of the reduced
 > role, and it is the only one — it is never a reason to grant a higher role.
 >
@@ -236,10 +238,11 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
   virgin database and on the **first start of a build whose schema moved** — and on that start a login
   without DDL rights **fails the open**; it does not degrade. Plan the DDL grant as an upgrade-window
   privilege, not a one-time bootstrap one.
-- **SQL Server specifics:** RCSI (`READ_COMMITTED_SNAPSHOT`) is enabled at open (with a DBA-fallback
-  warning if the login can't `ALTER DATABASE`); pre-enable it if your security policy forbids that grant.
+- **SQL Server specifics:** RCSI (`READ_COMMITTED_SNAPSHOT`) is enabled at open when the login can
+  `ALTER DATABASE`; when it cannot and RCSI is off, the open **fails** and names the statement for a
+  DBA. Pre-enable it if your security policy forbids that grant.
   With the §1.1 least-privilege login this is **not conditional** — that login cannot `ALTER DATABASE`,
-  and pooled claim mode (the shipped default) fails closed when RCSI is off.
+  so the store will not open until a DBA has turned RCSI on.
   The engine login's grants are §1.1 — `db_datareader` + `db_datawriter` + `db_ddladmin`, and never
   `db_owner` or `sysadmin`.
 
