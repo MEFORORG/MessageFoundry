@@ -87,10 +87,64 @@ async def test_enforce_session_cap_revokes_oldest() -> None:
         big = time.time() + 10_000
         for h, created in (("h1", 1.0), ("h2", 2.0), ("h3", 3.0)):
             await store.create_session(token_hash=h, user_id="u", expires_at=big, now=created)
-        await store.enforce_session_cap("u", keep=2)
+        # `now` pinned beside the rows: the cap counts only sessions still inside the idle window.
+        await store.enforce_session_cap("u", keep=2, idle_seconds=1800, now=4.0)
         assert (await store.get_session("h1")).revoked_at is not None  # type: ignore[union-attr]
         assert (await store.get_session("h2")).revoked_at is None  # type: ignore[union-attr]
         assert (await store.get_session("h3")).revoked_at is None  # type: ignore[union-attr]
+    finally:
+        await store.close()
+
+
+async def test_session_cap_contract_sqlite() -> None:
+    """SQLite leg of the BACKLOG #1900 contract: the cap counts only LIVE sessions. The live
+    Postgres and SQL Server suites run the same shared assertions."""
+    store = await _store()
+    try:
+        from tests._session_cap_contract import assert_session_cap_contract
+
+        await assert_session_cap_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_login_cap_skips_lapsed_sessions() -> None:
+    """BACKLOG #1900, service level: a login past the cap must not sign out a live device because
+    NEWER lapsed rows sit on record. Pins that ``_issue_session`` hands the store the same idle
+    timeout ``identity_for_token`` validates against, in seconds: too large or too small fails."""
+    store = await _store()
+    try:
+        settings = AuthSettings(max_sessions_per_user=2)
+        service = AuthService(store, settings)
+        await service.initialize()
+        await _local_user(service, "carol")
+        user = await store.get_user_by_username("carol")
+        assert user is not None
+        live_device = (await service.login("carol", PW)).token
+        assert live_device is not None
+        now = time.time()
+        idle = settings.session_idle_timeout_minutes * 60
+        # The live device was last used a minute inside the idle window. An idle timeout passed too
+        # SMALL (minutes read as seconds, say) would call it lapsed and revoke it.
+        await store.touch_session(hash_token(live_device), now=now - idle + 60)
+        # Two rows created AFTER the live device, so they outrank it by created_at, yet both are dead
+        # to the validator: one idle past the timeout, one past its absolute expiry. A timeout passed
+        # too LARGE would count the idle one as live and evict the device in its favour.
+        idle_gone, abs_gone = hash_token(mint_token()), hash_token(mint_token())
+        await store.create_session(
+            token_hash=idle_gone, user_id=user.id, expires_at=now + 3600, now=now
+        )
+        await store.touch_session(idle_gone, now=now - idle - 60)
+        await store.create_session(
+            token_hash=abs_gone, user_id=user.id, expires_at=now - 1, now=now
+        )
+
+        second = (await service.login("carol", PW)).token
+        assert second is not None
+        assert await service.identity_for_token(live_device) is not None, (
+            "the cap signed out a live device to make room for lapsed rows"
+        )
+        assert await service.identity_for_token(second) is not None
     finally:
         await store.close()
 

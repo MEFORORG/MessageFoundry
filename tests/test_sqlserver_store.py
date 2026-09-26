@@ -4769,6 +4769,15 @@ async def test_session_rotation_contract(store) -> None:
     await assert_session_rotation_contract(store)
 
 
+async def test_session_cap_contract(store) -> None:
+    """BACKLOG #1900: the per-user cap counts only LIVE sessions. What this leg executes that no
+    other does: ``TOP (?)`` ahead of the subquery's WHERE, which binds ``keep`` before the liveness
+    parameters rather than after them. Extra-free shared contract, so it actually runs."""
+    from tests._session_cap_contract import assert_session_cap_contract
+
+    await assert_session_cap_contract(store)
+
+
 # --- the per-message finalize lock, under real concurrency -----------------------------------------
 
 

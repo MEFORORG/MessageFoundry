@@ -1112,6 +1112,22 @@ _SESSION_INSERT: Final = (
 )
 
 
+# The session-cap predicates, in the `?` dialect SQLite and SQL Server share (BACKLOG #1900). Each
+# clause is one of AuthService.identity_for_token's rejections, negated with the SAME comparison, so
+# the cap and the validator cannot disagree at a boundary. See AuthStore.enforce_session_cap.
+#
+# A row whose stamps are not ahead of `now` (the validator's two clock-step tests). Bind (now, now).
+_SESSION_NOT_AHEAD_SQL: Final = "created_at <= ? AND last_used_at <= ?"
+# A row the validator would accept: not ahead, not past its absolute expiry, inside the idle window.
+# Bind with :func:`_session_live_params`.
+_SESSION_LIVE_SQL: Final = _SESSION_NOT_AHEAD_SQL + " AND expires_at >= ? AND ? - last_used_at <= ?"
+
+
+def _session_live_params(now: float, idle_seconds: float) -> tuple[float, ...]:
+    """The five parameters :data:`_SESSION_LIVE_SQL` binds, in order."""
+    return (now, now, now, now, float(idle_seconds))
+
+
 # The one connection_event INSERT, shared by MessageStore's singular and burst writers.
 _CONNECTION_EVENT_INSERT: Final = (
     "INSERT INTO connection_event"
@@ -11130,20 +11146,23 @@ class MessageStore:
             return int(cur.rowcount)
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, now: float | None = None
+        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
     ) -> None:
-        """Revoke a user's active sessions beyond the ``keep`` most recently created (AUTH-SESS-CAP)."""
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
+        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+                f" AND {_SESSION_NOT_AHEAD_SQL}"
                 " AND token_hash NOT IN ("
                 "  SELECT token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+                f"  AND {_SESSION_LIVE_SQL}"
                 "  ORDER BY created_at DESC, token_hash DESC LIMIT ?"
                 ")",
-                (now, user_id, user_id, keep),
+                (now, user_id, now, now, user_id, *_session_live_params(now, idle_seconds), keep),
             )
             await self._commit()
 
