@@ -31,6 +31,7 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
+from tests.test_sqlserver_store import _seed_lease_epoch
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -46,14 +47,6 @@ _LEASE_KEY = "mefor_cluster_leader"
 #: whose premise is "no lease row" is not quietly testing a row an earlier file left behind.
 _TABLES = ("message_events", "delivered_keys", "response", "queue", "messages", "leader_lease")
 
-_LEASE_DDL = (
-    "IF OBJECT_ID(N'leader_lease', N'U') IS NULL"
-    " CREATE TABLE leader_lease ("
-    " lease_key NVARCHAR(256) NOT NULL PRIMARY KEY, owner NVARCHAR(256) NULL,"
-    " lease_expires_at FLOAT NOT NULL,"
-    " leader_epoch BIGINT NOT NULL CONSTRAINT DF_leader_lease_epoch DEFAULT 0);"
-)
-
 
 async def _open() -> Any:
     from messagefoundry.config.settings import load_settings
@@ -66,7 +59,7 @@ async def _open() -> Any:
 async def store() -> AsyncIterator[Any]:
     s = await _open()
     try:
-        await s._execute(_LEASE_DDL)
+        await _seed_epoch(s, 0)  # creates leader_lease if absent; the row is cleared just below
         for table in _TABLES:
             await s._execute(f"DELETE FROM {table}")  # noqa: S608 - fixed table names
         s.set_leader_epoch(None)
@@ -78,14 +71,7 @@ async def store() -> AsyncIterator[Any]:
 
 async def _seed_epoch(store: Any, epoch: int) -> None:
     """Set the authoritative ``leader_lease.leader_epoch``; in production the coordinator owns it."""
-    await store._execute(
-        "MERGE leader_lease WITH (HOLDLOCK) AS t USING (SELECT ? AS lease_key) AS s"
-        " ON t.lease_key = s.lease_key"
-        " WHEN MATCHED THEN UPDATE SET leader_epoch = ?"
-        " WHEN NOT MATCHED THEN INSERT (lease_key, owner, lease_expires_at, leader_epoch)"
-        " VALUES (?, 'live', 9e18, ?);",
-        (_LEASE_KEY, epoch, _LEASE_KEY, epoch),
-    )
+    await _seed_lease_epoch(store, _LEASE_KEY, epoch)
 
 
 async def _drop_lease_row(store: Any) -> None:

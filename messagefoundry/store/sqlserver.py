@@ -8029,6 +8029,10 @@ class SqlServerStore:
         # ADR 0157 C1 — TERMINAL. Rendered ONCE for the loop: a fence on ANY member raises out and rolls
         # all N back, which is the all-or-nothing contract the docstring already promises.
         guard, guard_params = self._resolve_guard()
+        # ALL N, not the prefix walked so far: the rollback undoes every member, and all N are still
+        # INFLIGHT from the claim, so all N need re-pending. release_claimed is status-guarded, so a
+        # vanished member is a harmless no-op.
+        all_ids = tuple(outbox_ids)
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 finalize: dict[str, None] = {}
@@ -8050,10 +8054,7 @@ class SqlServerStore:
                     await self._exec_terminal(
                         cur,
                         "mark_batch_done",
-                        # ALL N, not the prefix walked so far: the rollback undoes every member, and
-                        # all N are still INFLIGHT from the claim, so all N need re-pending.
-                        # release_claimed is status-guarded, so a vanished member is a harmless no-op.
-                        tuple(outbox_ids),
+                        all_ids,
                         "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?"
                         + guard,
                         (OutboxStatus.DONE.value, now, outbox_id, *guard_params),
@@ -8224,9 +8225,8 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        return (
-            None  # reached only when _fence_scope swallowed a rejected DEAD branch (D1 re-pended)
-        )
+        # Reached only when _fence_scope swallowed a rejected DEAD branch (D1 re-pended).
+        return None
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
@@ -8236,6 +8236,7 @@ class SqlServerStore:
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         guard, guard_params = self._resolve_guard()  # ADR 0157 C1 — TERMINAL, once for the loop
+        all_ids = tuple(outbox_ids)  # a rejection re-pends ALL N, as in mark_batch_done
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 finalize: dict[str, None] = {}
@@ -8251,7 +8252,7 @@ class SqlServerStore:
                     await self._exec_terminal(
                         cur,
                         "dead_letter_batch",
-                        tuple(outbox_ids),
+                        all_ids,
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                         " WHERE id=?" + guard,
                         (

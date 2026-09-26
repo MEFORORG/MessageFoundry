@@ -23,7 +23,6 @@ import ast
 import asyncio
 import pathlib
 import re
-from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -39,6 +38,7 @@ from messagefoundry.store.sqlserver import (
     _FencedWrite,
 )
 from tests.test_adr0157_fence_scope import _calls_self, _sql_expressions
+from tests.test_sqlserver_sync_handoff_offline import _acm
 
 _SOURCE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "store" / "sqlserver.py"
 
@@ -285,14 +285,6 @@ def _store(cur: _Cursor, conn: _Conn, *, epoch: int | None) -> tuple[SqlServerSt
     store._leader_epoch = epoch
     store._lease_key = _LEASE_KEY if epoch is not None else None
 
-    @asynccontextmanager
-    async def acquire() -> Any:
-        yield conn
-
-    @asynccontextmanager
-    async def cursor(_conn: Any) -> Any:
-        yield cur
-
     released: list[Any] = []
 
     async def release_claimed(ids: Any, now: float | None = None) -> None:
@@ -301,8 +293,8 @@ def _store(cur: _Cursor, conn: _Conn, *, epoch: int | None) -> tuple[SqlServerSt
     async def noop(*_a: Any, **_k: Any) -> None:
         return None
 
-    store._acquire = acquire  # type: ignore[method-assign]
-    store._cursor = cursor  # type: ignore[method-assign]
+    store._acquire = _acm(conn)  # type: ignore[method-assign]
+    store._cursor = _acm(cur)  # type: ignore[method-assign]
     store.release_claimed = release_claimed  # type: ignore[method-assign]
     store._record_delivered_key = noop  # type: ignore[method-assign]
     store._event = noop  # type: ignore[method-assign]
