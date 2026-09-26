@@ -36,7 +36,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from messagefoundry.tray.config import TrayConfig
+from messagefoundry.tray.config import TrayConfig, is_tls_url
 from messagefoundry.tray.probe import (
     LoadedPin,
     load_pin,
@@ -239,14 +239,18 @@ class StatusPoller:
         self._ui_probe = ui_probe
         # The default factory carries the config's certificate pin, so a caller that injects its
         # own factory owns the trust decision too.
-        #: The pin the default client trusts. See :meth:`_follow_the_pin`.
+        #: The pin the default client trusts and follows. See :meth:`_follow_the_pin`. Only for
+        #: https: httpx ignores ``verify`` for plain http, so a pin there has nothing to follow.
         self._pin: str | None = None
         if client_factory is None:
-            self._pin = config.engine_cacert
+            if is_tls_url(config.engine_url):
+                self._pin = config.engine_cacert
             client_factory = functools.partial(make_probe_client, cacert=config.engine_cacert)
         self._client_factory = client_factory
         #: The pin bytes the current client was built from, or None when it was not built from them.
         self._pin_pem: bytes | None = None
+        #: The last changed pin bytes that would not load, so they are tried and logged only once.
+        self._pin_refused: bytes | None = None
         self._clock = clock
         self._toast_min_interval_s = toast_min_interval_s
         self._client: httpx.Client | None = None
@@ -373,15 +377,25 @@ class StatusPoller:
         engine's therefore fails verification exactly as before, and nothing here reaches for the
         OS trust store or turns verification off. The record moves only after the new client
         exists, so a build that raises is retried on the next tick.
+
+        Changed bytes that do not load are remembered, so the same bytes are neither loaded again
+        every tick nor logged again. A renewal caught mid-write logs one line and then settles; a
+        file that stays broken says so once, instead of the engine silently reading DOWN.
         """
         if self._pin is None or self._stop.is_set():
             return
         current = read_pin(self._pin)
-        if current is None or current == self._pin_pem:
-            return  # unreadable (keep the current client) or unchanged (nothing to do)
+        if current is None or current in (self._pin_pem, self._pin_refused):
+            return  # unreadable, unchanged, or already refused: keep the current client
         loaded = load_pin(self._pin)
         if loaded is None:
-            return  # present but not loadable yet: empty, half-written, or rewritten mid-load
+            # Present but not loadable: empty, half-written, or rewritten mid-load.
+            self._pin_refused = current
+            log.info(
+                "engine certificate %s changed but does not load; keeping the current probe client",
+                self._pin,
+            )
+            return
         log.info(
             "engine certificate %s %s; rebuilding the probe client",
             self._pin,

@@ -847,17 +847,18 @@ def test_a_pin_minted_after_start_is_picked_up_without_a_restart(
     from messagefoundry import pki
 
     pin = tmp_path / "api-generated-cert.pem"
-    built: list[str | None] = []
+    built: list[tuple[str | None, ssl.SSLContext | None]] = []
 
     def factory(
         url: str, *, cacert: str | None = None, pinned: ssl.SSLContext | None = None
     ) -> httpx.Client:
-        built.append(cacert)
+        built.append((cacert, pinned))
         return httpx.Client(base_url=url)
 
     monkeypatch.setattr("messagefoundry.tray.poller.make_probe_client", factory)
     poller = StatusPoller(
-        TrayConfig(engine_url=_ENGINE_URL, engine_cacert=str(pin)),
+        # https, because a pin is followed only there: httpx ignores `verify` for plain http.
+        TrayConfig(engine_url="https://127.0.0.1:8765", engine_cacert=str(pin)),
         on_update=lambda _r: None,
         scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
         health_probe=lambda _c: HealthProbe.OK,
@@ -881,6 +882,10 @@ def test_a_pin_minted_after_start_is_picked_up_without_a_restart(
         if poller._client is not None:
             poller._client.close()
     assert len(built) == 2
+    # The rebuild pins the loaded context itself rather than falling back to the OS trust store.
+    assert built[0] == (str(pin), None)
+    assert built[1][0] == str(pin)
+    assert isinstance(built[1][1], ssl.SSLContext)
 
 
 # --- Following a renewed pin (BACKLOG #1276) --------------------------------------------------------
@@ -1069,3 +1074,49 @@ def test_the_pin_is_still_enforced_after_a_rebuild(renewable_engine: _RenewableE
         renewable_engine.renew_pin()  # written to the pin, NOT served
         assert _health(poller, 1.0) is HealthProbe.DOWN
         assert poller._client is not first  # it did follow the file; the pin is what refused
+
+
+def test_a_pin_that_will_not_load_is_tried_and_logged_once(
+    renewable_engine: _RenewableEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Changed bytes that do not load are remembered: one load, one log line, then quiet."""
+    from messagefoundry.tray.probe import load_pin
+
+    loads: list[str] = []
+
+    def counting(cacert: str) -> object:
+        loads.append(cacert)
+        return load_pin(cacert)
+
+    with _pinned_poller(renewable_engine) as poller:
+        monkeypatch.setattr("messagefoundry.tray.poller.load_pin", counting)
+        renewable_engine.pin.write_bytes(b"")
+        with caplog.at_level(logging.INFO, logger=_POLLER_LOGGER):
+            for tick in range(3):
+                assert _health(poller, float(tick)) is HealthProbe.OK
+        assert len(loads) == 1
+        assert caplog.text.count("does not load") == 1
+
+
+def test_a_pin_on_a_plain_http_url_is_not_followed(tmp_path: Path) -> None:
+    """httpx ignores `verify` for http, so the file is never read and nothing is rebuilt."""
+    pin = tmp_path / "api-generated-cert.pem"
+    poller = StatusPoller(
+        TrayConfig(engine_url=_ENGINE_URL, engine_cacert=str(pin)),
+        on_update=lambda _r: None,
+        scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
+        health_probe=lambda _c: HealthProbe.OK,
+        ui_probe=lambda _c: UiProbe.ENABLED,
+    )
+    poller._open_client()
+    first = poller._client
+    try:
+        from messagefoundry import pki
+
+        pin.write_bytes(pki.make_self_signed("127.0.0.1", ["127.0.0.1"], 1)[0])
+        poller.poll_once(0.0)
+        assert poller._client is first
+    finally:
+        poller.stop()
