@@ -3470,7 +3470,8 @@ class AlertsSettings(_Section):
     # push channel, not just the pull-only /me/security-events feed. That feed carries the user's own
     # events, not an administrator's change to their account (auth/notifications.py states the rule).
     # Set false to accept the pull-only feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
-    # messagefoundry/__main__.py.
+    # messagefoundry/__main__.py. BACKLOG #2008 (ASVS 6.4.5): the same gate also requires a credential-
+    # reminder RECIPIENT (webhook_url, or email_to beside host + sender), and false waives that too.
     security_notifications_required: bool = True
 
     # Operator alert rules (ADR 0014): refine severity / which transports fire / cooldown / suppression

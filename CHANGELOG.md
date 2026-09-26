@@ -56,6 +56,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: `serve` now refuses to start when the credential reminders have no `[alerts]`
+  recipient.** The unclaimed-temporary-password and cert-expiry reminders go to the `[alerts]`
+  notifier. That notifier needs `webhook_url`, or `email_to` beside `email_smtp_host` and
+  `email_from`. The start gate checked only host and sender, so the smallest admitted configuration
+  sent every reminder to the log alone. With sign-in on, it now refuses under `enforce` and warns
+  under `warn`. The existing `[alerts].security_notifications_required = false` waiver covers it
+  and is audited. (`BACKLOG #2008`)
 - **BREAKING — `length_of_stay` needs a zone for admit and discharge times that carry no offset.**
   It used to subtract the two wall clocks. A stay spanning a daylight-saving change came back an hour
   wrong, with no error: 48 hours for a 47-hour stay across the March change, 48 for a 49-hour stay
