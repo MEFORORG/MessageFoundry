@@ -13,7 +13,8 @@ backticked spans on the anchored lines as the row's claim keys: config keys, rou
 symbols, which are the words a stale claim most often gets wrong and which grep finds verbatim. It
 then lists every line of that file that carries a key as a whole token and is not one of the row's
 own anchored lines. A line before the first anchored line carrying that key is EARLY; any other is
-LATER. A line two rows both reach is listed once.
+LATER. One finding is one (line, key) pair, listed once however many rows reach it. A line another
+row anchors is still listed: that row's reader checked it against a different claim.
 
 **What this cannot do, stated so nobody reads more into a short list than is there.**
 
@@ -22,7 +23,10 @@ LATER. A line two rows both reach is listed once.
 * An anchored line with no backticked span has no key, so its claim is never searched. The report
   counts those lines, and that count is the part of the record this instrument does not reach.
 * A key on more than ``--max-hits`` unanchored lines of its file is skipped as too common to
-  discriminate. That count is printed too, so a raised cap shows what it costs in noise.
+  discriminate, judged per row. That count is printed too, so a raised cap shows what it costs.
+* A key matches only in full. A restatement quoting part of a multi-word span, such as the flag
+  alone out of ``serve --flag``, is missed, and so is a span that a hard line wrap splits.
+* Only ``.md`` files are searched. Anchors on other files are not counted anywhere.
 
 **Disclosure.** No requirement identifier and no verdict: the finding type has no field for either,
 so no later edit can print one. It prints MORE than ``anchor_report.py`` does, namely the document
@@ -39,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess  # nosec B404 - imported only to name SubprocessError; this module runs nothing
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,8 +91,10 @@ def claim_keys(text: str) -> list[str]:
 
 
 def _hits(lines: list[str], key: str) -> list[int]:
-    # Whole-token match: `require_mfa` must not be found inside `require_mfa_for_admins`.
-    token = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])")
+    # Whole-token match: `require_mfa` must not be found inside `require_mfa_for_admins`, nor
+    # `--max-hits` inside `--max-hits-x`, `a.b` inside `a.b.c` or `/x` inside `/x/y`. A trailing
+    # full stop that ends a sentence is still a boundary, because no word character follows it.
+    token = re.compile(rf"(?<![\w-])(?<!\w[./]){re.escape(key)}(?![\w-])(?![./]\w)")
     return [n for n, text in enumerate(lines, start=1) if token.search(text)]
 
 
@@ -100,7 +107,7 @@ def census(cells: list[Cell], root: Path, *, max_hits: int) -> Census:
     for cell in cells:
         spans: dict[str, set[int]] = {}
         for anchor in cell.evidence:
-            if not anchor.path.endswith(PROSE_SUFFIX):
+            if not anchor.path.lower().endswith(PROSE_SUFFIX):
                 continue
             if anchor.path not in texts:
                 target = root / anchor.path
@@ -120,8 +127,10 @@ def census(cells: list[Cell], root: Path, *, max_hits: int) -> Census:
             if found is None or found.status != ANCHOR_LOCATED or found.line is None:
                 result.unresolved += 1
                 continue
-            last = found.line + anchor.expect.rstrip("\n").count("\n")
-            spans.setdefault(anchor.path, set()).update(range(found.line, last + 1))
+            # Leading and trailing newlines in `expect` are not quoted text, so they claim no line.
+            body = anchor.expect.strip("\n")
+            first = found.line + len(anchor.expect) - len(anchor.expect.lstrip("\n"))
+            spans.setdefault(anchor.path, set()).update(range(first, first + body.count("\n") + 1))
         for path, anchored in spans.items():
             _scan(result, path, lines_of[path], anchored, max_hits, hits_of)
     return result
@@ -221,24 +230,32 @@ def main(argv: list[str] | None = None) -> int:
         # Broad on purpose, for the reason anchor_report.py gives at the same boundary.
         return _refuse_unreadable(args.scorecard, exc)
 
-    result = census(cells, args.root, max_hits=args.max_hits)
-    if not result.anchored:
-        # An empty search space would print a reassuring zero that examined nothing.
-        return _refuse("no prose anchor resolved in this tree, so nothing was searched")
-    report = render(
-        result,
-        max_hits=args.max_hits,
-        early_only=args.early_only,
-        scorecard=args.scorecard,
-        root=args.root,
-    )
-    # Keys are quoted from the documents, and some carry characters a cp1252 console cannot encode.
-    # Escape them rather than die mid-report with a traceback that exits 1, the findings code.
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="backslashreplace")
+    try:
+        result = census(cells, args.root, max_hits=args.max_hits)
+        if not result.anchored:
+            # An empty search space would print a reassuring zero that examined nothing.
+            return _refuse("no prose anchor resolved in this tree, so nothing was searched")
+        report = render(
+            result,
+            max_hits=args.max_hits,
+            early_only=args.early_only,
+            scorecard=args.scorecard,
+            root=args.root,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # A document or git that would not answer is "could not measure", which is exit 2, never a
+        # traceback. The class name only: an OS message can quote a path, and nothing more is needed.
+        return _refuse(f"a read failed mid-run ({type(exc).__name__}), so no total is printed")
     print("\n".join(report))
     return EXIT_OK
 
 
 if __name__ == "__main__":
+    # Keys are quoted from the documents, and some carry characters a cp1252 console cannot encode.
+    # Escape them rather than die mid-report. Done here, not in main(), so an in-process caller's
+    # stdout is left alone.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(errors="backslashreplace")
     raise SystemExit(main())

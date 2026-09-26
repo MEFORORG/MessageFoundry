@@ -137,12 +137,13 @@ def test_the_rows_own_anchored_lines_are_never_findings(engine: Path, tmp_path: 
 
 
 def test_a_line_two_rows_reach_is_listed_once_and_early_wins(engine: Path, tmp_path: Path) -> None:
-    """Row one anchors line 5, so line 2 is EARLY for it; row two anchors line 1, so LATER for it."""
-    _write(engine, "intro `k_one`", "restated `k_one`", "", "", "row one `k_one`")
+    """The row read FIRST anchors line 1, so line 2 is LATER for it; the row read second anchors
+    line 5, so line 2 is EARLY for it. The later EARLY must replace the earlier LATER."""
+    _write(engine, "intro `k_one`", "restated `k_one`", "", "", "row two `k_one`")
     record = _record(
         tmp_path / "r.toml",
-        ("docs/SEC.md", 5, "row one `k_one`"),
-        second=(("docs/SEC.md", 1, "intro `k_one`"),),
+        ("docs/SEC.md", 1, "intro `k_one`"),
+        second=(("docs/SEC.md", 5, "row two `k_one`"),),
     )
     result = census(load_scorecard(record), engine, max_hits=3)
     at_two = [f for f in result.findings.values() if f.line == 2]
@@ -150,12 +151,73 @@ def test_a_line_two_rows_reach_is_listed_once_and_early_wins(engine: Path, tmp_p
     assert len(result.anchored) == 2
 
 
+@pytest.mark.parametrize(
+    ("key", "longer"),
+    [
+        ("require_mfa", "require_mfa_for_admins"),
+        ("--max-hits", "--max-hits-x"),
+        ("a.b_key", "a.b_key.c"),
+        ("/security/posture", "/security/posture/x"),
+    ],
+)
 def test_a_key_inside_a_longer_identifier_is_not_a_restatement(
-    engine: Path, tmp_path: Path
+    key: str, longer: str, engine: Path, tmp_path: Path
 ) -> None:
-    _write(engine, "see `require_mfa_for_admins`", "", "anchor `require_mfa`")
-    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 3, "anchor `require_mfa`"))
+    _write(engine, f"see `{longer}`", "", f"anchor `{key}`")
+    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 3, f"anchor `{key}`"))
     assert _found(record, engine) == set()
+
+
+def test_a_key_ending_a_sentence_still_matches(engine: Path, tmp_path: Path) -> None:
+    _write(engine, "Set k_one.", "", "anchor `k_one`")
+    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 3, "anchor `k_one`"))
+    assert _found(record, engine) == {(1, "k_one", EARLY)}
+
+
+def test_a_leading_newline_does_not_claim_the_previous_line(engine: Path, tmp_path: Path) -> None:
+    _write(engine, "prev `k_aaa`", "line two `k_bbb`", "later `k_aaa`")
+    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 2, NL + "line two `k_bbb`"))
+    result = census(load_scorecard(record), engine, max_hits=3)
+    assert result.anchored == {("docs/SEC.md", 2)}
+    assert result.findings == {}
+
+
+def test_early_only_hides_later_lines_but_not_their_count(
+    engine: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    doc = _doc(later="Turn `[security].require_mfa` off to opt out.")
+    (engine / "docs" / "SEC.md").write_text(doc, encoding="utf-8")
+    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 7, ANCHORED))
+    code, out = _run(["--scorecard", str(record), "--root", str(engine), "--early-only"], capsys)
+    assert code == 0
+    assert "LATER restatements            : 1" in out
+    assert "EARLY  docs/SEC.md:3" in out
+    assert "LATER  docs/SEC.md:9" not in out
+
+
+def test_an_unreadable_record_is_refused_without_naming_its_row(
+    engine: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reader's own diagnostic names the row it rejected. The refusal must not repeat it."""
+    # The document exists, so the only thing that can refuse here is the record's reader.
+    (engine / "docs" / "SEC.md").write_text(_doc(), encoding="utf-8")
+    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 7, ANCHORED))
+    text = record.read_text(encoding="utf-8").replace('verdict = "pass"', 'verdict = "bogus"')
+    record.write_text(text, encoding="utf-8")
+    code, out = _run(["--scorecard", str(record), "--root", str(engine)], capsys)
+    assert code == 2
+    assert "REFUSING" in out
+    assert SENTINEL_ID not in out
+    assert "bogus" not in out
+    assert "nothing was searched" not in out
+
+
+def test_a_max_hits_below_one_is_refused(
+    engine: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _record(tmp_path / "r.toml", ("docs/SEC.md", 7, ANCHORED))
+    argv = ["--scorecard", str(record), "--root", str(engine), "--max-hits", "0"]
+    assert _run(argv, capsys)[0] == 2
 
 
 def test_blind_spots_are_counted(engine: Path, tmp_path: Path) -> None:
