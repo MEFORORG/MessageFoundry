@@ -45,7 +45,8 @@ shared reader exists to get right once.
 none could check it** -- the backend is a build-isolation dependency and is installed in no
 interpreter here. At the pinned ``hatchling==1.32.4`` every ``[build-system]`` table names (re-read
 at the move from 1.32.0: ``builders/config.py`` is byte-identical, and ``plugin/interface.py`` gained
-nine lines of type annotations above these sites and no behaviour change):
+nine lines of example code in the ``BuilderInterface`` docstring above these sites, plus typing-only
+edits below them, so every line cited here moved by nine and none changed):
 
 * ``src/hatchling/builders/config.py:679`` is the ``in self.target_config`` test above;
 * ``src/hatchling/builders/plugin/interface.py`` calls ``include_path`` at exactly two sites, ``:213``

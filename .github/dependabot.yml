@@ -89,8 +89,9 @@ updates:
     # ruling. PR 1552 rewrote the release-tools `~=7.3.1` to `>=7.3.1,<7.5.0` and locked 7.4.0, which
     # silently lifted a deliberate ceiling. Why the ceiling exists is the cyclonedx-bom note above
     # `release-tools` in pyproject.toml; read it there. The range leaves the 7.3.x patch track open.
-    # The trade-off note above holds: security.yml runs pip-audit over ci/locks/release-tools.lock.
-    # Lift this entry in the same PR that moves the pyproject spec to a validated 7.4.
+    # The trade-off note above holds: security.yml runs pip-audit over ci/locks/release-tools.lock,
+    # and if that audit line is ever removed, REMOVE THIS ENTRY WITH IT, as for sigstore. Lift this
+    # entry in the same PR that moves the pyproject spec to a validated 7.4.
     ignore:
       - dependency-name: "annotated-types"
         versions: [">=0.8.0"]

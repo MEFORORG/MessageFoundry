@@ -6,7 +6,11 @@
 # It does NOT stop the fetch, check a hash, or pin hatchling's own dependencies; BACKLOG #1546 records
 # that residual and the `--no-isolation` form that would close it. Dependabot's uv updater bumps THIS
 # table and neither of the two under packaging/, so a Dependabot hatchling bump reds the lockstep test
-# until those two are moved by hand in the same PR.
+# until those two are moved by hand in the same PR. Read the backend's changes, not only its version:
+# 1.32.4 writes core-metadata `Version:` in the spelling the version root was TYPED in, where 1.32.0
+# wrote the PEP 440 canonical form. The release.yml version gates compare PEP 440 versions, so none
+# reds on that, but prose in release.yml and tests/test_release_pipeline.py that says the backend
+# canonicalises `Version:` now holds only for an already-canonical __version__.
 requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
@@ -384,8 +388,8 @@ ci-scanners = [
 #                  spec the inline install already carried, so this move adds hashes for the transitives
 #                  without changing which version resolves. THIS IS THE ONE STATEMENT OF THAT REASONING;
 #                  the test suite's FLOOR_BY_DESIGN entry points here rather than repeating it.
-#                  Dependabot WIDENS this cap rather than respecting it (PR 1552 did), so
-#                  .github/dependabot.yml ignores `>=7.4.0`; move both together.
+#                  .github/dependabot.yml carries a matching `>=7.4.0` ignore, and says why;
+#                  move both together.
 # Both are installed from `ci/locks/release-tools.lock` with `--require-hashes`, alongside the signing
 # tool above. One group and one lock rather than three: the three tools run on the same runners at the
 # same trust level, and a second lock would be another artifact to export, diff, resync and audit for a
