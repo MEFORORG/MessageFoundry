@@ -308,7 +308,7 @@ def test_data_key_of_the_wrong_type_refuses_to_start(
     assert "MEFOR_STORE_TRANSIT_KEY" in str(excinfo.value)  # names the knob to change
 
 
-@pytest.mark.parametrize("key_type", ["aes256-gcm96", "aes128-gcm96", "chacha20-poly1305"])
+@pytest.mark.parametrize("key_type", ["aes256-gcm96", "chacha20-poly1305"])
 def test_data_key_of_a_supported_aead_type_still_builds(
     monkeypatch: pytest.MonkeyPatch, key_type: str
 ) -> None:
@@ -318,6 +318,50 @@ def test_data_key_of_a_supported_aead_type_still_builds(
     monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
     assert isinstance(build_transit_cipher(StoreSettings()), TransitCipher)
     assert transit.read_calls == [_KEY_NAME]  # still exactly ONE round trip, as before the fix
+
+
+def test_an_aes128_data_key_is_refused_with_the_steps_that_fix_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``aes128-gcm96`` was a supported data-key type until owner ruling R4 of 2026-09-26 (BACKLOG
+    #2043). The refusal names the key, its type, a type to create and the knob, warns that a Vault
+    rotate keeps the type, and says a store that already holds data cannot switch this way.
+
+    CONTROL: ``aes256-gcm96`` builds, in ``test_data_key_of_a_supported_aead_type_still_builds``.
+    """
+    transit = _FakeTransit()
+    transit.key_types[_KEY_NAME] = "aes128-gcm96"
+    _use_fake(monkeypatch, transit)
+    monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
+    with pytest.raises(KeyProviderError) as excinfo:
+        build_transit_cipher(StoreSettings())
+    message = str(excinfo.value)
+    assert repr(_KEY_NAME) in message
+    assert "'aes128-gcm96'" in message
+    assert "type=aes256-gcm96" in message
+    assert "MEFOR_STORE_TRANSIT_KEY" in message
+    assert "rotating the key keeps its type" in message
+    assert "Only a store with no data yet can switch" in message
+    assert transit.read_calls == [_KEY_NAME]  # refused on the metadata read, at startup
+
+
+def test_an_aes128_dedicated_audit_key_is_refused_with_the_steps_that_fix_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The audit set is built from the data set, so it lost ``aes128-gcm96`` too (BACKLOG #2043).
+    The data key here is ``aes256-gcm96`` and passes, so the refusal is the audit key's alone."""
+    transit = _FakeTransit()
+    transit.key_types["mefor-audit"] = "aes128-gcm96"
+    _use_fake(monkeypatch, transit)
+    monkeypatch.setenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", "mefor-audit")
+    with pytest.raises(KeyProviderError) as excinfo:
+        build_transit_cipher(StoreSettings())
+    message = str(excinfo.value)
+    assert "'mefor-audit'" in message and "'aes128-gcm96'" in message
+    assert "`hmac` type" in message  # the dedicated MAC type is offered, not only AES
+    assert "MEFOR_STORE_TRANSIT_AUDIT_KEY" in message
+    assert "the audit-chain MAC" in message  # the use that refused, not the data key's
+    assert transit.read_calls == [_KEY_NAME, "mefor-audit"]  # the data key was read, and passed
 
 
 def test_dedicated_audit_key_of_the_wrong_type_refuses_to_start(

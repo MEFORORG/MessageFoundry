@@ -586,16 +586,21 @@ _APPROVED_SFTP_MACS = frozenset(
 #: paramiko offers, so forgetting to add a newly-shipped algorithm EXCLUDES it rather than proposing it.
 #:
 #: MEASURED against paramiko 5.0.0 (the version ``constraints.lock`` pins), whose ``_preferred_ciphers``
-#: offers nine names. Five are approved here. The four left out, and why each:
+#: offers nine names. ONE is approved here: ``aes256-gcm@openssh.com``, an AEAD cipher -- it
+#: authenticates its own ciphertext. paramiko 5.0.0 still negotiates a MAC beside it, though, so a
+#: server must ALSO offer a name from the MAC allow-list above or the handshake fails on "no
+#: acceptable macs". The eight left out, and why each:
 #:   - ``aes128-cbc``, ``aes192-cbc``, ``aes256-cbc`` -- CBC. SSH's CBC mode is what the
 #:     chosen-ciphertext plaintext-recovery attack of CVE-2008-5161 targets, and CBC is also the half
-#:     of the composition that makes a plaintext MAC (above) dangerous. AES-CTR and AES-GCM carry the
-#:     same key sizes with neither problem, so dropping these gives up no strength.
+#:     of the composition that makes a plaintext MAC (above) dangerous.
 #:   - ``3des-cbc`` -- CBC as above, and under the 128-bit floor twice over: a 64-bit block (the
 #:     Sweet32 birthday attack, CVE-2016-2183) and roughly 112 bits of effective key strength.
-#: Of the approved five, the two ``-gcm@openssh.com`` names are AEAD -- the cipher authenticates its
-#: own ciphertext -- and the three ``-ctr`` names are the modern non-AEAD floor every SSH server
-#: speaks, paired by the allow-list above with an encrypt-then-MAC tag.
+#:   - ``aes128-ctr``, ``aes192-ctr``, ``aes256-ctr`` -- CTR. ASVS Appendix C gives CTR status D
+#:     (disallowed), whatever the key size (BACKLOG #2041).
+#:   - ``aes128-gcm@openssh.com`` -- a 128-bit AES key. Owner ruling R4 of 2026-09-26 (BACKLOG #2042)
+#:     withdrew AES-128 here and on Vault Transit; this row is BACKLOG #2044.
+#: So a server that offers none of the approved names fails the handshake. OpenSSH added
+#: ``aes256-gcm@openssh.com`` in 6.2 (2013); a server or appliance that speaks only CTR fails.
 #:
 #: EXCLUDING AN ALGORITHM THE LIBRARY DOES NOT OFFER IS HARMLESS. The subtraction only ever names
 #: something paramiko actually proposed, so an algorithm a future release drops simply stops
@@ -603,11 +608,7 @@ _APPROVED_SFTP_MACS = frozenset(
 #: until someone approves it here. That second case costs a good cipher, never proposes a weak one.
 _APPROVED_SFTP_CIPHERS = frozenset(
     {
-        "aes128-gcm@openssh.com",
         "aes256-gcm@openssh.com",
-        "aes128-ctr",
-        "aes192-ctr",
-        "aes256-ctr",
     }
 )
 

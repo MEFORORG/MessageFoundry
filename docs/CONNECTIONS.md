@@ -1149,6 +1149,12 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   before any network traffic, as a permanent `SFTP connection rejected: ...` error. Its wording can
   mislead: an Ed25519 key in OpenSSH form reports `unpack requires a buffer of 4 bytes`. Measured
   against paramiko 5.0.0, the locked version.
+- **The server must offer `aes256-gcm@openssh.com`, and `hmac-sha2-256-etm@openssh.com` or
+  `hmac-sha2-512-etm@openssh.com`.** The connector proposes that one cipher and those two MACs, and
+  nothing else. A server missing either fails the handshake with a permanent `SFTP connection
+  rejected: Incompatible ssh server (no acceptable ciphers)` or `(no acceptable macs)`. No setting
+  widens either list. `_APPROVED_SFTP_CIPHERS` in `transports/remotefile.py` says why each name is
+  in or out, and why the MAC still matters beside GCM. (BACKLOG #2041, #2044)
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).
