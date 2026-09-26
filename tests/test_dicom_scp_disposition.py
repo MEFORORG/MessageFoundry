@@ -24,7 +24,12 @@ pytest.importorskip("pydicom", reason="DICOM SCP tests need the [dicom] extra")
 pytest.importorskip("pynetdicom", reason="DICOM SCP tests need the [dicom] extra")
 
 from messagefoundry.config.models import ConnectorType, ContentType, Source  # noqa: E402
-from messagefoundry.config.wiring import DICOM, Registry, build_inbound_connection  # noqa: E402
+from messagefoundry.config.wiring import (  # noqa: E402
+    DICOM,
+    ConnectionSpec,
+    Registry,
+    build_inbound_connection,
+)
 from messagefoundry.pipeline import wiring_runner  # noqa: E402
 from messagefoundry.pipeline.wiring_runner import RegistryRunner  # noqa: E402
 from messagefoundry.store import MessageStatus, MessageStore  # noqa: E402
@@ -177,37 +182,84 @@ def test_a_cap_below_the_ceiling_is_kept() -> None:
     assert _scp(_MIB)._max_object_bytes == _MIB
 
 
+def _clamp_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if "ingress ceiling" in r.getMessage()]
+
+
 @pytest.mark.parametrize(
-    ("configured", "warns"),
+    ("configured", "shown"),
     [
-        (64 * _MIB, True),
-        (wiring_runner._INGRESS_MAX_BYTES + 1, True),
-        (wiring_runner._INGRESS_MAX_BYTES, False),
-        (_MIB, False),
-        # The shipped default is clamped too, but the factory always passes it, so it cannot be told
-        # from an explicit setting. Warning on every default SCP would be noise.
-        (128 * _MIB, False),
+        (64 * _MIB, str(64 * _MIB)),
+        (wiring_runner._INGRESS_MAX_BYTES + 1, str(wiring_runner._INGRESS_MAX_BYTES + 1)),
+        # An explicit uncapped setting is the widest clamp of all: "no limit" becomes 16 MiB.
+        (None, "uncapped"),
+        (0, "uncapped"),
     ],
 )
 def test_a_clamped_cap_is_logged_at_build(
-    configured: int, warns: bool, caplog: pytest.LogCaptureFixture
+    configured: int | None, shown: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #1962: an operator who sets a cap above the ingress ceiling is told, at build, that the
-    SCP will refuse anything over the ceiling. A cap at or below it, and the shipped default, stay
-    silent."""
+    """BACKLOG #1962: an operator whose cap is clamped to the ingress ceiling is told so at build,
+    with the connection name, the value they set and the ceiling."""
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"):
         _scp(configured, name=_NAME)
 
-    hits = [r for r in caplog.records if "ingress ceiling" in r.getMessage()]
-    if not warns:
-        assert hits == []
-        return
+    hits = _clamp_warnings(caplog)
     assert len(hits) == 1
     assert hits[0].levelno == logging.WARNING
     message = hits[0].getMessage()
-    assert _NAME in message
-    assert str(configured) in message
-    assert str(wiring_runner._INGRESS_MAX_BYTES) in message
+    assert repr(_NAME) in message
+    assert f"max_object_bytes {shown} " in message
+    assert f"ceiling of {wiring_runner._INGRESS_MAX_BYTES} bytes" in message
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        wiring_runner._INGRESS_MAX_BYTES,
+        _MIB,
+        # The shipped default is clamped too, but the factory always passes it, so it cannot be told
+        # from an explicit setting. Warning on every default SCP would be noise.
+        128 * _MIB,
+    ],
+)
+def test_a_cap_that_is_not_clamped_or_is_the_default_stays_silent(
+    configured: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"):
+        _scp(configured, name=_NAME)
+
+    assert _clamp_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("spec", "warns"),
+    [
+        (DICOM(ae_title=_SCP_AE, port=0), False),
+        (DICOM(ae_title=_SCP_AE, port=0, max_object_bytes=64 * _MIB), True),
+    ],
+    ids=["factory-default", "explicit-64MiB"],
+)
+def test_the_clamp_warning_through_the_real_build_path(
+    spec: ConnectionSpec, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same rule through ``DICOM()`` and the runner's own Source builder, which is where the
+    default value and the connection name really come from."""
+    from messagefoundry.transports.base import build_source
+
+    ic = build_inbound_connection(
+        _NAME,
+        spec,
+        router="r",
+        content_type=ContentType.DICOM,
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"):
+        build_source(wiring_runner._source_config(ic, "127.0.0.1", {}))
+
+    hits = _clamp_warnings(caplog)
+    assert len(hits) == (1 if warns else 0)
+    if warns:
+        assert repr(_NAME) in hits[0].getMessage()
 
 
 def test_the_receipt_contract_is_declared_by_the_transport() -> None:
