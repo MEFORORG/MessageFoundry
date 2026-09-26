@@ -12,6 +12,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -29,7 +30,7 @@ from messagefoundry.auth.notifications import (
     ROLES_CHANGED,
     SecurityEvent,
 )
-from messagefoundry.auth.service import AuthService, IssuedCredential
+from messagefoundry.auth.service import AuthService, IssuedCredential, UsernameTaken
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, create_admin
@@ -1334,5 +1335,71 @@ async def test_the_reset_notice_to_a_disabled_account_carries_no_deadline() -> N
         notice = next(e for e in notifier.events if e.event_type == PASSWORD_RESET)
         assert "expires_at" not in notice.detail
         assert issued.expires_at is not None
+    finally:
+        await store.close()
+
+
+def _race_for_the_name(store: MessageStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the next ``create_user`` lose the BACKLOG #1808 race: a rival row takes the name first,
+    then the real insert runs and meets the UNIQUE index, as a concurrent create would."""
+    original = store.create_user
+
+    async def racing(**kwargs: Any) -> None:
+        monkeypatch.setattr(store, "create_user", original)
+        await original(user_id="rival", username=kwargs["username"], auth_provider="local")
+        await original(**kwargs)
+
+    monkeypatch.setattr(store, "create_user", racing)
+
+
+async def test_a_lost_username_race_raises_username_taken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #1808: the caller's check passed, then a concurrent create took the name. The store's
+    # UNIQUE refusal must come back as UsernameTaken, not as the driver's own integrity error.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        _race_for_the_name(store, monkeypatch)
+        with pytest.raises(UsernameTaken, match="username already exists") as raised:
+            await service.create_local_user(
+                username="carol",
+                password="a-long-enough-original-passphrase",
+                display_name=None,
+                email=None,
+                roles=[],
+                actor="admin",
+            )
+        assert isinstance(raised.value.__cause__, sqlite3.IntegrityError)
+        holder = await store.get_user_by_username("carol")
+        assert holder is not None and holder.id == "rival"
+    finally:
+        await store.close()
+
+
+async def test_an_integrity_refusal_with_no_holder_is_not_called_a_username_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The handler re-reads before it names the conflict. An integrity refusal while no row holds the
+    # name is some other fault, so it re-raises untouched rather than being reported as taken.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+
+        async def refused(**_kwargs: object) -> None:
+            raise sqlite3.IntegrityError("some other constraint")
+
+        monkeypatch.setattr(store, "create_user", refused)
+        with pytest.raises(sqlite3.IntegrityError, match="some other constraint"):
+            await service.create_local_user(
+                username="dave",
+                password="a-long-enough-original-passphrase",
+                display_name=None,
+                email=None,
+                roles=[],
+                actor="admin",
+            )
     finally:
         await store.close()
