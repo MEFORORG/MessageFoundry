@@ -277,14 +277,16 @@ async def _post(port: int, body: bytes, *, method: str = "POST") -> int:
 
 
 async def _run_http(
-    src: HttpSource, count: int, *, method: str = "POST"
+    src: HttpSource, count: int, *, method: str = "POST", decline: bool = False
 ) -> tuple[list[bytes], int]:
-    """Send ``count`` requests, each on its own connection, and return the bodies + last status."""
+    """Send ``count`` requests, each on its own connection, and return the bodies + last status.
+
+    ``decline`` makes the handler refuse every body, as the runner does after recording ERROR."""
     seen: list[bytes] = []
 
     async def handler(raw: bytes) -> str | None:
         seen.append(raw)
-        return f"msg-{len(seen)}"
+        return None if decline else f"msg-{len(seen)}"
 
     await src.start(handler)
     status = 0
@@ -362,6 +364,18 @@ async def test_a_committed_post_does_charge_the_budget() -> None:
     assert src._pacer is not None
     seen, _ = await _run_http(src, 2)
     assert len(seen) == 2
+    assert src._pacer.deficit(now=time.monotonic()) > 0.0
+
+
+async def test_a_body_refused_at_ingress_still_charges_the_budget() -> None:
+    """A body the handler reads, records as ERROR and refuses (answered 422, BACKLOG #1960) cost the
+    engine the same work a committed one did, so it spends the budget too. Pinned because the charge
+    sits above the 422 branch, and moving it below would stop refused bodies being paced at all."""
+    src = _http_source(max_messages_per_second=1, message_burst=1)
+    assert src._pacer is not None
+    seen, status = await _run_http(src, 2, decline=True)
+    assert len(seen) == 2
+    assert status == 422
     assert src._pacer.deficit(now=time.monotonic()) > 0.0
 
 

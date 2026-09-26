@@ -612,7 +612,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
 | `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited. |
 | `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). This one cap can't be switched off: unset or `None` takes the 64 KiB default, and `0` (or `"0"`) is refused at load rather than silently becoming the default (BACKLOG #1872). |
-| `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe and a refused request wait behind an outstanding debt but **charge nothing** — only a committed message spends budget, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
+| `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe waits behind an outstanding debt but **charges nothing**, and neither does a request refused before its body reaches the engine. Only a body the engine reads and records spends budget, including one it then refuses with a `422`, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so the listener can always make progress. |
 | `tls` | `false` | serve **HTTPS** (TLS 1.2+, the same per-connection inbound TLS builder MLLP uses). |
 | `tls_cert_file` / `tls_key_file` | — | the server-identity cert + its private key (required when `tls`). A PEM **path** (a plain string — unlike `DICOM()`, these two are not typed for `env()`). |
@@ -655,7 +655,13 @@ enforce` the bind is refused *even with it*. Treat the flag as a lab tool, not a
 and answered **`202 Accepted`** carrying the engine `message_id` the instant it is durably committed — the
 HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery failure happens *after* the
 `202` and is **not** reflected in the HTTP status; it surfaces as the message's `ERROR`/dead-letter
-disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A **pre-ingress** refusal answers
+disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A body the engine **refuses at
+ingress**, after reading it, answers **`422`** with `{"error":"message was not accepted"}` and no
+`message_id`. Examples are a body the engine cannot decode or one over its ingress ceiling. Others include
+a body that does not match the declared `content_type`, or an HL7 parse or strict-validation failure. The
+message is still recorded, with status `ERROR`, so it is counted and never silently dropped
+(owner ruling 2026-09-26, [ADR 0154 amendment](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths)).
+A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
 `max_header_bytes`), `400` (a malformed request line or header, or framing this listener will not guess at -- including at least any `Transfer-Encoding`, a duplicated or non-digit `Content-Length`, whitespace before a header colon, a folded header line, a bare CR or LF, a control character in a header value, an HTTP version other than 1.x, a missing `Host` on any version but HTTP/1.0, more than one `Host`, and a non-zero body declared on a method other than `POST`/`PUT`/`PATCH`), `411` (a `POST`/`PUT`/`PATCH` with no `Content-Length`; the body is never read to EOF), `503` (at
@@ -668,8 +674,9 @@ then returns that reply as the response body — a proxy API rather than a recei
 the sole authority** for the returned bytes: every in-process signal is only a latency hint and the waiter
 re-reads the store, which is what keeps this correct under engine sharding, HA failover, every claim mode,
 and any race between the capturing worker and the reader. A reply is therefore returned only once it is
-durable and replayable. An inbound **without** `reply_from` keeps the `202`-on-receipt path above byte for
-byte.
+durable and replayable. An inbound **without** `reply_from` keeps the receipt path above: `202` for a
+committed body, `422` for a body refused at ingress. A `reply_from` inbound answers that same `422` for a
+refused body, before it would wait for any reply.
 
 Refused at **check time** (`messagefoundry check`) rather than at runtime: a `reply_from` naming no
 deployed outbound; an outbound that does not capture responses; `reply_content_type="passthrough"` against
