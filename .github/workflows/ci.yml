@@ -2673,6 +2673,7 @@ jobs:
         run: >-
           bash scripts/ci/retry-native-crash.sh
           pytest -v
+          tests/test_adr0157_inc3_cancel_probe_sqlserver.py
           tests/test_inline_fast_path.py
           tests/test_batch_claim_fifo.py
           tests/test_batch_claim_worker.py
@@ -2685,7 +2686,6 @@ jobs:
           tests/test_pooled_rider.py
           tests/test_sqlserver_legacy_outbox_migration.py
           tests/test_sqlserver_audit_applock.py
-          tests/test_adr0157_inc3_cancel_probe_sqlserver.py
 
       - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
         env:
