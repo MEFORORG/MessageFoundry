@@ -11,8 +11,12 @@ Connectors are keyed by :class:`~messagefoundry.config.models.ConnectorType` in 
 registry, and the pipeline builds them through it. ``ConnectorType`` is a closed enum, though.
 Adding a transport means at least a new member in ``config/models.py``, a builder registered
 here, and the per-type arms elsewhere (the egress allow-list, the authoring factory). Nothing
-outside this repository can add a new type today (``ConnectorType("kafka")`` raises). Whether
-to open it for plugins is BACKLOG #1624.
+outside this repository can add a new type (``ConnectorType("kafka")`` raises), so transports
+have no plugin path. Opening the enum to plugins would be new work.
+
+The registry holds one builder per type. :func:`register_source` and
+:func:`register_destination` refuse a type that already has one unless the caller passes
+``replace=True``, so a second registration cannot silently swap out a built-in connector.
 """
 
 from __future__ import annotations
@@ -433,7 +437,7 @@ class SourceConnector(abc.ABC):
     """Inbound connector. ``start`` sets the source up, begins delivering received
     messages to ``handler`` in the background, and **returns once the source is live**
     (bound/listening or polling) — so a caller can rely on it being ready. ``stop`` shuts
-    it down and awaits any background task it owns.
+    it down; :meth:`stop` states what it must guarantee (bounded, closes peers, idempotent).
 
     :attr:`polls_shared_resource` documents whether the source **polls a shared external
     resource** (a directory, a DB table, a remote dir) — intake that must be **single-node** in a
@@ -525,7 +529,33 @@ class SourceConnector(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def stop(self) -> None: ...
+    async def stop(self) -> None:
+        """Shut the source down: stop taking new work, then await every task it owns.
+
+        Every source must meet three obligations. Review findings on the shipped sources produced
+        them, and they are written here for the next connector (BACKLOG #1624):
+
+        1. **Bounded.** Return within a bounded time even when a peer, a share call or the handler
+           is stuck. Wait for in-flight work with a grace, then cancel or abandon what is left and
+           log that you did. A caller may await ``stop()`` with no timeout of its own, so one
+           unbounded ``stop()`` can stall a whole reload or shutdown.
+        2. **Closes established peers.** Close every connection already open, not only the
+           listener. Closing the listener alone leaves peers attached, and ``wait_closed()`` then
+           waits on them.
+        3. **Idempotent.** A second call, or a call before :meth:`start`, returns promptly and does
+           not raise.
+
+        A message the handler already committed stays committed. Stopping loses at most the step
+        after the commit (a reply not yet sent, a file not yet moved, a row not yet marked), and the
+        message comes in again (at-least-once).
+
+        This is the contract a source is written against, and not every shipped source meets it
+        yet. Several await a poll task or a worker thread with no timeout, so they miss the first
+        obligation (review finding P2-05 is the file source's case). A source that misses it has
+        a defect to fix, not an exception to copy. ``tests/test_connector_contract.py`` checks
+        obligation 3 before start on every registered source and after start on every source whose
+        start dials nothing, and obligation 2 on the four asyncio listeners.
+        """
 
     async def validate_startup(self) -> None:
         """Optional **opt-in** at-start validity check for the source's external resource, run by the
@@ -613,12 +643,32 @@ _SOURCES: dict[ConnectorType, SourceBuilder] = {}
 _DESTINATIONS: dict[ConnectorType, DestinationBuilder] = {}
 
 
-def register_source(kind: ConnectorType, builder: SourceBuilder) -> None:
-    _SOURCES[kind] = builder
+def register_source(kind: ConnectorType, builder: SourceBuilder, *, replace: bool = False) -> None:
+    """Register the builder for an inbound ``kind``.
+
+    Raises :class:`ValueError` when ``kind`` already has a builder, unless ``replace`` is ``True``.
+    A silent overwrite would let a second registration swap out a built-in connector with no error
+    and no log line (review finding P2-10). ``replace=True`` is for a caller that means it, such as
+    a test fixture that installs a stand-in and restores the original afterwards."""
+    _register(_SOURCES, "source", kind, builder, replace=replace)
 
 
-def register_destination(kind: ConnectorType, builder: DestinationBuilder) -> None:
-    _DESTINATIONS[kind] = builder
+def register_destination(
+    kind: ConnectorType, builder: DestinationBuilder, *, replace: bool = False
+) -> None:
+    """Register the builder for an outbound ``kind``. Same duplicate rule as :func:`register_source`."""
+    _register(_DESTINATIONS, "destination", kind, builder, replace=replace)
+
+
+def _register[B](
+    table: dict[ConnectorType, B], role: str, kind: ConnectorType, builder: B, *, replace: bool
+) -> None:
+    if not replace and kind in table:
+        raise ValueError(
+            f"a {role} connector is already registered for {kind.value!r}; "
+            "pass replace=True to replace it deliberately"
+        )
+    table[kind] = builder
 
 
 # --- ECH egress: refuse the key where it would be a silent no-op (ADR 0139, ASVS 12.1.5, #1176) ----

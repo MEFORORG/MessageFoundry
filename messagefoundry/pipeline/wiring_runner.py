@@ -3668,7 +3668,9 @@ class RegistryRunner:
         This runs inside ``_reload_lock``, which ``reload()``, ``stop()``, the per-connection
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
         therefore wedge re-promotion, engine shutdown and the connection API for as long as a wedged
-        File/Database ``stop()`` runs (those gather with no cancel and no timeout).
+        File/Database ``stop()`` runs. (Database gathers with no cancel and no timeout. File now
+        cancels a poll task blocked on a share call after a grace, BACKLOG #1620, but still waits
+        without a bound while that task is inside a store call.)
 
         On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
         operator-recoverable), whereas refusing to re-promote strands the whole graph — and

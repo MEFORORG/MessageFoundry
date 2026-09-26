@@ -37,7 +37,7 @@ import hl7
 from hl7.containers import Component, Field, Repetition
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
-from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -63,10 +63,12 @@ from messagefoundry.config.tls_policy import (
     resolve_trust_anchor,
 )
 from messagefoundry.mllpcodec import (
+    _CODES,
     CR,
     DEFAULT_MAX_FRAME_BYTES,
     EB,
     SB,
+    AckMode,
     MLLPDecoder,
     MLLPFrameError,
     build_ack,
@@ -233,6 +235,14 @@ _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 #: of it. Bounding at the read keeps the peer's string out of the exception text, the store write and
 #: the log, not merely out of the scan.
 _MAX_NAK_DETAIL_CHARS = 1024
+
+#: MSA-3 of the NAK an MLLP listener sends when its inbound handler faults (BACKLOG #1619). Fixed and
+#: value-free: it names no exception, because the fault's text can carry message content.
+_HANDLER_FAILURE_NAK_TEXT = "message not accepted: internal error, retry later"
+
+#: How much of a faulted frame is read to find the MSH segment its NAK echoes (BACKLOG #1619). A
+#: header longer than this is not echoed; the NAK then carries the header defaults.
+_NAK_HEADER_SCAN_BYTES = 64 * 1024
 
 
 def _bounded_ack_field(value: str | None) -> str:
@@ -463,11 +473,14 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
         message = hl7.parse(normalize(payload))
         seg_sep: str = message.separator  # segment separator (CR) is not part of the override
         src_esc: str = message.esc  # the source message's own escape character
-    except (hl7.HL7Exception, IndexError, ValueError) as exc:
-        # IndexError covers a header so truncated python-hl7 can't read MSH-2 (e.g. "MSH|"); ValueError
-        # is defensive. A non-HL7 body simply cannot be delimiter-rewritten — surface it, don't corrupt.
+    except (hl7.HL7Exception, IndexError, ValueError, AssertionError) as exc:
+        # IndexError covers a header so truncated python-hl7 can't read MSH-2 (e.g. "MSH"); ValueError
+        # is defensive. AssertionError is python-hl7's own header check, which a header with no field
+        # separator before its first segment break trips ("MSH\rPID|1", "MSH|\rPID|1"; BACKLOG
+        # #1601). A non-HL7 body simply cannot be delimiter-rewritten — surface it, don't corrupt.
+        # safe_exc names the type: python-hl7's AssertionError carries no message of its own.
         raise ValueError(
-            f"cannot re-encode delimiters: payload is not parseable HL7 ({exc})"
+            f"cannot re-encode delimiters: payload is not parseable HL7 ({safe_exc(exc)})"
         ) from exc
 
     def leaf_text(node: object) -> str:
@@ -867,9 +880,12 @@ class MLLPDestination(DestinationConnector):
                 # than framing a corrupted message; the pipeline records the ERROR.
                 try:
                     payload = emit_raw_separators(payload)
-                except (hl7.HL7Exception, ValueError) as exc:
+                except (hl7.HL7Exception, ValueError, IndexError, AssertionError) as exc:
+                    # IndexError and AssertionError: the same truncated-header shapes that
+                    # reencode_delimiters maps to ValueError above (BACKLOG #1601).
                     raise DeliveryError(
-                        f"MLLP hl7_raw_separators emit failed (payload not parseable HL7): {exc}"
+                        "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
+                        f"{safe_exc(exc)}"
                     ) from exc
             if self.no_ack:
                 # BACKLOG #117 (ADR 0124): fire-and-forward — write + drain, no ACK read, deliver on
@@ -1624,6 +1640,9 @@ class MLLPSource(SourceConnector):
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
         self.encoding: str = s.get("encoding", "utf-8")
+        # The inbound's ack mode, read only to NAK a frame the handler faulted on (BACKLOG #1619).
+        # The runner builds every other ACK itself.
+        self.ack_mode: AckMode = config.ack_mode
         # Every cap on THIS listener: key absent → secure default; None/0 → disabled, in whichever
         # spelling arrives. `_cap_setting` is what makes that last clause true — see it for why
         # deciding "off" before the conversion read a string `"0"` as a live cap of zero. All five go
@@ -1799,6 +1818,90 @@ class MLLPSource(SourceConnector):
                 _ACK_DRAIN_GRACE,
             )
             raise
+
+    def _owes_handler_failure_reply(self) -> bool:
+        """Whether this inbound answers each frame in HL7, so a handler fault owes the sender a NAK.
+
+        Mirrors the runner, which replies only on an HL7 inbound with acknowledgements on.
+        ``content_type`` is injected by the runner; ``None`` (a direct build, as in tests) reads as
+        HL7, the MLLP default.
+        """
+        return self.ack_mode is not AckMode.NONE and self.content_type in (
+            None,
+            ContentType.HL7V2,
+        )
+
+    def _handler_failure_nak(self, message: bytes) -> bytes | None:
+        """The framed ``AE`` NAK (``CE`` in enhanced mode) for a frame the inbound handler faulted
+        on, or ``None`` if none can be framed. Call it only when a reply is owed.
+
+        **Why AE.** It is this engine's code for "not accepted, and not because of what the message
+        says". The runner answers ``AE`` for its own transient conditions (a strict-validation
+        timeout, a streaming-detach budget) and ``AR`` only for a body it could not read. The
+        engine's own MLLP destination reads the same split: it retries ``AE`` and dead-letters
+        ``AR`` at once. An ``AR`` here would dead-letter an engine-to-engine hop on a store blip.
+
+        Built defensively, because the fault may have come from reading this very message. Only a
+        bounded prefix up to the first segment break is decoded and parsed, so a large frame costs
+        nothing extra on the event loop. A header that cannot be read, or a ``build_ack`` that
+        faults on it, falls back to the header defaults. The text is fixed and names no exception,
+        so nothing from the message or the fault reaches the sender.
+        """
+        header: Peek | str = ""
+        try:
+            prefix = message[:_NAK_HEADER_SCAN_BYTES].lstrip()
+            breaks = [i for i in (prefix.find(b"\r"), prefix.find(b"\n")) if i >= 0]
+            first_segment = prefix[: min(breaks, default=len(prefix))]
+            header = Peek.parse(normalize(first_segment, encoding=self.encoding))
+        except Exception as exc:  # noqa: BLE001 -- an unreadable header: the NAK uses the defaults
+            logger.warning("MLLP NAK cannot echo the message header: %s", safe_exc(exc))
+        for inbound in (header, ""):
+            try:
+                nak = build_ack(
+                    inbound, code="AE", text=_HANDLER_FAILURE_NAK_TEXT, ack_mode=self.ack_mode
+                )
+                return frame(nak, self.encoding)
+            except Exception as exc:  # noqa: BLE001 -- fall back to the defaults, then give up
+                logger.warning("MLLP NAK for a handler fault could not be built: %s", safe_exc(exc))
+        return None
+
+    async def _answer_handler_failure(
+        self, message: bytes, exc: Exception, peer: object, peer_host: str | None
+    ) -> tuple[bool, bytes | None]:
+        """Log and record a handler fault. Returns whether a reply is owed, and the framed NAK.
+
+        BACKLOG #1619. The runner lets a store exception at the ingress commit propagate, so a
+        store outage used to reach the listener's last-resort catch. That catch dropped the
+        connection with no reply and recorded ``framing_error``, so the sender saw a reset and the
+        event log blamed framing.
+
+        Now the event is ``handler_error``. A sender that expects replies gets a NAK, and then the
+        connection closes, as before. Closing keeps two things the old drop gave for free. Frames
+        the sender pipelined behind this one go unanswered, so it resends them after this one and
+        order holds. And a sender pinned to a node whose store is down reconnects, which lets a
+        load balancer move it. A sender that expects no reply keeps its socket instead: it never
+        resends, so closing would only lose the frames it already sent behind this one.
+
+        Nothing is ACKed here, so the ACK-after-commit rule holds. A fault that came after a
+        commit does mean the resend commits another copy, which at-least-once delivery allows.
+        """
+        reason = safe_exc(exc)
+        owed = self._owes_handler_failure_reply()
+        nak = self._handler_failure_nak(message) if owed else None
+        if nak is not None:
+            outcome = f"answering MSA-1 {_CODES[self.ack_mode]['AE']}, then closing the connection"
+        elif owed:
+            outcome = "no reply could be framed; closing the connection"
+        else:
+            outcome = "this inbound sends no reply; keeping the connection"
+        logger.error(
+            "MLLP message from %s failed unexpectedly in the inbound handler: %s (%s)",
+            peer,
+            reason,
+            outcome,
+        )
+        await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
+        return owed, nak
 
     def _at_host_capacity(self, peer_host: str | None) -> bool:
         """Whether this peer address already holds every connection ``max_connections_per_host``
@@ -2012,12 +2115,31 @@ class MLLPSource(SourceConnector):
                         break
                     try:
                         decoded = 0
+                        handler_dropped = False
                         for message in decoder.feed(chunk):
                             decoded += 1
-                            reply = await self._handler(message)
+                            try:
+                                reply = await self._handler(message)
+                            except Exception as exc:  # noqa: BLE001 -- see _answer_handler_failure
+                                # BACKLOG #1619: the handler faulted on a frame the decoder read
+                                # cleanly, which is not a framing fault. A store outage at the
+                                # ingress commit is one reachable case. NAK it, then close.
+                                owed, nak = await self._answer_handler_failure(
+                                    message, exc, writer.get_extra_info("peername"), peer_host
+                                )
+                                if not owed:
+                                    continue  # no reply on this inbound: handle what follows
+                                if nak is not None:
+                                    writer.write(nak)
+                                    await self._drain_ack(writer)
+                                handler_dropped = True
+                                break
                             if reply is not None:
                                 writer.write(frame(reply, self.encoding))
                                 await self._drain_ack(writer)
+                        if handler_dropped:
+                            failed = True  # handler_error already names why this closes
+                            break
                         # Charge AFTER the messages in this chunk are fully handled and ACKed.
                         if pacer is not None:
                             pacer.settle(decoded)
@@ -2034,8 +2156,11 @@ class MLLPSource(SourceConnector):
                     except OSError:
                         raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
                     except Exception as exc:
-                        # Last-resort (ASVS 16.5.4): an unexpected handler/codec error must not let the
+                        # Last-resort (ASVS 16.5.4): an unexpected codec error must not let the
                         # per-connection task die silently or leak detail. Log redacted; drop the conn.
+                        # A HANDLER fault no longer lands here: the inner arm above answers it
+                        # (BACKLOG #1619). What still does includes a reply the listener's
+                        # encoding cannot carry.
                         peer = writer.get_extra_info("peername")
                         logger.error(
                             "MLLP connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
