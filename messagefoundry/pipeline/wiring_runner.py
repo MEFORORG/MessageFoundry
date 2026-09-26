@@ -608,6 +608,15 @@ class _ItemOutcome(Enum):
     STOPPED = "stopped"
 
 
+# Which direction's operator hold a STOPPED lane on each pooled stage belongs to. RESPONSE is absent
+# because no operator-required STOP happens there (its only STOP is the missing-inbound exit).
+_HOLD_DIRECTION: dict[Stage, Direction] = {
+    Stage.INGRESS: "inbound",
+    Stage.ROUTED: "inbound",
+    Stage.OUTBOUND: "outbound",
+}
+
+
 def _to_lane_result(outcome: tuple[_ItemOutcome, float | None]) -> LaneItemResult:
     """Map a ``_process_*_item`` result (the per_lane control-flow carrier) onto the pooled
     dispatcher's :class:`LaneItemResult` (ADR 0066 §4.5): ``(PROCESSED, None)`` → ``RESOLVED``,
@@ -1119,6 +1128,12 @@ class RegistryRunner:
         self._schedule_tick = schedule_tick
         self._schedule_clock: Callable[[], datetime] = schedule_clock or (lambda: datetime.now(UTC))
         self._schedule_workers: dict[tuple[Direction, str], asyncio.Task[None]] = {}
+        # Lanes halted by a STOP that only an operator may lift: a credential fault (#109) or the
+        # internal-error STOP policy. The scheduler reads this so a window close or open never undoes
+        # one (see _schedule_holds, which also names every path that clears a record). Keyed by
+        # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
+        self._stop_held: set[tuple[Direction, str]] = set()
+        self._stop_hold_logged: set[tuple[Direction, str]] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
         # resolved in _start_pooled_dispatchers AFTER trying to open the sync pools + build the per-stage
@@ -1417,7 +1432,14 @@ class RegistryRunner:
             for stage in stages:
                 d = self._dispatchers.get(stage)
                 if d is not None:
+                    # The broadcast re-arms every STOPPED lane, so it lifts the operator holds on
+                    # exactly those. Read BEFORE the broadcast: a hold whose lane has not reached
+                    # STOPPED yet is not re-armed by it, and must survive.
+                    kind = _HOLD_DIRECTION.get(stage)
+                    rearmed = [(k, n) for k, n in self._stop_held if k == kind and d.stopped(n)]
                     d.notify_work()
+                    for k, n in rearmed:
+                        self._release_operator_hold(n, k)
             if Stage.OUTBOUND in stages:
                 self._wake_worker_lanes()
             return
@@ -2448,6 +2470,9 @@ class RegistryRunner:
             worker = self._workers.get(name)
             if worker is None or worker.done():
                 self._spawn_worker(name)
+        # A start is the operator lifting a STOP. The scheduler never reaches here on a held lane
+        # (_schedule_holds refuses first), so this runs only for a start it is free to make.
+        self._release_operator_hold(name, "outbound")
 
     # --- per-connection active-window scheduler (#147, ADR 0095) --------------
 
@@ -2511,6 +2536,17 @@ class RegistryRunner:
             return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
+        # An operator-required STOP (#109 credential fault, or the internal-error STOP policy) outranks
+        # the calendar. The start branch must not re-arm it: that re-tries a bad credential at every
+        # window open, which is the partner lockout the STOP exists to prevent. The OUTBOUND park must
+        # not run either, because the park is a pause and a pause is what a window open resumes (and a
+        # pooled pause_lane overwrites the STOPPED phase outright). The INBOUND park still runs: it only
+        # unbinds the listener, which leaves the halted router/transform workers exactly as they are and
+        # keeps intake inside its window.
+        would_start = active and not running
+        would_park_outbound = kind == "outbound" and not active and running
+        if (would_start or would_park_outbound) and self._schedule_holds(name, kind):
+            return
         if active and not running:
             # Per-connection auto-start (#115): ``auto_start=False`` means the ENGINE never brings this
             # connection up on its own — only an explicit operator start does. A scheduler tick IS the
@@ -2535,6 +2571,42 @@ class RegistryRunner:
                 await self.stop_inbound(name)
             else:
                 await self.stop_outbound(name)
+
+    def _hold_for_operator(self, name: str, kind: Direction) -> None:
+        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (a #109
+        credential fault or the internal-error STOP policy). Called at the STOP site, beside its
+        ``connection_stopped`` alert; the scheduler reads it through :meth:`_schedule_holds`."""
+        self._stop_held.add((kind, name))
+        self._stop_hold_logged.discard((kind, name))
+
+    def _release_operator_hold(self, name: str, kind: Direction) -> None:
+        """The lane was re-armed (or an operator asked for it), so the scheduler owns its calendar
+        again."""
+        self._stop_held.discard((kind, name))
+        self._stop_hold_logged.discard((kind, name))
+
+    def _schedule_holds(self, name: str, kind: Direction) -> bool:
+        """Whether the scheduler must leave ``name``'s ``kind`` lane alone because an operator-required
+        STOP halted it. Logs once per hold.
+
+        The record alone decides, and it is not cross-checked against the lane's live state. That check
+        was tried and it races: the STOP site records the hold before its lane reaches STOPPED (a pooled
+        lane read PROCESSING for about 100 ms after the record, measured), so a scheduler tick in that
+        gap would have read the hold as stale and dropped it. Every path that really re-arms the lane
+        clears the record instead: :meth:`_start_inbound_unsafe`, :meth:`_start_outbound_unsafe`, a
+        successful :meth:`reload`, a full teardown, and the pooled broadcast in :meth:`_wake_all`."""
+        key = (kind, name)
+        if key not in self._stop_held:
+            return False
+        if key not in self._stop_hold_logged:
+            self._stop_hold_logged.add(key)
+            log.warning(
+                "schedule: %s connection %r is held by an operator-required STOP; the schedule "
+                "leaves it stopped until an operator starts it",
+                kind,
+                name,
+            )
+        return True
 
     def _guard_port_conflict(self, ic: InboundConnection) -> None:
         """Refuse to bind ``ic`` if its resolved ``(host, port)`` collides with a reserved service
@@ -2752,6 +2824,9 @@ class RegistryRunner:
                 await self._stop_inbound_unsafe(name)
                 return
             self._ensure_inbound_workers(name)
+            # A start is the operator lifting a STOP (per_lane: the line above re-armed the workers it
+            # returned). The scheduler never reaches here on a held lane (_schedule_holds refuses first).
+            self._release_operator_hold(name, "inbound")
 
     async def _stop_inbound_unsafe(self, name: str) -> None:
         """stop_inbound body without the reload lock — for callers that already hold it."""
@@ -3882,6 +3957,9 @@ class RegistryRunner:
         self._outbound_quiesced.clear()
         self._outbound_resume.clear()
         self._gate_parked.clear()
+        # start() re-arms every lane from scratch, so no STOP outlives a full teardown.
+        self._stop_held.clear()
+        self._stop_hold_logged.clear()
         self._rcsi_off_degraded = False
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
@@ -4904,6 +4982,12 @@ class RegistryRunner:
                     except Exception:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
+
+            # A reload is the documented way to re-arm a STOPPED lane (the STOP sites' own log lines
+            # say so): step 2b re-arms the inbound workers or broadcasts to the pooled dispatchers, and
+            # step 3 respawns a STOP-exited delivery worker. So every operator hold is spent here.
+            self._stop_held.clear()
+            self._stop_hold_logged.clear()
 
             # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
             # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has
@@ -5997,6 +6081,7 @@ class RegistryRunner:
                         name,
                         detail=f"credential fault ({exc.code}); lane stopped, queue retained (#109)",
                     )
+                    self._hold_for_operator(name, "outbound")
                     return _ItemOutcome.STOPPED, None
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
             elif exc.permanent:
@@ -6042,6 +6127,7 @@ class RegistryRunner:
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering {item.id}"
                 )
+                self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
             log.warning(
                 "delivery worker %r: internal error delivering %s (%s); dead-lettering",
@@ -6281,6 +6367,7 @@ class RegistryRunner:
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}"
                 )
+                self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
             log.warning(
                 "delivery worker %r: framing/internal error delivering a batch of %d (%s); dead-lettering",
@@ -6404,6 +6491,7 @@ class RegistryRunner:
             self._alert_sink.connection_stopped(
                 name, detail=f"router {type(exc).__name__} on {item.id}"
             )
+            self._hold_for_operator(name, "inbound")
             return _ItemOutcome.STOPPED, None
         log.warning(
             "router worker %r: router error on %s (%s); dead-lettering",
@@ -6438,6 +6526,7 @@ class RegistryRunner:
             self._alert_sink.connection_stopped(
                 name, detail=f"handler {type(exc).__name__} on {item.id}"
             )
+            self._hold_for_operator(name, "inbound")
             return _ItemOutcome.STOPPED, None
         log.warning(
             "transform worker %r: handler error on %s (%s); dead-lettering",
