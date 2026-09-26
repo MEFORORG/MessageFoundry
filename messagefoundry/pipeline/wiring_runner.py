@@ -8395,8 +8395,9 @@ def check_inbound_revocation(
     **Why this refusal cannot be delegated away for two of the three listeners.**
     ``harden_verify_flags``' own docstring delegates live revocation to the deploying org -- OCSP
     must-staple at a proxy plus the OS trust store. That is credible for the API/UI surface. **An
-    HTTP proxy can terminate neither MLLP framing nor DIMSE**, so for those two the named delegation
-    does not reach and no workaround remains.
+    HTTP proxy can terminate neither MLLP framing nor DIMSE**, so for those two the proxy-based
+    delegation does not reach. What remains there is ``tls_crl_file``, or an attestation that a
+    revocation-checking PKI outside the engine covers these certificates.
 
     Applies only where an mTLS listener exists: MLLP (which also serves the inbound HTTP listener),
     HTTP and DIMSE. Raw TCP/X12 have no TLS option at all, so they cannot have a client certificate
@@ -8440,8 +8441,8 @@ def check_inbound_revocation(
         "(a PEM file holding the CA's CRL) on the connection, or set "
         "tls_revocation_attested=true with a tls_revocation_attested_reason if a "
         "revocation-checking PKI covers these certificates outside the engine. An HTTP proxy can "
-        "terminate neither MLLP nor DIMSE, so for those listeners the documented out-of-engine "
-        "delegation does not reach."
+        "terminate neither MLLP nor DIMSE, so for those listeners the proxy-based OCSP delegation "
+        "does not reach."
     )
 
 
