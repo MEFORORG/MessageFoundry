@@ -4,6 +4,13 @@
 # files themselves (least-privilege permissions, env-passed refs, persist-credentials: false); this file
 # is only for findings that are safe-by-design here. Keep it small and commented — a suppression without
 # a reason is a latent vulnerability.
+#
+# PIN EVERY LINE ANCHOR. A `file.yml:LINE` entry goes stale when a pull request inserts lines above
+# the construct (BACKLOG #1493). So each one carries a `# anchor-pin: <text>` comment on the line
+# DIRECTLY above it. The pin is the text the anchored line starts with, once indentation is stripped.
+# No other line of that workflow may start with it. tests/test_zizmor_config_hygiene.py fails when the
+# two disagree and names the line to re-anchor to. It runs in ci.yml's `tooling` leg on any pull
+# request that touches .github/. Its docstring has the reasoning, the history, and what it misses.
 rules:
   dangerous-triggers:
     ignore:
@@ -137,7 +144,8 @@ rules:
       # purpose: a file-level entry would also swallow a future actor check added to this file as a SOLE
       # gate, which is the shape that IS exploitable. Accepted residual: an in-place rewrite that keeps
       # the line count would not re-fire the finding — that is what the test is for. If the line moves,
-      # RE-ANCHOR it; do not broaden it to the file.
+      # RE-ANCHOR it; do not broaden it to the file. The pin below catches a moved line (see the header).
+      # anchor-pin: && github.triggering_actor == 'dependabot[bot]' }}
       - dependabot-lock-resync.yml:84
 
   self-repository:
@@ -182,5 +190,7 @@ rules:
       #
       # Line-anchored on purpose, same as the bot-conditions entry above: a file-level entry would swallow a
       # future local `uses:` added to this file, and that one might carry none of the four reasons.
-      # Re-anchor if the line moves; do not broaden it to the file.
+      # Re-anchor if the line moves; do not broaden it to the file. The pin below catches a moved line
+      # (see the header).
+      # anchor-pin: uses: ./.github/actions/cla-assistant-lite
       - cla.yml:178

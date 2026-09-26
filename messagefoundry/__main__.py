@@ -1072,11 +1072,39 @@ def main(argv: list[str] | None = None) -> int:
     #
     # `configure_stderr_logging` is the shipped answer to "this process's stdout is not a log
     # channel" (the ADR 0087 sandbox worker, whose stdout carries IPC frames), and it carries the
-    # PHI-redaction + control-char-scrub filter chain, which is strictly more than the UNFILTERED
-    # `logging.lastResort` a handler-less subcommand degrades to today. `serve` and `supervise` take
-    # no `--json`, print no payload and are untouched: they still log to the stdout NSSM captures.
+    # PHI-redaction + control-char-scrub filter chain. `serve` and `supervise` take no `--json`,
+    # print no payload and are untouched: they still log to the stdout NSSM captures.
+    #
+    # EVERY OTHER SUBCOMMAND GETS THE SAME STDERR SINK, `--json` OR NOT (BACKLOG #1441). Before this,
+    # a subcommand without `--json` ran with NO root handler, so a WARNING or above went to the
+    # standard library's `logging.lastResort`: no filters and no formatter. A traceback quoting a PHI
+    # segment printed as written. Redaction is a property of the HANDLER, so a process that installs
+    # none has no chain at all. Stderr keeps stdout for data. The root stays at WARNING, the level
+    # `lastResort` used. At least these visible changes follow:
+    #   * Every such record now carries the timestamp/level/logger prefix and is redacted.
+    #   * The handler is at NOTSET, so a logger given its OWN level below WARNING (an operator's
+    #     `log.setLevel(logging.INFO)`, or the audit tee's) now prints those records. `lastResort`
+    #     dropped them. They pass the same chain as under `serve`, which prints them too; the chain
+    #     does not catch a lone identifier, so "never put PHI in a log message" still applies.
+    #   * A library that puts a NullHandler on its own logger (urllib3, pynetdicom and others) had
+    #     its WARNINGs DROPPED, because a NullHandler counts as "a handler found" and so skips
+    #     `lastResort`. They now print, through the chain, exactly as they already do under `serve`.
+    #   * A stdlib `basicConfig(...)` call in an operator's config module becomes a no-op under
+    #     `dryrun`/`check`/`validate`, because basicConfig does nothing once the root has a handler.
+    #     `serve` already behaves this way. The fix for an operator is a named logger, not basicConfig.
+    # The audit tee's INFO records reached stderr through `ensure_logger_sink` (#1199) before this;
+    # that now finds this handler and adds no second one. The exempt subcommands, and the one
+    # residual the exemption leaves, are stated once at `_CONFIGURES_OWN_LOGGING`.
+    #
+    # Only when the root has NO handler yet, which is the state a `python -m messagefoundry` process
+    # starts in. A caller that configured logging before calling main() owns its own handlers, and
+    # main() does not take them away: an embedding host, or pytest, whose `caplog` capture lives on
+    # the root (replacing it would empty `caplog`, as the ledger row measured). That host's handler
+    # is then the host's to filter. `--json` still replaces unconditionally, because a handler left
+    # in place could write to stdout and corrupt the document (#1489).
     as_json = bool(getattr(args, "json", False))
-    if as_json:
+    needs_sink = args.command not in _CONFIGURES_OWN_LOGGING and not logging.getLogger().handlers
+    if as_json or needs_sink:
         configure_stderr_logging()
     # THE FLOOR UNDER `_emit_error`'s --json CONTRACT (BACKLOG #1863). Without this `try`, an exception
     # no subcommand arm names went to `sys.excepthook`: one redacted CRITICAL line on stderr, exit 1,
@@ -2159,9 +2187,10 @@ def _serve(args: argparse.Namespace) -> int:
     # security_loosenings() feeds both this warning and the read-only GET /security/posture view.
     # The connection graph is NOT loaded yet here (the Engine loads it inside the ASGI lifespan, well
     # below), so this early warning covers the SETTINGS-scoped switches only and passes empty lists for
-    # all THREE connection-scoped deviations. That is not a silent subset: each is reported moments
+    # all FOUR connection-scoped deviations. That is not a silent subset: each is reported moments
     # later — per connection — by the connector's own construction-time WARN (the ADR 0153 acceptance
-    # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection),
+    # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection;
+    # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal),
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
@@ -2178,6 +2207,7 @@ def _serve(args: argparse.Namespace) -> int:
         (),
         (),
         (),
+        (),
         None,
         None,
     )
@@ -2186,8 +2216,8 @@ def _serve(args: argparse.Namespace) -> int:
         _seclog.warning(
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
-            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired and generic-ODBC "
-            "DATABASE TLS declarations are NOT in this list — the graph is not loaded yet; they are "
+            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, generic-ODBC "
+            "DATABASE TLS and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by the connector construction gate, `messagefoundry check` and "
             "GET /security/posture. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -6707,7 +6737,7 @@ def _security(args: argparse.Namespace) -> int:
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
-        # store — so it can see NEITHER the three per-connection declarations NOR the two store
+        # store — so it can see NEITHER the four per-connection declarations NOR the two store
         # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
         # declares BOTH gaps
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
@@ -6716,14 +6746,14 @@ def _security(args: argparse.Namespace) -> int:
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
-                sec, _store, _auth, _alerts, _rotation, (), (), (), None, None
+                sec, _store, _auth, _alerts, _rotation, (), (), (), (), None, None
             )
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
     #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
     #: read at all (the file did not load); the scope string is the standing limitation above. It names
-    #: ALL THREE connection-scoped deviations (#333) — naming only cleartext_accepted made the DECLARED
+    #: ALL FOUR connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
     #: scope itself incomplete, which is the same defect one level up.
     #:
     #: BACKLOG #1852 added a FOURTH gap and it is named for that same reason. This command reads the
@@ -6736,8 +6766,8 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
-            "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
-            "included, and neither are the store-principal privilege and audit-chain keying "
+            "cleartext_accepted, tls_allow_expired, generic-ODBC DATABASE TLS and "
+            "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
@@ -6899,6 +6929,19 @@ def _emit_error(message: str, *, as_json: bool) -> int:
         print(f"error: {message}", file=sys.stderr)
     return 1
 
+
+#: The subcommands main() does NOT give a stderr log sink, because each installs its own root handler
+#: with the PHI filter chain (`configure_logging`). Every other entry in `_DISPATCH` gets the sink by
+#: default, so a new subcommand is covered without anyone remembering to add it (BACKLOG #1441).
+#: Adding a name here takes a subcommand OUT of that default. `tests/test_cli.py` pins this set and
+#: checks that each member really calls `configure_logging`.
+#:
+#: KNOWN RESIDUAL, NOT FIXED HERE: `serve` calls `configure_logging` only after its settings, key
+#: and egress gates run, and its WARNINGs in that window still go through the unfiltered
+#: `logging.lastResort`. The comments inside `_serve` rely on that path by name. `supervise` calls it
+#: on its first line, so it has no such window. Whether `serve` should take main()'s sink for that
+#: window is an open question, deliberately not decided by the change that added this set.
+_CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
 
 _DISPATCH = {
     "serve": _serve,

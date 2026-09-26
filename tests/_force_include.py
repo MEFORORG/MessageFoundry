@@ -43,19 +43,23 @@ shared reader exists to get right once.
 
 **READ, NOT INFERRED, because three places in this repository had asserted hatchling's behaviour and
 none could check it** -- the backend is a build-isolation dependency and is installed in no
-interpreter here. At the pinned ``hatchling==1.32.0`` every ``[build-system]`` table names:
+interpreter here. At the pinned ``hatchling==1.32.4`` every ``[build-system]`` table names (re-read
+at the move from 1.32.0: ``builders/config.py`` is byte-identical, so its lines did not move, and
+``plugin/interface.py`` gained nine lines of example code in the ``BuilderInterface`` docstring above
+these sites, plus typing and docstring edits elsewhere, so each ``interface.py`` line cited here moved
+by nine and none changed):
 
 * ``src/hatchling/builders/config.py:679`` is the ``in self.target_config`` test above;
-* ``src/hatchling/builders/plugin/interface.py`` calls ``include_path`` at exactly two sites, ``:204``
-  in ``recurse_project_files`` and ``:269`` in ``recurse_explicit_files``. ``recurse_forced_files``
-  (``:209``) is neither, which is why ``exclude`` cannot filter a force-included file and why the
+* ``src/hatchling/builders/plugin/interface.py`` calls ``include_path`` at exactly two sites, ``:213``
+  in ``recurse_project_files`` and ``:278`` in ``recurse_explicit_files``. ``recurse_forced_files``
+  (``:218``) is neither, which is why ``exclude`` cannot filter a force-included file and why the
   harness map is enumerated rather than excluded (BACKLOG #1702).
 
 **"Unfiltered" is the wrong word for that last one, and the overstatement is worth not inheriting.**
 ``recurse_forced_files`` does filter, at **at least three** sites in its directory branch -- a floor
 rather than a list, because the first draft of this paragraph named two of them and stopped
-(SDS-3.6, and it caught this file): ``EXCLUDED_DIRECTORIES`` at ``:222``, ``EXCLUDED_FILES`` at
-``:226``, and ``path_is_reserved`` at ``:231``. The claim that survives all three is the one that
+(SDS-3.6, and it caught this file): ``EXCLUDED_DIRECTORIES`` at ``:231``, ``EXCLUDED_FILES`` at
+``:235``, and ``path_is_reserved`` at ``:240``. The claim that survives all three is the one that
 matters -- **no include or exclude OPTION reaches a force-included path**, because those flow through
 ``include_path`` and none of the three is it.
 
@@ -67,7 +71,7 @@ DIRECTORY walk re-adding a path another entry already claims.
 
 Re-read it the same way if the pin moves, rather than trusting the line numbers above::
 
-    pip download hatchling==1.32.0 --no-deps --no-binary :all: -d .
+    pip download hatchling==1.32.4 --no-deps --no-binary :all: -d .
 
 **Not covered here, deliberately:** which distributions exist. The two force-include readers each
 glob ``packaging/*`` for their own reasons, written down where they happen, and folding those

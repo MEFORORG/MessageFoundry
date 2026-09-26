@@ -14,6 +14,11 @@ ci/locks/*.lock text eol=lf
 # Shell scripts are executed on the Linux CI runners; force LF so a contributor's
 # core.autocrlf=true can never commit CRLF (which breaks `#!/usr/bin/env bash\r`).
 *.sh text eol=lf
+# The tooling manifest is read by ci.yml's `grep -qxFf` on a Linux runner, which matches each line
+# whole. A committed CR would ride on every entry and match no changed path, so the tooling job
+# would stop being summoned by an edit to any listed test. The Python parser cannot see a CR on a
+# CRLF checkout, so the line ending is pinned here instead (BACKLOG #1434).
+tests/tooling_manifest.txt text eol=lf
 
 # The bundled breach-screening corpus (BACKLOG #1134). Git already stores it LF, so this pin is an
 # empty content diff -- it only stops `core.autocrlf=true` from checking out CRLF. Two reasons it is

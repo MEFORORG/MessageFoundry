@@ -985,26 +985,341 @@ def test_users_manage_write_pacing_exemptions_are_named_exactly() -> None:
         )
 
 
-def test_ui_pacing_gap_wording_flips_with_the_code() -> None:
-    """Honest-interim wording, enforced both ways.
+#: At least these phrasings have said the console charges no admin-write floor. BACKLOG #1815: this
+#: guard once knew only the first two. SECURITY.md said it with the other three -- bolded, and one
+#: wrapped across a line -- and those sat beside a green test while the console already charged. So
+#: the match drops `*` emphasis and runs case-folded over whitespace-collapsed text. The last phrase
+#: names the floor on purpose: "charged on the JSON API only" alone also described the PHI-read hop.
+_UI_PACING_GAP_PHRASES = (
+    "no `/ui` route charges it",
+    "the `/ui` write path is not paced",
+    "no `/ui` route charges the per-actor admin-write",
+    "the `/ui` write path charges none",
+    "admin-write floor is charged on the json api only",
+)
 
-    While ``allow_admin_write`` has no console call site, the doc MUST state the gap. The moment
-    console parity (BACKLOG #287) lands a charge, this same test demands the sentence be removed — so
-    the interim wording can never become a stale falsehood.
+
+def _states_ui_pacing_gap(text: str) -> bool:
+    folded = " ".join(text.replace("*", "").split()).casefold()
+    return any(phrase in folded for phrase in _UI_PACING_GAP_PHRASES)
+
+
+_CONSOLE_AUTH = _WEBCONSOLE / "_auth.py"
+_CONSOLE_AUTH_KEY = _CONSOLE_AUTH.relative_to(_ROOT).as_posix()
+
+
+def _console_sources() -> dict[str, str]:
+    """Every web-console module's source, keyed by its path relative to the repository root."""
+    return {
+        module.relative_to(_ROOT).as_posix(): module.read_text(encoding="utf-8-sig")
+        for module in sorted(_WEBCONSOLE.rglob("*.py"))
+    }
+
+
+def _parse_src(src: str) -> ast.Module:
+    """``ast.parse`` that tolerates a leading UTF-8 BOM, which ``read_text("utf-8")`` keeps."""
+    return ast.parse(src.removeprefix("\ufeff"))
+
+
+#: Hoisted for the reason ``_ast_sites`` hoists ``_FUNC_DEF``: a union built per node is waste.
+_BINDINGS = (ast.Assign, ast.AnnAssign, ast.NamedExpr)
+_FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _bound_names(node: ast.Assign | ast.AnnAssign | ast.NamedExpr) -> set[str]:
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return {target.id for target in targets if isinstance(target, ast.Name)}
+
+
+def _charges(tree: ast.AST, limiter: str) -> bool:
+    """Whether ``tree`` calls ``limiter``: directly, or through a ``getattr(x, "<limiter>")``
+    lookup whose result is called, either in place or after binding it to a plain name.
+
+    The lookup form is how ``_auth.py`` already reaches ``allow_reauth_attempt`` across the
+    engine/console wheel skew. A lookup that is never called charges nothing. A bound name counts
+    only when the same function calls it (nested functions included), because ``_auth.py`` already
+    calls an unrelated ``gate(...)`` elsewhere. At least these spellings are NOT recognised and
+    read as no charge: binding to an attribute, and wrapping the lookup (``(getattr(...) or f)()``).
     """
-    console_charges = any(
-        "allow_admin_write" in module.read_text(encoding="utf-8")
-        for module in _CONSOLE_ROUTES.parent.rglob("*.py")
+    if calls_to(tree, {limiter}):
+        return True
+    lookups = {
+        id(call)
+        for call in call_sites(tree, "getattr")
+        if len(call.args) >= 2
+        and isinstance(call.args[1], ast.Constant)
+        and call.args[1].value == limiter
+    }
+    if not lookups:
+        return False
+    if any(isinstance(node, ast.Call) and id(node.func) in lookups for node in ast.walk(tree)):
+        return True
+    for func in ast.walk(tree):
+        if not isinstance(func, _FUNCS):
+            continue
+        bound: set[str] = set()
+        for node in ast.walk(func):
+            if isinstance(node, _BINDINGS) and node.value is not None and id(node.value) in lookups:
+                bound |= _bound_names(node)
+        if bound and calls_to(func, bound, bare_only=True):
+            return True
+    return False
+
+
+def _console_charges_admin_write(sources: dict[str, str]) -> bool:
+    """Whether any console module CALLS ``allow_admin_write``, by an AST call walk.
+
+    BACKLOG #1815: this used to be ``"allow_admin_write" in text``. A substring scan cannot tell a
+    call from a comment, and ``routes/core.py`` names the limiter in a comment explaining why
+    logout is not charged. Deleting the real call in ``require_ui`` therefore left the scan True,
+    so the guard below could never reach its other arm. The substring stays only as a cheap
+    pre-filter: a module that never names the limiter cannot call it, so it is not parsed.
+    """
+    return any(
+        "allow_admin_write" in src and _charges(_parse_src(src), "allow_admin_write")
+        for src in sources.values()
     )
+
+
+def test_console_charge_probe_can_fail() -> None:
+    """The probe must report ABSENT for a mention and PRESENT for a call, on snippets and on the
+    real tree with its admin-write charge removed."""
+    mentions = {
+        "comment.py": "# require_ui charges allow_admin_write on every non-GET\nx = 1\n",
+        "docstring.py": 'def f() -> None:\n    """Charges ``allow_admin_write``."""\n',
+        "string.py": 'NAME = "allow_admin_write"\n',
+    }
+    assert not _console_charges_admin_write(mentions)
+    assert _console_charges_admin_write(
+        {"call.py": "def f(auth):\n    return auth.allow_admin_write('u')\n"}
+    )
+    assert _console_charges_admin_write(
+        {"getattr.py": "def f(auth):\n    return getattr(auth, 'allow_admin_write')('u')\n"}
+    )
+    assert _console_charges_admin_write(
+        {
+            "bound.py": "def f(auth):\n"
+            "    gate = getattr(auth, 'allow_admin_write', None)\n"
+            "    return gate('u')\n"
+        }
+    )
+    # A lookup that is never called charges nothing.
+    assert not _console_charges_admin_write(
+        {"lookup.py": "def f(auth):\n    gate = getattr(auth, 'allow_admin_write', None)\n"}
+    )
+    assert not _console_charges_admin_write(
+        {"bare.py": "def f(auth):\n    getattr(auth, 'allow_admin_write')\n"}
+    )
+    assert _console_charges_admin_write(
+        {"bom.py": "\ufeffdef f(auth):\n    return auth.allow_admin_write('u')\n"}
+    )
+    assert _console_charges_admin_write(
+        {
+            "annotated.py": "def f(auth):\n"
+            "    gate: object = getattr(auth, 'allow_admin_write')\n"
+            "    return gate('u')\n"
+        }
+    )
+    assert _console_charges_admin_write(
+        {
+            "walrus.py": "def f(auth):\n"
+            "    if (gate := getattr(auth, 'allow_admin_write', None)) is not None:\n"
+            "        return gate('u')\n"
+        }
+    )
+    assert _console_charges_admin_write(
+        {
+            "builtins.py": "def f(auth):\n    return builtins.getattr(auth, 'allow_admin_write')('u')\n"
+        }
+    )
+    # A name bound in one function and a same-named call in ANOTHER is not a charge: _auth.py
+    # already calls an unrelated `gate(...)` in allow_reauth_attempt.
+    assert not _console_charges_admin_write(
+        {
+            "scoped.py": "def f(auth):\n"
+            "    gate = getattr(auth, 'allow_admin_write', None)\n"
+            "    return gate is not None\n"
+            "def g(gate):\n"
+            "    return gate('u')\n"
+        }
+    )
+
+    real = _console_sources()
+    call = "auth.allow_admin_write(identity.user_id)"
+    # The probe decides the state first; the call TEXT only aims the mutation. Branching on the
+    # text first would red the supported no-charge state if a comment kept the old spelling.
+    if not _console_charges_admin_write(real):
+        # The console charges nothing: the gap guard below governs that state, so there is no
+        # call to delete. The snippet half above still ran.
+        return
+    if real[_CONSOLE_AUTH_KEY].count(call) != 1:
+        pytest.fail(
+            f"the console charges allow_admin_write, but {_CONSOLE_AUTH_KEY} no longer carries "
+            f"exactly one `{call}`; re-aim this mutation rather than letting it skip"
+        )
+    mutated = {**real, _CONSOLE_AUTH_KEY: real[_CONSOLE_AUTH_KEY].replace(call, "True")}
+    assert not _console_charges_admin_write(mutated), (
+        "a charge survives deleting require_ui's call: either the probe is broken, or another "
+        "console module now charges allow_admin_write too and this mutation must remove it as well"
+    )
+    assert not _console_charges_admin_write(
+        {**mutated, "planted.py": "# allow_admin_write is named here and never called\n"}
+    ), "the probe counted a planted comment as a charge"
+    # The control, on the UNPLANTED tree: a real mention outlives the deleted call, so the substring
+    # scan this replaced would still have reported a charge. Today that mention is the comment on
+    # `ui_logout` in routes/core.py. If it goes, this reds: re-aim the control at a mention that
+    # still exists, rather than planting one, because a planted mention proves nothing here.
+    assert any("allow_admin_write" in src for src in mutated.values()), (
+        "control: no mention of allow_admin_write survives the deleted call, so this tree no "
+        "longer shows the substring scan's blindness"
+    )
+
+
+#: Calls that write a log record at WARNING or above, plus the console's own 429 helper, which
+#: logs (``routes/_common.py``). A DEBUG or INFO line does not make "no WARNING line" false. A new
+#: logging helper not named here would read as silent, so add it when one appears.
+_WARNING_LOG_CALLS = frozenset(
+    {"warning", "error", "exception", "critical", "log", "_rate_limited"}
+)
+_UI_REFUSAL_HEADING = "**The console's refusal differs from the JSON floor's.**"
+#: At least these wordings say the console's refusal writes no WARNING line.
+_UNLOGGED_PHRASES = ("no warning line", "no log line", "not logged")
+
+
+def _ui_refusal(src: str, limiter: str) -> tuple[str, bool] | None:
+    """``(Retry-After value, logs at WARNING?)`` for ``require_ui``'s refusal on ``limiter``.
+
+    The branch is the one ``if`` whose test calls ``limiter``. None when there is no such branch;
+    more than one reds, so a second charge site is never read silently in place of the first.
+    """
+    func = named_func(_parse_src(src), "require_ui")
+    branches = [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.If) and calls_to(node.test, {limiter})
+    ]
+    if not branches:
+        return None
+    assert len(branches) == 1, f"expected one {limiter} branch in require_ui, got {len(branches)}"
+    body = ast.Module(body=branches[0].body, type_ignores=[])
+    retry_after = [
+        value.value
+        for call in call_sites(body, "HTTPException")
+        for kw in call.keywords
+        if kw.arg == "headers" and isinstance(kw.value, ast.Dict)
+        for key, value in zip(kw.value.keys, kw.value.values, strict=True)
+        if isinstance(key, ast.Constant) and key.value == "Retry-After"
+        if isinstance(value, ast.Constant) and isinstance(value.value, str)
+    ]
+    assert len(retry_after) == 1, f"expected one literal Retry-After in the branch: {retry_after}"
+    return retry_after[0], bool(calls_to(body, _WARNING_LOG_CALLS))
+
+
+def _fail_if_charge_is_unreadable(src: str) -> None:
+    """``_ui_refusal`` found no branch. Fail if ``_auth.py`` still charges anyway -- for example
+    ``allowed = auth.allow_admin_write(...)`` then ``if not allowed:`` -- because the reader cannot
+    see that shape, and reading it as "no charge" would ask for an accurate paragraph's deletion."""
+    if _console_charges_admin_write({_CONSOLE_AUTH_KEY: src}):
+        pytest.fail(
+            f"{_CONSOLE_AUTH_KEY} still charges allow_admin_write, but not in an `if` test inside "
+            "require_ui, so _ui_refusal cannot read it; re-aim the reader"
+        )
+
+
+def test_ui_refusal_reader_can_fail() -> None:
+    """The reader must see a planted log call and a changed header, or the doc pin below is blind."""
+    src = _CONSOLE_AUTH.read_text(encoding="utf-8-sig")
+    charge = "if not auth.allow_admin_write(identity.user_id):\n"
+    baseline = _ui_refusal(src, "allow_admin_write")
+    if baseline is None:
+        _fail_if_charge_is_unreadable(src)
+        # require_ui charges no admin-write floor. That state is supported: the doc pin below
+        # then demands the paragraph be absent, and there is no branch here to mutate.
+        return
+    if src.count(charge) != 1:
+        pytest.fail(f"require_ui still has an admin-write branch, but not as {charge!r}; re-aim")
+    head, tail = src.split(charge, 1)
+    # One level inside the `if`, whatever the `if` is indented by.
+    indent = " " * (len(head) - len(head.rstrip(" ")) + 4)
+    logged = head + charge + f"{indent}log.warning('throttled')\n" + tail
+    assert _ui_refusal(logged, "allow_admin_write") == (baseline[0], True)
+    header = f'"Retry-After": "{baseline[0]}"'
+    sentinel = "98" if baseline[0] == "99" else "99"  # never equal to the live value
+    moved = head + charge + tail.replace(header, f'"Retry-After": "{sentinel}"', 1)
+    assert _ui_refusal(moved, "allow_admin_write") == (sentinel, baseline[1])
+    debug = head + charge + f"{indent}log.debug('throttled')\n" + tail
+    assert _ui_refusal(debug, "allow_admin_write") == baseline, "a DEBUG line is not a WARNING"
+
+
+def test_ui_refusal_is_described_as_the_code_behaves() -> None:
+    """SECURITY.md's paragraph on the console's refusal follows ``require_ui``, both ways.
+
+    Pinned: that paragraph (the header, and logging for the admin-write floor and the ``phi=True``
+    PHI-read arm it also names), the Admin writes row of the 2.1.3 limits table, the /ui plane's
+    item 2, the contextual-attributes row, and ``docs/CONFIGURATION.md``'s window row. At least the
+    logging restatements outside the paragraph are NOT pinned here.
+    """
+    src = _CONSOLE_AUTH.read_text(encoding="utf-8-sig")
+    write = _ui_refusal(src, "allow_admin_write")
+    phi = _ui_refusal(src, "allow_phi_read")
+    text = _doc_text()
+    found = [
+        " ".join(block.split())
+        for block in re.split(r"\n\s*\n", text)
+        if block.lstrip().startswith(_UI_REFUSAL_HEADING)
+    ]
+    if write is None:
+        _fail_if_charge_is_unreadable(src)
+        assert not found, (
+            "require_ui charges no admin-write floor; drop the paragraph describing it"
+        )
+        return
+    assert len(found) == 1, f"SECURITY.md must carry one paragraph headed {_UI_REFUSAL_HEADING}"
+    paragraph = found[0]
+    retry_after, write_logs = write
+    assert f"`Retry-After: {retry_after}`" in paragraph, (
+        f"require_ui's admin-write 429 sends Retry-After: {retry_after}; the paragraph must say so"
+    )
+    says_unlogged = any(p in paragraph.casefold() for p in _UNLOGGED_PHRASES)
+    logs = write_logs or (phi is not None and phi[1])
+    assert says_unlogged is not logs, (
+        "require_ui's refusal now logs at WARNING, but SECURITY.md says it does not"
+        if logs
+        else "require_ui's refusals write no WARNING line; SECURITY.md must say so"
+    )
+    rows = [
+        line for line in _section(_H_LIMITS).splitlines() if line.startswith("| Admin writes |")
+    ]
+    assert len(rows) == 1, "the 2.1.3 limits table lost its Admin writes row"
+    assert f"`/ui`: 429 + `Retry-After: {retry_after}`" in rows[0], (
+        "the 2.1.3 Admin writes row must carry the console's Retry-After"
+    )
+    folded = " ".join(text.split())
+    for restatement in (
+        f"its 429 carries `Retry-After: {retry_after}` where the JSON floor",
+        f"on the JSON API and `{retry_after}` on `/ui`",
+    ):
+        assert restatement in folded, f"SECURITY.md must still say {restatement!r}"
+    config = " ".join(_CONFIG_DOC.read_text(encoding="utf-8").split())
+    assert f"`Retry-After: {retry_after}` on the `/ui` console" in config, (
+        "docs/CONFIGURATION.md's admin_write_rate_limit_window_seconds row must carry it too"
+    )
+
+
+def test_ui_pacing_gap_wording_flips_with_the_code() -> None:
+    """Gap wording, enforced both ways.
+
+    The console charges ``allow_admin_write`` today (``require_ui``, BACKLOG #287), so the live arm
+    is the first one: neither document may say the console is unpaced. Should the console ever stop
+    charging, the other arm demands that both documents say so.
+    """
+    console_charges = _console_charges_admin_write(_console_sources())
     # The SAME time-bound claim is written into BOTH artefacts, so it must be guarded in both:
     # guarding only SECURITY.md would leave docs/CONFIGURATION.md asserting the gap forever once
     # console parity lands, which is precisely the rot this cell exists to close.
     surfaces = {
-        "docs/SECURITY.md": (
-            "no `/ui` route charges it" in _doc_text()
-            or "the `/ui` write path is not paced" in _doc_text()
-        ),
-        "docs/CONFIGURATION.md": "no `/ui` route charges it" in _config_section(),
+        "docs/SECURITY.md": _states_ui_pacing_gap(_doc_text()),
+        "docs/CONFIGURATION.md": _states_ui_pacing_gap(_config_section()),
     }
     for artefact, gap_stated in sorted(surfaces.items()):
         if console_charges:
@@ -1699,7 +2014,7 @@ def _charging_console_gates() -> set[str]:
     Derived rather than listed for the reason ``_pacing_charging_factories`` records: a hand-kept set
     of names keeps passing after a factory stops charging.
     """
-    tree = ast.parse((_WEBCONSOLE / "_auth.py").read_text(encoding="utf-8"))
+    tree = ast.parse(_CONSOLE_AUTH.read_text(encoding="utf-8-sig"))
     factories = {
         node.name
         for node in ast.walk(tree)

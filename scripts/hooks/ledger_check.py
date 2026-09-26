@@ -83,6 +83,25 @@ def git(*args: str) -> str:
     return proc.stdout or ""
 
 
+def _paths(out: str) -> list[str]:
+    """Split the output of a `-z` git path listing into whole paths (BACKLOG #1871).
+
+    NOT `.split()`: that splits on ANY whitespace, so `docs/adr/0190-with space.md` arrived as two
+    halves, neither half matched ADR_FILE, and the file was invisible to every rule in this gate.
+    NOT `.splitlines()` either: under git's default `core.quotePath`, line-oriented output C-quotes a
+    non-ASCII path (`"docs/adr/0192-caf\\303\\251.md"`), which ADR_FILE cannot match. With `-z`, git
+    writes each path unquoted and ends it with NUL, the one separator a path cannot hold. What reaches
+    here has still passed through git()'s text decoding, so a path holding a CR or invalid UTF-8 is
+    altered and its later `:path` lookup misses. That fails closed (a refusal), never open.
+
+    Every caller must pass `-z`. Without it the output holds no NUL and would come back as ONE bogus
+    path, hiding every file, so non-empty output with no NUL raises rather than reading as clean.
+    """
+    if out and "\0" not in out:
+        raise ValueError(f"expected NUL-terminated git output (-z); got {out[:80]!r}")
+    return [p for p in out.split("\0") if p]
+
+
 def _obj_exists(spec: str) -> bool:
     """Does the `<ref>:<path>` object exist? Probed EXPLICITLY rather than inferred from an error.
 
@@ -260,8 +279,8 @@ class Ledger:
     def added_files(self) -> list[str]:
         """Files ADDED by this change. In CI, HEAD is the PR merged into base, so this is the PR's set."""
         if self.ci:
-            return git("diff", "--name-only", "--diff-filter=A", self.base, "HEAD").split()
-        return git("diff", "--cached", "--name-only", "--diff-filter=A").split()
+            return _paths(git("diff", "-z", "--name-only", "--diff-filter=A", self.base, "HEAD"))
+        return _paths(git("diff", "-z", "--cached", "--name-only", "--diff-filter=A"))
 
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
@@ -272,7 +291,7 @@ class Ledger:
 
     def base_adr_numbers(self) -> dict[str, str]:
         out: dict[str, str] = {}
-        for f in git("ls-tree", "--name-only", self.base, "docs/adr/").split():
+        for f in _paths(git("ls-tree", "-z", "--name-only", self.base, "docs/adr/")):
             m = ADR_FILE.match(f)
             if m:
                 out.setdefault(m.group(1), f.rsplit("/", 1)[-1])

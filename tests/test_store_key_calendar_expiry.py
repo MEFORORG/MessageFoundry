@@ -243,6 +243,7 @@ def test_the_opt_out_is_a_NAMED_security_loosening() -> None:
             (),
             (),
             (),
+            (),
             None,
             None,
         )
@@ -264,6 +265,7 @@ def test_the_shipped_default_is_not_reported_as_a_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
+            (),
             (),
             (),
             (),
