@@ -156,6 +156,37 @@ suite("stepsModel — kind → row-type + params display", () => {
       { name: "params", value: "a, b" },
     ]);
   });
+
+  test("a read_field action row titles as Read Field, shows its bound name, and edits only its path", () => {
+    // ADR 0089 row 4: `name = msg.field("PID-5.1", occurrence=2)`. The bound name is read-only
+    // (`assign_to`, rendered as the subtitle); `occurrence` is a display kwarg outside literal_params.
+    const parse: LensParseResult = {
+      module: "x.py",
+      handlers: [
+        {
+          handler: "h",
+          module: "x.py",
+          def_line: 1,
+          rows: [
+            {
+              kind: "action",
+              action: "read_field",
+              assign_to: "name",
+              params: { path: "PID-5.1", occurrence: 2 },
+              literal_params: ["path"],
+              line_start: 2,
+              line_end: 2,
+              nesting: 0,
+            },
+          ],
+        },
+      ],
+    };
+    const [read] = buildHandlerViewModels(parse, "l1\nl2")[0].rows;
+    assert.strictEqual(read.title, "Read Field");
+    assert.strictEqual(read.subtitle, "→ name");
+    assert.deepStrictEqual(read.editableParams, ["path"]);
+  });
 });
 
 suite("stepsModel — code-row passthrough (the §4 degradation ladder)", () => {

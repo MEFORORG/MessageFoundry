@@ -48,6 +48,8 @@ export interface LensRow {
   action?: string;
   // lookup | diagnostic rows (diagnostic = log_note / checkpoint, ADR 0106 §5 K)
   call?: string;
+  // lookup rows, and the `read_field` action row (ADR 0089 row 4): the name the call's result binds to.
+  // Read-only: the engine offers no rename, because renaming the target alone would orphan its later uses.
   assign_to?: string;
   // action | lookup | diagnostic rows
   params?: Record<string, unknown>;
@@ -274,6 +276,7 @@ const ACTION_LABELS: Record<string, string> = {
   split_field: "Split Field",
   copy_segment: "Copy Segment",
   delete_segment: "Delete Segment",
+  read_field: "Read Field",
 };
 
 const LOOKUP_LABELS: Record<string, string> = {
@@ -401,12 +404,12 @@ export function rowTitle(row: LensRow): string {
   }
 }
 
-/** The secondary line for a row (the control test, the lookup assignment target, the send targets). */
+/** The secondary line for a row (the control test, the lookup or read-field assignment target, the send targets). */
 function rowSubtitle(row: LensRow): string | undefined {
   if (row.kind === "control") {
     return row.test_src ?? undefined;
   }
-  if (row.kind === "lookup" && row.assign_to) {
+  if (row.assign_to) {
     return `→ ${row.assign_to}`;
   }
   if (row.kind === "send") {
