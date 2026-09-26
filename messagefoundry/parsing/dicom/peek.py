@@ -92,26 +92,28 @@ class DicomPeek:
                 specific_tags=_PEEK_TAGS,
                 force=False,
             )
+            # The reads stay inside the try: pydicom converts a value only when it is read, so a
+            # malformed Modality raises here, after dcmread has returned (BACKLOG #1893).
+            file_meta = getattr(ds, "file_meta", None)
+            transfer_syntax = (
+                str_or_none(getattr(file_meta, "TransferSyntaxUID", None))
+                if file_meta is not None
+                else None
+            )
+            return cls(
+                sop_class_uid=str_or_none(ds.get("SOPClassUID")),
+                sop_instance_uid=str_or_none(ds.get("SOPInstanceUID")),
+                study_instance_uid=str_or_none(ds.get("StudyInstanceUID")),
+                series_instance_uid=str_or_none(ds.get("SeriesInstanceUID")),
+                modality=str_or_none(ds.get("Modality")),
+                transfer_syntax_uid=transfer_syntax,
+                calling_ae_title=calling_ae_title,
+                called_ae_title=called_ae_title,
+            )
         except DicomError:
             raise  # a DicomBombError is already the verdict; ValueError below must not rewrap it
         except parse_error_types() as exc:
             raise DicomPeekError("body is not a parseable DICOM Part-10 object") from exc
-        file_meta = getattr(ds, "file_meta", None)
-        transfer_syntax = (
-            str_or_none(getattr(file_meta, "TransferSyntaxUID", None))
-            if file_meta is not None
-            else None
-        )
-        return cls(
-            sop_class_uid=str_or_none(ds.get("SOPClassUID")),
-            sop_instance_uid=str_or_none(ds.get("SOPInstanceUID")),
-            study_instance_uid=str_or_none(ds.get("StudyInstanceUID")),
-            series_instance_uid=str_or_none(ds.get("SeriesInstanceUID")),
-            modality=str_or_none(ds.get("Modality")),
-            transfer_syntax_uid=transfer_syntax,
-            calling_ae_title=calling_ae_title,
-            called_ae_title=called_ae_title,
-        )
 
     def is_structured_report(self) -> bool:
         """Whether this is a Structured Report (its ``SOPClassUID`` is an SR storage class), so a
