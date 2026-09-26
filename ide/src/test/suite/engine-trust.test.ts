@@ -21,6 +21,7 @@ import {
   getJson,
   setEngineTrustAnchor,
   TLS_12_SUITES,
+  TLS_13_SUITES,
   TLS_CIPHERS,
   tlsOptions,
 } from "../../engineClient";
@@ -283,10 +284,13 @@ suite("the registered anchor reaches the TLS layer", () => {
 
   test("the suite pin is the approved AEAD list and carries no CBC suite (BACKLOG #300)", () => {
     const opts = tlsOptions(new URL("https://127.0.0.1:8765"));
-    assert.strictEqual(opts.ciphers, TLS_12_SUITES.join(":"));
-    assert.strictEqual(TLS_12_SUITES.length, 8);
-    for (const name of TLS_12_SUITES) {
+    assert.strictEqual(opts.ciphers, TLS_12_SUITES.concat(TLS_13_SUITES).join(":"));
+    assert.strictEqual(TLS_12_SUITES.length, 5);
+    assert.strictEqual(TLS_13_SUITES.length, 2);
+    for (const name of TLS_12_SUITES.concat(TLS_13_SUITES)) {
       assert.ok(/GCM|CHACHA20/.test(name), `${name} is not an AEAD suite`);
+      // Owner ruling R4 of 2026-09-26 (BACKLOG #2042): no AES-128 suite at either version.
+      assert.ok(!/AES128|AES_128/.test(name), `${name} is an AES-128 suite`);
     }
     setEngineTrustAnchor("https://127.0.0.1:8765", PEM);
     assert.strictEqual(

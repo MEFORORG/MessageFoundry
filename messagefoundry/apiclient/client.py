@@ -346,16 +346,21 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
 #: client must not import ``config/`` (CLAUDE.md section 4), so it cannot read the engine's tuple.
 #: ``tests/test_tls_default_suites.py`` pins the two equal, order included, so they cannot drift.
 #: The engine's API listener offers exactly these by default, so pinning them here refuses nothing a
-#: stock engine speaks; it stops the client offering the six CBC-SHA2 suites the interpreter enables.
+#: stock engine speaks; it stops the client offering the six CBC-SHA2 suites the interpreter enables,
+#: and since owner ruling R4 of 2026-09-26 (BACKLOG #2042) the three AES-128-GCM suites.
 _APPROVED_TLS12_SUITES = (
     "ECDHE-ECDSA-AES256-GCM-SHA384",
     "ECDHE-RSA-AES256-GCM-SHA384",
-    "ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-AES128-GCM-SHA256",
     "ECDHE-ECDSA-CHACHA20-POLY1305",
     "ECDHE-RSA-CHACHA20-POLY1305",
     "DHE-RSA-AES256-GCM-SHA384",
-    "DHE-RSA-AES128-GCM-SHA256",
+)
+
+#: The TLS 1.3 suites this client offers where the interpreter can say so (ruling R4). A COPY of
+#: ``messagefoundry.config.tls_policy.APPROVED_TLS13_SUITES``, pinned to it by the same test file.
+_APPROVED_TLS13_SUITES = (
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
 )
 
 
@@ -399,6 +404,11 @@ def _build_verify_context(
     # security level is written back in front of the names, as the engine's
     # narrow_to_approved_suites does, so it is stated rather than left to the OpenSSL build.
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
+    # TLS 1.3, ruling R4 (BACKLOG #2042): set_ciphersuites arrives in CPython 3.15. On 3.14 it is
+    # absent, so TLS_AES_128_GCM_SHA256 stays offered: a RECORDED GAP of R4, not an override.
+    set_ciphersuites = getattr(ctx, "set_ciphersuites", None)
+    if set_ciphersuites is not None:
+        set_ciphersuites(":".join(_APPROVED_TLS13_SUITES))
     if client_cert is not None:
         # keyfile=None is valid: the private key may be bundled in the client cert PEM.
         ctx.load_cert_chain(client_cert, client_key)

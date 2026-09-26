@@ -93,6 +93,8 @@ __all__ = [
     "log_revocation_attestation",
     "kex_groups_report",
     "APPROVED_TLS12_SUITES",
+    "APPROVED_TLS13_SUITES",
+    "narrow_tls13_suites",
     "narrow_to_approved_suites",
     "relax_verify_expiry",
     "requests_verify_from_anchor",
@@ -534,6 +536,10 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
         probe.set_ciphers(value)
     except ssl.SSLError as exc:
         raise ValueError(f"tls_ciphers is not a valid OpenSSL cipher string: {exc}") from exc
+    # The probe models an engine context, and every engine context narrows TLS 1.3 where it can
+    # (ruling R4). Without this, 3.15 would resolve TLS_AES_128_GCM_SHA256 here and the allow-list,
+    # which admits it only where it cannot be removed, would refuse every string.
+    narrow_tls13_suites(probe)
     resolved = probe.get_ciphers()
     non_fs = sorted({str(c.get("name", "?")) for c in resolved if not _is_forward_secret(c)})
     if non_fs:
@@ -583,7 +589,8 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
         raise ValueError(
             "tls_ciphers must resolve only to suites on the approved list (ASVS 12.1.2, BACKLOG "
             f"#1317); these are not on it: {', '.join(unlisted)}. The list is AEAD-only and excludes "
-            "the CBC-SHA2 suites the interpreter default enables; widening it for a legacy peer is a "
+            "the CBC-SHA2 suites the interpreter default enables, and since owner ruling R4 of "
+            "2026-09-26 (BACKLOG #2042) the AES-128-GCM suites too; widening it for a legacy peer is a "
             "deliberate change to _APPROVED_TLS_SUITES, not a configuration override."
         )
     return value
@@ -771,6 +778,7 @@ def apply_connection_tls_ciphers(
     try:
         validate_tls_ciphers(text)
         ctx.set_ciphers(text)
+        narrow_tls13_suites(ctx)  # the string cannot reach TLS 1.3 (ruling R4, BACKLOG #2042)
     except (ValueError, ssl.SSLError) as exc:
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
 
@@ -798,21 +806,38 @@ def apply_connection_tls_ciphers(
 #: served by a reviewed change to THIS set, the direction the paragraph above already names. What
 #: stays true: :func:`harden_cipher_suites` never applies this list itself. It asserts; a seam narrows.
 #:
-#: TLS 1.3 -- always negotiable and not configurable down through ``set_ciphers``, so they must be
-#: admitted here or every validation would fail on suites the operator cannot remove.
-_APPROVED_TLS13_SUITES = (
+#: **AMENDED BY OWNER RULING R4 of 2026-09-26 (BACKLOG #2042): no AES-128.** The three AES-128-GCM
+#: TLS 1.2 suites are gone from :data:`APPROVED_TLS12_SUITES`, and TLS 1.3's
+#: ``TLS_AES_128_GCM_SHA256`` goes wherever the interpreter can remove it. A legacy peer that needs
+#: AES-128 is served by a reviewed change that widens this list, as the CBC ruling above provides.
+#:
+#: TLS 1.3 -- ``set_ciphers`` cannot reach these suites, so the allow-list must admit whatever the
+#: engine cannot remove, or every validation would fail on a suite the operator cannot remove either.
+#: So the TLS 1.3 half is :data:`APPROVED_TLS13_SUITES`, plus ``TLS_AES_128_GCM_SHA256`` ONLY on an
+#: interpreter without ``SSLContext.set_ciphersuites`` (CPython 3.14 and earlier). That admission is
+#: the RECORDED GAP of ruling R4, not an override: see :func:`narrow_tls13_suites`.
+_TLS13_AES128_SUITE = "TLS_AES_128_GCM_SHA256"
+
+#: The TLS 1.3 suites every engine-built context offers, IN PREFERENCE ORDER (ruling R4).
+#:
+#: Applied by :func:`narrow_tls13_suites` through ``SSLContext.set_ciphersuites``, which CPython
+#: gains in 3.15. On 3.14 nothing can apply it, so the interpreter's own three TLS 1.3 suites stay.
+APPROVED_TLS13_SUITES = (
     "TLS_AES_256_GCM_SHA384",
     "TLS_CHACHA20_POLY1305_SHA256",
-    "TLS_AES_128_GCM_SHA256",
+)
+
+_APPROVED_TLS13_SUITES = APPROVED_TLS13_SUITES + (
+    () if hasattr(ssl.SSLContext, "set_ciphersuites") else (_TLS13_AES128_SUITE,)
 )
 
 #: The TLS 1.2 half of the approved list -- AEAD, forward-secret, authenticated -- IN PREFERENCE ORDER.
 #:
 #: A tuple, not a set, because :func:`narrow_to_approved_suites` hands it to ``set_ciphers`` and
 #: OpenSSL offers explicitly named suites in the order given. The order is the interpreter default's
-#: own order with the six CBC-SHA2 suites taken out (measured on CPython 3.14.6 / OpenSSL 3.5.7): ECDHE
-#: before DHE, and within each key exchange AES-256-GCM, then AES-128-GCM, then ChaCha20. So narrowing
-#: removes suites and never reorders the ones that stay.
+#: own order with the six CBC-SHA2 suites and, since ruling R4, the three AES-128-GCM suites taken
+#: out (measured on CPython 3.14.6 / OpenSSL 3.5.7): ECDHE before DHE, and within each key exchange
+#: AES-256-GCM, then ChaCha20. So narrowing removes suites and never reorders the ones that stay.
 #:
 #: **:data:`_APPROVED_TLS_SUITES` is DERIVED from this tuple, so an edit here moves both at once.**
 #: Adding a suite for a legacy peer widens the DEFAULT on every engine-built hop, not only the knob.
@@ -824,24 +849,23 @@ _APPROVED_TLS13_SUITES = (
 APPROVED_TLS12_SUITES = (
     "ECDHE-ECDSA-AES256-GCM-SHA384",
     "ECDHE-RSA-AES256-GCM-SHA384",
-    "ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-AES128-GCM-SHA256",
     "ECDHE-ECDSA-CHACHA20-POLY1305",
     "ECDHE-RSA-CHACHA20-POLY1305",
     "DHE-RSA-AES256-GCM-SHA384",
-    "DHE-RSA-AES128-GCM-SHA256",
 )
 
 _APPROVED_TLS_SUITES = frozenset(_APPROVED_TLS13_SUITES + APPROVED_TLS12_SUITES)
 
 
 def narrow_to_approved_suites(ctx: ssl.SSLContext) -> None:
-    """Make :data:`APPROVED_TLS12_SUITES` the TLS 1.2 suite list of ``ctx`` (BACKLOG #300).
+    """Make :data:`APPROVED_TLS12_SUITES` the TLS 1.2 suite list of ``ctx`` (BACKLOG #300), and
+    :data:`APPROVED_TLS13_SUITES` its TLS 1.3 list where the interpreter allows it (ruling R4).
 
     The default on every context the engine builds that no operator setting narrowed. It takes out
-    the six CBC-SHA2 suites the interpreter default enables, so a peer that speaks only CBC can no
-    longer negotiate TLS 1.2 with the engine. TLS 1.3 is untouched: ``set_ciphers`` cannot reach it,
-    and all three TLS 1.3 suites are AEAD anyway.
+    the six CBC-SHA2 suites the interpreter default enables, and since owner ruling R4 of 2026-09-26
+    (BACKLOG #2042) the three AES-128-GCM suites too. So a peer that speaks only CBC, or only
+    AES-128-GCM, can no longer negotiate TLS 1.2 with the engine. ``set_ciphers`` cannot reach TLS
+    1.3, so :func:`narrow_tls13_suites` does that half, and on CPython 3.14 it can do nothing.
 
     **MLLP and DICOM included, by owner ruling.** The interop rationale for CBC reaches only those
     two (2026-08-22, BACKLOG #1170), and on 2026-09-23 the owner removed the six there as well, with
@@ -862,6 +886,30 @@ def narrow_to_approved_suites(ctx: ssl.SSLContext) -> None:
     This narrows and does not assert. Each seam still calls :func:`harden_cipher_suites` itself,
     after this, so the ASVS 12.1.2 call-site guard keeps seeing the assertion by name (ADR 0188)."""
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(APPROVED_TLS12_SUITES))
+    narrow_tls13_suites(ctx)
+
+
+def narrow_tls13_suites(ctx: ssl.SSLContext) -> bool:
+    """Make :data:`APPROVED_TLS13_SUITES` the TLS 1.3 suite list of ``ctx``; return whether it did.
+
+    Owner ruling R4 of 2026-09-26 (BACKLOG #2042) drops ``TLS_AES_128_GCM_SHA256`` wherever the
+    interpreter provides ``SSLContext.set_ciphersuites``. CPython gains that method in 3.15, so on
+    3.14 this is a no-op that returns ``False``, and it turns on with no code change on 3.15.
+
+    **The 3.14 residual is a RECORDED GAP of ruling R4, not an override.** On 3.14 every context
+    still offers ``TLS_AES_128_GCM_SHA256`` at TLS 1.3, because no API here can remove it. Nothing
+    loosens policy to admit it; the allow-list admits it only because it cannot be removed.
+
+    The return value exists for the reason :func:`harden_kex_groups` returns one: a control that
+    cannot report whether it acted reports success forever. A call that raises is not caught, so a
+    list OpenSSL refuses fails the context at construction rather than reading as narrowed."""
+    set_ciphersuites = getattr(ctx, "set_ciphersuites", None)
+    if set_ciphersuites is None:
+        # RECORDED GAP (ruling R4): CPython 3.14 has no set_ciphersuites, so TLS_AES_128_GCM_SHA256
+        # stays negotiable at TLS 1.3 here. Not an override: no reviewed change ever admitted it.
+        return False
+    set_ciphersuites(":".join(APPROVED_TLS13_SUITES))
+    return True
 
 
 def _is_encrypting(cipher: Mapping[str, object]) -> bool:

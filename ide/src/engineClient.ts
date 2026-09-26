@@ -65,24 +65,36 @@ export const TLS_MIN_VERSION = "TLSv1.2";
  * and the engine it talks to agree by construction. `tests/test_tls_default_suites.py` in the Python
  * suite reads this array and pins it to the engine's tuple, order included, so the two cannot drift.
  *
- * TLS 1.2 names only, matching the engine: Python cannot restrict TLS 1.3 through its cipher string,
- * and every TLS 1.3 suite is AEAD anyway. Measured on Node 22.17.1: a list with no TLS 1.3 names
- * still negotiates TLS 1.3, refuses a TLS 1.2 server offering only `ECDHE-ECDSA-AES128-SHA256`
- * (the unpinned control completed against that server), and accepts one offering the GCM suite.
+ * Owner ruling R4 of 2026-09-26 (BACKLOG #2042) took the three AES-128-GCM suites out, here and in
+ * the engine. Measured on Node 22.17.1 / OpenSSL 3.0.16 with this list: a TLS 1.2 server offering
+ * only `ECDHE-ECDSA-AES128-GCM-SHA256` is refused (the unpinned control completed against it), and
+ * one offering only `ECDHE-ECDSA-AES256-GCM-SHA384` is accepted.
  */
 export const TLS_12_SUITES: readonly string[] = [
   "ECDHE-ECDSA-AES256-GCM-SHA384",
   "ECDHE-RSA-AES256-GCM-SHA384",
-  "ECDHE-ECDSA-AES128-GCM-SHA256",
-  "ECDHE-RSA-AES128-GCM-SHA256",
   "ECDHE-ECDSA-CHACHA20-POLY1305",
   "ECDHE-RSA-CHACHA20-POLY1305",
   "DHE-RSA-AES256-GCM-SHA384",
-  "DHE-RSA-AES128-GCM-SHA256",
 ];
 
-/** {@link TLS_12_SUITES} as the OpenSSL cipher string Node's `ciphers` option takes. */
-export const TLS_CIPHERS = TLS_12_SUITES.join(":");
+/**
+ * The TLS 1.3 suites every https request here offers, in preference order (ruling R4).
+ *
+ * A COPY of `APPROVED_TLS13_SUITES` in `messagefoundry/config/tls_policy.py`, pinned to it by the
+ * same Python test. Node, unlike CPython 3.14, can restrict TLS 1.3 through its `ciphers` option, so
+ * R4 applies here now. Measured on Node 22.17.1 / OpenSSL 3.0.16: with these names in the list, a
+ * TLS 1.3 server offering only `TLS_AES_128_GCM_SHA256` is refused, while a list of TLS 1.2 names
+ * alone still completed against it. A stock TLS 1.3 server, which is what a 3.14 engine is, still
+ * completes on `TLS_AES_256_GCM_SHA384`.
+ */
+export const TLS_13_SUITES: readonly string[] = [
+  "TLS_AES_256_GCM_SHA384",
+  "TLS_CHACHA20_POLY1305_SHA256",
+];
+
+/** Both suite lists as the one OpenSSL cipher string Node's `ciphers` option takes. */
+export const TLS_CIPHERS = TLS_12_SUITES.concat(TLS_13_SUITES).join(":");
 
 /**
  * Extra trust anchors, keyed by `host:port` (see {@link engineHostKey}) — BACKLOG #1695.
@@ -135,7 +147,8 @@ export function clearEngineTrustAnchors(): boolean {
  * Node's default still offers the CBC-SHA2 suites the engine's allow-list excludes, so an unpinned
  * client kept offering them to the engine. The cost that argument named is real
  * and now paid on purpose: a TLS terminator in front of the engine that speaks only CBC suites will
- * fail the handshake, and the fix is on that terminator. TLS 1.3 is not constrained by this list.
+ * fail the handshake, and the fix is on that terminator. Since ruling R4 (BACKLOG #2042) the list
+ * also names the TLS 1.3 suites, so `TLS_AES_128_GCM_SHA256` is no longer offered at TLS 1.3.
  */
 export function tlsOptions(url: URL): https.RequestOptions {
   if (url.protocol !== "https:") {
