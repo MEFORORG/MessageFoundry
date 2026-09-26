@@ -291,19 +291,29 @@ def drain_bounded(
     A chunked body is decoded under the strict grammar here too, because that decoder is what keeps
     a negative chunk size inside the byte bound (BACKLOG #1979). A drain stops at the first line it
     cannot parse and does not raise. It logs a WARNING instead, so the stop is recorded rather than
-    silent. The message names the connector and a fixed reason, never a peer byte.
+    silent. The WARNING carries a fixed reason, the request method and the status code, and nothing
+    else. It leaves ``connector`` out on purpose: every caller builds it from a configured URL, and
+    a log line should not depend on each caller's redaction being complete.
     """
     try:
         _read_capped(reader, limit, connector)
     except TruncatedResponseError:
         return
     except AmbiguousFramingError as exc:
+        method = getattr(reader, "_method", None)
+        status = getattr(reader, "status", None)
         logger.warning(
-            "%s sent a malformed reply body (%s); the drain stopped there, and the call is not "
-            "failed because the body is discarded",
-            connector,
+            "A %s reply with status %s had a malformed body (%s); the drain stopped there, and "
+            "the call is not failed because the body is discarded",
+            method if method in _LOGGED_METHODS else "HTTP",
+            status if isinstance(status, int) else "unknown",
             exc.reason,
         )
+
+
+#: The request methods the drain WARNING may name. Anything else is logged as "HTTP", so the line
+#: holds only text from this module.
+_LOGGED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 
 
 #: Statuses whose reply has no body (RFC 9112 section 6.3, rule 1). See reply_framing_fault.

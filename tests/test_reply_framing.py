@@ -846,11 +846,14 @@ def test_drain_bounded_stops_at_malformed_chunk_framing(
     raw = _BAD_CHUNKS[shape]
     resp, stream = _wire_counted(raw)
     with caplog.at_level(logging.WARNING):
-        drain_bounded(resp, limit=1000, connector="probe-c")
+        drain_bounded(resp, limit=1000, connector="https://h.example.test/p?token=SECRET")
     assert stream.tell() <= min(len(raw), len(_TE) + 40)
-    assert "probe-c" in caplog.text
+    assert "A GET reply with status 200 had a malformed body" in caplog.text
     assert "is not failed" in caplog.text
     assert "refusing" not in caplog.text
+    # The connector is built from a configured URL, so the WARNING leaves it out entirely.
+    assert "h.example.test" not in caplog.text
+    assert "SECRET" not in caplog.text
 
 
 @pytest.mark.parametrize("shape", list(_CHUNK_CONTROLS), ids=list(_CHUNK_CONTROLS))
