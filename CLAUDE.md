@@ -569,10 +569,11 @@ no account roster and still cannot reach another Manager: spawning makes a NEW s
 address an existing one, so the shape still dissolves the cross-account problem rather than solving
 it.
 
-**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing reads a red
-PR -- `failure-signal.yml` sets a `ci-red` label no workflow reads back, and `stalled-prs.yml`
-reports green-but-unmergeable PRs rather than red ones -- so the work stops until somebody happens
-to look. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
+**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing sends a
+red PR to a seat -- `failure-signal.yml` sets a `ci-red` label that only an advisory daily report
+reads back, and `stalled-prs.yml` reports green-but-unmergeable PRs rather than red ones -- so the
+work stops until somebody happens to look. **CORRECTED 2026-09-26:** this read "a `ci-red` label no
+workflow reads back"; `ci-red-report.yml` (PR 1240) reads it daily into its own run summary. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
 landing means nobody checked it, and a fix written to turn CI green is checked by the very signal it
 was written against.
 
@@ -588,7 +589,9 @@ The brief is disposable. The BACKLOG item is the record.
 
 No seat may rely on a notice arriving -- the Manager finds state by asking. `stalled-prs.yml` reports
 green-but-unmergeable PRs on a daily 07:05 UTC cron. `failure-signal.yml` adds a `ci-red` label to a
-PR whose required check went red, and no workflow reads that label back. Some workflows do comment on
+PR whose required check went red, and only an advisory daily report reads that label back, into a run
+summary no seat is sent. **CORRECTED 2026-09-26:** this read "no workflow reads that label back";
+`ci-red-report.yml` (PR 1240) reads it. Some workflows do comment on
 a PR -- at least `failure-signal.yml` and `nightly-notice.yml` -- but **no label any of them applies
 gates a merge**, and no seat has to clear one.
 
