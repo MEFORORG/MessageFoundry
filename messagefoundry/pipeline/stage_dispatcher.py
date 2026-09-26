@@ -1674,6 +1674,13 @@ class StageDispatcher:
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.PAUSED
 
+    def stopped(self, key: str) -> bool:
+        """Whether ``key`` is in the STOPPED phase (a STOP not yet re-armed). The runner reads it before
+        a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm. False
+        for an unknown lane."""
+        st = self._states.get(key)
+        return st is not None and st.phase is _LanePhase.STOPPED
+
     def is_dirty(self, key: str) -> bool:
         st = self._states.get(key)
         return st.dirty if st is not None else False
