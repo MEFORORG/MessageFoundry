@@ -248,12 +248,15 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     certificate count (``x509``, which also counts a non-CA certificate; ``x509_ca`` does not).
     OpenSSL does not add a certificate the store already holds, so a bare CRL and a bundle whose
     certificates the hop already trusts both load, and any other certificate refuses. The documented
-    shape is a bare CRL. **This relies on the CA loading first**, as every call site does; a CRL
-    bundle loaded before its CA is refused, which fails closed rather than widening. Stripping the
+    shape is a bare CRL. "Already holds" means loaded into the store now: a CA that OpenSSL would
+    read lazily from a hashed directory is not counted, so a bundle carrying it refuses. **This also
+    relies on the CA loading first**, as every call site does; a CRL bundle loaded before its CA is
+    refused. Both cases fail closed rather than widening. Stripping the
     certificates before the load was the alternative, and it was not taken: it needs a PEM parser
     that agrees with OpenSSL's and a temporary file, to keep a shape that gains nothing over a bare
     CRL. A refusal leaves the certificate in ``ctx``, so the caller must discard the context, which
-    every call site does by letting the ``ValueError`` abort construction.
+    every call site does by letting the ``ValueError`` abort construction. Calling this again on the
+    same context after a refusal would pass, because the certificate is then already counted.
 
     **Three refusals, and each one is a measured failure mode rather than defensive habit.**
     Re-measured on this worktree, CPython 3.14.6 / OpenSSL 3.5.7, TLS 1.2 pinned so client auth is
@@ -301,16 +304,16 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
             "revoked ones, so this would take the listener down at the first partner handshake"
         )
 
-    certs_before = ctx.cert_store_stats().get("x509", 0)
+    certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
     stats = ctx.cert_store_stats()
-    added = stats.get("x509", 0) - certs_before
+    added = stats["x509"] - certs_before
     if added:
         raise ValueError(
-            f"[tls] crl file {crl_file!r} carries {added} certificate(s) this hop did not already "
-            "trust; loading them would make each one a trust anchor for the hop, outside its CA "
-            "setting's pin and checks. Give this setting a bare CRL and put the CA in the hop's CA "
-            "setting (BACKLOG #1890)"
+            f"[tls] crl file {crl_file!r} carries {added} certificate(s) not already in this hop's "
+            "trust store; loading them would make each one a trust anchor for the hop, outside any "
+            "check on its CA setting. Remove the certificates and give this setting a bare CRL "
+            "(BACKLOG #1890)"
         )
     loaded = stats.get("crl", 0)
     if loaded < 1:
@@ -1756,7 +1759,7 @@ class TrustAnchorPolicy:
 
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"
-    #: ``[tls].crl_file`` — a PEM file of CRLs applied to the OUTBOUND hops this policy
+    #: ``[tls].crl_file``: a PEM file of CRLs applied to the OUTBOUND hops this policy
     #: reaches (BACKLOG #299). Independent of ``mode``: revocation is orthogonal to which roots anchor
     #: the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
     #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.

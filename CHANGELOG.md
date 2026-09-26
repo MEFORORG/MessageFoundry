@@ -135,9 +135,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   pin and permission checks. It covers at least `[api].tls_client_crl_file`, an inbound
   connection's `tls_crl_file`, `[tls].crl_file`, `[logging].forward_tls_crl_file`,
   `[auth].oidc_tls_crl_file` and `[store].ssl_crl_file`. The engine now refuses to build the hop
-  when its CRL file carries a certificate the hop does not already trust. A file holding a CA the
-  hop already trusts, plus that CA's CRL, still loads. Give each CRL setting a bare CRL, and put
-  the CA in the hop's CA setting. The inbound revocation refusal no longer tells an operator to
+  when its CRL file carries a certificate not already in the hop's trust store. A file holding a
+  CA already loaded for that hop, plus that CA's CRL, still loads. A bare CRL always does, so
+  give each CRL setting a bare CRL. The inbound revocation refusal no longer tells an operator to
   put the CA in the CRL file. ([BACKLOG #1890](docs/BACKLOG.md))
 - **BREAKING: under `enforce`, a trust anchor whose permissions or path the engine cannot read now
   refuses to start, unless its SHA-256 pin matches.** This covers `[auth].oidc_tls_ca_cert_file`,

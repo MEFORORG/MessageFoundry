@@ -911,7 +911,7 @@ def test_build_tls_context_loads_client_cert(tmp_path: Any) -> None:
 
 
 def _make_ca_and_crl(dir_path: Any) -> str:
-    """A CA bundled with its own fresh CRL -- the shape harden_crl_check loads. Synthetic, no PHI."""
+    """A CA bundled with its own fresh CRL -- it loads only where the same CA is loaded first (BACKLOG #1890). Synthetic, no PHI."""
     import datetime
 
     from cryptography import x509

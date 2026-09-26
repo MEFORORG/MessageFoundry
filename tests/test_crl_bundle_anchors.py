@@ -198,7 +198,7 @@ def test_a_planted_ca_in_the_crl_file_refuses(pki: _Pki) -> None:
     before = ctx.cert_store_stats()
     assert (before["x509"], before["x509_ca"], before["crl"]) == (1, 1, 0)
     with pytest.raises(
-        ValueError, match=r"carries 1 certificate\(s\) this hop did not already trust"
+        ValueError, match=r"carries 1 certificate\(s\) not already in this hop.s trust store"
     ):
         harden_crl_check(ctx, str(pki.planted_bundle))
 
@@ -302,7 +302,7 @@ def test_a_listener_refuses_a_crl_bundle_carrying_a_ca_the_pin_excludes(
 ) -> None:
     """Step 5 of the row, tested rather than read. Red before the fix: the listener built, and the
     planted client was ACCEPTED (see the control below for what that bundle admits)."""
-    with pytest.raises(ValueError, match="did not already trust"):
+    with pytest.raises(ValueError, match="not already in this hop"):
         build(pki, pki.planted_bundle)
 
 

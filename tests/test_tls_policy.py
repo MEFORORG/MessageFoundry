@@ -1566,11 +1566,11 @@ def test_a_crl_alone_makes_the_anchor_narrow(_crl_material: dict[str, str]) -> N
 
 
 def test_build_verifying_client_context_sets_the_crl_flag(_crl_material: dict[str, str]) -> None:
-    crl = _crl_material["fresh_only"]
+    crl, ca = _crl_material["fresh_only"], _crl_material["ca_only"]
     for anchor in (
         TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl),  # system + CRL
-        TrustAnchor(cafile=crl, load_system_roots=True, crl_file=crl),  # augment + CRL
-        TrustAnchor(cafile=crl, load_system_roots=False, crl_file=crl),  # pinned + CRL
+        TrustAnchor(cafile=ca, load_system_roots=True, crl_file=crl),  # augment + CRL
+        TrustAnchor(cafile=ca, load_system_roots=False, crl_file=crl),  # pinned + CRL
     ):
         ctx = build_verifying_client_context(anchor)
         assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF, anchor
@@ -1596,7 +1596,8 @@ def test_build_anchored_https_handler_sets_the_crl_flag_on_its_own_context(
     assert context_checks_revocation(urllib_handler_context(handler, connector="probe")) is True
     # The pinned arm substitutes a context and must carry the CRL through that substitution.
     pinned = build_anchored_https_handler(
-        anchor=TrustAnchor(cafile=crl, load_system_roots=False, crl_file=crl), connector="probe"
+        anchor=TrustAnchor(cafile=_crl_material["ca_only"], load_system_roots=False, crl_file=crl),
+        connector="probe",
     )
     assert context_checks_revocation(urllib_handler_context(pinned, connector="probe")) is True
     # NEGATIVE CONTROL.

@@ -398,7 +398,7 @@ def test_notifier_sink_emits_cert_expiry_event() -> None:
 
 
 def _write_crl(path: Path, *, next_update: datetime.datetime) -> None:
-    """A CA bundled with its own CRL, the shape harden_crl_check loads and the monitor reads."""
+    """A CA bundled with its own CRL, which the monitor reads. harden_crl_check loads it only where the same CA is loaded first (#1890)."""
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-test-ca")])
     ca = (
