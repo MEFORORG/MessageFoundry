@@ -172,7 +172,7 @@ replacement for it, and hooks get added.
 | gitleaks, bandit, actionlint | Secret scan, Python security lint, and workflow lint. |
 | username-access-key | A username used where an access key belongs. |
 | ledger gate (`scripts/hooks/ledger_check.py`) | You used an ADR or BACKLOG number you did not allocate. See below. |
-| claim gate (`commit-msg`, `scripts/hooks/claim_check.py`) | Your subject line says it implements `BACKLOG #N`, your diff touches code, and you hold no claim on N here. |
+| claim gate (`commit-msg`, `scripts/hooks/claim_check.py`) | Your subject line says it implements `BACKLOG #N`, your diff touches code, and you hold no claim on N here. Or, on any commit, your subject has a `#N` that no `BACKLOG #` token governs, that is not labelled `PR #N`, and that is not the one trailing `(#N)` of a squash merge. Write items as `(BACKLOG #a, #b)`. |
 | forbidden-content | The leak guard found customer or PHI-shaped content. See below. |
 | push guard (`pre-push`) | You tried to push a protected branch directly. Branch and open a PR. |
 

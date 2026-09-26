@@ -84,7 +84,7 @@ are still fresh, only the one with the largest `last_seen` is reported as leader
   live leader), so `/cluster/nodes` never shows two leaders and `leader_node_id` is never the dead node.
   This is the key correctness property: the derived leader is always a single *live* node.
 
-  > ⚠️ **CORRECTION (2026-08-01).** The "single leader" half holds unconditionally; the "always *live*"
+  > **CORRECTION (2026-08-01).** The "single leader" half holds unconditionally; the "always *live*"
   > half does not. The freshness test is `(now - last_seen) <= node_timeout_seconds` with no lower
   > bound, comparing the *reading* node's wall clock against a `last_seen` written by the *beating*
   > node's wall clock. A row stamped by a node whose clock runs ahead has a negative age, passes, and
