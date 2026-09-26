@@ -34,6 +34,7 @@ from messagefoundry.store.crypto import IdentityCipher
 from messagefoundry.store.sqlserver import (
     _EPOCH_GUARD_CLAIM,
     _EPOCH_GUARD_RESOLVE,
+    _RESOLVE_OUTPUT,
     SqlServerStore,
     _FencedWrite,
 )
@@ -158,18 +159,26 @@ def test_every_unguarded_status_write_carries_a_written_reason() -> None:
     assert all(len(reason) > 40 for reason in _UNGUARDED_REASONS.values())
 
 
-def test_every_fenced_terminal_resolve_inspects_the_rowcount_and_catches_the_sentinel() -> None:
-    """Splicing the guard is a third of it. The rowcount must be read (``_exec_terminal``) or the
-    guard can never fire, and the sentinel must be caught (``_fence_scope``) or it escapes the store
-    as an exception instead of becoming a counted, re-pended no-op."""
+def test_every_fenced_terminal_resolve_reads_its_output_and_catches_the_sentinel() -> None:
+    """Splicing the guard is only part of it. The UPDATE must carry the OUTPUT clause in the same
+    statement and be run through ``_exec_terminal``, or the guard can never fire. The sentinel must be
+    caught (``_fence_scope``) or it escapes the store as an exception instead of becoming a counted,
+    re-pended no-op."""
     tree = ast.parse(_SOURCE.read_text(encoding="utf-8"))
     seen: set[str] = set()
     for fn in ast.walk(tree):
         if isinstance(fn, ast.AsyncFunctionDef) and fn.name in _RESOLVE_FENCED:
             seen.add(fn.name)
             assert _calls_self(fn, "_resolve_guard"), f"{fn.name} does not splice the guard"
-            assert _calls_self(fn, "_exec_terminal"), f"{fn.name} never inspects the rowcount"
+            assert _calls_self(fn, "_exec_terminal"), f"{fn.name} never inspects the result"
             assert _calls_self(fn, "_fence_scope"), f"{fn.name} never catches _FencedWrite"
+            guarded = [
+                s for s in _sql_expressions(fn) if _STATUS_WRITE.search(s) and "{guard}" in s
+            ]
+            assert guarded, fn.name
+            for sql in guarded:
+                # OUTPUT must sit between the SET list and the WHERE, in the same statement.
+                assert re.search(r"\{output\} WHERE id=\?\{guard\}$", sql), (fn.name, sql)
     assert seen == set(_RESOLVE_FENCED)
 
 
@@ -199,6 +208,7 @@ def test_guard_polarity_is_pinned() -> None:
     assert "status" not in _EPOCH_GUARD_CLAIM and "status" not in _EPOCH_GUARD_RESOLVE
     assert _EPOCH_GUARD_CLAIM.count("?") == 2
     assert _EPOCH_GUARD_RESOLVE.count("?") == 3
+    assert _RESOLVE_OUTPUT == " OUTPUT inserted.id"
 
 
 def test_extracting_the_claim_guard_changed_no_emitted_sql() -> None:
@@ -226,18 +236,23 @@ _SELECT_ROW: dict[str, tuple[Any, ...]] = {
 }
 
 
-class _NoRowcount(AssertionError):
+class _NoRead(AssertionError):
     pass
 
 
 class _Cursor:
-    """Records every statement. ``rowcount`` answers for the last one: ``update_rowcount`` after a
-    queue status UPDATE, and it RAISES when ``read_forbidden`` is set, which is how a test proves the
-    unfenced path never reads it."""
+    """Records every statement, and models a pooled connection under ``SET NOCOUNT ON``.
 
-    def __init__(self, *, update_rowcount: int = 1, read_forbidden: bool = False) -> None:
+    ``rowcount`` is always ``-1``, which is what the hosted SQL Server legs showed a guarded UPDATE
+    reporting there, so a fence that trusts ``rowcount`` never fires against this cursor. The truth
+    is the OUTPUT rowset: after a queue status UPDATE ``fetchall`` returns ``matched`` rows. It RAISES
+    when ``read_forbidden`` is set, which is how a test proves the unfenced path reads nothing."""
+
+    rowcount = -1
+
+    def __init__(self, *, matched: int = 1, read_forbidden: bool = False) -> None:
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
-        self.update_rowcount = update_rowcount
+        self.matched = matched
         self.read_forbidden = read_forbidden
         self._last = ""
 
@@ -245,11 +260,12 @@ class _Cursor:
         self.calls.append((sql, tuple(params)))
         self._last = sql
 
-    @property
-    def rowcount(self) -> int:
+    async def fetchall(self) -> list[Any]:
+        if not self._last.startswith("UPDATE queue SET status"):
+            return []
         if self.read_forbidden:
-            raise _NoRowcount(f"rowcount read after {self._last!r}")
-        return self.update_rowcount if self._last.startswith("UPDATE queue SET status") else 1
+            raise _NoRead(f"result read after {self._last!r}")
+        return [("row",)] * self.matched
 
     async def fetchone(self) -> Any:
         for prefix, row in _SELECT_ROW.items():
@@ -309,16 +325,21 @@ def _updates(cur: _Cursor) -> list[tuple[str, tuple[Any, ...]]]:
 async def test_a_rejected_mark_done_rolls_back_repends_and_counts_once() -> None:
     """C3 + D1. Mutation that must break it: drop ``checked=bool(guard)`` to ``False`` in mark_done,
     and the zero-row write commits as if it landed."""
-    cur, conn = _Cursor(update_rowcount=0), _Conn()
+    cur, conn = _Cursor(matched=0), _Conn()
     store, released = _store(cur, conn, epoch=5)
 
-    assert await store.mark_done("row-1", now=1.0) is None  # a fenced write is NOT an exception
+    await store.mark_done("row-1", now=1.0)  # returns normally: a fenced write is NOT an exception
 
     assert conn.commits == 0 and conn.rollbacks == 1
     assert released == [["row-1"]]
     assert store.fenced_writes == 1
     sql, params = _updates(cur)[0]
-    assert sql.endswith(_EPOCH_GUARD_RESOLVE)
+    assert sql == (
+        "UPDATE queue SET status=?, last_error=NULL, updated_at=?"
+        + _RESOLVE_OUTPUT
+        + " WHERE id=?"
+        + _EPOCH_GUARD_RESOLVE
+    )
     assert params[-3:] == (_LEASE_KEY, 5, 5)
     assert cur.calls[-1][0] == sql  # nothing ran after the rejected UPDATE
 
@@ -326,7 +347,7 @@ async def test_a_rejected_mark_done_rolls_back_repends_and_counts_once() -> None
 async def test_a_landing_mark_done_under_an_armed_epoch_commits() -> None:
     """The negative twin: the true leader's write lands. Either test alone passes an always-on or an
     always-off fence; the pair does not."""
-    cur, conn = _Cursor(update_rowcount=1), _Conn()
+    cur, conn = _Cursor(matched=1), _Conn()
     store, released = _store(cur, conn, epoch=5)
 
     await store.mark_done("row-1", now=1.0)
@@ -335,20 +356,23 @@ async def test_a_landing_mark_done_under_an_armed_epoch_commits() -> None:
     assert released == [] and store.fenced_writes == 0
 
 
-async def test_an_unknown_rowcount_lets_the_write_stand() -> None:
-    """Only an exact 0 is a rejection. The DB-API ``-1`` means "not reported", and treating it as a
-    rejection would re-pend every delivered row: fail open."""
-    cur, conn = _Cursor(update_rowcount=-1), _Conn()
+async def test_the_fence_fires_even_though_rowcount_reports_nothing() -> None:
+    """The CI finding this file now pins. Under ``SET NOCOUNT ON``, which the finalize applock leaves
+    on every pooled connection, a guarded UPDATE reported a row count that was not 0 while matching
+    no rows. The first build read ``rowcount``, so every fenced write would have landed in
+    production. This cursor's ``rowcount`` is always ``-1``; the fence must fire from the OUTPUT
+    rowset alone. Mutation: read ``cur.rowcount == 0`` instead and this fails."""
+    cur, conn = _Cursor(matched=0), _Conn()
     store, released = _store(cur, conn, epoch=5)
 
     await store.mark_done("row-1", now=1.0)
 
-    assert conn.commits == 1 and released == [] and store.fenced_writes == 0
+    assert store.fenced_writes == 1 and released == [["row-1"]] and conn.commits == 0
 
 
-async def test_unfenced_terminal_sql_is_character_identical_and_never_reads_the_rowcount() -> None:
+async def test_unfenced_terminal_sql_is_character_identical_and_reads_no_result() -> None:
     """The single-node parity anchor. With no epoch armed the statement and params are exactly
-    pre-Inc-3, and the rowcount is not consulted at all."""
+    pre-Inc-3, with no OUTPUT clause, and no result is read at all."""
     cur, conn = _Cursor(read_forbidden=True), _Conn()
     store, _ = _store(cur, conn, epoch=None)
 
@@ -365,8 +389,8 @@ async def test_unfenced_terminal_sql_is_character_identical_and_never_reads_the_
 
 async def test_mark_failed_fences_the_dead_branch_and_leaves_the_retry_branch_unguarded() -> None:
     """C1's split. The seeded row has 3 attempts. ``max_attempts=1`` takes the DEAD branch, which is
-    fenced; retry-forever takes the PENDING branch, whose rowcount must never be read."""
-    cur, conn = _Cursor(update_rowcount=0), _Conn()
+    fenced; retry-forever takes the PENDING branch, whose result must never be read."""
+    cur, conn = _Cursor(matched=0), _Conn()
     store, released = _store(cur, conn, epoch=5)
     assert await store.mark_failed("row-1", "boom", RetryPolicy(max_attempts=1), now=1.0) is None
     assert released == [["row-1"]] and store.fenced_writes == 1 and conn.commits == 0
@@ -376,7 +400,7 @@ async def test_mark_failed_fences_the_dead_branch_and_leaves_the_retry_branch_un
     next_at = await store2.mark_failed("row-2", "x", RetryPolicy(max_attempts=None), now=1.0)
     assert isinstance(next_at, float)
     (sql, params), *_ = _updates(cur2)
-    assert "leader_lease" not in sql and _LEASE_KEY not in params
+    assert "leader_lease" not in sql and "OUTPUT" not in sql and _LEASE_KEY not in params
     assert released2 == [] and store2.fenced_writes == 0 and conn2.commits == 1
 
 
@@ -389,7 +413,7 @@ async def test_a_rejected_batch_repends_every_member_including_those_never_walke
         ("dead_letter_batch", ("boom",)),
         ("mark_batch_failed", ("boom", RetryPolicy(max_attempts=1))),
     ):
-        cur, conn = _Cursor(update_rowcount=0), _Conn()
+        cur, conn = _Cursor(matched=0), _Conn()
         store, released = _store(cur, conn, epoch=5)
         await getattr(store, method)(["a", "b", "c"], *args, now=1.0)
         assert released == [["a", "b", "c"]], method
@@ -426,7 +450,7 @@ async def test_every_single_row_resolve_is_fenced_and_returns_its_no_op_value() 
         ),
     }
     for method, (args, kwargs, no_op) in expected.items():
-        cur, conn = _Cursor(update_rowcount=0), _Conn()
+        cur, conn = _Cursor(matched=0), _Conn()
         store, released = _store(cur, conn, epoch=5)
         assert await getattr(store, method)(*args, now=1.0, **kwargs) is no_op, method
         assert released == [["row-1"]] and store.fenced_writes == 1, method
@@ -436,7 +460,7 @@ async def test_every_single_row_resolve_is_fenced_and_returns_its_no_op_value() 
 async def test_a_failed_repend_is_logged_and_never_raises(caplog: pytest.LogCaptureFixture) -> None:
     """D1 is best-effort. If it raises, the row stays INFLIGHT for the next promotion's
     ``reset_stale_inflight``, and the caller still sees the ordinary no-op."""
-    cur, conn = _Cursor(update_rowcount=0), _Conn()
+    cur, conn = _Cursor(matched=0), _Conn()
     store, _ = _store(cur, conn, epoch=5)
 
     async def boom(ids: Any, now: float | None = None) -> None:
@@ -465,9 +489,6 @@ async def test_the_fence_scope_swallows_only_its_own_sentinel() -> None:
 
 class _ClaimCursor(_Cursor):
     description: list[tuple[str]] = []
-
-    async def fetchall(self) -> list[Any]:
-        return []
 
 
 _PRE_INC3_CLAIM_READY = (

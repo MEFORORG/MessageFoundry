@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -224,7 +225,11 @@ async def test_fenced_ingress_handoff_dead_branch_repends_the_work_row(store: An
     rejection returns False and re-pends the token instead of consuming it."""
     mid = await _enqueue(store)
     claimed = await _claim_one(store)
-    await store.complete_with_response(claimed.id, body="ACK", outcome="ok", reingress_to="LOOP")
+    # now= is explicit: the work row is due at the write's `now`, and the claim below runs on the
+    # same fixed test clock. Left to default, `now` is wall-clock time and the row is never due.
+    await store.complete_with_response(
+        claimed.id, body="ACK", outcome="ok", reingress_to="LOOP", now=205.0
+    )
     token = await store.claim_next_fifo("LOOP", now=210.0, stage=Stage.RESPONSE.value)
     assert token is not None
     await _superseded(store)
@@ -304,37 +309,56 @@ async def test_fenced_batch_is_all_or_nothing_and_repends_every_member(store: An
     assert store.fenced_writes == 1  # once per CALL, not once per member
 
 
-async def test_the_rowcount_survives_nocount_on(store: Any) -> None:
-    """The fence reads ``cursor.rowcount``, and ``SET NOCOUNT ON`` is a session setting that the
-    finalize applock leaves on a pooled connection. Pin that SQLRowCount is still populated under it,
-    on one connection, so the premise does not depend on which pooled connection a test happens to
-    borrow. A ``-1`` here would make every fenced write land."""
-    from messagefoundry.store.sqlserver import _EPOCH_GUARD_RESOLVE, _FencedWrite
+def _force_nocount(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run ``SET NOCOUNT ON`` on every cursor this store opens.
 
+    That is the production state, not a contrived one: the finalize applock opens with
+    ``SET NOCOUNT ON``, the setting is session-scoped, and a pooled connection keeps it. A fresh
+    test store has not run a finalize yet, so without this a fence test can pass against a row count
+    that production never sees. It did: the first Inc 3 build read ``cursor.rowcount``, every other
+    test here passed, and under NOCOUNT the fence never fired."""
+    real_cursor = store._cursor
+
+    @asynccontextmanager
+    async def nocount_cursor(conn: Any) -> AsyncIterator[Any]:
+        async with real_cursor(conn) as cur:
+            await cur.execute("SET NOCOUNT ON;")
+            yield cur
+
+    monkeypatch.setattr(store, "_cursor", nocount_cursor)
+
+
+async def test_the_fence_fires_under_nocount_on(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production-shaped fence test. Mutation: read ``cur.rowcount == 0`` in ``_exec_terminal``
+    instead of the OUTPUT rowset, and the fenced half fails (the write lands DONE)."""
+    _force_nocount(store, monkeypatch)
     mid = await _enqueue(store)
     claimed = await _claim_one(store)
     await _superseded(store)
-    sql = "UPDATE queue SET updated_at=? WHERE id=?" + _EPOCH_GUARD_RESOLVE
-    async with store._acquire() as conn, store._cursor(conn) as cur:
-        try:
-            await cur.execute("SET NOCOUNT ON;")
-            with pytest.raises(_FencedWrite):  # held 5, lease at 6: zero rows
-                await store._exec_terminal(
-                    cur,
-                    "probe",
-                    (claimed.id,),
-                    sql,
-                    (1.0, claimed.id, _LEASE_KEY, 5, 5),
-                    checked=True,
-                )
-            await store._exec_terminal(  # held 6: one row, must not raise
-                cur, "probe", (claimed.id,), sql, (1.0, claimed.id, _LEASE_KEY, 6, 6), checked=True
-            )
-            assert cur.rowcount == 1
-        finally:
-            await conn.rollback()
-            await cur.execute("SET NOCOUNT OFF;")
-            await conn.commit()
+
+    await store.mark_done(claimed.id)
+
+    assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.PENDING.value
+    assert await _ledger_count(store, claimed.id) == 0
+    assert store.fenced_writes == 1
+
+
+async def test_a_current_leaders_write_lands_under_nocount_on(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative twin under NOCOUNT: the OUTPUT rowset must report the matched row, or the true
+    leader's every write would be re-pended."""
+    _force_nocount(store, monkeypatch)
+    mid = await _enqueue(store)
+    claimed = await _claim_one(store)
+
+    await store.mark_done(claimed.id)
+
+    assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
+    assert await _ledger_count(store, claimed.id) == 1
+    assert store.fenced_writes == 0
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.INFLIGHT.value
 
 
@@ -416,7 +440,9 @@ async def test_a_failed_repend_is_collected_by_the_successors_promotion_reset(
     successor = await _open()
     try:
         successor.set_leader_epoch(6, lease_key=_LEASE_KEY)
-        assert await successor.reset_stale_inflight() >= 1  # what promotion runs on SQL Server
+        # What promotion runs on SQL Server. now= is explicit because the reset stamps
+        # next_attempt_at=now, and the claim below runs on the fixed test clock.
+        assert await successor.reset_stale_inflight(now=250.0) >= 1
         taken = await successor.claim_next_fifo("OB1", now=300.0)
         assert taken is not None
         await successor.mark_done(taken.id)

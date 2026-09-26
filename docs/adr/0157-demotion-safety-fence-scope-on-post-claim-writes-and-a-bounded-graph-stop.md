@@ -619,10 +619,23 @@ mid-flight.
 1. **`ISNULL`, not `COALESCE`.** SQL Server expands `COALESCE(subquery, x)` into a `CASE` that runs the
    subquery twice. An epoch bump committed between the two reads could give the two halves different
    answers. `ISNULL` runs it once and keeps its `BIGINT` type.
-2. **A rejection is read from `cursor.rowcount`,** where Postgres parses the command tag. Only an
-   exact 0 rejects. The DB-API's `-1`, meaning "not reported", lets the write stand, which is the
-   fail-open direction. The finalize applock leaves `SET NOCOUNT ON` on pooled connections, so a gated
-   test pins that the row count still arrives under it.
+2. **A rejection is read from an `OUTPUT inserted.id` rowset,** where Postgres parses the command
+   tag. A fenced UPDATE carries the OUTPUT clause, and an empty rowset is the rejection. The unfenced
+   UPDATE carries no OUTPUT and reads nothing, so it stays character-identical.
+
+   > **Corrected 2026-09-26, on PR 1576's first CI run.** The first build read `cursor.rowcount`, and
+   > this item said a gated test pinned that the count arrives under `SET NOCOUNT ON`. **That was
+   > false, and the test that said so failed** on both SQL Server legs (jobs 108370811011 and
+   > 108370810994). Under NOCOUNT a guarded UPDATE that matched no row did not report 0, so the fence
+   > did not fire. This matters in production. The finalize applock opens with `SET NOCOUNT ON`, the
+   > setting is session-scoped, and a pooled connection keeps it, so almost every resolve runs under
+   > it. The other gated fence tests passed only because each opens a fresh store whose connections
+   > had not yet run a finalize. As first built, **the resolve fence would have been inert on almost
+   > every write of a real deployment**, with every test green. The claim guards were never affected,
+   > because they read the claimed rows, not a count. The exact value reported is not recorded: the
+   > failing assertion shows only that it was not 0. The fix reads the OUTPUT rowset, which SQL Server
+   > returns whatever NOCOUNT says, as the claim paths already do. Two gated tests now force
+   > `SET NOCOUNT ON` on every cursor and check both directions.
 3. **The claim guard became one constant.** The three FIFO claims carried it as an inline literal. It
    is now `_EPOCH_GUARD_CLAIM`, byte-identical, and a test pins that.
 
@@ -641,12 +654,14 @@ rows a stopped worker leaves behind.
 
 **Tests.** `tests/test_adr0157_sqlserver_fence_offline.py` has 17 tests and is not gated, so it runs
 on every leg. It holds the structural gate over every `queue` status write in `store/sqlserver.py`,
-the twin of `tests/test_adr0157_fence_scope.py`, and behaviour tests against fake cursors. Eleven
-mutations were each confirmed red against it, one per guard, check, sentinel catch, D1 call and
-batch loop.
-`tests/test_adr0157_sqlserver_fence.py` has 15 tests and needs a real server. It runs only on the
+the twin of `tests/test_adr0157_fence_scope.py`, and behaviour tests against fake cursors. Its fake
+cursor reports a row count of `-1` on every statement, as under NOCOUNT, so a fence that trusts
+`rowcount` fails there. Eleven mutations were confirmed red against the first build. After the
+correction above, seven more were confirmed red against the OUTPUT mechanism, including a return to
+reading `rowcount`.
+`tests/test_adr0157_sqlserver_fence.py` has 16 tests and needs a real server. It runs only on the
 hosted `sqlserver-store` legs, in the catch-all step of `.github/workflows/ci.yml`. It mirrors the
-Postgres runtime tests and adds the row-count pin and both recovery-closure paths above.
+Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure paths above.
 
 **What this still does not close.**
 
@@ -658,6 +673,10 @@ Postgres runtime tests and adds the row-count pin and both recovery-closure path
 - A cancel that commits a `claim_fifo_heads` claim leaves the row for the next start or promotion, as
   above.
 - A laptop run proves nothing about the T-SQL. The runtime tests skip without a server.
+- Other store methods still read `cursor.rowcount` on pooled connections that may have NOCOUNT ON:
+  `reset_stale_inflight`'s recovered count, `_execute`'s return value, the purge counts and others.
+  None of them gates a write the way the fence does, but their counts may be wrong on a reused
+  connection. Recorded, not examined here.
 - **Flagged for a decision, not built.** C1 leaves `mark_failed`'s retry branch unguarded, and on SQL
   Server it has no `status='inflight'` conjunct either. So a stalled ex-leader whose send then fails
   can re-pend a row the successor already finished as DONE, and the row is sent again. That is a
