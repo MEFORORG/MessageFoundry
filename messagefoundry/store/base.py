@@ -1109,6 +1109,8 @@ class QueueStore(StoreLifecycle, Protocol):
         """Append one **metadata-only** connection event to the ``connection_event`` log (#46): the
         inbound lifecycle (``established``/``closed``) + the pre-ingress failures
         (``peer_not_allowlisted``/``at_capacity``/``frame_oversize``/``peer_reset``/``framing_error``)
+        + the poll sources' rejects (``row_undecodable``; the FILE source's ``file_oversize``/
+        ``file_decompress_failed``/``file_content_mismatch``/``file_scan_rejected``, #1621)
         + the outbound lane transitions (``connection_lost``/``connection_restored``).
 
         It is a **pure observer**: a single short INSERT in its own transaction, touching no ``queue``

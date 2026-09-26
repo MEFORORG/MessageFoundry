@@ -675,13 +675,18 @@ class FileSource(SourceConnector):
             if self.max_file_bytes is not None and before[0] > self.max_file_bytes:
                 # Transport-level reject *before* any message is read — parallels MLLP dropping an
                 # over-cap frame. It never became a "received message", so (like MLLP) there's no
-                # store disposition to record; preserve the file in .error for the operator and log it.
+                # store disposition to record; preserve the file in .error for the operator, log it,
+                # and record a connection event as MLLP does (#1621).
                 logger.warning(
                     "file %s exceeds max_file_bytes (%s); routing to error dir",
                     safe_name(path.name),
                     self.max_file_bytes,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
+                await self._emit_event(
+                    "file_oversize",
+                    reason=f"{before[0]} bytes exceeds max_file_bytes {self.max_file_bytes}",
+                )
                 disposed += 1
                 continue
             try:
@@ -722,6 +727,9 @@ class FileSource(SourceConnector):
                         safe_exc(exc, file_name=path.name),
                     )
                     await self._run_fs(self._move, path, self.error_dir)
+                    await self._emit_event(
+                        "file_decompress_failed", reason=safe_exc(exc, file_name=path.name)
+                    )
                     disposed += 1
                     continue
             if not _content_matches_declared(self.content_type, raw):
@@ -735,13 +743,18 @@ class FileSource(SourceConnector):
                 # its magic bytes and flows on to the content_type-aware pipeline (carried NUL-safely via
                 # RawMessage.from_bytes / mfb64, ADR 0028). Only a genuine content-vs-type mismatch is
                 # newly quarantined (the 5.2.2 hardening over the prior hl7v2-only sniff).
+                declared = (self.content_type or ContentType.HL7V2).value
                 logger.warning(
                     "file %s does not match its declared content type %r (no matching magic bytes); "
                     "routing to error dir",
                     safe_name(path.name),
-                    (self.content_type or ContentType.HL7V2).value,
+                    declared,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
+                await self._emit_event(
+                    "file_content_mismatch",
+                    reason=f"does not match declared content type {declared}",
+                )
                 disposed += 1
                 continue
             try:
@@ -759,6 +772,9 @@ class FileSource(SourceConnector):
                     safe_exc(exc, file_name=path.name),
                 )
                 await self._run_fs(self._move, path, self.error_dir)
+                await self._emit_event(
+                    "file_scan_rejected", reason=safe_exc(exc, file_name=path.name)
+                )
                 disposed += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
@@ -820,6 +836,26 @@ class FileSource(SourceConnector):
             # Bound the ledger's growth (age + count); only when this tick recorded something, so a stable
             # read-only share (nothing new) never churns the store.
             await self.processed_ledger.prune()
+
+    async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
+        """Record a quarantine in the connection-event log (BACKLOG #1621), **fail-soft**.
+
+        A quarantined file never became a received message, so there is no disposition to record; it
+        was preserved in ``.error`` and logged. What was missing is a STORE record an operator watching
+        the console can see, which the MLLP over-cap arm has always written (``frame_oversize``). The
+        reason carries a size, a content type or a scrubbed codec or scanner message, and never the
+        file name, which a partner may build from an MRN.
+
+        An emit problem must never wedge the poll loop (pure observer). A no-op when the runner has not
+        injected the sink. No ``peer_host``: a directory has no peer, so the column stays ``NULL``,
+        as for the DATABASE poll source."""
+        sink = self.on_connection_event
+        if sink is None:
+            return
+        try:
+            await sink(kind, None, reason)
+        except Exception as exc:  # noqa: BLE001 - observer only; a capture bug can't stop ingest
+            logger.warning("file source connection-event emit failed: %s", safe_exc(exc))
 
     def _at_ceiling(self, disposed: int, remaining: int) -> bool:
         """True when this scan has spent its per-tick budget (``poll_max_files``) and must stop, leaving
