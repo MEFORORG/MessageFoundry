@@ -555,9 +555,10 @@ def ensure_api_tls_material(
     ``CA=false``). Anything else at the generated path is served as found and never replaced.
     Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because ``serve``
     hands it the path this function RETURNS, and it stays the alarm for an engine never restarted.
-    **A failed renewal never costs a start the old pair can still serve**: any ``OSError`` on the
-    locked path -- including a lock it could not take -- falls back to that pair with a WARNING,
-    and only a pair that does not load or has expired lets the error propagate.
+    **A file or lock failure never costs a start the old pair can still serve**: any ``OSError`` on
+    the locked path -- including a lock it could not take -- falls back to that pair with a WARNING,
+    and only a pair that does not load or has expired lets the error propagate. Other errors, such
+    as a ``[api].host`` the certificate builder refuses, still stop the start.
 
     **EVERY REPLACEMENT IS REPORTED, never silent (ADR 0172 decision 6).** A renewal, and the
     recovery of an unusable or half-written pair, each append one :class:`GeneratedPairReplaced` to
@@ -614,11 +615,13 @@ def ensure_api_tls_material(
         # nothing to fall back on, so then the error propagates.
         if not _still_serves(cert_path, key_path):
             raise
+        current = _cert_facts(cert_path)
         log.warning(
-            "could not renew the generated TLS pair at %s (%s); the current certificate still "
-            "serves, and the next start tries again.",
+            "could not check or renew the generated TLS pair at %s (%s); serving the current "
+            "certificate, which expires %s, and the next start tries again.",
             cert_path,
             exc,
+            "at an unknown date" if current is None else current.not_after_iso,
         )
     return str(cert_path), str(key_path)
 

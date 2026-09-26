@@ -177,10 +177,10 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
 5. **How it replaces.** The new key is staged under a temporary name with `_write_private_key`
    (`O_EXCL`, `0o600`, Windows DACL), and the new certificate beside it with the local-users read
    grant the tray needs. The certificate is then moved over the live name first, and the key second.
-   Any failure that leaves an old pair which still loads and has not expired keeps that pair, and
-   the next start tries again. That includes a failed first move, a state directory the engine can
-   read but not write, and a lock it could not take. An expired or unloadable pair has nothing to
-   fall back on, so the start fails. A crash between the two moves leaves a new certificate beside
+   A file-system or lock failure (an `OSError`) that leaves an old pair which still loads and has
+   not expired keeps that pair, and the next start tries again. That includes a failed first move,
+   a state directory the engine can read but not write, and a lock it could not take. An expired or
+   unloadable pair has nothing to fall back on, so the start fails, as does any other error. A crash between the two moves leaves a new certificate beside
    the old key. That pair does not load, so the next start discards it, mints a fresh one, and
    reports it as an unusable pair. That row's old fingerprint is the half-installed certificate,
    not the one clients trusted, whose fingerprint only the earlier WARNING line carries.

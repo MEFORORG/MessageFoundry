@@ -3362,7 +3362,7 @@ def test_a_renewal_that_fails_before_any_replace_keeps_a_still_valid_pair(
             assert ensure_api_tls_material(
                 ApiSettings(), state_dir=tmp_path, replacements=events
             ) == (str(cert), str(key))
-            assert "could not renew" in caplog.text
+            assert "could not check or renew" in caplog.text
         else:
             with pytest.raises(PermissionError):
                 ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
@@ -3411,7 +3411,11 @@ def test_what_the_engine_mints_is_what_it_would_renew() -> None:
 
 @pytest.mark.parametrize(("left", "keeps_old"), [(65, True), (-5, False)])
 def test_a_lock_the_start_cannot_take_keeps_a_still_valid_pair(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, left: int, keeps_old: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    left: int,
+    keeps_old: bool,
 ) -> None:
     """A due pair can no longer be reused without the lock, so a lock the start cannot take -- a
     read-only state dir, a hung holder -- must not stop a start the old pair can still serve. An
@@ -3426,14 +3430,16 @@ def test_a_lock_the_start_cannot_take_keeps_a_still_valid_pair(
 
     monkeypatch.setattr(tls, "_generated_pair_lock", unavailable)
     events: list[GeneratedPairReplaced] = []
-    if keeps_old:
-        assert ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events) == (
-            str(cert),
-            str(key),
-        )
-    else:
-        with pytest.raises(TimeoutError):
-            ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        if keeps_old:
+            assert ensure_api_tls_material(
+                ApiSettings(), state_dir=tmp_path, replacements=events
+            ) == (str(cert), str(key))
+            assert "could not check or renew" in caplog.text
+            assert "expires 20" in caplog.text  # the deadline is named, not only the failure
+        else:
+            with pytest.raises(TimeoutError):
+                ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
     assert _snapshot(cert, key) == before
     assert events == []
 
