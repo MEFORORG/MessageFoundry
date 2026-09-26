@@ -479,6 +479,20 @@ def test_los_date_only_pair_across_dst_stays_whole_days_with_or_without_zone() -
     assert length_of_stay("20261031", "20261102", zone=EASTERN).days == 2
 
 
+def test_los_calendar_rule_needs_both_stamps_date_only_and_offset_free() -> None:
+    """Pins the edge of the calendar rule, so widening it fails a test. A date-only stamp paired with
+    anything else is read as midnight in the zone and measured as elapsed time."""
+    assert length_of_stay("20260308", "2026030803", zone=EASTERN) == timedelta(hours=2)
+    assert length_of_stay("20260307", "2026030900", zone=EASTERN) == timedelta(days=1, hours=23)
+    assert length_of_stay("20260307-0500", "20260309", zone=EASTERN) == timedelta(days=1, hours=23)
+
+
+def test_los_mixed_date_only_pair_without_zone_is_refused() -> None:
+    # No time of day on either side, but only one offset: still refused without a zone.
+    with pytest.raises(ValueError, match="both"):
+        length_of_stay("20260307-0500", "20260309")
+
+
 def test_los_offset_pair_accounts_for_zone_difference() -> None:
     # Same wall-clock 12:00, but admit is +0000 and discharge -0500 -> 5h later actual.
     los = length_of_stay("20260101120000+0000", "20260101120000-0500")

@@ -39,9 +39,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   wrong, with no error: 48 hours for a 47-hour stay across the March change, 48 for a 49-hour stay
   across the November one. `length_of_stay` and `Message.length_of_stay` now take an optional
   `zone`, an IANA name such as `America/Chicago`. They read each offset-free stamp in that zone and
-  subtract in UTC. With no `zone`, a pair is refused with `ValueError` when either stamp has a time
-  of day and either lacks an offset. A pair of date-only stamps still needs no zone and stays a whole
-  number of days. A stamp on a daylight-saving edge of the zone is refused as `convert_hl7_timestamp`
+  subtract in UTC. With no `zone`, they refuse with `ValueError` a pair where only one stamp has an
+  offset, and a pair with no offsets where either stamp has a time of day. A pair of date-only stamps
+  with no offsets still needs no zone and stays a whole number of days. A stamp on a daylight-saving edge of the zone is refused as `convert_hl7_timestamp`
   refuses it, unless `on_dst_edge` names a resolution. (`BACKLOG #1770`)
 - **BREAKING — the engine no longer creates an account on its own.** A `serve` on a store with no
   users used to create an enabled Administrator named `admin` and write its one-time password to

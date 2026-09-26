@@ -9,6 +9,7 @@ All data here is synthetic (fabricated names + dates), never PHI.
 from __future__ import annotations
 
 from datetime import timedelta
+from zoneinfo import ZoneInfoNotFoundError
 
 import pytest
 
@@ -70,6 +71,15 @@ def test_length_of_stay_zone_measures_elapsed_time_across_dst() -> None:
         MSH + "PID|1||100^^^H^MR||DOE^JANE||19800110\r" + _pv1("202603071200", "202603091200")
     )
     assert m.length_of_stay(zone=EASTERN) == timedelta(hours=47)
+
+
+def test_length_of_stay_checks_zone_and_policy_even_for_an_open_encounter() -> None:
+    # A misspelt zone must fail on the first message, not wait for the first discharge.
+    m = Message.parse(MSH + "PID|1||100^^^H^MR||DOE^JANE||19800110\r" + _pv1("20260101080000", ""))
+    with pytest.raises(ZoneInfoNotFoundError):
+        m.length_of_stay(zone="America/Chicgo")
+    with pytest.raises(ValueError, match="on_dst_edge"):
+        m.length_of_stay(zone=EASTERN, on_dst_edge="nearest")  # type: ignore[arg-type]
 
 
 def test_length_of_stay_date_only_pair_needs_no_zone() -> None:

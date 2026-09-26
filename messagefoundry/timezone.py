@@ -500,12 +500,15 @@ def length_of_stay(
     - A stamp without one is read as a wall clock in ``zone`` (an IANA name such as
       ``"America/Chicago"``). Both instants are converted to UTC before subtracting, so the result is
       true elapsed time.
-    - With no ``zone``, a pair in which either stamp lacks an offset and **either** stamp has a time
-      of day is refused. That includes a mixed pair, where one stamp has an offset and one does not.
+    - With no ``zone``, two kinds of pair are refused. One is a mixed pair, where one stamp has an
+      offset and the other does not, at any precision. The other is a pair with no offset on either
+      side where **either** stamp has a time of day.
     - A pair of offset-free **date-only** stamps (``YYYYMMDD`` or coarser) is always allowed, and is
       the calendar difference whether or not ``zone`` is given. It has no hour to be wrong, and reading
       its two midnights through a zone would turn a two-day stay across spring-forward into one day
-      23 hours, so ``.days`` would lose a day.
+      23 hours, so ``.days`` would lose a day. This rule needs **both** stamps date-only and
+      offset-free. A date-only stamp paired with anything else is read as midnight in ``zone``, so
+      ``("20260307", "2026030900")`` in ``America/New_York`` is 1 day 23 hours.
 
     Args:
         admit_ts: the admit HL7 timestamp (conventionally PV1-44).
@@ -514,7 +517,11 @@ def length_of_stay(
             its own offset.
         on_dst_edge: what to do when an offset-free stamp falls on a daylight-saving edge of ``zone``
             (a wall time that happens twice, or never). ``"raise"`` (the default) refuses; see
-            :func:`convert_hl7_timestamp` for ``"earlier"``/``"later"``.
+            :func:`convert_hl7_timestamp` for ``"earlier"``/``"later"``. One policy governs **both**
+            stamps. So a stay whose admit and discharge both fall in the repeated fall-back hour, with
+            the admit in the first pass and the discharge in the second, cannot be expressed: it is
+            measured as if both were in one pass, or refused as a negative stay. Supply the sender's
+            offsets for such a stay.
 
     Raises:
         AmbiguousLocalTimeError: an offset-free stamp with a time of day occurs twice in ``zone`` and
@@ -528,11 +535,7 @@ def length_of_stay(
         zoneinfo.ZoneInfoNotFoundError: ``zone`` is unknown (on Windows, also if ``tzdata`` is
             missing).
     """
-    if on_dst_edge not in _DST_EDGE_POLICIES:
-        raise ValueError(f"on_dst_edge must be one of {_DST_EDGE_POLICIES}, got {on_dst_edge!r}")
-    if zone is not None:
-        # Fail on a misspelt zone now, not only on the first offset-free stamp that needs it.
-        ZoneInfo(zone)
+    _check_los_options(zone, on_dst_edge)
     admit_naive, admit_prec, admit_off = _parse_hl7_timestamp(admit_ts)
     discharge_naive, discharge_prec, discharge_off = _parse_hl7_timestamp(discharge_ts)
 
@@ -576,6 +579,18 @@ def length_of_stay(
             "(negative length of stay)"
         )
     return delta
+
+
+def _check_los_options(zone: str | None, on_dst_edge: DstEdgePolicy) -> None:
+    """Refuse a bad ``on_dst_edge`` or an unknown ``zone`` before any stamp is read.
+
+    Shared with :meth:`Message.length_of_stay`, which calls it before its open-encounter ``None``
+    return, so a misspelt zone fails on the first message rather than the first discharge.
+    """
+    if on_dst_edge not in _DST_EDGE_POLICIES:
+        raise ValueError(f"on_dst_edge must be one of {_DST_EDGE_POLICIES}, got {on_dst_edge!r}")
+    if zone is not None:
+        ZoneInfo(zone)
 
 
 def _instant_utc(
