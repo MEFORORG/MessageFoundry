@@ -600,7 +600,7 @@ def test_a_permanently_failing_poll_backs_its_traceback_logging_off(
     """One traceback per tick is what collapses the rotation window, so emissions back off.
 
     The arithmetic -- cadence, log size, how long the window survives unthrottled -- is on
-    `_FailureRun`, where the policy lives.
+    `messagefoundry.log_backoff.FailureRun`, where the policy lives.
     """
     caplog.set_level(logging.ERROR, logger=_POLLER_LOGGER)
 
@@ -648,7 +648,8 @@ def test_a_recovered_poll_records_how_long_it_was_failing(
     fast_poll: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Why the recovery line exists is on `_FailureRun.clear`; this pins that it is emitted."""
+    """Why the recovery line exists is on `messagefoundry.log_backoff.FailureRun`; this pins that
+    it is emitted."""
     caplog.set_level(logging.INFO, logger=_POLLER_LOGGER)
 
     with _looping_poller(
