@@ -12,6 +12,7 @@ async ``send`` tests construct fresh state per test (shared-loop safe, BACKLOG #
 from __future__ import annotations
 
 import email.message
+import http.client
 import io
 import json
 import time
@@ -263,6 +264,30 @@ def test_token_http_error_is_secret_safe(rsa_pem: str) -> None:
         provider.access_token()
     assert "LEAKED-TOKEN" not in str(ei.value)
     assert "400" in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    ("opener", "match"),
+    [
+        (_FakeOpener(exc=http.client.BadStatusLine("garbage")), "malformed HTTP reply"),
+        (_FakeOpener(body=b"[" * 200_000), "unparseable"),
+        (
+            _FakeOpener(body=b'{"access_token":"TOK","expires_in":' + b"9" * 400 + b"}"),
+            "unparseable",
+        ),
+    ],
+    ids=["bad-status-line", "deep-nesting", "huge-expires-in"],
+)
+def test_token_mint_failures_keep_the_delivery_error_contract(
+    rsa_pem: str, opener: _FakeOpener, match: str
+) -> None:
+    # BACKLOG #1980: each of these once escaped access_token() as a non-DeliveryError, past every
+    # caller that maps the provider's documented DeliveryError.
+    provider = _provider(rsa_pem)
+    provider._opener = opener  # type: ignore[assignment]
+    with pytest.raises(DeliveryError, match=match) as err:
+        provider.access_token()
+    assert "garbage" not in str(err.value)
 
 
 def test_asvs_191_smart_oauth_controls_exercised(rsa_pem: str) -> None:

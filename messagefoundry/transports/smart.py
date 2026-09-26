@@ -34,6 +34,7 @@ authorization/resource server, JWKS hosting, ``.well-known`` discovery (the MVP 
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import secrets
@@ -363,6 +364,14 @@ class SmartBackendTokenProvider:
             raise DeliveryError(
                 f"SMART token endpoint {_redact_url(self.token_url)} failed: {exc}"
             ) from exc
+        except http.client.HTTPException as exc:
+            # A malformed status or header line (BadStatusLine, LineTooLong) is neither an OSError
+            # nor a URLError, so it once escaped this provider's DeliveryError contract (BACKLOG
+            # #1980). Named by class only: the exception text can echo the endpoint's own bytes.
+            raise DeliveryError(
+                f"SMART token endpoint {_redact_url(self.token_url)} sent a malformed HTTP reply "
+                f"({type(exc).__name__})"
+            ) from exc
         return self._parse_token_response(body)
 
     def _parse_token_response(self, body: str) -> tuple[str, float]:
@@ -373,13 +382,16 @@ class SmartBackendTokenProvider:
             token = payload["access_token"]
             if not isinstance(token, str) or not token:
                 raise ValueError("missing access_token")
-        except (ValueError, KeyError, TypeError) as exc:
+            expires_in = payload.get("expires_in", _FALLBACK_TOKEN_TTL)
+            ttl = float(expires_in) if isinstance(expires_in, (int, float)) else _FALLBACK_TOKEN_TTL
+        # RecursionError (a deeply nested body) and OverflowError (an integer expires_in too large
+        # for a float) are neither ValueError nor TypeError, and once escaped the provider's
+        # DeliveryError contract (BACKLOG #1980).
+        except (ValueError, KeyError, TypeError, RecursionError, OverflowError) as exc:
             raise DeliveryError(
                 f"SMART token endpoint {_redact_url(self.token_url)} returned an unparseable or "
                 "incomplete token response"
             ) from exc
-        expires_in = payload.get("expires_in", _FALLBACK_TOKEN_TTL)
-        ttl = float(expires_in) if isinstance(expires_in, (int, float)) else _FALLBACK_TOKEN_TTL
         return token, ttl
 
 

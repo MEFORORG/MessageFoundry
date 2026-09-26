@@ -706,6 +706,15 @@ _TOKEN_FAILURES: dict[str, tuple[Any, type[BaseException]]] = {
     "unreachable": (_FakeOpener(exc=urllib.error.URLError("connection refused")), DeliveryError),
     # The endpoint refuses the client: DeliveryError naming the status.
     "http-400": (_FakeOpener(exc=_http_error(400, b'{"error":"invalid_client"}')), DeliveryError),
+    # A malformed status line: http.client raises an HTTPException, which is not an OSError.
+    "bad-status-line": (_FakeOpener(exc=http.client.BadStatusLine("hello")), DeliveryError),
+    # A deeply nested body under the token cap: json.loads raises RecursionError.
+    "deep-nesting": (_FakeOpener(body=b"[" * 200_000), DeliveryError),
+    # An integer expires_in too large for a float: float() raises OverflowError.
+    "huge-expires-in": (
+        _FakeOpener(body=b'{"access_token":"not a token","expires_in":' + b"9" * 400 + b"}"),
+        DeliveryError,
+    ),
 }
 
 
@@ -747,7 +756,8 @@ def _assert_token_failure_is_a_lookup_error(
     assert "epic" in str(err.value)
     # Secret-safe: no reply body and no token-URL query reach the message. The redacted token
     # host and path may, as they do in every sibling mapping.
-    for secret in ("invalid_client", "not a token", "hello", "aaaa"):
+    # "eyJ" opens every compact JWT, so it would show a leaked client assertion.
+    for secret in ("invalid_client", "not a token", "hello", "aaaa", "eyJ"):
         assert secret not in str(err.value)
     # No FHIR request went out without its bearer.
     assert fhir_opener.requests == []

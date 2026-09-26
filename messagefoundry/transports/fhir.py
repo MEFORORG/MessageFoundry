@@ -877,12 +877,13 @@ def _resolve_read_url(
 def _mint_bearer(token: Any, prefix: str) -> str:
     """Mint the SMART bearer for a lookup, raising :class:`FhirLookupError` if the mint fails.
 
-    The mint runs before the GET's own ``try``, and the provider raises ``DeliveryError`` (a refused
-    token reply is an ``EgressReplyError``, a subclass) or, for an over-length configured token URL,
-    ``ValueError``. A Handler and the sandbox worker catch only the lookup error types, so an escaped
-    mint failure read as a Handler crash (BACKLOG #1980). The ``DeliveryError`` text names only the
-    redacted token host and path plus a status or reason, never the assertion or the reply body, so
-    it is echoed like the sibling mappings; the ``ValueError`` is summarised, not echoed."""
+    The mint runs before the GET's own ``try``. The provider raises ``DeliveryError`` for a failed
+    mint: a refused or unreachable endpoint, an unparseable reply, or a refused reply body (an
+    ``EgressReplyError``, which is a subclass). It raises ``ValueError`` when a configured value is
+    over the length limit. Neither is a lookup error, so a Handler that caught ``FhirLookupError``
+    missed it (BACKLOG #1980). The ``DeliveryError`` text names only the redacted token URL and a
+    status or reason. It never carries the client assertion or the reply body, so it is echoed like
+    the sibling mappings. The ``ValueError`` is summarised with a fixed message."""
     from messagefoundry.config.fhir_lookup import FhirLookupError
 
     try:
@@ -891,8 +892,8 @@ def _mint_bearer(token: Any, prefix: str) -> str:
         raise FhirLookupError(f"{prefix}: {exc}") from exc
     except ValueError as exc:
         raise FhirLookupError(
-            f"{prefix}: the SMART token request could not be built (a configured SMART value was "
-            "refused)"
+            f"{prefix}: the SMART token request could not be built (check smart_token_url and the "
+            "proxy credential)"
         ) from exc
     return bearer
 

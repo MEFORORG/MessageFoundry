@@ -110,14 +110,16 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Fixed
 - **A failed SMART token mint in `fhir_lookup` now raises `FhirLookupError`, not a raw
   `DeliveryError`.** A lookup mints its bearer before the GET, outside the handling that maps
-  every other lookup failure. So a token endpoint that was down, refused the client, sent a
-  garbled reply, or framed its reply ambiguously let the provider's `DeliveryError` escape. The
-  sandbox worker and a Handler catch only the lookup error types, so on a first deployment that
-  failure would have read as a Handler crash rather than a lookup failure. The mint now maps to
-  `FhirLookupError`, with the cause chained. The message names the redacted token host and the
-  status or reason, never the client assertion or the reply body. An over-length configured token
-  URL maps the same way, with a fixed message. The connection probe had the same gap and is fixed
-  too. (`BACKLOG #1980`)
+  every other lookup failure. So a token endpoint that was down, refused the client, or sent a bad
+  reply let the provider's own error escape. A Handler that catches `FhirLookupError`, as the lookup
+  contract says to, would have missed it. The mint now maps to `FhirLookupError`, with the cause
+  chained. The message names the redacted token URL and a status or reason. It never carries the
+  client assertion or the reply body. An over-length configured token URL maps the same way, with
+  a fixed message. The SMART provider also raised three errors outside its own `DeliveryError`
+  contract: a malformed status line, a deeply nested reply, and an `expires_in` too large for a
+  float. It now raises `DeliveryError` for each. So a FHIR or REST destination using SMART
+  would retry them as transient failures rather than treat them as internal errors. The lookup
+  executor's probe method has no caller yet and gets the same mapping. (`BACKLOG #1980`)
 - **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
   it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
   `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals
