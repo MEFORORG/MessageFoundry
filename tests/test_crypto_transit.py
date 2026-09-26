@@ -324,8 +324,8 @@ def test_an_aes128_data_key_is_refused_with_the_steps_that_fix_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``aes128-gcm96`` was a supported data-key type until owner ruling R4 of 2026-09-26 (BACKLOG
-    #2043). The refusal names the key, its type, the replacement and the knob, and says plainly that
-    a store already holding data under the old key has no in-release way across.
+    #2043). The refusal names the key, its type, the type to create and the knob, and warns that a
+    Vault rotate keeps the type.
 
     CONTROL: ``aes256-gcm96`` builds, in ``test_data_key_of_a_supported_aead_type_still_builds``.
     """
@@ -341,7 +341,6 @@ def test_an_aes128_data_key_is_refused_with_the_steps_that_fix_it(
     assert "'aes256-gcm96'" in message
     assert "MEFOR_STORE_TRANSIT_KEY" in message
     assert "rotating the key keeps its type" in message
-    assert "rotate-key" in message and "previous release" in message  # the stranded-data case
     assert transit.read_calls == [_KEY_NAME]  # refused on the metadata read, at startup
     assert transit.encrypts == 0  # nothing was encrypted under the withdrawn key
 
@@ -361,7 +360,7 @@ def test_an_aes128_dedicated_audit_key_is_refused_with_the_steps_that_fix_it(
     assert "'mefor-audit'" in message and "'aes128-gcm96'" in message
     assert "'aes256-gcm96'" in message
     assert "MEFOR_STORE_TRANSIT_AUDIT_KEY" in message
-    assert "audit chain" in message
+    assert "the audit-chain MAC" in message  # the use that refused, not the data key's
     assert transit.read_calls == [_KEY_NAME, "mefor-audit"]  # the data key was read, and passed
 
 

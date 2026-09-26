@@ -229,9 +229,8 @@ def test_an_aes128_kek_is_refused_with_the_steps_that_fix_it(
 ) -> None:
     """``aes128-gcm96`` was a supported KEK type until owner ruling R4 of 2026-09-26 (BACKLOG #2043).
 
-    An operator holding one followed our own earlier advice, so the refusal has to say what to do.
-    It names the key, its type, the replacement type and the knob, warns that a Vault rotate keeps
-    the type, and says how to carry the DEK across. The CONTROL is the ``aes256-gcm96`` case in
+    The refusal names the key, its type, the type to create and the knob, and warns that a Vault
+    rotate keeps the type. The CONTROL is the ``aes256-gcm96`` case in
     ``test_kek_of_a_supported_type_still_unwraps`` above: same fake, same wiring, and it unwraps.
     """
     withdrawn = "aes128-gcm96"
@@ -244,7 +243,8 @@ def test_an_aes128_kek_is_refused_with_the_steps_that_fix_it(
     assert "'aes256-gcm96'" in message  # the type to create instead
     assert "MEFOR_STORE_VAULT_TRANSIT_KEY" in message  # the knob to change
     assert "rotating the key keeps its type" in message  # the fix that does not work
-    assert "MEFOR_STORE_VAULT_WRAPPED_DEK" in message  # how the DEK crosses to the new key
+    supported = message.split("Supported types: ", 1)[1]
+    assert "aes256-gcm96" in supported and "aes128" not in supported
     assert KEY_A not in message  # and no key material rides the refusal
     # Refused BEFORE the unwrap: nothing was decrypted under the withdrawn key.
     assert transit.calls == []

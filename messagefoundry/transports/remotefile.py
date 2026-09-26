@@ -587,8 +587,9 @@ _APPROVED_SFTP_MACS = frozenset(
 #:
 #: MEASURED against paramiko 5.0.0 (the version ``constraints.lock`` pins), whose ``_preferred_ciphers``
 #: offers nine names. ONE is approved here: ``aes256-gcm@openssh.com``, an AEAD cipher -- it
-#: authenticates its own ciphertext, so the MAC allow-list above is not consulted for it. The eight
-#: left out, and why each:
+#: authenticates its own ciphertext. paramiko 5.0.0 still negotiates a MAC beside it, though, so a
+#: server must ALSO offer a name from the MAC allow-list above or the handshake fails on "no
+#: acceptable macs". The eight left out, and why each:
 #:   - ``aes128-cbc``, ``aes192-cbc``, ``aes256-cbc`` -- CBC. SSH's CBC mode is what the
 #:     chosen-ciphertext plaintext-recovery attack of CVE-2008-5161 targets, and CBC is also the half
 #:     of the composition that makes a plaintext MAC (above) dangerous.

@@ -1338,14 +1338,11 @@ def test_sftp_proposes_no_ctr_or_aes128_cipher(monkeypatch: pytest.MonkeyPatch) 
 
 
 def _real_paramiko() -> Any:
-    try:
-        import paramiko
-    except ImportError:
-        pytest.skip(
-            "the [sftp] extra is not installed, so no real SSH handshake can run here. Install "
-            "'messagefoundry[sftp]' to run it."
-        )
-    return paramiko
+    return pytest.importorskip(
+        "paramiko",
+        reason="the [sftp] extra is not installed, so no real SSH handshake can run here. "
+        "Install 'messagefoundry[sftp]' to run it.",
+    )
 
 
 def _sftp_server_offering(
@@ -1414,17 +1411,17 @@ def _connector_handshake(
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     monkeypatch.setattr(remotefile, "_import_paramiko", lambda: paramiko)
     port, known_hosts, thread = _sftp_server_offering(paramiko, ciphers, tmp_path)
-    client = _SftpClient(
-        {
-            "host": "127.0.0.1",
-            "port": port,
-            "username": "u",
-            "password": "p",
-            "known_hosts": str(known_hosts),
-            "connect_timeout": 10,
-        }
-    )
     try:
+        client = _SftpClient(
+            {
+                "host": "127.0.0.1",
+                "port": port,
+                "username": "u",
+                "password": "p",
+                "known_hosts": str(known_hosts),
+                "connect_timeout": 10,
+            }
+        )
         ssh = client._connect()
         try:
             return str(ssh.get_transport().remote_cipher)
@@ -1432,26 +1429,36 @@ def _connector_handshake(
             ssh.close()
     finally:
         thread.join(10)
+        assert not thread.is_alive(), "the loopback SSH server did not shut down"
 
 
 def _stock_handshake(paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path) -> str:
     """The CONTROL: a stock paramiko ``Transport`` with no deny list, against the same server."""
     port, _known_hosts, thread = _sftp_server_offering(paramiko, ciphers, tmp_path)
-    transport = paramiko.Transport(("127.0.0.1", port))
     try:
-        transport.start_client(timeout=10)
-        return str(transport.remote_cipher)
+        transport = paramiko.Transport(("127.0.0.1", port))
+        try:
+            transport.start_client(timeout=10)
+            return str(transport.remote_cipher)
+        finally:
+            transport.close()
     finally:
-        transport.close()
         thread.join(10)
+        assert not thread.is_alive(), "the loopback SSH server did not shut down"
 
 
 def test_sftp_real_handshake_negotiates_aes256_gcm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The one approved cipher still gets through, even from a server that lists CTR first."""
+    """Against a server that offers CTR, AES-128 and AES-256, the connector picks AES-256-GCM.
+
+    The SSH client's order decides the pick, so the CONTROL is a stock paramiko client against the
+    same offer: it picks ``aes128-ctr``, first in paramiko's own list. The connector's pick differs
+    only because its deny list removed that name and the other two withdrawn ones.
+    """
     paramiko = _real_paramiko()
     offered = ("aes128-ctr", "aes256-ctr", "aes128-gcm@openssh.com", "aes256-gcm@openssh.com")
+    assert _stock_handshake(paramiko, offered, tmp_path / "control") == "aes128-ctr"
     negotiated = _connector_handshake(paramiko, offered, tmp_path, monkeypatch)
     assert negotiated == "aes256-gcm@openssh.com"
 

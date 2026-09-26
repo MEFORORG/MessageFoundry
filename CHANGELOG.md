@@ -756,25 +756,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   [BACKLOG #1979](docs/BACKLOG.md))
 - **BREAKING: SFTP now offers one cipher, `aes256-gcm@openssh.com`.** 0.4.0 also offered
   `aes128-ctr`, `aes192-ctr`, `aes256-ctr` and `aes128-gcm@openssh.com`. ASVS Appendix C marks
-  CTR as disallowed, and AES-128 is withdrawn. A server that does not offer
-  `aes256-gcm@openssh.com` now fails the handshake with `Incompatible ssh server (no acceptable
-  ciphers)`. OpenSSH has carried it since 6.2. **Migration:** the server owner enables
-  `aes256-gcm@openssh.com`. No setting re-admits the others. This narrows the 0.4.0 note that SFTP
-  offers "AES-CTR or AES-GCM". (`BACKLOG #2041`, `#2044`)
+  CTR as disallowed, and AES-128 is withdrawn. The server must also offer an ETM SHA-2 MAC, as in
+  0.4.0, because paramiko still agrees a MAC beside GCM. A server that lacks either now fails the
+  handshake with `Incompatible ssh server (no acceptable ciphers)` or `(no acceptable macs)`.
+  **Migration:** the server owner enables `aes256-gcm@openssh.com` and
+  `hmac-sha2-256-etm@openssh.com` or `hmac-sha2-512-etm@openssh.com`. No setting re-admits the
+  others. This narrows the 0.4.0 note that SFTP offers "AES-CTR or AES-GCM".
+  (`BACKLOG #2041`, `#2044`)
 - **BREAKING: the Vault key provider and the `vault_transit` cipher refuse an `aes128-gcm96`
   Transit key.** 0.4.0 accepted it for the KEK, the data key and the audit key. `serve` now
-  refuses to start, and the error names the key, its type, the setting that chose it and what to
-  do. Vault cannot change a key's type, and rotating a key keeps its type. **Migration:** create
-  an `aes256-gcm96` key and point the setting at it.
-  - KEK (`MEFOR_STORE_VAULT_TRANSIT_KEY`): decrypt `MEFOR_STORE_VAULT_WRAPPED_DEK` under the old
-    key, encrypt the result under the new one, and set the new ciphertext. The store is unchanged.
-  - Data key (`MEFOR_STORE_TRANSIT_KEY`) or audit key (`MEFOR_STORE_TRANSIT_AUDIT_KEY`): this
-    works for a store with no data yet. A store that already holds data under an `aes128-gcm96`
-    key cannot switch in this release. No command re-encrypts Transit ciphertext under a new key,
-    and `rotate-key` refuses a `vault_transit` store. Keep such a store on 0.4.0.
-
-  This narrows the 0.4.0 migration advice "an AES or RSA-3072 Transit key": AES now means
-  `aes256-gcm96`. (`BACKLOG #2043`)
+  refuses to start, and the error names the key, its type, the setting that chose it and the
+  type to create. Vault cannot change a key's type, and rotating a key keeps its type.
+  **Migration:** create an `aes256-gcm96` key and point the setting at it. A store already
+  encrypted under the old data or audit key would not read under the new one, and no command
+  moves Transit ciphertext between keys. This narrows the 0.4.0 advice "an AES or RSA-3072
+  Transit key": AES now means `aes256-gcm96`. (`BACKLOG #2043`)
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says

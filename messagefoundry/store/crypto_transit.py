@@ -244,15 +244,6 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
             allowed=TRANSIT_KEY_TYPES_DATA,
             use="at-rest PHI encryption (Transit encrypt/decrypt with cell associated_data)",
             selector=_ENV_TRANSIT_KEY,
-            # Unlike the KEK, this key encrypts the cells themselves, so a store that already holds
-            # data under it has nothing to re-wrap: every cell would need re-encrypting, and no
-            # command does that between two Transit keys (`rotate-key` exits 2 on this provider).
-            after_switch=(
-                "That is enough for a new, empty store. A store that already holds data under the "
-                "old key cannot switch yet: this release has no step that re-encrypts Transit "
-                "ciphertext under a new key, and `messagefoundry rotate-key` refuses a "
-                f"{PROVIDER_NAME} store. Keep such a store on the previous release until one ships."
-            ),
         )
         # Same fail-closed existence + type check for a DEDICATED audit key (skip the redundant read
         # when it is the data key we just verified) — a mis-set audit key must refuse to start, not
@@ -265,12 +256,6 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
                 allowed=TRANSIT_KEY_TYPES_AUDIT,
                 use="the audit-chain MAC (Transit generate_hmac)",
                 selector=_ENV_AUDIT_KEY,
-                after_switch=(
-                    "That is enough for a store with no audit rows yet. This cipher MACs and "
-                    "verifies the audit chain under one key only, so rows already MACed under the "
-                    "old key would not verify: keep such a store on the previous release until a "
-                    "re-key step ships."
-                ),
             )
     except KeyProviderError:
         raise
