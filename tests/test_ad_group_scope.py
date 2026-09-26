@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import closing
 from pathlib import Path
@@ -406,9 +407,11 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:
-    # Step-up admin endpoint test, not an MFA test: pin require_mfa=False so the admin's PUT isn't
-    # blocked first by the BACKLOG #187 secure default (require_mfa now ON).
+async def _admin_service(engine: Engine) -> AuthService:
+    """An auth service holding one usable local administrator, ``boss``.
+
+    Step-up admin endpoint tests, not MFA tests: ``require_mfa=False`` so the admin's PUT isn't
+    blocked first by the BACKLOG #187 secure default (require_mfa now ON)."""
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     boss_id = await service.create_local_user(
@@ -425,14 +428,62 @@ async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:
     await service.store.set_password(
         boss_id, password_hash=boss.password_hash, must_change_password=False
     )
+    return service
+
+
+async def _boss_headers(c: httpx.AsyncClient) -> dict[str, str]:
+    body = {"username": "boss", "password": PW, "provider": "local"}
+    tok = (await c.post("/auth/login", json=body)).json()["token"]
+    return {"Authorization": f"Bearer {tok}"}
+
+
+async def test_the_users_list_shows_who_wrote_each_scope(engine: Engine) -> None:
+    """BACKLOG #1958: ``GET /users`` carries ``channel_scope_source`` beside each scope.
+
+    Without it an administrator cannot see that a scope is the directory's, so nothing warns them
+    that saving it makes it manual. This also pins what that save does today: an administrator's
+    PUT of the SAME directory scope marks it manual, and a later sign-in that matches no mapped
+    group then keeps it. The console's warning exists because of that second half."""
+    service = await _admin_service(engine)
+    await engine.store.set_ad_group_scope_map([("grp-a", "IB_A")])
+    # Hex ids, because the JSON route takes a ResourceId in its path.
+    ada_id, len_id = uuid.uuid4().hex, uuid.uuid4().hex
+    await engine.store.create_user(user_id=ada_id, username="ada", auth_provider="ad")
+    await engine.store.create_user(user_id=len_id, username="len", auth_provider="local")
+    ada = await service._sync_ad_channel_scope(
+        await engine.store.get_user(ada_id), frozenset(), ["grp-a"]
+    )
+    assert ada.channel_scope_source == SCOPE_SOURCE_AD  # positive control on the setup
+
     transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        tok = (
-            await c.post(
-                "/auth/login", json={"username": "boss", "password": PW, "provider": "local"}
-            )
-        ).json()["token"]
-        h = {"Authorization": f"Bearer {tok}"}
+        h = await _boss_headers(c)
+
+        async def sources() -> dict[str, tuple[object, object]]:
+            users = (await c.get("/users", headers=h)).json()
+            return {u["username"]: (u["channel_scope"], u["channel_scope_source"]) for u in users}
+
+        got = await sources()
+        assert got["ada"] == (["IB_A"], "ad")
+        assert got["len"] == (None, None)  # no scope writer has run
+
+        # The re-save: the same scope, unchanged, through the admin API.
+        r = await c.put(f"/users/{ada_id}/channel-scope", json={"channels": ["IB_A"]}, headers=h)
+        assert r.status_code == 200
+        assert (await sources())["ada"] == (["IB_A"], "manual")
+
+    # And manual is what keeps it: leaving the last mapped group no longer withdraws it.
+    user = await engine.store.get_user(ada_id)
+    assert user is not None
+    out = await service._sync_ad_channel_scope(user, frozenset(), [])
+    assert json.loads(out.channel_scope) == ["IB_A"]
+
+
+async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:
+    service = await _admin_service(engine)
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _boss_headers(c)
         assert (await c.get("/ad-group-scope-map", headers=h)).json()["entries"] == []
         body = {"entries": [{"ad_group": "Lab-Ops", "channel": "IB_LAB"}]}
         assert (await c.put("/ad-group-scope-map", json=body, headers=h)).status_code == 200

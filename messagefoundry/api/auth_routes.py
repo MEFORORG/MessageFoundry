@@ -275,6 +275,7 @@ def _user_summary(
         disabled=user.disabled,
         roles=sorted(role_ids),
         channel_scope=_parse_channel_scope(user.channel_scope),
+        channel_scope_source=user.channel_scope_source,
         credential_expires_at=credential_expires_at,
     )
 

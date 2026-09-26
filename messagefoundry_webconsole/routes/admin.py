@@ -48,6 +48,11 @@ from .._auth import (
     require_ui_step_up_action,
 )
 from .._service import _service
+from ..pages.admin import (
+    CONFIRM_MANUAL_SCOPE_FIELD,
+    CONFIRM_MANUAL_SCOPE_VALUE,
+    needs_manual_scope_confirm,
+)
 from ._common import _form_pairs
 
 register_ui_action(r"^/ui/users/new$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
@@ -370,6 +375,27 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 status_code=400,
             )
+        # BACKLOG #1958: saving a directory scope makes it manual, and the login sync never withdraws
+        # a manual scope. The page warns and asks for a tick; this refuses a post without one, which
+        # also catches a page rendered before an earlier sign-in made the scope the directory's. It
+        # is a read then a write, so a sign-in landing between the two is not caught.
+        #
+        # Read through the summary, not the record: the console never reads a UserRecord attribute
+        # itself, so the seam snapshot covers the field. The role list is not read. A missing user
+        # falls through to the handler's own 404.
+        if form.get(CONFIRM_MANUAL_SCOPE_FIELD) != CONFIRM_MANUAL_SCOPE_VALUE:
+            user = await service.store.get_user(user_id)
+            if user is not None and needs_manual_scope_confirm(admin.user_summary(user, [])):
+                return await _user_detail(
+                    user_id,
+                    service,
+                    identity,
+                    error=(
+                        "the directory owns this scope -- tick the box to confirm that "
+                        "saving it here makes it manual"
+                    ),
+                    status_code=400,
+                )
         # BACKLOG #1152: all-channels is now the explicit ALL_CHANNELS grant, not a null scope. Null
         # and [] both deny, so posting null for "all" would have silently inverted this form.
         channels = [ALL_CHANNELS] if mode == "all" else ([] if mode == "none" else names)
