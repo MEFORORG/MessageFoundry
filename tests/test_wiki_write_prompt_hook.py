@@ -60,7 +60,13 @@ def _clean_env() -> dict[str, str]:
     """The fixture decides what the hook reads, not whoever runs the suite. A GIT_DIR inherited from
     a git hook would point `git -C <tmp>` at the REAL repository and its live coordination tree. A
     CLAUDE_* variable from the session running the suite would decide whether the hook prompts."""
-    scrub = {"MEFOR_WIKI_PROMPT", "KORUS_SEAT", "KORUS_AGENT", "KORUS_STATE_REL"}
+    scrub = {
+        "MEFOR_WIKI_PROMPT",
+        "MEFOR_KORUS_CHECKOUT",
+        "KORUS_SEAT",
+        "KORUS_AGENT",
+        "KORUS_STATE_REL",
+    }
     return {
         k: v
         for k, v in os.environ.items()
@@ -116,9 +122,11 @@ class Env:
         env: dict[str, str] | None = None,
         session: dict[str, str] | None = None,
         transcript: str | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """``session`` is the CLAUDE_* set Claude Code would pass. The default is an attended
-        session; pass ``{}`` for a hook that sees none of them."""
+        session; pass ``{}`` for a hook that sees none of them. ``cwd`` is the hook process's
+        working directory; the default inherits the suite's."""
         payload = stdin
         if payload is None:
             payload = json.dumps(
@@ -144,6 +152,7 @@ class Env:
             encoding="utf-8",
             timeout=TIMEOUT,
             env=full_env,
+            cwd=cwd,
             check=False,
         )
         assert proc.returncode == 0, proc.stderr
@@ -321,17 +330,161 @@ def test_threshold_tool_uses_block_with_the_resolved_state_root(env: Env) -> Non
 
 
 def test_the_korus_path_and_seat_resolve_when_present(env: Env) -> None:
-    korus_write = env.base / "korus" / "scripts" / "wiki" / "write.ps1"
-    korus_write.parent.mkdir(parents=True)
-    korus_write.write_text("# stub\n", encoding="utf-8")
-    (env.repo / ".claude").mkdir()
-    (env.repo / ".claude" / "seat.local.txt").write_text("manager", encoding="utf-8")
+    korus = make_korus(env.base / "korus")
+    seated(env)
     env.append(tools(MIN_TOOLS))
     reason = blocked(env.run())["reason"]
-    korus = str(env.base / "korus").replace("\\", "/")
-    assert f'"{korus}/scripts/wiki/write.ps1"' in reason
-    assert "-Seat manager" in reason
+    assert f'"{korus}/scripts/wiki/query.ps1"' in query_line(reason)
+    assert f'"{korus}/scripts/wiki/write.ps1"' in write_line(reason)
+    assert query_line(reason).endswith(" -Seat manager")
+    assert write_line(reason).endswith(" -Seat manager")
     assert env.logs()[-1]["seat"] == "manager"
+
+
+# The param-block line a current query.ps1 declares -Seat with.
+SEAT_PARAM = "    [string] $Seat,"
+
+
+def make_korus(path: Path, *, query_takes_seat: bool = True, seat_line: str = SEAT_PARAM) -> str:
+    """A korus checkout stub: write.ps1, plus a query.ps1 whose param block has -Seat or not. Its
+    body names $Seat untyped, as the real script does. Returns the path as the prompt prints it."""
+    wiki = path / "scripts" / "wiki"
+    wiki.mkdir(parents=True)
+    (wiki / "write.ps1").write_text("param([string] $Seat)\n", encoding="utf-8")
+    seat = seat_line + "\n" if query_takes_seat else ""
+    (wiki / "query.ps1").write_text(
+        f"[CmdletBinding()]\nparam(\n{seat}    [string] $Text\n)\n$logSeat = $Seat\n",
+        encoding="utf-8",
+    )
+    return str(path).replace("\\", "/")
+
+
+def query_line(reason: str) -> str:
+    [line] = [x for x in reason.splitlines() if "query.ps1" in x and "-File" in x]
+    return line
+
+
+def write_line(reason: str) -> str:
+    [line] = [x for x in reason.splitlines() if "write.ps1" in x and "-File" in x]
+    return line
+
+
+def seated(env: Env) -> None:
+    (env.repo / ".claude").mkdir()
+    (env.repo / ".claude" / "seat.local.txt").write_text("manager", encoding="utf-8")
+
+
+def test_the_korus_env_var_wins(env: Env) -> None:
+    make_korus(env.base / "korus-wiki-main")
+    make_korus(env.base / "korus")
+    chosen = make_korus(env.base / "elsewhere" / "korus-pinned")
+    env.append(tools(MIN_TOOLS))
+    reason = blocked(
+        env.run(env={"MEFOR_KORUS_CHECKOUT": str(env.base / "elsewhere" / "korus-pinned")})
+    )["reason"]
+    assert f'"{chosen}/scripts/wiki/query.ps1"' in query_line(reason)
+    assert f'"{chosen}/scripts/wiki/write.ps1"' in write_line(reason)
+    assert f"Korus checkout used: {chosen} (from MEFOR_KORUS_CHECKOUT)" in reason
+
+
+def test_an_env_var_naming_no_checkout_falls_through(env: Env) -> None:
+    chosen = make_korus(env.base / "korus")
+    env.append(tools(MIN_TOOLS))
+    reason = blocked(env.run(env={"MEFOR_KORUS_CHECKOUT": str(env.base / "missing")}))["reason"]
+    assert f'"{chosen}/scripts/wiki/write.ps1"' in write_line(reason)
+    assert "(from korus)" in reason
+    assert "MEFOR_KORUS_CHECKOUT is set but names no checkout" in reason
+
+
+def test_a_relative_env_var_is_printed_absolute(env: Env) -> None:
+    chosen = make_korus(env.base / "pinned")
+    env.append(tools(MIN_TOOLS))
+    # Resolve-Korus calls GetFullPath with no Set-Location, so a relative value resolves against
+    # the hook PROCESS cwd. Run the hook from env.base, which is not the payload cwd (env.repo):
+    # resolving against the payload cwd would name primary/pinned, which does not exist.
+    # The value is relative to a cwd inside the temp tree, never to the suite's cwd: a runner that
+    # checks out on D: with its temp dir on C: has no relative path between the two.
+    reason = blocked(env.run(env={"MEFOR_KORUS_CHECKOUT": "pinned"}, cwd=env.base))["reason"]
+    assert f'"{chosen}/scripts/wiki/query.ps1"' in query_line(reason)
+    assert f'"{chosen}/scripts/wiki/write.ps1"' in write_line(reason)
+    assert "(from MEFOR_KORUS_CHECKOUT)" in reason
+
+
+def test_korus_wiki_main_is_preferred_over_korus(env: Env) -> None:
+    make_korus(env.base / "korus")
+    chosen = make_korus(env.base / "korus-wiki-main")
+    env.append(tools(MIN_TOOLS))
+    reason = blocked(env.run())["reason"]
+    assert f'"{chosen}/scripts/wiki/query.ps1"' in query_line(reason)
+    assert f'"{chosen}/scripts/wiki/write.ps1"' in write_line(reason)
+    assert "(from korus-wiki-main)" in reason
+
+
+def test_the_fallback_is_korus(env: Env) -> None:
+    # A korus-wiki-main directory without write.ps1 is not a checkout, so it is skipped.
+    (env.base / "korus-wiki-main").mkdir()
+    chosen = make_korus(env.base / "korus")
+    seated(env)
+    env.append(tools(MIN_TOOLS))
+    reason = blocked(env.run())["reason"]
+    assert f'"{chosen}/scripts/wiki/write.ps1"' in write_line(reason)
+    assert "(from korus)" in reason
+    # A current query.ps1 takes -Seat, so both commands carry it.
+    assert query_line(reason).endswith(" -Seat manager")
+    assert write_line(reason).endswith(" -Seat manager")
+    assert "probably stale" not in reason
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "    [Parameter()] [string] $Seat,",
+        "    [ValidateNotNullOrEmpty()][string]$Seat = '',",
+        "    [string[]] $Seat,",
+    ],
+)
+def test_an_attributed_seat_parameter_is_recognised(env: Env, line: str) -> None:
+    make_korus(env.base / "korus-wiki-main", seat_line=line)
+    seated(env)
+    env.append(tools(MIN_TOOLS))
+    reason = blocked(env.run())["reason"]
+    assert query_line(reason).endswith(" -Seat manager")
+    assert "probably stale" not in reason
+
+
+def test_a_typed_seat_outside_the_param_block_does_not_count(env: Env) -> None:
+    korus = env.base / "korus-wiki-main"
+    make_korus(korus, query_takes_seat=False)
+    query = korus / "scripts" / "wiki" / "query.ps1"
+    body = query.read_text(encoding="utf-8") + "[string] $Seat = $env:KORUS_SEAT\n"
+    query.write_text(body, encoding="utf-8")
+    seated(env)
+    env.append(tools(MIN_TOOLS))
+    reason = blocked(env.run())["reason"]
+    assert "-Seat" not in query_line(reason)
+
+
+def test_seat_is_dropped_from_the_query_when_query_ps1_lacks_it(env: Env) -> None:
+    make_korus(env.base / "korus-wiki-main", query_takes_seat=False)
+    seated(env)
+    env.append(tools(MIN_TOOLS))
+    reason = blocked(env.run())["reason"]
+    assert "-Seat" not in query_line(reason)
+    # write.ps1 has always taken -Seat, so the write command keeps it.
+    assert write_line(reason).endswith(" -Seat manager")
+    assert "probably stale" in reason
+
+
+def test_the_placeholder_is_used_when_no_korus_checkout_exists(env: Env) -> None:
+    seated(env)
+    env.append(tools(MIN_TOOLS))
+    reason = blocked(env.run(env={"MEFOR_KORUS_CHECKOUT": str(env.base / "missing")}))["reason"]
+    assert '"<korus checkout>/scripts/wiki/query.ps1"' in query_line(reason)
+    assert '"<korus checkout>/scripts/wiki/write.ps1"' in write_line(reason)
+    assert "Korus checkout used: none found" in reason
+    # With nothing to inspect, the query assumes a current korus and keeps -Seat.
+    assert query_line(reason).endswith(" -Seat manager")
+    assert reason.isascii()
 
 
 @pytest.mark.parametrize(

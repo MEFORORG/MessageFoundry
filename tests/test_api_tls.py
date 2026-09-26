@@ -39,6 +39,9 @@ from messagefoundry.api.security import (
 )
 from messagefoundry.api.tls import (
     _GENERATED_CERT_NAME,
+    GENERATED_PAIR_REPLACED,
+    GeneratedPairReplaced,
+    _generated_pair,
     build_api_ssl_context,
     ensure_api_tls_material,
 )
@@ -389,8 +392,19 @@ def _serve_capturing_monitored_api_cert(
     """Run ``serve`` and return the ``api_tls_cert_file`` it handed the app, plus uvicorn's kwargs.
 
     That kwarg is the only route the ``[api]`` certificate takes to ``Engine._monitored_certs``,
-    which feeds ``CertExpiryRunner``. The real ``create_managed_app`` still runs, so nothing else
-    about the serve path changes under the spy.
+    which feeds ``CertExpiryRunner``.
+    """
+    handed, captured = _serve_capturing(tmp_path, monkeypatch, toml)
+    return handed["api_tls_cert_file"], captured
+
+
+def _serve_capturing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, extra: tuple[str, ...] = ()
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run ``serve`` and return every kwarg it handed ``create_managed_app``, plus uvicorn's.
+
+    The real ``create_managed_app`` still runs, so nothing else about the serve path changes under
+    the spy.
     """
     import messagefoundry.api as api_pkg
     from messagefoundry.api.app import create_managed_app
@@ -408,9 +422,9 @@ def _serve_capturing_monitored_api_cert(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     monkeypatch.setattr(api_pkg, "create_managed_app", _spy)
     (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev", *extra]) == 0
     assert "api_tls_cert_file" in handed  # the spy saw the call, so a None below is a real None
-    return handed["api_tls_cert_file"], captured
+    return handed, captured
 
 
 def test_the_generated_api_certificate_is_watched_by_the_expiry_monitor(
@@ -644,7 +658,10 @@ def test_cert_identity_map_requires_client_ca() -> None:
 # require_mfa posture exactly. create_managed_app + uvicorn are mocked so no socket is opened. The keyless
 # gate is pre-satisfied with an encryption key so only the Posture-B posture decides prod refusals.
 
-_SECURE_ALERTS = '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+_SECURE_ALERTS = (
+    '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+    'email_to = ["ops@example.org"]\n'
+)
 
 
 def _posture_b_toml(
@@ -1052,6 +1069,7 @@ def test_serve_loopback_emits_no_new_stderr(
         # empty. Configuring the transport is the honest way past the gate and stays silent.
         'alerts.email_smtp_host = "smtp.example.org"\n'
         'alerts.email_from = "sec@example.org"\n'
+        'alerts.email_to = ["ops@example.org"]\n'
         "security.delete_message_bodies_after_days = 30\n"
         "retention.dead_letter_days = 30\n"
         "retention.reference_snapshot_days = 30\n"
@@ -2303,15 +2321,18 @@ def test_the_minted_certificate_names_the_bind_host(tmp_path: Path) -> None:
     assert api.host in common_names
 
 
-def test_a_second_start_reuses_the_pair_and_never_re_mints(tmp_path: Path) -> None:
-    # MINT-ONCE. _write_private_key uses O_EXCL and REFUSES to overwrite, so a re-mint attempt
-    # would not silently rotate the key -- it would raise. Asserting the bytes are unchanged proves
-    # the reuse branch is taken rather than the write being attempted and swallowed.
+def test_a_second_start_reuses_a_fresh_pair_and_never_re_mints(tmp_path: Path) -> None:
+    # MINT ONCE, THEN REUSE WHILE FRESH. A pair with most of its lifetime left is never replaced:
+    # early renewal (ADR 0172, 2026-09-26 amendment) starts only in its last third, and the tests
+    # under "early, audited renewal" below cover that. Asserting the bytes are unchanged proves the
+    # reuse branch is taken rather than the write being attempted and swallowed.
     api = ApiSettings()
     first_cert, first_key = ensure_api_tls_material(api, state_dir=tmp_path)
     cert_bytes = Path(first_cert).read_bytes()
     key_bytes = Path(first_key).read_bytes()
-    second_cert, second_key = ensure_api_tls_material(api, state_dir=tmp_path)
+    events: list[GeneratedPairReplaced] = []
+    second_cert, second_key = ensure_api_tls_material(api, state_dir=tmp_path, replacements=events)
+    assert events == []
     assert (second_cert, second_key) == (first_cert, first_key)
     assert Path(second_cert).read_bytes() == cert_bytes
     assert Path(second_key).read_bytes() == key_bytes
@@ -3062,3 +3083,627 @@ def test_a_failed_read_grant_never_stops_the_mint(
         cert, key = ensure_api_tls_material(ApiSettings(), state_dir=tmp_path / "state")
     assert Path(cert).exists() and Path(key).exists()
     assert "could not grant read on" in caplog.text
+
+
+# --- BACKLOG #1276: early, audited renewal of the generated pair ---------------------------------
+#
+# Owner ruling 2026-09-26, recorded as the ADR 0172 amendment of that date. At startup, under the
+# one-writer lock, a generated pair with less than a third of its lifetime left (about 122 of 365
+# days), or past it, is renewed. Only the engine's own shape is ever touched, and every replacement
+# of an existing pair is reported for the audit log.
+
+_DAY = datetime.timedelta(days=1)
+
+
+def _plant_generated_pair(
+    state: Path, *, lived_days: float, left_days: float, shape: str = "engine"
+) -> tuple[Path, Path]:
+    """Write a loadable pair at the GENERATED names, valid from ``lived_days`` ago to ``left_days``
+    from now. ``shape`` is ``engine`` (what the engine mints: self-signed, CA=false), ``ca_true``
+    (self-signed, CA=true) or ``issued`` (a leaf another key signed)."""
+    state.mkdir(parents=True, exist_ok=True)
+    cert_path, key_path = _generated_pair(state)
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.UTC)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    issuer_name, signer = name, key
+    if shape == "issued":
+        signer = ec.generate_private_key(ec.SECP256R1())
+        issuer_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Operator CA")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(issuer_name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - lived_days * _DAY)
+        .not_valid_after(now + left_days * _DAY)
+        .add_extension(
+            x509.BasicConstraints(ca=shape == "ca_true", path_length=None), critical=True
+        )
+        .sign(signer, hashes.SHA256())
+    )
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return cert_path, key_path
+
+
+def _sha256(cert: Path) -> str:
+    return x509.load_pem_x509_certificate(cert.read_bytes()).fingerprint(hashes.SHA256()).hex()
+
+
+def _snapshot(*paths: Path) -> dict[Path, bytes]:
+    return {p: p.read_bytes() for p in paths}
+
+
+@pytest.mark.parametrize(
+    ("lived", "left", "renews"),
+    [
+        (240, 125, False),  # CONTROL: just above a third of 365 days left, so untouched
+        (247, 118, True),  # just below it
+        (370, -5, True),  # already expired
+    ],
+)
+def test_a_generated_pair_renews_inside_its_last_third_and_not_before(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, lived: int, left: int, renews: bool
+) -> None:
+    """The threshold, both sides of it, and an expired pair.
+
+    Mutation: drop the renewal branch (the parent commit). Red: the two renewing rows keep their old
+    bytes, and the expired one keeps serving a certificate every client rejects."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=lived, left_days=left)
+    before = _snapshot(cert, key)
+    old_sha = _sha256(cert)
+    events: list[GeneratedPairReplaced] = []
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        material = ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+
+    assert material == (str(cert), str(key))  # the same fixed names clients already pin by path
+    _load_pair(cert, key)
+    if not renews:
+        assert _snapshot(cert, key) == before
+        assert events == []
+        assert caplog.records == []
+        return
+    assert cert.read_bytes() != before[cert] and key.read_bytes() != before[key]
+    new = x509.load_pem_x509_certificate(cert.read_bytes())
+    remaining = new.not_valid_after_utc - datetime.datetime.now(datetime.UTC)
+    assert 364 * _DAY < remaining <= 365 * _DAY  # a whole new lifetime
+    assert len(events) == 1
+    event = events[0]
+    assert event.reason == "renewal" and event.cert_file == str(cert)
+    assert event.old_sha256 == old_sha and event.new_sha256 == _sha256(cert)
+    assert event.old_sha256 != event.new_sha256
+    assert event.new_not_after == new.not_valid_after_utc.isoformat()
+    renewed = [r for r in caplog.records if "renewed the generated" in r.getMessage()]
+    assert len(renewed) == 1 and renewed[0].levelno == logging.WARNING
+    assert "PRIVATE KEY" not in caplog.text
+    assert not list(tmp_path.glob("*.renewing"))  # nothing staged is left behind
+
+
+def test_a_second_start_after_a_renewal_reuses_the_renewed_pair(tmp_path: Path) -> None:
+    """Renew once, then reuse: a renewed pair is fresh, so the next start writes nothing."""
+    _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    first: list[GeneratedPairReplaced] = []
+    material = ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=first)
+    assert material is not None and len(first) == 1
+    renewed = _snapshot(Path(material[0]), Path(cast("str", material[1])))
+    second: list[GeneratedPairReplaced] = []
+    assert (
+        ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=second) == material
+    )
+    assert second == []
+    assert _snapshot(*renewed) == renewed
+
+
+@pytest.mark.parametrize("shape", ["issued", "ca_true"])
+def test_a_certificate_the_engine_did_not_generate_is_never_renewed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, shape: str
+) -> None:
+    """CONTROL: an EXPIRED pair at the generated path that is not the engine's shape -- a leaf some
+    other key signed, or a self-signed CA -- is served as found, never replaced, and the log says
+    why. Mutation: drop the shape check. Red: both pairs are replaced."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=370, left_days=-5, shape=shape)
+    before = _snapshot(cert, key)
+    events: list[GeneratedPairReplaced] = []
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        material = ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+
+    assert material == (str(cert), str(key))
+    assert _snapshot(cert, key) == before
+    assert events == []
+    assert "not renewing" in caplog.text
+
+
+def test_an_expired_operator_certificate_is_never_renewed_or_inspected(tmp_path: Path) -> None:
+    """CONTROL: `[api].tls_cert_file` wins, expired or not. The engine's pair is a fallback beneath
+    it and the renewal is part of that fallback, so nothing is written, not even the lock file."""
+    op = tmp_path / "operator"
+    cert, key = _plant_generated_pair(op, lived_days=370, left_days=-5)
+    before = _snapshot(cert, key)
+    state = tmp_path / "state"
+    state.mkdir()
+    events: list[GeneratedPairReplaced] = []
+    api = ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key))
+
+    assert ensure_api_tls_material(api, state_dir=state, replacements=events) == (
+        str(cert),
+        str(key),
+    )
+    assert _snapshot(cert, key) == before
+    assert events == [] and list(state.iterdir()) == []
+
+
+def test_nothing_is_renewed_behind_a_declared_upstream_terminator(tmp_path: Path) -> None:
+    """CONTROL: the engine serves no certificate of its own there, so it renews none, even when an
+    expired generated pair from an earlier posture is still on disk."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=370, left_days=-5)
+    before = _snapshot(cert, key)
+    events: list[GeneratedPairReplaced] = []
+    api = ApiSettings(tls_terminated_upstream=True, trusted_proxies=["10.0.0.7"])
+
+    assert ensure_api_tls_material(api, state_dir=tmp_path, replacements=events) is None
+    assert _snapshot(cert, key) == before
+    assert events == []
+
+
+def test_concurrent_starts_renew_a_due_pair_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Six shards starting together on one due pair: one renews, five reuse its result, and one
+    renewal is reported in total. Mutation: renew outside `_generated_pair_lock`. Red: several
+    renewals, several reports, and pairs that do not load."""
+    _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    mints = _count_and_slow_the_mint(monkeypatch, 0.3)
+    starters = 6
+    barrier = threading.Barrier(starters)
+    results: list[tuple[str, str | None] | None] = []
+    reported: list[GeneratedPairReplaced] = []
+    errors: list[Exception] = []
+    guard = threading.Lock()
+
+    def start() -> None:
+        events: list[GeneratedPairReplaced] = []
+        barrier.wait()
+        try:
+            material = ensure_api_tls_material(
+                ApiSettings(), state_dir=tmp_path, replacements=events
+            )
+        except Exception as exc:  # collected and asserted below, so no failure is swallowed
+            with guard:
+                errors.append(exc)
+            return
+        with guard:
+            results.append(material)
+            reported.extend(events)
+
+    threads = [threading.Thread(target=start) for _ in range(starters)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert errors == []
+    assert len(results) == starters and len(set(results)) == 1
+    assert mints[0] == 1, "exactly one starter may renew; every other must reuse its pair"
+    assert [e.reason for e in reported] == ["renewal"]
+    material = results[0]
+    assert material is not None
+    _load_pair(*material)
+    assert _sha256(Path(material[0])) == reported[0].new_sha256
+
+
+def test_a_renewal_interrupted_between_its_replaces_recovers_and_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after the certificate's replace and before the key's leaves a new certificate beside
+    the old key. That pair does not load, so the next start discards and re-mints it, and reports
+    it as an unusable pair. The staged key the crash left is discarded first, or the next renewal's
+    O_EXCL write would refuse it."""
+    import messagefoundry.api.tls as tls
+
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    real = tls._replace_generated
+    calls = [0]
+
+    def die_on_the_key(staged: Path, live: Path) -> None:
+        calls[0] += 1
+        if calls[0] == 2:
+            raise OSError("simulated crash between the two replaces")
+        real(staged, live)
+
+    monkeypatch.setattr(tls, "_replace_generated", die_on_the_key)
+    with pytest.raises(OSError, match="simulated crash"):
+        ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
+    with pytest.raises(ssl.SSLError):  # CONTROL: the interruption really left a mismatched pair
+        _load_pair(cert, key)
+    assert (tmp_path / (key.name + ".renewing")).exists()
+    monkeypatch.setattr(tls, "_replace_generated", real)
+
+    events: list[GeneratedPairReplaced] = []
+    assert ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events) == (
+        str(cert),
+        str(key),
+    )
+    _load_pair(cert, key)
+    assert [e.reason for e in events] == ["unusable"]
+    assert events[0].old_sha256 is not None  # the half-installed new certificate, identified
+    assert not list(tmp_path.glob("*.renewing"))
+
+
+@pytest.mark.parametrize(("left", "keeps_old"), [(65, True), (-5, False)])
+def test_a_renewal_that_fails_before_any_replace_keeps_a_still_valid_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    left: int,
+    keeps_old: bool,
+) -> None:
+    """The certificate is the file other processes hold open, so its replace is the one most likely
+    to be refused. A refusal there has changed nothing: a pair that still serves is kept and the
+    next start tries again. An EXPIRED pair has nothing to fall back on, so the failure stops the
+    start rather than serving a certificate every client rejects."""
+    import messagefoundry.api.tls as tls
+
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=left)
+    before = _snapshot(cert, key)
+
+    def refused(staged: Path, live: Path) -> None:
+        raise PermissionError(13, "held open elsewhere")
+
+    monkeypatch.setattr(tls, "_replace_generated", refused)
+    events: list[GeneratedPairReplaced] = []
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        if keeps_old:
+            assert ensure_api_tls_material(
+                ApiSettings(), state_dir=tmp_path, replacements=events
+            ) == (str(cert), str(key))
+            assert "could not check or renew" in caplog.text
+        else:
+            with pytest.raises(PermissionError):
+                ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+    assert _snapshot(cert, key) == before
+    assert events == []
+    assert not list(tmp_path.glob("*.renewing"))
+
+
+@pytest.mark.parametrize("damage", ["foreign_cert", "lone_key", "lone_cert"])
+def test_every_recovery_re_mint_is_reported_for_the_audit_log(tmp_path: Path, damage: str) -> None:
+    """ADR 0172 decision 6 covers every re-mint, not only the renewal: a replaced unusable pair and
+    a replaced half-pair are reported too, with the old certificate's fingerprint when one exists."""
+    api = ApiSettings()
+    material = ensure_api_tls_material(api, state_dir=tmp_path / "state")
+    assert material is not None
+    cert, key = Path(material[0]), Path(cast("str", material[1]))
+    if damage == "foreign_cert":
+        other = ensure_api_tls_material(api, state_dir=tmp_path / "other")
+        assert other is not None
+        cert.write_bytes(Path(other[0]).read_bytes())
+        expected = ("unusable", _sha256(cert))
+    elif damage == "lone_key":
+        cert.unlink()
+        expected = ("half_pair", None)
+    else:
+        key.unlink()
+        expected = ("half_pair", _sha256(cert))
+
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(api, state_dir=tmp_path / "state", replacements=events)
+
+    _load_pair(cert, key)
+    assert [(e.reason, e.old_sha256) for e in events] == [expected]
+    assert events[0].new_sha256 == _sha256(cert)
+
+
+def test_what_the_engine_mints_is_what_it_would_renew() -> None:
+    """The renewal tests plant hand-built pairs. This pins the link to the real primitive: a
+    certificate `make_self_signed` produces must read as the engine's shape, or renewal would
+    silently stop while every planted-pair test stayed green."""
+    from messagefoundry import pki
+
+    cert_pem, _ = pki.make_self_signed("127.0.0.1", [], 365)
+    assert pki.read_self_signed_facts(cert_pem).engine_shaped
+
+
+@pytest.mark.parametrize(("left", "keeps_old"), [(65, True), (-5, False)])
+def test_a_lock_the_start_cannot_take_keeps_a_still_valid_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    left: int,
+    keeps_old: bool,
+) -> None:
+    """A due pair can no longer be reused without the lock, so a lock the start cannot take -- a
+    read-only state dir, a hung holder -- must not stop a start the old pair can still serve. An
+    expired pair has nothing to fall back on, so the error propagates."""
+    import messagefoundry.api.tls as tls
+
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=left)
+    before = _snapshot(cert, key)
+
+    def unavailable(state_dir: Path) -> Any:
+        raise TimeoutError(f"{state_dir} lock held by a hung holder")
+
+    monkeypatch.setattr(tls, "_generated_pair_lock", unavailable)
+    events: list[GeneratedPairReplaced] = []
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        if keeps_old:
+            assert ensure_api_tls_material(
+                ApiSettings(), state_dir=tmp_path, replacements=events
+            ) == (str(cert), str(key))
+            assert "could not check or renew" in caplog.text
+            assert "expires 20" in caplog.text  # the deadline is named, not only the failure
+        else:
+            with pytest.raises(TimeoutError):
+                ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+    assert _snapshot(cert, key) == before
+    assert events == []
+
+
+def test_a_first_run_mint_replaces_nothing_and_reports_nothing(tmp_path: Path) -> None:
+    """CONTROL for the reports above: a mint into an empty state dir is not a re-mint."""
+    events: list[GeneratedPairReplaced] = []
+    assert ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+    assert events == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the grant is Windows-only, as the tray is")
+def test_local_users_can_read_the_renewed_certificate_but_not_the_key(tmp_path: Path) -> None:
+    """The renewed certificate is a new file, so the tray's read grant has to be made again. It is
+    made on the staged file, and the rename keeps it."""
+    state = tmp_path / "state"
+    cert, key = _plant_generated_pair(state, lived_days=300, left_days=65)
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(), state_dir=state, replacements=events)
+    assert len(events) == 1  # it really renewed, so the ACLs below are the renewed files'
+    cert_acl = _sddl(str(cert), tmp_path)
+    key_acl = _sddl(str(key), tmp_path)
+    assert ";;;BU)" in cert_acl, cert_acl
+    assert ";;;BU)" not in key_acl, key_acl
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a held file is Windows behaviour")
+def test_a_cert_held_open_by_a_reader_is_waited_out_during_renewal(tmp_path: Path) -> None:
+    """The tray opens the pinned certificate on every poll, and Python on Windows opens without
+    delete sharing, so a renewal's replace can land during a read. Replacing a file held open
+    returns ERROR_ACCESS_DENIED (a delete returns ERROR_SHARING_VIOLATION); both are ridden out.
+
+    Mutation: make `_replace_generated` a bare `os.replace`. Red: the renewal gives up, keeps the
+    old pair, and reports nothing."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    old_sha = _sha256(cert)
+    events: list[GeneratedPairReplaced] = []
+    with cert.open("rb") as handle:  # the tray's read, released mid-renewal by the timer
+        closer = threading.Timer(0.5, handle.close)
+        closer.start()
+        try:
+            ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+        finally:
+            closer.cancel()
+    assert [(e.reason, e.old_sha256) for e in events] == [("renewal", old_sha)]
+    assert _sha256(cert) == events[0].new_sha256
+    _load_pair(cert, key)
+
+
+@pytest.mark.parametrize("shard", [None, "a"])
+def test_plain_serve_renews_and_an_engine_shard_never_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shard: str | None
+) -> None:
+    """End to end on the serve path, same due pair. A plain ``serve`` renews it before the app is
+    built and hands the report to `create_managed_app`, whose lifespan audits it. An engine shard
+    (``serve --shard``, which is how the supervisor starts every shard, a lone restart included)
+    reuses it untouched: `supervise` renews for the whole fleet before spawning, so one restarted
+    shard can never serve a certificate its siblings do not.
+
+    Mutation: drop ``renew=args.shard is None``. Red: the shard row renews."""
+    cert = tmp_path / _GENERATED_CERT_NAME
+    _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    old = cert.read_bytes()
+    old_sha = _sha256(cert)
+    extra = () if shard is None else ("--shard", shard)
+    handed, _ = _serve_capturing(tmp_path, monkeypatch, _SYNTHETIC_LOOPBACK_TOML, extra)
+    events = handed["api_tls_replacements"]
+    if shard is not None:
+        assert events == []
+        assert cert.read_bytes() == old
+        return
+    assert [(e.reason, e.old_sha256) for e in events] == [("renewal", old_sha)]
+    assert events[0].new_sha256 == _sha256(cert)
+
+
+def test_supervise_renews_once_before_it_spawns_any_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`supervise` is where a sharded fleet's pair is renewed: once, before the first shard starts,
+    so every shard then serves the new certificate. It passes nothing new to the shards. The
+    renewal is audited in the store the shards are about to open.
+
+    Mutation: drop the call in `_supervise`. Red: the pair is unchanged at spawn and no row."""
+    import argparse
+    import asyncio
+
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store import open_store, sqlite_settings
+    from messagefoundry.store.crypto import generate_key
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    cert = tmp_path / _GENERATED_CERT_NAME
+    _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    old = cert.read_bytes()
+    old_sha = _sha256(cert)
+    at_spawn: dict[str, Any] = {}
+
+    async def fake_supervise(config: str, **kwargs: Any) -> int:
+        at_spawn["cert"] = cert.read_bytes()
+        at_spawn["kwargs"] = set(kwargs)
+        return 0
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
+    db = tmp_path / "mefor.db"
+    args = argparse.Namespace(
+        config=str(SAMPLES_CONFIG),
+        db=str(db),
+        base_port=8765,
+        env="dev",
+        service_config=None,
+        project_root=str(tmp_path),
+    )
+    assert cli._supervise(args) == 0
+
+    assert at_spawn["cert"] != old  # renewed BEFORE the fleet was spawned
+    assert at_spawn["kwargs"] == {
+        "store_backend",
+        "db_base",
+        "base_port",
+        "env",
+        "service_config",
+        "project_root",
+    }  # nothing new handed to the shards
+    _load_pair(cert, tmp_path / "api-generated-key.pem")
+
+    async def rows() -> list[Any]:
+        store = await open_store(sqlite_settings(db))
+        try:
+            return list(await store.list_audit(action=GENERATED_PAIR_REPLACED, limit=10))
+        finally:
+            await store.close()
+
+    found = asyncio.run(rows())
+    assert len(found) == 1
+    detail = json.loads(found[0]["detail"])
+    assert (detail["reason"], detail["old_sha256"]) == ("renewal", old_sha)
+    assert detail["new_sha256"] == _sha256(cert)
+
+    # A second supervise start finds a fresh pair: nothing renewed, no second row.
+    assert cli._supervise(args) == 0
+    assert len(asyncio.run(rows())) == 1
+
+
+def test_supervise_renews_the_pair_the_shards_will_serve_under_a_file_set_base_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shard anchors a relative store path under ``[environments].base_dir`` from the settings
+    file, even with no ``--project-root``. The supervisor must renew THAT pair, not one beside its
+    own working directory, or the shards would serve a pair that never renews.
+
+    Mutation: derive the state dir from ``db_base`` alone. Red: the pair under base_dir is untouched
+    and a new pair appears in the working directory."""
+    import argparse
+
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.crypto import generate_key
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    base = tmp_path / "base"
+    elsewhere = tmp_path / "cwd"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    cert, _ = _plant_generated_pair(base, lived_days=300, left_days=65)
+    old = cert.read_bytes()
+    service = tmp_path / "messagefoundry.toml"
+    service.write_text(f'[environments]\nbase_dir = "{base.as_posix()}"\n', encoding="utf-8")
+
+    async def fake_supervise(config: str, **kwargs: Any) -> int:
+        return 0
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
+    args = argparse.Namespace(
+        config=str(SAMPLES_CONFIG),
+        db="mefor.db",  # relative, so the shards anchor it under base_dir
+        base_port=8765,
+        env="dev",
+        service_config=str(service),
+        project_root=None,
+    )
+    assert cli._supervise(args) == 0
+    assert cert.read_bytes() != old
+    assert not (elsewhere / _GENERATED_CERT_NAME).exists()
+    assert (base / "mefor.db").exists()  # the audit row went to the store the shards will open
+
+
+def test_a_shard_with_a_due_pair_reuses_it_and_reports_nothing(tmp_path: Path) -> None:
+    """The unit form of the shard rule: ``renew=False`` reuses a due pair that loads. The control
+    is the same pair with ``renew`` left on, which renews."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    before = _snapshot(cert, key)
+    events: list[GeneratedPairReplaced] = []
+    material = ensure_api_tls_material(
+        ApiSettings(), state_dir=tmp_path, replacements=events, renew=False
+    )
+    assert material == (str(cert), str(key))
+    assert _snapshot(cert, key) == before and events == []
+    ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+    assert [e.reason for e in events] == ["renewal"]
+
+
+def test_a_shard_still_recovers_a_pair_that_does_not_load(tmp_path: Path) -> None:
+    """A shard never renews, but a shard that finds no loadable pair has nothing to serve, so the
+    first-run mint and the unloadable-pair recovery still run there, and are still reported."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    cert.write_bytes(b"")
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events, renew=False)
+    _load_pair(cert, key)
+    assert [e.reason for e in events] == ["unusable"]
+
+
+def test_the_lifespan_writes_one_audit_row_per_replacement(tmp_path: Path) -> None:
+    """The audit record itself, through the store's existing hash-chained audit log, with the old
+    and new fingerprints and expiry dates and no key material. Mutation: drop the lifespan call.
+    Red: no row."""
+    import functools
+
+    from fastapi.testclient import TestClient
+
+    from messagefoundry.api.app import create_managed_app
+
+    event = GeneratedPairReplaced(
+        reason="renewal",
+        cert_file=str(tmp_path / _GENERATED_CERT_NAME),
+        old_sha256="aa" * 32,
+        old_not_after="2026-12-01T00:00:00+00:00",
+        new_sha256="bb" * 32,
+        new_not_after="2027-09-26T00:00:00+00:00",
+    )
+    app = create_managed_app(db_path=tmp_path / "managed.db", api_tls_replacements=[event])
+    with TestClient(app) as tc:
+        store = app.state.engine.store
+        rows = tc.portal.call(
+            functools.partial(store.list_audit, action=GENERATED_PAIR_REPLACED, limit=10)
+        )
+    assert len(rows) == 1
+    assert rows[0]["actor"] is None
+    detail = json.loads(rows[0]["detail"])
+    assert detail == {
+        "reason": "renewal",
+        "cert_file": event.cert_file,
+        "old_sha256": "aa" * 32,
+        "old_not_after": "2026-12-01T00:00:00+00:00",
+        "new_sha256": "bb" * 32,
+        "new_not_after": "2027-09-26T00:00:00+00:00",
+    }
+
+
+def test_the_lifespan_writes_no_audit_row_when_nothing_was_replaced(tmp_path: Path) -> None:
+    """CONTROL for the row above: the ordinary start adds nothing to the audit log."""
+    import functools
+
+    from fastapi.testclient import TestClient
+
+    from messagefoundry.api.app import create_managed_app
+
+    app = create_managed_app(db_path=tmp_path / "managed.db")
+    with TestClient(app) as tc:
+        store = app.state.engine.store
+        rows = tc.portal.call(
+            functools.partial(store.list_audit, action=GENERATED_PAIR_REPLACED, limit=10)
+        )
+    assert rows == []

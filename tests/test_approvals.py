@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -19,7 +21,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.approvals import ApprovalGate
+from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
@@ -480,6 +482,198 @@ async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engin
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None
     assert str(row["status"]) == "rejected"
+
+
+# --- BACKLOG #1940: the audit row and the executed operation must agree ---------------------------
+#
+# approval.approved was written only AFTER the executor ran, outside its try. An audit log that
+# refused writes let the operation complete with no record of the release and handed the approver a
+# 500. The executors had the mirror defect: their own trailing audit row raised after the action ran,
+# and the gate compensated an operation that DID run to 'failed'. The fault is injected per action
+# name, so every other audit write (the login, the request) still lands.
+
+
+def _fail_audit_for(monkeypatch: pytest.MonkeyPatch, engine: Engine, *actions: str) -> None:
+    real = engine.store.record_audit
+
+    async def _record(action: str, **kwargs: Any) -> None:
+        if action in actions:
+            raise sqlite3.OperationalError("disk I/O error")
+        await real(action, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", _record)
+
+
+async def _gate_with_spy_op(engine: Engine) -> tuple[ApprovalGate, list[Mapping[str, Any]], str]:
+    service = await _service(engine)
+    maker_id = await _add(service, "maker", Role.OPERATOR)
+    gate = ApprovalGate(engine.store, ON, resolve_identity=service.identity_for_user_id)
+    calls: list[Mapping[str, Any]] = []
+
+    async def _spy(p: Mapping[str, Any]) -> dict[str, Any]:
+        calls.append(p)
+        return {"requeued": 3}
+
+    gate.register(
+        "dead_letter_replay",
+        "Replay dead-lettered deliveries",
+        _spy,
+        permission=Permission.MESSAGES_REPLAY,
+    )
+    return gate, calls, maker_id
+
+
+async def test_an_audit_log_that_refuses_the_release_stops_the_operation(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-fix the executor ran first and the audit write raised after it, so the operation
+    completed with no approval row. Now the release row is written first, and its failure stops
+    the approve before anything moves."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    _fail_audit_for(monkeypatch, engine, "approval.release_attempted", "approval.approved")
+
+    with pytest.raises(ApprovalError) as caught:
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert caught.value.status == 503
+    assert "did not run" in caught.value.detail
+    assert calls == []  # pre-fix: the operation ran
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "pending"  # retryable, not stranded
+
+    # Once the audit log accepts writes again, the same request releases normally.
+    monkeypatch.undo()
+    outcome = await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert outcome["result"] == {"requeued": 3} and len(calls) == 1
+
+
+async def test_the_refused_release_is_a_503_at_the_route(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route maps the refusal to a clear 503, not a 500, and the replay does not run."""
+    await _dead_letter(engine)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        admin = await _token(c, "approver")
+        _fail_audit_for(monkeypatch, engine, "approval.release_attempted", "approval.approved")
+        r = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+        assert r.status_code == 503
+        assert "still pending" in r.json()["detail"]
+    # The dead letter was not re-queued: nothing ran, and the request did not move.
+    assert len(await engine.store.list_dead(limit=10)) == 1
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "pending"
+    assert await engine.store.list_audit(action="approval.release_attempted") == []
+
+
+async def test_a_release_that_loses_to_a_reject_runs_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented cost of writing the release row first. A reject that lands between that row
+    and the transition wins: the approve is refused, nothing runs, and the release row stands
+    alone with no approved or failed row after it."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    real = engine.store.record_audit
+
+    async def _reject_right_after_the_release_row(action: str, **kwargs: Any) -> None:
+        await real(action, **kwargs)
+        if action == "approval.release_attempted":
+            monkeypatch.undo()  # so the reject's own audit write goes straight through
+            await gate.reject(approval_id, approver="other-checker")
+
+    monkeypatch.setattr(engine.store, "record_audit", _reject_right_after_the_release_row)
+    with pytest.raises(ApprovalError) as caught:
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert caught.value.status == 409
+    assert calls == []
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "rejected"
+    actions = [str(r["action"]) for r in await engine.store.list_audit(limit=50)]
+    assert actions.count("approval.release_attempted") == 1
+    assert "approval.approved" not in actions and "approval.failed" not in actions
+
+
+async def test_a_failed_approved_row_after_the_operation_ran_still_reports_success(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The operation has run, so a 500 would invite a second, duplicate request. The release row
+    written before it already names both identities."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    _fail_audit_for(monkeypatch, engine, "approval.approved")
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        outcome = await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert outcome["result"] == {"requeued": 3} and len(calls) == 1
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "approved"
+    released = await engine.store.list_audit(action="approval.release_attempted")
+    assert len(released) == 1 and str(released[0]["actor"]) == "checker"
+    assert json.loads(str(released[0]["detail"]))["requester"] == "maker"
+    assert any(
+        r.levelno == logging.ERROR and "approval.approved audit row failed" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_a_failed_replay_audit_row_is_not_compensated_to_failed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The executor's own dead_letter_replay row fails AFTER the deliveries were re-queued. Pre-fix
+    the raise reached the gate's compensation and the row read 'failed' for a replay that ran."""
+    await _dead_letter(engine)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        admin = await _token(c, "approver")
+        _fail_audit_for(monkeypatch, engine, "dead_letter_replay")
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+            ok = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+        assert ok.status_code == 200
+        assert ok.json()["result"] == {"requeued": 1}  # the replay really ran
+
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "approved"
+    assert await engine.store.list_audit(action="approval.failed") == []
+    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+    assert any(
+        r.levelno == logging.ERROR and "dead_letter_replay audit row failed" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_a_normal_release_writes_one_release_row_and_one_approved_row(
+    engine: Engine,
+) -> None:
+    """CONTROL for the fault tests above: with a healthy audit log, one release runs the operation
+    once and writes each approval row once, in order."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert len(calls) == 1
+    actions = [str(r["action"]) for r in await engine.store.list_audit(limit=50)]
+    assert actions.count("approval.release_attempted") == 1
+    assert actions.count("approval.approved") == 1
+    # list_audit is newest-first: the release row precedes the approved row in the chain.
+    assert actions.index("approval.approved") < actions.index("approval.release_attempted")
 
 
 async def test_pending_approval_store_contract(engine: Engine) -> None:

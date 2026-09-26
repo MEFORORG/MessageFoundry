@@ -2,7 +2,7 @@
 
 - **Status:** **Accepted (2026-07-31) — owner-ratified at revision 5. BOTH increments are now authorised, built and merged: increment A 2026-08-01 (`f2ef0ea9`, PR #109), increment B 2026-08-01 (PR #119). `AC-18` was deliberately deferred and remains outstanding — see the note below.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-30 (rev 1–4), 2026-07-31 (rev 5, ratified)
-- **⚠️ What acceptance authorised, and what has since been built.** "Accepted" normally means *build may
+- **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
   start*. Here it was **scoped**, because rev 4 split the build and that split is part of what was
   ratified. **Both halves have since been authorised and built** — the split below is retained as the
   decision record, not as a live restriction:

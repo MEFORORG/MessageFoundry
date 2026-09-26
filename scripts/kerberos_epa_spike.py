@@ -21,7 +21,8 @@ CBT unless the acceptor itself supplies bindings; Windows SSPI may enforce under
   ``tls-server-end-point`` binding for the in-process-TLS mode only) is warranted — #98(b).
 
 **How it mirrors production.** The acceptor is constructed exactly as
-``messagefoundry/auth/ldap.py`` builds it — ``spnego.server(service=<spn>, channel_bindings=<...>)``
+``messagefoundry/auth/ldap.py`` builds it — ``spnego.server(hostname=<host>, service=<svc>, ...)``
+with the SPN split at its ``/`` (BACKLOG #275), plus ``channel_bindings=<...>``
 then ``server.step(token)`` — the only addition being the ``channel_bindings`` argument this spike
 varies. The client leg drives a real in-process SPNEGO exchange via ``spnego.client(...)``, so the
 provider's *actual* enforcement behaviour is observed, not assumed.
@@ -29,8 +30,9 @@ provider's *actual* enforcement behaviour is observed, not assumed.
 Env vars (all required; the runbook sets them):
 
 * ``MEFOR_SPIKE_SPN``      — the acceptor SPN, e.g. ``HTTP/engine.lab.example.com`` (matches
-  ``[auth].kerberos_spn``). Passed verbatim as ``service=`` to the acceptor, mirroring ldap.py.
-* ``MEFOR_SPIKE_HOSTNAME`` — the client-side target host (FQDN); used only if the SPN has no ``/``.
+  ``[auth].kerberos_spn``). Split at the ``/`` into ``service=`` and ``hostname=`` for the
+  acceptor, mirroring ldap.py. Passing it whole as ``service=`` built ``HTTP/host/unspecified``.
+  A value the engine would refuse at load is refused here too; the client targets the same SPN.
 * ``MEFOR_SPIKE_USER``     — the test domain user for the client leg (``user`` or ``user@REALM``).
 * ``MEFOR_SPIKE_PASS``     — that user's password (lab, disposable — never a prod credential).
 * ``MEFOR_SPIKE_DOMAIN``   — the lab realm/domain, recorded in the report header for provenance.
@@ -47,9 +49,18 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:  # import for typing only; the runtime imports are lazy (mirrors ldap.py)
+# Anchor on the script, not on whatever sys.path offers (BACKLOG #1439; the same insert as
+# scripts/webconsole_seam_snapshot.py). The runbook runs a worktree's copy with the primary
+# checkout's interpreter, whose editable install may point at another tree. Without this the
+# SPN splitter would come from that tree, or fail to import at all.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from messagefoundry.config.settings import split_kerberos_spn  # noqa: E402
+
+if TYPE_CHECKING:  # typing only; spnego itself is imported lazily (mirrors ldap.py)
     from spnego import ContextProxy
     from spnego.channel_bindings import GssChannelBindings
 
@@ -62,7 +73,6 @@ _HASH_B = bytes(range(32, 64))  # a distinct hash for the "mismatching client CB
 
 _ENV_VARS = (
     "MEFOR_SPIKE_SPN",
-    "MEFOR_SPIKE_HOSTNAME",
     "MEFOR_SPIKE_USER",
     "MEFOR_SPIKE_PASS",
     "MEFOR_SPIKE_DOMAIN",
@@ -74,21 +84,13 @@ class LabParams:
     """The domain-joined lab inputs, read from the environment."""
 
     spn: str
+    # The SPN's two halves, split once by the engine's own splitter (BACKLOG #275).
+    service: str
     hostname: str
     username: str
     password: str
     domain: str
     cert_hash: bytes
-
-    @property
-    def client_service(self) -> str:
-        """Service class for the *client* target SPN (``HTTP`` from ``HTTP/host``)."""
-        return self.spn.split("/", 1)[0] if "/" in self.spn else self.spn
-
-    @property
-    def client_hostname(self) -> str:
-        """Host for the *client* target SPN — the ``/``-suffix of the SPN, else the env hostname."""
-        return self.spn.split("/", 1)[1] if "/" in self.spn else self.hostname
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,14 @@ def _read_params() -> LabParams | None:
             "  set them per docs/security/KERBEROS-EPA-SPIKE-RUNBOOK.md inside the lab, then re-run"
         )
         return None
+    spn = os.environ["MEFOR_SPIKE_SPN"]
+    try:
+        service, hostname = split_kerberos_spn(spn)
+    except ValueError as exc:
+        # The same refusal the engine applies at settings load, so the spike never exercises an
+        # acceptor the engine could not build.
+        print(f"MEFOR_SPIKE_SPN is refused: {exc}")
+        return None
     hash_hex = os.environ.get("MEFOR_SPIKE_CERT_HASH_HEX")
     if hash_hex:
         try:
@@ -127,8 +137,9 @@ def _read_params() -> LabParams | None:
     else:
         cert_hash = _HASH_A
     return LabParams(
-        spn=os.environ["MEFOR_SPIKE_SPN"],
-        hostname=os.environ["MEFOR_SPIKE_HOSTNAME"],
+        spn=spn,
+        service=service,
+        hostname=hostname,
         username=os.environ["MEFOR_SPIKE_USER"],
         password=os.environ["MEFOR_SPIKE_PASS"],
         domain=os.environ["MEFOR_SPIKE_DOMAIN"],
@@ -203,7 +214,7 @@ def _run_exchange(
 ) -> CellResult:
     """Drive one real in-process SPNEGO exchange and report a :class:`CellResult`.
 
-    The acceptor is built exactly as ``auth/ldap.py`` does — ``spnego.server(service=<spn>, …)`` +
+    The acceptor is built exactly as ``auth/ldap.py`` does — ``spnego.server(hostname=, service=)`` +
     ``server.step(token)`` — with only ``channel_bindings`` added. A rejected exchange raises
     ``SpnegoError``; the provider's *channel-binding* (EPA) rejection surfaces specifically as
     ``BadBindingsError`` and is flagged so the verdict never confuses it with an unrelated
@@ -220,12 +231,16 @@ def _run_exchange(
         client = spnego.client(
             username=params.username,
             password=params.password,
-            hostname=params.client_hostname,
-            service=params.client_service,
+            hostname=params.hostname,
+            service=params.service,
             channel_bindings=client_cb,
         )
-        # Mirror ldap.py's acceptor construction verbatim, plus the varied channel_bindings.
-        server = spnego.server(service=params.spn, channel_bindings=server_cb)
+        # Mirror ldap.py's acceptor construction (the SPN split at its '/'), plus channel_bindings.
+        server = spnego.server(
+            hostname=params.hostname,
+            service=params.service,
+            channel_bindings=server_cb,
+        )
 
         token = client.step()
         # SPNEGO can be multi-leg; bound the ping-pong so a misbehaving provider can't spin forever.
@@ -303,7 +318,7 @@ def main() -> int:
     print("Kerberos / SPNEGO channel-binding (EPA) acceptor-enforcement spike — BACKLOG #98(a)")
     print("=" * 78)
     print(f"  domain     : {params.domain}")
-    print(f"  acceptor SPN: {params.spn}  (passed verbatim as service= — mirrors auth/ldap.py)")
+    print(f"  acceptor SPN: {params.spn}  (split into service=/hostname= — mirrors auth/ldap.py)")
     print(f"  client user : {params.username}")
     print(
         f"  cert hash   : {'operator-supplied' if len(params.cert_hash) != 32 or params.cert_hash != _HASH_A else 'synthetic placeholder'} ({len(params.cert_hash)} bytes)"

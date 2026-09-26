@@ -344,7 +344,8 @@ authentication is on, because a browser cannot set the `Authorization` header on
 
 The two gates audit differently. Under the default audit setting, `authorize_ws` writes one
 `auth.permission_granted` row per authorized handshake, before the route's connection-cap check.
-`authorize_ui_ws` writes no grant row, and its denial rows carry no client address.
+`authorize_ui_ws` writes no grant row. Its denial rows carry the client address, as those of
+`authorize_ws` do, read through the same `client_ip()` (ADR 0150, BACKLOG #1644).
 
 ### Permission catalogue (29)
 
@@ -996,6 +997,14 @@ server-side, not a client confirmation). On release the captured operation is **
 `approval.approved` by the checker); `POST /approvals/{id}/reject` declines it (`approval.rejected`), and
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`.
+
+**The audit log must accept a release before the operation runs.** Just before it releases a
+request, the gate writes an `approval.release_attempted` row against the approver, naming the
+requester. If the audit log refuses that write, the approve returns **503**, nothing runs, and the
+request stays pending. `approval.approved` is written after the operation, with its result. If only
+that later write fails, the error is logged and the release still succeeds, because the operation
+has already run. A release that loses a race with another approve or a reject leaves an
+`approval.release_attempted` row with no outcome row after it; the request's status says what won.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
@@ -1919,7 +1928,14 @@ pass. That is why *renamed* is absent from the ambiguity list below: it used to 
 rename as an absence revoked the renamed person's sessions on every interval. A directory that returns
 no readable `objectGUID` still probes by name and keeps that ambiguity (BACKLOG #1471, #1532). Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
-BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5).
+BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
+row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and
+audits `auth.ad_reconcile_binding_unkeyed` with reason `directory_object_id_missing`, once per account
+per process, and a federated sign-in to it is refused with the same reason. That row is distinct from
+the outage's `auth.ad_reconcile_skipped` on purpose: it reports one account whose directory disable
+the pass will not enforce, which is not benign. **The cost:** a directory
+disable or demotion no longer ends that row's sessions within one interval, only at their expiry.
+Removing the binding (`DELETE /users/{user_id}/federated-identity`) returns the row to the pass.
 
 Three safety properties, because the lookup still returns one indistinguishable "not found" for
 *disabled*, *deleted*, *moved out of the search base* and *the search base was never right*:

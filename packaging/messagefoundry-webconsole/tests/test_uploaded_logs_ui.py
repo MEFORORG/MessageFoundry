@@ -1019,7 +1019,11 @@ async def test_a_stale_step_up_window_uploads_nothing(engine: Engine, tmp_path: 
         assert "acme.hl7" in listing2.text
         assert "/ui/uploaded-logs/file/" in listing2.text
         # Exactly one across the WHOLE store, which is the stale arm's zero and this arm's one.
-        assert len(await engine.store.list_audit(action="upload.create", limit=200)) == 1
+        created = await engine.store.list_audit(action="upload.create", limit=200)
+        assert len(created) == 1
+        # BACKLOG #1643: the row must name WHO uploaded, and that is the signed-in "op". A count
+        # alone would pass on a row written with the wrong actor, or with none.
+        assert created[0]["actor"] == "op", created[0]["actor"]
 
 
 async def test_reauth_unlocks_the_upload_form(engine: Engine, tmp_path: Path) -> None:
