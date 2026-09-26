@@ -588,11 +588,14 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
         message = hl7.parse(normalize(payload))
         seg_sep: str = message.separator  # segment separator (CR) is not part of the override
         src_esc: str = message.esc  # the source message's own escape character
-    except (hl7.HL7Exception, IndexError, ValueError) as exc:
-        # IndexError covers a header so truncated python-hl7 can't read MSH-2 (e.g. "MSH|"); ValueError
-        # is defensive. A non-HL7 body simply cannot be delimiter-rewritten — surface it, don't corrupt.
+    except (hl7.HL7Exception, IndexError, ValueError, AssertionError) as exc:
+        # IndexError covers a header so truncated python-hl7 can't read MSH-2 (e.g. "MSH"); ValueError
+        # is defensive. AssertionError is python-hl7's own header check, which a header with no field
+        # separator before its first segment break trips ("MSH\rPID|1", "MSH|\rPID|1"; BACKLOG
+        # #1601). A non-HL7 body simply cannot be delimiter-rewritten — surface it, don't corrupt.
+        # safe_exc names the type: python-hl7's AssertionError carries no message of its own.
         raise ValueError(
-            f"cannot re-encode delimiters: payload is not parseable HL7 ({exc})"
+            f"cannot re-encode delimiters: payload is not parseable HL7 ({safe_exc(exc)})"
         ) from exc
 
     def leaf_text(node: object) -> str:
@@ -990,9 +993,12 @@ class MLLPDestination(DestinationConnector):
                 # than framing a corrupted message; the pipeline records the ERROR.
                 try:
                     payload = emit_raw_separators(payload)
-                except (hl7.HL7Exception, ValueError) as exc:
+                except (hl7.HL7Exception, ValueError, IndexError, AssertionError) as exc:
+                    # IndexError and AssertionError: the same truncated-header shapes that
+                    # reencode_delimiters maps to ValueError above (BACKLOG #1601).
                     raise DeliveryError(
-                        f"MLLP hl7_raw_separators emit failed (payload not parseable HL7): {exc}"
+                        "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
+                        f"{safe_exc(exc)}"
                     ) from exc
             if self.no_ack:
                 # BACKLOG #117 (ADR 0124): fire-and-forward — write + drain, no ACK read, deliver on
