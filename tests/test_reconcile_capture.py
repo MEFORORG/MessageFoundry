@@ -20,7 +20,7 @@ import pytest
 
 from harness.reconcile import __main__ as reconcile_cli
 from harness.reconcile.capture import CaptureSink
-from messagefoundry.transports.mllp import MLLPDecoder, frame
+from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder, frame
 from tests._mllp_over_cap import send_over_cap, send_valid_then_over_cap
 
 
@@ -229,4 +229,4 @@ def test_capture_cli_passes_zero_through_as_cap_off(
     argv = ["capture", "--port", "0", "--out", str(tmp_path / "c.jsonl")]
     assert reconcile_cli.main([*argv, "--max-frame-bytes", "0"]) == 0
     assert reconcile_cli.main(argv) == 0
-    assert seen == [0, reconcile_cli.DEFAULT_MAX_FRAME_BYTES]
+    assert seen == [0, DEFAULT_MAX_FRAME_BYTES]

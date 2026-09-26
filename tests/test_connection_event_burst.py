@@ -175,7 +175,7 @@ async def test_a_failed_burst_costs_only_its_bad_row_and_the_drainer_keeps_going
         " salvaged 2 of 3 event(s) singly, dropped 1"
     ]
     kept = await store.list_connection_events()
-    assert sorted(e.peer_host for e in kept) == ["10.0.0.0", "10.0.0.2"]
+    assert sorted(e.peer_host or "" for e in kept) == ["10.0.0.0", "10.0.0.2"]
     # Two salvaged rows commit; the third rolls back and commits nothing.
     assert store.committed_txns - before == 2
     assert not store._db.in_transaction  # neither the failed burst nor the failed retry left one
@@ -183,7 +183,7 @@ async def test_a_failed_burst_costs_only_its_bad_row_and_the_drainer_keeps_going
 
     _enqueue(runner, _event(4))
     await _join(runner)
-    assert sorted(e.peer_host for e in await store.list_connection_events()) == [
+    assert sorted(e.peer_host or "" for e in await store.list_connection_events()) == [
         "10.0.0.0",
         "10.0.0.2",
         "10.0.0.4",

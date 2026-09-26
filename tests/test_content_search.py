@@ -216,7 +216,7 @@ async def test_scan_runs_off_event_loop(tmp_path: Path, monkeypatch: pytest.Monk
         calls: list[str] = []
         real_to_thread = asyncio.to_thread
 
-        async def _spy(func, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+        async def _spy(func, /, *args, **kwargs):
             calls.append(getattr(func, "__name__", str(func)))
             return await real_to_thread(func, *args, **kwargs)
 

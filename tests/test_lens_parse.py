@@ -33,7 +33,7 @@ def _handler_def_ranges(source: str) -> dict[str, tuple[int, int]]:
                     name = dec.args[0].value
                 else:
                     name = node.name
-                assert node.end_lineno is not None
+                assert isinstance(name, str) and node.end_lineno is not None
                 out[name] = (node.body[0].lineno, node.end_lineno)
     return out
 

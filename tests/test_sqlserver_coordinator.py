@@ -86,7 +86,7 @@ async def test_standby_takes_over_an_expired_lease(store) -> None:
     assert a.is_leader() is True
 
     # Simulate A going dark: force its lease expired (epoch 0 < DB now) without waiting out a TTL.
-    await store._execute(  # type: ignore[attr-defined]
+    await store._execute(
         "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = ?", (a._lease_key,)
     )
     b = _coord(store, "nodeB:2:bbbb")

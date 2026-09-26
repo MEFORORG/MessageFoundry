@@ -51,6 +51,22 @@ Recognition is added in phases, ordered by leverage (statement counts from the s
 > call sites, so an `ast.Assign` can never reach it; the function carries no `field` branch in any
 > case. The lens defines no read-field action.
 >
+> **Update 2026-09-25 (BACKLOG #1505) -- row 4 is now BUILT, with the var name read-only.** The
+> paragraph above is kept as the 2026-09-09 reading. `name = msg.field("Y")` now renders as a
+> `read_field` action row, titled **Read Field**. Its `path` is editable while it is a literal, as on
+> Set Field. `occurrence=` and `repetition=` are read-only display params, preserved byte-for-byte on
+> an edit. The bound name rides as `assign_to`, the field lookup rows use, and it is **not**
+> editable: renaming the target alone would leave its later uses pointing at the old name, and this
+> ADR does not say whether a rename should follow them. That is an open design question, not a
+> build gap. For the same reason the row's STRUCTURE stays as read-only as the code row it was:
+> `lens rewrite` refuses `delete_row` and `move_row` on it (so a Steps cut, drag or up/down too),
+> and the Steps view offers none of them. Inserting a Read Field is not built. Only a plain
+> assignment to one bare name qualifies; a `msg` target, a tuple, attribute, subscript or chained
+> target, an annotated or augmented assignment, the `msg.field(...) or ""` default, and any read
+> inside a `@router` stay `code` rows. A separate recognizer, `_recognize_native_read`, carries
+> it, so `_recognize_native_method` still has no `field` branch and a bare `msg.field(...)`
+> statement stays `code`. Tests: `tests/test_lens_native_read.py`.
+>
 > **HALF BUILT -- row 6.** `msg.add_segment(line)` is built, and emits an **Add Segment** row, not
 > "Add/Copy Segment" (the lens credits it to ADR 0106 §3 Group 1). `set_segment` names a method the
 > `Message` API does not have: `messagefoundry/parsing/message.py` defines, among others, `field`,

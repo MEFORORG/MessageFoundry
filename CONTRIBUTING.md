@@ -52,6 +52,7 @@ maintainer.)
    ruff check .
    ruff format --check .
    mypy messagefoundry
+   mypy --explicit-package-bases tests   # needs CI's extras: scripts\worktree\ensure-venv.ps1 installs them
    $env:QT_QPA_PLATFORM = "offscreen"; pytest -q
    ```
    You can also run the project's own commit/CI gate: `python -m messagefoundry check`.

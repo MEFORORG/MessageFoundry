@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import textwrap
+import typing
 from collections.abc import Callable
 from pathlib import Path
 
@@ -84,13 +85,14 @@ _BUILDERS = pytest.mark.parametrize("builder", [_code_first, _toml], ids=["code"
 def test_one_pattern_object_serves_both_layers() -> None:
     # Identity, not equality: a second copy with the same text today is the drift this item closes.
     assert validation.CONNECTION_NAME_PATTERN is connection_names.CONNECTION_NAME_PATTERN
-    assert wiring.CONNECTION_NAME_PATTERN is connection_names.CONNECTION_NAME_PATTERN
+    # vars(): wiring imports the name rather than re-exporting it, which strict mypy refuses.
+    assert vars(wiring)["CONNECTION_NAME_PATTERN"] is connection_names.CONNECTION_NAME_PATTERN
     # The ceiling the importer budgets against is the one written in the pattern.
     assert f"{{0,{connection_names.CONNECTION_NAME_MAX_LENGTH - 1}}}" in (
         connection_names.CONNECTION_NAME_PATTERN
     )
     # And the pydantic type the API routes use is built from that same string.
-    constraint = validation.ConnectionName.__metadata__[0]
+    constraint = typing.get_args(validation.ConnectionName)[1]  # Annotated[str, <constraint>]
     assert constraint.pattern is connection_names.CONNECTION_NAME_PATTERN
 
 

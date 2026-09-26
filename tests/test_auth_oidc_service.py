@@ -45,6 +45,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.base import Row
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports.signing import CompactJwtSigner
 
@@ -261,7 +262,7 @@ def _stub_exchange(monkeypatch: pytest.MonkeyPatch, id_token: str) -> list[dict[
     return calls
 
 
-async def _audit_rows(store: MessageStore, action: str) -> list[Mapping[str, Any]]:
+async def _audit_rows(store: MessageStore, action: str) -> list[Row]:
     return [a for a in await store.list_audit() if a["action"] == action]
 
 

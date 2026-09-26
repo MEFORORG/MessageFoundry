@@ -9,7 +9,8 @@ decrypts PHI) is step-up-gated + registered as an UNLOCK action (like content se
 step-up, body-less, auto-retryable POST behind a confirm step; upload is a step-up'd same-origin
 multipart POST whose re-auth continuation is the UNLOCK form page at ``/ui/uploaded-logs/upload-form``
 (BACKLOG #1739). Resend is a step-up POST behind a body-less confirm step, its message index and target
-inbound carried in the query so the confirm URL is a valid re-auth continuation (BACKLOG #1227).
+inbound carried in the query so the confirm URL is a valid re-auth continuation (BACKLOG #1227). The
+confirm GET is step-up-gated too (BACKLOG #1822); both map a stale window back to that URL.
 
 THE UPLOAD SENTENCE USED TO ARGUE THE OPPOSITE CONCLUSION, and it is quoted and answered here rather
 than simply deleted, because it is the argument anyone re-opening this question will reach for again.
@@ -45,6 +46,7 @@ from .._auth import (
     require_ui,
     require_ui_step_up,
 )
+from ..pages._common import _seg
 from ._common import _form_pairs
 
 # The browse GET decrypts PHI (step-up), so register it as an UNLOCK form — a stale step-up 303s to
@@ -220,6 +222,16 @@ _MINTED_FILE_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
 def _log_file_id(file_id: str) -> str:
     return file_id if _MINTED_FILE_ID_RE.match(file_id) else "malformed"
+
+
+def _resend_confirm_next(r: Request) -> str:
+    """The re-auth continuation for BOTH resend routes: the confirm page, carrying the query.
+
+    The query is the operator's selection (``index`` and ``to``). The default continuation is the
+    bare path, which would come back from re-auth as a 422 with the selection gone. The POST and the
+    confirm GET carry the same two parameters, so one mapping serves both. ``_seg`` re-encodes the
+    decoded id, as the messages twin does, so a ``?`` or ``#`` in it cannot split the URL."""
+    return f"/ui/uploaded-logs/file/{_seg(r.path_params['file_id'])}/resend-confirm?{r.url.query}"
 
 
 def _refused(code: str) -> RedirectResponse:
@@ -509,13 +521,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         to: str = Query(..., min_length=1, max_length=256),
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(
-            require_ui_step_up(
-                Permission.FILES_BROWSE,
-                reauth_next=lambda r: (
-                    f"/ui/uploaded-logs/file/{r.path_params['file_id']}/resend-confirm"
-                    f"?{r.url.query}"
-                ),
-            )
+            require_ui_step_up(Permission.FILES_BROWSE, reauth_next=_resend_confirm_next)
         ),
     ) -> Response:
         # BACKLOG #1227. The old premise here was "the browse page it posts from is already
@@ -582,11 +588,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         index: int = Query(..., ge=0),
         to: str = Query(..., min_length=1, max_length=256),
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui(Permission.FILES_BROWSE)),
+        identity: Identity = Depends(
+            require_ui_step_up(Permission.FILES_BROWSE, reauth_next=_resend_confirm_next)
+        ),
     ) -> Response:
-        # The confirm step for resend (BACKLOG #1227), mirroring the delete confirm below. It is
-        # PLAIN require_ui, not step-up: this page is the re-auth CONTINUATION, so gating it with
-        # step-up would bounce the operator straight back to /ui/reauth in a loop.
+        # The confirm step for resend (BACKLOG #1227). STEP-UP-GATED since BACKLOG #1822, matching
+        # the JSON browse route that carries the same permission. It used to be plain require_ui on
+        # the claim that a gate on the re-auth continuation loops. It does not: /ui/reauth refreshes
+        # the window BEFORE it redirects back, so the gated page renders, as the upload form's does.
+        # The one real difference from that form is the query, which is why ``reauth_next`` is set.
         #
         # It exists so the POST can be body-less. The selection lives in THIS page's own URL rather
         # than in server-side state, which is why the shape beats stashing the message body across
