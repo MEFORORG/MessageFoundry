@@ -125,6 +125,23 @@ def test_a_companion_named_inside_its_row_is_represented(
     assert coverage.unrepresented == []
 
 
+def test_a_row_written_without_the_space_after_the_pipe_is_seen(
+    tmp_path: Path, ledger_check: ModuleType
+) -> None:
+    # BACKLOG #2003. The gate's row count already accepted `|[0002]`, while index_row needed
+    # `| [0002]`, so this file read as unrepresented here and as indexed at commit time.
+    row = "|[0002](0002-tight.md) | Tight row | Accepted |"
+    adr = _corpus(tmp_path, rows=[row], files=["0002-tight.md"])
+
+    coverage = ledger_check.adr_index_coverage(adr)
+
+    assert coverage.unrepresented == []
+    # The row's own link, not a companion: the classifier anchors on the same pattern.
+    assert coverage.companions == []
+    assert ledger_check.index_row(README_HEAD + row + "\n", "0002") == row
+    assert ledger_check.INDEX_ROW.findall(README_HEAD + row + "\n") == ["0002"]
+
+
 def test_the_shared_companion_predicate(ledger_check: ModuleType) -> None:
     # Pins the predicate only. The gate's own use of it is covered by test_ledger_check.py's
     # declared-companion and reused-number tests.

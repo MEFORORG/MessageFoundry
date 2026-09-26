@@ -37,7 +37,12 @@ from pathlib import Path
 from typing import NamedTuple
 
 ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
-INDEX_ROW = re.compile(r"^\|\s*\[(\d{4})\]", re.M)
+#: THE ONE DEFINITION OF AN INDEX ROW (BACKLOG #2003). check_adrs counts rows with it, and index_row
+#: finds one with it, so a row is seen by every check or by none. index_row used to need the exact
+#: prefix `| [NNNN]` while this allowed `|[NNNN]`, so such a row passed the has-a-row test and was
+#: invisible to the companion check and to adr_index_coverage. `[ \t]*`, not `\s*`: under re.M a
+#: `\s*` crosses a newline, so findall over the whole file could count a row index_row never sees.
+INDEX_ROW = re.compile(r"^\|[ \t]*\[(\d{4})\]", re.M)
 
 #: How far back the restore carve-out (BACKLOG #1468) will look for a blob one ADR path once carried.
 #: Bounded because this runs inside a pre-commit hook; see Ledger._history_of_this_number, which
@@ -137,8 +142,24 @@ def _blob_id(spec: str) -> str | None:
 
 
 def index_row(readme: str, number: str) -> str:
-    """The docs/adr/README.md row for one ADR number, or "" when the index has none."""
-    return next((ln for ln in readme.splitlines() if ln.startswith(f"| [{number}]")), "")
+    """The docs/adr/README.md row for one ADR number, or "" when the index has none.
+
+    Matches with INDEX_ROW, never a prefix of its own (BACKLOG #2003).
+    """
+    for ln in readme.splitlines():
+        m = INDEX_ROW.match(ln)
+        if m and m.group(1) == number:
+            return ln
+    return ""
+
+
+def _row_links_as_own(row: str, basename: str) -> bool:
+    """True when the row's number cell links this file, i.e. it is the row's own ADR, not a companion.
+
+    Anchored with INDEX_ROW for the same reason index_row is (BACKLOG #2003).
+    """
+    m = INDEX_ROW.match(row)
+    return bool(m) and row[m.end() :].startswith(f"({basename})")
 
 
 def row_names_file(row: str, basename: str) -> bool:
@@ -179,7 +200,7 @@ def adr_index_coverage(adr_dir: Path) -> AdrCoverage:
         row = index_row(readme, name[:4])
         if not row_names_file(row, name):
             unrepresented.append(name)
-        elif not row.startswith(f"| [{name[:4]}]({name})"):
+        elif not _row_links_as_own(row, name):
             companions.append(name)
     return AdrCoverage(files, companions, unrepresented)
 

@@ -657,6 +657,47 @@ def test_duplicate_index_rows_are_blocked(repo: Path) -> None:
     assert "duplicate index row" in out
 
 
+def test_a_companion_declared_in_a_row_written_WITHOUT_the_space_is_allowed(repo: Path) -> None:
+    """BACKLOG #2003. The row-counting pattern already took `|[0001]`; the row finder did not.
+
+    Before the fix index_row returned "" for this row, so the declared companion read as an undeclared
+    reuse of 0001 and was refused, while the has-a-row test counted the same row. One pattern now.
+    """
+    write(repo, "docs/adr/0001-first-increment-2.md", "# 0001 -- First, increment 2\n")
+    row = (
+        "|[0001](0001-first.md) | First. Companion: "
+        "[0001-first-increment-2](0001-first-increment-2.md) | Accepted |"
+    )
+    write(repo, "docs/adr/README.md", README_HEAD + row + "\n")
+    allocate(repo, "adr", "0001")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_a_row_split_across_a_newline_after_the_pipe_is_not_a_row(repo: Path) -> None:
+    """BACKLOG #2003. `\\s*` under re.M crossed a newline, so a bare `|` line counted the next line.
+
+    index_row reads one line at a time and never saw such a "row", so the two disagreed. With the
+    shared pattern neither sees it, and the new ADR has no row.
+    """
+    write(repo, "docs/adr/0002-new.md", "# 0002 -- New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n|\n[0002](0002-new.md) | New | Accepted |\n",
+    )
+    allocate(repo, "adr", "0002")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 (0002-new.md) has no row" in out
+
+
 # ----------------------------------------------------------------- BACKLOG numbers
 
 
