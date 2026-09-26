@@ -15,8 +15,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.parsing import Message, split_batch, split_by_obr
+from messagefoundry.parsing._backend import backend
 from messagefoundry.transports import build_source
 
 # --- synthetic fixtures ------------------------------------------------------
@@ -183,6 +186,36 @@ def test_split_by_obr_no_control_id_left_untouched() -> None:
     assert len(parts) == 2
     assert all(Message.parse(p).control_id is None for p in parts)
     assert Message.parse(parts[1]).field("OBR-4.1") == "BMP"
+
+
+# BACKLOG #1597: the ledger row's seven-segment shape. The blank line sits in the header, before any
+# OBR, so a slice that loses it shifts EVERY group: v2 used to land under order 1.
+_BLANK_BEFORE_ORDERS = "MSH|^~\\&|LAB|FAC|EHR|HOSP|20260101||ORU^R01|B1|P|2.5.1\rPID|1||500\r\r"
+_TWO_ORDERS = "OBR|1|O1\rOBX|1|ST|T||v1\rOBR|2|O2\rOBX|1|ST|T||v2\r"
+
+
+@pytest.mark.parametrize("builtin", [True, False], ids=["builtins", "python-hl7"])
+@pytest.mark.parametrize(
+    "oru",
+    [
+        _BLANK_BEFORE_ORDERS + _TWO_ORDERS,
+        _BLANK_BEFORE_ORDERS.replace("\r\r", "\r") + _TWO_ORDERS,  # control: no blank line
+        # A blank line INSIDE an order group, between OBR 1 and its OBX.
+        _BLANK_BEFORE_ORDERS.replace("\r\r", "\r") + _TWO_ORDERS.replace("O1\r", "O1\r\r"),
+    ],
+    ids=["blank-in-header", "control", "blank-in-group"],
+)
+def test_split_by_obr_keeps_each_observation_with_its_own_order(oru: str, builtin: bool) -> None:
+    with backend(builtin=builtin):
+        parts = [Message.parse(p) for p in split_by_obr(oru)]
+        assert [p.segments() for p in parts] == [["MSH", "PID", "OBR", "OBX"]] * 2
+        assert [(p.field("OBR-2"), p.field("OBX-5")) for p in parts] == [("O1", "v1"), ("O2", "v2")]
+        assert [p.control_id for p in parts] == ["B1-1", "B1-2"]
+
+
+def test_split_by_obr_returns_a_zero_obr_message_verbatim_with_its_blank_line() -> None:
+    adt = ADT_A01.replace("EVN", "\rEVN", 1)  # MSH, blank, EVN, PID
+    assert split_by_obr(adt) == [adt]
 
 
 # --- File source: batch split at ingress -------------------------------------
