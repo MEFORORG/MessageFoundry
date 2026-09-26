@@ -689,6 +689,39 @@ async def test_content_search_scan_decrypt(store) -> None:
     assert res4.scanned == 1 and res4.truncated is True
 
 
+@pytest.mark.parametrize(
+    ("seeded", "fetched", "truncated"),
+    # Exactly scan_limit (not truncated), one past it, and well past it. The last arm is the one a
+    # dropped LIMIT fails: with only scan_limit + 1 seeded, an unbounded SELECT reads the same count.
+    [(3, 3, False), (4, 4, True), (12, 4, True)],
+)
+async def test_content_search_select_is_capped_at_scan_limit_plus_one(
+    store, monkeypatch: pytest.MonkeyPatch, seeded: int, fetched: int, truncated: bool
+) -> None:
+    """BACKLOG #2068 backend parity: the candidate SELECT reads at most scan_limit + 1 rows (each
+    carrying `raw`), so the scan cap bounds memory and not only decrypts; `truncated` stays exact.
+    (Runs against a real server in the gated CI leg.)"""
+    for i in range(seeded):
+        await store.enqueue_message(
+            channel_id="IB_A", raw=RAW, deliveries=[], control_id=f"C{i}", now=100.0 + i
+        )
+    counts: list[int] = []
+    real = store._scan_rows
+
+    def _spy(spec, candidates, limit):
+        counts.append(len(candidates))
+        return real(spec, candidates, limit)
+
+    monkeypatch.setattr(store, "_scan_rows", _spy)
+    spec = make_spec(content="zzz-no-match", field_path=None, field_value=None, scan_limit=3)
+    res = await store.search_messages(spec)
+    assert counts == [fetched]
+    assert res.scanned == 3 and res.truncated is truncated
+    counts.clear()
+    res = await store.search_messages(spec, channel_id="IB_A")
+    assert counts == [fetched] and res.truncated is truncated
+
+
 async def test_replay_dead_only_dead_rows(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], now=100.0

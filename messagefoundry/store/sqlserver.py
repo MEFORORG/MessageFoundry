@@ -9538,14 +9538,16 @@ class SqlServerStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
+        # Capped at scan_limit + 1 rows (#2068): each candidate carries `raw`, and one row past the cap
+        # lets `_scan_rows` report `truncated`. See ``MessageStore.search_messages``.
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata, raw,"
             " (SELECT TOP 1 event FROM message_events e WHERE e.message_id = messages.id"
             "  ORDER BY e.id DESC) AS last_event"
             f" FROM messages{where}"
-            " ORDER BY received_at DESC, id DESC",
-            params,
+            " ORDER BY received_at DESC, id DESC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY",
+            (*params, spec.scan_limit + 1),
         )
         return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
 
