@@ -208,7 +208,7 @@ The one row that *does* vary:
 | `proxy_tls_min_version` | str | _unset_ | the operator-**declared** TLS version floor the reverse proxy negotiates with browsers: `1.2` or `1.3` (NIST SP 800-52r2) — any other value is refused at load. The engine terminates no browser TLS in Posture-B, so it cannot inspect the proxy's negotiated version (ASVS 11.6.2); this is the attested floor, validated only for coherence. Unset = undeclared, gated exactly like `proxy_intra_service_auth` above. |
 | `proxy_tls_ciphers` | str | _unset_ | an **optional** declared OpenSSL cipher list for that proxy floor. When set it must resolve to suites that are forward-secret (ASVS 11.6.2), that encrypt, and that authenticate the peer — so a declared floor can't itself name a non-forward-secret key exchange, a NULL cipher, or an anonymous one. It uses the same validator as `tls_ciphers` but **deliberately without the approved-suite allow-list** ([BACKLOG #1317](BACKLOG.md)): this field *declares* what a proxy the engine does not operate already speaks, and refusing an unlisted-but-sound suite would not harden anything — it would stop an operator describing their proxy accurately. Unset = no cipher declaration; it is **not** required to satisfy the Posture-B gate (only `proxy_intra_service_auth` + `proxy_tls_min_version` are). |
 | `serve_ui` | | | **→ moved to `[security].serve_web_console`** (ADR 0118) — set it there; no longer accepted in `[api]`. |
-| `serve_ui_explicit` | bool | `false` | **Internal plumbing — not an operator knob.** The loader sets it `true` when `[security].serve_web_console` was **explicitly** provided (at either value), so `serve` can tell an explicit `serve_web_console = true` with the console wheel absent (**hard refuse** — the operator asked for the console by name) from the default-on posture with the wheel absent (JSON-only serve + a warning, never a start failure). Set `[security].serve_web_console`, not this. |
+| `serve_ui_explicit` | | | **Removed, and refused at load** in the file or as `MEFOR_API_SERVE_UI_EXPLICIT` (BACKLOG #2000). It was an internal marker, never an operator setting. `serve` now checks whether you set `[security].serve_web_console` yourself, at either value. With the console wheel absent, an explicit `true` refuses to start. The default-on posture serves JSON only, with a warning. To request the console explicitly, set `[security].serve_web_console`. |
 | `public_origin` | | | **→ moved to `[security].web_console_public_address`** (ADR 0118) — set it there; no longer accepted in `[api]`. |
 | `ws_allowed_origins` | list[str] | `[]` | browser `Origin` allowlist for the **native/bearer** `/ws/stats` path only — NOT the `/ui` browser WebSocket (that authorizes via the cookie + a match against `[security].web_console_public_address`, falling back to the `Host` header when unset). Don't conflate the two knobs. |
 
@@ -255,12 +255,12 @@ The one row that *does* vary:
 > **auto-degrades a default-on console to JSON-only** (ADR 0143; [`__main__.py`](../messagefoundry/__main__.py)
 > flips `serve_ui` off in place). That degrade is the **one precondition on this page whose absence
 > produces no error**: the engine starts clean, prints a single stderr warning, and `/ui` 404s. It is
-> the *explicitness* that saves you, not the value — the loader only marks the console explicit when
+> the *explicitness* that saves you, not the value — `serve` treats the console as explicit only when
 > you wrote the key yourself, so inheriting the `true` default is exactly what trips it. Verified by
-> loading the terminator recipe below through `load_settings()`: without the key,
-> `serve_ui = True, serve_ui_explicit = False` and the exposure predicate is true, so the console is
-> dropped; with it, `serve_ui_explicit = True` and the console is served (and then has to satisfy the
-> ladder). Setting it also arms the refusals below — which is the point: an explicit `true` converts
+> loading the terminator recipe below through `load_settings()`. Without the key,
+> `security.serve_web_console_explicit` is `False` and the exposure predicate is true, so the console
+> is dropped. With it, that property is `True` and the console is served, and then has to satisfy the
+> ladder. Setting it also arms the refusals below — which is the point: an explicit `true` converts
 > every silent degrade on this page into a loud `exit 2`.
 >
 > With that set, the two supported postures:

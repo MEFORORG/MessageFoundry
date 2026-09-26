@@ -2164,7 +2164,7 @@ def test_browser_hardening_default_reports_nothing(
     assert "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING" not in capsys.readouterr().err
 
 
-def test_serve_ui_explicit_offloopback_still_refuses(
+def test_serve_web_console_explicit_offloopback_still_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # ADR 0143: the off-loopback /ui refusals are UNCHANGED for an EXPLICITLY-enabled console — an
