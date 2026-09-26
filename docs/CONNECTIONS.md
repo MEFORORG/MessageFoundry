@@ -1149,12 +1149,12 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   before any network traffic, as a permanent `SFTP connection rejected: ...` error. Its wording can
   mislead: an Ed25519 key in OpenSSH form reports `unpack requires a buffer of 4 bytes`. Measured
   against paramiko 5.0.0, the locked version.
-- **A slow SFTP server is retried; a refusing one is not (BACKLOG #1999).** A server that does not
-  finish the SSH banner, the key exchange or authentication within the connect timeout is a
-  **transient** `SFTP connect timed out: ...` error, so the delivery retries. A host-key rejection
-  stays permanent, and an authentication refusal stays a credential fault that stops the lane (ADR
-  0095). How the connector tells a timeout from a refusal is stated once, in
-  `remotefile._sftp_connect_timeout`'s docstring.
+- **A slow SFTP server is retried; a refusing one is not (BACKLOG #1999).** A server that stalls in
+  the SSH banner, the key exchange or authentication is a **transient** error, and so is one that
+  drops the connection before the key exchange completes, so the delivery retries. A host-key
+  rejection stays permanent, and an authentication refusal stays a credential fault that stops the
+  lane (ADR 0095). How the connector tells the two apart, and which paramiko bounds apply, is stated
+  once, in `remotefile._sftp_slow_peer`'s docstring.
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).

@@ -297,9 +297,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   credential.** A server that did not finish the SSH banner or key exchange within the connect
   timeout was classed as a permanent error, so the delivery would dead-letter on first deployment.
   One that did not answer authentication in time was classed as a credential fault, so the lane
-  would stop (ADR 0095) though no credential was wrong. Both are now transient. A host-key rejection
-  stays permanent, and an authentication refusal stays a credential fault. The connector now also
-  closes the half-open client when the connect fails. (`BACKLOG #1999`)
+  would stop (ADR 0095) though no credential was wrong. Both are now transient, and so is a server
+  that drops the connection before the key exchange completes. A host-key rejection stays
+  permanent, and an authentication refusal stays a credential fault. The connector now also closes
+  the half-open client whenever the connect fails. (`BACKLOG #1999`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`

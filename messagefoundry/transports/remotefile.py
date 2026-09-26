@@ -725,52 +725,77 @@ def _open_sftp_within(client: Any, seconds: float) -> Any:
     return outcome[0]
 
 
-#: The message paramiko gives an authentication the server never answered inside ``auth_timeout``.
-#: It is the ONLY thing that tells that case apart from a refusal: both are a bare
-#: ``AuthenticationException``, with no subclass, attribute or chained cause between them.
 _PARAMIKO_AUTH_TIMEOUT = "Authentication timeout."
+_PARAMIKO_NO_SESSION = "No existing session"
 
 
-def _sftp_connect_timeout(paramiko: Any, exc: BaseException, client: Any) -> str | None:
-    """Name the phase a failed ``SSHClient.connect`` timed out in, or ``None`` if it did not time out
-    (BACKLOG #1999).
+def _io_fault(exc: BaseException | None) -> BaseException | None:
+    """``exc`` itself, or the exception it was raised while handling, if that is a socket or EOF
+    fault; otherwise ``None``."""
+    for candidate in (exc, None if exc is None else exc.__context__):
+        if isinstance(candidate, (OSError, EOFError)):
+            return candidate
+    return None
+
+
+def _sftp_slow_peer(
+    paramiko: Any, exc: BaseException, client: Any
+) -> tuple[str | None, BaseException | None]:
+    """Decide whether a failed ``SSHClient.connect`` came from a slow or dropped peer rather than a
+    refusal (BACKLOG #1999). Returns the reason to report, or ``None`` for a refusal, and the
+    exception the transport thread left behind, if this read one, so the caller can report it.
 
     THIS DOCSTRING IS THE ONE PLACE THE PARAMIKO FACTS BELOW ARE STATED. Read against paramiko 5.0.0.
 
     **Authentication.** ``AuthHandler.wait_for_response`` raises
     ``AuthenticationException("Authentication timeout.")`` once ``auth_timeout`` passes with no reply.
-    A refusal is the same class, ``"Authentication failed."``, so the message is the discriminator.
-    Matching it exactly fails safe: if paramiko rewords it, the timeout goes back to being a
-    credential fault, which stops the lane rather than retrying into a lockout.
+    A refusal is the same class, ``"Authentication failed."``, with no subclass, attribute or chained
+    cause between them, so the message is the only discriminator. Matching it exactly fails safe: if
+    paramiko rewords it, the timeout goes back to being a credential fault, which stops the lane
+    rather than retrying into a lockout. A transport that dies mid-authentication raises
+    ``"Authentication failed: transport shut down or saw EOF"``; that is left a credential fault,
+    because a server that refuses and then disconnects produces it too.
 
     **Banner and key exchange.** ``SSHClient.connect`` passes one ``timeout`` to both the TCP connect
     and ``Transport.start_client``, and this connector sets ``banner_timeout`` to the same value.
     ``start_client`` does not raise when its own wait runs out; it returns, and the next call,
     ``get_remote_server_key``, raises ``SSHException("No existing session")`` with nothing chained.
     That is what a silent peer produces here, measured on every run against a peer that accepts the
-    connection and never sends a banner. The transport is then still active with its first key
-    exchange not done, which is the discriminator: a host-key rejection and every authentication
-    outcome happen only after that exchange completes.
+    connection and never sends a banner. The transport is then still active. That is the
+    discriminator: every call that raises "No existing session" does so only on an inactive
+    transport or one whose first key exchange is not done, and the transport thread can finish that
+    exchange between the raise and this read, so an active transport is enough on its own.
 
-    The transport thread's own banner read raises ``SSHException("Error reading SSH protocol
-    banner")`` chained from ``TimeoutError``. It reaches the caller when it wins the race with
-    ``start_client``, or it is left on the transport when the thread dies between that return and
-    this check; both are read here. A key-exchange mismatch dies the same way with no timeout
-    chained, so it stays permanent.
+    The transport thread's own banner read wraps any failure as ``SSHException("Error reading SSH
+    protocol banner")``, chained from what it caught: ``TimeoutError`` for a silent peer,
+    ``EOFError`` or a reset for one that dropped the connection. That exception reaches the caller
+    when the thread dies before ``start_client`` returns, or it is left on the transport, read here
+    by ``get_exception``, when the thread dies in between. A dropped connection is transient for the
+    same reason a dropped TCP connect is. A key-exchange mismatch dies with no socket fault chained,
+    so it stays permanent, and so does everything after the exchange, host-key rejection included.
+
+    paramiko also bounds the key exchange with ``Transport.handshake_timeout``, 15 s, which
+    ``SSHClient.connect`` does not expose. Past it the thread raises a bare ``EOFError``, which is
+    already transient as a dropped connection.
     """
     if isinstance(exc, paramiko.AuthenticationException):
-        return "authentication" if str(exc) == _PARAMIKO_AUTH_TIMEOUT else None
+        return ("authentication timed out" if str(exc) == _PARAMIKO_AUTH_TIMEOUT else None), None
     transport = client.get_transport()
-    if transport is None or transport.initial_kex_done:
-        return None
-
-    def _from_timeout(e: BaseException | None) -> bool:
-        return e is not None and isinstance(e.__context__, TimeoutError)
-
-    # Short-circuit order matters: get_exception() clears what it returns, so it is read last.
-    if _from_timeout(exc) or transport.is_active() or _from_timeout(transport.get_exception()):
-        return "banner and key exchange"
-    return None
+    if transport is None:
+        return None, None
+    if transport.is_active() and (
+        not transport.initial_kex_done or str(exc) == _PARAMIKO_NO_SESSION
+    ):
+        return "the banner and key exchange timed out", None
+    if transport.initial_kex_done:
+        return None, None
+    late = transport.get_exception()
+    fault = _io_fault(exc) or _io_fault(late)
+    if isinstance(fault, TimeoutError):
+        return "the banner and key exchange timed out", late
+    if fault is not None:
+        return "the server dropped the connection during the banner and key exchange", late
+    return None, late
 
 
 class _SftpClient(_RemoteClient):
@@ -804,43 +829,52 @@ class _SftpClient(_RemoteClient):
             )
 
     def _connect(self) -> Any:
-        """Connect and authenticate, or raise a classified :class:`_RemoteError`. Every connect fault
-        is classified here and nowhere else, so ``_op`` needs no connect arms of its own.
+        """Connect and authenticate, or raise. The connect arms live here, so ``_op`` has none.
 
-        A host-key rejection is permanent (the operator must add the key; a retry cannot fix it). An
-        authentication refusal is a permanent credential fault. A TCP/IO failure is transient, and so
-        is a banner, key-exchange or authentication timeout (BACKLOG #1999)."""
+        At least these are mapped to a :class:`_RemoteError`: a host-key rejection is permanent (the
+        operator must add the key; a retry cannot fix it), an authentication refusal is a permanent
+        credential fault, and a TCP/IO failure is transient, as is a banner, key-exchange or
+        authentication timeout (BACKLOG #1999). Whatever else is raised propagates unmapped. The
+        client is closed on every failure."""
         paramiko = _import_paramiko()
         client = paramiko.SSHClient()
         try:
             self._dial(paramiko, client)
-        except (paramiko.AuthenticationException, paramiko.SSHException) as exc:
-            # Read the phase before closing: the close ends the transport state it is read from.
-            # The close matters most on the timeout path, where the transport thread is still
-            # waiting on the peer and would otherwise hold the socket past this call.
-            phase = _sftp_connect_timeout(paramiko, exc, client)
-            client.close()
-            if phase is not None:
+        except paramiko.SSHException as exc:
+            # Classify before closing: the close ends the transport state that is read. The close
+            # matters most on the timeout path, where the transport thread is still waiting on the
+            # peer and would otherwise hold the socket past this call.
+            try:
+                reason, late = _sftp_slow_peer(paramiko, exc, client)
+            finally:
+                client.close()
+            detail = str(exc) if late is None else f"{exc} (the transport saw {late!r})"
+            if reason is not None:
                 # A slow peer, not a refusing one: transient, so the caller retries. As a permanent
                 # error it would dead-letter on first deployment, and an authentication timeout
                 # would stop the lane as a credential fault (ADR 0095) that no credential caused.
                 raise _RemoteError(
-                    f"SFTP connect timed out: the server did not finish the {phase} "
-                    f"within {self._timeout:g}s: {exc}",
+                    f"SFTP connect failed, {reason} (connect_timeout {self._timeout:g}s): {detail}",
                     permanent=False,
                 ) from exc
             if isinstance(exc, paramiko.AuthenticationException):
                 # #109 (ADR 0095): auth rejection = a CREDENTIAL fault (account-lockout risk) — the
                 # delivery worker STOP-and-retains instead of dead-lettering + re-authing the backlog.
                 raise _RemoteError(
-                    f"SFTP authentication failed: {exc}", permanent=True, credential_fault=True
+                    f"SFTP authentication failed: {detail}", permanent=True, credential_fault=True
                 ) from exc
             # SSHException covers an unknown/rejected host key (RejectPolicy) — a security stop the
             # operator must resolve, so it's permanent, not a retry.
-            raise _RemoteError(f"SFTP connection rejected: {exc}", permanent=True) from exc
+            raise _RemoteError(f"SFTP connection rejected: {detail}", permanent=True) from exc
         except (OSError, EOFError) as exc:
             client.close()
-            raise _RemoteError(f"SFTP connect failed: {exc}", permanent=False) from exc
+            # A bare EOFError has no text, which would leave the operator a message ending in ": ".
+            raise _RemoteError(
+                f"SFTP connect failed: {str(exc) or type(exc).__name__}", permanent=False
+            ) from exc
+        except BaseException:
+            client.close()
+            raise
         return client
 
     def _dial(self, paramiko: Any, client: Any) -> None:

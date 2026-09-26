@@ -21,7 +21,7 @@ import contextlib
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -517,7 +517,7 @@ def test_real_paramiko_silent_session_open_is_bounded(
 # Before #1999 both were permanent: a banner or key-exchange timeout would dead-letter on first
 # deployment, and an authentication timeout would stop the lane as an ADR 0095 credential fault.
 # What paramiko raises in each case, and why each discriminator is the one used, is stated once, in
-# ``remotefile._sftp_connect_timeout``'s docstring.
+# ``remotefile._sftp_slow_peer``'s docstring.
 
 
 class _NegTransport:
@@ -536,12 +536,16 @@ class _NegTransport:
         return saved
 
 
-def _chained_from_timeout(message: str) -> _FakeSshException:
-    """An SSH exception raised while handling a ``TimeoutError``, as paramiko's banner read raises
-    one: the chain is implicit, on ``__context__``, not an explicit ``from``."""
+def _chained_from(message: str, cause: BaseException) -> _FakeSshException:
+    """An SSH exception raised while handling ``cause``, as paramiko's banner read raises one: the
+    chain is implicit, on ``__context__``, not an explicit ``from``."""
     exc = _FakeSshException(message)
-    exc.__context__ = TimeoutError()
+    exc.__context__ = cause
     return exc
+
+
+def _chained_from_timeout(message: str) -> _FakeSshException:
+    return _chained_from(message, TimeoutError())
 
 
 def _sftp_client_failing_with(
@@ -584,42 +588,87 @@ def _sftp_client_failing_with(
     return _SftpClient({"host": "h", "port": 22, "remote_dir": "/in"}), closes
 
 
+#: Each case is a FACTORY, not a built pair: ``_NegTransport.get_exception`` clears what it returns,
+#: so a shared instance would pass once and then fail on any re-run of the same item.
+_Case = Callable[[], tuple[BaseException, _NegTransport]]
+
+
 @pytest.mark.parametrize(
-    ("exc", "transport"),
+    ("make", "reason"),
     [
         pytest.param(
             # What a silent peer produces with the shipped settings: start_client's own wait runs
             # out first and get_remote_server_key refuses on a transport still awaiting the banner.
-            _FakeSshException("No existing session"),
-            _NegTransport(kex_done=False, active=True),
+            lambda: (
+                _FakeSshException("No existing session"),
+                _NegTransport(kex_done=False, active=True),
+            ),
+            "timed out",
             id="start_client gave up",
         ),
         pytest.param(
-            _chained_from_timeout("Error reading SSH protocol banner"),
-            _NegTransport(kex_done=False, active=False),
+            # The same, but the thread finished the key exchange between the raise and the read.
+            lambda: (
+                _FakeSshException("No existing session"),
+                _NegTransport(kex_done=True, active=True),
+            ),
+            "timed out",
+            id="the exchange finished just after the deadline",
+        ),
+        pytest.param(
+            lambda: (
+                _chained_from_timeout("Error reading SSH protocol banner"),
+                _NegTransport(kex_done=False, active=False),
+            ),
+            "timed out",
             id="the banner read timed out first",
         ),
         pytest.param(
             # The thread died of the banner timeout between start_client returning and the check.
-            _FakeSshException("No existing session"),
-            _NegTransport(
-                kex_done=False,
-                active=False,
-                saved=_chained_from_timeout("Error reading SSH protocol banner"),
+            lambda: (
+                _FakeSshException("No existing session"),
+                _NegTransport(
+                    kex_done=False,
+                    active=False,
+                    saved=_chained_from_timeout("Error reading SSH protocol banner"),
+                ),
             ),
+            "timed out",
             id="the banner read timed out in the gap",
         ),
         pytest.param(
-            _FakeAuthException("Authentication timeout."),
-            _NegTransport(kex_done=True, active=True),
+            # A peer that closes before its banner, as a throttling or restarting sshd does.
+            lambda: (
+                _chained_from("Error reading SSH protocol banner", EOFError()),
+                _NegTransport(kex_done=False, active=False),
+            ),
+            "dropped the connection",
+            id="the peer closed before the banner",
+        ),
+        pytest.param(
+            lambda: (
+                _chained_from("Error reading SSH protocol banner", ConnectionResetError()),
+                _NegTransport(kex_done=False, active=False),
+            ),
+            "dropped the connection",
+            id="the peer reset before the banner",
+        ),
+        pytest.param(
+            lambda: (
+                _FakeAuthException("Authentication timeout."),
+                _NegTransport(kex_done=True, active=True),
+            ),
+            "timed out",
             id="authentication got no answer",
         ),
     ],
 )
-def test_a_connect_timeout_is_transient(
-    exc: BaseException, transport: _NegTransport, monkeypatch: pytest.MonkeyPatch
+def test_a_slow_or_dropped_peer_at_connect_is_transient(
+    make: _Case, reason: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every way a slow peer surfaces at connect is a retry, never a dead-letter or a lane stop."""
+    """Every way a slow or dropped peer surfaces at connect is a retry, never a dead-letter or a
+    lane stop."""
+    exc, transport = make()
     client, closes = _sftp_client_failing_with(exc, transport, monkeypatch)
 
     with pytest.raises(_RemoteError) as caught:
@@ -627,54 +676,70 @@ def test_a_connect_timeout_is_transient(
 
     assert caught.value.permanent is False, "a slow peer is transient, not a dead-letter"
     assert caught.value.credential_fault is False, "no credential caused this"
-    assert "timed out" in str(caught.value), str(caught.value)
+    assert reason in str(caught.value), str(caught.value)
     assert caught.value.__cause__ is exc, "the paramiko exception must stay on the chain"
     assert closes == [1], f"the half-open client was closed {len(closes)} times"
 
 
 @pytest.mark.parametrize(
-    ("exc", "transport", "credential_fault"),
+    ("make", "credential_fault"),
     [
         pytest.param(
-            _FakeSshException("Server '[h]:22' not found in known_hosts"),
-            _NegTransport(kex_done=True, active=True),
+            lambda: (
+                _FakeSshException("Server '[h]:22' not found in known_hosts"),
+                _NegTransport(kex_done=True, active=True),
+            ),
             False,
             id="a host-key rejection",
         ),
         pytest.param(
-            _FakeAuthException("Authentication failed."),
-            _NegTransport(kex_done=True, active=True),
+            lambda: (
+                _FakeAuthException("Authentication failed."),
+                _NegTransport(kex_done=True, active=True),
+            ),
             True,
             id="an authentication refusal",
         ),
         pytest.param(
+            # Left a credential fault on purpose: a server that refuses and then disconnects
+            # produces this message too.
+            lambda: (
+                _FakeAuthException("Authentication failed: transport shut down or saw EOF"),
+                _NegTransport(kex_done=True, active=False),
+            ),
+            True,
+            id="the transport died during authentication",
+        ),
+        pytest.param(
             # A key-exchange mismatch kills the thread before the exchange completes, with no
-            # timeout anywhere on its chain. It is a configuration fault, not a slow peer.
-            _FakeSshException("Incompatible ssh peer (no acceptable kex algorithm)"),
-            _NegTransport(kex_done=False, active=False),
+            # socket fault anywhere on its chain. It is a configuration fault, not a slow peer.
+            lambda: (
+                _FakeSshException("Incompatible ssh peer (no acceptable kex algorithm)"),
+                _NegTransport(kex_done=False, active=False),
+            ),
             False,
             id="a key-exchange mismatch",
         ),
         pytest.param(
             # A negotiated transport rules out the negotiation arm even with a timeout on the chain.
-            _chained_from_timeout("No existing session"),
-            _NegTransport(kex_done=True, active=True),
+            lambda: (
+                _chained_from_timeout("a post-exchange failure"),
+                _NegTransport(kex_done=True, active=True),
+            ),
             False,
             id="a post-exchange failure chained from a timeout",
         ),
     ],
 )
 def test_a_refusal_at_connect_stays_permanent(
-    exc: BaseException,
-    transport: _NegTransport,
-    credential_fault: bool,
-    monkeypatch: pytest.MonkeyPatch,
+    make: _Case, credential_fault: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CONTROL for the test above: the timeout arm must not swallow a real refusal.
+    """CONTROL for the test above: the transient arm must not swallow a real refusal.
 
     A host-key rejection is a security stop the operator must resolve. An authentication refusal must
     keep its ADR 0095 credential marker, so the lane stops instead of retrying into a lockout.
     """
+    exc, transport = make()
     client, closes = _sftp_client_failing_with(exc, transport, monkeypatch)
 
     with pytest.raises(_RemoteError) as caught:
@@ -686,8 +751,56 @@ def test_a_refusal_at_connect_stays_permanent(
     assert closes == [1], f"the half-open client was closed {len(closes)} times"
 
 
-def test_real_paramiko_banner_stall_is_transient(tmp_path: Path) -> None:
-    """A peer that accepts the connection and never sends a banner, against the real library.
+def test_a_refusal_found_on_the_transport_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The exception the transport thread left behind is read destructively, so it must reach the
+    message: otherwise the operator sees only "No existing session" and not why."""
+    late = _FakeSshException("Incompatible ssh peer (no acceptable kex algorithm)")
+    exc = _FakeSshException("No existing session")
+    client, _ = _sftp_client_failing_with(
+        exc, _NegTransport(kex_done=False, active=False, saved=late), monkeypatch
+    )
+
+    with pytest.raises(_RemoteError) as caught:
+        client.list_dir("/in")
+
+    assert caught.value.permanent is True
+    assert "no acceptable kex algorithm" in str(caught.value), str(caught.value)
+
+
+def test_the_client_is_closed_whatever_the_connect_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure outside the mapped classes, and one inside the classifier, both still close.
+
+    Either would otherwise leave a connected socket, and possibly a live transport thread, behind.
+    """
+
+    class _Unmapped(Exception):
+        pass
+
+    client, closes = _sftp_client_failing_with(
+        _Unmapped("not an SSH fault"), _NegTransport(kex_done=True, active=True), monkeypatch
+    )
+    with pytest.raises(_Unmapped):
+        client.list_dir("/in")
+    assert closes == [1]
+
+    class _BrokenTransport(_NegTransport):
+        def is_active(self) -> bool:
+            raise RuntimeError("transport state unreadable")
+
+    client, closes = _sftp_client_failing_with(
+        _FakeSshException("No existing session"),
+        _BrokenTransport(kex_done=False, active=True),
+        monkeypatch,
+    )
+    with pytest.raises(RuntimeError):
+        client.list_dir("/in")
+    assert closes == [1]
+
+
+@pytest.mark.parametrize("peer", ["stays silent", "closes at once"])
+def test_real_paramiko_peer_without_a_banner_is_transient(peer: str, tmp_path: Path) -> None:
+    """A peer that accepts the connection and never sends a banner, against the real library: one
+    stays silent, the other closes straight away, as a throttling or restarting sshd does.
 
     This is what checks the stub model above. Which exception wins the race between the banner read
     and ``start_client``'s own wait is paramiko's business, and the test passes whichever wins.
@@ -705,7 +818,10 @@ def test_real_paramiko_banner_stall_is_transient(tmp_path: Path) -> None:
                 conn, _ = listener.accept()
             except OSError:  # the listener closed first: the connect never got that far
                 return
-            held.append(conn)
+            if peer == "closes at once":
+                conn.close()
+            else:
+                held.append(conn)
 
         threading.Thread(target=_accept_and_say_nothing, daemon=True).start()
         # The peer never reaches a host key, so an empty known_hosts is enough; it must exist.
@@ -722,9 +838,13 @@ def test_real_paramiko_banner_stall_is_transient(tmp_path: Path) -> None:
         listener.close()
 
     assert isinstance(result, _RemoteError), f"expected a refusal, got {result!r}"
-    assert result.permanent is False, f"a silent peer is transient, not a dead-letter: {result}"
+    assert result.permanent is False, (
+        f"a peer with no banner is transient, not a dead-letter: {result}"
+    )
     assert result.credential_fault is False
-    assert "banner and key exchange" in str(result), str(result)
+    if peer == "stays silent":
+        # A closing peer's wording depends on where the close lands; a silent one's does not.
+        assert "banner and key exchange timed out" in str(result), str(result)
     assert elapsed < bound + 5.0
 
 
@@ -765,8 +885,10 @@ def test_real_paramiko_authentication_timeout_vs_refusal(
                 release.wait(_PARKED_AFTER * 2)
             return int(paramiko.AUTH_FAILED)
 
-    # Long enough for a key exchange on a loaded runner; it is also the authentication bound.
-    bound = 3.0
+    # The connect timeout is also the key-exchange bound, so only the stall arm, which needs it to
+    # fire, shortens it; the refusal arm keeps the 30 s default so a slow runner cannot time out
+    # its key exchange and turn the control into a transient.
+    bound = 5.0 if server_stalls else None
     with _ssh_server(_AuthServer(), host_key, tmp_path) as (port, known_hosts):
         try:
             result, elapsed = _list_on_a_thread(
@@ -779,7 +901,8 @@ def test_real_paramiko_authentication_timeout_vs_refusal(
     assert result.permanent is permanent, str(result)
     assert result.credential_fault is credential_fault, str(result)
     assert ("timed out" in str(result)) is server_stalls, str(result)
-    assert elapsed < bound + 5.0
+    if bound is not None:
+        assert elapsed < bound + 5.0
 
 
 def test_real_paramiko_unknown_host_key_stays_permanent(
@@ -798,9 +921,7 @@ def test_real_paramiko_unknown_host_key_stays_permanent(
         port,
         known_hosts,
     ):
-        result, _ = _list_on_a_thread(
-            _SftpClient(_sftp_settings(port, known_hosts, connect_timeout=5.0))
-        )
+        result, _ = _list_on_a_thread(_SftpClient(_sftp_settings(port, known_hosts)))
 
     assert isinstance(result, _RemoteError), f"expected a refusal, got {result!r}"
     assert result.permanent is True, f"a rejected host key is a security stop: {result}"
