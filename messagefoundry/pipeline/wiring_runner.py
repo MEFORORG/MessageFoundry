@@ -131,6 +131,7 @@ from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
+    reingress_size_error,
     streaming_over_threshold,
     strict_validate_timeout,
 )
@@ -6962,7 +6963,8 @@ class RegistryRunner:
         inbound message (ADR 0013 Increment 2). Strict FIFO per loopback lane: claim the oldest
         ``Stage.RESPONSE`` token, peek the reply body for the loopback's ``content_type``, and hand it
         off **atomically** via :meth:`~messagefoundry.store.base.QueueStore.ingress_handoff` (which
-        produces the re-ingressed message + ingress row, depth-caps it, or errors a non-peekable body).
+        produces the re-ingressed message + ingress row, depth-caps it, or errors a non-peekable or
+        oversize body).
         Mirrors :meth:`_router_worker`'s claim / missing-inbound / backoff supervision. Re-ingress is an
         internal stage with no source of its own (``LoopbackSource`` is inert); under active-passive HA
         the whole graph (and thus this worker) runs on the leader ONLY, so a single node drains it."""
@@ -7026,8 +7028,15 @@ class RegistryRunner:
         # Peek the reply body for the loopback's content_type (in pipeline/, not the store), then
         # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
         # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree.
-        body = await self.store.response_body_for_work_row(item.id)
-        control_id, message_type, summary, peek_failed = _peek_for_loopback(ic, body or "")
+        body = await self.store.response_body_for_work_row(item.id) or ""
+        # BACKLOG #1914: the engine ceiling the listeners enforce (SEC-017), checked before the peek so
+        # an oversize non-HL7 body is recorded ERROR with the listener's wording and never routed. An
+        # HL7 body meets the same ceiling inside Peek.parse.
+        oversize = reingress_size_error(ic, body)
+        if oversize is None:
+            control_id, message_type, summary, peek_failed = _peek_for_loopback(ic, body)
+        else:
+            control_id, message_type, summary, peek_failed = None, ic.content_type.value, None, True
         produced = await self.store.ingress_handoff(
             response_row_id=item.id,
             loopback_channel_id=name,
@@ -7036,6 +7045,7 @@ class RegistryRunner:
             message_type=message_type,
             summary=summary,
             peek_failed=peek_failed,
+            peek_error=oversize,
         )
         if produced:
             # Wake the loopback's router worker to route the freshly-ingressed answer (a no-op
