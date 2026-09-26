@@ -5117,11 +5117,27 @@ class _KeylessProvisionRefused(RuntimeError):
 
 
 def _store_key_configured(settings: ServiceSettings) -> bool:
-    """Is a local store key configured? The at-rest gate's one test for "keyed" (a DPAPI key file counts;
-    ``open_store`` fails closed later if it is unreadable). It does not consult ``cipher_provider`` --
-    the documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` -- and keeping the test
-    here means that gap, when it is closed, is closed once for every command that applies the gate."""
-    return bool(settings.store.encryption_key or settings.store.encryption_key_file)
+    """Is a store key configured? The at-rest gate's one test for "keyed". A local key or a DPAPI key
+    file counts, and so does an external ``[store].key_provider`` such as ``vault`` (BACKLOG #1998).
+
+    The test reads what is CONFIGURED, not what resolves: the gate runs before ``open_store`` and must
+    not need the network. That is safe because a source that cannot resolve fails closed at
+    ``open_store`` -- an unreadable key file raises ``DpapiError``, and an external provider raises
+    ``KeyProviderError`` -- rather than opening under the identity cipher. (Under ``vault_transit`` the
+    store never resolves ``key_provider`` at all, and Transit encrypts.) The known exception is a
+    pinned built-in provider that ignores the configured source (``env`` with only a key file), which
+    ``provision-admin`` checks after opening (BACKLOG #1905). It does not consult
+    ``cipher_provider`` -- the documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` --
+    and keeping the test here means that gap, when it is closed, is closed once for every command that
+    applies the gate."""
+    from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS
+
+    store = settings.store
+    return bool(
+        store.encryption_key
+        or store.encryption_key_file
+        or store.key_provider in _EXTERNAL_PROVIDERS
+    )
 
 
 def _keyless_store_gate(settings: ServiceSettings, *, enforcing: bool) -> str | None:

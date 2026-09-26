@@ -2183,8 +2183,26 @@ def resolve_active_key(settings: StoreSettings) -> str | None:
 
     Fail-closed: a configured-but-unreadable/foreign DPAPI key file raises ``DpapiError`` here, and a
     selected-but-unresolvable/unknown provider raises ``KeyProviderError`` — both propagate so
-    ``serve`` refuses to start rather than silently degrading to the identity (plaintext) cipher."""
-    return resolve_key_provider(settings).active_key()
+    ``serve`` refuses to start rather than silently degrading to the identity (plaintext) cipher.
+
+    An EXTERNAL provider that returns no key raises too (BACKLOG #1998). The keyless at-rest gate
+    counts a configured external provider as keyed before it resolves, so "no key" from one must
+    never mean the identity cipher. Every shipped provider already raises; this holds the next one
+    to the same contract."""
+    return _checked_active_key(resolve_key_provider(settings).active_key(), settings)
+
+
+def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
+    """``key`` (a provider's ``active_key()``), refusing "no key" from an EXTERNAL provider (BACKLOG
+    #1998). The one check both :func:`resolve_active_key` and :func:`resolve_decrypt_keys` pass."""
+    from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS, KeyProviderError
+
+    if not key and settings.key_provider in _EXTERNAL_PROVIDERS:
+        raise KeyProviderError(
+            f"[store].key_provider={settings.key_provider!r} resolved no key; refusing to use "
+            "the identity (plaintext) cipher in its place."
+        )
+    return key
 
 
 def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
@@ -2198,7 +2216,7 @@ def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
     empty list (identity cipher)."""
     provider = resolve_key_provider(settings)
     ordered: list[str] = []
-    active = provider.active_key()
+    active = _checked_active_key(provider.active_key(), settings)
     if active:
         ordered.append(active)
     for retired in provider.retired_keys():
