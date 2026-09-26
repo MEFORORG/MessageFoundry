@@ -14,6 +14,7 @@ are read from the same send. Each pins both halves together, never one alone."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from io import BytesIO
 from pathlib import Path
 
@@ -22,8 +23,14 @@ import pytest
 pytest.importorskip("pydicom", reason="DICOM SCP tests need the [dicom] extra")
 pytest.importorskip("pynetdicom", reason="DICOM SCP tests need the [dicom] extra")
 
-from messagefoundry.config.models import ContentType  # noqa: E402
-from messagefoundry.config.wiring import DICOM, Registry, build_inbound_connection  # noqa: E402
+from messagefoundry.config.models import ConnectorType, ContentType, Source  # noqa: E402
+from messagefoundry.config.wiring import (  # noqa: E402
+    DICOM,
+    ConnectionSpec,
+    Registry,
+    build_inbound_connection,
+)
+from messagefoundry.parsing.dicom._inflate import DEFAULT_MAX_INFLATED_BYTES  # noqa: E402
 from messagefoundry.pipeline import wiring_runner  # noqa: E402
 from messagefoundry.pipeline.wiring_runner import RegistryRunner  # noqa: E402
 from messagefoundry.store import MessageStatus, MessageStore  # noqa: E402
@@ -155,29 +162,131 @@ async def test_a_committed_object_still_answers_success(store: MessageStore) -> 
     assert rows[0]["status"] != MessageStatus.ERROR.value
 
 
-@pytest.mark.parametrize("configured", [128 * _MIB, None, 0])
-def test_the_scp_cap_never_exceeds_the_engine_ingress_ceiling(configured: int | None) -> None:
-    """The shipped 128 MiB default, and an uncapped SCP, both resolve to the engine's binary ingress
-    ceiling. An object above it could only ever be recorded ERROR, so the SCP must not accept one."""
-    from messagefoundry.config.models import ConnectorType, Source
-
-    settings: dict[str, object] = {"ae_title": _SCP_AE, "host": "127.0.0.1", "port": 0}
-    settings["max_object_bytes"] = configured
-    scp = DicomScpSource(Source(type=ConnectorType.DIMSE, settings=settings))
-    assert scp._max_object_bytes == wiring_runner._INGRESS_MAX_BYTES
-
-
-def test_a_cap_below_the_ceiling_is_kept() -> None:
-    from messagefoundry.config.models import ConnectorType, Source
-
+def _scp(max_object_bytes: int | None, name: str | None = None) -> DicomScpSource:
     settings: dict[str, object] = {
         "ae_title": _SCP_AE,
         "host": "127.0.0.1",
         "port": 0,
-        "max_object_bytes": _MIB,
+        "max_object_bytes": max_object_bytes,
     }
-    scp = DicomScpSource(Source(type=ConnectorType.DIMSE, settings=settings))
-    assert scp._max_object_bytes == _MIB
+    return DicomScpSource(Source(type=ConnectorType.DIMSE, name=name, settings=settings))
+
+
+@pytest.mark.parametrize("configured", [128 * _MIB, None, 0])
+def test_the_scp_cap_never_exceeds_the_engine_ingress_ceiling(configured: int | None) -> None:
+    """The shipped 128 MiB default, and an uncapped SCP, both resolve to the engine's binary ingress
+    ceiling. An object above it could only ever be recorded ERROR, so the SCP must not accept one."""
+    assert _scp(configured)._max_object_bytes == wiring_runner._INGRESS_MAX_BYTES
+
+
+def test_a_cap_below_the_ceiling_is_kept() -> None:
+    assert _scp(_MIB)._max_object_bytes == _MIB
+
+
+def _clamp_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if "ingress ceiling" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    ("configured", "shown", "inflate"),
+    [
+        (64 * _MIB, str(64 * _MIB), 64 * _MIB),
+        (
+            wiring_runner._INGRESS_MAX_BYTES + 1,
+            str(wiring_runner._INGRESS_MAX_BYTES + 1),
+            wiring_runner._INGRESS_MAX_BYTES + 1,
+        ),
+        # An explicit uncapped setting is the widest clamp of all: "no limit" becomes 16 MiB, and
+        # the inflate bound falls to the codec default.
+        (None, "uncapped", DEFAULT_MAX_INFLATED_BYTES),
+        (0, "uncapped", DEFAULT_MAX_INFLATED_BYTES),
+    ],
+)
+def test_a_clamped_cap_is_logged_at_build(
+    configured: int | None, shown: str, inflate: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1962: an operator whose cap is clamped to the ingress ceiling is told so at build,
+    with the connection name, the value they set and the ceiling."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"):
+        _scp(configured, name=_NAME)
+
+    hits = _clamp_warnings(caplog)
+    assert len(hits) == 1
+    assert hits[0].levelno == logging.WARNING
+    message = hits[0].getMessage()
+    assert repr(_NAME) in message
+    assert f"max_object_bytes {shown} " in message
+    assert f"ceiling of {wiring_runner._INGRESS_MAX_BYTES} bytes" in message
+    assert f"inflate bound is {inflate} bytes" in message
+
+
+def test_a_connection_that_is_refused_logs_no_clamp_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-loopback SCP with no peer control is refused at construction. It never runs, so it must
+    not also log a warning about its object limit."""
+    settings: dict[str, object] = {
+        "ae_title": _SCP_AE,
+        "host": "10.0.0.5",
+        "port": 0,
+        "max_object_bytes": 64 * _MIB,
+    }
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"),
+        pytest.raises(ValueError, match="no verifiable peer control"),
+    ):
+        DicomScpSource(Source(type=ConnectorType.DIMSE, name=_NAME, settings=settings))
+
+    assert _clamp_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        wiring_runner._INGRESS_MAX_BYTES,
+        _MIB,
+        # The shipped default is clamped too, but the factory always passes it, so it cannot be told
+        # from an explicit setting. Warning on every default SCP would be noise.
+        128 * _MIB,
+    ],
+)
+def test_a_cap_that_is_not_clamped_or_is_the_default_stays_silent(
+    configured: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"):
+        _scp(configured, name=_NAME)
+
+    assert _clamp_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("spec", "warns"),
+    [
+        (DICOM(ae_title=_SCP_AE, port=0), False),
+        (DICOM(ae_title=_SCP_AE, port=0, max_object_bytes=64 * _MIB), True),
+    ],
+    ids=["factory-default", "explicit-64MiB"],
+)
+def test_the_clamp_warning_through_the_real_build_path(
+    spec: ConnectionSpec, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same rule through ``DICOM()`` and the runner's own Source builder, which is where the
+    default value and the connection name really come from."""
+    from messagefoundry.transports.base import build_source
+
+    ic = build_inbound_connection(
+        _NAME,
+        spec,
+        router="r",
+        content_type=ContentType.DICOM,
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"):
+        build_source(wiring_runner._source_config(ic, "127.0.0.1", {}))
+
+    hits = _clamp_warnings(caplog)
+    assert len(hits) == (1 if warns else 0)
+    if warns:
+        assert repr(_NAME) in hits[0].getMessage()
 
 
 def test_the_receipt_contract_is_declared_by_the_transport() -> None:

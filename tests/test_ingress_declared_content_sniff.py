@@ -122,7 +122,7 @@ async def test_http_listener_mismatch_dead_letters_and_returns_no_receipt(
     store: MessageStore,
 ) -> None:
     # The HTTP listener's own handler (ADR 0023): the same guard, but the receipt is None (the source
-    # maps that to a 202 without an id) rather than a wire ACK.
+    # answers it with a 422, ADR 0154 amendment 2026-09-26) rather than a wire ACK.
     reg = _registry(ContentType.JSON, source=ConnectorType.HTTP)
     runner = RegistryRunner(reg, store)
 
