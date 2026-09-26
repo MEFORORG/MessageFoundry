@@ -108,6 +108,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **Replay no longer re-queues a pass-through completion marker, so a replayed message that
+  delivered ends `PROCESSED`, not `ERROR`.** A handler `Send` into a pass-through inbound leaves an
+  already-finished marker row on the parent. Its lane is an inbound name, so no delivery worker
+  drains it. On a store with an encryption key, message replay put a delivered marker back to
+  pending. The parent then stayed `ROUTED`, even when its real delivery had gone out again. The next
+  start's sweep dead-lettered the marker and recorded the delivered message as `ERROR`. Bulk
+  dead-letter replay did the same to a marker that the depth cap had left dead: its parent went back
+  to `ROUTED`, and nothing could finish it before the next start. Markers now carry the stamp `@passthrough-marker` in
+  `handler_name`. Replay, bulk dead-letter replay and resend skip a row with that stamp, on SQLite,
+  PostgreSQL and SQL Server. The attachment clean-up no longer keeps an attachment alive for a dead
+  marker. Replay does not retransmit into a pass-through inbound, because the marker has no body. A
+  depth-capped marker stays dead, so its parent keeps `ERROR`. A resend with no source named no
+  longer calls a parent with one real delivery ambiguous. A pass-through-only parent now reports no
+  delivered body, not a purged one, and its replay refusal names the pass-through case.
+  ([BACKLOG #1580](docs/BACKLOG.md))
 - **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
   it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
   `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals
