@@ -100,7 +100,7 @@ def test_missing_ca_file_refuses_at_construction(tmp_path: Path) -> None:
 
 
 def _ca_and_crl_pem() -> bytes:
-    """A throwaway CA bundled with its own fresh CRL -- the shape harden_crl_check loads."""
+    """A throwaway CA bundled with its own fresh CRL -- it loads only where the same CA is loaded first (BACKLOG #1890)."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-test-idp-crl-ca")])
     now = datetime.datetime.now(datetime.UTC)

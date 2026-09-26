@@ -8270,7 +8270,7 @@ def check_inbound_revocation(
     **Measured on this tree**: the three server builders load a CA, set ``CERT_REQUIRED`` and finish
     with ``harden_verify_flags`` -- strict RFC 5280 path validation, NOT revocation -- so a client
     certificate revoked this morning keeps authenticating until its ``notAfter``. Set
-    ``tls_crl_file`` on the connection (a PEM carrying the CA and its CRL).
+    ``tls_crl_file`` on the connection (a PEM file holding the CA's CRL).
 
     The messages below name no ``tls_revocation_attested``. ``Source`` carries the field, but no
     factory parameter or ``connections.toml`` key sets it and ``_source_config`` never populates it,
@@ -8298,7 +8298,7 @@ def check_inbound_revocation(
         log.warning(
             "inbound %r requires and verifies a client certificate (mTLS) but checks NO revocation: "
             "a revoked partner certificate would keep authenticating until its notAfter. Set "
-            "tls_crl_file (a PEM carrying the CA and its CRL) on the connection.",
+            "tls_crl_file (a PEM file holding the CA's CRL) on the connection.",
             name,
         )
         return
@@ -8306,7 +8306,7 @@ def check_inbound_revocation(
         f"inbound connection {name!r} requires and verifies a client certificate (mTLS) but checks "
         "no revocation, on an enforcing production-PHI instance; a partner certificate revoked "
         "today would keep authenticating to this interface until its notAfter. Set tls_crl_file "
-        "(a PEM carrying the CA and its CRL) on the connection. An HTTP proxy can terminate "
+        "(a PEM file holding the CA's CRL) on the connection. An HTTP proxy can terminate "
         "neither MLLP nor DIMSE, so for those "
         "listeners the documented out-of-engine delegation does not reach."
     )

@@ -140,6 +140,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a CRL file can no longer add trust anchors.** Each CRL setting loaded its file as
+  a CA file, so any certificate in it became a trusted CA for the hop. That CA skipped the hop's
+  pin and permission checks. It covers at least `[api].tls_client_crl_file`, an inbound
+  connection's `tls_crl_file`, `[tls].crl_file`, `[logging].forward_tls_crl_file`,
+  `[auth].oidc_tls_crl_file` and `[store].ssl_crl_file`. The engine now refuses to build the hop
+  when its CRL file carries a certificate not already in the hop's trust store. A file holding a
+  CA already loaded for that hop, plus that CA's CRL, still loads. A bare CRL always does, so
+  give each CRL setting a bare CRL. The inbound revocation refusal no longer tells an operator to
+  put the CA in the CRL file. ([BACKLOG #1890](docs/BACKLOG.md))
 - **BREAKING: under `enforce`, a trust anchor whose permissions or path the engine cannot read now
   refuses to start, unless its SHA-256 pin matches.** This covers `[auth].oidc_tls_ca_cert_file`,
   `[auth].ad_tls_ca_cert_file`, `[api].tls_client_ca_file` and, new in this release, the mTLS CA
@@ -193,7 +202,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   cleartext guards as the live build, so a hop the live build refuses now fails the test too. A
   refused CA answers the test with `trust anchor refused; see the server log`. The path and
   SHA-256 go to the log, not to the caller or the audit row. Not covered: the CAs of outbound connections, and an inbound `tls_crl_file`, which is still
-  read by path, so a certificate inside it is trusted unchecked.
+  read by path. A certificate inside it was trusted unchecked until BACKLOG #1890, later in this release.
   ([BACKLOG #1142](docs/BACKLOG.md))
 - **A config reload now refuses a trust anchor that the next start would refuse.** The reload
   check ran the pin, ACL and path checks, but not the check that the file holds a loadable PEM
@@ -763,8 +772,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `messagefoundry verify` reports it ahead of time. ADR 0173 section 4.3 called for this guard,
   and ADR 0173 AC-4 records these limits. **Migration:** with OIDC on, set
   `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the token and
-  JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file becomes a
-  trusted root for this hop. `[security].enforcement = "warn"` also lets `serve` start, but it
+  JWKS endpoint certificates. Put only CRLs in it. A certificate in that file became a trusted
+  root for this hop until BACKLOG #1890, later in this release, made it refuse instead. `[security].enforcement = "warn"` also lets `serve` start, but it
   turns every enforce-only refusal in the instance into a warning, not this one alone.
   (`BACKLOG #1887`)
 - **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine

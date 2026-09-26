@@ -1322,7 +1322,7 @@ def MLLP(
     tls_ca_pin: str
     | None = None,  # INBOUND: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
-    | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
+    | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     tls_allow_expired: bool = False,  # OUTBOUND: honour an EXPIRED server cert (chain+hostname still verified; #129)
@@ -1701,7 +1701,7 @@ def Http(
     tls_ca_file: str | None = None,  # trust anchor — opt-in mTLS (require + verify a client cert)
     tls_ca_pin: str | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
-    | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
+    | None = None,  # opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     # --- Intake authentication (ADR 0154 D6) — a PEER control on this connector, not admin RBAC ---
     intake_auth: Literal[
         "none", "api_key", "bearer", "mtls_subject"
@@ -2589,7 +2589,7 @@ def DICOM(
     | None = None,  # SCP: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
     | EnvRef
-    | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
+    | None = None,  # opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain+hostname still verified; #129)
     tls_ciphers: str
     | EnvRef

@@ -115,7 +115,7 @@ def build_idp_opener(
         # trusted unchecked. A non-empty cadata= makes create_default_context skip the OS store, as
         # cafile= does. An EMPTY one would load the whole OS store, because it tests cadata for
         # truth, so anchor_cadata refuses an anchor with no PEM block before it gets here. A
-        # certificate inside crl_file still joins the store, by path: see verified_anchor_cadata.
+        # certificate inside crl_file that this store lacks refuses the build (harden_crl_check, #1890).
         cadata = verified_anchor_cadata(oidc_anchor_spec(ca_cert_file, pin), enforcing=enforcing)
         ctx = ssl.create_default_context(cadata=cadata)
     else:
