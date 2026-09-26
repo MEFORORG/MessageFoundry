@@ -113,6 +113,7 @@ __all__ = [
     "make_spec",
     "open_store",
     "sqlite_settings",
+    "store_driver_errors",
     "warm_pool_connections",
     "warm_pool_target",
     "pool_over_provisioned_warning",
@@ -2182,8 +2183,26 @@ def resolve_active_key(settings: StoreSettings) -> str | None:
 
     Fail-closed: a configured-but-unreadable/foreign DPAPI key file raises ``DpapiError`` here, and a
     selected-but-unresolvable/unknown provider raises ``KeyProviderError`` — both propagate so
-    ``serve`` refuses to start rather than silently degrading to the identity (plaintext) cipher."""
-    return resolve_key_provider(settings).active_key()
+    ``serve`` refuses to start rather than silently degrading to the identity (plaintext) cipher.
+
+    An EXTERNAL provider that returns no key raises too (BACKLOG #1998). The keyless at-rest gate
+    counts a configured external provider as keyed before it resolves, so "no key" from one must
+    never mean the identity cipher. Every shipped provider already raises; this holds the next one
+    to the same contract."""
+    return _checked_active_key(resolve_key_provider(settings).active_key(), settings)
+
+
+def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
+    """``key`` (a provider's ``active_key()``), refusing "no key" from an EXTERNAL provider (BACKLOG
+    #1998). The one check both :func:`resolve_active_key` and :func:`resolve_decrypt_keys` pass."""
+    from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS, KeyProviderError
+
+    if not key and settings.key_provider in _EXTERNAL_PROVIDERS:
+        raise KeyProviderError(
+            f"[store].key_provider={settings.key_provider!r} resolved no key; refusing to use "
+            "the identity (plaintext) cipher in its place."
+        )
+    return key
 
 
 def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
@@ -2197,7 +2216,7 @@ def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
     empty list (identity cipher)."""
     provider = resolve_key_provider(settings)
     ordered: list[str] = []
-    active = provider.active_key()
+    active = _checked_active_key(provider.active_key(), settings)
     if active:
         ordered.append(active)
     for retired in provider.retired_keys():
@@ -2250,6 +2269,42 @@ class StoreNotFoundError(RuntimeError):
             f"no SQLite store at {path}: refusing to create one "
             "(check [store].path or --db; `messagefoundry serve` creates the store on its first run)"
         )
+
+
+def store_driver_errors() -> tuple[type[Exception], ...]:
+    """The base exception classes the database drivers behind each backend raise (BACKLOG #1983).
+
+    For a caller that must catch a refused store call on every backend, such as a CLI command that
+    opens its store through :func:`open_store`. ``sqlite3.DatabaseError`` alone covers only SQLite:
+    asyncpg's errors (PostgreSQL) and pyodbc's (SQL Server, through aioodbc) subclass neither it nor
+    ``RuntimeError``, and the store layer has no common engine type that wraps them.
+
+    Driver errors only. A caller adds the rest itself: ``RuntimeError`` for the engine's own
+    refusals (the acquire timeout, a keyless audit append) and ``OSError`` for a connection lost at
+    the socket. For the two DB-API drivers this names ``DatabaseError``, not the ``Error`` root, so
+    an interface misuse such as a bad bind still reads as a defect rather than a refusal.
+
+    The two server drivers are optional extras, so each is imported here, guarded, and left out
+    when it is absent. A driver that is not installed cannot have raised anything.
+    """
+    import sqlite3
+
+    errors: list[type[Exception]] = [sqlite3.DatabaseError]
+    try:
+        import asyncpg
+    except ImportError:
+        pass
+    else:
+        # asyncpg has three roots, measured on 0.31.0: the server's errors (a lost connection among
+        # them), the client's, and its internal ones, such as a protocol error.
+        errors += [asyncpg.PostgresError, asyncpg.InterfaceError, asyncpg.InternalClientError]
+    try:
+        import pyodbc
+    except ImportError:
+        pass
+    else:
+        errors.append(pyodbc.DatabaseError)  # a lost link is OperationalError, beneath it
+    return tuple(errors)
 
 
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:

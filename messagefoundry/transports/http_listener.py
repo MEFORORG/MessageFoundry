@@ -42,7 +42,7 @@ import re
 import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import client_cert_principal, constant_time_match_any
@@ -53,6 +53,7 @@ from messagefoundry.transports.base import (
     ReplyOutcome,
     SourceConnector,
     peer_ip_allowed,
+    positive_cap,
     register_source,
 )
 from messagefoundry.transports.mllp import (
@@ -76,7 +77,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 # Resource caps (DoS guards), HTTP analogs of the MLLP frame/connection/idle caps. All overridable per
-# connection via Http() settings; a falsy value (None/0) disables a cap explicitly where noted.
+# connection via Http() settings; None/0 (in any spelling) disables a cap explicitly where noted.
 DEFAULT_MAX_BODY_BYTES = (
     16 * 1024 * 1024
 )  # 16 MiB — matches the MLLP frame cap + the engine ceiling
@@ -326,8 +327,8 @@ async def _read_head(
     because it is consulted earlier still, in ``_on_client``. Keep any new pre-body refusal here.
 
     Raises :class:`HttpRequestError` (carrying the status + connection-event kind) on an unbounded
-    header read, a malformed request line, or ambiguous framing, so the caller can answer
-    synchronously **before** any ingress row is written."""
+    header read, a malformed request line, ambiguous framing, or a missing or repeated ``Host``,
+    so the caller can answer synchronously **before** any ingress row is written."""
     # Request line + headers, bounded by max_header_bytes (so a peer can't stream headers forever).
     try:
         head = await reader.readuntil(b"\r\n\r\n")
@@ -472,6 +473,21 @@ async def _read_head(
         # refuses a request with no Content-Length.
         raise HttpRequestError(411, "Content-Length is required", kind="framing_error")
 
+    # HOST MUST APPEAR EXACTLY ONCE ON HTTP/1.1, AND NEVER TWICE ON ANY VERSION (RFC 9112 section
+    # 3.2, BACKLOG #1972). A server MUST answer 400 to either shape. This listener reads no Host
+    # value, so the refusal is RFC conformance first. It also helps a fronting proxy that does read
+    # Host. The dict above keeps only the last of two Host lines, while such a proxy may act on the
+    # first. This check runs after the framing refusals, so a smuggling probe keeps its own reason.
+    # HTTP/1.0 predates the field, so a 1.0 request with no Host still parses. Every other 1.x minor
+    # is read as 1.1 (RFC 9110 section 2.5). An EMPTY value counts as present, because RFC 9112 has
+    # a client send it when the target URI has no authority. The value's syntax is NOT checked here,
+    # and the refusal reason never carries the value.
+    host_count = header_counts.get("host", 0)
+    if host_count > 1:
+        raise HttpRequestError(400, "duplicate Host header", kind="framing_error")
+    if host_count == 0 and version != "HTTP/1.0":
+        raise HttpRequestError(400, "missing Host header", kind="framing_error")
+
     return HttpRequest(method, target, headers, b"")
 
 
@@ -553,6 +569,26 @@ async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
 HttpReceiptHandler = Callable[[bytes], Awaitable[str | None]]
 
 
+def _header_cap(value: Any) -> int:
+    """Read ``max_header_bytes``, the one cap on this listener that cannot be switched off.
+
+    Unset, ``None`` and ``""`` (an env var that is set but empty) take the 64 KiB default. Anything
+    else must be a positive number of bytes, and zero is refused in every spelling (BACKLOG #1872).
+    Before that, a TOML ``0`` silently became the default while a string ``"0"`` became a cap of zero
+    that refused every request, because no request has a head of zero bytes: one number, two outcomes,
+    one of them a total outage. Both now refuse loudly, because an operator who writes 0 means "no cap",
+    and this listener does not offer one; silently substituting 64 KiB would hide that. Written
+    ``not ... >= 1`` so NaN and a sub-1 value that would truncate to zero are refused as well."""
+    if value is None or value == "":
+        return DEFAULT_MAX_HEADER_BYTES
+    if not float(value) >= 1:
+        raise ValueError(
+            f"HTTP source max_header_bytes={value!r} must be a positive number of bytes; this cap "
+            "cannot be switched off (leave it unset or None for the 64 KiB default)"
+        )
+    return int(value)
+
+
 class HttpSource(SourceConnector):
     """Listen for inbound HTTP/1.1 requests, commit each POSTed body to the ingress stage via the
     pipeline handler, and return a ``202`` respond-with-receipt once it is durably committed (ADR 0023).
@@ -571,19 +607,34 @@ class HttpSource(SourceConnector):
         # without TLS (check_http_tls_exposure). See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
-        # Caps below: key absent → secure default; present-but-falsy (None/0) → disabled where allowed.
-        mc = s.get("max_connections", DEFAULT_MAX_CONNECTIONS)
-        self.max_connections: int | None = int(mc) if mc else None
-        rt = s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT)
-        self.receive_timeout: float | None = float(rt) if rt else None
-        mb = s.get("max_body_bytes", DEFAULT_MAX_BODY_BYTES)
-        self.max_body_bytes: int | None = int(mb) if mb else None
-        mh = s.get("max_header_bytes", DEFAULT_MAX_HEADER_BYTES)
-        self.max_header_bytes: int = int(mh) if mh else DEFAULT_MAX_HEADER_BYTES
+        # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
+        # an uncast env() yields) → disabled where allowed; a negative or NaN → refused at build
+        # (BACKLOG #1872).
+        self.max_connections: int | None = positive_cap(
+            s.get("max_connections", DEFAULT_MAX_CONNECTIONS),
+            int,
+            knob="max_connections",
+            transport="HTTP source",
+        )
+        self.receive_timeout: float | None = positive_cap(
+            s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT),
+            float,
+            knob="receive_timeout",
+            transport="HTTP source",
+        )
+        self.max_body_bytes: int | None = positive_cap(
+            s.get("max_body_bytes", DEFAULT_MAX_BODY_BYTES),
+            int,
+            knob="max_body_bytes",
+            transport="HTTP source",
+        )
+        self.max_header_bytes: int = _header_cap(s.get("max_header_bytes"))
         # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
         # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. The
         # port changed REACHABILITY, never the default -- a stock HTTP inbound still has no bound.
-        self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        self.max_messages_per_second, self.message_burst = _pacing_settings(
+            s, transport="HTTP source"
+        )
         #: ONE bucket for the whole listener, not one per connection. This connector answers exactly
         #: one request per connection (build_response hardcodes Connection: close), so a
         #: per-connection bucket would be charged once and thrown away — a rate knob that paced

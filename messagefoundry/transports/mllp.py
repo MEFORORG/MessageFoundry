@@ -85,10 +85,12 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     peer_ip_allowed,
+    positive_cap,
     probe_tcp_reachable,
     register_destination,
     register_source,
 )
+from messagefoundry.transports.base import cap_setting as _cap_setting
 
 __all__ = [
     "SB",
@@ -118,7 +120,7 @@ logger = logging.getLogger(__name__)
 # engine callers and tests that import them from this module keep working.
 
 # Resource caps (DoS guards). All are overridable per connection via MLLP() settings; see
-# docs/CONNECTIONS.md. A falsy value (None/0) in settings disables the cap explicitly. The frame
+# docs/CONNECTIONS.md. None/0 in settings, in any spelling, disables the cap explicitly. The frame
 # cap, DEFAULT_MAX_FRAME_BYTES, is defined in `messagefoundry.mllpcodec` beside the decoder.
 DEFAULT_MAX_CONNECTIONS = 256  # bound concurrent inbound clients (connection-flood guard)
 DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this long (slowloris guard)
@@ -221,6 +223,28 @@ _CLIENT_SHUTDOWN_GRACE = 5.0
 # may take to leave, versus how long teardown waits for in-flight handlers — and a test that bounds
 # one must not silently shrink the other.
 _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
+
+# Seconds a TLS listener waits for a new connection to finish its handshake (BACKLOG #1606).
+# `_on_client` runs only after the handshake, so until then a socket is outside `_clients` and the
+# `max_connections` count, and asyncio's own default of 60 s was the only bound on it. A peer that
+# opened sockets and never sent a ClientHello could hold each one that long, uncounted. A handshake
+# is a few round trips of engine-fixed work, so 10 s is generous even across a slow WAN hop.
+# A constant rather than a per-connection setting, for the reason `_ACK_DRAIN_GRACE` gives: there is
+# no feed-shaped traffic to size it against, and a setting would carry the `None`/`0` = "off" spelling
+# every cap here accepts, which would restore the unbounded window through a supported value.
+# **This bounds how LONG an unhandshaken socket lives, not how MANY there are.** A peer that keeps
+# opening them still holds about its connect rate times this window, outside `max_connections`,
+# `max_connections_per_host` and `source_ip_allowlist`, which all act only in `_on_client`. When it
+# fires, asyncio aborts the socket and logs that only in debug mode, so nothing reaches the log.
+_TLS_HANDSHAKE_TIMEOUT = 10.0
+
+# Seconds a closed TLS connection waits for the peer's close_notify before the socket is dropped
+# (BACKLOG #1606). asyncio's default is 30 s, and it runs AFTER the handler has freed the connection's
+# `max_connections` slot, so a peer that never answered held each socket that long uncounted. Equal
+# to the shutdown grace, and named apart from it for the reason `_ACK_DRAIN_GRACE` gives: shortening
+# teardown in a test must not silently shorten this too. On the stdlib loop stop() does not wait
+# for it, and on uvloop it can; see stop().
+_TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
 
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
@@ -693,20 +717,32 @@ class MLLPDestination(DestinationConnector):
         # re-attached very-large document (#149, ADR 0105 Phase 1b — a base64 PDF spliced back into
         # OBX-5.5 for an inline MDM) or a Handler-built large MDM streams inline to a receiver that does
         # not cap the frame (Epic). Raise/lower it per outbound only to bound a partner's ACK size; a
-        # falsy value disables the ACK cap entirely (`max_frame_bytes=0`).
-        mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
-        self.max_frame_bytes: int | None = int(mf) if mf else None
+        # None/0 disables the ACK cap entirely (`max_frame_bytes=0`).
+        self.max_frame_bytes: int | None = positive_cap(
+            s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES),
+            int,
+            knob="max_frame_bytes",
+            transport="MLLP destination",
+        )
         # ADR 0067: persistent outbound connection. Shipped OPT-IN this release (default OFF): the
         # adjudicated default is connect-per-message (today's proven posture, BACKLOG #82.1 "stays off
         # by default"); persistent=true is the documented opt-in that removes the per-message
         # TIME_WAIT port pressure, with the default flip planned once the §8 trigger is met. Key absent
-        # → off; the two freshness knobs follow the receive_timeout convention: present-but-falsy
-        # (None/0) = disabled.
+        # → off; the two freshness knobs follow the receive_timeout convention: None/0 in any
+        # spelling = disabled, a negative = refused.
         self.persistent: bool = bool(s.get("persistent", False))
-        it = s.get("idle_timeout_seconds", 60.0)
-        self.idle_timeout_seconds: float | None = float(it) if it else None
-        ma = s.get("max_connection_age_seconds")
-        self.max_connection_age_seconds: float | None = float(ma) if ma else None
+        self.idle_timeout_seconds: float | None = positive_cap(
+            s.get("idle_timeout_seconds", 60.0),
+            float,
+            knob="idle_timeout_seconds",
+            transport="MLLP destination",
+        )
+        self.max_connection_age_seconds: float | None = positive_cap(
+            s.get("max_connection_age_seconds"),
+            float,
+            knob="max_connection_age_seconds",
+            transport="MLLP destination",
+        )
         # BACKLOG #117 (ADR 0124): fire-and-forward. When True, send() writes + drains and finalizes
         # the delivery on the successful TCP write — it reads NO ACK and validates NO MSA-1
         # (at-most-once-confirmation; there is no NAK-/timeout-driven retry). Default False = today's
@@ -1568,51 +1604,29 @@ class _MessagePacer:
         return cls(rate, burst, now=time.monotonic(), name=name) if rate else None
 
 
-def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
+def _pacing_settings(
+    settings: Mapping[str, Any], *, transport: str = "MLLP source"
+) -> tuple[float | None, float]:
     """Read ``(max_messages_per_second, message_burst)`` from one connection's settings.
 
     Shared by every intake that paces, so a rename, a default change or a coercion fix lands once
     instead of in four places that must agree. Absent rate -> OFF, deliberately against this
     module's "key absent -> secure default" convention; see :data:`DEFAULT_MAX_MESSAGES_PER_SECOND`.
     Burst defaults to one second's worth, so a peer that sends in bursts is not paced until it
-    exceeds the SUSTAINED rate; it is meaningless when pacing is off.
+    exceeds the SUSTAINED rate; it is meaningless when pacing is off. Both read ``"0"`` as their
+    ``0`` and refuse a negative or NaN at build (BACKLOG #1872). ``transport`` only names the
+    connector in that refusal; the MLLP listener takes the default so its call site is unchanged.
     """
-    mps = settings.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND)
-    rate = float(mps) if mps else None
-    return rate, float(settings.get("message_burst") or rate or 0.0)
-
-
-def _cap_setting[NumT: (int, float)](value: Any, convert: Callable[[Any], NumT]) -> NumT | None:
-    """Read one inbound cap: a number, or ``None`` for the documented ``None``/``0`` disable.
-
-    **Decide "off" on the NUMBER, not on Python truthiness.** The older idiom ``int(v) if v else
-    None`` tests the RAW settings value, and a raw ``"0"`` is a non-empty string — truthy — so it
-    survives that test and becomes a live cap of zero. That spelling is reachable rather than
-    contrived: a
-    ``connections.toml`` ``env()`` reference without a ``cast`` hands the connector the environment's
-    TEXT (``docs/CONNECTIONS.md``), so an operator disabling a cap through the environment writes
-    ``"0"`` and gets the opposite of what they asked for — a listener that refuses every connection,
-    rejects every frame, or closes every socket the instant it opens, depending on which cap it was.
-
-    ``None`` and ``""`` short-circuit before either conversion, and both are needed: a key may be
-    absent, and ``resolve_env_settings`` tests membership rather than truthiness, so an env var that
-    is SET but empty arrives as ``""`` — which ``int()``/``float()`` would raise on.
-
-    **The zero test reads a ``float`` view, and the cap is built with the caller's own ``convert``.**
-    Testing the CONVERTED value instead would read anything that truncates to zero as "off": with
-    ``convert=int``, a ``max_connections_per_host`` of ``-0.5`` would silently disable a security cap
-    that the guard below is supposed to refuse at build. A float view answers "did the operator write
-    zero", which is the actual question, and leaves every sub-1 value to the caller's own guard.
-
-    A negative value is therefore returned as-is, for the callers that refuse one at build with a
-    message naming their own key. It is a different mistake with a different answer, and folding it
-    into "off" here would swallow the typo this connector exists to reject.
-    """
-    if value is None or value == "":
-        return None
-    if float(value) == 0:  # at least 0, 0.0, -0.0, False, "0", "0.0" and " 0 " reach this as off
-        return None
-    return convert(value)
+    rate = positive_cap(
+        settings.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND),
+        float,
+        knob="max_messages_per_second",
+        transport=transport,
+    )
+    burst = positive_cap(
+        settings.get("message_burst"), float, knob="message_burst", transport=transport
+    )
+    return rate, float(burst or rate or 0.0)
 
 
 class MLLPSource(SourceConnector):
@@ -1646,9 +1660,9 @@ class MLLPSource(SourceConnector):
         # Every cap on THIS listener: key absent → secure default; None/0 → disabled, in whichever
         # spelling arrives. `_cap_setting` is what makes that last clause true — see it for why
         # deciding "off" before the conversion read a string `"0"` as a live cap of zero. All five go
-        # through it, so there is one rule here rather than a per-key convention to look up. The
-        # raw-TCP, X12 and HTTP listeners still read their own caps the older way, so this is a
-        # property of this connector and not yet of the transport layer.
+        # through it, so there is one rule here rather than a per-key convention to look up. It lives
+        # in transports/base.py now (BACKLOG #1872), where the raw-TCP, X12 and HTTP listeners read
+        # their caps through `positive_cap` on top of it.
         self.max_connections: int | None = _cap_setting(
             s.get("max_connections", DEFAULT_MAX_CONNECTIONS), int
         )
@@ -1686,13 +1700,29 @@ class MLLPSource(SourceConnector):
                 "MLLP max_frame_seconds must be a number of seconds, zero or more (use None or 0 to "
                 f"disable the frame deadline), got {self.max_frame_seconds}"
             )
+        # BACKLOG #1872: the three caps above with no guard of their own. `_cap_setting` passes a
+        # negative through on purpose, and each one refuses everything: a negative `receive_timeout`
+        # makes every peer look idle the moment it connects and closes it as an idle timeout, a
+        # negative `max_connections` admits no connection, and a negative `max_frame_bytes` rejects
+        # every frame. Written `not > 0` so NaN is refused with them. The same rule the other three
+        # listeners get from `positive_cap`, applied here without touching the call sites above.
+        for knob, cap in (
+            ("max_connections", self.max_connections),
+            ("receive_timeout", self.receive_timeout),
+            ("max_frame_bytes", self.max_frame_bytes),
+        ):
+            if cap is not None and not cap > 0:
+                raise ValueError(
+                    f"MLLP {knob}={cap!r} must be above zero (use None or 0 to disable it)"
+                )
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
         # Carried only so a pacing report can name this connection (BACKLOG #290).
         self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
-        # is not listed is refused at accept time. Absent/empty = no restriction.
+        # is not listed is refused when its connection reaches `_on_client` -- with TLS on, that is
+        # after the handshake (see _TLS_HANDSHAKE_TIMEOUT). Absent/empty = no restriction.
         sa = s.get("source_ip_allowlist")
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # WP-13b: per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file). Built
@@ -1721,6 +1751,11 @@ class MLLPSource(SourceConnector):
         # alone hangs on a still-connected sender on py3.12.1+ and is a no-op quiesce on 3.11 (H-2).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        # True from the start of stop() until the next start() (BACKLOG #1606). `_on_client` refuses
+        # a connection that arrives while it is set. On the stdlib loop close_clients() in stop()
+        # already closes such a socket; on uvloop, which lacks it, this is what keeps a socket that
+        # finishes its TLS handshake after stop() began from being read by a stopped listener.
+        self._stopping = False
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -1729,8 +1764,20 @@ class MLLPSource(SourceConnector):
         # a load balancer / per-node ports distribute inbound connections), so there is no
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
+        self._stopping = False  # a restart of this same instance serves again (see __init__)
+        # Bound both ends of a TLS socket's life outside `_on_client` (BACKLOG #1606): the handshake
+        # before it, and the close_notify exchange after writer.close(), which otherwise holds the
+        # socket open for asyncio's default of 30 s after its slot is freed. Only when there is TLS,
+        # because asyncio refuses both arguments without `ssl`. Read at start() so a test can shorten
+        # them.
+        tls = self._ssl is not None
         self._server = await asyncio.start_server(
-            self._on_client, self.host, self.port, ssl=self._ssl
+            self._on_client,
+            self.host,
+            self.port,
+            ssl=self._ssl,
+            ssl_handshake_timeout=_TLS_HANDSHAKE_TIMEOUT if tls else None,
+            ssl_shutdown_timeout=_TLS_SHUTDOWN_TIMEOUT if tls else None,
         )
 
     @property
@@ -1741,6 +1788,8 @@ class MLLPSource(SourceConnector):
         return port
 
     async def stop(self) -> None:
+        # First, so a connection that reaches `_on_client` from here on is refused there unread.
+        self._stopping = True
         # Stop accepting NEW connections (this alone does not close established ones).
         if self._server is not None:
             self._server.close()
@@ -1752,6 +1801,36 @@ class MLLPSource(SourceConnector):
         # await the connection tasks with a bounded grace and cancel any stragglers (review H-2).
         for writer in list(self._clients):
             writer.close()
+        # Then close every transport the SERVER tracks, a wider set than `_clients` (BACKLOG #1606).
+        # A TLS socket still in its handshake never reached `_on_client`, so the loop above cannot see
+        # it, and wait_closed() below waits for it -- so stop() spent its whole grace there and left
+        # the socket open behind it. This comes BEFORE the task wait: during that wait such a socket
+        # could otherwise finish its handshake, reach `_on_client` and have a message handled
+        # mid-stop. For an established client this closes the raw socket under the writer just
+        # closed; its close_notify is already queued, and close() sends what is queued before it
+        # closes, so stop() does not wait out `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is
+        # untouched, as with writer.close(). It awaits nothing, so it cannot wedge on the Proactor
+        # (#55).
+        #
+        # ONLY WHERE THE LOOP'S SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(), and
+        # uvicorn runs the engine on uvloop wherever it is installed, which `uvicorn[standard]` does
+        # for CPython outside Windows. Called unguarded, it raised AttributeError here, so a reload's
+        # first stop() failed, left that listener unbound, and the reload restarted nothing.
+        # What uvloop loses, and what still holds there:
+        # * stop() does not close a socket still in its handshake. `_TLS_HANDSHAKE_TIMEOUT` still
+        #   bounds it, since uvloop honours it, and `_stopping` refuses it unread if it finishes.
+        # * stop() can wait, inside the grace below, for an established TLS peer's close_notify, up
+        #   to `_TLS_SHUTDOWN_TIMEOUT`: `_on_client`'s finally waits for the close exchange.
+        # * uvloop's wait_closed() returns once the listening socket is closed, so the wait this
+        #   block exists to cut short does not happen there.
+        close_clients = getattr(self._server, "close_clients", None)
+        if close_clients is not None:
+            close_clients()
+        # One loop turn, so a client task created but not yet started (its handshake completed in
+        # the same turn stop() began) runs now and meets `_stopping`, rather than first running
+        # after stop() has returned. That narrows the window to asyncio's own scheduling; it does
+        # not claim to close every interleaving.
+        await asyncio.sleep(0)
         pending = [task for task in self._client_tasks if not task.done()]
         if pending:
             _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
@@ -2001,11 +2080,10 @@ class MLLPSource(SourceConnector):
         than falsy when it is off, so neither ordinary input can produce one. An earlier draft
         carried ``max(0.0, ...)`` and it was dead on those inputs, which is a claim nobody can check.
 
-        **One input CAN still be negative, and it is not defended here.** Unlike
-        ``max_frame_seconds``, ``receive_timeout`` has no build-time guard refusing a negative, so a
-        configured ``-1`` reaches this function and closes every peer at once as ``idle_timeout``.
-        That predates the frame deadline and is unchanged by it; the fix is a guard beside the other
-        two in ``__init__``, not a clamp here, because a clamp would turn a typo into a silent bound.
+        ``receive_timeout`` cannot be negative either: ``__init__`` refuses a negative or NaN one at
+        build (BACKLOG #1872). It used to reach this function and close every peer at once as
+        ``idle_timeout``. The guard sits in ``__init__`` rather than as a clamp here, because a clamp
+        would turn a typo into a silent bound.
         """
         if frame_left is None:
             return self.receive_timeout
@@ -2015,6 +2093,14 @@ class MLLPSource(SourceConnector):
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
+        if self._stopping:
+            # Reached after stop() began, so nothing will wait for this task: refuse the connection
+            # before it is registered, admitted or read (see `_stopping`). The close is not awaited,
+            # and on TLS it is bounded by `_TLS_SHUTDOWN_TIMEOUT`. No message was read, so the
+            # sender retries against the restarted listener.
+            logger.debug("MLLP connection refused: the listener is stopping")
+            writer.close()
+            return
         # Register before anything else so stop() can always find + close this connection — no race
         # with a client that connects just as we're stopping (review H-2).
         task = asyncio.current_task()
