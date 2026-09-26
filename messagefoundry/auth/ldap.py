@@ -247,10 +247,9 @@ def _account_enabled(entry: Any) -> bool:
         shape = "absent"
     else:
         value = entry[_UAC_ATTR].value
-        # bool is an int subclass, and True is not a flag word.
-        if isinstance(value, int) and not isinstance(value, bool):
-            return not value & _ACCOUNTDISABLE
-        if isinstance(value, str | bytes) and value.strip():
+        # bool is an int subclass, and True is not a flag word. int() itself refuses an empty or
+        # blank string, so that case needs no guard of its own.
+        if isinstance(value, int | str | bytes) and not isinstance(value, bool):
             try:
                 return not int(value) & _ACCOUNTDISABLE
             except ValueError:

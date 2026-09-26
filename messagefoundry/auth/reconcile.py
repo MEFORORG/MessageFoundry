@@ -21,8 +21,9 @@ Three safety properties are built in, in order of importance:
 3. **A mass-revoke circuit breaker.** A misconfigured search base, a moved OU, or a service account
    that lost read rights (on the entries, or on ``userAccountControl`` alone) returns "not found"
    for **every** user — indistinguishable from "everyone was disabled". :func:`breaker_tripped`
-   aborts such a pass wholesale rather than signing out the estate. This is why the pass is planned in full before anything is written: an abort must leave
-   the store byte-identical, including the role re-diff.
+   aborts such a pass wholesale rather than signing out the estate. This is why the pass is
+   planned in full before anything is written: an abort must leave the store byte-identical,
+   including the role re-diff.
 """
 
 from __future__ import annotations

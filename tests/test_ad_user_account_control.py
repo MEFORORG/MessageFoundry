@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -222,12 +224,31 @@ def test_login_refuses_an_account_whose_disabled_bit_is_set_or_undetermined(
 # --- the reconciler ------------------------------------------------------------------------------
 
 
-async def _sign_in(service: AuthService, auth: LdapAuthenticator, name: str) -> str:
-    """Mint an AD session through the shared tail of the surviving AD login paths, from a principal
-    the REAL authenticator resolved, so the row carries the id the id-keyed probe will ask about."""
-    principal = auth.resolve_principal(name)
-    assert principal is not None
-    return (await service._complete_ad_login(principal, None, mfa_verified=True)).token
+@asynccontextmanager
+async def _signed_in_estate(
+    monkeypatch: pytest.MonkeyPatch, names: list[str]
+) -> AsyncIterator[tuple[_Directory, AuthService, MessageStore, dict[str, str]]]:
+    """Every account in ``names`` enabled and holding one live AD session.
+
+    Each session is minted through the shared tail of the surviving AD login paths, from a principal
+    the REAL authenticator resolved, so every row carries the id the id-keyed probe will ask about.
+    """
+    directory = _Directory(names)
+    _install_directory(monkeypatch, directory)
+    auth = LdapAuthenticator(_settings())
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _settings(), ldap=auth)
+        await service.initialize()
+        tokens: dict[str, str] = {}
+        for name in names:
+            principal = auth.resolve_principal(name)
+            assert principal is not None
+            login = await service._complete_ad_login(principal, None, mfa_verified=True)
+            tokens[name] = login.token
+        yield directory, service, store, tokens
+    finally:
+        await store.close()
 
 
 @pytest.mark.parametrize(("uac", "shape"), REFUSED)
@@ -237,15 +258,8 @@ async def test_the_reconciler_revokes_an_account_whose_disabled_bit_is_set_or_un
     """One undetermined account among enabled ones: it reads ABSENT, strikes, and is revoked at the
     strike threshold -- exactly as a disabled one is. Before #1639 it read PRESENT and kept its
     session to the absolute cap."""
-    directory = _Directory(["jdoe", "asmith", "bwong"])
-    _install_directory(monkeypatch, directory)
-    auth = LdapAuthenticator(_settings())
-    store = await MessageStore.open(":memory:")
-    try:
-        service = AuthService(store, _settings(), ldap=auth)
-        await service.initialize()
-        tokens = {n: await _sign_in(service, auth, n) for n in directory.ids}
-
+    async with _signed_in_estate(monkeypatch, ["jdoe", "asmith", "bwong"]) as estate:
+        directory, service, _store, tokens = estate
         directory.uac["jdoe"] = uac
         first = await service.reconcile_directory_sessions()
         assert first.revocations == ()  # strike 1: one ambiguous answer never revokes
@@ -258,8 +272,6 @@ async def test_the_reconciler_revokes_an_account_whose_disabled_bit_is_set_or_un
         for name, token in tokens.items():
             assert (await service.identity_for_token(token) is None) is (name == "jdoe")
         assert ldap_module._uac_shapes_warned == (set() if shape is None else {shape})
-    finally:
-        await store.close()
 
 
 @pytest.mark.parametrize("uac", [ABSENT, NON_NUMERIC], ids=["absent", "non-numeric"])
@@ -270,15 +282,7 @@ async def test_a_bind_account_that_cannot_read_the_attribute_trips_the_breaker(
     rights on ``userAccountControl`` makes EVERY account undetermined at once. That wave must reach
     the existing mass-revoke breaker, which aborts the pass, and must not sign the estate out."""
     names = [f"user{i:02d}" for i in range(12)]
-    directory = _Directory(names)
-    _install_directory(monkeypatch, directory)
-    auth = LdapAuthenticator(_settings())
-    store = await MessageStore.open(":memory:")
-    try:
-        service = AuthService(store, _settings(), ldap=auth)
-        await service.initialize()
-        tokens = [await _sign_in(service, auth, n) for n in names]
-
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, tokens):
         directory.uac = dict.fromkeys(names, uac)  # the bind account loses the read right
         first = await service.reconcile_directory_sessions()
         assert first.aborted is None and first.revocations == ()  # strike 1: nothing to abort yet
@@ -287,12 +291,10 @@ async def test_a_bind_account_that_cannot_read_the_attribute_trips_the_breaker(
             assert plan.aborted == "mass_revoke_breaker"
             assert plan.revocations == ()
 
-        for token in tokens:
+        for token in tokens.values():
             assert await service.identity_for_token(token) is not None
         assert service.directory_reconcile_alert is not None
         assert not any(a["action"] == "auth.ad_session_revoked" for a in await store.list_audit())
-    finally:
-        await store.close()
 
 
 async def test_below_the_breaker_floor_the_same_wave_revokes(
@@ -303,21 +305,11 @@ async def test_below_the_breaker_floor_the_same_wave_revokes(
     it cannot tell five genuine offboardings from five unreadable entries -- and the fail-closed
     answer here: those principals can no longer sign in either. Pinned so it is a stated arm."""
     names = ["jdoe", "asmith", "bwong"]
-    directory = _Directory(names)
-    _install_directory(monkeypatch, directory)
-    auth = LdapAuthenticator(_settings())
-    store = await MessageStore.open(":memory:")
-    try:
-        service = AuthService(store, _settings(), ldap=auth)
-        await service.initialize()
-        tokens = [await _sign_in(service, auth, n) for n in names]
-
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, _store, tokens):
         directory.uac = dict.fromkeys(names, ABSENT)
         await service.reconcile_directory_sessions()
         plan = await service.reconcile_directory_sessions()
         assert plan.aborted is None
         assert sorted(r.username for r in plan.revocations) == sorted(names)
-        for token in tokens:
+        for token in tokens.values():
             assert await service.identity_for_token(token) is None
-    finally:
-        await store.close()
