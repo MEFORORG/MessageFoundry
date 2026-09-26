@@ -787,12 +787,22 @@ def test_pl1_encryption_rule_carves_out_the_backup_codec() -> None:
 #: under ``vault_transit`` a restore makes no Transit call. Limb (2) below is what holds that to
 #: account: ``_restore_blocking`` is absent from :data:`_SNAPSHOT_READ_FUNCS`, so the day it acquires a
 #: store cipher this test reds again rather than passing on this note.
+#:
+#: ``_verify_in_staging`` (BACKLOG #1721) is the verify's steps 2 to 4, split out of
+#: ``_verify_archive_blocking`` so that caller can always discard the staging directory. It unseals
+#: with the ``match_key`` its caller picked by the header's ``key_id`` out of ``keys``. At least two
+#: callers supply ``keys``: ``run_restore_verify`` resolves them with ``resolve_decrypt_keys``, and
+#: ``_do_backup`` passes the one key ``BackupRunner._resolve_key`` got from ``resolve_active_key``.
+#: Either way they are RAW DEK BYTES, never a store cipher.
+#: Its full-verify leg reads cells only through ``_full_open_check``, which is in
+#: :data:`_SNAPSHOT_READ_FUNCS`, so the carve-out holds for it unchanged.
 _MFBAK_CODEC_FUNCS = frozenset(
     {
         "_do_backup",
         "_resolve_key",
         "_build_archive_blocking",
         "_verify_archive_blocking",
+        "_verify_in_staging",
         "_restore_blocking",
     }
 )
@@ -999,7 +1009,10 @@ def _build_archive_blocking(key):
     encrypt_stream(src, dst, key)
 
 def _verify_archive_blocking(keys):
-    decrypt_stream(src, dst, keys[0])
+    return _verify_in_staging(staging, match_key=keys[0])
+
+def _verify_in_staging(staging, match_key):
+    decrypt_stream(src, dst, match_key)
 
 def _restore_blocking(keys):
     decrypt_stream(src, dst, keys[0])

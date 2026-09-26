@@ -119,6 +119,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
+  is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
+  handle still open on the extracted store, such as a scanner's, made the removal fail. The
+  directory then stayed for good with the decrypted store in it. The failure also replaced the
+  verdict with a `PermissionError`, or replaced the error the verify was raising. The verify now
+  truncates every file to zero bytes and retries the removal for about two seconds. Truncation
+  usually works while another process holds the file open, but not when the holder denies write
+  sharing or has the file mapped. The verdict or error is the verify's own. If a file can be neither
+  removed nor emptied, the verify names the directory to delete: a `PASS` becomes `FAIL`, another
+  verdict keeps its status, and an exception carries it as a note.
+  `docs/PHI.md` says the same. (`BACKLOG #1721`)
 - **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
   stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
   stage stopped draining while intake kept acknowledging, and the engine still read healthy. The
