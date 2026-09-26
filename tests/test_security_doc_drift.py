@@ -1063,8 +1063,9 @@ def test_ui_gate_divergences_are_exactly_the_reviewed_set() -> None:
 # ``ctx.verify_mode = ssl.CERT_REQUIRED`` left the data-plane mTLS probe GREEN, because a comment in
 # the same file names ``CERT_REQUIRED``. These helpers read only code: a docstring is a bare string
 # constant and a comment never reaches the tree. ``test_source_probe_helpers_ignore_mentions`` pins
-# that for each helper, and ``test_source_probes_do_not_regress_to_a_substring_scan`` pins that each
-# probe still goes through one.
+# that for each helper, and ``test_source_probes_do_not_regress_to_a_substring_scan`` flags at least
+# the common spellings of a raw-text scan in the modules it covers. It does not see raw text that a
+# probe receives through a parameter or a local helper's return value.
 
 
 def _parse(source: str) -> ast.Module:
@@ -1234,7 +1235,10 @@ _SOURCE_PROBE_MODULES = (
 #: Functions in those modules that DO test raw text, each reviewed and kept, keyed by
 #: ``(module, function)`` with the reason. A claim about prose or about a string literal is a text
 #: claim. An ABSENCE check over text can only over-fire on a mention, which is loud; it cannot
-#: under-fire, which is the silent failure this guard exists for.
+#: under-fire, which is the silent failure this guard exists for. A scan that only LOCATES an anchor
+#: for a planted mutation, and fails loudly when the anchor moves, decides nothing and is admitted.
+#: An entry exempts its WHOLE function, so a new raw-text scan added to a listed function is not
+#: flagged. Review that function's diff by hand.
 _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
     ("test_adaptive_attributes_doc_drift.py", "_disclaimer_paragraph"): "slices SECURITY.md prose",
     (
@@ -1260,7 +1264,8 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "_ui_refusal's AST read"
     ),
     ("test_security_doc_rate_limits.py", "test_ui_refusal_is_described_as_the_code_behaves"): (
-        "the text scan reads CONFIGURATION.md prose; the code half is _ui_refusal's AST read"
+        "the text scan reads CONFIGURATION.md prose; the code half is _ui_refusal's AST read. It also "
+        "holds _auth.py source in `src`, which it only passes to _ui_refusal"
     ),
     ("test_threat_model_doc_drift.py", "test_checks_py_only_names_os_system_as_a_lint_string"): (
         "the claim is about a string literal in checks.py"
@@ -1361,7 +1366,8 @@ def _substring_scans(tree: ast.Module) -> set[str]:
     binding counts inside every function. Text passed through ``ast.parse`` or ``_code_only`` is
     code and is not followed. It catches at least these spellings; it is not a proof that no other
     spelling exists. It does NOT follow raw text into a parameter, so ``def has(text, tok): return
-    tok in text`` called with a read is missed. Module-level statements, class bodies excluded, are
+    tok in text`` called with a read is missed, and so is raw text returned by a local helper such
+    as ``_console_sources()``. Module-level statements, class bodies excluded, are
     one scope, named ``<module>``.
     """
     module_nodes = [
