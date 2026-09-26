@@ -10,6 +10,7 @@ import datetime
 import ipaddress
 import logging
 import ssl
+import sys
 import time
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from messagefoundry.transports.mllp import (
     MLLPSource,
     _mllp_ssl_context,
     build_ack,
+    frame,
 )
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
@@ -726,3 +728,158 @@ async def test_the_tls_bounds_reach_start_server_only_with_tls(
     else:
         assert seen.get("ssl_handshake_timeout") is None
         assert seen.get("ssl_shutdown_timeout") is None
+
+
+# --- stop() on a loop whose server has no close_clients() (BACKLOG #1606) ------------------------
+#
+# uvicorn runs the engine on uvloop wherever it is installed, and `uvicorn[standard]` installs it for
+# CPython outside Windows. uvloop's Server (0.22.1) has no close_clients(). stop() called it
+# unguarded, so on Linux every reload failed at its first listener: that listener stayed unbound and
+# none was restarted. The connscale smoke caught it on ubuntu only, as "connection(s) never came back
+# after the reload probe". The suite's own loop is the stdlib one on every platform, so without these
+# tests nothing in it runs stop() against that server shape.
+
+
+class _ServerWithoutCloseClients:
+    """A stdlib server seen through uvloop 0.22.1's Server surface: no close_clients()."""
+
+    def __init__(self, inner: asyncio.Server) -> None:
+        self._inner = inner
+
+    @property
+    def sockets(self) -> tuple[object, ...]:
+        return tuple(self._inner.sockets)
+
+    def close(self) -> None:
+        self._inner.close()
+
+    async def wait_closed(self) -> None:
+        await self._inner.wait_closed()
+
+
+def _plain_source() -> MLLPSource:
+    return MLLPSource(Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0}))
+
+
+async def _ack(raw: bytes) -> str:
+    return build_ack(raw, code="AA")
+
+
+async def _in_handler(source: MLLPSource, count: int) -> None:
+    """Wait until ``count`` connections have reached `_on_client`, on any event loop."""
+    deadline = time.monotonic() + 5.0
+    while len(source._clients) < count:
+        if time.monotonic() > deadline:
+            pytest.fail(f"{count} connection(s) never reached the listener's handler")
+        await asyncio.sleep(0.01)
+
+
+async def _served(source: MLLPSource) -> None:
+    """A real client gets a message through ``source``."""
+    dest = MLLPDestination(
+        Destination(
+            name="out",
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": source.sockport, "timeout_seconds": 5},
+        )
+    )
+    try:
+        await dest.send(ADT)
+    finally:
+        await dest.aclose()
+
+
+async def test_stop_works_when_the_server_has_no_close_clients() -> None:
+    source = _plain_source()
+    await source.start(_ack)
+    reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+    try:
+        await _in_handler(source, 1)  # so stop() meets a live connection, not a kernel backlog
+        assert source._server is not None
+        source._server = _ServerWithoutCloseClients(source._server)  # type: ignore[assignment]
+        # Before the fix this raised AttributeError, after closing the listening socket.
+        await source.stop()
+        await _closed_by_listener(reader, within=mllp_module._CLIENT_SHUTDOWN_GRACE)
+    finally:
+        await _close_raw(writer)
+    # The same instance comes back, as a listener restarted in place does.
+    await source.start(_ack)
+    try:
+        await _served(source)
+    finally:
+        await source.stop()
+
+
+async def test_a_connection_reaching_the_handler_after_stop_is_refused_unread() -> None:
+    """On uvloop stop() cannot close a socket still in its TLS handshake, so one can finish it after
+    stop() began and reach `_on_client`. It must be closed there, never counted, tracked or read."""
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> str:
+        received.append(raw)
+        return build_ack(raw, code="AA")
+
+    source = _plain_source()
+    await source.start(handler)
+    await source.stop()
+
+    closed: list[bool] = []
+
+    class _Writer:
+        def close(self) -> None:
+            closed.append(True)
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(frame(ADT))
+    reader.feed_eof()
+    await source._on_client(reader, _Writer())  # type: ignore[arg-type]
+    assert closed == [True]
+    assert received == []
+    assert source._clients == set()
+    assert source._client_tasks == set()
+    # A restart of the same instance serves again.
+    await source.start(handler)
+    try:
+        await _served(source)
+    finally:
+        await source.stop()
+    assert received == [ADT.encode("utf-8")]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uvloop does not run on Windows")
+@pytest.mark.parametrize("tls", [False, True])
+def test_stop_and_restart_on_uvloop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls: bool
+) -> None:
+    """The real loop, not a stand-in for it. It skips where uvloop is not installed. With TLS the
+    socket never handshakes, so stop() cannot close it on uvloop; the handshake bound, shortened
+    here, is what closes it."""
+    uvloop = pytest.importorskip("uvloop")
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 0.5)
+
+    async def scenario() -> None:
+        source = _tls_source(tmp_path)[0] if tls else _plain_source()
+        await source.start(_ack)
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            if tls:
+                # Nothing public counts a socket still in its handshake, so give the loop a moment
+                # to accept it. On a runner too slow for that, the close below is the listening
+                # socket's reset rather than the bound, and the test passes without reaching it.
+                await asyncio.sleep(0.2)
+            else:
+                await _in_handler(source, 1)
+            started = time.monotonic()
+            await source.stop()
+            assert time.monotonic() - started < mllp_module._CLIENT_SHUTDOWN_GRACE
+            await _closed_by_listener(reader, within=5.0)
+        finally:
+            await _close_raw(writer)
+        plain = _plain_source()
+        await plain.start(_ack)
+        try:
+            await _served(plain)
+        finally:
+            await plain.stop()
+
+    asyncio.run(scenario(), loop_factory=uvloop.new_event_loop)

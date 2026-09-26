@@ -240,7 +240,8 @@ _TLS_HANDSHAKE_TIMEOUT = 10.0
 # (BACKLOG #1606). asyncio's default is 30 s, and it runs AFTER the handler has freed the connection's
 # `max_connections` slot, so a peer that never answered held each socket that long uncounted. Equal
 # to the shutdown grace, and named apart from it for the reason `_ACK_DRAIN_GRACE` gives: shortening
-# teardown in a test must not silently shorten this too. stop() does not wait for it; see stop().
+# teardown in a test must not silently shorten this too. On the stdlib loop stop() does not wait
+# for it, and on uvloop it can; see stop().
 _TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
 
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
@@ -1743,6 +1744,11 @@ class MLLPSource(SourceConnector):
         # alone hangs on a still-connected sender on py3.12.1+ and is a no-op quiesce on 3.11 (H-2).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        # True from the start of stop() until the next start() (BACKLOG #1606). `_on_client` refuses
+        # a connection that arrives while it is set. On the stdlib loop close_clients() in stop()
+        # already closes such a socket; on uvloop, which lacks it, this is what keeps a socket that
+        # finishes its TLS handshake after stop() began from being read by a stopped listener.
+        self._stopping = False
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -1751,6 +1757,7 @@ class MLLPSource(SourceConnector):
         # a load balancer / per-node ports distribute inbound connections), so there is no
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
+        self._stopping = False  # a restart of this same instance serves again (see __init__)
         # Bound both ends of a TLS socket's life outside `_on_client` (BACKLOG #1606): the handshake
         # before it, and the close_notify exchange after writer.close(), which otherwise holds the
         # socket open for asyncio's default of 30 s after its slot is freed. Only when there is TLS,
@@ -1774,6 +1781,8 @@ class MLLPSource(SourceConnector):
         return port
 
     async def stop(self) -> None:
+        # First, so a connection that reaches `_on_client` from here on is refused there unread.
+        self._stopping = True
         # Stop accepting NEW connections (this alone does not close established ones).
         if self._server is not None:
             self._server.close()
@@ -1795,12 +1804,25 @@ class MLLPSource(SourceConnector):
         # closes, so stop() does not wait out `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is
         # untouched, as with writer.close(). It awaits nothing, so it cannot wedge on the Proactor
         # (#55).
-        if self._server is not None:
-            self._server.close_clients()
+        #
+        # ONLY WHERE THE LOOP'S SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(), and
+        # uvicorn runs the engine on uvloop wherever it is installed, which `uvicorn[standard]` does
+        # for CPython outside Windows. Called unguarded, it raised AttributeError here, so a reload's
+        # first stop() failed, left that listener unbound, and the reload restarted nothing.
+        # What uvloop loses, and what still holds there:
+        # * stop() does not close a socket still in its handshake. `_TLS_HANDSHAKE_TIMEOUT` still
+        #   bounds it, since uvloop honours it, and `_stopping` refuses it unread if it finishes.
+        # * stop() can wait, inside the grace below, for an established TLS peer's close_notify, up
+        #   to `_TLS_SHUTDOWN_TIMEOUT`: `_on_client`'s finally waits for the close exchange.
+        # * uvloop's wait_closed() returns once the listening socket is closed, so the wait this
+        #   block exists to cut short does not happen there.
+        close_clients = getattr(self._server, "close_clients", None)
+        if close_clients is not None:
+            close_clients()
         # One loop turn, so a client task created but not yet started (its handshake completed in
-        # the same turn stop() began) registers itself in `_client_tasks` and joins the wait below,
-        # rather than first running after stop() has returned. That narrows the window to asyncio's
-        # own scheduling; it does not claim to close every interleaving.
+        # the same turn stop() began) runs now and meets `_stopping`, rather than first running
+        # after stop() has returned. That narrows the window to asyncio's own scheduling; it does
+        # not claim to close every interleaving.
         await asyncio.sleep(0)
         pending = [task for task in self._client_tasks if not task.done()]
         if pending:
@@ -2065,6 +2087,14 @@ class MLLPSource(SourceConnector):
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
+        if self._stopping:
+            # Reached after stop() began, so nothing will wait for this task: refuse the connection
+            # before it is registered, admitted or read (see `_stopping`). The close is not awaited,
+            # and on TLS it is bounded by `_TLS_SHUTDOWN_TIMEOUT`. No message was read, so the
+            # sender retries against the restarted listener.
+            logger.debug("MLLP connection refused: the listener is stopping")
+            writer.close()
+            return
         # Register before anything else so stop() can always find + close this connection — no race
         # with a client that connects just as we're stopping (review H-2).
         task = asyncio.current_task()
