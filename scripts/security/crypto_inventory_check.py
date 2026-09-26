@@ -842,7 +842,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:truststore.SSLContext",
         }
     ),
-    "messagefoundry/auth/ldap.py": frozenset({"tls_context:via messagefoundry.config.tls_policy"}),
+    # BACKLOG #2034: the AD CA anchor is checked (its SHA-256 pinned) at construction, and the bind
+    # loads those checked bytes, as auth/oidc_http.py does for the IdP anchor.
+    "messagefoundry/auth/ldap.py": frozenset(
+        {
+            "hash:via messagefoundry.auth.trust_anchors",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
+    ),
     "messagefoundry/auth/oidc/claims.py": frozenset(
         {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}
     ),

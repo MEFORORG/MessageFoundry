@@ -7,7 +7,8 @@ Before this slice both consumers checked one read of the anchor file and then lo
 by path: ``build_idp_opener`` through ``create_default_context(cafile=)``, and
 ``build_api_ssl_context`` through ``load_verify_locations(cafile=)``. A file swapped between the two
 reads was trusted with no pin, ACL or path check. Now both load ``cadata=`` built from the checked
-bytes.
+bytes. The AD bind followed in BACKLOG #2034: ldap3 gets the checked bytes as ``ca_certs_data``
+rather than the path it read again on every bind.
 
 What this file proves, and the instrument for each:
 
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import socket
 import ssl
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -33,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import ldap3
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -42,10 +45,11 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
+from messagefoundry.auth.ldap import LdapAuthenticator
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, anchor_cadata
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.config.settings import ApiSettings, ServiceSettings
+from messagefoundry.config.settings import ApiSettings, AuthSettings, ServiceSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture, urllib_handler_context
 from messagefoundry.store.base import Row
 from messagefoundry.transports.dicom import _server_ssl_context
@@ -273,6 +277,87 @@ def test_the_api_client_ca_loads_the_checked_bytes_not_the_swapped_file(
         _handshake(_mtls_client(evil, trusting=good), ctx)
 
 
+def _ad_auth(anchor: Path, pin: str | None, *, enforcing: bool = True) -> LdapAuthenticator:
+    """An LDAPS ``LdapAuthenticator`` anchored at ``anchor``. Its constructor runs the check."""
+    settings = AuthSettings(
+        ad_enabled=True,
+        ad_server="ldaps://dc1.example.test:636",
+        ad_user_search_base="DC=example,DC=test",
+        ad_bind_dn="CN=svc,DC=example,DC=test",
+        ad_bind_password="not-a-real-password",
+        ad_tls_ca_cert_file=str(anchor),
+        ad_tls_ca_cert_pin=pin,
+    )
+    return LdapAuthenticator(settings, enforcing=enforcing)
+
+
+def _ldap3_context(tls: Any) -> ssl.SSLContext:
+    """The context ldap3's OWN ``Tls.wrap_socket`` builds for a bind, captured off the socket it
+    returns. A socketpair and no handshake: no peer and no network, but ldap3's construction ran."""
+
+    class _Server:
+        host = "localhost"
+
+    class _Conn:
+        def __init__(self, sock: socket.socket) -> None:
+            self.socket: Any = sock
+            self.server = _Server()
+
+    left, right = socket.socketpair()
+    conn = _Conn(left)
+    try:
+        tls.wrap_socket(conn, do_handshake=False)
+        ctx = conn.socket.context
+        assert isinstance(ctx, ssl.SSLContext)
+        return ctx
+    finally:
+        conn.socket.close()
+        left.close()
+        right.close()
+
+
+def test_the_ad_bind_loads_the_checked_bytes_not_the_swapped_file(
+    tmp_path: Path, cas: tuple[_Ca, _Ca], swap_after_check: Callable[[Path, bytes], None]
+) -> None:
+    """BACKLOG #2034. ldap3 used to get the path and read it again on every bind, so a file swapped
+    after the check was trusted by every later bind. The swap lands in the check itself, and the
+    anchor stays swapped for every bind after it: each bind must still trust only the checked CA."""
+    good, evil = cas
+    anchor = tmp_path / "ad-ca.pem"
+    anchor.write_bytes(good.pem)
+    swap_after_check(anchor, evil.pem)
+
+    auth = _ad_auth(anchor, hashlib.sha256(good.pem).hexdigest())
+
+    assert anchor.read_bytes() == evil.pem  # the swap happened, and it persists for every bind
+    for _bind in range(2):  # the service-account bind and the user bind each build a Server
+        tls = auth._server().tls
+        assert tls.ca_certs_file is None  # the bind never names the path to ldap3
+        ctx = _ldap3_context(tls)
+        assert _subjects(ctx) == ["good-ca"]
+        _handshake(ctx, _server(good))
+        with pytest.raises(ssl.SSLCertVerificationError):
+            _handshake(ctx, _server(evil))
+
+
+def test_control_the_old_ad_bind_by_path_picks_up_the_swap(
+    tmp_path: Path, cas: tuple[_Ca, _Ca], swap_after_check: Callable[[Path, bytes], None]
+) -> None:
+    """The ldap3 load BACKLOG #2034 removed, run after the same swap: ``Tls(ca_certs_file=)`` trusts
+    the attacker's CA under a pin that matched the operator's. Without this, the test above could
+    pass because no swap reached ldap3 at all."""
+    good, evil = cas
+    anchor = tmp_path / "ad-ca.pem"
+    anchor.write_bytes(good.pem)
+    swap_after_check(anchor, evil.pem)
+    _ad_auth(anchor, hashlib.sha256(good.pem).hexdigest())
+
+    ctx = _ldap3_context(ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=str(anchor)))
+
+    assert _subjects(ctx) == ["evil-ca"]
+    _handshake(ctx, _server(evil))
+
+
 def test_control_a_second_read_by_path_picks_up_the_swap(
     tmp_path: Path, cas: tuple[_Ca, _Ca], swap_after_check: Callable[[Path, bytes], None]
 ) -> None:
@@ -303,6 +388,9 @@ def test_a_pin_mismatch_still_refuses_both_consumers(tmp_path: Path, cas: tuple[
         build_idp_opener(str(anchor), pin=pin, enforcing=False)
     with pytest.raises(TrustAnchorError, match="does not match its configured SHA-256 pin"):
         build_api_ssl_context(_api(tmp_path, cas, anchor, pin), enforcing=False)
+    # The AD bind checks at construction since BACKLOG #2034, and a mismatch refuses at warn too.
+    with pytest.raises(TrustAnchorError, match="does not match its configured SHA-256 pin"):
+        _ad_auth(anchor, pin, enforcing=False)
 
 
 # --- equivalence: cadata= sets the same trust as cafile= ---------------------------------------------

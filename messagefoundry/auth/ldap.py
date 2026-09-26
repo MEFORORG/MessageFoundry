@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from messagefoundry.auth.trust_anchors import ad_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
@@ -287,6 +288,7 @@ class LdapAuthenticator:
         *,
         secret_provider: SecretProvider | None = None,
         posture: HopPosture | None = None,
+        enforcing: bool = True,
     ) -> None:
         if not settings.ad_server or not settings.ad_user_search_base:
             raise LdapError("AD is enabled but ad_server / ad_user_search_base are not configured")
@@ -307,6 +309,16 @@ class LdapAuthenticator:
         # One definition of "is this bind LDAPS", read by the verify-off refusal below, the suite
         # assertion, and _server(). The assertion would have been its third open-coded spelling.
         self._ldaps = str(settings.ad_server).lower().startswith("ldaps")
+        # BACKLOG #2034 (ASVS 6.7.1): check [auth].ad_tls_ca_cert_file ONCE, here, and keep the bytes
+        # the pin, ACL and path check read. Every bind hands ldap3 those bytes as ca_certs_data, so a
+        # file swapped after this check is never trusted. ldap3 used to get the path, and read the
+        # file again on every bind. `enforcing` is the [security].enforcement dial, as for the OIDC
+        # anchor: a pin mismatch always refuses, and an anchor others can replace refuses at enforce.
+        # Only an LDAPS bind loads a CA; a plain ldap:// bind builds no Tls at all.
+        spec = ad_anchor_spec(settings) if self._ldaps else None
+        self._ca_certs_data = (
+            verified_anchor_cadata(spec, enforcing=enforcing) if spec is not None else None
+        )
         # #329: the instance hop posture (threaded by AuthService from create_app's derived posture).
         # LDAPS is built OUT of the connector-construction gate (AuthService, not build_check_registry),
         # so current_hop_posture() would be None here; the posture must be passed explicitly or the
@@ -352,10 +364,14 @@ class LdapAuthenticator:
         from them, so the two cannot drift onto different shapes. Keep it that way: the assertion runs
         against a REBUILT context (``ldap3.Tls`` holds no ``SSLContext`` to check directly), and a
         rebuilt context is only evidence about this hop while it is built from the hop's own arguments.
+
+        The CA goes in as ``ca_certs_data``, the bytes ``__init__`` checked, and never as
+        ``ca_certs_file`` (BACKLOG #2034). ``None`` means no CA is configured, and ldap3 then loads
+        the OS trust store, as it did before.
         """
         return {
             "validate": ssl.CERT_REQUIRED if self._s.ad_tls_verify else ssl.CERT_NONE,
-            "ca_certs_file": self._s.ad_tls_ca_cert_file,
+            "ca_certs_data": self._ca_certs_data,
         }
 
     def _server(self) -> Any:

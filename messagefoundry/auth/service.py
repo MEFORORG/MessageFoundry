@@ -840,8 +840,12 @@ class AuthService:
             # resolves the bind password from the external backend (fail-closed) at construction. #329:
             # thread the instance hop posture too — LDAPS is built out of the connector-construction gate,
             # so its ad_tls_verify=false escape clamp is inert unless the posture arrives explicitly here.
+            # BACKLOG #2034: the enforcement dial too, since the authenticator now checks its CA anchor.
             self._ldap = LdapAuthenticator(
-                settings, secret_provider=secret_provider, posture=hop_posture
+                settings,
+                secret_provider=secret_provider,
+                posture=hop_posture,
+                enforcing=self._trust_anchors_enforcing,
             )
         else:
             self._ldap = None

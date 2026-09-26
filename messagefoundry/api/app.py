@@ -229,6 +229,7 @@ from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
     make_registry_anchor_preflight,
+    make_settings_anchor_preflight,
     run_anchor_preflight,
 )
 from messagefoundry.config.ai_policy import (
@@ -3523,29 +3524,10 @@ def create_app(
                     operation="config_reload",
                     detail="held for a second approver (dual-control)",
                 )
-        # #285 (ASVS 6.7.1): re-verify the operator-supplied trust anchors on every real deploy, BEFORE
-        # the graph swap — the on-disk PEMs are re-read, so a swapped anchor is audited (auth.trust_anchor)
-        # and a pinned-but-substituted / (under enforce) newly group-writable anchor REFUSES the deploy
-        # (422) rather than converging onto a tampered CA. Dormant (no-op) when no anchor is configured.
-        anchor_specs = getattr(request.app.state, "trust_anchor_specs", ())
-        if anchor_specs and not req.dry_run:
-            try:
-                await run_anchor_preflight(
-                    anchor_specs,
-                    engine.store,
-                    enforcing=getattr(request.app.state, "trust_anchors_enforcing", True),
-                )
-            except (TrustAnchorError, OSError) as exc:
-                _log.warning("config reload refused (trust anchor): %s", exc)
-                await engine.store.record_audit(
-                    "config_reload_failed",
-                    actor=user.username,
-                    detail=json.dumps(
-                        {"requested": req.config_dir, "dry_run": False, "reason": "trust_anchor"}
-                    ),
-                    client=client_ip(request),
-                )
-                raise HTTPException(422, "invalid configuration") from exc
+        # #285 (ASVS 6.7.1): the engine re-verifies the settings trust anchors first on every real
+        # reload, so a swapped or newly exposed anchor refuses the deploy (422, audited as
+        # reason="trust_anchor" below). It moved there from this route in BACKLOG #2034, so a held,
+        # convergence or DR reload runs it too.
         try:
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
@@ -7332,6 +7314,12 @@ def create_managed_app(
             registry_preflight=make_registry_anchor_preflight(
                 store, enforcing=trust_anchors_enforcing
             ),
+            # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA), re-verified by
+            # the engine on EVERY real reload, not only the direct /config/reload route. None when
+            # no settings anchor is configured.
+            settings_preflight=make_settings_anchor_preflight(
+                trust_anchor_specs, store, enforcing=trust_anchors_enforcing
+            ),
         )
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
@@ -7392,10 +7380,6 @@ def create_managed_app(
 
                 notifier.set_control_callback(_alert_control)
             app.state.engine = engine
-            # #285: stash the trust anchors so /config/reload re-verifies the on-disk PEMs (a swapped anchor
-            # is caught + audited, a pinned-but-substituted anchor refuses the deploy) — the reload seam.
-            app.state.trust_anchor_specs = tuple(trust_anchor_specs)
-            app.state.trust_anchors_enforcing = trust_anchors_enforcing
             app.state.store_settings = resolved  # back GET /security/posture (M5)
             # BACKLOG #1182: the settings half of the static-credential inventory, for the same route.
             app.state.static_credential_settings = static_credential_settings
