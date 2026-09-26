@@ -1571,3 +1571,43 @@ async def test_authenticate_oidc_pads_its_own_refusals(
         assert spy.seams == ["oidc"]
     finally:
         await store.close()
+
+
+# --- BACKLOG #1948: a caller's bad code is not an IdP outage -------------------------------------
+#
+# ``oidc_available`` hides the federated link on /ui/login and in /auth/providers. It was set by
+# every FlowError, and a token endpoint refusing a bad code raises one, so any signed-out caller who
+# started a flow could switch federated sign-in off for everyone by calling back with a junk code.
+
+
+def _refuse_the_grant(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(**_kwargs: Any) -> Mapping[str, object]:
+        raise oidc.TokenRefusedError("token endpoint returned HTTP 400")
+
+    monkeypatch.setattr(oidc, "exchange_code", refuse)
+
+
+@pytest.mark.parametrize("was_available", [True, False])
+async def test_a_refused_code_leaves_the_idp_flag_as_it_was(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, was_available: bool
+) -> None:
+    """The refusal must not hide the link. Nor may it clear a real outage: the token endpoint
+    answered, but no sign-in succeeded, and only a completed login clears the flag (AC-8)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        if not was_available:
+            service.mark_oidc_unavailable("URLError")
+        _refuse_the_grant(monkeypatch)
+        out = await service.authenticate_oidc(
+            AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+        )
+        assert not out.ok and out.token is None and out.reason == "token_refused"
+        assert service.oidc_available is was_available
+        # A refusal of the caller's grant, audited as a failed sign-in under a closed-set slug and
+        # NOT as an IdP error: the operator reading the log must not chase an outage.
+        assert await _audit_rows(store, "auth.login_error") == []
+        failed = await _audit_rows(store, "auth.login_failed")
+        assert any('"reason": "token_refused"' in (r["detail"] or "") for r in failed)
+    finally:
+        await store.close()

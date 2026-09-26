@@ -56,6 +56,21 @@ class FlowCacheFullError(FlowError):
     """The global or per-IP pending-flow bound is full — a start-leg flood, refused not evicted."""
 
 
+class TokenRefusedError(FlowError):
+    """The token endpoint answered and refused THIS grant: the IdP is up (BACKLOG #1948).
+
+    RFC 6749 section 5.2 answers a bad, used or expired ``code`` with HTTP 400 ``invalid_grant``, and
+    a signed-out caller chooses the ``code``. So this refusal must not read as an IdP outage, or any
+    caller could hide the federated sign-in link.
+
+    Raised for HTTP 400 ONLY, which is the status section 5.2 gives every grant-level error. Every
+    other failure stays a plain :class:`FlowError` and so an outage: a 401 is ``invalid_client`` (the
+    engine's own secret, which fails every sign-in), a 404 or 403 is usually a wrong endpoint or a
+    firewall, and 408, 429 and 5xx are the endpoint declining to serve. The error body is never read
+    to refine this, because it may echo the request, client secret included.
+    """
+
+
 def pkce_challenge(verifier: str) -> str:
     """The PKCE S256 challenge for ``verifier`` — ``base64url(sha256(verifier))`` (RFC 7636).
 
@@ -263,6 +278,8 @@ def exchange_code(
     confidential client sends ``client_secret_post``; a public client omits it and relies on PKCE.
     Raises :class:`FlowError` on a non-2xx, misframed, oversized or non-JSON response — PHI/secret-safe: the
     secret, the ``code``, and the tokens never enter an exception message.
+    An HTTP 400, which refuses the grant itself, raises the subclass :class:`TokenRefusedError`, so
+    the caller can tell a caller-chosen bad ``code`` from an IdP outage (BACKLOG #1948).
 
     The request line and header block are **measured before the POST** (ASVS 4.2.5, BACKLOG #1048).
     ``token_endpoint`` is operator-static config (validated https at load), so this is the weaker of
@@ -325,6 +342,7 @@ def exchange_code(
     # may echo the request params, this POST's client secret among them — would still be reachable
     # by a chain-walking handler. See `encode_wire_body` in transports/base.py.
     refusal: str | None = None
+    grant_refused = False
     body = b""
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
@@ -334,6 +352,7 @@ def exchange_code(
     except urllib.error.HTTPError as exc:
         # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
         refusal = f"token endpoint returned HTTP {exc.code}"
+        grant_refused = exc.code == 400
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         refusal = f"token endpoint unreachable: {type(exc).__name__}"
     except AmbiguousFramingError:
@@ -345,6 +364,8 @@ def exchange_code(
     except EgressReplyError:
         # The family, so a refusal added to bounded_read later still lands on FlowError.
         refusal = "token endpoint response could not be read"
+    if grant_refused:
+        raise TokenRefusedError(refusal)
     if refusal is not None:
         raise FlowError(refusal)
     # No handler here, for the same reason (BACKLOG #2048): the decode error holds the WHOLE reply,

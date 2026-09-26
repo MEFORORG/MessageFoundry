@@ -147,6 +147,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   removed nor emptied, the verify names the directory to delete: a `PASS` becomes `FAIL`, another
   verdict keeps its status, and an exception carries it as a note.
   `docs/PHI.md` says the same. (`BACKLOG #1721`)
+- **A bad authorization code no longer hides the federated sign-in link.** A token endpoint that
+  refuses the code a caller presents answers with HTTP 400, and the engine used to read that as
+  an identity provider outage. That set `oidc_available` to false, which hides the link on
+  `/ui/login` and reports `oidc: false` from `/auth/providers`. So any signed-out visitor who
+  started a flow could turn federated sign-in off for everyone by calling back with a junk code.
+  The token exchange now raises `TokenRefusedError` for an HTTP 400, the status RFC 6749 gives a
+  refused grant. The engine audits it as a failed sign-in with reason `token_refused` and leaves the
+  flag alone. Any other status, or a transport failure, is still an outage.
+  (`BACKLOG #1948`)
 - **The Python engine client now ends the session a new sign-in replaces.** `EngineClient.login`
   used to overwrite the bearer token it held and never revoke it, so the old session would have
   stayed valid on first deployment until it idled out. It now calls `POST /auth/logout` with the

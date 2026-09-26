@@ -1121,11 +1121,17 @@ class AuthService:
         restart"; a copy of the Kerberos latch would leave one IdP blip disabling federated login
         until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
         and ``/auth/providers``, nothing more. Do not "fix" the asymmetry with the Kerberos twin.
+
+        "A failed login" means an IdP OUTAGE, never a refusal the caller chose: a token endpoint
+        refusing a bad ``code`` leaves the flag alone (BACKLOG #1948).
         """
         return self.oidc_enabled and self._oidc_unavailable_reason is None
 
     def mark_oidc_unavailable(self, reason: str) -> None:
-        """Record that an IdP interaction failed. Advisory only — see :attr:`oidc_available`."""
+        """Record that an IdP interaction failed. Advisory only — see :attr:`oidc_available`.
+
+        Only for a failure no caller can cause. A token endpoint refusing a bad ``code`` is not one:
+        the IdP answered, and a signed-out caller chooses the code (BACKLOG #1948)."""
         self._oidc_unavailable_reason = reason
 
     def clear_oidc_unavailable(self) -> None:
@@ -1902,8 +1908,16 @@ class AuthService:
             # exc.reason is closed-set, so nothing IdP-influenced reaches the audit row.
             await self._directory_reject_audit("<oidc>", "oidc", exc.reason)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=exc.reason)
+        except oidc.TokenRefusedError:
+            # BACKLOG #1948. The token endpoint ANSWERED and refused this grant, which a signed-out
+            # caller causes by presenting a bad code. It must not mark the IdP unavailable: that flag
+            # hides the federated link on /ui/login and in /auth/providers for everyone, so marking
+            # here would let any caller switch federated sign-in off. Nor does it clear the flag, as
+            # no sign-in succeeded. It is a FlowError, so this arm must stay above the outage arm.
+            await self._directory_reject_audit("<oidc>", "oidc", "token_refused")
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason="token_refused")
         except (OSError, ValueError, http.client.HTTPException) as exc:
-            # IdP unreachable / non-2xx / malformed response. JwksCache's injected fetch raises RAW
+            # IdP unreachable / a non-2xx that is not a grant refusal / malformed response. JwksCache's injected fetch raises RAW
             # urllib errors (it is not wrapped in JwksError), so a narrow `except JwksError` here
             # would let an IdP outage escape as an unhandled 500 instead of a degraded login.
             # http.client.HTTPException is neither an OSError nor a ValueError: a proxy answering the
