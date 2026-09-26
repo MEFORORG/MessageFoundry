@@ -5,7 +5,9 @@
 **Destination** writes each payload to a file in a directory. The filename may contain
 ``{HL7-path}`` placeholders (e.g. ``{MSH-10}.hl7``) resolved by peeking the payload, so
 archived files are named by control id / message type. Writes are atomic (write to a
-temp name, then ``rename``) so a reader watching the directory never sees a partial file.
+temp name, flush it, then ``rename``/``link``) so a reader watching the directory never sees a partial
+file. The one residual is a POSIX filesystem with no hard links, where a reader can briefly see an
+EMPTY file at the final name (see ``_publish_staged``, BACKLOG #1622).
 
 **Source** polls a directory for files, hands each to the pipeline handler, then moves the
 file into a ``.processed`` subdirectory (or ``.error`` if the handler raised). Files have
@@ -24,7 +26,7 @@ import shutil
 import tempfile
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, TypeVar
@@ -1118,87 +1120,139 @@ def scan_inbound_file(raw: bytes, source: str) -> None:
     _scan_hook(raw, source)
 
 
+#: ``os.rename`` on Windows refuses to replace an existing file (``FileExistsError``) and is atomic, so
+#: it can publish a finished file under a free name with no placeholder. POSIX ``rename`` silently
+#: replaces instead, so that arm claims the name first (see :func:`_publish_staged`). Module-level so a
+#: test can drive the POSIX arm on a Windows runner; it is never reassigned at run time.
+_RENAME_REFUSES_OVERWRITE = os.name == "nt"
+
+
 def _claim_unique(tmp: Path, target: Path) -> Path:
-    """Claim ``target`` (or ``name-1.ext``, ``name-2.ext``, … if taken) for ``tmp``, atomically.
+    """Publish ``tmp``'s bytes at ``target`` (or ``name-1.ext``, ``name-2.ext``, … if taken), never
+    clobbering an existing file and never consuming ``tmp``.
 
     Prefers ``os.link`` (the target becomes a hard link to ``tmp``); ``FileExistsError`` means the
     name is taken, so claiming a free name is a single atomic step — no check-then-act window where
-    a concurrent writer could clobber us. Where hard links aren't supported (FAT/exFAT, many SMB/NAS
-    mounts) ``os.link`` raises a different ``OSError``; fall back to an exclusive-create copy
-    (``O_CREAT | O_EXCL``), which is also atomic no-clobber but works cross-filesystem (review low-5)."""
-    stem, suffix = target.stem, target.suffix
-    candidate, n = target, 0
-    linkable = True
+    a concurrent writer could clobber us.
+
+    Where hard links aren't usable from ``tmp`` (FAT/exFAT, many SMB/NAS mounts, or ``tmp`` on another
+    filesystem), the bytes are first copied to a staging temp INSIDE the target directory and flushed,
+    and only that finished file is published (BACKLOG #1622). The fallback used to claim the final name
+    with an empty ``O_EXCL`` file and fill it in place, so a reader polling the directory could pick up
+    an empty or partial file under the final name on exactly the filesystems the fallback exists for
+    (review low-5). The staged copy is published by a second ``os.link`` where the first failed only
+    for being cross-filesystem, else by :func:`_publish_staged`."""
+    claimed = _link_free_name(tmp, target)
+    if claimed is not None:
+        return claimed
+    staged = _stage_copy(tmp, target.parent)
+    try:
+        claimed = _link_free_name(staged, target)
+        return claimed if claimed is not None else _publish_staged(staged, target)
+    finally:
+        # After a link the staged name is a second link to the published file; after a rename or
+        # replace it is already gone. Either way nothing of ours may be left behind.
+        _discard(staged)
+
+
+def _free_names(target: Path) -> Iterator[Path]:
+    """``target``, then ``name-1.ext``, ``name-2.ext``, … — the order every claim walks."""
+    yield target
+    n = 0
     while True:
-        if linkable:
-            try:
-                os.link(tmp, candidate)
-                return candidate
-            except FileExistsError:
-                n += 1
-                candidate = target.with_name(f"{stem}-{n}{suffix}")
-                continue
-            except OSError:
-                linkable = False  # hard links unusable on this filesystem — copy instead
+        n += 1
+        yield target.with_name(f"{target.stem}-{n}{target.suffix}")
+
+
+def _link_free_name(source: Path, target: Path) -> Path | None:
+    """Hard-link ``source`` to the first free name from ``target``, or return ``None`` when a hard link
+    cannot be made here at all (unsupported filesystem, or ``source`` on another one)."""
+    for candidate in _free_names(target):
         try:
-            # 0o600 (owner-only), matching the mkstemp temp this delivers and the os.link / os.replace
-            # paths that inherit its mode: delivered files can carry PHI, so the rare cross-filesystem
-            # copy fallback must not be the one path that leaves them world-readable.
-            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.link(source, candidate)
         except FileExistsError:
-            n += 1
-            candidate = target.with_name(f"{stem}-{n}{suffix}")
             continue
-        # The exclusive create above sits OUTSIDE the cleanup guard on purpose: a lost create race
-        # raises FileExistsError there and bumps the name, so the file then at `candidate` belongs to
-        # the winner — unlinking it would clobber exactly what O_EXCL exists to protect.
-        placed = False
-        try:
-            # Streamed, not read_bytes(): the archive move claims through here too (#1046), and an
-            # inbound file is only as small as the operator's max_file_bytes (unset by default), so
-            # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
-            # in memory on exactly the filesystems that already can't hard-link.
-            # `fd` is wrapped FIRST so a handle that closes it always exists: were `open(tmp)` opened
-            # first and to raise, the fd would still be open and the unlink below would die on Windows
-            # with a sharing violation, replacing the real error with a bogus one.
-            with os.fdopen(fd, "wb") as handle, open(tmp, "rb") as source:
-                shutil.copyfileobj(source, handle)
-                # The copy is a NEW file, so the fsync the delivery path gave `tmp` does not cover
-                # it: flush this one's bytes too before reporting it placed (BACKLOG #1618).
-                handle.flush()
-                os.fsync(handle.fileno())
-            placed = True
-        finally:
-            # A copy that dies mid-stream (a full volume, a dropped share) would otherwise leave a
-            # TRUNCATED, PHI-bearing file at `candidate` beside a reported failure — and it would
-            # consume that name permanently, since the bumping loop above skips a name that exists,
-            # so every later delivery would route around the debris instead of replacing it.
-            # `finally`, not `except`, so nothing is caught or relabelled and no failure mode is
-            # missed — `return` and `break` included, which an `except` arm never sees. It runs
-            # after the `with` has closed the handle, which Windows requires.
-            #
-            # Deliberately NOT the `except BaseException` that this package's persistent-connection
-            # connectors use (mllp.py, tcp.py, x12.py). Those are connection-discard arms inside
-            # `async def`, and they are broad because an await point can deliver CancelledError and
-            # the arm must stay distinguishable from the `except DeliveryError` above it. Neither
-            # applies here: `_claim_unique` is sync, so no CancelledError can arrive mid-execution,
-            # and there is only one cleanup path to begin with. Matching that shape would widen a
-            # catch past section 6 of CLAUDE.md for nothing. Settled twice; please leave it.
-            if not placed:
-                try:
-                    candidate.unlink(missing_ok=True)
-                except OSError as unlink_exc:
-                    # Cleanup must never DISPLACE the failure that caused it. Our own handle is
-                    # closed by now, but a drop directory is one other processes watch by design, so
-                    # a scanner or a reader holding the partial open is ordinary here, not exotic —
-                    # and an escaping unlink error would hide the full volume or dropped share behind
-                    # a cleanup message. Log it and let the real exception propagate.
-                    logger.warning(
-                        "could not remove the partial file %s after a failed claim: %s",
-                        candidate,
-                        unlink_exc,
-                    )
+        except OSError:
+            return None  # not a taken name: links are unusable here, so the caller copies instead
         return candidate
+    raise AssertionError("unreachable: _free_names never ends")  # pragma: no cover
+
+
+def _stage_copy(source: Path, directory: Path) -> Path:
+    """Copy ``source`` to a new private temp in ``directory`` and flush it, returning the temp.
+
+    ``mkstemp`` creates it 0o600 (owner-only): delivered files can carry PHI, so the copy fallback
+    must not be the one path that leaves them world-readable. Streamed, not ``read_bytes()``: the
+    archive move claims through here too (#1046), and an inbound file is only as small as the
+    operator's ``max_file_bytes`` (unset by default).
+
+    A copy that dies mid-stream (a full volume, a dropped share) removes its temp and re-raises, so a
+    failure never leaves a truncated, PHI-bearing file behind. The cleanup is a ``finally`` rather
+    than an ``except`` so nothing is caught or relabelled; it runs after the ``with`` has closed the
+    handle, which Windows requires before an unlink. Deliberately not the ``except BaseException``
+    the persistent-connection connectors use: this function is sync, so no ``CancelledError`` can
+    arrive mid-copy, and a wider catch would breach section 6 of CLAUDE.md for nothing."""
+    fd, name = tempfile.mkstemp(dir=directory, suffix=".part")
+    staged = Path(name)
+    placed = False
+    try:
+        # `fd` is wrapped FIRST so a handle that closes it always exists: were `open(source)` opened
+        # first and to raise, the fd would stay open and the unlink would fail on Windows.
+        with os.fdopen(fd, "wb") as handle, open(source, "rb") as reader:
+            shutil.copyfileobj(reader, handle)
+            # Durable before anyone can see it under the final name (BACKLOG #1618).
+            handle.flush()
+            os.fsync(handle.fileno())
+        placed = True
+    finally:
+        if not placed:
+            _discard(staged)
+    return staged
+
+
+def _publish_staged(staged: Path, target: Path) -> Path:
+    """Move a finished ``staged`` file to the first free name from ``target``, never clobbering.
+
+    **Windows:** ``os.rename`` is atomic and refuses an existing name, so the file appears whole or not
+    at all.
+
+    **POSIX without hard links** (a vfat or exFAT mount, some CIFS and FUSE mounts): the standard
+    library has no rename that refuses to replace, so the name is claimed with an empty ``O_EXCL``
+    placeholder and the finished file is renamed over it at once. A reader polling the directory can
+    therefore see an EMPTY file at the final name for the moment between those two calls. No bytes are
+    copied in that window, so it is far narrower than the in-place fill this replaced, and never a
+    partial file, but it is not zero. That residual is stated rather than claimed away."""
+    for candidate in _free_names(target):
+        if _RENAME_REFUSES_OVERWRITE:
+            try:
+                os.rename(staged, candidate)
+            except FileExistsError:
+                continue
+            return candidate
+        try:
+            placeholder = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        os.close(placeholder)
+        try:
+            os.replace(staged, candidate)  # over our OWN placeholder, never someone else's file
+        except OSError:
+            _discard(candidate)  # the placeholder is ours and empty; do not leave it at the name
+            raise
+        return candidate
+    raise AssertionError("unreachable: _free_names never ends")  # pragma: no cover
+
+
+def _discard(path: Path) -> None:
+    """Remove a staging temp or an unused placeholder, logging rather than raising if it cannot go.
+
+    Cleanup must never DISPLACE the failure that caused it. A drop directory is one other processes
+    watch by design, so a scanner or a reader holding the file open is ordinary here, and an escaping
+    unlink error would hide the full volume or dropped share behind a cleanup message."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("could not remove the file %s after a failed claim: %s", path, exc)
 
 
 def _mtime(p: Path) -> float:
