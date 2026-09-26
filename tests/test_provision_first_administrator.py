@@ -518,7 +518,11 @@ def test_a_password_the_policy_refuses_leaves_no_store(
     _tty(monkeypatch, "short", "short")
     db = tmp_path / "never.db"
     assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
-    assert "error" in json.loads(capsys.readouterr().out)
+    error = json.loads(capsys.readouterr().out)["error"]
+    # Pin the REFUSAL, not just the key. Since BACKLOG #1863 `main`'s dispatch floor also answers
+    # an escaped exception with exit 1 and an `error` key, so the key alone no longer proves the
+    # policy refused the password rather than something crashing.
+    assert "at least 15 characters" in error, error
     assert not db.exists(), "a refused password left a store behind"
 
 

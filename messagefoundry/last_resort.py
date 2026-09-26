@@ -72,7 +72,21 @@ def _excepthook(
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc, tb)  # Ctrl-C is a clean interrupt, not an error to redact
         return
-    _log.critical("last-resort: uncaught exception: %s", safe_exc(exc))
+    report_uncaught(exc)
+
+
+def report_uncaught(exc: BaseException) -> str:
+    """Log ``exc`` as an uncaught exception, PHI-redacted, and return the redacted text.
+
+    This is the one rendering of an uncaught exception. :func:`_excepthook` uses it, and so does the
+    CLI's dispatch-level catch in ``messagefoundry.__main__.main`` (BACKLOG #1863). That catch has to
+    stop the exception reaching ``sys.excepthook``, so it could not print a ``--json`` error object
+    otherwise. Sharing this function keeps the stderr line identical either way, and hands the
+    caller the SAME redacted text for stdout. A caller must never format the exception itself: its
+    message can quote a PHI-bearing value (ASVS 16.5.4)."""
+    text = safe_exc(exc)
+    _log.critical("last-resort: uncaught exception: %s", text)
+    return text
 
 
 def install_excepthook() -> None:

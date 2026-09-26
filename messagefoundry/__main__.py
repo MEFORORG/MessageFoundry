@@ -105,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     # INSTALLING THE HOOK CHANGES NO EXIT CODE: the interpreter still exits 1 after calling
     # `sys.excepthook`. That is why this shape was taken over the alternative of wrapping the dispatch
     # and exiting 2, which would have made every CLI exit-code assertion in the suite a fresh question.
+    # The dispatch IS now wrapped (BACKLOG #1863, at the foot of this function), but it returns 1,
+    # so that reasoning still holds. The hooks stay: they cover everything outside that `try`.
     #
     # LATE IMPORT, DELIBERATELY. Two `tests/test_config_anchoring.py` monkeypatches target the module
     # attribute `messagefoundry.last_resort.install_excepthook`; importing the name at module scope
@@ -517,6 +519,10 @@ def main(argv: list[str] | None = None) -> int:
         "match the 'lens parse --contract' that produced them, so a v1 client's coordinates resolve "
         "against the v1 partition and a v2 client's against the v2 one",
     )
+    # `lens rewrite` has no --json flag, yet every error it reports is JSON on stdout. Setting the
+    # attribute lets `main` treat it as a --json command: its logging goes to stderr (BACKLOG #1489),
+    # and an uncaught exception still yields `{"error": ...}` (#1863). `_lens_rewrite` never reads it.
+    lens_rewrite.set_defaults(json=True)
 
     lens_schema = lens_sub.add_parser(
         "schema",
@@ -1070,9 +1076,29 @@ def main(argv: list[str] | None = None) -> int:
     # PHI-redaction + control-char-scrub filter chain, which is strictly more than the UNFILTERED
     # `logging.lastResort` a handler-less subcommand degrades to today. `serve` and `supervise` take
     # no `--json`, print no payload and are untouched: they still log to the stdout NSSM captures.
-    if getattr(args, "json", False):
+    as_json = bool(getattr(args, "json", False))
+    if as_json:
         configure_stderr_logging()
-    return _DISPATCH[args.command](args)
+    # THE FLOOR UNDER `_emit_error`'s --json CONTRACT (BACKLOG #1863). Without this `try`, an exception
+    # no subcommand arm names went to `sys.excepthook`: one redacted CRITICAL line on stderr, exit 1,
+    # and stdout EMPTY. A machine consumer could not tell that from a command with no output. Now it
+    # gets `{"error": ...}` on stdout under --json. Text mode prints nothing new, as before; only the
+    # log line appears, on whatever sink logging uses (stdout for `serve`/`supervise`, per NSSM).
+    #
+    # The exit code stays 1, the same 1 the hook path gave, so #1674's reasoning above still holds.
+    # `report_uncaught` is the hook's own rendering, so the stderr line is unchanged and the stdout
+    # text is the same PHI-redacted string. Never format `exc` here.
+    #
+    # `Exception`, not `BaseException`: Ctrl-C and `SystemExit` keep their own meaning. A command that
+    # printed part of its JSON before raising still leaves two documents on stdout; this catch cannot
+    # take back what was already written.
+    try:
+        return _DISPATCH[args.command](args)
+    except Exception as exc:
+        from messagefoundry.last_resort import report_uncaught
+
+        text = report_uncaught(exc)
+        return _emit_error(text, as_json=True) if as_json else 1
 
 
 def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
@@ -6817,9 +6843,9 @@ def _load_operator_json(raw: str, what: str) -> Any:
     has established is at fault. The stack has already unwound to this shallow frame before either
     clause runs, so raising cannot re-trip the limit.
 
-    Each caller keeps its OWN arm rather than one dispatch-level catch because the callers differ in
-    where the report goes: four pass ``as_json=args.json``, while ``lens rewrite`` has no ``--json``
-    flag and always emits JSON. A single catch could not pick the right output stream.
+    Each caller keeps its OWN arm even though ``main`` now has a dispatch-level catch (BACKLOG #1863).
+    That catch is only a floor: it reports the exception type and redacted message, and cannot say
+    WHICH operator input was at fault. The arm here can, so it is the better report where it applies.
 
     DO NOT DRIVE A TEST OF THE RECURSION ARM WITH REAL DEEPLY-NESTED INPUT -- manufacture the
     exception. The depth where ``json``'s C accelerator gives out is a property of the runner, not
