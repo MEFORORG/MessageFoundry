@@ -435,5 +435,5 @@ Two results, and the second is the one that matters:
 - [x] Owner approval to wire the drain rows, which places a hook on `SessionStart` and `Stop` for
       every session in this repo. **Given 2026-08-05/06, in two steps:** `Stop` first, then
       `SessionStart` once the show/consume split made a discarded session unable to consume what it
-      displayed. Default config root only. ⚠️ The rows are live and the hook still resolves nothing
+      displayed. Default config root only. WARNING: The rows are live and the hook still resolves nothing
       outside a worktree holding this branch — see §"Status and what gates wiring".
