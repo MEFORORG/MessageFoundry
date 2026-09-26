@@ -17,7 +17,9 @@ is exactly the defect this file exists to catch.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -115,7 +117,9 @@ def test_two_attested_outbounds_to_one_host_each_line_names_its_own(
 
 # --- every outbound call site passes the name ------------------------------------------------------
 
-_HTTP = {
+# Annotated because the four factories share no common type: mypy joins them to `object`, and
+# the tests-wide mypy pass (#1799) then refuses the call.
+_HTTP: dict[str, tuple[ConnectorType, Callable[..., Any], str]] = {
     "REST": (ConnectorType.REST, Rest, f"https://{_HOST}/x"),
     "SOAP": (ConnectorType.SOAP, Soap, f"https://{_HOST}/svc"),
     "FHIR": (ConnectorType.FHIR, FHIR, f"https://{_HOST}/fhir"),
