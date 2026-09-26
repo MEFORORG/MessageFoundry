@@ -197,6 +197,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   only; the listeners' NUL and declared-type checks still do not run there. An HL7 loopback keeps
   its peek check and its wording. SQL Server now also encrypts the error text of a re-ingress
   `ERROR` message, as it does every other message error. (`BACKLOG #1914`)
+- **The OIDC revocation refusal now stops startup before any connection starts, and `verify`
+  reports it.** On an enforcing instance, an off-box OIDC token or JWKS leg with no
+  `[auth].oidc_tls_crl_file` refuses to start. That refusal fired when the API lifespan built the
+  auth service, which was after the engine had started its connections. The lifespan now builds the
+  service before `engine.start()`, so the engine starts nothing. Any other refusal the service's
+  constructor raises moved with it. `verify --section federation` has a new `fed.idp_revocation`
+  row. It runs the engine's own guard and FAILs where the engine would refuse. `messagefoundry
+  check` still does not report it. (`BACKLOG #1923`)
 - **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
   is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
   handle still open on the extracted store, such as a scanner's, made the removal fail. The
