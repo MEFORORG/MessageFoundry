@@ -39,13 +39,11 @@ counting it as coverage would be wrong. It is kept as a boundary pin and labelle
 ``gated_commands_own_argument_spans_lines`` has no middle statement to measure: the gated command IS
 the whole shape there, so that row carries a verdict and no execution reading.
 
-**THIS FILE ASSERTS THE DENY SIDE ONLY, DELIBERATELY.** The four ALLOWing corners are already pinned as
-a tripwire in ``tests/test_worktree_gate_quote_straddle.py``. Restating them here would give a future
-fixer of #1429 two places to find and delete, and the standing hazard in this neighbourhood is exactly
-that: two shipped tripwires assert ALLOW and tell a reader who reds them to DELETE the row. So when
-#1429 closes, the straddle suite reds and this file stays green -- which is the correct outcome,
-because these shapes must go on denying. This is the must-NOT-trip half of the paired suite #1429 asks
-a fix to bring; the must-trip half is the straddle suite's four rows.
+**THIS FILE ASSERTS THE DENY SIDE ONLY, DELIBERATELY.** The four corners that ALLOWED before #1429 are
+pinned in ``tests/test_worktree_gate_quote_straddle.py``, which now asserts they DENY. This file is the
+must-NOT-trip half of the paired suite #1429 asked a fix to bring: every shape here denied before the
+fix and must go on denying after it. The ``MUST_STAY`` rows near the end add the shapes a cross-line
+quote carry is most likely to get wrong -- a quote the shell reads as data.
 
 **ALL FOUR TOOL x QUOTE CORNERS, AND THE COMPLETENESS IS PAID FOR.** Each row costs a ``pwsh`` launch
 and a sampled corner set would be cheaper. The last person to sample corners here missed the
@@ -56,6 +54,7 @@ mode this neighbourhood actually has.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -64,7 +63,7 @@ import pytest
 from _bash_resolver import explain_returncode, require_bash
 
 from tests._spawn_lock import run_single
-from tests.test_worktree_gate import assert_denied, run_gate  # reuse the subprocess harness
+from tests.test_worktree_gate import GATE, assert_denied, run_gate  # reuse the harness
 
 # Built by concatenation, matching the straddle suite: a test about quote handling must not depend on
 # how its own string literals nest.
@@ -128,6 +127,12 @@ NEAR_MISS = {
     # so the shell treats it as an argument to `echo`/`Write-Output` and never executes it. Measured
     # with the computing marker in the same slot -- it prints the marker's own text, not 333. Kept as
     # a boundary pin so a future over-blanking fix that stopped denying it is still visible here.
+    #
+    # THE #1429 FIX KEEPS THIS FALSE POSITIVE ON PURPOSE. Its logical-line view blanks this span whole,
+    # but that view is ADDED to the per-line one rather than replacing it, and the per-line view still
+    # sees the gated line raw. Replacing the per-line view would clear this row and was measured to
+    # open ten fail-opens (the MUST_STAY rows below). If a later change makes this row ALLOW, check
+    # that it did so without replacing the per-line view.
     "gated_inside_span_never_runs": "{P} {Q}a\n{G}\nb{Q}",
 }
 
@@ -168,8 +173,8 @@ def test_the_near_miss_line_split_shapes_still_deny(
         # A heredoc carrying the gated command on its own line. Named in the residual list as an
         # inherited category; it denies, and the middle statement genuinely runs.
         ("heredoc_body", "Bash", "checkout main", "bash <<{Q}EOF{Q}\n{G}\nEOF"),
-        # An interpreter payload spanning lines. The recursion is not what saves this -- the payload's
-        # middle line reaches the scanner raw on its own.
+        # An interpreter payload spanning lines. The per-line view sees its middle line raw; since
+        # #1429 the logical-line view also recurses into the whole payload.
         (
             "interpreter_payload_spanning_lines",
             "Bash",
@@ -197,6 +202,134 @@ def test_the_other_multi_line_categories_still_deny(
 # The over-deny arm. Without it every row above would pass against a gate that denied its own input,
 # which is the cheapest wrong way to make a must-not-trip suite green.
 # ---------------------------------------------------------------------------------------------
+
+
+#: Text that never runs but QUOTES a straddle or a gated command, in the places a cross-line view
+#: could mis-read it. Each ALLOWED before #1429; each DENIED under an earlier draft of the fix, which
+#: re-scanned data bodies as code and paired quotes flatly through a substitution spanning lines.
+#: The commit row is this fleet's everyday commit idiom. ``{G}`` is a gated command, and
+#: test_the_data_rows_never_run_their_gated_slot proves every one is inert.
+DATA_THAT_QUOTES = {
+    "here_string_body_quoting_the_repro": (
+        "PowerShell",
+        "$m = @'\nWrite-Output 'a\nb' ; {G} ; Write-Output 'c\nd'\n'@",
+    ),
+    "heredoc_to_cat_quoting_the_repro": (
+        "Bash",
+        "cat > notes.md <<'EOF'\necho 'a\nb' ; {G} ; echo 'c\nd'\nEOF",
+    ),
+    "commit_idiom_with_a_double_quoted_phrase": (
+        "Bash",
+        'git commit -m "$(cat <<\'EOF\'\nFix the "{G}" path\nEOF\n)"',
+    ),
+    "pwsh_subexpression_spanning_lines": (
+        "PowerShell",
+        'Write-Output "$(Write-Output "a"\nWrite-Output "{G} now")"',
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(DATA_THAT_QUOTES))
+def test_data_that_quotes_a_gated_command_still_allows(
+    primary: Path, repos_file: Path, shape: str
+) -> None:
+    """The false denies a cross-line view could buy, pinned so it cannot buy them back."""
+    tool, template = DATA_THAT_QUOTES[shape]
+    verb = "checkout main" if tool == "Bash" else "reset --hard"
+    command = template.replace("{G}", f"git -C {primary} {verb}")
+    result = run_gate(payload(tool, command, cwd=primary), repos_file)
+    assert result is None, f"{shape} now DENIES text that never runs. Deny object:\n{result}"
+
+
+def test_the_data_rows_never_run_their_gated_slot(tmp_path: Path) -> None:
+    """Each DATA_THAT_QUOTES row is inert, so its ALLOW is correct rather than a hole (SDS-3.8).
+
+    The slot is filled with a marker that COMPUTES, and it must come back as text or not at all. The
+    commit row runs with ``git commit -m`` swapped for ``printf %s``, so no git command runs.
+    """
+    bash = require_bash(tmp_path)
+    for shape, (tool, template) in sorted(DATA_THAT_QUOTES.items()):
+        if tool == "Bash":
+            command = template.replace("git commit -m", "printf %s").replace("{G}", BASH_MARKER)
+            proc = subprocess.run(
+                [bash, "-c", command], capture_output=True, text=True, timeout=120, cwd=tmp_path
+            )
+        else:
+            proc = run_single(
+                [
+                    "pwsh",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    template.replace("{G}", PWSH_MARKER),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=tmp_path,
+            )
+        assert MARKER_RESULT not in proc.stdout, (
+            f"{shape}: the gated slot RAN, so its ALLOW is a fail-open, not a false deny avoided. "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+
+_SPLIT_TIMER = r"""param([string]$Gate, [string]$In)
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
+foreach ($fn in $ast.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    Invoke-Expression $fn.Extent.Text
+}
+$req = Get-Content -LiteralPath $In -Raw | ConvertFrom-Json
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$null = @(Split-LogicalLines $req.text $req.conv)
+$sw.ElapsedMilliseconds
+"""
+
+
+@pytest.mark.parametrize(
+    "label,conv,text",
+    [
+        # Every line opens a heredoc that never closes. Unbounded, each body nested the next.
+        ("unterminated_heredocs", "posix", "git checkout main\n" + "cat <<X\n" * 600),
+        # Every line opens a here-string that never closes. A per-line terminator search rescanned
+        # the tail for each one.
+        ("unterminated_here_strings", "pwsh", "git reset --hard\n" + "@'\n" * 4500),
+    ],
+)
+def test_the_logical_line_split_stays_linear(
+    tmp_path: Path, label: str, conv: str, text: str
+) -> None:
+    """A hook killed by its timeout lets the command through, so a slow split is a fail-open.
+
+    Both shapes took 7 s or more per call before they were bounded, measured, and the hook calls
+    the split once per command; both now take well under one second. The ceiling is loose on
+    purpose, so load on a shared runner cannot red it, and still sits far below the unbounded cost.
+    """
+    script = tmp_path / "timer.ps1"
+    script.write_text(_SPLIT_TIMER, encoding="utf-8")
+    inp = tmp_path / "in.json"
+    inp.write_text(json.dumps({"text": text, "conv": conv}), encoding="utf-8")
+    proc = run_single(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(script),
+            "-Gate",
+            str(GATE),
+            "-In",
+            str(inp),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert proc.returncode == 0, f"{label}: the timer failed. stderr={proc.stderr!r}"
+    elapsed_ms = int(proc.stdout.strip().splitlines()[-1])
+    assert elapsed_ms < 4000, f"{label}: Split-LogicalLines took {elapsed_ms} ms"
 
 
 @pytest.mark.parametrize(
@@ -293,6 +426,11 @@ def test_the_denied_shapes_would_really_have_executed(tmp_path: Path) -> None:
 #
 # The gated line RUNS in every row; test_the_must_stay_rows_really_run_their_gated_line proves it,
 # so none of these DENYs is a false positive being counted as coverage.
+#
+# WHAT THESE ROWS CAN AND CANNOT CATCH. Under the shipped fix they deny through the per-line view, so
+# no mutant of Split-LogicalLines alone can red them. They catch the change that matters most: a
+# second view REPLACING the per-line one. That is the design a naive fix reaches for, and it is the
+# one they were measured against.
 MUST_STAY = {
     # A quoted heredoc body is literal, so its apostrophe opens nothing.
     "heredoc_body_apostrophe": ("Bash", "cat <<'EOF' > notes.txt\ndon't\nEOF\n{G}\necho 'done'"),
