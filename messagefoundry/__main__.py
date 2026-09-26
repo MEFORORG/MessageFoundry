@@ -3714,10 +3714,22 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
     # DAST target each decide it their own way, which is the defect this item exists to remove.
-    from messagefoundry.api.tls import ensure_api_tls_material, generated_state_dir
+    from messagefoundry.api.tls import (
+        GeneratedPairReplaced,
+        ensure_api_tls_material,
+        generated_state_dir,
+    )
 
+    # A renewal or recovery of the generated pair is reported here and audited by the lifespan once
+    # the store is open, which is after this point (ADR 0172 decision 6: never silent).
+    _replaced: list[GeneratedPairReplaced] = []
     _material = ensure_api_tls_material(
-        settings.api, state_dir=generated_state_dir(settings.store.path)
+        settings.api,
+        state_dir=generated_state_dir(settings.store.path),
+        replacements=_replaced,
+        # An engine shard never renews: `supervise` renews before it spawns the whole fleet, so a
+        # lone restarted shard cannot leave its siblings serving a different certificate (#1276).
+        renew=args.shard is None,
     )
     # Minted HERE, before the app is built, so the expiry monitor below watches the certificate this
     # listener actually presents. [api].tls_cert_file is the PRE-mint config value and is empty
@@ -3781,6 +3793,7 @@ def _serve(args: argparse.Namespace) -> int:
         backup_settings=settings.backup,
         dr_settings=settings.dr,
         api_tls_cert_file=_served_api_cert,  # the SERVED cert, generated or operator (#1276)
+        api_tls_replacements=_replaced,  # audited once the store opens (ADR 0172 decision 6)
         # ASVS 6.4.5: operator-held copies of inbound service callers' client certs — watched by the same
         # [cert_monitor] scan, so a caller's cert cannot expire unnoticed while it has stopped connecting.
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
@@ -3897,6 +3910,64 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> None:
+    """Renew the shared generated API pair, if due, before any engine shard starts (#1276).
+
+    Every shard serves this one pair from the state dir beside its store, and a shard never renews
+    it (``serve --shard`` passes ``renew=False``), so this is the fleet's only renewal: all shards
+    then start together on the same certificate.
+
+    **The state dir is derived the way each shard derives it.** A shard anchors a relative
+    ``[store].path`` under the merged ``[environments].base_dir`` (``--project-root``, which the
+    supervisor forwards, or the settings file). ``db_base`` is anchored only by ``--project-root``
+    here, so a base_dir set in the file is applied too, or the two would name different pairs.
+
+    A re-mint is audited like serve's, in the store the shards are about to open, over the same
+    derived store-hop posture serve's lifespan opens it with. A failure to open propagates, as it
+    would in serve: the WARNING the renewal logged, with both fingerprints, is then its record.
+    """
+    from messagefoundry.api.tls import (
+        GeneratedPairReplaced,
+        ensure_api_tls_material,
+        generated_state_dir,
+        record_generated_pair_replacements,
+    )
+    from messagefoundry.config.anchor import resolve_project_root
+    from messagefoundry.config.settings import hop_posture_from_ai
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store import open_store
+
+    store_path = Path(db_base)
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=Path.cwd())
+    if root is not None and not store_path.is_absolute():
+        store_path = root / store_path
+
+    replaced: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(
+        settings.api, state_dir=generated_state_dir(str(store_path)), replacements=replaced
+    )
+    if not replaced:
+        return
+    posture = (
+        hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+        if settings.ai is not None
+        else None
+    )
+
+    async def _audit() -> None:
+        store = await open_store(
+            settings.store.model_copy(update={"path": str(store_path)}),
+            create=True,
+            posture=posture,
+        )
+        try:
+            await record_generated_pair_replacements(store, replaced)
+        finally:
+            await store.close()
+
+    run_guarded(_audit())
+
+
 def _supervise(args: argparse.Namespace) -> int:
     """L3 multi-process sharding (messagefoundry/pipeline/supervisor.py): discover the shard ids in the
     config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
@@ -3932,6 +4003,8 @@ def _supervise(args: argparse.Namespace) -> int:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
         return 2
+
+    _renew_api_tls_before_spawning(settings, db_base)
 
     return run_guarded(
         supervise(
