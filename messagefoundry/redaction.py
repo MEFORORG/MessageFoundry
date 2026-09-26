@@ -14,12 +14,17 @@ separate, centralized framework; see PHI.md §9). It errs toward over-redaction.
 spans it also applies a **conservative free-text heuristic** (date/DOB runs + multi-token name runs;
 see :func:`redact`), so a delimiter-free leak like ``raise ValueError("patient DOE JANE dob 1980-05-05
 not found")`` is narrowed too. The delimiters are **read from MSH** rather than assumed, so a feed
-declaring ``*`` and ``$`` is covered too (:func:`_sniff_delimiters`, BACKLOG #1572).
+declaring ``*`` and ``$`` is covered too (:func:`_sniff_delimiters`, BACKLOG #1572). Three
+**structured** shapes get label-anchored passes of their own, because they hand every pattern above
+single tokens by construction: FHIR (or any) JSON keyed ``family``/``given``/``name``/``birthDate``/
+``identifier``/``telecom``/``address``, DICOM ``(0010,00xx)`` tag dumps and ``PatientName=``-style
+labels, and XML elements with the same vocabulary (:func:`_redact_structured`, BACKLOG #1711).
 
-Two residuals, and this module claims no completeness beyond them: an adversarially-crafted
-*single-token* or non-name-shaped identifier, and a **headerless** custom-delimiter fragment (no MSH,
-so nothing declares its delimiters). For both, the "never put PHI in an exception message" convention
-remains the control.
+Residuals, at least these, and this module claims no completeness: an adversarially-crafted
+*single-token* or non-name-shaped identifier, a **headerless** custom-delimiter fragment (no MSH, so
+nothing declares its delimiters), and the structured shapes the section comment above
+:func:`_redact_structured` lists. For all of them, the "never put PHI in an exception message"
+convention remains the control.
 
 A **file name is exactly the first of those residuals**, which is why :func:`safe_name` exists beside
 the heuristic rather than inside it: a partner names a drop ``MRN123456789_ADT.hl7`` or
@@ -346,6 +351,12 @@ _USERINFO_SPAN = len(_USERINFO_OPENER) + _USERINFO_TAIL_MAX + 1
 #: module's own patterns, 64 KiB is 1.6 ms of segment-shaped text and about 3 ms of delimiter-free
 #: prose, against 0.29 s and 0.78 s for the same shapes at a 16 MiB MLLP frame cap.
 #:
+#: **Those figures predate the structured passes of BACKLOG #1711, which walk tokens in Python and
+#: cost more.** Measured when they landed: about 30 ms on a realistic 64 KiB FHIR Bundle and 50 to
+#: 65 ms on the worst shapes in ``tests/test_redaction_structured_shapes.py`` (which pins a linear-
+#: growth ratio and a 0.5 s ceiling per window), against about 5 ms for the HL7 passes alone. A line
+#: carrying no structured shape pays a few microseconds for their prefilters and nothing more.
+#:
 #: The number bounds the SCAN, not the answer: :func:`safe_text` still cuts its result to
 #: :data:`_DEFAULT_LIMIT`, and a caller that keeps the whole redacted text (the logging handler filter)
 #: keeps a window's worth of it.
@@ -393,6 +404,14 @@ _REDACT_WINDOW = 64 * 1024
 #: that :func:`redact` scrubs unclamped survives. The dependency is not on a span, so no amount of
 #: looking back from the cut finds it. It is a known open gap, recorded here and on the corpus arm in
 #: ``tests/test_redaction.py`` that also cannot reach it -- not a pattern this register covers.
+#:
+#: **The structured passes (BACKLOG #1711) mostly answer "yes", and need no walk.** Each is
+#: label-anchored and treats a region that never closes as running to the end of the text, so a cut
+#: inside a JSON string, a quoted XML attribute, a DICOM tag value or a ``PatientName=`` value leaves a
+#: head that still matches from its own label and is scrubbed to its end. The "no" answers are XML
+#: text a placeholder test reads as prose -- at least text opening with whitespace or punctuation --
+#: and there the fragment before the cut survives (:func:`_redact_xml_elements`). Both answers are
+#: pinned in ``tests/test_redaction.py`` under *a structured span the cut broke*.
 #:
 #: ``string.whitespace`` searched with :meth:`str.rfind`, rather than ``\s`` through the regex engine:
 #: a right-to-left search is what this needs and ``re`` only scans left to right. The stdlib name is
@@ -682,6 +701,532 @@ def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
     return redact(clamp_untrusted(text, window=window))
 
 
+# --- structured payload shapes: FHIR JSON, DICOM tag dumps, XML (BACKLOG #1711) ------------------
+#
+# Every pass above is HL7-shaped, and a structured payload hands them single tokens by construction:
+# ``"family": "DOE"`` carries no delimiter, no date and no second capitalized token, so it walked
+# through all of them, and so did an MRN in ``<value value="..."/>`` and a patient id in a DICOM tag
+# dump. The engine is payload-agnostic, the FHIR and DICOM transports raise with peer-supplied text,
+# and the bundle and ``GET /logs/tail`` delegate here, so these three shapes are ordinary input.
+#
+# The passes are LABEL-ANCHORED and deliberately narrow. Each fires only on a key, tag or element
+# from a small PHI vocabulary and scrubs the value that label introduces, never the label, so an
+# operator can still read WHICH field was withheld. This is not a JSON, XML or DICOM parser and does
+# not try to be one: a text that merely mentions ``<name>`` or ``PatientID`` in prose must come
+# through byte-identical, because a structural pass that eats prose damages every log line the engine
+# writes. ``tests/test_redaction_structured_shapes.py`` pins both directions.
+#
+# **They run AFTER the HL7 passes, and the order was measured, not chosen for tidiness.** Run first,
+# scrubbing a labelled value removed the delimiters a whitespace-free token needed to stay over
+# :data:`_HL7_FIELD_RUN`'s two-delimiter threshold: ``{"mrn":"M1^H","name":[{"family":"D^J"}]}`` was
+# scrubbed whole before these passes existed and then kept the unlabelled MRN. Scrubbing a single
+# unquoted token after ``"name":`` likewise split a two-token name :data:`_NAME_RUN` used to catch.
+# After them, every pass here only ever sees what the HL7 passes left, so it can add redaction and
+# never take any away. The cost is legibility: a field run can swallow a label with its value.
+#
+# **Fail-closed at the edge, which is also this family's answer to the cut register on
+# :data:`_CUT_CHARS`.** A region that never closes -- an unterminated string, array, object, quoted
+# attribute or element -- runs to the end of the text (a DICOM value to the end of its line) rather than
+# stopping short. So a whitespace cut inside a span leaves a head that still matches from its own
+# label and is still scrubbed to its end. The exceptions are XML text a placeholder test reads as
+# prose; :func:`_redact_xml_elements` states them.
+#
+# **Residuals, at least these, and the "never put PHI in an exception message" convention remains
+# the control for them:** JSON or XML quoted INSIDE a JSON string (``\"family\"`` escapes defeat the
+# key and attribute patterns); a structure that uses PHI as its KEYS, since keys are always kept; a
+# single-token STRING under a JSON ``name`` or ``address`` (:data:`_PHI_STRUCTURE_ONLY_KEYS` says
+# why); DICOM identifiers outside ``(0010,00xx)`` (Other Patient IDs ``(0010,1000)``, Patient's
+# Address ``(0010,1040)``); and XML or JSON vocabularies other than this one (CDA's ``<id
+# extension>``, ``<addr>``, a FHIR ``display`` or narrative ``div``). The vocabulary is the one
+# BACKLOG #1711 set; widening it is a separate decision, because every word added also over-redacts
+# the operator text that happens to use it as a key.
+#
+# Not :mod:`messagefoundry.anon`. That framework de-identifies a whole HL7 v2 message by FIELD ADDRESS
+# (``PID-5``) into keyed surrogates, loads its token denylist from ``scripts/`` in a source checkout,
+# and has no FHIR, XML or DICOM vocabulary at all. This module is the one redaction chokepoint, pure
+# stdlib by design, so the shapes are added here beside the passes they complement.
+
+#: Keys and elements whose ENTIRE value is PHI: every scalar under them is scrubbed.
+_PHI_LEAF_KEYS = frozenset({"family", "given", "name", "birthDate", "address"})
+#: The two leaf words that are also ordinary operator vocabulary. In JSON a STRING under one of them
+#: is kept and only a structure is scrubbed: FHIR's ``HumanName`` and ``Address`` are always objects
+#: or arrays of them, while ``{"name": "IB_ACME_ADT"}``, ``{"address": "10.1.2.3"}`` and the audit
+#: detail ``{"name": "<preset>"}`` the off-box tee copies are diagnostics. A single-token string name in
+#: non-FHIR JSON is therefore a residual (a two-token one is still caught by :data:`_NAME_RUN`). An XML
+#: element carries no such ambiguity, so there both stay full leaf words.
+_PHI_STRUCTURE_ONLY_KEYS = frozenset({"name", "address"})
+#: Keys and elements whose PHI is the ``value`` member (FHIR ``Identifier.value``,
+#: ``ContactPoint.value``). The siblings -- ``system``, ``use``, ``type`` -- say which identifier it
+#: was, which is the diagnostic, so they are kept. A scalar value under one of these is scrubbed whole.
+_PHI_VALUE_KEYS = frozenset({"identifier", "telecom"})
+#: The member of a :data:`_PHI_VALUE_KEYS` structure that carries the identifier itself.
+_VALUE_MEMBER = "value"
+
+#: How a value is treated, decided by the key or element that introduces it.
+_LEAF = 0  # every scalar under it is scrubbed
+_VALUE_TOP = 1  # a scalar is scrubbed; a structure is searched for its ``value`` member
+_INHERIT = 2  # kept, but a structure under it is still searched
+_STRUCTURE_ONLY = 3  # a scalar is kept; a structure is scrubbed whole (JSON ``name``/``address``)
+
+#: A JSON (or Python-repr) key from the vocabulary, with its colon: ``"family": `` or ``'given':``.
+#: ``001000xx`` is the DICOM JSON model's key for a ``(0010,00xx)`` attribute (PS3.18 F.2), the same
+#: tag the dump pass below reads in its other spelling.
+#:
+#: The literals are spelled out rather than joined from :data:`_PHI_LEAF_KEYS`: the static ReDoS scan
+#: in ``tests/test_security_static.py`` resolves every ``re.compile`` argument and records one it
+#: cannot read as a blind spot. ``tests/test_redaction_structured_shapes.py`` pins the two spellings
+#: against each other so they cannot drift.
+_JSON_PHI_KEY = re.compile(
+    r"""(["'])(family|given|name|birthDate|address|identifier|telecom|001000[0-9A-Fa-f]{2})\1"""
+    r"""\s*+:[ \t]*+"""
+)
+#: One JSON token: whitespace, a structural character, a double- or single-quoted string, or a bare
+#: run (a number, a literal, or anything else). Parentheses are structure too, so a Python tuple or a
+#: call such as ``datetime.date(1980, 5, 5)`` is walked as a container rather than ending at its first
+#: token. A string may carry a Python prefix (``b'..'``), and its closer is optional, so an
+#: unterminated string is still one token, ending at the line. An escape consumes ANY next character,
+#: a line end included, and a lone trailing backslash stays inside the string: split off as a bare
+#: token, it re-read differently on a second pass and broke the fixed point :func:`safe_text` relies
+#: on. The alternatives are disjoint on their first character, so the scan has one parse and every
+#: character belongs to exactly one token.
+_JSON_TOKEN = re.compile(
+    r"""(?P<ws>\s++)|(?P<punct>[{}\[\](),:])"""
+    r"""|(?P<pre>[bBrRuUfF]{1,2}(?=["']))?"""
+    r"""(?:"(?:[^"\\\r\n]|\\[\s\S])*+\\?(?P<dq>"?)|'(?:[^'\\\r\n]|\\[\s\S])*+\\?(?P<sq>'?))"""
+    r"""|(?P<bare>[^\s{}\[\](),:"']++)"""
+)
+#: Whether the string just read is a KEY: a colon follows it.
+_JSON_COLON_AHEAD = re.compile(r"\s*+:")
+#: A DICOM JSON attribute key for group 0010, element 00xx, read in nested position.
+_DICOM_JSON_PHI_TAG = re.compile(r"001000[0-9A-Fa-f]{2}")
+#: Bare tokens that are JSON or Python literals, not data, and so are kept even under a leaf key.
+#: ``redacted`` is here because a scrubbed bare token becomes ``[redacted]``, which a second pass reads
+#: as an array holding that word, and must leave alone.
+_JSON_LITERALS = frozenset({"true", "false", "null", "True", "False", "None", "redacted"})
+#: A bare run continuing a top-level value on the same line: ``"birthDate": 5 May 1980``. It stops
+#: before a callable's name, so ``"given": x frozenset({..})`` still walks the call.
+_JSON_BARE_CONTINUATION = re.compile(r"""(?:[ \t]++[^\s{}\[\](),:"']++(?!\())*+""")
+
+#: The bound note :func:`_clamp_marker` writes, joined by a newline (:func:`clamp_untrusted`) or a
+#: space (:func:`safe_text`). The structured passes run on the text BEFORE it, because an unterminated
+#: region runs to the end of the text and would otherwise scrub the note -- and :func:`safe_text` is
+#: re-applied to its own output at the store chokepoint, where that would erase the only sign the text
+#: was cut. Anchored at ``\Z`` so only a note last in the text is spared: a peer that writes the
+#: literal mid-payload ends nothing early, and a trailing one carries no PHI. :func:`safe_text`'s
+#: ``…(+N chars)`` count is not here because a second :func:`safe_text` re-truncates past it anyway.
+_TRAILING_NOTES = re.compile(r"[\n ]\[redaction bound: dropped [0-9_]+ more chars unscanned\]\Z")
+
+
+def _vocabulary_policy(local: str) -> int:
+    """How a value is treated when a key or element named ``local`` introduces it, outside a region
+    already scrubbed whole. One function for JSON and XML, so the two passes cannot disagree about what
+    a word means; XML reads :data:`_STRUCTURE_ONLY` as :data:`_LEAF`."""
+    if local in _PHI_STRUCTURE_ONLY_KEYS:
+        return _STRUCTURE_ONLY
+    if local == _VALUE_MEMBER or local in _PHI_LEAF_KEYS or _DICOM_JSON_PHI_TAG.fullmatch(local):
+        return _LEAF
+    return _VALUE_TOP if local in _PHI_VALUE_KEYS else _INHERIT
+
+
+def _json_scalar(match: re.Match[str], policy: int) -> str:
+    """The token ``match`` read, scrubbed under ``policy``. A string keeps its prefix and quotes, so
+    the text still reads as the structure it was; any other data token becomes the bare placeholder,
+    which a second pass reads as an array holding a literal and leaves alone (the fixed point
+    :func:`safe_text` relies on)."""
+    token = match.group()
+    if policy in (_INHERIT, _STRUCTURE_ONLY):
+        return token
+    if match.group("bare") is not None:
+        return token if token in _JSON_LITERALS else _REDACTED
+    prefix = match.group("pre") or ""
+    quote = token[len(prefix)]
+    closer = quote if match.group("dq") or match.group("sq") else ""
+    return f"{prefix}{quote}{_REDACTED}{closer}"
+
+
+def _scrub_json_value(text: str, pos: int, policy: int) -> tuple[str, int]:
+    """``(replacement, end)`` for the JSON value starting at ``pos``, scrubbed under ``policy``.
+
+    An explicit stack rather than recursion, because the nesting depth is the peer's choice. The walk
+    visits each character once. A structure that never closes runs to the end of the text, so a cut
+    inside it strands nothing (the fail-closed rule on the section comment above).
+
+    **Object KEYS are always kept**, which is what keeps the output legible, so a structure that uses
+    PHI as its keys (``{"name": {"DOE": 1}}``) is a residual. A bare token straight before ``(`` is a
+    callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value."""
+    out: list[str] = []
+    #: One frame per open container: ``(is_object, policy)``. An object's policy is LEAF or INHERIT
+    #: (searched); an array's or a call's is the policy its elements take.
+    frames: list[tuple[bool, int]] = []
+    pending = policy
+    n = len(text)
+    while pos < n:
+        match = _JSON_TOKEN.match(text, pos)
+        if match is None:  # unreachable: every character starts one alternative
+            break
+        token = match.group()
+        if match.group("ws") is not None:
+            if not frames and ("\n" in token or "\r" in token):
+                break  # the key ends its line with no value: the next line is not this key's
+            out.append(token)
+            pos = match.end()
+            continue
+        punct = match.group("punct")
+        if punct is not None:
+            if not frames and punct in ",}]):":
+                break  # the key had no value: nothing to scrub, and nothing consumed
+            pos = match.end()
+            out.append(token)
+            if punct == "{":
+                leaf = pending in (_LEAF, _STRUCTURE_ONLY)
+                frames.append((True, _LEAF if leaf else _INHERIT))
+                pending = frames[-1][1]
+            elif punct in "[(":
+                frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending))
+                pending = frames[-1][1]
+            elif punct in "}])":
+                frames.pop()
+                if not frames:
+                    return "".join(out), pos
+                pending = frames[-1][1]
+            elif punct == ",":
+                pending = frames[-1][1]
+            continue
+        pos = match.end()
+        bare = match.group("bare") is not None
+        if bare and text.startswith("(", pos):
+            out.append(token)  # a callable's name; the call's parentheses hold the value
+            continue
+        if not bare and frames and frames[-1][0] and _JSON_COLON_AHEAD.match(text, pos):
+            out.append(token)  # a key: kept, and it decides how its value is treated
+            if frames[-1][1] == _LEAF:
+                pending = _LEAF
+            else:
+                closed = bool(match.group("dq") or match.group("sq"))
+                start = len(match.group("pre") or "") + 1
+                pending = _vocabulary_policy(token[start : -1 if closed else None])
+            continue
+        if bare and not frames:
+            # A top-level bare value can be prose running on after a key-shaped label, such as
+            # `"birthDate": 5 May 1980`, so the rest of the run on its line goes with it.
+            run = _JSON_BARE_CONTINUATION.match(text, pos)
+            if run is not None and run.end() > pos:
+                pos = run.end()
+                keep = pending in (_INHERIT, _STRUCTURE_ONLY)
+                out.append(text[match.start() : pos] if keep else _REDACTED)
+                return "".join(out), pos
+        out.append(_json_scalar(match, pending))
+        if not frames:
+            return "".join(out), pos
+    return "".join(out), pos
+
+
+def _redact_json_fields(text: str) -> str:
+    """Scrub the value of every vocabulary key in a JSON or Python dict/list repr.
+
+    Leaf keys (:data:`_PHI_LEAF_KEYS` and the DICOM JSON ``001000xx`` tags) lose every scalar under
+    them; :data:`_PHI_VALUE_KEYS` lose their ``value`` member and keep ``system``/``use``/``type``;
+    :data:`_PHI_STRUCTURE_ONLY_KEYS` lose a structure and keep a plain string. Keys stay, so
+    ``{"family": "[redacted]"}`` still says what was withheld. A key nested inside a region is handled
+    by the walk, so the search resumes after the region."""
+    out: list[str] = []
+    pos = 0
+    while (match := _JSON_PHI_KEY.search(text, pos)) is not None:
+        replacement, end = _scrub_json_value(text, match.end(), _vocabulary_policy(match.group(2)))
+        out.append(text[pos : match.end()])
+        out.append(replacement)
+        pos = end
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
+
+#: Any DICOM tag as a dump prints it, ``(gggg,eeee)`` -- pydicom 2 wrote a space after the comma. Read
+#: as a whole so the value of a PHI tag can end at the NEXT tag on the same line.
+_DICOM_TAG = re.compile(r"\(([0-9A-Fa-f]{4}), ?([0-9A-Fa-f]{4})\)")
+#: A line ending, for where a tag's value stops when no further tag follows it on the line.
+_LINE_END = re.compile(r"[\r\n]")
+#: The keyword labels of the ``(0010,00xx)`` identifiers, as ``PatientName=...``, ``PatientID: ...``,
+#: a dict key ``'PatientName': ...`` or an attribute ``ds.PatientID='...'`` -- which is what the
+#: f-string debug form ``f"{ds.PatientID=}"`` renders, so a traceback's quoted source line
+#: ``ds.PatientID = raw_id`` is scrubbed too: over-redaction of source text, in the safe direction.
+#: Only spaces and tabs around the separator: a label that ends its line has no value, and the next
+#: line of a traceback is not one.
+_DICOM_PHI_LABEL = re.compile(
+    r"""(?<!\w)(?:PatientName|PatientID|IssuerOfPatientID|PatientBirthDate|PatientBirthTime)"""
+    r"""['"]?[ \t]*+[=:][ \t]*+"""
+)
+#: A quoted label value, to its closing quote or the end of the line.
+_DICOM_QUOTED_VALUE = re.compile(r"""'[^'\r\n]*+'?|"[^"\r\n]*+"?""")
+#: Where an unquoted label value ends: a ``;``, a line end, or whitespace before the next ``Label=``,
+#: the next PHI label with a colon, or the next tag. A name with spaces or a comma in it therefore
+#: stays one value (``PatientName: Doe, Jane``; a list ``['A', 'B']``). A bare ``word:`` does NOT end
+#: it -- ``PatientName=doe jane: no match`` would otherwise strand ``jane`` -- so a following
+#: ``Modality: CT`` is scrubbed with the name, which is over-redaction in the safe direction.
+_DICOM_LABEL_VALUE_END = re.compile(
+    r"""[;\r\n]|\s(?=[A-Za-z][A-Za-z0-9_]*+['"]?[ \t]*+=)"""
+    r"""|\s(?=(?:PatientName|PatientID|IssuerOfPatientID|PatientBirthDate|PatientBirthTime)"""
+    r"""['"]?[ \t]*+:)|\s(?=\([0-9A-Fa-f]{4},)"""
+)
+
+
+def _redact_dicom_tags(text: str) -> str:
+    """Scrub the value of every ``(0010,00xx)`` tag in a DICOM dump -- dcmdump's ``PN [..]``, pydicom's
+    ``Patient's Name  PN: '..'`` -- keeping the tag, which names the attribute. The value runs to the
+    next tag on its line or to the line's end, so the VR, the element name and dcmdump's trailing
+    ``#`` comment go with it: over-redaction in the safe direction, and the tag still says what it
+    was."""
+    if "(0010," not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    line_end = -1
+    tags = _DICOM_TAG.finditer(text)
+    current = next(tags, None)
+    while current is not None:
+        following = next(tags, None)
+        if current.group(1) == "0010" and current.group(2).startswith("00"):
+            start = current.end()
+            if line_end < start:  # cached: tags arrive in order, so each line end is found once
+                found = _LINE_END.search(text, start)
+                line_end = found.start() if found is not None else len(text)
+            stop = line_end
+            if following is not None and following.start() < line_end:
+                stop = following.start()
+            bounded = stop != line_end
+            if text[start:stop].strip():
+                out.append(text[pos:start])
+                out.append(f" {_REDACTED} " if bounded else f" {_REDACTED}")
+                pos = stop
+        current = following
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _redact_dicom_labels(text: str) -> str:
+    """Scrub the value after a ``PatientName=`` / ``PatientID=`` (and the other ``(0010,00xx)``
+    identifier keywords) label, keeping the label. A quoted value runs to its closing quote, an
+    unquoted one to the next label, separator or line end."""
+    if "Patient" not in text:  # every label carries it; skips the search on an ordinary line
+        return text
+    out: list[str] = []
+    pos = 0
+    n = len(text)
+    while (match := _DICOM_PHI_LABEL.search(text, pos)) is not None:
+        start = match.end()
+        quoted = _DICOM_QUOTED_VALUE.match(text, start)
+        if quoted is not None:
+            value = quoted.group()
+            closed = len(value) > 1 and value[-1] == value[0]
+            replacement = f"{value[0]}{_REDACTED}{value[0] if closed else ''}"
+            stop = quoted.end()
+        else:
+            found = _DICOM_LABEL_VALUE_END.search(text, start)
+            stop = found.start() if found is not None else n
+            value = text[start:stop]
+            kept = value.rstrip()
+            replacement = f"{_REDACTED}{value[len(kept) :]}" if kept else value
+        out.append(text[pos:start])
+        out.append(replacement)
+        pos = max(stop, start)
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
+
+#: A start tag whose local name is in the vocabulary, with or without a namespace prefix.
+_XML_PHI_ELEMENT = re.compile(
+    r"<((?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom))(?=[\s/>])"
+)
+#: Any start or end tag, for the walk through an element's content.
+_XML_TAG = re.compile(r"<(/?)((?:[A-Za-z_][\w.-]*+:)?([A-Za-z_][\w.-]*+))")
+#: The rest of an end tag, up to its ``>``.
+_XML_END_TAG_REST = re.compile(r"[^<>]*+>?")
+#: One part of a start tag after its name: whitespace, the tag's end, an attribute and the opening of
+#: its quoted value (the value itself is read by :data:`_XML_ATTR_VALUE`), or anything else.
+#:
+#: **The last alternative is what keeps the walk linear.** Without it a run that is not a quoted
+#: attribute -- ``<name aaaa...`` or an unquoted ``data=QUJD...`` -- failed to match, the walk stepped
+#: ONE character and retried, and the possessive ``attr`` alternative re-read the rest of the run on
+#: every retry: about 10 s on a 64 KiB window, on the event loop. The junk alternative consumes the
+#: whole failing run at once instead. Only ``<`` is left unmatched, which is where an unterminated tag
+#: ends. An UNQUOTED value (``value=Janex``, SGML and hand-built diagnostics) is its own alternative,
+#: so a leaf element loses it too rather than passing it through as junk.
+_XML_TAG_PART = re.compile(
+    r"""(?P<ws>\s++)|(?P<end>/?>)"""
+    r"""|(?P<attr>[^\s=<>/"']++)\s*+=\s*+(?:(?P<q>["'])|(?P<unquoted>[^\s<>"'/]++))"""
+    r"""|(?P<junk>[^\s=<>/"']++|[^<])"""
+)
+#: A quoted attribute value after its opening quote, to the closer, the next ``<`` or the end of the
+#: text. XML forbids ``<`` in an attribute value, and stopping there matters: a KEPT value with no
+#: closer otherwise ran to the next quote in the text, swallowed the following tag, and walked the
+#: ``<value value="..."/>`` inside it through as part of the kept value.
+_XML_ATTR_VALUE = {'"': re.compile(r'[^"<]*+"?'), "'": re.compile(r"[^'<]*+'?")}
+#: The start of an element's content that says "this is markup, not a placeholder in prose": a child
+#: tag straight after the ``>`` or on a following line, or text that begins at once with a word
+#: character (any script's letters, so ``<family>Ødegaard`` counts). A child tag after a SPACE is not
+#: evidence: ``usage: tool <name> <address>`` is prose.
+_XML_CONTENT_EVIDENCE = re.compile(r"<|[ \t]*+\r?\n\s*+<|\w")
+#: Every end tag of a vocabulary element, located once per call so a placeholder that never closes
+#: costs a lookup rather than a search to the end of the text.
+_XML_PHI_END = re.compile(
+    r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)\s*+>"
+)
+
+#: How a start tag ended: ``>``, ``/>``, or not at all.
+_TAG_OPEN, _TAG_SELF_CLOSED, _TAG_UNTERMINATED = 0, 1, 2
+
+
+def _walk_xml_tag(text: str, pos: int, policy: int, out: list[str]) -> tuple[int, int, bool]:
+    """Walk a start tag's attributes from ``pos``, scrubbing each value ``policy`` says to. Returns
+    ``(end, how it ended, whether it carried an attribute)``. A leaf element loses every attribute
+    value; a :data:`_VALUE_TOP` one only ``value="..."``. An unterminated quoted value runs to the next
+    ``<`` or the end of the text, the fail-closed edge."""
+    n = len(text)
+    attributed = False
+    while pos < n:
+        part = _XML_TAG_PART.match(text, pos)
+        if part is None:  # only `<`: the tag never closed and the next one starts here
+            return pos, _TAG_UNTERMINATED, attributed
+        if part.group("end") is not None:
+            out.append(part.group())
+            how = _TAG_SELF_CLOSED if part.group("end") == "/>" else _TAG_OPEN
+            return part.end(), how, attributed
+        if part.group("attr") is None:
+            out.append(part.group())
+            pos = part.end()
+            continue
+        attributed = True
+        local = part.group("attr").rpartition(":")[2]
+        scrub = policy == _LEAF or (policy == _VALUE_TOP and local == _VALUE_MEMBER)
+        if part.group("unquoted") is not None:
+            out.append(text[part.start() : part.start("unquoted")])
+            out.append(_REDACTED if scrub else part.group("unquoted"))
+            pos = part.end()
+            continue
+        out.append(part.group())
+        pos = part.end()
+        quote = part.group("q")
+        value = _XML_ATTR_VALUE[quote].match(text, pos)
+        if value is None:  # unreachable: both patterns match the empty string
+            continue
+        if scrub:
+            out.append(f"{_REDACTED}{quote if value.group().endswith(quote) else ''}")
+        else:
+            out.append(value.group())
+        pos = value.end()
+    return pos, _TAG_UNTERMINATED, attributed
+
+
+def _xml_text(chunk: str, policy: int) -> str:
+    """A text node scrubbed under ``policy``, keeping the whitespace around it so indentation stays."""
+    if policy == _INHERIT or not chunk.strip():
+        return chunk
+    lead = len(chunk) - len(chunk.lstrip())
+    return f"{chunk[:lead]}{_REDACTED}{chunk[len(chunk.rstrip()) :]}"
+
+
+def _scrub_xml_element(
+    text: str, match: re.Match[str], last_close: dict[str, int]
+) -> tuple[str, int]:
+    """``(replacement, end)`` for the vocabulary element starting at ``match``."""
+    out = [match.group()]
+    policy = _VALUE_TOP if match.group(2) in _PHI_VALUE_KEYS else _LEAF
+    pos, how, attributed = _walk_xml_tag(text, match.end(), policy, out)
+    if how != _TAG_OPEN:
+        return "".join(out), pos
+    if not (
+        last_close.get(match.group(2), -1) >= pos
+        or attributed
+        or _XML_CONTENT_EVIDENCE.match(text, pos)
+    ):
+        # A bare `<name>` that never closes and is followed by prose: a placeholder, not markup.
+        return "".join(out), pos
+    stack = [(match.group(1), policy)]
+    open_names = {match.group(1): 1}
+    n = len(text)
+    while stack:
+        tag = _XML_TAG.search(text, pos)
+        stop = tag.start() if tag is not None else n
+        if stop > pos:
+            out.append(_xml_text(text[pos:stop], stack[-1][1]))
+        if tag is None:
+            return "".join(out), n
+        qname = tag.group(2)
+        if tag.group(1):  # an end tag: close back to the element it names, if it is open at all
+            rest = _XML_END_TAG_REST.match(text, tag.end())
+            pos = rest.end() if rest is not None else tag.end()
+            out.append(text[tag.start() : pos])
+            if open_names.get(qname):
+                while stack:
+                    name, _ = stack.pop()
+                    open_names[name] -= 1
+                    if name == qname:
+                        break
+            continue
+        out.append(tag.group())
+        parent = stack[-1][1]
+        child = _LEAF if parent == _LEAF else _vocabulary_policy(tag.group(3))
+        child = _LEAF if child == _STRUCTURE_ONLY else child  # no string/structure split in XML
+        pos, how, _ = _walk_xml_tag(text, tag.end(), child, out)
+        if how == _TAG_OPEN:
+            stack.append((qname, child))
+            open_names[qname] = open_names.get(qname, 0) + 1
+    return "".join(out), pos
+
+
+def _redact_xml_elements(text: str) -> str:
+    """Scrub the content and attribute values of every vocabulary element in an XML payload -- FHIR's
+    ``<family value="..."/>``, a text-content ``<family>...</family>``, with or without a namespace
+    prefix -- keeping every tag name, and inside ``<identifier>``/``<telecom>`` keeping everything but
+    the ``<value>``.
+
+    **An element that never closes needs a judgment, and the judgment favours prose.** Operator text
+    carries placeholders -- the provision-admin hint in ``api/app.py`` reads ``--username <name>
+    --email <address>`` -- and reading one as an open element would scrub the rest of the message. So
+    an unclosed element is treated as markup only on evidence (:data:`_XML_CONTENT_EVIDENCE`): it
+    carries an attribute, or its content opens with a child tag or a word character. That is where the
+    fail-closed rule has exceptions, at least these: a cut that strands ``<family> Van`` (text opening
+    with whitespace) or ``<family>(Van`` (opening with punctuation) reads as prose, and the fragment
+    before the cut survives. A closed element is always scrubbed, whatever its text opens with."""
+    if "<" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    #: Where the LAST end tag of each vocabulary name starts, built on the first match: whether an
+    #: element closes anywhere later is then one lookup, not a search to the end of the text.
+    last_close: dict[str, int] | None = None
+    while (match := _XML_PHI_ELEMENT.search(text, pos)) is not None:
+        if last_close is None:
+            last_close = {close.group(1): close.start() for close in _XML_PHI_END.finditer(text)}
+        replacement, end = _scrub_xml_element(text, match, last_close)
+        out.append(text[pos : match.start()])
+        out.append(replacement)
+        pos = end
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _redact_structured(text: str) -> str:
+    """The structured-shape passes, run on everything but this module's own trailing notes
+    (:data:`_TRAILING_NOTES`)."""
+    body, tail = text, ""
+    if text.endswith("unscanned]"):  # a cheap test before a search of the whole text
+        note = _TRAILING_NOTES.search(text)
+        if note is not None:
+            body, tail = text[: note.start()], note.group()
+    body = _redact_json_fields(body)
+    body = _redact_dicom_tags(body)
+    body = _redact_dicom_labels(body)
+    return _redact_xml_elements(body) + tail
+
+
 def redact(text: str) -> str:
     """Scrub HL7 segment/field content (potential PHI) from free text, keeping segment IDs, then apply a
     conservative free-text heuristic for delimiter-free identifiers. Conservative (errs toward over-
@@ -691,12 +1236,41 @@ def redact(text: str) -> str:
     Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN`, then the
     separator-aware pass for a message that declares delimiters outside the defaults) is handled first,
     so the free-text passes (:data:`_DATE_RUN`, then :data:`_NAME_RUN`) only see delimiter-free
-    text. The free-text heuristic narrows the prior residual to adversarial *single-token* identifiers
-    (a lone name with no second token, no date) — for which the "never put PHI in an exception message"
+    text. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
+    XML elements) run LAST, so they can only add redaction to what the others left (the section
+    comment above them says what running them first cost). The free-text heuristic narrows the prior
+    residual to adversarial *single-token* identifiers (a lone name with no second token, no date) — for which the "never put PHI in an exception message"
     convention remains the control. Idempotent: the literal ``[redacted]`` substituted in never re-
-    matches any pattern, so ``redact(redact(x)) == redact(x)``."""
-    if not text:
-        return text
+    matches any pattern, so ``redact(redact(x)) == redact(x)``.
+
+    **The structured passes can expose work for a pass that already ran, so they repeat until they
+    change nothing (BACKLOG #1711).** Scrubbing ``"a b"`` to ``"[redacted]"`` inside a token can join
+    two one-delimiter halves into a field run, and scrubbing a quoted label value can uncover a key.
+    A fuzz over those fragments broke the fixed point above on its first run. So when the structured
+    passes change the text, the whole redaction runs again on the result; text they leave alone takes
+    exactly one round, byte-identical and at the cost it had before them. If the rounds run out, the
+    flat passes run once more, so a run the last structured round joined is still caught."""
+    for _ in range(_STRUCTURED_ROUNDS):
+        if not text:
+            return text
+        flat = _redact_flat(text)
+        text = _redact_structured(flat)
+        if text == flat:
+            return text
+    return _redact_flat(text)
+
+
+#: The most rounds :func:`redact` takes. Measured over 200,000 fuzzed inputs from the alphabet of
+#: ``test_redact_is_a_fixed_point_over_random_structure``: none needed more than 3, the last of them
+#: the round that confirms nothing changed. The cap is set well above that so a peer has to build
+#: many nested layers of uncovering to reach it; an input that does gets one last flat round, and
+#: keeps what that produced, which is at least as redacted as every round before it.
+_STRUCTURED_ROUNDS = 8
+
+
+def _redact_flat(text: str) -> str:
+    """Every pass but the structured ones: the credential backstop, the HL7 shapes, dates and
+    names. :func:`redact` is this plus :func:`_redact_structured`, repeated to a fixed point."""
     text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
     scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
