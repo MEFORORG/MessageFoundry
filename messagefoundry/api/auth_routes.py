@@ -1208,11 +1208,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 str(r["ad_group"]) for r in rows if str(r["role_id"]) == Role.ADMINISTRATOR.value
             }
 
-        before = await admin_groups()
+        grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
+        before = await admin_groups() if grants else set()
         await service.set_ad_group_map(
             [(e.ad_group, e.role) for e in body.entries], actor=identity.username
         )
-        for group in sorted(await admin_groups() - before):
+        for group in sorted((await admin_groups() - before) if grants else set()):
             _alert_administrator_granted(
                 app, f"ad-group:{group}", via="ad_group_map", granted_by=identity.username
             )

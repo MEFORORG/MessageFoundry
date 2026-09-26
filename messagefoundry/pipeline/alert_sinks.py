@@ -185,7 +185,11 @@ class AlertTransport(Protocol):
 
 def _subject(event: dict[str, Any]) -> str:
     severity = str(event.get("severity", "warning")).upper()
-    return f"[MessageFoundry] {severity} {event['type']} — {event['connection']}"
+    subject = f"[MessageFoundry] {severity} {event['type']} — {event['connection']}"
+    # One header line. Some keys carry operator-authored names (a username or a directory group,
+    # BACKLOG #315), and a line break in one makes EmailMessage refuse the header, which would drop
+    # the page. Collapse every character str.splitlines() breaks on, as _render_subject does for CR/LF.
+    return " ".join(subject.splitlines())
 
 
 def _body(event: dict[str, Any]) -> str:

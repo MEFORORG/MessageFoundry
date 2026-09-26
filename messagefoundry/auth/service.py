@@ -4857,7 +4857,8 @@ class AuthService:
                 ACCOUNT_CREATED,
                 username=username,
                 email=notify,
-                client=client,
+                # No `client`: the address is admin-typed and unverified, and no other admin-initiated
+                # notice sends the administrator's address to the account's mailbox.
                 detail={"roles": list(roles)},
             )
         return user_id

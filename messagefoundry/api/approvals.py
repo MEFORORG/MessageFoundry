@@ -35,6 +35,7 @@ module owns only the generic hold/approve/reject mechanics over the ``pending_ap
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -324,14 +325,18 @@ class ApprovalGate:
         finally:
             # After the transition, so only a release that really happened is flagged, and in a
             # `finally`, so the flag lands whether the executor succeeded, failed or was cancelled.
+            # Shielded: a cancellation re-delivered here (a request timeout inside a middleware task
+            # group) would otherwise cancel the audit write too, on exactly the release it describes.
             if changed:
-                await self._flag_approver_provenance(
-                    approval_id,
-                    operation=operation,
-                    approver=approver,
-                    requester=str(row["requester"]),
-                    changed=changed,
-                    client=client,
+                await asyncio.shield(
+                    self._flag_approver_provenance(
+                        approval_id,
+                        operation=operation,
+                        approver=approver,
+                        requester=str(row["requester"]),
+                        changed=changed,
+                        client=client,
+                    )
                 )
         await self._store.record_audit(
             "approval.approved",

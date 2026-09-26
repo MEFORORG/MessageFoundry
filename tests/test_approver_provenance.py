@@ -33,7 +33,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+from messagefoundry.pipeline.alert_sinks import NotifierAlertSink, _subject
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from tests.test_alert_sinks import _drain, _RecordingTransport
@@ -315,7 +315,8 @@ async def test_account_created_notice_goes_to_the_new_accounts_address(engine: E
     sent = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
     assert len(sent) == 1
     assert sent[0].email == "newbie@example.org"
-    assert sent[0].client_ip == "10.1.1.1"
+    # The admin's address is not sent to an admin-typed, unverified mailbox.
+    assert sent[0].client_ip is None
     body = _build_body(sent[0])
     # Wired into BOTH renderers: each falls back silently to generic text when an arm is missing.
     assert ACCOUNT_CREATED in _SUBJECTS
@@ -407,3 +408,12 @@ async def test_a_failed_executor_is_still_flagged(engine: Engine) -> None:
 
     assert len(await _flags(engine)) == 1
     assert len(await engine.store.list_audit(action="approval.failed")) == 1
+
+
+def test_a_line_break_in_a_key_cannot_drop_the_email_page() -> None:
+    """A username or group name is operator-authored. A line break in the alert key would make the
+    email transport refuse the Subject header and drop the page, so the subject collapses it."""
+    key = "user:ev" + chr(10) + "il" + chr(0x2028) + "x"
+    subject = _subject({"type": "administrator_granted", "connection": key})
+    assert subject.splitlines() == [subject]
+    assert "user:ev il x" in subject
