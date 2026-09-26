@@ -1,17 +1,22 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0)
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2)
 
-> **Increments 0, 1, 4 and 5 are BUILT.** C1 (terminal writes only, fail-open) and C6 (yes, bounded,
+> **Increments 0, 1, 2, 4 and 5 are BUILT.** C1 (terminal writes only, fail-open) and C6 (yes, bounded,
 > abandon-don't-await) were decided by the owner.
 >
 > **Inc 3 is not built**, and it is gated on an empirical question nobody has run: whether a coroutine
 > cancelled mid-`execute` leaves an aioodbc transaction committed or rolled back. See the Increments
 > section for the question and where it has to be answered.
 >
-> **Inc 2 is not built, and was RE-SPECIFIED on 2026-09-10** (BACKLOG #1497) from the owner-blind age
-> sweep this ADR warned against to a scoped in-flight recovery at graph re-start. The original
-> paragraph is kept below with the rewrite under it; read the rewrite, not the paragraph.
+> **Inc 2 is BUILT (2026-09-25, BACKLOG #1497), in two layers and with a narrower scope than its
+> re-specification.** A per-lane worker that stops mid-batch now releases its own unprocessed tail,
+> as the pooled dispatcher already did. A reload then re-pends anything a worker that has RETURNED
+> still left in flight, and touches no lane whose worker is alive. The re-specification scoped the
+> reload reset to "the names in the old registry"; built that way it would re-pend rows a live
+> worker is sending, because `reload()` stops no worker. It does **not** make SQL Server recover a
+> crash strand: that still waits for the next start or promotion. The age-sweep paragraph and the
+> re-specification are both kept below; read the as-built note at the end of the re-specification.
 >
 > **Inc 0 shipped with three deviations from its own paragraph** — the check's subject, refuse-rather-
 > than-warn, and a Postgres-only clamp. Each is recorded with its reason at the increment.
@@ -424,8 +429,9 @@ rather than claiming a proof.
 ### Inc 2, RE-SPECIFIED — scoped in-flight recovery at graph re-start (2026-09-10, BACKLOG #1497)
 
 **This replaces the "periodic sweep" paragraph above. The paragraph is kept, not deleted, because other
-documents quote it; the warning immediately above it is what made this rewrite necessary.** Nothing was
-built here — this increment is specification only, and it remains open.
+documents quote it; the warning immediately above it is what made this rewrite necessary.** It was
+built on 2026-09-25 with a narrower scope; the note at the end of this section says what shipped and
+where it departs from the text below.
 
 **The defect, re-stated in one sentence.** A row left INFLIGHT by a graph re-start is never recovered on
 SQL Server, because `reload()` calls no recovery and the backend has no periodic sweep to fall back on.
@@ -475,6 +481,72 @@ criterion read as "SQL Server now recovers in-flight rows".
 **Sequencing is unchanged.** Inc 2 still blocks Inc 3: GAP 1's *recovery closure* criterion — after a
 fenced write the row is resolved within a bounded time — cannot pass on SQL Server until some recovery
 path exists. Re-scoping narrows what Inc 2 builds; it does not make Inc 3 independent.
+
+> **What shipped, 2026-09-25 (BACKLOG #1497), and three places it departs from the text above.**
+> A per-lane worker can return mid-batch with the rest of its claimed batch INFLIGHT. At least these
+> paths do it: the STOP `internal_error` policy, an inbound a reload removed, and on the delivery
+> worker a credential fault or a leadership loss before send. Before this, that tail waited for the
+> next start on SQLite and on SQL Server (or a promotion there). On clustered Postgres the leader's
+> `reclaim_expired_leases` sweep collected it after its lease expired, and still does.
+>
+> - **Layer 1, at the source.** The router, transform and delivery workers call
+>   `RegistryRunner._release_tail_on_stop` as they return on a STOPPED outcome. It hands the rows
+>   behind the one that stopped to `release_claimed`, which touches only rows still INFLIGHT and
+>   undoes the claim's `attempts` increment. The transform worker passes its whole batch, which the
+>   INFLIGHT guard makes safe. The pooled `_run_lane` already released its tail the same way, so
+>   one STOP now leaves the same queue state in both claim modes. The response worker claims one row
+>   at a time and has no tail. It does nothing on a node that has lost leadership: the release is
+>   unfenced, and those rows belong to the successor's promotion recovery, which may already have
+>   re-claimed them. The leadership-lost path therefore still releases only its own head, as before.
+> - **Layer 2, the reload backstop.** `RegistryRunner._recover_stopped_worker_residue` runs inside
+>   `reload()` after step 1's quiesce and before step 2 restarts the listeners, under
+>   `_reload_lock`. It re-pends the INFLIGHT rows of every lane whose per-lane worker has
+>   **returned** normally, through `reset_stale_inflight(stage=, owned=)`. It catches a Layer 1
+>   release that failed. It too does nothing off the leader, for the reason the engine's
+>   `_start_graph` gives for never running the reset in clustered mode outside promotion. A failure
+>   logs and leaves the rows for the next start, and the call sits inside the reload's rollback
+>   `try`, so it can never leave intake down.
+>
+> `tests/test_adr0157_inc2_reload_recovery.py` covers both layers: the router, transform and
+> delivery STOP paths, the removed-inbound path, the backstop end to end on the real reload, the
+> leadership gate on both layers, and a table of worker states. Nine mutations were each confirmed
+> red, one per guard and per call site.
+>
+> 1. **The reload scope is the worker's state, not the old registry's names.** The tree disagreed with
+>    the premise of point 1. `reload()`'s quiesce stops the inbound *sources* only. It stops no
+>    worker, and outbound workers keep draining by design. So the quiesce itself leaves nothing
+>    INFLIGHT, and "every name in the old registry" includes lanes whose worker is mid-send.
+>    Re-pending those is a duplicate and a FIFO break. A returned worker holds nothing, and each lane
+>    has one consumer (ADR 0059), so its rows are safe. A worker that raised is skipped, because its
+>    done-callback respawns it. A cancelled one is skipped, because only teardown cancels. A lane the
+>    pooled OUTBOUND dispatcher holds is skipped too. The old-registry bound would also have
+>    **missed** a real case: an inbound removed by one reload and restored by a later one is not in
+>    the later reload's old registry.
+> 2. **The reload-only design was the wrong depth, so the fix moved to the source.** An operator
+>    `start_*` or `restart_*`, or an alert rule's `control_action` auto-restart on the
+>    `connection_stopped` alert the STOP policy raises, re-arms a returned worker without a reload.
+>    The re-armed worker is alive, so every later reload skips its lane, and the tail would have
+>    waited for a start while newer rows drained past it. Layer 1 closes that; Layer 2 is kept as the
+>    backstop. Neither layer adds a store method. Layer 2 reuses the ADR 0073 ownership-scoped
+>    `reset_stale_inflight`, which the `Store` protocol requires and all three backends implement and
+>    test. That meets point 2's purpose: nothing probes `reclaim_expired_leases`, so the promotion
+>    path's `hasattr` gate cannot move. Layer 2's reset does not undo the claim's `attempts`
+>    increment, as Consequence 4 records; Layer 1's release does.
+> 3. **The comments were half-corrected already, then had to move again.** BACKLOG #1611 Part A
+>    (engine PR 1164) had rewritten the two *"next start/reload"* comments to say *"next START ... NOT
+>    on a reload"*. That was true on its day. The two sites are the removed-inbound path, and they now
+>    say the worker releases its tail as it returns. The three *"startup/DR-only"* comments are about
+>    a **cancelled** worker, which neither layer covers. They now say that plainly.
+>
+> **What this still does not close.** A crash strand on SQL Server still waits for the next start or
+> promotion. If a Layer 1 release fails and a `start_*` door re-arms the worker before any reload,
+> the tail waits for the next start: the re-armed worker is alive, so the backstop skips its lane.
+> A leadership-lost tail still waits for the successor's promotion recovery, and strands if no node
+> takes over, exactly as before. Rows orphaned while their worker stays **alive** are out of scope,
+> because nothing can tell them from rows that worker is sending. The #1611 re-pend covers the
+> common case of that shape. Because of that limit, Inc 2 as built is **not** a recovery path for a
+> fenced write's residue on a live lane. Whoever builds Inc 3 should re-read the sequencing paragraph
+> above against this note rather than treat it as satisfied.
 
 **Inc 4 — `TeardownReason` + bounded, concurrent source stop (DEMOTE only). BUILT.** The enum lands
 **here**: `_teardown_unsafe` is the single shutdown path, so bounding it unguarded would change
@@ -555,8 +627,8 @@ reviewer conclude the problem was solved while a demoted leader is still mid-wri
    guard is not merely disarmed, it favours the stale node. The restore path must force the epoch forward.
 8. **A new `[cluster]`-scoped setting is invisible to the posture completeness floor.**
    `tests/test_security_posture_defaults.py:203` iterates `SecuritySettings.model_fields` only, so no
-   `[store]`- or `[cluster]`-scoped deviation can trip it (BACKLOG #333). Inc 0's and Inc 2's settings land
-   into that gap.
+   `[store]`- or `[cluster]`-scoped deviation can trip it (BACKLOG #333). Inc 0's setting lands
+   into that gap. Inc 2 as built adds no setting.
 9. **Out of scope, deliberately.** The in-claim cross-owner reclaim statements stay unfenced this pass —
    Postgres-only exposure. Self-theft by the owner-blind sweep is a **lease-sizing** bug, not a leadership
    bug.
