@@ -32,6 +32,7 @@ from harness.reconcile.compare import DEFAULT_KEY, ReconcileResult, load_message
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
 from messagefoundry.config.models import AckMode
+from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES
 
 
@@ -100,6 +101,11 @@ def _run_compare(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Both subcommands print RUNTIME values no source scan can see: `capture` echoes the operator's
+    # --out path, and `compare` prints render_text(), whose result line always carries a check or a
+    # cross mark cp1252 cannot encode. Without this, a redirected cp1252 stdout ABORTS `compare`
+    # and stderr turns a non-cp1252 path into backslash escapes (BACKLOG #1875). UTF-8 keeps both.
+    harden_console_streams(encoding="utf-8")
     parser = argparse.ArgumentParser(prog="harness.reconcile", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
