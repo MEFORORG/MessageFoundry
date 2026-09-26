@@ -511,8 +511,12 @@ class EngineClient:
         #: key). A relative path re-read later would resolve against whatever the working directory
         #: is then, and could pin a different file. None when there is no pin to follow.
         self._pin_paths: tuple[str, str | None, str | None] | None = None
-        #: Serialises a rebuild, and close(), between threads sharing a poll client.
-        self._pin_lock = threading.Lock()
+        #: Serialises a rebuild between threads sharing a poll client. Held across the file reads
+        #: and the context build, so only a rebuild waits on it.
+        self._rebuild_lock = threading.Lock()
+        #: Guards the swap of `_http`, the retired list and `_closed`. Held only for those, so a
+        #: close() never waits behind a slow read of the pin file.
+        self._state_lock = threading.Lock()
         self._closed = False
         #: Transports replaced by a renewal. Kept open until close(): another thread may still be
         #: mid-request on one, and closing it under that thread raises a bare RuntimeError. One is
@@ -575,9 +579,9 @@ class EngineClient:
         self.close()
 
     def close(self) -> None:
-        # Under the lock, so a rebuild racing close() cannot retire or open a transport after the
-        # list was taken; _follow_renewed_pin refuses once _closed is set.
-        with self._pin_lock:
+        # Under the state lock, so a rebuild racing close() cannot retire or open a transport after
+        # the list was taken; _follow_renewed_pin refuses to swap once _closed is set.
+        with self._state_lock:
             self._closed = True
             transports = [*self._retired_http, self._http]
             self._retired_http = []
@@ -620,38 +624,43 @@ class EngineClient:
         if self._pin_paths is None:
             return False
         pin, client_cert, client_key = self._pin_paths
-        with self._pin_lock:
-            if self._closed:
-                return False
-            if self._http is not failed:
-                return True
+        with self._rebuild_lock:
+            with self._state_lock:
+                if self._closed:
+                    return False
+                if self._http is not failed:
+                    return True  # another thread already followed the renewal
+            # Only a rebuild changes `_http`, and rebuilds are serialised, so it is still `failed`.
             current = _read_pin(pin)
             if current is None or current == self._pin_pem:
                 return False
-            reason = "the file changed while it loaded"
             try:
-                context: ssl.SSLContext | None = _build_verify_context(pin, client_cert, client_key)
+                context = _build_verify_context(pin, client_cert, client_key)
             except OSError as exc:  # ssl.SSLError is an OSError: empty, half-written, not a cert
-                context, reason = None, str(exc)
-            # A rewrite during the load leaves the context's bytes unknown; try again next time.
-            if context is None or _read_pin(pin) != current:
-                if current != self._pin_refused:
-                    self._pin_refused = current
-                    # The reason names which file failed: the pin, or an mTLS client cert or key
-                    # that a rebuild reloads too.
-                    _log.info(
-                        "engine certificate %s changed but the TLS material does not load (%s); "
-                        "keeping the current pin",
-                        pin,
-                        reason,
-                    )
+                # The reason names which file failed: the pin, or an mTLS client cert or key that
+                # a rebuild reloads too.
+                self._refuse_pin(current, f"the TLS material does not load ({exc})")
                 return False
-            self._retired_http.append(self._http)
-            self._http = self._open_transport(context)
+            if _read_pin(pin) != current:
+                # Rewritten during the load: which bytes the context holds is unknown.
+                self._refuse_pin(current, "the file changed again while it loaded")
+                return False
+            with self._state_lock:
+                if self._closed:
+                    return False
+                self._retired_http.append(self._http)
+                self._http = self._open_transport(context)
             self._pin_pem = current
             self._pin_refused = None
         _log.info("engine certificate %s has changed; now trusting the renewed certificate", pin)
         return True
+
+    def _refuse_pin(self, current: bytes, why: str) -> None:
+        """Keep the current pin, and say so once per distinct refused bytes."""
+        if current != self._pin_refused:
+            self._pin_refused = current
+            pin = self._pin_paths[0] if self._pin_paths is not None else self._cacert
+            _log.info("engine certificate %s changed but %s; keeping the current pin", pin, why)
 
     def for_polling(self) -> EngineClient:
         """A second client dedicated to **background (off-thread) reads** — the nav health poll, the
@@ -678,13 +687,20 @@ class EngineClient:
         reference, not a lock. That is a plain retry (one background read 401s and the next succeeds),
         not the permanent breakage a stale copy would cause.
         """
+        # The absolute paths fixed at construction, when there are any: a relative path resolved
+        # now could name a different file than this client pins, after a change of directory.
+        cacert, client_cert, client_key = self._pin_paths or (
+            self._cacert,
+            self._tls_client_cert,
+            self._tls_client_key,
+        )
         poll = EngineClient(
             self.base_url,
             timeout=self._timeout,
             allow_insecure=self._allow_insecure,
-            cacert=self._cacert,
-            tls_client_cert=self._tls_client_cert,
-            tls_client_key=self._tls_client_key,
+            cacert=cacert,
+            tls_client_cert=client_cert,
+            tls_client_key=client_key,
         )
         poll._token_cell = self._token_cell  # shared by reference — see the docstring
         poll._user = self._user

@@ -212,8 +212,12 @@ def test_a_retried_post_is_delivered_exactly_once(engine: _RenewableEngine) -> N
 def test_a_request_retried_after_a_prompt_may_follow_a_renewal(
     engine: _RenewableEngine, challenge: str
 ) -> None:
-    """The MFA and step-up retries are new attempts, so they re-arm the follow. Here the engine
-    restarts onto a renewed pair while the operator answers the prompt."""
+    """The MFA and step-up retries are new attempts, so they re-arm the follow.
+
+    The first attempt fails verification and follows renewal one, so its retry runs with the follow
+    spent. That retry meets the challenge, and the engine restarts onto renewal two while the
+    operator answers the prompt. Only a retry that re-arms the follow reaches the engine; one that
+    inherits the spent flag fails verification."""
     with _pinned(engine) as client:
 
         def answer_the_prompt() -> bool:
@@ -224,8 +228,10 @@ def test_a_request_retried_after_a_prompt_may_follow_a_renewal(
             client.set_mfa_handler(answer_the_prompt)
         else:
             client.set_step_up_handler(answer_the_prompt)
+        engine.serve(engine.renew_pin())
         engine.challenges.append(challenge)
         assert client.health().status == "ok"
+        assert engine.challenges == [], "the retry never met the challenge"
 
 
 def test_an_unchanged_pin_never_rebuilds(
@@ -338,23 +344,48 @@ def test_a_transport_already_replaced_is_retried_without_a_reload(
         assert client.health().status == "ok"
 
 
+class _ContendedLock:
+    """A lock that records when a SECOND thread has asked for it while the first holds it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._asked = 0
+        self._count = threading.Lock()
+        self.contended = threading.Event()
+
+    def __enter__(self) -> _ContendedLock:
+        with self._count:
+            self._asked += 1
+            if self._asked >= 2:
+                self.contended.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._lock.release()
+
+
 def test_two_threads_failing_together_rebuild_once(
     engine: _RenewableEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Two threads share one poll client and both fail on the old transport at once. Exactly one
-    rebuild happens and both requests succeed. The build is slowed so the second thread arrives
-    while the first is still inside it; without the lock both would rebuild."""
+    rebuild happens and both requests succeed. The rebuild waits until the second thread has asked
+    for the rebuild lock, so the second thread is provably inside the window; without the lock
+    both would rebuild."""
     real = client_module._build_verify_context
     built: list[str | None] = []
     both_failed = threading.Barrier(2)
+    lock = _ContendedLock()
 
-    def slow(cacert: str | None, client_cert: str | None, client_key: str | None) -> ssl.SSLContext:
+    def waits_for_the_other_thread(
+        cacert: str | None, client_cert: str | None, client_key: str | None
+    ) -> ssl.SSLContext:
         built.append(cacert)
         if len(built) > 1:
-            threading.Event().wait(0.3)
+            lock.contended.wait(timeout=5)
         return real(cacert, client_cert, client_key)
 
-    monkeypatch.setattr(client_module, "_build_verify_context", slow)
+    monkeypatch.setattr(client_module, "_build_verify_context", waits_for_the_other_thread)
     real_follow = EngineClient._follow_renewed_pin
 
     def meet_then_follow(self: EngineClient, failed: httpx.Client) -> bool:
@@ -363,6 +394,7 @@ def test_two_threads_failing_together_rebuild_once(
 
     monkeypatch.setattr(EngineClient, "_follow_renewed_pin", meet_then_follow)
     with _pinned(engine) as client:
+        client._rebuild_lock = lock  # type: ignore[assignment]
         engine.serve(engine.renew_pin())
         results: list[str] = []
         errors: list[BaseException] = []
@@ -380,6 +412,7 @@ def test_two_threads_failing_together_rebuild_once(
             thread.join(timeout=30)
         assert not errors
         assert results == ["ok", "ok"]
+        assert lock.contended.is_set(), "the second thread never reached the rebuild lock"
         assert len(built) == 2, "the constructor plus exactly one rebuild"
 
 
@@ -424,6 +457,11 @@ def test_a_relative_pin_is_followed_at_the_path_it_was_given(
         engine.serve(engine.renew_pin())
         assert client.health().status == "ok"
         _assert_pinned(client)
+        # A poll clone made AFTER the change of directory pins the same file, not the decoy.
+        with client.for_polling() as poll:
+            assert poll.health().status == "ok"
+            engine.serve(engine.renew_pin())
+            assert poll.health().status == "ok"
     finally:
         client.close()
 
@@ -460,15 +498,20 @@ def test_a_transport_error_that_is_not_verification_does_not_reload(
     engine: _RenewableEngine, builds: list[str | None]
 ) -> None:
     """Only a certificate-verification failure triggers the re-read. A refused connection with a
-    changed pin file is an unreachable engine, and it does not rebuild the transport."""
-    with _pinned(engine) as client:
-        transport = client._http
-        engine.renew_pin()
-        engine.close()
-        with pytest.raises(ApiError, match="could not reach engine"):
-            client.health()
-        assert client._http is transport
-        assert builds == [str(engine.pin)]
+    changed pin file is an unreachable engine, and it does not rebuild the transport. The port is
+    held bound and not listening for the whole test, so no other server can take it."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+        held.bind(("127.0.0.1", 0))
+        port = held.getsockname()[1]
+        with EngineClient(f"https://127.0.0.1:{port}", cacert=str(engine.pin)) as client:
+            transport = client._http
+            engine.renew_pin()
+            with pytest.raises(ApiError, match="could not reach engine"):
+                client.health()
+            assert client._http is transport
+            assert builds == [str(engine.pin)]
 
 
 def test_the_verification_failure_is_found_through_the_httpx_wrapping() -> None:
