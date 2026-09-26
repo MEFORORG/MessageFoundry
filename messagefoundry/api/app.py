@@ -224,7 +224,7 @@ from messagefoundry.api.validation import (
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
-from messagefoundry.auth.reconcile import ReconcilePlan
+from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
@@ -6887,7 +6887,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     """Raise the alert that matches each audit row the pass wrote (ASVS 8.3.2).
 
     A breaker trip is ``auth.ad_reconcile_aborted`` and becomes one ``ad_reconcile_aborted`` alert.
-    Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
+    An engaged undetermined-wave hold is ``auth.ad_reconcile_held`` and becomes one
+    ``ad_reconcile_held`` alert, on every pass while it holds, including one the breaker also aborts
+    (ADR 0195). Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
     alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
     and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
 
@@ -6895,6 +6897,13 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     already audited the revocations it applied; those rows stand, and no alert is raised for them."""
     if plan.directory_outage:
         return
+    if plan.hold:
+        sink.ad_reconcile_held(
+            "directory-reconciler",
+            reason=HOLD_REASON,
+            undetermined=plan.undetermined,
+            detail=auth.directory_reconcile_hold or HOLD_REASON,
+        )
     if plan.aborted is not None:
         # Every other abort is audited as auth.ad_reconcile_aborted (ReconcilePlan.directory_outage
         # is the one predicate both sides read), so every such abort alerts.

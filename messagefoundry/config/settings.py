@@ -3261,6 +3261,8 @@ _ALERT_EVENT_TYPES = frozenset(
         # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
         "ad_reconcile_aborted",
         "ad_session_revoked",
+        # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
+        "ad_reconcile_held",
         # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
         # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
     }

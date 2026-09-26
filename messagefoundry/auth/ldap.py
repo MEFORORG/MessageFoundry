@@ -22,7 +22,8 @@ import logging
 import ssl
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from enum import Enum
+from typing import Any, NamedTuple
 
 from messagefoundry.auth.trust_anchors import ad_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
@@ -77,6 +78,41 @@ class AdPrincipal:
 
 class LdapError(RuntimeError):
     """LDAP/Kerberos configuration or connectivity failure (distinct from rejected credentials)."""
+
+
+class DirectoryAnswer(Enum):
+    """What one password-free lookup of one account established (ADR 0195 rule item 2).
+
+    Only the session reconciler reads this. Every sign-in and step-up caller keeps its plain ``None``
+    for anything but :attr:`FOUND`, so the reason an account was refused never reaches a login path.
+    """
+
+    #: The entry was found and ``userAccountControl`` proved it enabled.
+    FOUND = "found"
+    #: The search matched nothing, or an id-keyed probe held an id the filter builder cannot parse,
+    #: so no search ran.
+    NOT_FOUND = "not_found"
+    #: The entry was found and ``userAccountControl`` read, with ACCOUNTDISABLE (0x2) set.
+    DISABLED = "disabled"
+    #: The entry was found and ``userAccountControl`` was absent, empty or not an integer. Refused
+    #: like a disabled account on every sign-in path (BACKLOG #1639); told apart here so the
+    #: reconciler can hold a wave of them (ADR 0195) instead of revoking it.
+    UNDETERMINED = "undetermined"
+
+
+@dataclass(frozen=True)
+class DirectoryProbe:
+    """One reconciler lookup: the answer, and the principal when the answer is :attr:`FOUND`."""
+
+    answer: DirectoryAnswer
+    principal: AdPrincipal | None = None
+
+
+class _Lookup(NamedTuple):
+    """One user search: the answer, and the extracted entry when the answer is FOUND."""
+
+    answer: DirectoryAnswer
+    info: dict[str, Any] | None = None
 
 
 def _escape_filter(value: str) -> str:
@@ -211,7 +247,7 @@ def _object_guid(entry: Any) -> str | None:
     return text
 
 
-#: Shapes of an unusable ``userAccountControl`` already reported by :func:`_account_enabled`. Same
+#: Shapes of an unusable ``userAccountControl`` already reported by :func:`_account_state`. Same
 #: reasoning as the ``objectGUID`` latch above: the reconciler reads every signed-in user every pass,
 #: and a bind account that cannot read the attribute makes EVERY entry unusable at once.
 _uac_shapes_warned: set[str] = set()
@@ -224,9 +260,11 @@ def _warn_once_about_user_account_control(shape: str) -> None:
     _uac_shapes_warned.add(shape)
     logger.warning(
         "AD %s is unusable (%s), so the engine cannot tell whether these accounts are disabled; "
-        "their AD logins are refused and the session reconciler reads them as absent. Check that "
-        "the [auth].ad_bind_dn service account can read this attribute and that it arrives as an "
-        "integer (BACKLOG #1639). Reported once per shape.",
+        "their AD logins are refused. The session reconciler revokes a single such account among "
+        "readable ones, and holds more than one without revoking them while it raises the "
+        "ad_reconcile_held alert (ADR 0195). Check that the [auth].ad_bind_dn service account can "
+        "read this attribute and that it arrives as an integer (BACKLOG #1639). Reported once per "
+        "shape.",
         _UAC_ATTR,
         shape,
     )
@@ -239,7 +277,17 @@ def _account_enabled(entry: Any) -> bool:
     empty or non-integer attribute is ``False``, the same answer a disabled account gets: the check
     must not pass on a value it could not read. Before this, a bind account without read rights on
     the attribute saw every principal as enabled, so a directory-disabled account would still sign
-    in and keep its sessions through the reconciler.
+    in and keep its sessions through the reconciler. :func:`_account_state` says which refusal it
+    was; only the reconciler asks.
+    """
+    return _account_state(entry) is DirectoryAnswer.FOUND
+
+
+def _account_state(entry: Any) -> DirectoryAnswer:
+    """Read ``userAccountControl`` three ways: FOUND (enabled), DISABLED, or UNDETERMINED.
+
+    ADR 0195 rule item 1. DISABLED is a readable flag word with ACCOUNTDISABLE (0x2) set.
+    UNDETERMINED is an absent, empty or non-integer attribute, and warns once per shape.
 
     The parse is ``int()`` inside a ``ValueError`` handler, and it is lenient rather than strict:
     whatever ``int()`` reads as an integer is taken as the flag word. What it must never do is
@@ -258,15 +306,19 @@ def _account_enabled(entry: Any) -> bool:
         # blank string, so that case needs no guard of its own.
         if isinstance(value, int | str | bytes) and not isinstance(value, bool):
             try:
-                return not int(value) & _ACCOUNTDISABLE
+                flags = int(value)
             except ValueError:
                 pass
+            else:
+                return (
+                    DirectoryAnswer.DISABLED if flags & _ACCOUNTDISABLE else DirectoryAnswer.FOUND
+                )
         # ldap3 can return an attribute it asked for and did not receive as present with no value
         # (its return_empty_attributes option), so "empty" is usually the same fact as "absent".
         blank = isinstance(value, str | bytes) and not value.strip()
         shape = "empty" if blank or not value else f"non-numeric {type(value).__name__}"
     _warn_once_about_user_account_control(shape)
-    return False
+    return DirectoryAnswer.UNDETERMINED
 
 
 def _multi(entry: Any, name: str) -> list[str]:
@@ -447,10 +499,9 @@ class LdapAuthenticator:
         except ldap3.core.exceptions.LDAPException:
             return
 
-    def _search_user(
-        self, conn: Any, search_filter: str, *, fallback_username: str
-    ) -> dict[str, Any] | None:
-        """Run one user search and extract the entry, or ``None`` for no match / a disabled account.
+    def _search_user(self, conn: Any, search_filter: str, *, fallback_username: str) -> _Lookup:
+        """Run one user search and extract the entry. ``info`` is ``None`` for no match, a disabled
+        account or an undetermined one, and ``answer`` says which (ADR 0195 rule item 2).
 
         The filter is the caller's; everything after it -- the attribute list, the ACCOUNTDISABLE
         rejection and the extraction -- is shared by both lookups on purpose. **The two lookups differ
@@ -479,30 +530,38 @@ class LdapAuthenticator:
             ],
         )
         if not conn.entries:
-            return None
+            return _Lookup(DirectoryAnswer.NOT_FOUND)
         e = conn.entries[0]
         # ACCOUNTDISABLE (0x2): a disabled AD account must not authenticate. The local-user path
         # checks `disabled` up front; the AD password + Kerberos paths both go through here, so
-        # rejecting a disabled account at the lookup covers both (review M-18). So does the session
-        # reconciler, whose probe reads this `None` as ABSENT: one check covers all three callers.
-        # An UNREADABLE attribute is refused the same way (BACKLOG #1639). Returning `None` rather
-        # than raising is deliberate: the reconciler reads an `LdapError` as UNAVAILABLE, which
-        # never revokes, and that would be the same fail-open in a new place.
-        if not _account_enabled(e):
-            return None
-        return {
-            "dn": str(e.entry_dn),
-            "username": _attr(e, "sAMAccountName") or fallback_username,
-            # BACKLOG #1471. Read through _object_guid, never _attr: that helper str()s whatever it
-            # is given, which would render the raw 16 bytes as a Python bytes repr and store a
-            # second, non-canonical spelling of the same identity.
-            "object_id": _object_guid(e),
-            "display_name": _attr(e, "displayName"),
-            "email": _attr(e, "mail"),
-            "memberOf": _multi(e, "memberOf"),
-        }
+        # rejecting a disabled account at the lookup covers both (review M-18). An UNREADABLE
+        # attribute is refused the same way (BACKLOG #1639): every sign-in caller reads `info` alone
+        # and sees `None` for both. The session reconciler also reads `answer`, which tells a set
+        # bit from an unreadable one, so it can hold a wave of unreadable answers (ADR 0195).
+        # Answering rather than raising is deliberate: the reconciler reads an `LdapError` as
+        # UNAVAILABLE, which never revokes, and that would be the same fail-open in a new place.
+        state = _account_state(e)
+        if state is not DirectoryAnswer.FOUND:
+            return _Lookup(state)
+        return _Lookup(
+            DirectoryAnswer.FOUND,
+            {
+                "dn": str(e.entry_dn),
+                "username": _attr(e, "sAMAccountName") or fallback_username,
+                # BACKLOG #1471. Read through _object_guid, never _attr: that helper str()s whatever it
+                # is given, which would render the raw 16 bytes as a Python bytes repr and store a
+                # second, non-canonical spelling of the same identity.
+                "object_id": _object_guid(e),
+                "display_name": _attr(e, "displayName"),
+                "email": _attr(e, "mail"),
+                "memberOf": _multi(e, "memberOf"),
+            },
+        )
 
     def _find_user(self, conn: Any, username: str) -> dict[str, Any] | None:
+        return self._lookup_by_name(conn, username).info
+
+    def _lookup_by_name(self, conn: Any, username: str) -> _Lookup:
         upn = f"{username}@{self._s.ad_domain}" if self._s.ad_domain else username
         return self._search_user(
             conn,
@@ -516,6 +575,9 @@ class LdapAuthenticator:
     def _find_user_by_object_id(
         self, conn: Any, object_id: str, *, fallback_username: str
     ) -> dict[str, Any] | None:
+        return self._lookup_by_object_id(conn, object_id, fallback_username=fallback_username).info
+
+    def _lookup_by_object_id(self, conn: Any, object_id: str, *, fallback_username: str) -> _Lookup:
         """Find a user by the directory's immutable ``objectGUID`` rather than by a name.
 
         This is the lookup a **renamed** account needs. A name-keyed search asks a question the
@@ -526,8 +588,8 @@ class LdapAuthenticator:
         if value is None:
             # A stored id the filter builder cannot parse. Refusing to search is the honest answer:
             # a search with no filter, or one falling back to the name, would report on a different
-            # question than the one asked.
-            return None
+            # question than the one asked. The reconciler reads it as ABSENT (ADR 0195 rule item 1).
+            return _Lookup(DirectoryAnswer.NOT_FOUND)
         return self._search_user(
             conn, f"({_OBJECT_GUID_ATTR}={value})", fallback_username=fallback_username
         )
@@ -626,22 +688,35 @@ class LdapAuthenticator:
         carries no ``sAMAccountName`` of its own -- an absent attribute is not the directory announcing
         a rename to nothing.
         """
+        return self.probe_principal(username, object_id=object_id).principal
+
+    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        """:meth:`resolve_principal`, also saying WHY an account did not resolve (ADR 0195).
+
+        The session reconciler's lookup, and only its. Same key choice, same service-account bind,
+        same refusals: :meth:`resolve_principal` is this method with the answer dropped, so the two
+        cannot drift. The answer tells a search that matched nothing from a set disabled bit and from
+        an unreadable ``userAccountControl``; the reconciler holds a wave of the last kind rather
+        than revoking it. Raises :class:`LdapError` on a connectivity or configuration failure,
+        exactly as :meth:`resolve_principal` does.
+        """
         import ldap3
 
         try:
             with self._service_conn() as svc:
-                info = (
-                    self._find_user_by_object_id(svc, object_id, fallback_username=username)
+                found = (
+                    self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None
-                    else self._find_user(svc, username)
+                    else self._lookup_by_name(svc, username)
                 )
+                info = found.info
                 if info is None:
-                    return None
+                    return DirectoryProbe(found.answer)
                 user_dn = str(info["dn"])
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
         except ldap3.core.exceptions.LDAPException as exc:  # pragma: no cover - needs real AD
             raise LdapError(str(exc)) from exc
-        return _principal_from(info, user_dn, groups)
+        return DirectoryProbe(DirectoryAnswer.FOUND, _principal_from(info, user_dn, groups))
 
 
 def _kerberos_acceptor(settings: AuthSettings) -> Any:

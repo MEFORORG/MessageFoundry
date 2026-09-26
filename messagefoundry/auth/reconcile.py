@@ -10,17 +10,22 @@ that decides what a reconciliation pass would do; the I/O (LDAP probes, store wr
 the API lifespan. Splitting it this way keeps the two properties that matter — **fail-open** and the
 **mass-revoke circuit breaker** — directly testable without a directory or a store.
 
-Three safety properties are built in, in order of importance:
+Four safety properties are built in, in order of importance:
 
 1. **Fail-OPEN on directory unavailability.** An unreachable DC yields
    :attr:`ProbeOutcome.UNAVAILABLE`, which never contributes a strike and never revokes. A
    fail-closed re-check would turn a directory blip into a total console outage during exactly the
    incident when operators need the console.
-2. **Two-strike before revoking.** ``resolve_principal`` collapses *disabled*, *deleted* and *the
-   search matched nothing* into a single ``None``, so one ambiguous result must not revoke.
-3. **A mass-revoke circuit breaker.** A misconfigured search base, a moved OU, or a service account
-   that lost read rights (on the entries, or on ``userAccountControl`` alone) returns "not found"
-   for **every** user — indistinguishable from "everyone was disabled". :func:`breaker_tripped`
+2. **Two-strike before revoking.** A search that matched nothing cannot tell *deleted* from *moved
+   out of the search base* or *a search base that was never right*, so one such result must not
+   revoke. A set disabled bit and an unreadable ``userAccountControl`` strike the same way.
+3. **A hold on an undetermined wave (ADR 0195).** A bind account that loses read on
+   ``userAccountControl`` makes every entry it can no longer read :attr:`ProbeOutcome.UNDETERMINED`
+   at once. :func:`hold_engaged` holds those accounts, and only those: none of them is revoked, and
+   the rest of the estate is reconciled as usual. The mass-revoke breaker below cannot do this on a
+   small estate, because its absolute floor lets five or fewer revocations through.
+4. **A mass-revoke circuit breaker.** A misconfigured search base or a moved OU returns "not found"
+   for **every** user, which looks the same as "everyone was deleted". :func:`breaker_tripped`
    aborts such a pass wholesale rather than signing out the estate. This is why the pass is
    planned in full before anything is written: an abort must leave the store byte-identical,
    including the role re-diff.
@@ -29,7 +34,7 @@ Three safety properties are built in, in order of importance:
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -45,9 +50,17 @@ class ProbeOutcome(Enum):
     #: The principal resolved — the account exists and ``auth.ldap._account_enabled`` passed it.
     #: Carries the current group set, so the role re-diff is free.
     PRESENT = "present"
-    #: The lookup succeeded but matched nothing. **Ambiguous**: refused by
-    #: ``auth.ldap._account_enabled``, deleted, moved out of the search base, or a search base that
-    #: was never right. Strikes, never revokes on its own.
+    #: The entry was found and its ``userAccountControl`` read, with the disabled bit set. Plans
+    #: exactly as :attr:`ABSENT` does: it strikes, and revokes at the threshold.
+    DISABLED = "disabled"
+    #: The entry was found and its ``userAccountControl`` was absent, empty or not an integer
+    #: (BACKLOG #1639). A single one beside readable answers strikes and revokes like :attr:`ABSENT`;
+    #: a wave of them is held (ADR 0195, :func:`hold_engaged`).
+    UNDETERMINED = "undetermined"
+    #: The lookup matched nothing, or an id-keyed probe held a stored ``objectGUID`` that could not
+    #: be parsed, so no search ran. **Ambiguous**: deleted, moved out of the search base, or a search
+    #: base that was never right. Strikes, never revokes on its own. Since ADR 0195 a disabled or an
+    #: unreadable entry is NOT this outcome.
     ABSENT = "absent"
     #: The directory could not be consulted (``LdapError`` — connectivity/bind/config). Contributes
     #: nothing: no strike, no revocation, no strike reset.
@@ -87,6 +100,20 @@ class UsernameRefresh:
     new_username: str
 
 
+#: The revocation reason each striking outcome carries once it reaches the threshold.
+REVOKE_REASONS: Mapping[ProbeOutcome, str] = {
+    ProbeOutcome.ABSENT: "directory_absent",
+    ProbeOutcome.DISABLED: "directory_disabled",
+    ProbeOutcome.UNDETERMINED: "directory_undetermined",
+}
+
+#: The outcomes that count as a READABLE answer for the hold's ``r`` (ADR 0195 rule item 5).
+_READABLE = frozenset({ProbeOutcome.PRESENT, ProbeOutcome.DISABLED})
+
+#: The closed-set slug the held audit row and alert carry (ADR 0195 rule item 9).
+HOLD_REASON = "user_account_control_undetermined"
+
+
 @dataclass(frozen=True)
 class SessionRevocation:
     """One planned revocation. ``role_ids`` is set only for a role re-diff, and is the *target* set
@@ -94,7 +121,8 @@ class SessionRevocation:
 
     user_id: str
     username: str
-    reason: str  # "directory_absent" | "roles_changed"
+    #: One of the values of :data:`REVOKE_REASONS`, or ``"roles_changed"``.
+    reason: str
     role_ids: tuple[str, ...] | None = None
 
 
@@ -115,6 +143,19 @@ class ReconcilePlan:
     #: Non-None when the pass ABORTED and must apply nothing: the breaker tripped, or every probe in
     #: the pass failed (a whole-directory outage). The value is a closed-set operator-facing slug.
     aborted: str | None = None
+    #: Outcomes to record in the caller's per-candidate record (ADR 0195 rule item 4): every probe of
+    #: this pass except an UNAVAILABLE one, which leaves the prior entry in place. Populated on a
+    #: breaker abort too, like ``strikes``.
+    outcomes: Mapping[str, ProbeOutcome] = field(default_factory=dict)
+    #: Whether the undetermined-wave hold is engaged after this pass. On a whole-directory outage
+    #: nothing was judged, so it carries the caller's prior state unchanged.
+    hold: bool = False
+    #: ``user_id`` of every UNDETERMINED probe this pass held: no revocation, strike reset to 0.
+    held: tuple[str, ...] = ()
+    #: ``u``: candidates whose latest recorded outcome is UNDETERMINED, across the rotation.
+    undetermined: int = 0
+    #: ``r``: probes in THIS pass that read the attribute (PRESENT or DISABLED).
+    readable: int = 0
 
     @property
     def directory_outage(self) -> bool:
@@ -140,6 +181,24 @@ def breaker_tripped(
     return revoke_count > max_absolute and revoke_count > max_fraction * probed
 
 
+def hold_engaged(*, undetermined: int, readable: int, engaged: bool) -> bool:
+    """Whether the undetermined-wave hold is engaged for this pass (ADR 0195 rule item 6).
+
+    ``undetermined`` is ``u``, counted across the rotation; ``readable`` is ``r``, counted in this
+    pass only. **The count of one is a fixed rule, not a setting** (owner ruling 2026-09-26): an
+    undetermined answer may revoke only when it is the only one the reconciler knows of AND this pass
+    read the attribute on some other account. Two at once is more likely a lost read right than two
+    coincidences. A lone one with nothing readable beside it cannot be told from a whole-estate wave.
+
+    **Hysteresis.** Once engaged, the hold releases only when ``u`` reaches 0. Without it, attrition
+    defeats the hold: as a wave's sessions expire, the last held account reads as a single and is
+    revoked. The rule has no floor; it applies at any estate size.
+    """
+    if engaged:
+        return undetermined > 0
+    return undetermined > 1 or (undetermined == 1 and readable == 0)
+
+
 def select_candidates(
     candidates: Iterable[tuple[str, str]], *, last_probed: Mapping[str, float], budget: int
 ) -> list[tuple[str, str]]:
@@ -163,6 +222,8 @@ def plan_pass(
     strike_threshold: int,
     max_absolute: int,
     max_fraction: float,
+    prior_outcomes: Mapping[str, ProbeOutcome] | None = None,
+    hold_was_engaged: bool = False,
 ) -> ReconcilePlan:
     """Turn a pass's probe results into an all-or-nothing plan.
 
@@ -170,29 +231,52 @@ def plan_pass(
     caller from the store (``get_user_role_ids``) and from the probed groups
     (``roles_for_ad_groups``). They drive the free role re-diff: because ``resolve_principal``
     already returns the group set, a *demotion* in the directory costs no extra bind.
+
+    ``prior_outcomes`` is the caller's record of each live candidate's latest outcome, pruned to the
+    current candidate set, and ``hold_was_engaged`` is whether the previous pass left the hold engaged
+    (ADR 0195). This pass's outcomes are merged into that record BEFORE the hold is judged.
     """
     probes = list(probes)
-    absent = [p for p in probes if p.outcome is ProbeOutcome.ABSENT]
-    present = [p for p in probes if p.outcome is ProbeOutcome.PRESENT]
     unavailable = [p for p in probes if p.outcome is ProbeOutcome.UNAVAILABLE]
 
     if probes and len(unavailable) == len(probes):
         # Every probe failed: the directory, not the accounts, is what changed. Belt-and-braces on
         # top of the per-probe fail-open — this is the shape a DC outage takes, and naming it keeps
         # the operator-facing reason honest rather than reporting a silent zero-revocation pass.
+        # The hold is not judged on a pass that learned nothing, so its state carries over.
         return ReconcilePlan(
-            probed=len(probes), unavailable=len(unavailable), aborted="directory_unavailable"
+            probed=len(probes),
+            unavailable=len(unavailable),
+            aborted="directory_unavailable",
+            hold=hold_was_engaged,
         )
+
+    # ADR 0195 rule items 4 to 6. An UNAVAILABLE probe leaves the prior entry in place, so a
+    # directory blip on one held account does not make another look single.
+    outcomes = {p.user_id: p.outcome for p in probes if p.outcome is not ProbeOutcome.UNAVAILABLE}
+    record = {**(prior_outcomes or {}), **outcomes}
+    undetermined = sum(1 for o in record.values() if o is ProbeOutcome.UNDETERMINED)
+    readable = sum(1 for p in probes if p.outcome in _READABLE)
+    hold = hold_engaged(undetermined=undetermined, readable=readable, engaged=hold_was_engaged)
 
     strikes: dict[str, int] = {}
     revocations: list[SessionRevocation] = []
-    for probe in absent:
+    held: list[str] = []
+    for probe in probes:
+        reason = REVOKE_REASONS.get(probe.outcome)
+        if reason is None:
+            continue
+        if hold and probe.outcome is ProbeOutcome.UNDETERMINED:
+            # Held: no revocation, and the strike count starts again from 0 (rule item 7), so an
+            # account still unreadable once the hold releases needs `strike_threshold` fresh passes.
+            strikes[probe.user_id] = 0
+            held.append(probe.user_id)
+            continue
         count = prior_strikes.get(probe.user_id, 0) + 1
         strikes[probe.user_id] = count
         if count >= strike_threshold:
-            revocations.append(
-                SessionRevocation(probe.user_id, probe.username, reason="directory_absent")
-            )
+            revocations.append(SessionRevocation(probe.user_id, probe.username, reason=reason))
+    present = [p for p in probes if p.outcome is ProbeOutcome.PRESENT]
     for probe in present:
         strikes[probe.user_id] = 0  # a successful resolve clears the record
         target = target_roles.get(probe.user_id, frozenset())
@@ -211,9 +295,11 @@ def plan_pass(
                 )
             )
 
+    # Held probes are left out of the breaker's denominator (rule item 7): it judges only what the
+    # pass could still revoke.
     if breaker_tripped(
         revoke_count=len(revocations),
-        probed=len(probes),
+        probed=len(probes) - len(held),
         max_absolute=max_absolute,
         max_fraction=max_fraction,
     ):
@@ -227,6 +313,11 @@ def plan_pass(
             probed=len(probes),
             unavailable=len(unavailable),
             aborted="mass_revoke_breaker",
+            outcomes=outcomes,
+            hold=hold,
+            held=tuple(held),
+            undetermined=undetermined,
+            readable=readable,
         )
 
     return ReconcilePlan(
@@ -244,6 +335,11 @@ def plan_pass(
         strikes=strikes,
         probed=len(probes),
         unavailable=len(unavailable),
+        outcomes=outcomes,
+        hold=hold,
+        held=tuple(held),
+        undetermined=undetermined,
+        readable=readable,
     )
 
 
@@ -253,13 +349,23 @@ def breaker_ceiling(*, probed: int, max_absolute: int, max_fraction: float) -> i
     return max(max_absolute, math.floor(max_fraction * probed))
 
 
-def prune_ledger[V: (int, float)](ledger: dict[str, V], keep: Iterable[str]) -> None:
+def prune_ledger[V](
+    ledger: dict[str, V], keep: Iterable[str], *, rank: Callable[[V], float]
+) -> None:
     """Drop bookkeeping for users no longer holding a live directory session, then hard-cap what
-    remains. Keeps the process-local strike / last-probed state bounded across a long uptime with
-    heavy user churn."""
+    remains. Keeps the process-local strike, last-probed and outcome state bounded across a long
+    uptime with heavy user churn. The cap drops the lowest ``rank`` first: the numeric ledgers pass
+    ``float``, and the outcome record passes :func:`outcome_rank`."""
     live = set(keep)
     for user_id in [k for k in ledger if k not in live]:
         del ledger[user_id]
     if len(ledger) > LEDGER_MAX:  # pragma: no cover - pathological estate
-        for user_id in sorted(ledger, key=ledger.__getitem__)[: len(ledger) - LEDGER_MAX]:
+        order = sorted(ledger, key=lambda k: rank(ledger[k]))
+        for user_id in order[: len(ledger) - LEDGER_MAX]:
             del ledger[user_id]
+
+
+def outcome_rank(outcome: ProbeOutcome) -> float:
+    """Cap order for the outcome record: an UNDETERMINED entry is dropped last, so the cap is never
+    what releases a hold."""
+    return 1.0 if outcome is ProbeOutcome.UNDETERMINED else 0.0
