@@ -32,7 +32,6 @@ from messagefoundry.config.tls_policy import (
     harden_kex_groups,
     harden_verify_flags,
     narrow_to_approved_suites,
-    refuse_lowered_security_level,
 )
 
 if TYPE_CHECKING:
@@ -90,8 +89,6 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         # Unset is no longer "whatever the interpreter enables": the approved AEAD names are the
         # default on every context the engine builds (BACKLOG #300, the ADR 0188 amendment).
         narrow_to_approved_suites(ctx)
-    # BACKLOG #2106: the settings validator refuses an @ directive; this checks the context too.
-    refuse_lowered_security_level(ctx, connector="API/UI listener")
     harden_kex_groups(ctx)  # pin approved ECDHE groups where the runtime supports it (ASVS 11.6.2)
     harden_cipher_suites(ctx, connector="API/UI listener")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 cert validation (ASVS 12.1.4)

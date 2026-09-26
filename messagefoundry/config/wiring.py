@@ -1649,7 +1649,8 @@ def MLLP(
     string is validated by the **same** strict allow-list that guards ``[api].tls_ciphers`` (AEAD-only,
     forward-secret, encrypting, peer-authenticating, 128-bit floor) and then applied, so opting in
     NARROWS this one hop. A rejected string fails loud at construction, surfaced by
-    ``messagefoundry check`` / dry-run."""
+    ``messagefoundry check`` / dry-run. An OpenSSL ``@`` directive, such as ``@SECLEVEL=0``, is
+    refused too, because it lowers the security level without naming a suite (BACKLOG #2106)."""
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -2861,7 +2862,9 @@ def DICOM(
     ``_APPROVED_TLS_SUITES``. Set, the string is validated by the **same** strict allow-list that guards
     ``[api].tls_ciphers`` (AEAD-only, forward-secret, encrypting, peer-authenticating, 128-bit floor)
     and then applied, so opting in NARROWS this one hop. A rejected string fails loud at construction,
-    surfaced by ``messagefoundry check`` / dry-run."""
+    surfaced by ``messagefoundry check`` / dry-run. An OpenSSL ``@`` directive, such as
+    ``@SECLEVEL=0``, is refused too, because it lowers the security level without naming a suite
+    (BACKLOG #2106)."""
     _reject_envref_in_lists(
         "DICOM",
         presentation_contexts=presentation_contexts,

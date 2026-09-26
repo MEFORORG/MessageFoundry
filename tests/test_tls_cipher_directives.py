@@ -10,22 +10,24 @@ key, so the directive undid it with every gate saying yes.
 Two guards now hold, and each is tested with a control that shows the test can pass:
 
 * ``validate_tls_ciphers`` refuses any ``@`` token, on the operator knob and the proxy declaration;
-* ``refuse_lowered_security_level`` refuses a context below the stock level, after the string is
-  applied, on the API listener and the four MLLP/DICOM seams.
+* ``harden_cipher_suites`` refuses a finished context below the stock level, through
+  ``refuse_lowered_security_level``. Every seam calls it after applying an operator string.
 
-The handshake tests at the end are the harm itself, measured on a real TLS exchange in memory.
+``tests/test_connection_tls_ciphers.py`` runs both guards over the four MLLP and DICOM seams. The
+handshake tests at the end are the harm itself, measured on a real TLS exchange in memory.
 """
 
 from __future__ import annotations
 
 import datetime
 import ssl
+import warnings
 from pathlib import Path
 
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from pydantic import ValidationError
 
@@ -34,9 +36,11 @@ from messagefoundry.config import tls_policy
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import (
     apply_connection_tls_ciphers,
+    harden_cipher_suites,
     validate_proxy_tls_posture,
     validate_tls_ciphers,
 )
+from messagefoundry.pki import make_self_signed
 
 #: One approved suite per key type. The directive forms below are these plus a directive, so each
 #: refusal has a control that differs from it by the directive alone.
@@ -44,19 +48,24 @@ ECDSA_SUITE = "ECDHE-ECDSA-AES256-GCM-SHA384"
 RSA_SUITE = "ECDHE-RSA-AES256-GCM-SHA384"
 
 #: Every form measured to parse on CPython 3.14.6 / OpenSSL 3.5.7, so the refusal is ours and not a
-#: parse error. OpenSSL takes ``:``, ``,``, ``;`` and a space as separators. ``@SECLEVEL=2`` is
+#: parse error. OpenSSL takes ``:``, ``,``, ``;`` and a space as separators, and it also starts a
+#: directive at an ``@`` with NO separator, the last form. ``@SECLEVEL=2`` and ``@SECLEVEL=3`` are
 #: refused too: a directive is refused for being one, not for the level it names.
 DIRECTIVE_FORMS = [
     f"@SECLEVEL=0:{ECDSA_SUITE}",
     f"@SECLEVEL=1:{ECDSA_SUITE}",
     f"@SECLEVEL=2:{ECDSA_SUITE}",
+    f"@SECLEVEL=3:{ECDSA_SUITE}",
     f"{ECDSA_SUITE}:@SECLEVEL=0",
     f"@STRENGTH:{ECDSA_SUITE}",
     f"{ECDSA_SUITE}:@STRENGTH",
     f"{ECDSA_SUITE} @SECLEVEL=0",
     f"{ECDSA_SUITE},@SECLEVEL=0",
     f"{ECDSA_SUITE};@SECLEVEL=0",
+    f"{ECDSA_SUITE}@SECLEVEL=0",
 ]
+
+SIDES = [ssl.PROTOCOL_TLS_SERVER, ssl.PROTOCOL_TLS_CLIENT]
 
 
 def _stock_level(protocol: ssl._SSLMethod) -> int:
@@ -67,8 +76,8 @@ def _stock_level(protocol: ssl._SSLMethod) -> int:
 
 
 def test_the_build_default_is_level_two() -> None:
-    """The premise every test below leans on. If a build ships a different default, the harm
-    measured here changes shape, and this says so first."""
+    """The premise the handshake tests lean on: level 2 refuses an RSA-1024 key and level 1 would
+    not. The other tests compare against the stock level, so they hold on any build."""
     assert _stock_level(ssl.PROTOCOL_TLS_SERVER) == 2
     assert _stock_level(ssl.PROTOCOL_TLS_CLIENT) == 2
 
@@ -78,6 +87,13 @@ def test_every_directive_form_parses_on_this_build(value: str) -> None:
     """Control for the refusals below: OpenSSL accepts each form, so the refusal is not a parse
     error in disguise."""
     ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).set_ciphers(value)
+
+
+def test_a_directive_with_no_separator_still_lowers_the_level() -> None:
+    """Why the check looks for ``@`` anywhere in a token, not only at its start."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.set_ciphers(f"{ECDSA_SUITE}@SECLEVEL=0")
+    assert ctx.security_level == 0
 
 
 @pytest.mark.parametrize("require_approved", [True, False])
@@ -121,86 +137,83 @@ def test_the_api_setting_refuses_a_directive_at_load() -> None:
     assert ApiSettings(tls_ciphers=ECDSA_SUITE).tls_ciphers == ECDSA_SUITE  # control
 
 
-# --- the connection path: refused, and an allowed string keeps level 2 ----------------------------
+# --- the connection path: refused, and an allowed string keeps the stock level --------------------
 
 
-@pytest.mark.parametrize("protocol", [ssl.PROTOCOL_TLS_SERVER, ssl.PROTOCOL_TLS_CLIENT])
-def test_a_connection_refuses_a_directive_and_keeps_level_two(protocol: ssl._SSLMethod) -> None:
+@pytest.mark.parametrize("protocol", SIDES)
+def test_a_connection_refuses_a_directive_and_keeps_the_stock_level(
+    protocol: ssl._SSLMethod,
+) -> None:
     ctx = ssl.SSLContext(protocol)
     with pytest.raises(ValueError, match=r"MLLP listener: tls_ciphers rejected.*directive"):
         apply_connection_tls_ciphers(
             ctx, {"tls_ciphers": f"@SECLEVEL=0:{ECDSA_SUITE}"}, connector="MLLP listener"
         )
-    assert ctx.security_level == 2, "the refused string still reached the context"
+    assert ctx.security_level == _stock_level(protocol), "the refused string reached the context"
 
 
-@pytest.mark.parametrize("protocol", [ssl.PROTOCOL_TLS_SERVER, ssl.PROTOCOL_TLS_CLIENT])
+@pytest.mark.parametrize("protocol", SIDES)
 @pytest.mark.parametrize("ciphers", [ECDSA_SUITE, f"{ECDSA_SUITE}:{RSA_SUITE}", None])
-def test_an_allowed_operator_string_keeps_level_two(
+def test_an_allowed_operator_string_keeps_the_stock_level(
     protocol: ssl._SSLMethod, ciphers: str | None
 ) -> None:
     """``None`` is the unset default, which narrows by name and writes the level back."""
     ctx = ssl.SSLContext(protocol)
     settings = {} if ciphers is None else {"tls_ciphers": ciphers}
     apply_connection_tls_ciphers(ctx, settings, connector="MLLP destination")
-    assert ctx.security_level == 2
+    harden_cipher_suites(ctx, connector="MLLP destination")
+    assert ctx.security_level == _stock_level(protocol)
 
 
-# --- defence in depth: the context itself is checked after the string is applied ------------------
+# --- defence in depth: the finished context is checked, whatever reached it ------------------------
 
 
-def test_refuse_lowered_security_level_refuses_level_zero() -> None:
+@pytest.mark.parametrize("protocol", SIDES)
+def test_refuse_lowered_security_level_refuses_level_zero(protocol: ssl._SSLMethod) -> None:
     refuse = tls_policy.refuse_lowered_security_level
-    lowered = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    lowered = ssl.SSLContext(protocol)
     lowered.set_ciphers(f"@SECLEVEL=0:{RSA_SUITE}")
     assert lowered.security_level == 0, "control: the directive did not take"
     with pytest.raises(ValueError, match=r"test hop: .*security level 0"):
         refuse(lowered, connector="test hop")
-    refuse(ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), connector="test hop")  # control: stock passes
+    refuse(ssl.SSLContext(protocol), connector="test hop")  # control: stock passes
 
 
-def test_a_connection_whose_validator_is_bypassed_still_refuses_a_lowered_level(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The second guard, reached without the first. With the validator stubbed out, only the
-    level check stands between the directive and the context."""
-    monkeypatch.setattr(tls_policy, "validate_tls_ciphers", lambda value, **_: value)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    with pytest.raises(ValueError, match=r"DICOM destination: .*security level 0"):
-        apply_connection_tls_ciphers(
-            ctx, {"tls_ciphers": f"@SECLEVEL=0:{RSA_SUITE}"}, connector="DICOM destination"
-        )
+def test_harden_cipher_suites_refuses_a_lowered_level() -> None:
+    """The seam's own assertion carries the check, so the call-site guard that holds every seam to
+    ``harden_cipher_suites`` by name holds it to this too. Level 0 with approved suites fails no
+    suite check, so the level is the only thing that can raise here."""
+    lowered = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    lowered.set_ciphers(f"@SECLEVEL=0:{RSA_SUITE}")
+    with pytest.raises(ValueError, match=r"MLLP destination: .*security level 0"):
+        harden_cipher_suites(lowered, connector="MLLP destination")
+    stock = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    stock.set_ciphers(RSA_SUITE)
+    harden_cipher_suites(stock, connector="MLLP destination")  # control
+
+
+def test_the_stock_level_lookup_never_builds_a_deprecated_context() -> None:
+    """A bare ``ssl.SSLContext()`` is ``PROTOCOL_TLS``, which warns on construction. The check
+    compares it against a client context rather than building another one of its kind."""
+    with pytest.warns(DeprecationWarning):
+        legacy = ssl.SSLContext(ssl.PROTOCOL_TLS)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        tls_policy.refuse_lowered_security_level(legacy, connector="legacy")
 
 
 def _ec_pair(tmp_path: Path) -> tuple[Path, Path]:
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC))
-        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC))
-        .sign(key, hashes.SHA256())
-    )
+    cert_pem, key_pem = make_self_signed("localhost", [], 30)
     cert_path, key_path = tmp_path / "cert.pem", tmp_path / "key.pem"
-    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    )
+    cert_path.write_bytes(cert_pem)
+    key_path.write_bytes(key_pem)
     return cert_path, key_path
 
 
-def test_the_api_listener_keeps_level_two_with_an_allowed_string(tmp_path: Path) -> None:
+def test_the_api_listener_keeps_the_stock_level_with_an_allowed_string(tmp_path: Path) -> None:
     cert, key = _ec_pair(tmp_path)
     api = ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key), tls_ciphers=ECDSA_SUITE)
-    assert build_api_ssl_context(api).security_level == 2
+    assert build_api_ssl_context(api).security_level == _stock_level(ssl.PROTOCOL_TLS_SERVER)
 
 
 def test_the_api_listener_refuses_a_lowered_level_that_skipped_the_settings_validator(
@@ -217,7 +230,8 @@ def test_the_api_listener_refuses_a_lowered_level_that_skipped_the_settings_vali
 
     with pytest.raises(ValueError, match=r"API/UI listener: .*security level 0"):
         build_api_ssl_context(construct(f"@SECLEVEL=0:{ECDSA_SUITE}"))
-    assert build_api_ssl_context(construct(ECDSA_SUITE)).security_level == 2
+    control = build_api_ssl_context(construct(ECDSA_SUITE))
+    assert control.security_level == _stock_level(ssl.PROTOCOL_TLS_SERVER)
 
 
 # --- the harm: an RSA-1024 server certificate, on a real handshake --------------------------------
@@ -227,7 +241,8 @@ def _rsa_1024_server(tmp_path: Path) -> tuple[ssl.SSLContext, bytes]:
     """A server presenting a self-signed RSA-1024 certificate for ``localhost``, and its PEM.
 
     The server context runs at level 0 on purpose: at 2, ``load_cert_chain`` refuses the key before
-    any client is asked. The question is what the CLIENT does."""
+    any client is asked. The question is what the CLIENT does. ``make_self_signed`` mints EC only,
+    so the RSA key is built here."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
     cert = (
@@ -302,13 +317,14 @@ def test_a_client_built_from_operator_input_refuses_an_rsa_1024_server(tmp_path:
     server, pem = _rsa_1024_server(tmp_path)
     client = _client_trusting(pem)
     apply_connection_tls_ciphers(client, {"tls_ciphers": RSA_SUITE}, connector="MLLP destination")
+    harden_cipher_suites(client, connector="MLLP destination")
     with pytest.raises(ssl.SSLError, match="key too weak"):
         _handshake(client, server)
 
 
 def test_operator_input_cannot_build_the_level_zero_client(tmp_path: Path) -> None:
     """The row's reproduction, closed: the string that lowered the level is refused before it
-    reaches a context, so no handshake happens with it."""
+    reaches a context, so the client keeps refusing the key."""
     server, pem = _rsa_1024_server(tmp_path)
     client = _client_trusting(pem)
     with pytest.raises(ValueError, match="directive"):

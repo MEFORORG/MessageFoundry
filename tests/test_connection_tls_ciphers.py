@@ -206,6 +206,7 @@ def test_opt_in_removes_the_suites_the_allow_list_excludes(seam: str, tmp_path: 
         ("ECDHE-RSA-AES256-SHA384", "sound but NOT on the AEAD-only approved list"),
         ("this-is-not-a-cipher-string", "unparseable by OpenSSL"),
         (f"@SECLEVEL=0:{NARROW}", "an @ directive lowers the security level (BACKLOG #2106)"),
+        (f"{NARROW}:@STRENGTH", "an @ directive, level-neutral, so only the validator sees it"),
     ],
 )
 def test_a_suite_the_shared_policy_refuses_is_refused_here(
@@ -243,6 +244,20 @@ def test_the_refusal_is_the_shared_validator_and_not_a_second_copy(
         ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER), {"tls_ciphers": NARROW}, connector="probe"
     )
     assert calls == [NARROW], "the seam did not run the shared validator on the operator string"
+
+
+@pytest.mark.parametrize("seam", SEAMS)
+def test_a_seam_refuses_a_lowered_level_even_past_the_validator(
+    seam: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2106, the second guard. With the validator stubbed out, ``@SECLEVEL=0`` reaches
+    the context, and only the seam's own ``harden_cipher_suites`` call can refuse it. The control
+    builds each seam with the same suites and no directive, and it keeps the stock level."""
+    monkeypatch.setattr(tls_policy, "validate_tls_ciphers", lambda value, **_: value)
+    with pytest.raises(ValueError, match=re.escape(seam) + r": .*security level 0"):
+        _build(seam, tmp_path, f"@SECLEVEL=0:{NARROW}")
+    control = _build(seam, tmp_path, NARROW)
+    assert control.security_level == _reference(seam).security_level
 
 
 # --- AC-4 / AC-5 / AC-6: THE BOUNDARY, as amended by BACKLOG #300. Unset narrows. ---------------

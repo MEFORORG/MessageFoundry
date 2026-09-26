@@ -729,6 +729,10 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
             f"secrecy, encryption and peer authentication all hold for these, so none of the checks "
             f"above can see them."
         )
+    # BACKLOG #2106. Last, so a context failing a suite check reports that first. Every seam that
+    # applies an operator tls_ciphers string calls this function after it, and the call-site guard
+    # holds each seam to that by name, so the level is checked on every one of them.
+    refuse_lowered_security_level(ctx, connector=connector)
 
 
 #: The connector setting :func:`apply_connection_tls_ciphers` reads. Named ONCE, here, so the four
@@ -788,30 +792,39 @@ def apply_connection_tls_ciphers(
         ctx.set_ciphers(text)
     except (ValueError, ssl.SSLError) as exc:
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
-    refuse_lowered_security_level(ctx, connector=connector)  # BACKLOG #2106, defence in depth
 
 
 def _cipher_directives(value: str) -> list[str]:
     """The ``@`` tokens in an OpenSSL cipher string, in order (BACKLOG #2106).
 
-    OpenSSL separates tokens with ``:``, ``,``, ``;`` or a space, measured on OpenSSL 3.5.7. A token
-    counts if it holds ``@`` anywhere, because no suite or alias name does."""
+    OpenSSL separates tokens with ``:``, ``,``, ``;`` or a space, and it ALSO starts a directive at an
+    ``@`` with no separator: ``ECDHE-ECDSA-AES256-GCM-SHA384@SECLEVEL=0`` sets level 0, measured on
+    OpenSSL 3.5.7. So a token counts if it holds ``@`` anywhere, never only if it starts with one.
+    No suite or alias name holds ``@``."""
     for sep in ",; ":
         value = value.replace(sep, ":")
     return [token for token in value.split(":") if "@" in token]
 
 
+#: The security level OpenSSL gives a new context, per side, read once at import (BACKLOG #2106).
+#: Read, not written, because the OpenSSL build sets it. Only the two non-deprecated protocols are
+#: built, so no caller's context shape can raise the ``PROTOCOL_TLS`` deprecation warning here.
+_STOCK_SECURITY_LEVEL_SERVER = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).security_level
+_STOCK_SECURITY_LEVEL_CLIENT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).security_level
+
+
 def refuse_lowered_security_level(ctx: ssl.SSLContext, *, connector: str) -> None:
-    """Raise if ``ctx`` runs below the OpenSSL security level of a stock context of its protocol.
+    """Raise if ``ctx`` runs below the OpenSSL security level of a stock context of its side.
 
     BACKLOG #2106, defence in depth. :func:`validate_tls_ciphers` refuses every ``@`` directive, so a
-    validated string cannot lower the level. This checks the context itself after the string is
-    applied, so a path that skipped the validator still cannot go below the floor.
+    validated string cannot lower the level. :func:`harden_cipher_suites` calls this on the finished
+    context, so a string that skipped the validator still cannot take a seam below the floor.
 
     The floor is read off a stock context rather than written here, because the OpenSSL build sets
     it: 2 on CPython 3.14.6 / OpenSSL 3.5.7. At 2 a client refuses a peer certificate with an
     RSA-1024 key; at 0 it accepts one."""
-    floor = ssl.SSLContext(ctx.protocol).security_level
+    server = getattr(ctx, "protocol", None) == ssl.PROTOCOL_TLS_SERVER
+    floor = _STOCK_SECURITY_LEVEL_SERVER if server else _STOCK_SECURITY_LEVEL_CLIENT
     if ctx.security_level < floor:
         raise ValueError(
             f"{connector}: the TLS context runs at OpenSSL security level {ctx.security_level}, "
