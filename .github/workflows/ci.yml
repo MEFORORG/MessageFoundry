@@ -1122,7 +1122,7 @@ jobs:
       # Each leg's 66 splits 61 success / 5 not, and every red above came from the 61: `decide()`
       # returns LOW only for a step that concluded SUCCESS, so a red here is always a green suite.
       #
-      # At the margin caps in force -- 5 / 6 / 9 -- the observed maxima sit at 1.345x, 1.229x and
+      # At the margin caps then in force -- 5 / 6 / 9 -- the observed maxima sit at 1.345x, 1.229x and
       # 1.179x. Two legs are under the gate's 1.30x floor AT THEIR OWN WORST RUN. Seven ejections in
       # twelve hours is what that looks like from the inside. ubuntu clears at 1.345x and is next.
       #
@@ -1213,10 +1213,13 @@ jobs:
       # still names the test, so a hang is attributable; the stack is not. Re-run that node id serially
       # to get the dump back -- do not read the missing dump as the timeout having failed to fire.
       #
-      # WINDOWS-2025's MARGIN CAP IS 9, NOT 6, AND THE CAUSE IS RUNNER VARIANCE RATHER THAN SUITE
-      # GROWTH. Every "cap" in this note means `webconsole_margin_cap`, which is what these four runs
-      # were measured against; it was spelled `webconsole_step_timeout` when the note was written,
-      # because that one variable was then both the ruler and the wall. The numbers are untouched.
+      # WINDOWS-2025's MARGIN CAP WENT FROM 6 TO 9, AND THE CAUSE WAS RUNNER VARIANCE RATHER THAN SUITE
+      # GROWTH. It is 8 now: the BACKLOG #1842 re-derivation under "THE MARGIN CAPS ARE RE-DERIVED"
+      # below re-sized it on a post-xdist pool. This paragraph is the 2026-09-13 reasoning for 9, kept
+      # as a record. Every "cap" in this note means `webconsole_margin_cap`, which is what these four
+      # runs were measured against; it was spelled `webconsole_step_timeout` when the note was
+      # written, because that one variable was then both the ruler and the wall. The numbers are
+      # untouched.
       # Re-derived 2026-09-13, after the margin gate EVICTED PR 1097 from the merge queue. Four
       # windows-2025 runs of the SAME 497-test suite, inside one hour:
       #
@@ -1279,17 +1282,18 @@ jobs:
       # BEFORE the kill. Splitting the two makes that true with room: the gate still reds at
       # margin_cap / 1.30, which now sits well under the wall instead of on it.
       #
-      # THE MARGIN CAPS ARE UNCHANGED AND ARE NOT SIZED BY *THIS* CHANGE -- the DECOUPLING -- at 5 / 6
-      # / 9, exactly the values that were in force as `webconsole_step_timeout`. Sizing them honestly
+      # THE MARGIN CAPS WERE LEFT UNCHANGED BY *THAT* CHANGE -- the DECOUPLING -- at 5 / 6 / 9,
+      # exactly the values then in force as `webconsole_step_timeout`. Sizing them honestly
       # needs a sample collected under a kill that does not truncate it. Shipping a decoupling and a
       # re-size together would bury the one change that can be reasoned about, so the re-size is
       # deliberately a later, separate change with its own measurement.
       #
-      # THE CAPS ARE STILL 5 / 6 / 9 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
-      # "THE MARGIN CAPS ARE RE-DERIVED". BACKLOG #1879 did the re-derivation this paragraph defers and
-      # came back "unchanged", so the two notes agree; they are 50 lines apart and could be read as
-      # contradicting, which is the only reason this pointer exists. Do not restate the arithmetic
-      # here -- one copy, per SDS-3.5.
+      # THE CAPS ARE NOW 5 / 6 / 8 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
+      # "THE MARGIN CAPS ARE RE-DERIVED". BACKLOG #1879 did the first re-derivation this paragraph
+      # defers and came back "unchanged". BACKLOG #1842 did the second, on the first hosted pool taken
+      # under xdist, and moved windows-2025 from 9 to 8. The notes are 50 lines apart and could be
+      # read as contradicting, which is the only reason this pointer exists. Do not restate the
+      # arithmetic here -- one copy, per SDS-3.5.
       #
       # THAT SAMPLE NOW EXISTS, and this paragraph's next clause used to deny it: it said such a sample
       # "does not exist yet and cannot exist until this arrangement has been live for a while". The
@@ -1317,7 +1321,8 @@ jobs:
       # number until a warning stops. What it asks for is a cap derived from what the work takes. This cap
       # is derived from four measured runs and set so the OBSERVED WORST clears the floor, so it is the
       # second. The detector is not disarmed either: at 9:00 it warns again above 6:55, which is outside
-      # the entire observed range.
+      # the entire observed range. That 9 is 8 now, re-sized by BACKLOG #1842 below; at 8:00 the gate
+      # warns above 6:09.
       #
       # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 a green suite came within 35 seconds of being
       # KILLED, because the 6:00 that was then the margin cap was also the `timeout-minutes` -- the
@@ -1340,17 +1345,18 @@ jobs:
       # 7:38 on 2026-09-22, nine days later. Not necessarily its FIRST: the pool above is twelve hours
       # wide, so it can date a breach and cannot date the earliest one.
       #
-      # THE MARGIN CAPS ARE RE-DERIVED AND THE RE-DERIVATION CAME BACK "UNCHANGED" -- 5 / 6 / 9, and
-      # saying that out loud is the point of this paragraph. A cap that nobody moved and a cap that was
-      # checked and found right look identical in a diff, so here is the arithmetic. Each cap divided by
-      # the 1.30x floor gives the longest the step may take on that leg, set beside the WORST SERIAL run
-      # in the 66-observation pool above:
+      # THE MARGIN CAPS ARE RE-DERIVED, TWICE. The first re-derivation came back "UNCHANGED" -- 5 / 6 /
+      # 9 -- and saying so out loud is the point of the next few paragraphs. The second, BACKLOG #1842,
+      # moved windows-2025 to 8; it is the group headed "THE SECOND RE-DERIVATION" below. A cap that
+      # nobody moved and a cap that was checked and found right look identical in a diff, so here is
+      # the first one's arithmetic. Each cap divided by the 1.30x floor gives the longest the step may
+      # take on that leg, set beside the WORST SERIAL run in the 66-observation pool above:
       #
       #   ubuntu-latest   5:00 / 1.30 = 3:51   worst serial 3:43   already clears with no speedup
       #   windows-2022    6:00 / 1.30 = 4:37   worst serial 4:53   needs 1.058x
       #   windows-2025    9:00 / 1.30 = 6:55   worst serial 7:38   needs 1.103x
       #
-      # So the caps as they stand bet that xdist delivers 1.06x and 1.10x on the two breaching legs.
+      # So the caps as they then stood bet that xdist delivers 1.06x and 1.10x on the two breaching legs.
       # Measured locally at 1.563x under this step's own flags. A bet that small against a margin that
       # large is the whole argument for leaving the numbers alone, and it is falsifiable: if either leg
       # still reds after this lands, the bet was wrong and the number, not the reasoning, is the fix.
@@ -1361,17 +1367,75 @@ jobs:
       # are not evidence; a hosted leg landing materially above them means the contention penalty is
       # real and the re-derivation below matters sooner.
       #
-      # WHY THE CAPS ARE NOT LOWERED, WHICH IS THE OTHER HALF OF "RE-DERIVED". Sizing them at 1.30x a
-      # PROJECTED post-xdist time would need a hosted post-xdist sample, and none exists -- this change
-      # creates the first one. Projecting the local 1.861x onto a 4-vCPU runner and sizing from it is
-      # precisely the move that reds the gate on the first merge group if the hosted ratio comes in at
-      # 1.15x, which is the harm being fixed rather than a cost of fixing it. The honest cost of waiting
-      # is named instead of hidden: until the caps come down, the gate tolerates roughly another
-      # doubling before it speaks, and at the growth rate above that is about a quarter of cover.
+      # WHY THE CAPS WERE NOT LOWERED THEN, WHICH IS THE OTHER HALF OF "RE-DERIVED". Written before any
+      # hosted post-xdist sample existed; that sample is the second re-derivation below. Sizing them at
+      # 1.30x a PROJECTED post-xdist time would need a hosted post-xdist sample, and none existed --
+      # that change created the first one. Projecting the local 1.861x onto a 4-vCPU runner and sizing
+      # from it is precisely the move that reds the gate on the first merge group if the hosted ratio
+      # comes in at 1.15x, which is the harm being fixed rather than a cost of fixing it.
       #
       # RE-DERIVING THEM LATER NEEDS NO NEW INSTRUMENT. The pool above was collected from the jobs API
       # by keying on this step's name and its OWN conclusion, per leg; repeat that once a few dozen
       # post-xdist merge_group runs exist, take each leg's worst PASSING run, and size at 1.30x it.
+      # CORRECTED 2026-09-26: read literally, "1.30x it" puts the worst run ON the gate's floor. The
+      # rule the second re-derivation used is ceil_minute(1.35x the worst passing run). The 1.35
+      # multiple is #131's, per the engine sizing note above `step_timeout`; the BACKLOG #1842 row
+      # credits the rule to #344 and adds a 5:00 floor, which binds on no leg here.
+      #
+      # THE SECOND RE-DERIVATION, BACKLOG #1842, ON THE FIRST HOSTED POST-xdist POOL. It moved
+      # windows-2025 from 9 to 8 and left the other two alone. The pool's definition, n, min and median
+      # live ONCE, in the three web console rows of scripts/ci/step_margin_baseline.toml. The pool
+      # opens at the first run after PR 1415, which added `-n`. This note carries the sizing input and
+      # the evidence those rows do not:
+      #
+      #   leg             worst passing   x 1.35   cap
+      #   ubuntu-latest   3:13            4:21     5   unchanged
+      #   windows-2022    4:11            5:39     6   unchanged
+      #   windows-2025    5:24            7:17     8   was 9
+      #
+      # tests/test_ci_step_margin.py reads each cap and each recorded maximum, and fails unless the cap
+      # is exactly what this rule gives. So a re-measured row moves its cap in the same change, or CI
+      # says so. The same table at 1.30x rounds up to the same three caps.
+      #
+      # The pool is merge_group plus pull_request. merge_group alone has maxima 2:54 / 4:09 / 5:06,
+      # which would size windows-2025 at 7; the wider pool is used because its maximum is higher. push
+      # and workflow_dispatch runs in the same window executed this step only 7 times per leg, all
+      # under the rows, because a push that changes no code leaves the job unexpanded. The kills stay
+      # 9 / 10 / 12. Each is still at least 1.30x its cap, and the nesting table above sums the kills,
+      # so that table does not move.
+      #
+      # LOWERING windows-2025 TO 8 HAS A COST, AND IT IS TAKEN ON PURPOSE. At 9 the gate reds above
+      # 6:55; at 8 it reds above 6:09, 14 percent over the worst pooled run of 5:24. The rule leaves
+      # windows-2022 10 percent (4:37 over 4:11) and ubuntu 20 percent (3:51 over 3:13), so 8 puts
+      # windows-2025 between them. The rule keeps the ruler close to the work, so the gate speaks when
+      # the suite grows. Holding 9 would keep a cap that no run in this pool supports, which is the
+      # "bound derived from another bound" #344 closed. If windows-2025 starts ejecting merge groups
+      # at 8, re-measure; do not restore 9 by hand.
+      #
+      # THE POOL IS UNCENSORED ON EVIDENCE. No step in it concluded failure. Two were cancelled, and
+      # each for a cause unrelated to its duration. The ubuntu step stopped at 1:09 when its whole run
+      # was cancelled. The windows-2025 step stopped at 4:11 in run 35748255462, cancelled once a newer
+      # run on the same branch started four minutes after it. The other exclusions were skipped.
+      #
+      # THE GATE'S OWN STEP IS THE READING, AND IT HAS A CONTROL. The census also read each job's
+      # `Step margin -- web console suite` conclusion. Across every success row in the pool, at 5 / 6 /
+      # 9, it concluded failure zero times. The control is the same census before PR 1415, from PR
+      # 1398's merge: there that step failed 12 times on windows-2022 and 3 times on windows-2025, over
+      # about 140 rows per leg. So the zero is a reading, not a matcher that finds nothing.
+      #
+      # THE API DURATION AND THE GATE'S OWN CLOCK AGREE TO ABOUT A SECOND. The gate divides a
+      # mark-to-mark elapsed, which includes step transitions. In the pre-xdist half, windows-2022's
+      # slowest green was 4:36 and its fastest red 4:38, straddling the 4:37 red line.
+      #
+      # WHAT THIS MEANS FOR BACKLOG #1842. It was filed against windows-2022 at 5 of 30 merge_group
+      # runs red, and it proposed raising that cap to 7. xdist fixed the red first: that leg's worst
+      # run is now 4:11, 1.434x under 6:00. No run in the pool supports the raise.
+      #
+      # THE HOSTED RUNS CAME IN SLOWER THAN THE PROJECTION, AS IT WARNED THEY MIGHT. Medians, both
+      # sides from the one census, moved 3:20 -> 2:35, 4:20 -> 3:17 and 4:50 -> 3:35. That is 1.29x,
+      # 1.32x and 1.35x against the projected 1.563x, so the contention penalty on a 4-vCPU runner is
+      # real. Worst runs are not compared here: the projection's inputs came from a 66-row pool and
+      # this one holds about 300 rows per leg, and a maximum grows with the size of its sample.
       #
       # `matrix.pytest_workers` NOW FEEDS TWO SUITES, AND ITS OWN NOTE STILL CALLS IT THE ENGINE'S.
       # That note offers 2 as "the conservative rung" if engine timing tests start flaking. Taking that
@@ -1955,8 +2019,9 @@ jobs:
           # THE TWO MUST MOVE TOGETHER AND A TEST SAYS SO. Two copies of a coupled number is the drift
           # this repository has been bitten by repeatedly, so the coupling is asserted mechanically
           # rather than documented: tests/test_ci_step_margin.py reads BOTH out of these literals and
-          # requires kill >= 1.30x margin cap on every named leg, plus the nesting invariant, plus the
-          # leg names and their count. Raise one of the pair and that test names the other.
+          # requires, at least, kill >= 1.30x margin cap on every named leg, the nesting invariant, the
+          # leg names and their count, and each margin cap equal to ceil_minute(1.35x) its leg's row in
+          # scripts/ci/step_margin_baseline.toml. Move one number and that test names the others.
           # `pytest_workers` is the xdist worker count for the engine suite. It is a MATRIX knob rather
           # than a literal in the run body for the same reason every other per-leg number here is one:
           # the trial dispatches that size it are then a one-line edit, and a leg can differ from its
@@ -2023,7 +2088,7 @@ jobs:
           # they were split.
           U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_margin_cap":5,"webconsole_step_timeout":9,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":6,"webconsole_step_timeout":10,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":8,"webconsole_step_timeout":12,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
