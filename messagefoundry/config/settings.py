@@ -929,12 +929,6 @@ class ApiSettings(_Section):
     # HttpOnly session cookie CONFINED to /ui (the JSON API stays Authorization-header-only). Off a
     # loopback host it requires exposure_protected (see serve gate) — the UI is a stricter surface.
     serve_ui: bool = True
-    # ADR 0143 soft-degrade signal — INTERNAL plumbing, set by _desugar_security (NOT a user knob). True
-    # only when [security].serve_web_console was EXPLICITLY provided, so the serve path can tell an
-    # explicit serve_web_console=true (console package absent -> HARD refuse) from the default-on posture
-    # (package absent -> JSON-only serve + WARNING, never a start failure). Absent-[security] leaves it
-    # False = default-on.
-    serve_ui_explicit: bool = False
     # The browser-facing external origin of the /ui dashboard when it is reached OFF-loopback through a
     # reverse proxy that does NOT preserve the Host header (ADR 0065). The same-origin CSRF + CSWSH checks
     # normally compare the browser's Origin to the request Host; behind such a proxy the Host is the
@@ -4914,6 +4908,19 @@ class SecuritySettings(_Section):
         is unchanged."""
         return tuple(self.allowed_client_networks)
 
+    @property
+    def serve_web_console_explicit(self) -> bool:
+        """Whether ``serve_web_console`` was PROVIDED, at either value (BACKLOG #2000).
+
+        ``serve`` reads it to tell an explicit console request from the default-on posture; ADR 0143
+        says what each one does. Read from ``model_fields_set`` rather than stored, so only the
+        switch itself can set it. It replaced ``[api].serve_ui_explicit``, a field an operator could
+        write too. A plain property, so ``model_dump()`` is unchanged.
+
+        It holds for the model the loader validated. A copy rebuilt from ``model_dump()`` marks
+        every field set, so it reads True there."""
+        return "serve_web_console" in self.model_fields_set
+
 
 class ServiceSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")  # tolerate forward-looking/unknown sections
@@ -5234,6 +5241,14 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "[security].handles_real_patient_data under ADR 0118, and that key is retired too — delete "
         "this line"
     ),
+    # BACKLOG #2000. It was loader plumbing that an operator could also set, and setting it changed
+    # startup while [security] reported no choice. `serve` now reads the same fact from what
+    # [security] was given (SecuritySettings.serve_web_console_explicit), so nothing writes this key.
+    ("api", "serve_ui_explicit"): (
+        "it was an internal marker the loader set, never an operator setting (BACKLOG #2000). "
+        "Remove it from the config file, or unset MEFOR_API_SERVE_UI_EXPLICIT if the environment "
+        "sets it. To request the web console explicitly, set [security].serve_web_console"
+    ),
 }
 
 #: ``[security]`` key → ``(section, field)`` for the switches that map 1:1 onto a settable internal field.
@@ -5332,13 +5347,6 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
     for skey, section, field in _SECURITY_PASSTHROUGH:
         if skey in provided:
             _set(section, field, getattr(sec, skey))
-
-    # ADR 0143: mark serve_ui EXPLICITLY requested (serve_web_console was provided, at either value) so
-    # the serve path can tell an explicit serve_web_console=true (console package absent -> HARD refuse)
-    # from the default-on posture (package absent -> JSON-only + WARNING soft-degrade). Irrelevant when
-    # serve_web_console=false (serve_ui is then off — no console to degrade).
-    if "serve_web_console" in provided:
-        _set("api", "serve_ui_explicit", True)
 
     # Network host: local_access_only forces loopback; a contradictory non-loopback listen_address with
     # local_access_only=true REFUSES (AC-3) rather than silently overriding.

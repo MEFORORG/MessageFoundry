@@ -234,3 +234,23 @@ def test_serve_explicit_console_refuses_when_absent(
     )
     assert rc == 2
     assert "serve_web_console=true needs the web console package" in err
+
+
+@pytest.mark.parametrize("surface", ["file", "env"])
+def test_serve_refuses_operator_supplied_serve_ui_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    surface: str,
+) -> None:
+    """BACKLOG #2000: ``[api].serve_ui_explicit`` was loader plumbing. Before, setting it by hand
+    turned the default-on soft-degrade above into the explicit hard refuse, and the refusal named
+    ``[security].serve_web_console``, which the operator had not set. Now ``serve`` refuses the key
+    itself at load, naming it, and never reaches the console-package probe."""
+    toml = "api.serve_ui_explicit = true\n" if surface == "file" else ""
+    if surface == "env":
+        monkeypatch.setenv("MEFOR_API_SERVE_UI_EXPLICIT", "true")
+    rc, err = _serve_with_console_absent(tmp_path, monkeypatch, capsys, toml)
+    assert rc == 2
+    assert "[api].serve_ui_explicit was REMOVED" in err
+    assert "needs the web console package" not in err

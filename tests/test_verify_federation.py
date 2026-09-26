@@ -391,3 +391,148 @@ def test_a_disabled_mfa_gate_skips_its_rung_instead_of_passing_it(
     assert rows["fed.replay.mfa"].status is Status.SKIP
     assert "disabled" in rows["fed.replay.mfa"].detail.lower()
     assert rows["fed.replay.username"].status is Status.PASS  # the ladder still walked past it
+
+
+# --- BACKLOG #1923: the OIDC revocation refusal, reported before start ------------------------------
+#
+# fed.idp_tls fails a CRL file the engine refuses to LOAD. The engine has a second refusal on this hop:
+# an off-box leg that checks no revocation, under an enforcing posture (#1887). fed.idp_revocation
+# reads that guard's own decision per leg. The FAIL arm alone would pass against a row that always
+# fails, so the arms that do NOT fail are the half that proves it reads the right facts.
+
+_LOOPBACK_LEGS: dict[str, Any] = {
+    "oidc_token_endpoint": "https://127.0.0.1:8443/token",
+    "oidc_jwks_uri": "https://127.0.0.1:8443/jwks",
+    "oidc_allowed_endpoints": ["idp.example", "127.0.0.1"],
+}
+
+
+@pytest.fixture(scope="module")
+def bare_crl(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A fresh CRL with no certificate in the file: the shape harden_crl_check loads. Synthetic.
+    Local rather than imported from another test module, so the two suites stay independent."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.datetime.now(datetime.UTC)
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-1923-ca")]))
+        .last_update(now - datetime.timedelta(days=1))
+        .next_update(now + datetime.timedelta(days=30))
+        .sign(ec.generate_private_key(ec.SECP256R1()), hashes.SHA256())
+    )
+    path = tmp_path_factory.mktemp("crl1923") / "crl.pem"
+    path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+    return str(path)
+
+
+def _revocation_result(settings: ServiceSettings) -> CheckResult:
+    return _by_id(run_federation_checks(settings))["fed.idp_revocation"]
+
+
+def _warn(settings: ServiceSettings) -> ServiceSettings:
+    from messagefoundry.config.settings import SecurityEnforcement, SecuritySettings
+
+    return settings.model_copy(
+        update={"security": SecuritySettings(enforcement=SecurityEnforcement.WARN)}
+    )
+
+
+def test_an_off_box_idp_with_no_crl_fails_as_the_engine_would_refuse() -> None:
+    """The shipped default posture is enforce, and idp.example is off-box, so the engine refuses to
+    start. The row must say so in the engine's own words, name the lever for this hop, and name
+    BOTH legs: the engine stops at the first, but an operator who fixes only that one would learn
+    about the second on the next run."""
+    row = _revocation_result(_settings())
+    assert row.status is Status.FAIL
+    assert "refuses to start" in row.detail
+    assert "OIDC token endpoint" in row.detail
+    assert "OIDC JWKS endpoint" in row.detail
+    assert "[auth].oidc_tls_crl_file" in row.detail
+
+
+def test_auth_disabled_skips_because_the_engine_runs_no_guard() -> None:
+    """The lifespan builds the auth service, and so runs the guard, only when
+    [security].require_sign_in is true. A FAIL here would report a refusal the engine never makes."""
+    row = _revocation_result(_settings(enabled=False))
+    assert row.status is Status.SKIP
+    assert "[security].require_sign_in is false" in row.detail
+
+
+def test_on_box_legs_pass_because_the_engine_lets_them_cross() -> None:
+    row = _revocation_result(_settings(**_LOOPBACK_LEGS))
+    assert row.status is Status.PASS
+    assert row.detail.count("is on this host") == 2
+
+
+def test_an_off_box_jwks_leg_alone_still_fails() -> None:
+    """The legs are guarded one by one. A token leg on this host must not carry an off-box JWKS
+    leg across, so the row fails and names the JWKS cell."""
+    row = _revocation_result(
+        _settings(
+            oidc_token_endpoint="https://127.0.0.1:8443/token",
+            oidc_allowed_endpoints=["idp.example", "127.0.0.1"],
+        )
+    )
+    assert row.status is Status.FAIL
+    assert "OIDC JWKS endpoint" in row.detail
+
+
+def test_a_loaded_crl_is_manual_because_its_coverage_cannot_be_read(bare_crl: str) -> None:
+    """The engine lets both legs cross on a loaded CRL. Whether that CRL covers each leg's CA is
+    not knowable offline (BACKLOG #1925): this CRL covers neither leg, and a PASS would hide that
+    every login would then fail. So a person must confirm it."""
+    row = _revocation_result(_settings(oidc_tls_crl_file=bare_crl))
+    assert row.status is Status.MANUAL
+    assert row.detail.count("against [auth].oidc_tls_crl_file") == 2
+    # BACKLOG #1925: a PASS on a loaded CRL must not read as "each leg's CA is covered".
+    assert row.detail.count("unable to get certificate CRL") == 2
+
+
+def test_a_warn_posture_is_manual_and_logs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under warn the engine starts, so FAIL would be wrong. The off-box legs still cross with no
+    revocation check, so PASS would be wrong too. The row reads the decision without acting on it,
+    so the engine's warning is not added to the verify output."""
+    from messagefoundry.config import tls_policy
+
+    # Recorded on the module logger, not through caplog: see _record_guard_warnings in
+    # tests/test_hop_refusal_revocation.py for why caplog is not used for this logger.
+    warned: list[str] = []
+    monkeypatch.setattr(
+        tls_policy.logger, "warning", lambda msg, *args: warned.append(msg % args if args else msg)
+    )
+    row = _revocation_result(_warn(_settings()))
+    assert row.status is Status.MANUAL
+    assert row.detail.count("NO certificate revocation checking") == 2
+    assert warned == []
+
+
+def test_on_box_legs_under_warn_still_pass() -> None:
+    """The engine allows on-box legs at any posture. A row that keyed on the posture alone would
+    call these MANUAL and tell the operator an off-box leg exists."""
+    row = _revocation_result(_warn(_settings(**_LOOPBACK_LEGS)))
+    assert row.status is Status.PASS
+
+
+def test_the_blanket_env_under_warn_is_manual_not_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The blanket attestation lets a non-enforcing leg cross silently. It is still a leg with no
+    revocation check, so a person must confirm it."""
+    from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV
+
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    row = _revocation_result(_warn(_settings()))
+    assert row.status is Status.MANUAL
+
+
+def test_a_context_that_does_not_build_skips_the_revocation_row(tmp_path: Path) -> None:
+    rows = _by_id(
+        run_federation_checks(_settings(oidc_tls_ca_cert_file=str(tmp_path / "nope.pem")))
+    )
+    assert rows["fed.idp_tls"].status is Status.FAIL
+    assert rows["fed.idp_revocation"].status is Status.SKIP
+    assert "fed.idp_tls" in rows["fed.idp_revocation"].detail

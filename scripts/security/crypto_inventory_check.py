@@ -719,6 +719,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/ai_broker.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/database.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/http_auth.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # BACKLOG #1923: the fed.idp_revocation row reads the OIDC legs' revocation-guard decisions
+    # (HopDisposition, is_loopback_hop_host) and catches the engine's InsecureHopRefused. It builds
+    # no context of its own; the opener it reads is the one fed.idp_tls built.
+    "messagefoundry/verify/federation.py": frozenset({"messagefoundry.config.tls_policy"}),
 }
 
 # --------------------------------------------------------------------------------------------
