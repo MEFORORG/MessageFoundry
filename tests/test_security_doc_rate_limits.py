@@ -1016,20 +1016,43 @@ def _console_sources() -> dict[str, str]:
     }
 
 
-def _charges(tree: ast.AST, limiter: str) -> bool:
-    """Whether ``tree`` calls ``limiter`` directly, or looks it up with ``getattr(x, "<limiter>")``.
+def _parse_src(src: str) -> ast.Module:
+    """``ast.parse`` that tolerates a leading UTF-8 BOM, which ``read_text("utf-8")`` keeps."""
+    return ast.parse(src.removeprefix("﻿"))
 
-    The second form is how ``_auth.py`` already reaches ``allow_reauth_attempt`` across the
-    engine/console wheel skew, so a call walk that missed it would read a real charge as absent.
+
+def _charges(tree: ast.AST, limiter: str) -> bool:
+    """Whether ``tree`` calls ``limiter``: directly, or through a ``getattr(x, "<limiter>")``
+    lookup whose result is called, either in place or after binding it to a name.
+
+    The lookup form is how ``_auth.py`` already reaches ``allow_reauth_attempt`` across the
+    engine/console wheel skew. A lookup that is never called charges nothing. The bound-name case
+    is not scope-aware: a call to that name anywhere in ``tree`` counts.
     """
     if calls_to(tree, {limiter}):
         return True
-    return any(
-        len(call.args) >= 2
+    lookups = {
+        id(call)
+        for call in call_sites(tree, "getattr", bare_only=True)
+        if len(call.args) >= 2
         and isinstance(call.args[1], ast.Constant)
         and call.args[1].value == limiter
-        for call in call_sites(tree, "getattr", bare_only=True)
-    )
+    }
+    if not lookups:
+        return False
+    nodes = list(ast.walk(tree))
+    if any(isinstance(node, ast.Call) and id(node.func) in lookups for node in nodes):
+        return True
+    bound = {
+        target.id
+        for node in nodes
+        if isinstance(node, ast.Assign | ast.AnnAssign)
+        and node.value is not None
+        and id(node.value) in lookups
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Name)
+    }
+    return bool(bound and calls_to(tree, bound, bare_only=True))
 
 
 def _console_charges_admin_write(sources: dict[str, str]) -> bool:
@@ -1042,7 +1065,7 @@ def _console_charges_admin_write(sources: dict[str, str]) -> bool:
     pre-filter: a module that never names the limiter cannot call it, so it is not parsed.
     """
     return any(
-        "allow_admin_write" in src and _charges(ast.parse(src), "allow_admin_write")
+        "allow_admin_write" in src and _charges(_parse_src(src), "allow_admin_write")
         for src in sources.values()
     )
 
@@ -1062,22 +1085,49 @@ def test_console_charge_probe_can_fail() -> None:
     assert _console_charges_admin_write(
         {"getattr.py": "def f(auth):\n    return getattr(auth, 'allow_admin_write')('u')\n"}
     )
+    assert _console_charges_admin_write(
+        {
+            "bound.py": "def f(auth):\n"
+            "    gate = getattr(auth, 'allow_admin_write', None)\n"
+            "    return gate('u')\n"
+        }
+    )
+    # A lookup that is never called charges nothing.
+    assert not _console_charges_admin_write(
+        {"lookup.py": "def f(auth):\n    gate = getattr(auth, 'allow_admin_write', None)\n"}
+    )
+    assert not _console_charges_admin_write(
+        {"bare.py": "def f(auth):\n    getattr(auth, 'allow_admin_write')\n"}
+    )
+    assert _console_charges_admin_write(
+        {"bom.py": "﻿def f(auth):\n    return auth.allow_admin_write('u')\n"}
+    )
 
     real = _console_sources()
     call = "auth.allow_admin_write(identity.user_id)"
     if call not in real[_CONSOLE_AUTH_KEY]:
-        # The console stopped charging, or moved the call. The gap guard below governs that
-        # state, so this half has nothing to mutate; the snippet half above still ran.
+        if _console_charges_admin_write(real):
+            pytest.fail(
+                f"the console still charges allow_admin_write, but not as `{call}` in "
+                f"{_CONSOLE_AUTH_KEY}; re-aim this mutation rather than letting it skip"
+            )
+        # The console charges nothing: the gap guard below governs that state, so there is no
+        # call to delete. The snippet half above still ran.
         return
     assert _console_charges_admin_write(real)
-    mutated = {
-        **real,
-        _CONSOLE_AUTH_KEY: real[_CONSOLE_AUTH_KEY].replace(call, "True"),
-        "planted.py": "# allow_admin_write is named here and never called\n",
-    }
+    mutated = {**real, _CONSOLE_AUTH_KEY: real[_CONSOLE_AUTH_KEY].replace(call, "True")}
     assert not _console_charges_admin_write(mutated), "the probe survived deleting the call"
-    assert any("allow_admin_write" in src for src in mutated.values()), (
-        "control: the substring scan this replaced would still have reported a charge here"
+    assert not _console_charges_admin_write(
+        {**mutated, "planted.py": "# allow_admin_write is named here and never called\n"}
+    ), "the probe counted a planted comment as a charge"
+    # The control, on the UNPLANTED tree: a real mention outlives the deleted call, so the substring
+    # scan this replaced would still have reported a charge. Today that mention is the comment on
+    # `ui_logout` in routes/core.py. If it goes, this reds: re-aim the control at a mention that
+    # still exists, rather than planting one, because a planted mention proves nothing here.
+    survivors = sorted(key for key, src in mutated.items() if "allow_admin_write" in src)
+    assert survivors, (
+        "control: no mention of allow_admin_write survives the deleted call, so this tree no "
+        "longer shows the substring scan's blindness"
     )
 
 
@@ -1098,7 +1148,7 @@ def _ui_refusal(src: str, limiter: str) -> tuple[str, bool] | None:
     The branch is the one ``if`` whose test calls ``limiter``. None when there is no such branch;
     more than one reds, so a second charge site is never read silently in place of the first.
     """
-    func = named_func(ast.parse(src), "require_ui")
+    func = named_func(_parse_src(src), "require_ui")
     branches = [
         node
         for node in ast.walk(func)
@@ -1126,8 +1176,12 @@ def test_ui_refusal_reader_can_fail() -> None:
     src = _CONSOLE_AUTH.read_text(encoding="utf-8")
     charge = "if not auth.allow_admin_write(identity.user_id):\n"
     baseline = _ui_refusal(src, "allow_admin_write")
-    if baseline is None or src.count(charge) != 1:
-        pytest.fail(f"require_ui's admin-write branch moved; re-aim this mutation at {charge!r}")
+    if baseline is None:
+        # require_ui charges no admin-write floor. That state is supported: the doc pin below
+        # then demands the paragraph be absent, and there is no branch here to mutate.
+        return
+    if src.count(charge) != 1:
+        pytest.fail(f"require_ui still has an admin-write branch, but not as {charge!r}; re-aim")
     head, tail = src.split(charge, 1)
     # One level inside the `if`, whatever the `if` is indented by.
     indent = " " * (len(head) - len(head.rstrip(" ")) + 4)
