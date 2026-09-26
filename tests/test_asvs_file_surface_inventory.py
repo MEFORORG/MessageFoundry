@@ -67,6 +67,7 @@ from messagefoundry.parsing.x12.delimiters import DEFAULT_MAX_INTERCHANGE_BYTES
 from messagefoundry.pipeline import dr_backup, dryrun
 from messagefoundry.transports.base import _SOURCES, DEFAULT_MAX_ITEMS_PER_POLL
 from messagefoundry.transports.bounded_read import DEFAULT_MAX_RESPONSE_BYTES
+from messagefoundry.transports.database import DEFAULT_DB_LOOKUP_MAX_ROWS
 from messagefoundry.transports.dicom import DEFAULT_MAX_OBJECT_BYTES
 from messagefoundry.transports.file import DEFAULT_MAX_DECOMPRESSED_BYTES, DEFAULT_MAX_FILE_BYTES
 from messagefoundry.transports.http_listener import DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_HEADER_BYTES
@@ -184,13 +185,15 @@ def unbounded_decoders(
     receivers: dict[str, list[ast.Call]], root: Path, cap_name: str = "DEFAULT_MAX_FRAME_BYTES"
 ) -> list[str]:
     """Receivers with an ``MLLPDecoder`` built without ``max_frame_bytes=`` (or with it ``None``),
-    or whose file does not import ``cap_name`` from ``messagefoundry.transports.mllp`` and use it in
+    or whose file does not import ``cap_name`` from ``messagefoundry.mllpcodec`` and use it in
     that unit. A cap read from a setting that defaults to ``cap_name`` passes: the check is on the
-    default, and a site may raise it as the engine's own setting may."""
+    default, and a site may raise it as the engine's own setting may. The module is the client-
+    importable leaf, not ``transports.mllp``: a harness file may not import ``transports`` (BACKLOG
+    #1697, enforced in ``tests/test_dependency_boundaries.py``)."""
     bad: list[str] = []
     for key, decoders in receivers.items():
         file, unit = key.split("::")
-        if not _imports_and_uses(root / file, unit, "messagefoundry.transports.mllp", cap_name):
+        if not _imports_and_uses(root / file, unit, "messagefoundry.mllpcodec", cap_name):
             bad.append(f"{key} (does not bound at {cap_name})")
         for call in decoders:
             cap = next((k.value for k in call.keywords if k.arg == "max_frame_bytes"), None)
@@ -746,6 +749,7 @@ QUOTED_CONSTANTS: dict[str, int] = {
     "DEFAULT_MAX_ITEMS_PER_POLL": DEFAULT_MAX_ITEMS_PER_POLL,
     "DEFAULT_MAX_MESSAGE_BYTES": DEFAULT_MAX_MESSAGE_BYTES,
     "DEFAULT_MAX_RESPONSE_BYTES": DEFAULT_MAX_RESPONSE_BYTES,
+    "DEFAULT_DB_LOOKUP_MAX_ROWS": DEFAULT_DB_LOOKUP_MAX_ROWS,
     "_MAX_REQUEST_BODY_BYTES": api_app._MAX_REQUEST_BODY_BYTES,
     "MAX_EXPORT_IDS": MAX_EXPORT_IDS,
     "_MAX_RESTORE_MEMBER_BYTES": dr_backup._MAX_RESTORE_MEMBER_BYTES,
@@ -925,7 +929,7 @@ def test_self_test_a_harness_receiver_is_found_and_an_unbounded_one_flagged(tmp_
     src = tmp_path / "harness"
     src.mkdir()
     (src / "rx.py").write_text(
-        "from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder\n"
+        "from messagefoundry.mllpcodec import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder\n"
         "class Bounded:\n"
         "    async def start(self):\n        await asyncio.start_server(self.on, 'h', 0)\n"
         "    def on(self):\n        return MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)\n"

@@ -215,6 +215,7 @@ def _loosening_names(audit_chain_unkeyed: bool | None) -> set[str]:
             (),
             (),
             (),
+            (),
             None,
             audit_chain_unkeyed,
         )

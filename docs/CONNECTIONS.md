@@ -825,7 +825,7 @@ figure stops matching the constant named beside it.
 | `remotefile`: SFTP or FTP drop directory, `Sftp(...)` / `Ftp(...)` ([Remote file](#remote-file--sftp--ftp)) | as for `file` | chosen by `pattern` (default `*.hl7`) | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB, charged against the listed size and again against the bytes read | no unpacking on intake; the connector has no `decompress` setting |
 | `dimse`: DICOM C-STORE SCP, an inbound `DICOM(...)`; its size, peer and TLS settings are under [DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025) | DICOM objects in the SCP's accepted presentation contexts | not applicable; objects arrive over DIMSE | `max_object_bytes`, default `DEFAULT_MAX_OBJECT_BYTES` = 128 MiB (`transports/dicom.py`), charged before decode | a Deflated Explicit VR LE object is inflated in bounded memory before decode, capped at `max_object_bytes`. Setting `max_object_bytes` to `0` or `None` removes the object cap and drops this inflate cap to `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB |
 | `http`: web-service listener, `Http(...)` ([HTTP](#http-web-service-listener--http-inbound-only-adr-0023)) | the inbound's declared `content_type` | not applicable; a request body | `max_body_bytes`, default `DEFAULT_MAX_BODY_BYTES` = 16 MiB (`transports/http_listener.py`); headers `DEFAULT_MAX_HEADER_BYTES` = 64 KiB | no unpacking on intake. The listener decodes no `Content-Encoding` and no transfer coding. It refuses a body whose `Transfer-Encoding` is exactly `chunked`, and reads any other body as sent, up to the cap |
-| `mllp`: MLLP listener ([MLLP](#mllp--mllp)) | the inbound's declared `content_type` (default `hl7v2`) | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB (`transports/mllp.py`) | no unpacking on intake |
+| `mllp`: MLLP listener ([MLLP](#mllp--mllp)) | the inbound's declared `content_type` (default `hl7v2`) | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB (`mllpcodec.py`) | no unpacking on intake |
 | `tcp`: raw TCP listener ([Raw TCP](#raw-tcp--tcp)) | the inbound's declared `content_type` | not applicable; a framed stream | `max_frame_bytes`, default `DEFAULT_MAX_FRAME_BYTES` = 16 MiB | no unpacking on intake |
 | `x12`: X12 EDI listener ([X12 EDI](#x12-edi--x12)) | X12 interchanges | not applicable; a framed stream | `max_interchange_bytes`, default `DEFAULT_MAX_INTERCHANGE_BYTES` = 16 MiB (`parsing/x12/delimiters.py`) | no unpacking on intake |
 | `database`: database poller, `DatabasePoll(...)` ([Database source](#database-source--databasepoll)) | rows from `poll_statement`, each handed on as one body in the declared `content_type` | not applicable; table rows | no byte cap of its own; the engine's per-message ceiling below rejects an oversized row after it is read; `poll_max_rows`, default `DEFAULT_MAX_ITEMS_PER_POLL` = 500, bounds rows per poll | no unpacking on intake |
@@ -872,8 +872,10 @@ row only. The two export rows are made safe as their own row says.
 - A Handler's live lookup result is data it reads to shape its output, not content the product keeps
   as a message ([ADR 0010](adr/0010-handler-callable-db-lookup.md),
   [ADR 0043](adr/0043-fhir-read-lookup.md)). `fhir_lookup` reads are capped at
-  `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB. `db_lookup` returns every row its statement selects, and the
-  engine sets no row cap, so the Handler's statement is the bound.
+  `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB. `db_lookup` reads are capped at `max_rows` rows per call,
+  default `DEFAULT_DB_LOOKUP_MAX_ROWS` = 500, charged at the fetch. A larger result fails the lookup
+  rather than being truncated. There is no byte cap, so a row's own width is still the statement's
+  bound.
 - `/ui/static` serves first-party assets that ship in the package. `AllowlistedStaticFiles` serves
   only `ALLOWED_STATIC_EXTENSIONS` (`.css`, `.js`), and it sends no `Content-Disposition`.
 - The API routes not listed above that take a body are treated as parameter routes, capped by
@@ -1379,6 +1381,23 @@ reads through a stored procedure — which this gate refuses anyway.
 > database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
 > a credential the operator configures per connection.
 
+#### A lookup that selects too many rows fails the message
+
+Each `DatabaseLookup(...)` takes `max_rows`, default `500`. A `db_lookup` call whose statement selects
+more rows than that raises `DbLookupError`, and the Handler's message goes to `ERROR` like any other
+lookup failure. The engine never hands the Handler a truncated result, because a Handler shaping a
+message from the first 500 rows of a larger set would be wrong with nothing to say so.
+
+The ceiling is charged at the fetch (BACKLOG #1730). The executor asks the driver for at most
+`max_rows + 1` rows, so a broad predicate is refused with at most one row past the ceiling held in the
+transform worker, not the whole result set. The driver may still spend time discarding the unread rows
+when the cursor closes. The error names the connection and the ceiling, never the statement or a row.
+
+A lookup that shapes one message rarely needs more than a handful of rows. If a feed needs a large
+table, a synced `Reference(...)` is the better fit. `max_rows=0` removes the ceiling. A negative
+or fractional value stops `serve` building the lookup. `messagefoundry check` refuses it in its build
+leg, which runs when the config has a `messagefoundry.toml`. The ceiling counts rows, not bytes.
+
 #### Static credentials on every backend hop
 
 ASVS 13.2.1 asks that every backend hop authenticate with an individual service account, a short-term
@@ -1394,8 +1413,7 @@ Three surfaces read that one list, so they cannot disagree:
 - `GET /security/posture` returns it as `static_credential_hops`, one entry per hop.
 - `serve` refuses on it, but only when you turn the refusal on.
 
-The list covers the hops named in the table below. It is not a promise about hops added later, or
-about plugin connector types.
+The list covers the hops named in the table below. It is not a promise about hops added later.
 
 **The refusal ships off.** Set `[security].require_nonstatic_credentials = true` to turn it on. `serve`
 then refuses to start while any listed hop has no opt-out. To keep a hop, name it with a reason:
@@ -1968,7 +1986,7 @@ a generic partner — the `RS384` default below is SMART's own requirement, not 
 | `key_id` | `None` | the JWT `kid` → the public key registered with the server (for rotation) |
 | `audience` | = `token_url` | the assertion `aud`, if the server documents a different audience |
 | `private_key_password` | `None` | passphrase for an encrypted key (secret — use `env()`) |
-| `expiry_skew_seconds` | `60` | re-mint this many seconds before the server's stated expiry |
+| `expiry_skew_seconds` | `60` | re-mint this many seconds before the server's stated expiry. The engine caches a token for at most one hour after this skew, whatever `expires_in` says |
 
 ```python
 from messagefoundry import FHIR, env, outbound
@@ -2959,7 +2977,7 @@ reading this page already applies to a file the scan never opened.
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
-| DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
+| DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings); a `db_lookup` call fetches at most `max_rows` (500) plus one, and [refuses a larger result](#a-lookup-that-selects-too-many-rows-fails-the-message) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
 | Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | a borrow that cannot be satisfied within `DatabaseRef(acquire_timeout=…)` (default 30 s) raises `StoreAcquireTimeout`, failing that set's sync | the sync task is isolated per reference set; the previous snapshot keeps serving reads and the AlertSink fires. The bound also keeps one wedged source from stalling the sequential pass over the other sets |
 | Internal sources — Timer / Loopback / PassThrough | n/a — they open no socket and reach no external system | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn's own defaults (no `limit_concurrency` / `timeout_keep_alive` is passed); per-actor 429 throttles bound abuse: login 10 per IP and 60 global per 60 s, PHI reads 120 per actor per 60 s, admin writes 12 per actor per second | over a throttle the request gets `429` and an audit row; the connection stays usable | the caller backs off; the window rolls |
@@ -2972,8 +2990,8 @@ reading this page already applies to a file the scan never opened.
 | Kerberos / SPNEGO SSO (`kerberos_spn`) | no engine socket — one SPNEGO server step per login against the OS provider | the OS provider's own limits apply | a failed step is an audited login reject; a boot preflight degrades SSO legibly when no provider exists |
 | OIDC IdP — token endpoint (`oidc_token_endpoint`) | one POST per login, bounded by the login rate limiter | the IdP's own limit surfaces as an HTTP error | the login fails closed; the user retries |
 | OIDC IdP — JWKS fetch (`oidc_jwks_uri`) | one GET per cache miss, bounded by `oidc_jwks_ttl_seconds` (3600) and the amplification floor `oidc_jwks_min_refetch_seconds` (300) | a refetch inside the floor is not made; the cached key set is used | a fetch failure fails the verification closed |
-| SMART token endpoint (`smart_token_url`) | one POST per token mint; the token is cached until expiry minus `smart_expiry_skew_seconds` | the delivery fails and re-queues | re-minted on the next attempt or on a `401` via `invalidate()` |
-| OAuth2 token endpoint (`oauth2_token_url`) | one POST per token mint, cached the same way | the delivery fails and re-queues | re-minted on the next attempt or on a `401` |
+| SMART token endpoint (`smart_token_url`) | one POST per token mint; the token is cached until expiry minus `smart_expiry_skew_seconds`, for at most one hour | the delivery fails and re-queues | re-minted on the next attempt or on a `401` via `invalidate()` |
+| OAuth2 token endpoint (`oauth2_token_url`) | one POST per token mint, cached until expiry minus its skew, with no one-hour ceiling | the delivery fails and re-queues | re-minted on the next attempt or on a `401` |
 | AI broker (`[ai].endpoint`) | one POST per assist request; bounded at the API route by the `ai:assist` RBAC gate, the fail-closed `[ai].allowed_endpoints` SSRF allow-list and the 60 s per-request timeout. **There is NO per-actor pacing on `POST /ai/chat`** — it depends on plain `require(Permission.AI_ASSIST)`, not `require_paced`/`require_step_up`, so a holder of `ai:assist` can loop assist POSTs unthrottled | the LLM's own 429/503 surfaces as an `AiBrokerError` → HTTP `502` to the caller | the assist call fails; nothing is queued or retried |
 | DR backup destination (`[backup].destination`, ADR 0049) | **one writer** — leader-gated under `[cluster].enabled`, so exactly one node writes the shared destination; once per `schedule_at` pass plus any on-demand run. No engine-side cap: the OS/SMB redirector queues | a slow or full destination stretches the run; nothing is dropped and the next scheduled pass still fires | a failed or verify-failed run is logged + audited and is **never** counted as a good backup when pruning to `retention_keep` |
 | Vault Transit — store DEK unwrap (`MEFOR_STORE_VAULT_ADDR`, `[store].key_provider = vault`, ADR 0019) | one HTTPS request per DEK unwrap (startup / rotation), not per message | a failure is fail-closed — the store does not open | operator fixes Vault and restarts |
@@ -2991,7 +3009,7 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset` | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |

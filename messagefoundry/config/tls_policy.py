@@ -90,6 +90,7 @@ __all__ = [
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
+    "log_revocation_attestation",
     "kex_groups_report",
     "APPROVED_TLS12_SUITES",
     "narrow_to_approved_suites",
@@ -1394,18 +1395,67 @@ def cleartext_acceptance_audit_sink(
 
     The marker is deliberately **lower-case**: the PHI redaction filter (``redaction._NAME_RUN``) treats
     two or more adjacent ALL-CAPS tokens as a possible name run and replaces them with ``[redacted]``,
-    so a shouted marker would be scrubbed out of the very record it exists to make findable."""
+    so a shouted marker would be scrubbed out of the very record it exists to make findable. The name
+    is rendered by :func:`_audit_connection`, which says why it is quoted."""
 
     def _record(detail: str) -> None:
         logger.warning(
-            "cleartext hop crossed on an operator acceptance — connection %s: %s "
+            "cleartext hop crossed on an operator acceptance — connection %s; %s "
             "(cleartext_accepted; reason: %s)",
-            connection or "(unnamed)",
+            _audit_connection(connection),
             detail,
             reason or "(none provided)",
         )
 
     return _record
+
+
+def _audit_connection(connection: str | None) -> str:
+    """Render a declaring connection's name for an audit record, or ``(unnamed)`` for a hop that is not
+    a connection (or an empty name).
+
+    It goes at the FRONT of the record: the detail after it runs to several hundred characters, and a
+    relay or SIEM that truncates a long line would otherwise cut the name first.
+
+    Quoted with ``repr`` so a control character in a code-first name is escaped, not passed raw to a
+    handler that lacks the control-character scrub.
+
+    **Callers must not follow the name with ``:`` or ``=``.** ``CredentialScrubFilter`` reads
+    ``LABEL: value`` as a credential pair when the label ends in a credential word, and it allows a
+    quote between the two. So ``connection 'IB_LAB_PASS': MLLP inbound`` ships as
+    ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``.
+    Inbound and outbound names cannot reach that shape: registration refuses any name outside
+    ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space, ``:`` or
+    ``=``. A name that does not pass registration can still be scrubbed. That includes at least a
+    ``FhirLookup`` name, which its read hop and SMART token hop both render, and a raw
+    ``cleartext_connection`` key in a lookup's settings."""
+    return repr(connection) if connection else "(unnamed)"
+
+
+def log_revocation_attestation(
+    log: logging.Logger,
+    *,
+    crossing: str,
+    connection: str | None,
+    detail: str,
+    reason: str | None,
+    declaration: str = "tls_revocation_attested",
+) -> None:
+    """Record one hop that crossed an enforcing revocation refusal on an operator declaration (ADR 0173).
+
+    The ONE record builder for both directions: :meth:`RevocationHopGuard.enforce_construction` for a
+    verifying outbound hop and ``check_inbound_revocation`` for an mTLS listener, so the two halves
+    cannot drift apart. Why the record names its connection, why the marker is lower-case, and why
+    ``reason`` is a logging parameter are all stated once, on :func:`cleartext_acceptance_audit_sink`,
+    and hold here unchanged."""
+    log.warning(
+        "%s on operator attestation — connection %s; %s (%s; reason: %s)",
+        crossing,
+        _audit_connection(connection),
+        detail,
+        declaration,
+        reason or "(none provided)",
+    )
 
 
 #: The instance posture in force during connector construction. Stamped by the construction gate
@@ -1624,6 +1674,9 @@ class RevocationHopGuard:
     #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
     #: a hop that carries no per-connection attestation.
     attested_reason: str | None = None
+    #: The declaring connection's name, recorded in the same audit line so an auditor can trace the
+    #: crossing to the declaration to fix. ``None`` for a hop that is not a connection.
+    connection: str | None = None
 
     @classmethod
     def capture(
@@ -1638,6 +1691,7 @@ class RevocationHopGuard:
         posture: HopPosture | None = None,
         ways_across: str | None = None,
         attested_reason: str | None = None,
+        connection: str | None = None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -1672,6 +1726,7 @@ class RevocationHopGuard:
             crl_checked=context_checks_revocation(context),
             ways_across=ways_across,
             attested_reason=attested_reason,
+            connection=connection,
         )
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
@@ -1719,15 +1774,16 @@ class RevocationHopGuard:
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
-            logger.warning(
-                "verified TLS hop crossed WITHOUT certificate revocation checking on operator "
-                "attestation — %s: %s (reason: %s)",
-                self.cell,
-                self._detail(),
-                # A proven terminator ALLOWs without any per-connection attestation, so say which.
-                (self.attested_reason or "(none provided)")
+            # A proven terminator ALLOWs without any per-connection attestation, so say which.
+            log_revocation_attestation(
+                logger,
+                crossing="verified TLS hop crossed without certificate revocation checking",
+                connection=self.connection,
+                detail=f"{self.cell}: {self._detail()}",
+                reason=self.attested_reason
                 if self.attested
                 else "revocation proven by a declared egress terminator",
+                declaration="tls_revocation_attested" if self.attested else "proxy_proven",
             )
         enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
 

@@ -294,8 +294,8 @@ Option B decouples **development, test, and release**. It does **not** buy deplo
 - **Hard cross-seam import.** `api.security`'s dep surface is imported directly (outside `UiDeps`), so a
   signature change there breaks the console outside the type-checked construction site — it is in the
   seam's compat scope and the snapshot gate.
-- **Same-origin security is unchanged.** The `/ui`-confined `SameSite=Strict` session cookie, the
-  `Origin`/`Sec-Fetch-Site` CSRF check on every `/ui` POST, the CSWSH `Origin == Host` WS check, step-up
+- **Same-origin security is unchanged.** The console's `SameSite=Strict` session cookie, the
+  `Origin`/`Sec-Fetch-Site` CSRF check on every `/ui` POST, the CSWSH `Origin` WS check, step-up
   re-auth + `reauth_next` unlock mapping, and dual-control all moved **verbatim** and read
   `request(.websocket).app.state`, not `create_app` locals — see [SECURITY.md](SECURITY.md).
 

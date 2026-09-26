@@ -21,15 +21,15 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
 
 from harness.frame_cap import resolve_max_frame_bytes
-from messagefoundry.config import AckMode
-from messagefoundry.parsing import HL7PeekError, Peek, normalize
-from messagefoundry.transports.mllp import (
+from messagefoundry.mllpcodec import (
     DEFAULT_MAX_FRAME_BYTES,
+    AckMode,
     MLLPDecoder,
     MLLPFrameError,
     build_ack,
     frame,
 )
+from messagefoundry.parsing import HL7PeekError, Peek, normalize
 
 # ACK-mode label -> (build_ack code, ack_mode). "none" sends no acknowledgement.
 ACK_MODES: dict[str, tuple[str, AckMode]] = {

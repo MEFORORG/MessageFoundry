@@ -25,10 +25,11 @@ from __future__ import annotations
 import ast
 import inspect
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
+from _ast_sites import call_sites, callee_name, calls_to, named_func
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from pydantic import BaseModel
 
@@ -1051,6 +1052,63 @@ def test_ui_gate_divergences_are_exactly_the_reviewed_set() -> None:
         )
 
 
+# --- source probes: AST walks, never substring scans (BACKLOG #1818) ----------------------------------
+#
+# Several guards below decide whether a CONTROL exists by reading engine source. A substring scan
+# cannot tell code from a mention: a docstring, a comment or an error string that names the symbol
+# keeps it True after the code is deleted, so the probe cannot fail in the direction it exists to
+# detect. Measured on main at c1f466676: deleting ``transports/dicom.py``'s real
+# ``ctx.verify_mode = ssl.CERT_REQUIRED`` left the data-plane mTLS probe GREEN, because a comment in
+# the same file names ``CERT_REQUIRED``. These helpers read only code: a docstring is a bare string
+# constant and a comment never reaches the tree. ``test_source_probe_helpers_ignore_mentions`` pins
+# that for each helper, and ``test_source_probes_do_not_regress_to_a_substring_scan`` flags at least
+# the common spellings of a raw-text scan in the modules it covers. It does not see raw text that a
+# probe receives through a parameter or a local helper's return value.
+
+
+def _parse(source: str) -> ast.Module:
+    """``ast.parse`` that tolerates a UTF-8 byte-order mark, which ``read_text`` leaves in place."""
+    return ast.parse(source.removeprefix("\ufeff"))
+
+
+def _referenced_names(tree: ast.AST) -> set[str]:
+    """Every name ``tree`` reads or binds in CODE: bare names and attribute tails (``ssl.X`` -> ``X``)."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+    return names
+
+
+def _code_calls(source: str, function_name: str) -> bool:
+    """Whether ``source`` CALLS ``function_name``. An import or an ``__all__`` entry is not a call."""
+    return bool(calls_to(_parse(source), {function_name}))
+
+
+def _code_references(source: str, name: str) -> bool:
+    """Whether CODE in ``source`` uses ``name`` (``ssl.CERT_REQUIRED``, ``x.tls_client_ca_file``)."""
+    return name in _referenced_names(_parse(source))
+
+
+def _code_passes_keyword(source: str, keyword: str, value: str) -> bool:
+    """Whether some call in ``source`` passes ``keyword=value``, with ``value`` a string literal."""
+    return any(
+        isinstance(node, ast.Call)
+        and any(
+            kw.arg == keyword and isinstance(kw.value, ast.Constant) and kw.value.value == value
+            for kw in node.keywords
+        )
+        for node in ast.walk(_parse(source))
+    )
+
+
+def _function_references(source: str, function: str, name: str) -> bool:
+    """Whether the CODE of the one ``def function`` in ``source`` uses ``name``."""
+    return name in _referenced_names(named_func(_parse(source), function))
+
+
 def _console_calls(function_name: str) -> bool:
     """Whether any module under ``messagefoundry_webconsole/`` CALLS ``function_name``.
 
@@ -1060,16 +1118,331 @@ def _console_calls(function_name: str) -> bool:
     would keep a substring probe True, let the caller below take the parity branch, and stop requiring
     ``docs/SECURITY.md`` to re-disclose a gap that had reopened.
     """
-    for module in (_ROOT / "messagefoundry_webconsole").rglob("*.py"):
-        for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
-            if not isinstance(node, ast.Call):
+    return any(
+        _code_calls(module.read_text(encoding="utf-8"), function_name)
+        for module in (_ROOT / "messagefoundry_webconsole").rglob("*.py")
+    )
+
+
+#: Engine-shaped source that only MENTIONS each symbol the probes look for: in a module docstring, an
+#: import, ``__all__``, a string constant, a function docstring and comments. Every helper must read
+#: it as ABSENT; a substring scan reads every one of them as present.
+_MENTION_ONLY_SOURCE = '''
+"""Calls peer_ip_allowed(peer, allow), sets ssl.CERT_REQUIRED, passes reason="roles_changed"."""
+from messagefoundry.netaddr import peer_ip_allowed  # peer_ip_allowed(peer) is the gate
+
+__all__ = ["peer_ip_allowed"]
+MESSAGE = 'peer_ip_allowed( refused; ssl.CERT_REQUIRED; reason="roles_changed"; tls_client_ca_file'
+
+
+def api_client_anchor_spec(api):
+    """Reads api.tls_client_ca_file and calls peer_ip_allowed(peer, allow)."""
+    # ctx.verify_mode = ssl.CERT_REQUIRED
+    # revoke(user, reason="roles_changed")
+    return "roles_changed"
+'''
+
+_SOURCE_PROBE_CASES = [
+    pytest.param(
+        lambda src: _code_calls(src, "peer_ip_allowed"),
+        "if not peer_ip_allowed(peer, self.source_ip_allowlist):\n    pass\n",
+        id="call-bare",
+    ),
+    pytest.param(
+        lambda src: _code_calls(src, "peer_ip_allowed"),
+        "allowed = netaddr.peer_ip_allowed(peer, allow)\n",
+        id="call-attribute",
+    ),
+    pytest.param(
+        lambda src: _code_references(src, "CERT_REQUIRED"),
+        "ctx.verify_mode = ssl.CERT_REQUIRED\n",
+        id="reference",
+    ),
+    pytest.param(
+        lambda src: _code_passes_keyword(src, "reason", "roles_changed"),
+        'revocations.append(SessionRevocation(uid, name, reason="roles_changed"))\n',
+        id="keyword",
+    ),
+    pytest.param(
+        lambda src: _function_references(src, "api_client_anchor_spec", "tls_client_ca_file"),
+        "def api_client_anchor_spec(api):\n    return api.tls_client_ca_file\n",
+        id="function-reference",
+    ),
+]
+
+
+@pytest.mark.parametrize(("probe", "real"), _SOURCE_PROBE_CASES)
+def test_source_probe_helpers_ignore_mentions(probe: Callable[[str], bool], real: str) -> None:
+    """Pins each helper's falsifiability both ways, so none can silently become a substring scan.
+
+    A mention alone must read ABSENT, and the real construct must read PRESENT (BACKLOG #1818).
+    """
+    assert not probe(_MENTION_ONLY_SOURCE), "a mention alone was read as the real construct"
+    assert probe(real), "the real construct was not found; the helper cannot see what it guards"
+
+
+def test_assignment_and_arm_helpers_ignore_mentions() -> None:
+    """The ``__main__.py`` shape guards' helpers, pinned the same way (BACKLOG #1818)."""
+    mention = "admin_exposed = instance_exposed  # never settings.api.serve_ui\n"
+    assert not _derives_from_console(mention), "a comment was read as the derivation"
+    for derived in (
+        "admin_exposed = (\n    instance_exposed\n    and settings.api.serve_ui\n)\n",
+        'admin_exposed = instance_exposed or getattr(settings.api, "serve_ui")\n',
+        "admin_exposed = instance_exposed or console_ui_exposed\n",
+        "admin_exposed = instance_exposed\nadmin_exposed |= ui_exposed\n",
+        "admin_exposed: bool = instance_exposed or settings.api.serve_ui\n",
+        "if (admin_exposed := settings.api.serve_ui):\n    pass\n",
+        "admin_exposed, desc = settings.api.serve_ui, 'x'\n",
+    ):
+        assert _derives_from_console(derived), f"missed a console derivation: {derived!r}"
+
+    head = "if admin_exposed and not settings.approvals.enabled:\n"
+    warn_only = (
+        head + '    """Warn; the owner may later make this return 2."""\n'
+        '    print("warning: approvals off")\n'
+        "    # return 2 once the owner rules\n"
+        "else:\n"
+        "    return 2\n"
+    )
+    arms = _approvals_arms(warn_only)
+    assert _arm_prints_its_warning(arms[0]), "the arm's warning print was not found"
+    assert not _arm_prints_its_warning(_approvals_arms(head + "    print('debug')\n")[0])
+    assert len(arms) == 1 and not _arm_can_refuse(arms[0]), (
+        "a mention of `return 2`, or a refusal in the else branch, was read as the arm refusing"
+    )
+    for refusal in ("return 2", "raise SystemExit(2)", "sys.exit(2)", "os.abort()", "return"):
+        arm = _approvals_arms(head + '    print("warning: approvals off")\n    ' + refusal + "\n")
+        assert _arm_can_refuse(arm[0]), f"the arm refusing via {refusal!r} was not detected"
+
+
+#: Modules the substring-scan regression check covers: this one and at least the sibling doc-drift
+#: and security-record modules BACKLOG #1818 converted. NOT a census of ``tests/``: measured at this
+#: change, the same scanner flags 490 scopes in 215 test modules, 95 of them in 36 modules whose
+#: names mark them as doc, security or inventory guards. Most read prose; which of the rest decide a
+#: control from code is still to be triaged.
+_SOURCE_PROBE_MODULES = (
+    "test_security_doc_drift.py",
+    "test_security_doc_rate_limits.py",
+    "test_crit2_inline_doc_drift.py",
+    "test_docs_security_pathways.py",
+    "test_threat_model_doc_drift.py",
+    "test_adaptive_attributes_doc_drift.py",
+    "test_crypto_inventory_doc.py",
+)
+
+#: Functions in those modules that DO test raw text, each reviewed and kept, keyed by
+#: ``(module, function)`` with the reason. A claim about prose or about a string literal is a text
+#: claim. An ABSENCE check over text can only over-fire on a mention, which is loud; it cannot
+#: under-fire, which is the silent failure this guard exists for. A scan that only LOCATES an anchor
+#: for a planted mutation, and fails loudly when the anchor moves, decides nothing and is admitted.
+#: An entry exempts its WHOLE function, so a new raw-text scan added to a listed function is not
+#: flagged. Review that function's diff by hand.
+_REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
+    ("test_adaptive_attributes_doc_drift.py", "_disclaimer_paragraph"): "slices SECURITY.md prose",
+    (
+        "test_adaptive_attributes_doc_drift.py",
+        "test_no_authorization_decision_reads_a_time_window",
+    ): ("absence over text: a mention in auth/ can only over-fire"),
+    (
+        "test_adaptive_attributes_doc_drift.py",
+        "test_the_engine_ships_a_time_of_day_evaluator_this_pattern_can_see",
+    ): "positive control for the text instrument of the absence check, so it must share it",
+    ("test_crit2_inline_doc_drift.py", "test_adr_0057_does_not_claim_unwired"): "ADR 0057 prose",
+    ("test_crypto_inventory_doc.py", "_section4"): "slices the Phase 0 changes document",
+    ("test_crypto_inventory_doc.py", "test_default_keyless_claim_is_absent_from_its_other_sites"): (
+        "absence of a retired prose claim, in PHI.md and in audit_tee.py's docstrings"
+    ),
+    (
+        "test_docs_security_pathways.py",
+        "test_the_console_dependency_of_the_browser_legs_is_stated",
+    ): ("absence over text: a mention of serve_ui can only over-fire"),
+    ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
+        "absence of retired prose in two sibling docs (BACKLOG #1959)"
+    ),
+    ("test_security_doc_rate_limits.py", "_config_section"): "slices CONFIGURATION.md prose",
+    ("test_security_doc_rate_limits.py", "test_ui_refusal_reader_can_fail"): (
+        "locates the anchor for a planted mutation, and fails loudly if it moves; the verdict is "
+        "_ui_refusal's AST read"
+    ),
+    ("test_security_doc_rate_limits.py", "test_ui_refusal_is_described_as_the_code_behaves"): (
+        "the text scan reads CONFIGURATION.md prose; the code half is _ui_refusal's AST read. It also "
+        "holds _auth.py source in `src`, which it only passes to _ui_refusal"
+    ),
+    ("test_threat_model_doc_drift.py", "test_checks_py_only_names_os_system_as_a_lint_string"): (
+        "the claim is about a string literal in checks.py"
+    ),
+    (
+        "test_threat_model_doc_drift.py",
+        "test_the_open_gap_is_tracked_against_an_artifact_that_exists",
+    ): ("reads the cited tracker document's prose"),
+}
+
+#: Calls that turn raw text into code, so what they return is not raw text any more.
+_TEXT_TO_CODE = frozenset({"parse", "_parse", "_code_only", "_code_text"})
+#: Calls that return raw source or prose.
+_RAW_TEXT_READS = frozenset({"read_text", "read_bytes", "getsource", "getsourcelines"})
+#: Regex functions that scan the raw text passed to them.
+_TEXT_SCANS = frozenset(
+    {"search", "match", "fullmatch", "findall", "finditer", "split", "sub", "subn"}
+)
+#: String methods that scan the raw text they are called on.
+_TEXT_METHODS = frozenset(
+    {
+        "count",
+        "find",
+        "rfind",
+        "index",
+        "rindex",
+        "startswith",
+        "endswith",
+        "split",
+        "splitlines",
+        "partition",
+        "rpartition",
+    }
+)
+
+
+def _holds_raw_text(expr: ast.AST, names: set[str]) -> bool:
+    """Whether ``expr`` is, or is built from, raw text: a read, or a name bound from one."""
+    stack = [expr]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Call):
+            called = callee_name(node)
+            if called in _TEXT_TO_CODE:
                 continue
-            func = node.func
-            if isinstance(func, ast.Name) and func.id == function_name:
+            if called in _RAW_TEXT_READS:
                 return True
-            if isinstance(func, ast.Attribute) and func.attr == function_name:
-                return True
+        if isinstance(node, ast.Name) and node.id in names:
+            return True
+        stack.extend(ast.iter_child_nodes(node))
     return False
+
+
+def _raw_text_names(nodes: list[ast.AST], inherited: set[str]) -> set[str]:
+    """Names bound, in ``nodes``, from raw text or from a name already known to hold it."""
+    names = set(inherited)
+    while True:
+        before = len(names)
+        for node in nodes:
+            pairs: list[tuple[ast.AST, ast.AST | None]] = []
+            if isinstance(node, ast.Assign):
+                pairs = [(t, node.value) for t in node.targets]
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
+                pairs = [(node.target, node.value)]
+            elif isinstance(node, ast.For | ast.comprehension):
+                pairs = [(node.target, node.iter)]
+            for target, value in pairs:
+                if value is not None and _holds_raw_text(value, names):
+                    names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+        if len(names) == before:
+            return names
+
+
+def _scans_raw_text(node: ast.AST, names: set[str]) -> bool:
+    """Whether ``node`` tests raw text: ``in`` / ``not in``, a regex call, or a string method."""
+    if isinstance(node, ast.Compare):
+        return any(
+            isinstance(op, ast.In | ast.NotIn) and _holds_raw_text(right, names)
+            for op, right in zip(node.ops, node.comparators, strict=True)
+        )
+    if not isinstance(node, ast.Call):
+        return False
+    called = callee_name(node)
+    if called in _TEXT_SCANS and any(_holds_raw_text(arg, names) for arg in node.args):
+        return True
+    return (
+        called in _TEXT_METHODS
+        and isinstance(node.func, ast.Attribute)
+        and _holds_raw_text(node.func.value, names)
+    )
+
+
+def _substring_scans(tree: ast.Module) -> set[str]:
+    """Scopes in ``tree`` that scan raw text: ``in`` / ``not in``, a regex, or a string method.
+
+    Raw text is a ``read_text``, ``read_bytes`` or ``getsource`` result, or a name bound from one by
+    assignment, walrus, or loop or comprehension target, followed to a fixed point. A module-level
+    binding counts inside every function. Text passed through ``ast.parse`` or ``_code_only`` is
+    code and is not followed. It catches at least these spellings; it is not a proof that no other
+    spelling exists. It does NOT follow raw text into a parameter, so ``def has(text, tok): return
+    tok in text`` called with a read is missed, and so is raw text returned by a local helper such
+    as ``_console_sources()``. Module-level statements, class bodies excluded, are
+    one scope, named ``<module>``.
+    """
+    module_nodes = [
+        node
+        for st in tree.body
+        if not isinstance(st, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+        for node in ast.walk(st)
+    ]
+    module_names = _raw_text_names(module_nodes, set())
+    scopes: list[tuple[str, list[ast.AST], set[str]]] = [("<module>", module_nodes, set())]
+    scopes += [
+        (func.name, list(ast.walk(func)), module_names)
+        for func in ast.walk(tree)
+        if isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef)
+    ]
+    offenders: set[str] = set()
+    for scope, nodes, inherited in scopes:
+        names = _raw_text_names(nodes, inherited)
+        if any(_scans_raw_text(node, names) for node in nodes):
+            offenders.add(scope)
+    return offenders
+
+
+def test_source_probes_do_not_regress_to_a_substring_scan() -> None:
+    """No probe in the census decides a control exists by scanning source text (BACKLOG #1818).
+
+    Every raw-text scan in those modules must be a reviewed text claim in
+    ``_REVIEWED_TEXT_CHECKS``, and every reviewed entry must still exist. Planted spellings run
+    first, so the check is shown to be able to fail before its clean result is trusted.
+    """
+    planted = _parse(
+        "def assigned():\n"
+        "    src = (ROOT / 'tls.py').read_text(encoding='utf-8')\n"
+        "    assert 'CERT_REQUIRED' in src\n"
+        "def annotated():\n"
+        "    src: str = PATH.read_text()\n"
+        "    return src.count('peer_ip_allowed(')\n"
+        "def by_regex():\n"
+        "    return re.search('roles_changed', inspect.getsource(mod))\n"
+        "def by_walrus():\n"
+        "    return (s := PATH.read_text()) and 'X' in s.lower()\n"
+        "def parsed_is_fine():\n"
+        "    return 'X' in names(ast.parse(PATH.read_text()))\n"
+        "HITS = {p for p in PATHS if 'X' in p.read_text()}\n"
+        "_SRC = PATH.read_text()\n"
+        "def module_bound():\n"
+        "    assert 'CERT_REQUIRED' in _SRC\n"
+        "def by_bytes_and_split():\n"
+        "    return re.split(b'X', PATH.read_bytes())\n"
+        "def by_partition():\n"
+        "    return inspect.getsourcelines(f)[0][0].partition('X')\n"
+    )
+    assert _substring_scans(planted) == {
+        "<module>",
+        "assigned",
+        "annotated",
+        "by_regex",
+        "by_walrus",
+        "module_bound",
+        "by_bytes_and_split",
+        "by_partition",
+    }, "the regression check cannot fire on a spelling it claims to catch"
+    found: set[tuple[str, str]] = set()
+    for module in _SOURCE_PROBE_MODULES:
+        tree = _parse((_ROOT / "tests" / module).read_text(encoding="utf-8"))
+        found |= {(module, scope) for scope in _substring_scans(tree)}
+    unreviewed = sorted(found - set(_REVIEWED_TEXT_CHECKS))
+    assert not unreviewed, (
+        f"these scopes scan raw source text: {unreviewed}. A docstring or comment keeps that True "
+        "after the code is gone. Use _code_calls, _code_references or _code_passes_keyword; if the "
+        "claim really is about text, add it to _REVIEWED_TEXT_CHECKS with the reason."
+    )
+    stale = sorted(set(_REVIEWED_TEXT_CHECKS) - found)
+    assert not stale, f"_REVIEWED_TEXT_CHECKS names scopes that no longer scan text: {stale}"
 
 
 def test_ui_plane_states_the_phi_read_hop_gap() -> None:
@@ -1106,11 +1479,25 @@ def test_control_plane_mtls_handshake_gate_has_its_own_table_a_row() -> None:
     Why it belongs in Table A at all: it is a pre-auth, consumer-keyed DENY on the CONTROL plane —
     the request never reaches the ASGI stack — and the section claims to inventory every such input on
     both planes, while Table B already gives the identical data-plane gate its own row.
+
+    The code half is three AST reads (BACKLOG #1818). It used to be a substring scan for
+    ``tls_client_ca_file`` in ``api/tls.py``, and only two docstrings there name it: the code reads
+    the setting through ``auth/trust_anchors.py``'s ``api_client_anchor_spec``. So that conjunct was
+    decided by prose and could not fail when the gate stopped reading the setting.
     """
     tls_src = (_ROOT / "messagefoundry" / "api" / "tls.py").read_text(encoding="utf-8")
-    assert "CERT_REQUIRED" in tls_src and "tls_client_ca_file" in tls_src, (
-        "api/tls.py no longer requires a client certificate when [api].tls_client_ca_file is set. "
-        "If the control-plane mTLS gate is gone, remove its Table A row in the same change."
+    anchors_src = (_ROOT / "messagefoundry" / "auth" / "trust_anchors.py").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        _code_references(tls_src, "CERT_REQUIRED")
+        and _code_calls(tls_src, "api_client_anchor_spec")
+        and _function_references(anchors_src, "api_client_anchor_spec", "tls_client_ca_file")
+    ), (
+        "api/tls.py no longer requires a client certificate when [api].tls_client_ca_file is set: "
+        "its code must use ssl.CERT_REQUIRED and call api_client_anchor_spec, which must read "
+        "tls_client_ca_file. If the control-plane mTLS gate is gone, remove its Table A row in the "
+        "same change."
     )
     rows_a, _rows_b = _contextual_table_rows()
     hits = [
@@ -1133,7 +1520,9 @@ def test_ad_role_drift_revocation_has_its_own_table_a_row() -> None:
     takes two passes when it takes one.
     """
     src = (_ROOT / "messagefoundry" / "auth" / "reconcile.py").read_text(encoding="utf-8")
-    assert 'reason="roles_changed"' in src, (
+    # A call passing reason="roles_changed", read from the AST: a docstring quoting the same
+    # keyword kept the old substring scan green with the revocation deleted (BACKLOG #1818).
+    assert _code_passes_keyword(src, "reason", "roles_changed"), (
         "auth/reconcile.py no longer revokes on role drift. If that arm is gone, remove its Table A "
         "row and restore the two-row wording in the same change."
     )
@@ -1358,6 +1747,310 @@ def test_gate_wrapper_table_counts_match_the_route_walk() -> None:
     )
 
 
+_WS_GATES = ("ui_ws_authorize", "authorize_ws")
+
+
+def _ws_stats_handler(tree: ast.Module) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """The one ``ws_stats`` definition in ``tree``, found once and shared by the readers below.
+
+    The readers take parsed trees, never source text, so no raw text reaches a helper parameter,
+    where ``test_source_probes_do_not_regress_to_a_substring_scan`` could not follow it."""
+    return named_func(tree, "ws_stats")
+
+
+def _ws_stats_gate_order(handler: ast.AST) -> list[str]:
+    """The gates ``ws_stats`` calls, in source order, read by an AST walk of ``api/app.py``.
+
+    Only two names count: ``ui_ws_authorize`` (the web console's hook, fetched from ``app.state``) and
+    ``authorize_ws`` (the engine's header path). A substring scan cannot do this job: both names also
+    sit in the handler's own comments, so a refactor that deleted a call and kept the comment would
+    still read as present. ``scripts/security/route_gates.py`` cannot either, because it hard-codes the
+    WebSocket row's gate as ``authorize_ws`` without reading the body (its module docstring says so).
+    Sorted by line AND column, so two calls on one line keep their written order.
+    """
+    calls = [
+        (call.lineno, call.col_offset, name)
+        for name in _WS_GATES
+        for call in call_sites(handler, name, bare_only=True)
+    ]
+    return [name for _line, _col, name in sorted(calls)]
+
+
+def _assignments(node: ast.AST) -> list[tuple[int, list[ast.expr], ast.expr | None]]:
+    """``(line, targets, value)`` for every plain or annotated assignment under ``node``."""
+    found: list[tuple[int, list[ast.expr], ast.expr | None]] = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Assign):
+            found.append((sub.lineno, list(sub.targets), sub.value))
+        elif isinstance(sub, ast.AnnAssign):
+            found.append((sub.lineno, [sub.target], sub.value))
+    return sorted(found, key=lambda item: item[0])
+
+
+def _ws_stats_fallback_gaps(handler: ast.AST) -> list[str]:
+    """What is missing for the header gate to be a FALLBACK behind the cookie gate (empty = none).
+
+    Each property is read from the AST. (1) The local ``ui_ws_authorize`` is bound only by
+    ``getattr(websocket.app.state, "ui_ws_authorize", ...)``, so the slot ``mount_ui`` fills is the
+    one the handler reads. (2) The cookie gate's result binds ``identity``. (3) Nothing resets
+    ``identity`` to ``None`` after that. (4) Every ``authorize_ws`` call sits under
+    ``if identity is None:``. Without all four, the doc's "step 2 runs only when step 1 yields no
+    identity" can be false while the call order stays the same.
+
+    NOT covered: a guard around the cookie call that can never be true. That is control flow, and a
+    syntactic reader cannot decide it.
+    """
+    gaps: list[str] = []
+    fetch = 'getattr(websocket.app.state, "ui_ws_authorize", None)'
+    hook_values = [
+        ast.unparse(value).replace("'", '"') if value is not None else "<none>"
+        for _line, targets, value in _assignments(handler)
+        if any(ast.unparse(t) == "ui_ws_authorize" for t in targets)
+    ]
+    if hook_values != [fetch]:
+        gaps.append(f"ui_ws_authorize is not bound only by {fetch}: {hook_values}")
+
+    cookie_lines = [
+        line
+        for line, targets, value in _assignments(handler)
+        if isinstance(value, ast.Await) and call_sites(value, "ui_ws_authorize", bare_only=True)
+        for first in targets[:1]
+        if ast.unparse(first.elts[0] if isinstance(first, ast.Tuple) else first) == "identity"
+    ]
+    if not cookie_lines:
+        gaps.append("the ui_ws_authorize result does not bind `identity`")
+    else:
+        resets = [
+            line
+            for line, targets, value in _assignments(handler)
+            if line > cookie_lines[0]
+            and any(ast.unparse(t) == "identity" for t in targets)
+            and isinstance(value, ast.Constant)
+            and value.value is None
+        ]
+        if resets:
+            gaps.append(f"`identity` is reset to None after the cookie gate, at lines {resets}")
+
+    header_calls = {id(call) for call in call_sites(handler, "authorize_ws", bare_only=True)}
+    guarded: set[int] = set()
+    for node in ast.walk(handler):
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "identity is None":
+            for stmt in node.body:
+                guarded |= {id(call) for call in call_sites(stmt, "authorize_ws", bare_only=True)}
+    if not header_calls or not header_calls <= guarded:
+        gaps.append("an authorize_ws call is not under `if identity is None:`")
+    return gaps
+
+
+def _mount_installs_ui_ws_hook(tree: ast.Module) -> bool:
+    """Whether ``mount_ui`` leaves ``app.state.ui_ws_authorize`` set to ``_auth.authorize_ui_ws``.
+
+    Scoped to ``mount_ui``'s own body, and the LAST assignment to that slot there decides, so a later
+    overwrite or an assignment in some other helper does not count."""
+    values = [
+        ast.unparse(value) if value is not None else "<none>"
+        for _line, targets, value in _assignments(named_func(tree, "mount_ui"))
+        if any(ast.unparse(t) == "app.state.ui_ws_authorize" for t in targets)
+    ]
+    return bool(values) and values[-1] == "_auth.authorize_ui_ws"
+
+
+def _ui_ws_audit_shape(tree: ast.Module) -> tuple[bool, bool]:
+    """``(writes a grant row, passes a client address)`` for ``authorize_ui_ws``, read by AST.
+
+    The WebSocket note says the cookie gate writes no grant row and its denial rows carry no client
+    address. Both are facts about code that BACKLOG #1197 may change, so they are read, not assumed.
+    """
+    gate = named_func(tree, "authorize_ui_ws")
+    grants = bool(call_sites(gate, "audit_permission_granted"))
+    denials = call_sites(gate, "audit_mfa_denied") + call_sites(gate, "audit_permission_denied")
+    with_client = any(kw.arg == "client" for call in denials for kw in call.keywords)
+    return grants, with_client
+
+
+def test_ws_stats_gate_order_is_derived_and_documented() -> None:
+    """``/ws/stats`` tries the web console's cookie gate first, then the header gate (BACKLOG #1959).
+
+    RULE: the route map row and the WebSocket note under the gate table must name both gates in the
+    order the handler calls them. The doc used to describe ``authorize_ws`` alone, with
+    ``[api].ws_allowed_origins`` as THE browser control, while a same-origin browser actually passed
+    through ``authorize_ui_ws`` and its session cookie. A reviewer reading that text would have
+    assessed the wrong control for every browser.
+
+    It reads ``messagefoundry_webconsole/`` source without ``importorskip``, unlike its console
+    siblings, on purpose: the claim is about files in this tree, so a missing file must fail, not skip.
+    """
+    ws_routes = [row for row in _route_rows() if row[0] == "WS"]
+    assert [row[1] for row in ws_routes] == ["/ws/stats"], (
+        f"the app now serves WebSocket routes {ws_routes}; the doc calls /ws/stats 'the one "
+        "WebSocket route', so restate that sentence and extend this guard to the new route."
+    )
+    handler = _ws_stats_handler(
+        _parse((_ROOT / "messagefoundry" / "api" / "app.py").read_text(encoding="utf-8"))
+    )
+    order = _ws_stats_gate_order(handler)
+    assert order == ["ui_ws_authorize", "authorize_ws"], (
+        f"ws_stats now calls its gates as {order}; rewrite the plane-selection item, the /ws/stats "
+        "route row, the WebSocket note under the gate table and the Table A Origin row, then this pin."
+    )
+    gaps = _ws_stats_fallback_gaps(handler)
+    assert not gaps, (
+        f"the header gate is no longer a plain fallback behind the cookie gate: {gaps}. The doc's "
+        "step 2 condition ('when step 1 yields no identity') is now false; rewrite it."
+    )
+    console = _ROOT / "messagefoundry_webconsole"
+    assert _mount_installs_ui_ws_hook(_parse((console / "mount.py").read_text(encoding="utf-8"))), (
+        "mount_ui no longer installs authorize_ui_ws as app.state.ui_ws_authorize, so the cookie path "
+        "the doc describes does not run. Rewrite the /ws/stats prose."
+    )
+    grants, with_client = _ui_ws_audit_shape(
+        _parse((console / "_auth.py").read_text(encoding="utf-8"))
+    )
+    assert not grants and not with_client, (
+        f"authorize_ui_ws now writes a grant row ({grants}) or passes a client address "
+        f"({with_client}). The WebSocket note and the 16.3.2 paragraph say it does neither; "
+        "rewrite both."
+    )
+
+    rows = [
+        row
+        for table in _tables(_json_route_map_block())
+        for row in table
+        if len(row) > 3 and "`/ws/stats`" in row[1]
+    ]
+    assert len(rows) == 1, f"expected one /ws/stats route row, found {len(rows)}"
+    gate_cell = rows[0][3]
+    assert "authorize_ui_ws" in gate_cell and "authorize_ws" in gate_cell, gate_cell
+    assert gate_cell.index("authorize_ui_ws") < gate_cell.index("authorize_ws"), (
+        "the /ws/stats row must name the cookie gate before the header gate, as the handler runs them"
+    )
+    assert "ws_allowed_origins" in gate_cell and "session cookie" in gate_cell, gate_cell
+
+    text = _doc_text()
+    design = " ".join(_section(text, _H_DESIGN).split())
+    ui_step = design.find("1. **`authorize_ui_ws`")
+    header_step = design.find("2. **`authorize_ws`, when step 1 yields no identity")
+    assert 0 <= ui_step < header_step, (
+        "the WebSocket note under the gate table must list authorize_ui_ws as step 1 and "
+        "authorize_ws as step 2, the fallback when step 1 yields no identity"
+    )
+    assert "`authorize_ui_ws` writes no grant row" in design, (
+        "the WebSocket note must say the cookie gate writes no grant row"
+    )
+    plane_item = design[design.find("2. **Authentication plane selection**") :][:900]
+    assert "cookie first and header token second" in plane_item, (
+        "the plane-selection item must say /ws/stats accepts the cookie first and the header second"
+    )
+    assert "never cross" not in plane_item, (
+        "the plane-selection item must not say the planes never cross: /ws/stats takes two"
+    )
+    assert "`/ui`-confined" not in text, (
+        "the session cookie is Path=/ and /ws/stats reads it, so it is not /ui-confined"
+    )
+
+    rows_a, _rows_b = _contextual_table_rows()
+    origin_rows = [r for r in rows_a if r[0].startswith("Browser `Origin` at the WebSocket")]
+    assert len(origin_rows) == 1, "fixture drifted: the WebSocket Origin row moved or split"
+    origin_row = " ".join(origin_rows[0])
+    for needed in ("session-cookie path", "web_console_public_address", "ws_allowed_origins"):
+        assert needed in origin_row, (
+            f"the Table A WebSocket Origin row no longer names {needed!r}; it must describe both "
+            "paths, or a reviewer reads ws_allowed_origins as the only browser control"
+        )
+
+
+def test_retired_ws_cookie_wording_is_absent_from_sibling_docs() -> None:
+    """``WEBCONSOLE-PACKAGE.md`` and ``ASVS-L2-PHASE0-CHANGES.md`` repeated the retired wording.
+
+    BACKLOG #1959 corrected both. "``/ui``-confined" is false because the cookie is ``Path=/`` and
+    ``/ws/stats`` reads it; "``Origin == Host``" is incomplete because
+    ``[security].web_console_public_address`` replaces ``Host`` when it is set."""
+    for name in ("WEBCONSOLE-PACKAGE.md", "ASVS-L2-PHASE0-CHANGES.md"):
+        prose = (_ROOT / "docs" / name).read_text(encoding="utf-8")
+        for retired in ("`/ui`-confined", "`Origin == Host`", "`Origin`-vs-`Host` check"):
+            assert retired not in prose, f"docs/{name} still says {retired!r}"
+
+
+def test_ws_stats_gate_order_reader_detects_a_planted_reorder() -> None:
+    """Proves the AST readers can fail. A hook named only in a comment, or called second, must read
+    differently from the shipped order; two calls on one line keep their written order; each broken
+    fallback shape is named; and a hook left in the wrong slot, or overwritten, does not count."""
+
+    def handler(body: str) -> ast.AST:
+        return _ws_stats_handler(_parse("async def ws_stats(websocket):\n" + body))
+
+    def mount(body: str) -> bool:
+        return _mount_installs_ui_ws_hook(_parse("def mount_ui(app, deps):\n" + body))
+
+    assert _ws_stats_gate_order(
+        handler(
+            "    # ui_ws_authorize(websocket) is only mentioned here\n"
+            "    identity = await authorize_ws(websocket)\n"
+        )
+    ) == ["authorize_ws"]
+    assert _ws_stats_gate_order(
+        handler(
+            "    identity = await authorize_ws(websocket)\n"
+            "    identity, token = await ui_ws_authorize(websocket)\n"
+        )
+    ) == ["authorize_ws", "ui_ws_authorize"]
+    assert _ws_stats_gate_order(
+        handler(
+            "    identity = await ui_ws_authorize(websocket) or await authorize_ws(websocket)\n"
+        )
+    ) == ["ui_ws_authorize", "authorize_ws"]
+
+    fetch = '    ui_ws_authorize = getattr(websocket.app.state, "ui_ws_authorize", None)\n'
+    cookie = "    identity, token = await ui_ws_authorize(websocket)\n"
+    guarded = "    if identity is None:\n        identity = await authorize_ws(websocket)\n"
+    assert _ws_stats_fallback_gaps(handler(fetch + cookie + guarded)) == []
+    annotated = fetch.replace("ui_ws_authorize =", "ui_ws_authorize: Hook | None =")
+    assert _ws_stats_fallback_gaps(handler(annotated + cookie + guarded)) == []
+
+    def gap_texts(body: str) -> list[str]:
+        return _ws_stats_fallback_gaps(handler(body))
+
+    assert gap_texts(fetch + cookie + "    identity = await authorize_ws(websocket)\n") == [
+        "an authorize_ws call is not under `if identity is None:`"
+    ]
+    assert gap_texts(fetch + cookie.replace("identity,", "ui_identity,") + guarded) == [
+        "the ui_ws_authorize result does not bind `identity`"
+    ]
+    reset = gap_texts(fetch + cookie + "    identity = None\n" + guarded)
+    assert len(reset) == 1 and reset[0].startswith("`identity` is reset to None"), reset
+    for broken in (
+        fetch.replace('"ui_ws_authorize", None', '"ui_ws_auth", None'),
+        fetch.replace("websocket.app.state", "websocket.state"),
+        fetch + "    ui_ws_authorize = other_hook\n",
+    ):
+        found = gap_texts(broken + cookie + guarded)
+        assert len(found) == 1 and found[0].startswith("ui_ws_authorize is not bound only by"), (
+            broken,
+            found,
+        )
+
+    assert mount("    app.state.ui_ws_authorize = _auth.authorize_ui_ws\n")
+    assert not mount("    app.state.ui_connections_render = _auth.authorize_ui_ws\n")
+    assert not mount("    request.state.ui_ws_authorize = _auth.authorize_ui_ws\n")
+    assert not mount("    app.state.ui_ws_authorize = other.authorize_ui_ws\n")
+    assert not mount(
+        "    app.state.ui_ws_authorize = _auth.authorize_ui_ws\n"
+        "    app.state.ui_ws_authorize = None\n"
+    ), "a later overwrite must win"
+    helper_only = _parse(
+        "def mount_ui(app, deps):\n    pass\n"
+        "def _unused(app):\n    app.state.ui_ws_authorize = _auth.authorize_ui_ws\n"
+    )
+    assert not _mount_installs_ui_ws_hook(helper_only), "only mount_ui's own body counts"
+
+    audit = _parse(
+        "async def authorize_ui_ws(websocket):\n"
+        "    await auth.audit_permission_granted(identity, p, path)\n"
+        "    await auth.audit_permission_denied(identity, p, path, client=ip)\n"
+    )
+    assert _ui_ws_audit_shape(audit) == (True, True)
+
+
 # =====================================================================================================
 # ASVS 8.1.2 — data-/field-level authorization
 # =====================================================================================================
@@ -1559,12 +2252,16 @@ def test_data_plane_mtls_listeners_are_derived_from_the_transports() -> None:
 
     RULE: a transport gaining ``ssl.CERT_REQUIRED`` on its listener is a new pre-auth,
     consumer-keyed DENY on the data plane and needs the row updated.
+
+    The set is read from CODE (BACKLOG #1818). The substring scan it replaced could not fail for
+    ``dicom``: a comment in ``transports/dicom.py`` names ``CERT_REQUIRED``, so deleting the real
+    ``ctx.verify_mode = ssl.CERT_REQUIRED`` left the module in the set and this test green.
     """
     transports = _ROOT / "messagefoundry" / "transports"
     capable = {
         path.stem
         for path in sorted(transports.glob("*.py"))
-        if "CERT_REQUIRED" in path.read_text(encoding="utf-8")
+        if _code_references(path.read_text(encoding="utf-8"), "CERT_REQUIRED")
     }
     assert capable == _MTLS_LISTENER_MODULES, (
         f"the transports building an mTLS-capable context changed: "
@@ -1639,12 +2336,15 @@ def test_data_plane_allowlist_listeners_match_the_transports() -> None:
 
     RULE (binding correction): 8.1.3/8.1.4's inventory must cover the DATA plane. A sixth listener
     gaining the allow-list without a doc row reds CI.
+
+    A module counts only if its code CALLS ``peer_ip_allowed`` (BACKLOG #1818): an import, an
+    ``__all__`` entry, or a comment quoting the call does not enforce anything.
     """
     transports = _ROOT / "messagefoundry" / "transports"
     enforcing = {
         path.stem
         for path in sorted(transports.glob("*.py"))
-        if "peer_ip_allowed(" in path.read_text(encoding="utf-8")
+        if _code_calls(path.read_text(encoding="utf-8"), "peer_ip_allowed")
     }
     assert enforcing == set(_DATA_PLANE_LABELS), (
         "the set of transports enforcing [inbound].source_ip_allowlist changed: "
@@ -1770,6 +2470,83 @@ def test_contextual_prefixed_settings_force_a_documented_decision() -> None:
     )
 
 
+def _admin_exposed_values(source: str) -> list[ast.expr]:
+    """The value of every binding of ``admin_exposed`` in ``source``: ``=``, ``|=``, ``: bool =``,
+    ``:=`` and tuple unpacking. For an unpacking the whole right-hand side is returned.
+
+    An AST read, so a wrapped right-hand side is read whole. The line slice it replaced saw only the
+    first physical line, so ``admin_exposed = (`` over a continuation line naming ``serve_ui`` left
+    the guard green (BACKLOG #1818).
+    """
+    values: list[ast.expr] = []
+    for node in ast.walk(_parse(source)):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
+            targets = [node.target]
+        else:
+            continue
+        binds = any(
+            isinstance(n, ast.Name) and n.id == "admin_exposed"
+            for t in targets
+            for n in ast.walk(t)
+        )
+        if binds and node.value is not None:
+            values.append(node.value)
+    return values
+
+
+def _derives_from_console(source: str) -> bool:
+    """Whether any ``admin_exposed`` assignment in ``source`` reads a console-mount term.
+
+    Each name, attribute and string literal in the value is matched as a SUBSTRING, as the old slice
+    did, so ``console_ui_exposed`` and ``getattr(settings.api, "serve_ui")`` still count.
+    """
+    values = _admin_exposed_values(source)
+    tokens = set().union(*(_referenced_names(value) for value in values)) | {
+        node.value
+        for value in values
+        for node in ast.walk(value)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    return any(banned in token for token in tokens for banned in ("ui_exposed", "serve_ui"))
+
+
+def _approvals_arms(source: str) -> list[ast.If]:
+    """Every ``if`` whose TEST reads ``admin_exposed`` and ``approvals.enabled``: the #189 arm."""
+    return [
+        node
+        for node in ast.walk(_parse(source))
+        if isinstance(node, ast.If)
+        and {"admin_exposed", "approvals", "enabled"} <= _referenced_names(node.test)
+    ]
+
+
+def _arm_can_refuse(arm: ast.If) -> bool:
+    """Whether the arm's own body can stop startup: any ``return``, any ``raise``, or an exit call.
+
+    The direct spellings, not only the literal ``return 2`` the text slice looked for. ``raise
+    SystemExit(2)`` and ``sys.exit(2)`` refuse just as well, and the slice was green for both
+    (BACKLOG #1818). The ``else`` branch is not the arm and is not read. A refusal hidden inside a
+    helper the arm calls is NOT seen: the guard reads the arm, not the functions it calls.
+    """
+    return any(
+        bool(calls_to(stmt, {"exit", "_exit", "abort"}))
+        or any(isinstance(node, ast.Return | ast.Raise) for node in ast.walk(stmt))
+        for stmt in arm.body
+    )
+
+
+def _arm_prints_its_warning(arm: ast.If) -> bool:
+    """Whether the arm's own body prints text containing ``warning:``, as the WARN action says."""
+    return any(
+        isinstance(node, ast.Constant) and isinstance(node.value, str) and "warning:" in node.value
+        for stmt in arm.body
+        for call in call_sites(stmt, "print")
+        for node in ast.walk(call)
+    )
+
+
 def test_admin_exposed_is_not_derived_from_the_mutated_console_flag() -> None:
     """The exposure predicate must not read a field an earlier arm has already rewritten.
 
@@ -1782,70 +2559,45 @@ def test_admin_exposed_is_not_derived_from_the_mutated_console_flag() -> None:
     The behavioural pins live in ``tests/test_cli.py`` and ``tests/test_checks_gate_parity.py``. This
     is the SHAPE guard: it exists so the defect cannot quietly return through a refactor that keeps
     every current test green (re-introducing the console term only changes behaviour for configs no
-    case happens to cover). Kept here beside the dual-control slice because it uses the same idiom on
-    the same file, including its liveness receipt.
+    case happens to cover). Kept here beside the dual-control guard because both read the same file,
+    each with its own liveness receipt.
     """
     source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
-    marker = "\n    admin_exposed = "
-    # Liveness receipt FIRST: a rename or a reflow that makes the slice empty must red this test, not
-    # make it unfailable. `in` is checked explicitly so the failure names the cause rather than
-    # surfacing a bare ValueError from `index`.
-    assert marker in source, (
-        "no top-level `admin_exposed = ` assignment found in messagefoundry/__main__.py. If it was "
-        "renamed, update this guard AND docs/SECURITY.md Table A AND the literal marker in "
-        "test_startup_dual_control_arm_is_documented_as_warn_only, which all name it."
+    # Liveness receipt FIRST: a rename that leaves nothing to read must red this test, not make it
+    # unfailable.
+    assert _admin_exposed_values(source), (
+        "no `admin_exposed = ...` assignment found in messagefoundry/__main__.py. "
+        "If it was renamed, update this guard AND docs/SECURITY.md Table A AND _approvals_arms, "
+        "which all name it."
     )
-    start = source.index(marker) + 1
-    assignment = source[start : source.index("\n", start)]
-    assert assignment.strip().startswith("admin_exposed = ") and len(assignment.strip()) > len(
-        "admin_exposed = "
-    ), (
-        f"the assignment slice looks wrong — the assertions below would pass vacuously: {assignment!r}"
+    assert not _derives_from_console(source), (
+        "`admin_exposed` is derived from `serve_ui` or a `ui_exposed` term, which the ADR 0143 "
+        "degrade arms rewrite in place further up this same function (BACKLOG #326). Derive it from "
+        "`instance_exposed` — the console being mounted is a presentation fact, not an exposure fact."
     )
-    for banned in ("ui_exposed", "serve_ui"):
-        assert banned not in assignment, (
-            f"`admin_exposed` is derived from `{banned}`, which the ADR 0143 degrade arms rewrite in "
-            f"place further up this same function (BACKLOG #326). Derive it from `instance_exposed` "
-            f"— the console being mounted is a presentation fact, not an exposure fact. Slice was: "
-            f"{assignment!r}"
-        )
 
 
 def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
     """The bind/exposure inventory claimed a refusal the code does not implement.
 
     ``admin_exposed + PHI + approvals off`` prints a warning and falls through on EVERY instance;
-    ``__main__.py`` records the refuse arm as an unresolved owner fork. Derived by slicing the
-    approvals block out of the source and asserting it contains no ``return 2``, so promoting it to a
-    refusal later reds the doc.
+    ``__main__.py`` records the refuse arm as an unresolved owner fork. Derived from the AST of that
+    arm: its body must hold no ``return``, no ``raise`` and no exit call, so promoting it to a refusal
+    later reds the doc.
 
-    The slice is taken by **indentation**, not by "up to the next comment banner". The banner boundary
-    was not reference-invariant: it measured whatever happened to sit between the arm and the next
-    banner, so inserting an unrelated refusal after the arm (the ASVS 12.1.1 TLS-floor probe did
-    exactly this) turned the guard red and blamed the approvals arm for a ``return 2`` that was not in
-    it. A gate whose answer depends on unrelated neighbouring code is not measuring its subject.
+    The arm is the ``if`` node and its own body, so nothing that sits after it can be blamed on it.
+    The earlier text slice first ran to the next comment banner and measured whatever sat between,
+    which blamed this arm for the ASVS 12.1.1 TLS-floor probe's ``return 2``. Its indentation-based
+    successor fixed that, and still looked only for the literal ``return 2`` (BACKLOG #1818).
     """
     source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
-    marker = "if admin_exposed and not settings.approvals.enabled"
-    # Slice from the START OF THE LINE, not from the marker itself: the `if`'s own indentation is what
-    # defines its body, and `source.index` lands past the leading whitespace.
-    start = source.rindex("\n", 0, source.index(marker)) + 1
-    lines = source[start:].splitlines(keepends=True)
-    # The arm is the `if` statement and its own body, which is anything indented deeper than the `if`.
-    body_indent = " " * (len(lines[0]) - len(lines[0].lstrip()) + 1)
-    arm_lines = [lines[0]]
-    for line in lines[1:]:
-        if line.strip() and not line.startswith(body_indent):
-            break
-        arm_lines.append(line)
-    arm = "".join(arm_lines)
-    # Liveness receipt: a boundary bug that produced a 1-line slice would make the assertion below
-    # unfailable, so prove the slice actually captured the arm's body before trusting it.
-    assert "warning:" in arm and len(arm_lines) > 5, (
-        f"the arm slice looks wrong ({len(arm_lines)} lines) — the assertion below would pass "
-        f"vacuously. Slice was:\n{arm}"
+    arms = _approvals_arms(source)
+    # Liveness receipt: the assertion below is vacuous unless it is reading the real arm.
+    assert len(arms) == 1 and _arm_prints_its_warning(arms[0]), (
+        f"expected exactly one `if admin_exposed and not settings.approvals.enabled` arm that prints "
+        f"its warning; found {len(arms)}. Re-locate the arm before trusting the assertion below."
     )
-    assert "return 2" not in arm, (
+    assert not _arm_can_refuse(arms[0]), (
         "the approvals-at-exposure arm now REFUSES to start. Move its row out of the WARN action in "
         "docs/SECURITY.md's Table A (and re-check `_CONTEXT_TABLE_A_ROWS`) in the same change."
     )
