@@ -159,8 +159,30 @@ class UserCreateRequest(RequestModel):
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
-    email: str | None = Field(default=None, max_length=_NAME_MAX)
+    #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,
+    #: where every security notice goes. An account born without one is told nothing about a change
+    #: made to it before its holder's first sign-in, an administrator's password reset included. The
+    #: service refuses a blank value or anything but one plain mailbox, with the check the PATCH
+    #: route applies to ``notify_email``.
+    email: str = Field(max_length=_NAME_MAX)
     roles: list[RoleId] = Field(default=[], max_length=64)
+
+
+class DirectoryUserCreateRequest(RequestModel):
+    """``POST /users/directory``: create a directory (AD) account's mirror row by name, with no
+    sign-in (BACKLOG #2021).
+
+    The row's ``objectGUID``, display name and ``mail`` come from a service-account directory
+    lookup, so there is deliberately no field for them, and the model refuses an unknown key with
+    422: a caller cannot choose which directory identity a row claims.
+
+    ``notify_email`` is not identity. It is required when the directory supplies no usable ``mail``
+    and refused when it does, so the row is never born without an address and an administrator
+    cannot point the holder's notices away from the directory's (ASVS 6.3.7).
+    """
+
+    username: str = Field(min_length=1, max_length=_NAME_MAX)
+    notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
 class UserUpdateRequest(RequestModel):

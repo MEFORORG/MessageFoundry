@@ -7,6 +7,25 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **An administrator can create a directory (AD) account without a Windows SSO sign-in.**
+  `POST /users/directory` takes a body of `{"username": "<name>"}` and creates the account's mirror
+  row. Before, only a Kerberos sign-in created one, so a site with no Windows SSO had no account to
+  link a federated (OIDC) identity to, and nobody could sign in through its identity provider. The
+  engine looks the name up with the directory service account, as a Kerberos sign-in does. The
+  account's `objectGUID`, display name and `mail` come from that answer, never from the request, so
+  an administrator cannot choose which directory identity an account claims. The route refuses a
+  name the directory does not return or returns disabled (404), an entry with no readable
+  `objectGUID` (400, since that account could never be linked), a name or `objectGUID` an account
+  already holds (409), and an unreachable directory (503). It needs `users:manage` and the same
+  step-up as `POST /users`. The account is never created without a notification address. When the
+  directory's `mail` passes the rule a sign-in applies to it, that is the address, and a
+  `notify_email` in the body is refused, so an administrator cannot send the holder's notices
+  elsewhere. Otherwise the body must carry `notify_email`, checked as `POST /users` checks `email`.
+  The address gets the `account_created` notice. The account starts with no roles; they come from
+  the AD-group map at sign-in. It writes a `user.created` audit row with `"provider": "ad"` and
+  where the address came from.
+  The account can then take `PUT /users/{user_id}/federated-identity`. There is no console screen
+  for it yet. (`BACKLOG #2021`, ADR 0184)
 - **A DAST pass now sends hostile bytes to live MLLP, raw-TCP and X12 listeners and checks the
   engine's ingress rules.** `scripts/security/dast_ingress_sweep.py` runs a real engine on loopback.
   It sends broken framing, hostile HL7 and seeded mutations. Six detectors check each case: one reply
@@ -56,6 +75,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: an administrator must give a notification address to create an account.**
+  `POST /users` now requires `email`, and the web console's create-user form requires it too. The
+  address becomes the account's notification address, so its holder is told about changes made
+  before their first sign-in, an administrator's password reset included. A blank value, or anything
+  but one plain mailbox, is refused with 400, the same check `PATCH /users/{id}` applies to
+  `notify_email`. A body with no `email` is refused with 422. `EngineClient.create_user` takes `email`
+  as a required keyword. An existing account with no address can be given one through
+  `PATCH /users/{id}` with `notify_email`, which notifies the new address. (`BACKLOG #2018`)
 - **BREAKING — the `Http()` inbound listener answers 400 to a request with no `Host` or with two.**
   RFC 9112 section 3.2 requires a server to refuse both shapes. In the shipped code an HTTP/1.1
   request with no `Host` was accepted, and a second `Host` silently replaced the first. The listener
@@ -135,6 +162,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   whatever its `acquire_delay_seconds`. The delay still applies to a lease that expired on its own.
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
+- **BREAKING — the `Http()` inbound listener answers 422 to a body it refuses at ingress.** The
+  engine refuses some bodies after reading them, for example one it cannot decode or one over the
+  ingress ceiling; `docs/CONNECTIONS.md` lists more. The receipt
+  path answered that `202` with no `message_id`, which told the caller its body was accepted. It now
+  answers `422` with `{"error":"message was not accepted"}`, the answer a `reply_from` inbound already
+  gave. The message is still recorded with status `ERROR`. A committed body still gets `202` with its
+  `message_id`. On a `reply_from` inbound, that `422` now logs a `closed` connection event, which it
+  used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
+  to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
 - **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
   is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
@@ -327,6 +363,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   has no effect, such as `[auth].oidc_tls_crl_file` with OIDC off. A CRL that exists but is expired
   or unloadable is still refused when the context is built, under the old `[tls] crl file` prefix.
   (`BACKLOG #1997`)
+- **An SFTP server that is slow to connect is now retried, not dead-lettered or treated as a bad
+  credential.** A server that did not finish the SSH banner or key exchange within the connect
+  timeout was classed as a permanent error, so the delivery would dead-letter on first deployment.
+  One that did not answer authentication in time was classed as a credential fault, so the lane
+  would stop (ADR 0095) though no credential was wrong. Both are now transient, and so is a server
+  that drops the connection before the key exchange completes. A host-key rejection stays
+  permanent, and an authentication refusal stays a credential fault. The connector now also closes
+  the half-open client whenever the connect fails. (`BACKLOG #1999`)
 - **The FHIR parsers and the OIDC token exchange no longer put their input on the exception
   chain.** `FhirPeek.parse`, `FhirResource.parse` and `exchange_code` each raised a content-free
   error `from exc`. The chained decode error holds the whole input: the FHIR body, or the token
@@ -544,8 +588,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   longer emitted. **What an operator must do before turning on `[auth].oidc_enabled`:** link each
   account with `PUT /users/{user_id}/federated-identity` and a body of `{"subject": "<the IdP
   sub>"}`. The issuer is always `[auth].oidc_issuer`, which must be set. The account must already
-  exist as a directory account; a Windows SSO (Kerberos) sign-in creates one. Nothing else creates
-  one yet, so a site with no Kerberos sign-in cannot link anyone until a later change adds that.
+  exist as a directory account. A Windows SSO (Kerberos) sign-in creates one, and so does an
+  administrator's `POST /users/directory`, which needs no sign-in (`BACKLOG #2021`, its own entry).
   The same route with a new `sub` moves the link and signs the account out. `DELETE` on the same
   path removes the link and signs the account out. Both routes need `users:manage` and a fresh
   re-authentication for the action `admin_federated_identity`. Each write leaves an audit row

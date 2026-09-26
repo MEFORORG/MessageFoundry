@@ -1935,9 +1935,12 @@ def Http(
     MLLP's AA-on-receipt (ACK-on-receipt, ADR 0001). A post-ingress routing/transform/delivery failure
     happens *after* the ``202`` and is **not** reflected in the HTTP status (it surfaces as the message's
     ``ERROR``/dead-letter + the AlertSink). A pre-ingress refusal (oversize/malformed/allowlist) returns a
-    synchronous ``4xx`` + an ADR 0021 ``connection_event``. ``GET``/``HEAD`` are static health probes (no
-    ingress row). This is the behaviour of an inbound **without** ``reply_from``; naming it switches
-    to the synchronous captured-downstream reply described below.
+    synchronous ``4xx`` + an ADR 0021 ``connection_event``. A body the engine refuses after reading it
+    (for example one it cannot decode, or one over the ingress ceiling) is recorded with status
+    ``ERROR`` and answered ``422`` with no ``message_id``, in either mode (ADR 0154 amendment
+    2026-09-26). ``GET``/``HEAD`` are static health probes (no ingress row). This is the behaviour of
+    an inbound **without** ``reply_from``; naming it switches to the synchronous captured-downstream
+    reply described below.
 
     **DoS guards** are HTTP twins of MLLP's: ``max_connections`` (flood), ``receive_timeout`` (slow-loris
     — bounds the whole-request read), ``max_body_bytes`` (the frame-cap twin — refused on the declared
@@ -1951,7 +1954,8 @@ def Http(
     handed a ``408`` for a delay the engine imposed. The bucket is **listener-wide, not
     per-connection**: this connector answers one request per connection, so a per-connection bucket
     would pace nothing. A ``GET``/``HEAD`` health probe waits behind an outstanding debt but charges
-    nothing, and neither does a refused request — only a committed message spends the budget. Both
+    nothing. A request refused before its body reaches the engine charges nothing either. Only a body
+    the engine reads and records spends the budget, including one it then refuses with a ``422``. Both
     keys ship **off**, for the same reason as MLLP's: the number has to come from your feed profile.
 
     **TLS (WP-13b).** ``tls=True`` presents ``tls_cert_file``/``tls_key_file`` as the HTTPS server
@@ -2000,9 +2004,9 @@ def Http(
     the caller and *nowhere else* — never logged, and never placed in an exception, a
     ``connection_event.reason`` or a ``message_events.detail``.
 
-    An inbound **without** ``reply_from`` keeps the shipped ``202``-on-receipt behaviour byte for
-    byte; every knob above is inert without it, and setting one alone is refused rather than silently
-    ignored."""
+    An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
+    body, ``422`` for a refused one); every knob above is inert without it, and setting one alone is
+    refused rather than silently ignored."""
     _reject_envref_in_lists("Http", intake_client_subjects=intake_client_subjects)
     settings: dict[str, Any] = {
         "port": port,
