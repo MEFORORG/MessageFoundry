@@ -77,9 +77,10 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # route: the console leg is slice B.
 # BACKLOG #1143 / #295 (ADR 0184 slice B) added four /ui routes and no JSON route: the
 # federated-identity screen and its unlink confirm page, and the link and unlink POSTs behind them.
-_ROUTES_DEFAULT = 112
-_ROUTES_WITH_DOCS = 116
-_ROUTES_WITH_UI = 227
+# BACKLOG #1562 part B added one JSON route, POST /approvals/{approval_id}/resolve, and no /ui route.
+_ROUTES_DEFAULT = 113
+_ROUTES_WITH_DOCS = 117
+_ROUTES_WITH_UI = 228
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -1564,8 +1565,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     # 87 -> 90: BACKLOG #1184's three needle-bearing POSTs, each gated exactly as its GET sibling.
     # 90 -> 91: BACKLOG #1494's POST /cluster/stepdown, gated on the new cluster:control.
     # 91 -> 93: BACKLOG #1143's PUT and DELETE /users/{user_id}/federated-identity, users:manage.
-    assert len(gated) == 93, (
-        f"{len(gated)} permission-gated routes, not 93 — update the doc's totals."
+    # 93 -> 94: BACKLOG #1562 part B's POST /approvals/{approval_id}/resolve, approvals:approve.
+    assert len(gated) == 94, (
+        f"{len(gated)} permission-gated routes, not 94 — update the doc's totals."
     )
 
 

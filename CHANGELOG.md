@@ -7,6 +7,19 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **An operator can now record what an interrupted dual-control release did.** A release cut off
+  mid-run is marked `interrupted`, and until now nothing could move it on. `GET /approvals` now lists
+  `interrupted` rows after the pending ones, each with a `status`, the approver who released it and
+  when it stopped. `POST /approvals/{approval_id}/resolve` takes `{"outcome": "effects_applied"}` or
+  `{"outcome": "effects_not_applied"}` and moves the row to `resolved_applied` or
+  `resolved_not_applied`. It needs `approvals:approve` and a fresh step-up, refuses the original
+  requester, and answers `409` for a row that is not `interrupted`. It never runs the operation
+  again. Each resolve writes an `approval.resolve_attempted` audit row naming the resolver and the
+  outcome before the row moves, and `approval.resolved` after; if the audit log refuses the first,
+  the row stays `interrupted` and the call answers `503`. The engine
+  client gains `list_approvals()` and `resolve_interrupted_approval()`. Not built yet: a web console
+  page for it, a startup pass over rows left `executing`, and a way out for a row left `executing`
+  by a failed status write. (`BACKLOG #1562`)
 - **A DAST pass now sends hostile bytes to live MLLP, raw-TCP and X12 listeners and checks the
   engine's ingress rules.** `scripts/security/dast_ingress_sweep.py` runs a real engine on loopback.
   It sends broken framing, hostile HL7 and seeded mutations. Six detectors check each case: one reply

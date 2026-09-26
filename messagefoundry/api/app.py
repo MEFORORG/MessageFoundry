@@ -97,6 +97,8 @@ from messagefoundry.api.models import (
     AlertTestEmailResult,
     ApprovalDecisionResult,
     ApprovalList,
+    ApprovalResolveRequest,
+    ApprovalResolveResult,
     AttachmentInfo,
     CapturedResponseInfo,
     ChannelInfo,
@@ -3489,10 +3491,18 @@ def create_app(
         _: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalList:
-        """Open (still-pending, unexpired) high-value actions awaiting a second approver."""
+        """Open high-value actions: ``pending`` ones awaiting a second approver, then ``interrupted``
+        releases awaiting a resolve (BACKLOG #1562). Each row carries its ``status``."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
-        return ApprovalList(approvals=[PendingApprovalInfo(**a) for a in await gate.list_pending()])
+        pending = await gate.list_pending()
+        interrupted = await gate.list_interrupted()
+        # Two reads, so a release cut off between them can appear in both. The interrupted read is
+        # the later one and a row never returns to pending, so that status wins. A row released and
+        # settled between the reads still shows as pending; approving it then answers 409.
+        cut_off = {a["id"] for a in interrupted}
+        rows = [a for a in pending if a["id"] not in cut_off] + interrupted
+        return ApprovalList(approvals=[PendingApprovalInfo(**a) for a in rows])
 
     @app.post("/approvals/{approval_id}/approve", response_model=ApprovalDecisionResult)
     async def approve_action(
@@ -3534,6 +3544,36 @@ def create_app(
         except ApprovalError as exc:
             raise HTTPException(exc.status, exc.detail) from exc
         return ApprovalDecisionResult(**outcome)
+
+    @app.post("/approvals/{approval_id}/resolve", response_model=ApprovalResolveResult)
+    async def resolve_action(
+        approval_id: ResourceId,
+        body: ApprovalResolveRequest,
+        request: Request,
+        # Owner ruling 2026-09-26: any approver, with a FRESH step-up, never the requester. A
+        # resolution closes a dual-control record on a person's word alone, so it asks for a
+        # re-proof that approve and reject (require_paced) do not.
+        identity: Identity = Depends(require_step_up(Permission.APPROVALS_APPROVE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ApprovalResolveResult:
+        """Record what an ``interrupted`` release did: ``effects_applied`` or ``effects_not_applied``
+        (BACKLOG #1562 part B). Audited as ``approval.resolve_attempted`` before the row moves and
+        ``approval.resolved`` after; the operation is never re-run. The
+        requester cannot resolve their own request, and a row not ``interrupted`` answers 409."""
+        if gate is None:
+            raise HTTPException(503, "approval workflow is not available")
+        try:
+            outcome = await gate.resolve_interrupted(
+                approval_id,
+                outcome=body.outcome,
+                resolver=identity.username,
+                # The self-resolution refusal keys on the immutable id, like approve (BACKLOG #1540).
+                resolver_user_id=identity.user_id,
+                client=client_ip(request),
+            )
+        except ApprovalError as exc:
+            raise HTTPException(exc.status, exc.detail) from exc
+        return ApprovalResolveResult(**outcome)
 
     # --- config promote / reload ---------------------------------------------
 

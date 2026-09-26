@@ -21,6 +21,9 @@ a row as ``executing`` and settles it to ``approved``, ``failed`` or ``interrupt
 ``decide_pending_approval`` guarded on ``from_status="executing"``. That guard is backend SQL, so the
 real gate runs over each real store here. Only the two account reads are stubbed (see
 :class:`_StandingStore`), because they are not what this contract is about.
+
+The third half is the **resolution** contract (BACKLOG #1562 part B): ``list_interrupted_approvals``
+and the ``from_status="interrupted"`` guard a resolve writes through, again backend SQL.
 """
 
 from __future__ import annotations
@@ -252,3 +255,186 @@ async def _assert_release_outcome_contract(store: Any) -> None:
     await _assert_release_success_contract(store)
     await _assert_release_failure_contract(store)
     await _assert_release_cancel_contract(store)
+
+
+# --- BACKLOG #1562 part B: resolving an interrupted release ----------------------------------------
+
+_RESOLVER = "contract-resolver-name"
+_RESOLVER_ID = "contract-resolver-id-0001"
+
+
+async def _interrupt(store: Any, runs: list[str]) -> tuple[Any, str]:
+    """A gate over ``store`` and a request of its, cut off mid-run so it reads ``interrupted``.
+    ``runs`` records each time the executor starts."""
+    never = asyncio.Event()
+    started = asyncio.Event()
+
+    async def _hangs(_p: Mapping[str, Any]) -> dict[str, Any]:
+        runs.append("started")
+        started.set()
+        await never.wait()
+        return {"ran": True}
+
+    gate = _gate(store, _hangs)
+    approval_id = await _request(gate)
+    task = asyncio.create_task(
+        gate.approve(approval_id, approver=_APPROVER, approver_user_id=_APPROVER_ID)
+    )
+    await asyncio.wait_for(started.wait(), _WAIT_S)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _WAIT_S)
+    assert await _status(store, approval_id) == "interrupted"
+    return gate, approval_id
+
+
+#: Wider than the store's default cap, because the server legs share one table and the list is
+#: oldest-first: leftover interrupted rows from earlier tests would otherwise push this one out.
+_LIST_LIMIT = 10_000
+
+
+async def _resolved_rows(
+    store: Any, approval_id: str, action: str = "approval.resolved"
+) -> list[Any]:
+    return [
+        r
+        for r in await store.list_audit(action=action, limit=500)
+        if json.loads(str(r["detail"])).get("approval_id") == approval_id
+    ]
+
+
+async def _assert_interrupted_resolution_contract(store: Any) -> None:
+    """An interrupted row is listed apart from the pending queue, and a resolve moves it to a
+    terminal status through this backend's ``from_status="interrupted"`` guard, once.
+
+    Pre-part-B there was no listing and no transition out of ``interrupted`` at all."""
+    from messagefoundry.api.approvals import ApprovalError
+
+    for outcome, status in (
+        ("effects_applied", "resolved_applied"),
+        ("effects_not_applied", "resolved_not_applied"),
+    ):
+        runs: list[str] = []
+        gate, approval_id = await _interrupt(store, runs)
+
+        # Listed as interrupted, with who released it and when it was cut off; NOT in the pending
+        # queue, so "pending" still means awaiting a second approver.
+        listed = [
+            r
+            for r in await store.list_interrupted_approvals(limit=_LIST_LIMIT)
+            if str(r["id"]) == approval_id
+        ]
+        assert len(listed) == 1
+        assert str(listed[0]["status"]) == "interrupted"
+        assert str(listed[0]["approver"]) == _APPROVER
+        assert listed[0]["decided_at"] is not None
+        pending = await store.list_pending_approvals(now=float(listed[0]["requested_at"]))
+        assert all(str(r["id"]) != approval_id for r in pending)
+
+        out = await gate.resolve_interrupted(
+            approval_id, outcome=outcome, resolver=_RESOLVER, resolver_user_id=_RESOLVER_ID
+        )
+        assert out["status"] == status and out["resolved_by"] == _RESOLVER
+        assert out["approved_by"] == _APPROVER and out["requested_by"] == _REQUESTER
+
+        row = await store.get_pending_approval(approval_id)
+        assert row is not None
+        assert str(row["status"]) == status
+        # The row keeps who RELEASED it; the resolver lives in the audit row.
+        assert str(row["approver"]) == _APPROVER
+        assert runs == ["started"], "a resolve must never run the operation again"
+
+        # This backend's guard: a second transition out of 'interrupted' moves nothing.
+        assert not await store.decide_pending_approval(
+            approval_id,
+            status="resolved_applied",
+            approver="contract-second",
+            decided_at=2_000.0,
+            from_status="interrupted",
+        )
+        assert await _status(store, approval_id) == status
+        with pytest.raises(ApprovalError) as caught:
+            await gate.resolve_interrupted(
+                approval_id, outcome=outcome, resolver=_RESOLVER, resolver_user_id=_RESOLVER_ID
+            )
+        assert caught.value.status == 409
+
+        # Gone from the interrupted listing once resolved.
+        assert all(
+            str(r["id"]) != approval_id
+            for r in await store.list_interrupted_approvals(limit=_LIST_LIMIT)
+        )
+
+        expected = {
+            "approval_id": approval_id,
+            "operation": "dead_letter_replay",
+            "requester": _REQUESTER,
+            "approver": _APPROVER,
+            "outcome": outcome,
+            "status": status,
+            # The status write replaced decided_at, so the audit rows carry the cut-off time.
+            "interrupted_at": float(listed[0]["decided_at"]),
+        }
+        audited = await _resolved_rows(store, approval_id)
+        assert len(audited) == 1
+        assert str(audited[0]["actor"]) == _RESOLVER
+        assert json.loads(str(audited[0]["detail"])) == expected
+        # One attempt row, written before the move. The second resolve above is refused on the
+        # status check, before it writes one.
+        attempted = await _resolved_rows(store, approval_id, "approval.resolve_attempted")
+        assert len(attempted) == 1
+        assert str(attempted[0]["actor"]) == _RESOLVER
+        assert json.loads(str(attempted[0]["detail"])) == expected
+        # Resolving writes no second outcome row: the trail still says the release was cut off.
+        actions = await _audit_actions(store, approval_id)
+        assert actions == ["approval.interrupted"]
+
+    await _assert_interrupted_listing_is_oldest_first(store)
+
+
+async def _assert_interrupted_listing_is_oldest_first(store: Any) -> None:
+    """Interrupted rows never expire, so the capped listing is OLDEST request first: newest first
+    would hide the longest-waiting rows past the cap for good. Written straight through the store's
+    own transitions, with requested_at values chosen far apart."""
+    ids = {"older": "contractinterruptedolder00000001", "newer": "contractinterruptednewer00000001"}
+    for name, requested_at in (("newer", 20.0), ("older", 10.0)):  # inserted newest first
+        await store.create_pending_approval(
+            approval_id=ids[name],
+            operation="dead_letter_replay",
+            params="{}",
+            requester=_REQUESTER,
+            requester_user_id=_REQUESTER_ID,
+            requested_at=requested_at,
+            expires_at=None,
+        )
+        assert await store.decide_pending_approval(
+            ids[name], status="executing", approver=_APPROVER, decided_at=requested_at + 1.0
+        )
+        assert await store.decide_pending_approval(
+            ids[name],
+            status="interrupted",
+            approver=_APPROVER,
+            decided_at=requested_at + 2.0,
+            from_status="executing",
+        )
+    try:
+        order = [
+            str(r["id"])
+            for r in await store.list_interrupted_approvals(limit=_LIST_LIMIT)
+            if str(r["id"]) in ids.values()
+        ]
+        assert order == [ids["older"], ids["newer"]]
+        # And the cap keeps the oldest. The server legs share the table, so the one row a limit of
+        # 1 returns is at least as old as ours rather than necessarily ours.
+        first = await store.list_interrupted_approvals(limit=1)
+        assert len(first) == 1 and float(first[0]["requested_at"]) <= 10.0
+    finally:
+        # Leave no interrupted rows behind: they would sit at the head of this listing for good.
+        for approval_id in ids.values():
+            await store.decide_pending_approval(
+                approval_id,
+                status="resolved_not_applied",
+                approver=_APPROVER,
+                decided_at=3_000.0,
+                from_status="interrupted",
+            )

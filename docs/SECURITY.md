@@ -18,7 +18,7 @@ with secure defaults, and AD-group→role mapping is automatic.
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer (`[security] require_sign_in = true` by default). Of the **112** engine route objects, **93 demand a
+auth layer (`[security] require_sign_in = true` by default). Of the **113** engine route objects, **94 demand a
 specific permission** and 19 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -317,7 +317,7 @@ apply. What each **adds** over plain `require()`:
 | `require` | 41 | nothing — the ladder itself |
 | `require_paced` | 19 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
-| `require_step_up` | 28 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up` | 29 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 6 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`). Promoting a route here no longer drops the pacing floor |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
@@ -351,7 +351,7 @@ The two gates audit differently. Under the default audit setting, `authorize_ws`
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 95, not 93, because BOTH `/messages/export` routes require two).
+under `create_app()` (they sum to 96, not 94, because BOTH `/messages/export` routes require two).
 
 | Constant | Permission | PHI | Routes | Gates |
 |---|---|---|:--:|---|
@@ -383,7 +383,7 @@ under `create_app()` (they sum to 95, not 93, because BOTH `/messages/export` ro
 | `FILES_BROWSE` | `files:browse` | **PHI** | 4 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
 | `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
-| `APPROVALS_APPROVE` | `approvals:approve` | | 3 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject` (dual control, ASVS 2.3.5). Never assignable to a custom role |
+| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). Never assignable to a custom role |
 
 `config:validate` and `code:edit` have **no API endpoint yet**; they are defined so
 the Deployment/Coding roles are complete and those endpoints can be gated the moment they land, without
@@ -447,12 +447,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **112 route objects** — 71 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket) and 41 declared in
+**Counting basis.** `create_app()` with no arguments builds **113 route objects** — 72 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (71 HTTP + 1 WebSocket) and 41 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
-and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 116 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 227
-(112 + the 114 console routes + the `/ui/static` mount). Of the 112: **93 are permission-gated**, 19 are
+and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 117 (`/openapi.json`,
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 228
+(113 + the 114 console routes + the `/ui/static` mount). Of the 113: **94 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -572,6 +572,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/approvals` | `approvals:approve` | `require` |
 | `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_paced` — the requester can never approve their own request |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
+| `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
 | `POST` | `/dr/activate` | `dr:operate` | `require_paced` |
 | `POST` | `/dr/release` | `dr:operate` | `require_paced` |
@@ -668,7 +669,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 112 route objects a default `create_app()` serves, **fifteen** can put
+**PHI-egress route set.** Of the 113 route objects a default `create_app()` serves, **fifteen** can put
 PHI on the wire: the twelve message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
@@ -1017,10 +1018,36 @@ row:
 | `approved` | The operation ran and returned | `approval.approved` |
 | `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
 | `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
+| `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
+| `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
-worse than a stuck row, so an operator has to check the operation's own effects. The engine has no
-route to settle an `interrupted` row yet. A process that dies mid-operation leaves its row at
+worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
+lists `interrupted` rows after the pending ones, each with its `status`, the approver who released it,
+and when it was cut off. Once the operator has checked, `POST /approvals/{id}/resolve` with
+`{"outcome": "effects_applied"}` or `{"outcome": "effects_not_applied"}` records the finding and moves
+the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
+
+- needs `approvals:approve` **and a fresh step-up** (`require_step_up`), which approve and reject do
+  not ask for;
+- refuses the original requester with **403**, keyed on the user id like the self-approval refusal. The
+  approver who released the request may resolve it;
+- **never runs the operation again**, whichever outcome is chosen. If the effects are missing, request
+  the operation afresh, through dual control;
+- answers **409** for a row that is not `interrupted`, including one another operator resolved first;
+- writes `approval.resolve_attempted` against the resolver **before** the row moves, naming the
+  requester, the releasing approver, the outcome, the new status and the cut-off time. If the audit
+  log refuses it, the resolve answers **503** and the row stays `interrupted`. After the move it writes
+  `approval.resolved` with the same detail; if only that later row fails, the error is logged and the
+  resolve still succeeds, because the attempt row already records it. The row keeps the releasing
+  approver. One case the audit rows cannot settle alone: two resolvers race with the same outcome and
+  the winner's `approval.resolved` is lost. The logged error, which names the approval id, then says
+  who won.
+
+`GET /approvals` lists at most 100 `interrupted` rows, oldest request first, so the requests that
+have waited longest are never the ones cut off.
+
+A process that dies mid-operation leaves its row at
 `executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
 share one store, and each would see the others' live releases as leftovers. If the operation ran but
 the move from `executing` to `approved` fails, the error is logged and the release still succeeds,
@@ -1170,7 +1197,7 @@ revoked. The account lock does not refuse this password re-proof, so a live sess
 already met its second factor keeps step-up during a lock (BACKLOG #1138; see the
 [protection set](#the-documented-protection-set-asvs-611)).
 
-**Gated operations — 34 route objects** (28 `require_step_up` + 6 action-bound `require_step_up_action`).
+**Gated operations — 35 route objects** (29 `require_step_up` + 6 action-bound `require_step_up_action`).
 The complete set, as enumerated in the [route map](#route--permission-map-engine-api) above:
 
 - **User / role administration** — `POST /users`, `DELETE /users/{id}`, `DELETE /users/{id}/sessions`,
@@ -1185,6 +1212,8 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   `POST /config/reload`, `POST /search/presets`.
 - **Uploaded files** — `POST /uploads`, `POST /uploads/{id}/resend`, `DELETE /uploads/{id}`.
 - **Cluster control** -- `POST /cluster/stepdown` (BACKLOG #1494).
+- **Dual control** -- `POST /approvals/{id}/resolve` (BACKLOG #1562). Approve and reject are not
+  step-up gated; this one is, because it closes an approval record on the resolver's word alone.
 - **Bulk-PHI reads** — `GET /messages/search`, `GET /messages/export`, `GET /search/layered`,
   `GET /uploads/{file_id}/messages`, and the body-carrying twins `POST /messages/search`,
   `POST /messages/export` and `POST /uploads/{file_id}/messages/search` (BACKLOG #1184). These are **reads** and are step-up-gated deliberately, because

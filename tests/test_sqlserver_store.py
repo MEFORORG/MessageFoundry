@@ -573,6 +573,15 @@ async def test_approval_release_outcome_contract(store) -> None:
     await _assert_release_outcome_contract(store)
 
 
+async def test_interrupted_approval_resolution_contract(store) -> None:
+    """BACKLOG #1562 part B: this backend lists ``interrupted`` rows apart from the pending queue and
+    moves one to ``resolved_applied`` / ``resolved_not_applied`` through a guarded update, once.
+    ``resolved_not_applied`` is 20 characters, the width of this backend's status column."""
+    from tests._pending_approval_store_contract import _assert_interrupted_resolution_contract
+
+    await _assert_interrupted_resolution_contract(store)
+
+
 async def test_directory_identity_store_contract(store) -> None:
     """BACKLOG #1471 ``get_user_by_directory_object_id`` on the real SQL Server backend.
 
