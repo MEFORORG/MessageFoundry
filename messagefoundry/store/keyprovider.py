@@ -126,10 +126,15 @@ class AutoKeyProvider:
 #: Built-in providers — fully reproduce today's behavior, no external dependency.
 _BUILTIN_PROVIDERS = ("auto", "env", "dpapi")
 
-#: External provider name → optional ``pyproject`` extra that will carry its SDK. Each envelope-decrypts
-#: a wrapped DEK inside an isolated security module (ADR 0019 §3). NOT built here — see
-#: :func:`_load_external_provider`. ``key_provider`` is **not** a file-secret: it names a provider, not
-#: key material, so it must never be added to ``_FILE_SECRET_KEYS`` (ADR 0019 §2).
+#: External provider name → optional ``pyproject`` extra that carries its SDK. Each envelope-decrypts
+#: a wrapped DEK inside an isolated security module (ADR 0019 §3). Each lives in its own module, loaded
+#: by :func:`_load_external_provider`: ``vault`` ships (``keyprovider_vault.py``), and the rest are not
+#: built yet and fail closed if selected. The keyless at-rest gate (``_store_key_configured`` in
+#: ``__main__.py``) counts every name here as a configured key, before it resolves. That is safe
+#: because ``store.base._checked_active_key`` refuses "no key" from any of them, on both the
+#: ``resolve_active_key`` and ``resolve_decrypt_keys`` paths. ``key_provider`` is **not** a
+#: file-secret: it names a provider, not key material, so it must never be added to
+#: ``_FILE_SECRET_KEYS`` (ADR 0019 §2).
 _EXTERNAL_PROVIDERS: dict[str, str] = {
     "aws_kms": "aws_kms",
     "azure_kv": "azure_kv",

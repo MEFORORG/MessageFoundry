@@ -2715,8 +2715,8 @@ def Direct(
     mail, MDN, and DNS-CERT discovery are deferred, ADR 0085 PR1). The Handler produces the clinical
     **body** (content-agnostic — an HL7 string, a CDA/XML document, plain text); this **signs** it with
     ``signing_key``/``signing_cert``, **encrypts** the signed blob to the partner's ``recipient_cert``
-    (which must chain to ``trust_anchor``), and submits the S/MIME message to ``host:port`` over
-    STARTTLS. All cert/key material is loaded + validated at construction (fail loud).
+    (which must chain to ``trust_anchor`` and carry an RSA key), and submits the S/MIME message to
+    ``host:port`` over STARTTLS. All cert/key material is loaded + validated at construction (fail loud).
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``

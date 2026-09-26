@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import _FILE_SECRET_KEYS, StoreSettings
-from messagefoundry.store.base import resolve_active_key
+from messagefoundry.store.base import resolve_active_key, resolve_decrypt_keys
 from messagefoundry.store.crypto import PREFIX, CipherError, cipher_info, make_cipher
 from messagefoundry.store.keyprovider import (
     KNOWN_PROVIDERS,
@@ -175,6 +175,29 @@ def test_external_provider_lazy_hook_wires_a_shipped_module(
     provider = resolve_key_provider(s)
     assert isinstance(provider, EnvKeyProvider) and provider.active_key() == "QUJD"
     assert captured["settings"] is s
+
+
+def test_an_external_provider_that_returns_no_key_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #1998: the keyless at-rest gate counts a configured external provider as keyed before it
+    # resolves, so a provider module that returned None would otherwise open under the identity cipher.
+    fake = ModuleType("messagefoundry.store.keyprovider_vault")
+    fake.build_provider = EnvKeyProvider  # type: ignore[attr-defined]  # no encryption_key -> None
+    monkeypatch.setattr(
+        "messagefoundry.store.keyprovider.importlib.import_module", lambda _name: fake
+    )
+    with pytest.raises(KeyProviderError, match="resolved no key"):
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    # The DR restore path builds its keyring separately; a retired key must not stand in for the
+    # missing active one there either.
+    with pytest.raises(KeyProviderError, match="resolved no key"):
+        resolve_decrypt_keys(StoreSettings(key_provider="vault", encryption_keys_retired="QUJD"))
+    # The control: the same fake with a key resolves it, so the raise is about the missing key.
+    assert resolve_active_key(StoreSettings(key_provider="vault", encryption_key="QUJD")) == "QUJD"
+    assert resolve_decrypt_keys(StoreSettings(key_provider="vault", encryption_key="QUJD")) == [
+        "QUJD"
+    ]
 
 
 def test_unknown_provider_fails_closed() -> None:

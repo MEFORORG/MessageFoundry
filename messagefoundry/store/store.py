@@ -3908,9 +3908,15 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     -- why, and ApprovalGate.approve is what enforces it.
     requester_user_id TEXT,
     requested_at REAL NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired | failed
-                                       -- 'failed': the gate released it but the executor raised, so
-                                       -- the operation did NOT happen (ASVS 2.3.3 compensation)
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | executing | approved | rejected
+                                       -- | expired | failed | interrupted (BACKLOG #1562)
+                                       -- 'executing': released and claimed, the executor is running;
+                                       -- 'approved' is written only after the executor returns
+                                       -- 'failed': the executor raised, or the release was cancelled
+                                       -- before it started, so the operation did NOT complete
+                                       -- (ASVS 2.3.3 compensation)
+                                       -- 'interrupted': cancelled mid-execution; the outcome is
+                                       -- UNKNOWN, and nothing retries it
     approver     TEXT,                 -- the distinct second user who released/declined it
     decided_at   REAL,
     expires_at   REAL                  -- NULL = never; past this a pending request can't be approved
@@ -9973,10 +9979,11 @@ class MessageStore:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
 
-        ``from_status`` defaults to ``pending`` (the request/decide path: approved/rejected/expired).
-        The approval gate also uses it for the ASVS 2.3.3 compensating transition ``approved`` ->
-        ``failed``, which must NOT be able to move a row some other caller already rejected or
-        expired — hence the guard is a parameter rather than a hardcoded literal."""
+        ``from_status`` defaults to ``pending`` (the request/decide path: executing/rejected/expired).
+        The approval gate also uses it to settle a claimed row out of ``executing`` -- to
+        ``approved``, to ``failed`` (the ASVS 2.3.3 compensation) or to ``interrupted`` (BACKLOG
+        #1562) -- none of which may move a row some other caller already rejected or expired, hence
+        the guard is a parameter rather than a hardcoded literal."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
@@ -10199,6 +10206,7 @@ class MessageStore:
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
+        adopt_notify_email: bool = True,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
@@ -10213,7 +10221,7 @@ class MessageStore:
                     auth_provider,
                     display_name,
                     email,
-                    seed_notify_email(email),
+                    seed_notify_email(email) if adopt_notify_email else None,
                     now,
                     now,
                     password_hash,

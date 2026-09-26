@@ -492,7 +492,9 @@ class StoreSettings(_Section):
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
     # single built-in source; `aws_kms`|`azure_kv`|`gcp_kms`|`vault`|`pkcs11` are external HSM/KMS/Vault
-    # envelope-decrypt providers (lazy, optional extras — not built yet, fail closed if selected). This
+    # envelope-decrypt providers (lazy, optional extras; `vault` ships in store/keyprovider_vault.py, the
+    # rest are not built yet and fail closed if selected). Every external provider counts as a
+    # configured key for the keyless at-rest gate, before it resolves (BACKLOG #1998). This
     # names a *provider*, not key material, so it is NOT a secret — it must never be added to
     # `_FILE_SECRET_KEYS`. Unknown/unresolvable values fail closed at `open_store` (store/keyprovider.py).
     key_provider: str = "auto"

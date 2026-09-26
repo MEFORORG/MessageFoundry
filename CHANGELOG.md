@@ -141,6 +141,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   caller piping to `jq` got an empty stdout. They now print `{"error": ...}` on stdout, as the
   unreadable-file refusal already did. The message and exit code 2 are unchanged, and text mode is
   byte-identical. (`BACKLOG #1922`)
+- **`Direct(...)` now fails at construction on faults that used to fail every send.** A
+  `recipient_cert` whose key is not RSA is refused, because the S/MIME envelope supports RSA key
+  transport only. This reverses the EC recipient allowance. An EC `signing_key` or `trust_anchor` is
+  still accepted. Construction also signs and encrypts one synthetic body. So a crypto library that
+  refuses the algorithms, or a line break inside `subject`, now fails `check`.
+- **A `Direct(...)` message that cannot be built now dead-letters at once, with no body on the
+  error.** That is a body the `encoding` cannot represent, or a build failure that began after
+  construction. It used to be a retried transport error. The error now keeps only the failure class,
+  or the codec and position. The old one chained the encode error, whose `.object` is the whole body.
+  `UnsupportedAlgorithm` and `InternalError` are now mapped too. The first was reported under a
+  FIPS-enabled OpenSSL. Neither case was reproduced. (`BACKLOG #1918`, `#1919`, `#1920`, `#1921`)
 - **The shared redactor now scrubs FHIR JSON, DICOM tag dumps and XML, not only HL7.** Its passes
   were HL7-shaped, so a structured payload handed them single tokens and a family name, an MRN or a
   DICOM patient id went through a stored error, a log line, the support bundle and `GET /logs/tail`
@@ -161,6 +172,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   `approval.approved` write is logged at ERROR and the release still succeeds. The replay and
   reload executors had the mirror defect: their own audit row failing after the action ran made
   the gate mark the request `failed`. They now log that failure at ERROR instead. (`BACKLOG #1940`)
+- **A dual-control release now records whether its operation finished, failed or was cut off.**
+  The gate used to mark a request `approved` before the operation ran, so a crash or a request
+  timeout mid-run left a row claiming an outcome nobody saw. The gate now claims the request as
+  `executing`, then settles it once the operation stops. `approved` means it ran and returned.
+  `failed` means it raised, or the release was cancelled before it started. `interrupted` means it
+  was cancelled while running, so it may have done none, some or all of its work; that writes a new
+  `approval.interrupted` audit row, and nothing retries it. Every outcome write is shielded, so a
+  second cancel cannot stop it. If the move to `approved` fails after the operation ran, the error
+  is logged and the release still succeeds, and the row may stay `executing`. A process that dies
+  mid-run also leaves its row at `executing`; nothing reconciles those rows yet.
+  (`BACKLOG #1562`)
 - **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
   stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
   stage stopped draining while intake kept acknowledging, and the engine still read healthy. The

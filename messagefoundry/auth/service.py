@@ -437,6 +437,23 @@ def _is_single_mailbox(address: str) -> bool:
     )
 
 
+def _is_adoptable_directory_address(address: str) -> bool:
+    """Whether a stripped, directory-supplied ``address`` may stand as a notification address.
+
+    One plain mailbox (:func:`_is_single_mailbox`), pure ASCII, and no ``xn--`` domain label, so a
+    directory writer cannot pass off a homoglyph lookalike of the holder's real address. It does
+    NOT catch an all-ASCII lookalike such as ``examp1e``.
+
+    Two decisions share it, and neither may loosen it for itself: what the address form offers
+    (:meth:`AuthService.suggested_notify_email`, BACKLOG #1139) and whether a directory account's
+    birth seeds ``notify_email`` from its ``mail`` (BACKLOG #2014).
+    """
+    if not _is_single_mailbox(address) or not address.isascii():
+        return False
+    domain = address.rpartition("@")[2]
+    return not any(label.lower().startswith("xn--") for label in domain.split("."))
+
+
 class InvalidNotifyEmail(ValueError):
     """A notification address was refused before anything was written (BACKLOG #1139).
 
@@ -2438,6 +2455,16 @@ class AuthService:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
             user_id = uuid4().hex
+            # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
+            # become `notify_email`, where every later security notice goes. So it must pass the test
+            # the address form applies before it suggests the same value; the form never sees an
+            # account born with an address. Someone who can write `mail` but cannot sign in could
+            # otherwise plant a lookalike before the holder's first sign-in. A refused value stays
+            # in the profile mirror, and the account is born with no target, which confines it
+            # until the holder chooses one (`notify_email_required`). Refused in the same INSERT
+            # rather than cleared after, so no crash can leave the lookalike seeded.
+            directory_mail = (principal.email or "").strip()
+            adopt = not directory_mail or _is_adoptable_directory_address(directory_mail)
             await self._store.create_user(
                 user_id=user_id,
                 username=principal.username,
@@ -2448,7 +2475,23 @@ class AuthService:
                 # unbound state. A crash between the two writes would have left a row no id-carrying
                 # login may adopt and no operator asked for -- a self-inflicted lockout.
                 directory_object_id=principal.directory_object_id,
+                adopt_notify_email=adopt,
             )
+            if not adopt:
+                # The address stays out of the row and the log. It is directory-supplied and may be
+                # a lookalike of someone's real one. The audit row is a second write after the
+                # INSERT, so a crash between them loses the record but never seeds the address.
+                _log.warning(
+                    "directory account %s created without a notification address: the directory "
+                    "mail is not one plain ASCII mailbox with no Punycode label",
+                    user_id,
+                )
+                await self._audit(
+                    "auth.ad_notify_email_not_adopted",
+                    actor=principal.username,
+                    detail=_json({"user_id": user_id, "source": "directory"}),
+                    client=client,
+                )
         else:
             user_id = existing.id
             if principal.username != existing.username:
@@ -2519,13 +2562,20 @@ class AuthService:
                 # follows when it addresses its own EMAIL_CHANGED to ``before.notify_email``.
                 #
                 # THE MIRROR FALLBACK IS NOT DEAD, AND IT IS NOT WHAT ``update_user`` DOES -- that
-                # sibling reads one term. It is reachable in exactly one state, which only this
-                # method can produce: an account created with NO address, which later acquired one
-                # from the directory, because ``update_user_profile`` writes the mirror and never
+                # sibling reads one term. It is reachable in at least two states, which only this
+                # method can produce. One is an account created with NO address, which later acquired
+                # one from the directory, because ``update_user_profile`` writes the mirror and never
                 # seeds ``notify_email``. On that account's next repoint the mirror is the prior
                 # holder. Failing both terms the account has never carried an address at all, so the
                 # incoming value is the only reachable party and there is no earlier holder to
                 # protect -- it is the target rather than announcing a first set to nobody.
+                #
+                # THE OTHER IS AN ACCOUNT WHOSE BIRTH REFUSED THE DIRECTORY'S ``mail`` (BACKLOG
+                # #2014), which keeps that value in the mirror only. Until the holder fills an
+                # address, its next repoint is announced to the refused value, with ``new_email``.
+                # That is a known cost, left open on purpose. Reading the mirror through the birth
+                # test would close it, but would also skip a legitimate non-ASCII profile address an
+                # administrator typed, and tell the new value instead of the old holder.
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=principal.username,
@@ -3472,12 +3522,7 @@ class AuthService:
         already holds, where seam discovery sees it and moves ``ENGINE_UI_SEAM``.
         """
         address = (profile_email or "").strip()
-        if not _is_single_mailbox(address) or not address.isascii():
-            return None
-        domain = address.rpartition("@")[2]
-        if any(label.lower().startswith("xn--") for label in domain.split(".")):
-            return None
-        return address
+        return address if _is_adoptable_directory_address(address) else None
 
     async def fill_own_notify_email(
         self, identity: Identity, email: str, *, client: str | None = None
