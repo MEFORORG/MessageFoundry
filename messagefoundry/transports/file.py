@@ -231,6 +231,8 @@ class FileDestination(DestinationConnector):
         # Optional outbound compression (ADR 0123): "gzip" gzips the encoded body and appends `.gz` to
         # the rendered name; None (default) is byte-identical to before. Single-stream gzip only.
         self.compress: str | None = _validate_compression(s.get("compress"), "compress")
+        # Set once a directory fsync has failed here, so it is logged once and not retried (#1618).
+        self._dir_fsync_unsupported = False
 
     async def _run_fs(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
         """Run a blocking filesystem callable off the event loop — under the alternate credential (on a
@@ -342,14 +344,51 @@ class FileDestination(DestinationConnector):
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
+                # Durable BEFORE it is published (BACKLOG #1618). The delivery worker marks the row
+                # delivered, durably, the moment send() returns. Without this the bytes could still
+                # sit in the page cache then, and a power loss would leave an empty file at the final
+                # name that nothing re-delivers. The rename below is atomic for visibility only.
+                handle.flush()
+                os.fsync(handle.fileno())
             if self._overwrite:
                 os.replace(tmp, target)  # atomic overwrite; consumes tmp
             else:
                 _claim_unique(tmp, target)  # hard-links tmp → a free name
+            # The new directory entry belongs to the directory, not the file, so the published NAME
+            # needs its own flush to survive a crash as well as the bytes.
+            self._fsync_directory()
         finally:
             # Remove the temp; after a successful os.replace it's already gone (suppressed).
             with suppress(OSError):
                 os.unlink(tmp)
+
+    def _fsync_directory(self) -> None:
+        """Flush the destination directory's entries after a publish, on POSIX (BACKLOG #1618).
+
+        POSIX makes a rename or a link durable only once the DIRECTORY is fsync'd. Windows exposes no
+        directory handle through :func:`os.open`, so there is nothing to call there and this returns.
+
+        A failure is logged once per destination and then no longer attempted, rather than raised. The
+        file is already published under its final name with its bytes flushed, so failing the delivery
+        now would make the worker retry and publish a duplicate beside it. Some network filesystems
+        refuse a directory fsync outright, and a WARNING on every delivery there would be noise."""
+        if os.name != "posix" or self._dir_fsync_unsupported:
+            return
+        try:
+            dir_fd = os.open(self.directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError as exc:
+            self._dir_fsync_unsupported = True
+            logger.warning(
+                "file destination %s: the directory could not be fsync'd after a publish (%s); each "
+                "file's bytes are still flushed, but a crash may lose a just-published name. Not "
+                "retried for this destination.",
+                self.directory,
+                safe_exc(exc),
+            )
 
 
 class FileSource(SourceConnector):
@@ -1124,6 +1163,10 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
             # with a sharing violation, replacing the real error with a bogus one.
             with os.fdopen(fd, "wb") as handle, open(tmp, "rb") as source:
                 shutil.copyfileobj(source, handle)
+                # The copy is a NEW file, so the fsync the delivery path gave `tmp` does not cover
+                # it: flush this one's bytes too before reporting it placed (BACKLOG #1618).
+                handle.flush()
+                os.fsync(handle.fileno())
             placed = True
         finally:
             # A copy that dies mid-stream (a full volume, a dropped share) would otherwise leave a
