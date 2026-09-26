@@ -136,6 +136,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **The Python engine client now ends the session a new sign-in replaces.** `EngineClient.login`
+  used to overwrite the bearer token it held and never revoke it, so the old session would have
+  stayed valid on first deployment until it idled out. It now calls `POST /auth/logout` with the
+  old token after the engine accepts the new sign-in, as the IDE does. Unlike the IDE, it ends only
+  a token the engine issued to that client. A token adopted with `set_token`, such as one from a
+  keyring or `--token`, may be shared with another process, so the client drops it and leaves it
+  live. A refused sign-in ends nothing, and a revoke that fails is logged without the token and
+  never fails the sign-in.
+  (`BACKLOG #1901`)
 - **`Direct(...)` now fails at construction on faults that used to fail every send.** A
   `recipient_cert` whose key is not RSA is refused, because the S/MIME envelope supports RSA key
   transport only. This reverses the EC recipient allowance. An EC `signing_key` or `trust_anchor` is
