@@ -24,6 +24,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 
+# AckMode is defined in the client-importable MLLP leaf (BACKLOG #1697) so a client can name it
+# without importing this package; it is re-exported here, where the engine has always found it.
+from messagefoundry.mllpcodec import AckMode as AckMode
+
 
 class ConnectorType(str, Enum):  # noqa: UP042
     """Built-in transport connectors. A closed set: a new transport is a new member here, and no
@@ -94,14 +98,6 @@ class ContentType(str, Enum):  # noqa: UP042
 #: Content types whose inbound bodies are raw bytes, carried as base64 per ADR 0028. Kept as a set so
 #: a byte-oriented codec (e.g. DICOM) opts in by adding its member — see :attr:`ContentType.is_binary`.
 _BINARY_CONTENT_TYPES: frozenset[ContentType] = frozenset({ContentType.BINARY, ContentType.DICOM})
-
-
-class AckMode(str, Enum):  # noqa: UP042
-    """HL7 acknowledgement mode for MLLP/TCP sources."""
-
-    ORIGINAL = "original"  # MSA generated from the inbound message
-    ENHANCED = "enhanced"  # application + commit acks (MSH-15/16)
-    NONE = "none"
 
 
 class AckAfter(str, Enum):  # noqa: UP042

@@ -15,6 +15,10 @@ is a stateful, byte-accurate reassembler that handles both.
 ACKs are built from the inbound MSH (echoing its encoding characters, swapping
 sender/receiver, copying the original control id into MSA-2). ``ack_mode`` selects the
 MSA-1 code family: ``original`` → AA/AE/AR, ``enhanced`` → CA/CE/CR.
+
+The framing and ACK builder are defined in the client-importable leaf
+:mod:`messagefoundry.mllpcodec` (BACKLOG #1697) and re-exported here; this module adds the
+connectors, their TLS and their resource caps.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ import hl7
 from hl7.containers import Component, Field, Repetition
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
-from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -58,10 +62,21 @@ from messagefoundry.config.tls_policy import (
     relax_verify_expiry,
     resolve_trust_anchor,
 )
+from messagefoundry.mllpcodec import (
+    _CODES,
+    CR,
+    DEFAULT_MAX_FRAME_BYTES,
+    EB,
+    SB,
+    AckMode,
+    MLLPDecoder,
+    MLLPFrameError,
+    build_ack,
+    frame,
+)
 from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
-from messagefoundry.timezone import hl7_now
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -74,7 +89,6 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
-from messagefoundry.transports.framing import MLLP_CODEC, FrameDecoder, FrameError
 
 __all__ = [
     "SB",
@@ -99,15 +113,13 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# MLLP framing is the VT/FS+CR preset of the shared, configurable codec (transports.framing); these
-# names + frame()/MLLPDecoder are kept as the MLLP-specific surface so existing imports + tests hold.
-SB = 0x0B  # start block  (VT)
-EB = 0x1C  # end block    (FS)
-CR = 0x0D  # carriage return
+# SB/EB/CR, DEFAULT_MAX_FRAME_BYTES, frame(), MLLPDecoder, MLLPFrameError and build_ack() live in the
+# client-importable leaf `messagefoundry.mllpcodec` (BACKLOG #1697) and are re-exported here, so
+# engine callers and tests that import them from this module keep working.
 
 # Resource caps (DoS guards). All are overridable per connection via MLLP() settings; see
-# docs/CONNECTIONS.md. A falsy value (None/0) in settings disables the cap explicitly.
-DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024  # 16 MiB — fits embedded base64 docs, bounds OOM
+# docs/CONNECTIONS.md. A falsy value (None/0) in settings disables the cap explicitly. The frame
+# cap, DEFAULT_MAX_FRAME_BYTES, is defined in `messagefoundry.mllpcodec` beside the decoder.
 DEFAULT_MAX_CONNECTIONS = 256  # bound concurrent inbound clients (connection-flood guard)
 DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this long (slowloris guard)
 
@@ -400,133 +412,6 @@ def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
     if sock is not None:
         with contextlib.suppress(OSError):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-
-# MLLP's frame-too-large error is the shared codec error under its historical name (subclassing keeps
-# `except MLLPFrameError` working while the codec raises the generic FrameError internally).
-class MLLPFrameError(FrameError):
-    """Raised when an MLLP frame exceeds its configured byte cap before end-of-block.
-
-    Signals the caller to drop the connection rather than buffer an unbounded frame.
-    """
-
-
-def frame(payload: str | bytes, encoding: str = "utf-8") -> bytes:
-    """Wrap a message in an MLLP block: ``SB payload EB CR`` (the VT/FS+CR codec preset)."""
-    return MLLP_CODEC.frame(payload, encoding)
-
-
-class MLLPDecoder(FrameDecoder):
-    """Stateful MLLP frame reassembler — the :class:`~messagefoundry.transports.framing.FrameDecoder`
-    bound to the MLLP (VT/FS+CR) codec.
-
-    Feed it whatever bytes arrive; it yields complete message payloads (framing bytes
-    stripped) as they complete. Bytes outside a frame — including a stray CR after EB or
-    junk before the next SB — are discarded, matching tolerant real-world receivers. A frame
-    over ``max_frame_bytes`` raises :class:`MLLPFrameError`.
-    """
-
-    error_class = MLLPFrameError
-
-    def __init__(self, max_frame_bytes: int | None = None) -> None:
-        super().__init__(MLLP_CODEC, max_frame_bytes=max_frame_bytes)
-
-
-# --- ACK building ------------------------------------------------------------
-
-# MSH-1 default field separator and MSH-2 default encoding characters.
-_DEFAULT_FIELD_SEP = "|"
-_DEFAULT_ENC = "^~\\&"
-
-
-def _no_seg_sep(value: str) -> str:
-    """Strip CR/LF from an echoed ACK value so an attacker-controlled inbound field can't inject a
-    new segment into the ACK we send back (HL7-3)."""
-    return value.replace("\r", " ").replace("\n", " ")
-
-
-def _escape_ack_text(text: str, *, field_sep: str, enc: str) -> str:
-    """Sanitize free-text MSA-3: drop CR/LF and escape the escape char + field separator so the
-    text can't introduce extra fields/segments (the inbound-derived NACK reason is untrusted)."""
-    esc = enc[2] if len(enc) > 2 else "\\"
-    text = _no_seg_sep(text)
-    # Escape the escape char first (so the substitution below stays reversible), then the field sep.
-    return text.replace(esc, f"{esc}E{esc}").replace(field_sep, f"{esc}F{esc}")
-
-
-_CODES = {
-    AckMode.ORIGINAL: {"AA": "AA", "AE": "AE", "AR": "AR"},
-    AckMode.ENHANCED: {"AA": "CA", "AE": "CE", "AR": "CR"},
-}
-
-
-def build_ack(
-    inbound: str | bytes | Peek,
-    *,
-    code: str = "AA",
-    text: str | None = None,
-    ack_mode: AckMode = AckMode.ORIGINAL,
-    control_id: str | None = None,
-    timestamp: str = "",
-) -> str:
-    """Build an HL7 acknowledgement for ``inbound``.
-
-    ``code`` is the logical outcome — ``"AA"`` (accept), ``"AE"`` (error) or ``"AR"``
-    (reject) — mapped to the MSA-1 value appropriate for ``ack_mode``. ``text`` becomes
-    MSA-3 (e.g. a NACK reason). ``control_id`` is the ACK's own MSH-10 (defaults to
-    echoing the inbound control id). ``timestamp`` is MSH-7; pass one to pin it (tests),
-    otherwise it defaults to the current HL7 DTM so strict senders that reject an empty
-    MSH-7 don't NAK-loop and re-send (review low-6).
-
-    The default MSH-7 carries an **explicit numeric UTC offset** (``YYYYMMDDHHMMSS±ZZZZ``, the
-    HL7 v2 DTM/TS form). A bare local stamp would be ambiguous across a daylight-saving fall-back —
-    the same wall-clock hour occurs twice — so a receiver correlating an acknowledgement against its
-    own UTC-stamped record would mis-order events by an hour. An explicit offset pins the instant.
-    An operator-supplied ``timestamp`` is used verbatim; the caller owns its form.
-    """
-    if code not in _CODES[AckMode.ORIGINAL]:
-        raise ValueError(f"unknown ack code {code!r} (expected AA, AE or AR)")
-    timestamp = timestamp or hl7_now(with_offset=True)
-    msa1 = _CODES[ack_mode if ack_mode is not AckMode.NONE else AckMode.ORIGINAL][code]
-
-    try:
-        peek = inbound if isinstance(inbound, Peek) else Peek.parse(inbound)
-    except HL7PeekError:
-        peek = None
-
-    field_sep = (peek.field("MSH-1") if peek else None) or _DEFAULT_FIELD_SEP
-    enc = (peek.field("MSH-2") if peek else None) or _DEFAULT_ENC
-    # Every value below is echoed from the (untrusted) inbound message, so strip CR/LF to prevent
-    # segment injection into the ACK; MSA-3 free text is additionally escaped (HL7-3).
-    sending_app = _no_seg_sep((peek.sending_app if peek else None) or "")
-    sending_fac = _no_seg_sep((peek.sending_facility if peek else None) or "")
-    receiving_app = _no_seg_sep((peek.receiving_app if peek else None) or "")
-    receiving_fac = _no_seg_sep((peek.receiving_facility if peek else None) or "")
-    version = _no_seg_sep((peek.version if peek else None) or "2.5.1")
-    original_control = _no_seg_sep((peek.control_id if peek else None) or "")
-    ack_control = _no_seg_sep(control_id if control_id is not None else original_control)
-
-    # Swap sender/receiver: the ACK goes back the way it came.
-    msh_fields = [
-        "MSH",
-        _no_seg_sep(enc),
-        receiving_app,
-        receiving_fac,
-        sending_app,
-        sending_fac,
-        timestamp,
-        "",
-        "ACK",
-        ack_control,
-        "P",
-        version,
-    ]
-    msh = field_sep.join(msh_fields)
-    msa_fields = ["MSA", msa1, original_control]
-    if text:
-        msa_fields.append(_escape_ack_text(text, field_sep=field_sep, enc=enc))
-    msa = field_sep.join(msa_fields)
-    return msh + "\r" + msa + "\r"
 
 
 # --- per-outbound encoding-character override (Corepoint -override parity) ----
