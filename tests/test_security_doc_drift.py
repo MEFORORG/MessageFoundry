@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1052,6 +1053,74 @@ def test_ui_gate_divergences_are_exactly_the_reviewed_set() -> None:
         )
 
 
+# --- source probes: AST walks, never substring scans (BACKLOG #1818) ----------------------------------
+#
+# Several guards below decide whether a CONTROL exists by reading engine source. A substring scan
+# cannot tell code from a mention: a docstring, a comment or an error string that names the symbol
+# keeps it True after the code is deleted, so the probe cannot fail in the direction it exists to
+# detect. Measured on main at c1f466676: deleting ``transports/dicom.py``'s real
+# ``ctx.verify_mode = ssl.CERT_REQUIRED`` left the data-plane mTLS probe GREEN, because a comment in
+# the same file names ``CERT_REQUIRED``. These helpers read only code: a docstring is a bare string
+# constant and a comment never reaches the tree. ``test_source_probe_helpers_ignore_mentions`` pins
+# that for each helper, and ``test_source_probes_do_not_regress_to_a_substring_scan`` pins that each
+# probe still goes through one.
+
+
+def _referenced_names(tree: ast.AST) -> set[str]:
+    """Every name ``tree`` reads or binds in CODE: bare names and attribute tails (``ssl.X`` -> ``X``)."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+    return names
+
+
+def _call_name(node: ast.AST) -> str | None:
+    """The called name of a CALL node, bare (``f(...)``) or as an attribute tail (``x.f(...)``)."""
+    if not isinstance(node, ast.Call):
+        return None
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
+def _code_calls(source: str, function_name: str) -> bool:
+    """Whether ``source`` CALLS ``function_name``. An import or an ``__all__`` entry is not a call."""
+    return any(_call_name(node) == function_name for node in ast.walk(ast.parse(source)))
+
+
+def _code_references(source: str, name: str) -> bool:
+    """Whether CODE in ``source`` uses ``name`` (``ssl.CERT_REQUIRED``, ``x.tls_client_ca_file``)."""
+    return name in _referenced_names(ast.parse(source))
+
+
+def _code_passes_keyword(source: str, keyword: str, value: str) -> bool:
+    """Whether some call in ``source`` passes ``keyword=value``, with ``value`` a string literal."""
+    return any(
+        isinstance(node, ast.Call)
+        and any(
+            kw.arg == keyword and isinstance(kw.value, ast.Constant) and kw.value.value == value
+            for kw in node.keywords
+        )
+        for node in ast.walk(ast.parse(source))
+    )
+
+
+def _function_references(source: str, function: str, name: str) -> bool:
+    """Whether the CODE of top-level-or-nested ``def function`` in ``source`` uses ``name``."""
+    defs = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == function
+    ]
+    assert len(defs) == 1, f"expected exactly one def {function}, found {len(defs)}"
+    return name in _referenced_names(defs[0])
+
+
 def _console_calls(function_name: str) -> bool:
     """Whether any module under ``messagefoundry_webconsole/`` CALLS ``function_name``.
 
@@ -1061,16 +1130,151 @@ def _console_calls(function_name: str) -> bool:
     would keep a substring probe True, let the caller below take the parity branch, and stop requiring
     ``docs/SECURITY.md`` to re-disclose a gap that had reopened.
     """
-    for module in (_ROOT / "messagefoundry_webconsole").rglob("*.py"):
-        for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
-            if not isinstance(node, ast.Call):
+    return any(
+        _code_calls(module.read_text(encoding="utf-8"), function_name)
+        for module in (_ROOT / "messagefoundry_webconsole").rglob("*.py")
+    )
+
+
+#: Engine-shaped source that only MENTIONS each symbol the probes look for: in a module docstring, an
+#: import, ``__all__``, a string constant, a function docstring and comments. Every helper must read
+#: it as ABSENT; a substring scan reads every one of them as present.
+_MENTION_ONLY_SOURCE = '''
+"""Calls peer_ip_allowed(peer, allow), sets ssl.CERT_REQUIRED, passes reason="roles_changed"."""
+from messagefoundry.netaddr import peer_ip_allowed  # peer_ip_allowed(peer) is the gate
+
+__all__ = ["peer_ip_allowed"]
+MESSAGE = 'peer_ip_allowed( refused; ssl.CERT_REQUIRED; reason="roles_changed"; tls_client_ca_file'
+
+
+def api_client_anchor_spec(api):
+    """Reads api.tls_client_ca_file and calls peer_ip_allowed(peer, allow)."""
+    # ctx.verify_mode = ssl.CERT_REQUIRED
+    # revoke(user, reason="roles_changed")
+    return "roles_changed"
+'''
+
+_SOURCE_PROBE_CASES = [
+    pytest.param(
+        lambda src: _code_calls(src, "peer_ip_allowed"),
+        "if not peer_ip_allowed(peer, self.source_ip_allowlist):\n    pass\n",
+        id="call-bare",
+    ),
+    pytest.param(
+        lambda src: _code_calls(src, "peer_ip_allowed"),
+        "allowed = netaddr.peer_ip_allowed(peer, allow)\n",
+        id="call-attribute",
+    ),
+    pytest.param(
+        lambda src: _code_references(src, "CERT_REQUIRED"),
+        "ctx.verify_mode = ssl.CERT_REQUIRED\n",
+        id="reference",
+    ),
+    pytest.param(
+        lambda src: _code_passes_keyword(src, "reason", "roles_changed"),
+        'revocations.append(SessionRevocation(uid, name, reason="roles_changed"))\n',
+        id="keyword",
+    ),
+    pytest.param(
+        lambda src: _function_references(src, "api_client_anchor_spec", "tls_client_ca_file"),
+        "def api_client_anchor_spec(api):\n    return api.tls_client_ca_file\n",
+        id="function-reference",
+    ),
+]
+
+
+@pytest.mark.parametrize(("probe", "real"), _SOURCE_PROBE_CASES)
+def test_source_probe_helpers_ignore_mentions(probe: Callable[[str], bool], real: str) -> None:
+    """Pins each helper's falsifiability both ways, so none can silently become a substring scan.
+
+    A mention alone must read ABSENT, and the real construct must read PRESENT (BACKLOG #1818).
+    """
+    assert not probe(_MENTION_ONLY_SOURCE), "a mention alone was read as the real construct"
+    assert probe(real), "the real construct was not found; the helper cannot see what it guards"
+
+
+def test_assignment_and_arm_helpers_ignore_mentions() -> None:
+    """The ``__main__.py`` shape guards' helpers, pinned the same way (BACKLOG #1818)."""
+    mention = "admin_exposed = instance_exposed  # never settings.api.serve_ui\n"
+    wrapped = "admin_exposed = (\n    instance_exposed\n    and settings.api.serve_ui\n)\n"
+    assert _assignment_value_names(mention, "admin_exposed") == [{"instance_exposed"}]
+    assert "serve_ui" in _assignment_value_names(wrapped, "admin_exposed")[0]
+
+    head = "if admin_exposed and not settings.approvals.enabled:\n"
+    warn_only = (
+        head + '    """Warn; the owner may later make this return 2."""\n'
+        '    print("warning: approvals off")\n'
+        "    # return 2 once the owner rules\n"
+        "else:\n"
+        "    return 2\n"
+    )
+    arms = _approvals_arms(warn_only)
+    assert len(arms) == 1 and not _arm_can_refuse(arms[0]), (
+        "a mention of `return 2`, or a refusal in the else branch, was read as the arm refusing"
+    )
+    for refusal in ("return 2", "raise SystemExit(2)", "sys.exit(2)", "return"):
+        arm = _approvals_arms(head + '    print("warning: approvals off")\n    ' + refusal + "\n")
+        assert _arm_can_refuse(arm[0]), f"the arm refusing via {refusal!r} was not detected"
+
+
+def _substring_scans(tree: ast.AST) -> list[str]:
+    """Functions in ``tree`` that test membership (``in`` / ``not in``) against raw source text.
+
+    Raw source text is a ``.read_text(...)`` call, or a name bound from one in the same function.
+    ``_DOC.read_text`` is exempt: ``docs/SECURITY.md`` is prose, and a claim about prose is about
+    text.
+    """
+
+    def is_source_read(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "read_text"
+            and not (isinstance(node.func.value, ast.Name) and node.func.value.id == "_DOC")
+        )
+
+    offenders: list[str] = []
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        source_names = {
+            target.id
+            for node in ast.walk(func)
+            if isinstance(node, ast.Assign) and is_source_read(node.value)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Compare):
                 continue
-            func = node.func
-            if isinstance(func, ast.Name) and func.id == function_name:
-                return True
-            if isinstance(func, ast.Attribute) and func.attr == function_name:
-                return True
-    return False
+            for op, right in zip(node.ops, node.comparators, strict=True):
+                if isinstance(op, ast.In | ast.NotIn) and (
+                    is_source_read(right)
+                    or (isinstance(right, ast.Name) and right.id in source_names)
+                ):
+                    offenders.append(func.name)
+    return offenders
+
+
+def test_source_probes_do_not_regress_to_a_substring_scan() -> None:
+    """No probe in this module decides a control exists by ``"symbol" in source`` (BACKLOG #1818).
+
+    Checked on this module's own AST, after a planted substring probe shows the check can fail.
+    """
+    planted = ast.parse(
+        "def probe():\n"
+        "    src = (ROOT / 'tls.py').read_text(encoding='utf-8')\n"
+        "    assert 'CERT_REQUIRED' in src\n"
+        "def inline():\n"
+        "    return {p for p in PATHS if 'peer_ip_allowed(' in p.read_text(encoding='utf-8')}\n"
+    )
+    assert _substring_scans(planted) == ["probe", "inline"], "the regression check cannot fire"
+    offenders = _substring_scans(ast.parse(Path(__file__).read_text(encoding="utf-8")))
+    assert not offenders, (
+        f"these functions test membership against raw source text: {sorted(set(offenders))}. A "
+        "docstring or comment keeps that True after the code is gone. Use _code_calls, "
+        "_code_references or _code_passes_keyword instead."
+    )
 
 
 def test_ui_plane_states_the_phi_read_hop_gap() -> None:
@@ -1107,11 +1311,25 @@ def test_control_plane_mtls_handshake_gate_has_its_own_table_a_row() -> None:
     Why it belongs in Table A at all: it is a pre-auth, consumer-keyed DENY on the CONTROL plane —
     the request never reaches the ASGI stack — and the section claims to inventory every such input on
     both planes, while Table B already gives the identical data-plane gate its own row.
+
+    The code half is three AST reads (BACKLOG #1818). It used to be a substring scan for
+    ``tls_client_ca_file`` in ``api/tls.py``, and only two docstrings there name it: the code reads
+    the setting through ``auth/trust_anchors.py``'s ``api_client_anchor_spec``. So that conjunct was
+    decided by prose and could not fail when the gate stopped reading the setting.
     """
     tls_src = (_ROOT / "messagefoundry" / "api" / "tls.py").read_text(encoding="utf-8")
-    assert "CERT_REQUIRED" in tls_src and "tls_client_ca_file" in tls_src, (
-        "api/tls.py no longer requires a client certificate when [api].tls_client_ca_file is set. "
-        "If the control-plane mTLS gate is gone, remove its Table A row in the same change."
+    anchors_src = (_ROOT / "messagefoundry" / "auth" / "trust_anchors.py").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        _code_references(tls_src, "CERT_REQUIRED")
+        and _code_calls(tls_src, "api_client_anchor_spec")
+        and _function_references(anchors_src, "api_client_anchor_spec", "tls_client_ca_file")
+    ), (
+        "api/tls.py no longer requires a client certificate when [api].tls_client_ca_file is set: "
+        "its code must use ssl.CERT_REQUIRED and call api_client_anchor_spec, which must read "
+        "tls_client_ca_file. If the control-plane mTLS gate is gone, remove its Table A row in the "
+        "same change."
     )
     rows_a, _rows_b = _contextual_table_rows()
     hits = [
@@ -1134,7 +1352,9 @@ def test_ad_role_drift_revocation_has_its_own_table_a_row() -> None:
     takes two passes when it takes one.
     """
     src = (_ROOT / "messagefoundry" / "auth" / "reconcile.py").read_text(encoding="utf-8")
-    assert 'reason="roles_changed"' in src, (
+    # A call passing reason="roles_changed", read from the AST: a docstring quoting the same
+    # keyword kept the old substring scan green with the revocation deleted (BACKLOG #1818).
+    assert _code_passes_keyword(src, "reason", "roles_changed"), (
         "auth/reconcile.py no longer revokes on role drift. If that arm is gone, remove its Table A "
         "row and restore the two-row wording in the same change."
     )
@@ -1560,12 +1780,16 @@ def test_data_plane_mtls_listeners_are_derived_from_the_transports() -> None:
 
     RULE: a transport gaining ``ssl.CERT_REQUIRED`` on its listener is a new pre-auth,
     consumer-keyed DENY on the data plane and needs the row updated.
+
+    The set is read from CODE (BACKLOG #1818). The substring scan it replaced could not fail for
+    ``dicom``: a comment in ``transports/dicom.py`` names ``CERT_REQUIRED``, so deleting the real
+    ``ctx.verify_mode = ssl.CERT_REQUIRED`` left the module in the set and this test green.
     """
     transports = _ROOT / "messagefoundry" / "transports"
     capable = {
         path.stem
         for path in sorted(transports.glob("*.py"))
-        if "CERT_REQUIRED" in path.read_text(encoding="utf-8")
+        if _code_references(path.read_text(encoding="utf-8"), "CERT_REQUIRED")
     }
     assert capable == _MTLS_LISTENER_MODULES, (
         f"the transports building an mTLS-capable context changed: "
@@ -1640,12 +1864,15 @@ def test_data_plane_allowlist_listeners_match_the_transports() -> None:
 
     RULE (binding correction): 8.1.3/8.1.4's inventory must cover the DATA plane. A sixth listener
     gaining the allow-list without a doc row reds CI.
+
+    A module counts only if its code CALLS ``peer_ip_allowed`` (BACKLOG #1818): an import, an
+    ``__all__`` entry, or a comment quoting the call does not enforce anything.
     """
     transports = _ROOT / "messagefoundry" / "transports"
     enforcing = {
         path.stem
         for path in sorted(transports.glob("*.py"))
-        if "peer_ip_allowed(" in path.read_text(encoding="utf-8")
+        if _code_calls(path.read_text(encoding="utf-8"), "peer_ip_allowed")
     }
     assert enforcing == set(_DATA_PLANE_LABELS), (
         "the set of transports enforcing [inbound].source_ip_allowlist changed: "
@@ -1771,6 +1998,45 @@ def test_contextual_prefixed_settings_force_a_documented_decision() -> None:
     )
 
 
+def _assignment_value_names(source: str, target: str) -> list[set[str]]:
+    """For each assignment to the bare name ``target`` in ``source``, the names its VALUE reads.
+
+    An AST read, so a wrapped right-hand side is read whole. The line slice it replaced saw only the
+    first physical line, so ``admin_exposed = (`` over a continuation line naming ``serve_ui`` left
+    the guard green (BACKLOG #1818).
+    """
+    return [
+        _referenced_names(node.value)
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == target for t in node.targets)
+    ]
+
+
+def _approvals_arms(source: str) -> list[ast.If]:
+    """Every ``if`` whose TEST reads ``admin_exposed`` and ``approvals.enabled``: the #189 arm."""
+    return [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.If)
+        and {"admin_exposed", "approvals", "enabled"} <= _referenced_names(node.test)
+    ]
+
+
+def _arm_can_refuse(arm: ast.If) -> bool:
+    """Whether the arm's own body can stop startup: any ``return``, any ``raise``, or an exit call.
+
+    Every spelling, not the literal ``return 2`` the text slice looked for: ``raise SystemExit(2)``
+    and ``sys.exit(2)`` refuse just as well, and the slice was green for both (BACKLOG #1818). The
+    ``else`` branch is not the arm and is not read.
+    """
+    return any(
+        isinstance(node, ast.Return | ast.Raise) or _call_name(node) in {"exit", "_exit"}
+        for stmt in arm.body
+        for node in ast.walk(stmt)
+    )
+
+
 def test_admin_exposed_is_not_derived_from_the_mutated_console_flag() -> None:
     """The exposure predicate must not read a field an earlier arm has already rewritten.
 
@@ -1783,32 +2049,24 @@ def test_admin_exposed_is_not_derived_from_the_mutated_console_flag() -> None:
     The behavioural pins live in ``tests/test_cli.py`` and ``tests/test_checks_gate_parity.py``. This
     is the SHAPE guard: it exists so the defect cannot quietly return through a refactor that keeps
     every current test green (re-introducing the console term only changes behaviour for configs no
-    case happens to cover). Kept here beside the dual-control slice because it uses the same idiom on
-    the same file, including its liveness receipt.
+    case happens to cover). Kept here beside the dual-control guard because both read the same file,
+    each with its own liveness receipt.
     """
     source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
-    marker = "\n    admin_exposed = "
-    # Liveness receipt FIRST: a rename or a reflow that makes the slice empty must red this test, not
-    # make it unfailable. `in` is checked explicitly so the failure names the cause rather than
-    # surfacing a bare ValueError from `index`.
-    assert marker in source, (
-        "no top-level `admin_exposed = ` assignment found in messagefoundry/__main__.py. If it was "
-        "renamed, update this guard AND docs/SECURITY.md Table A AND the literal marker in "
-        "test_startup_dual_control_arm_is_documented_as_warn_only, which all name it."
-    )
-    start = source.index(marker) + 1
-    assignment = source[start : source.index("\n", start)]
-    assert assignment.strip().startswith("admin_exposed = ") and len(assignment.strip()) > len(
-        "admin_exposed = "
-    ), (
-        f"the assignment slice looks wrong — the assertions below would pass vacuously: {assignment!r}"
+    assignments = _assignment_value_names(source, "admin_exposed")
+    # Liveness receipt FIRST: a rename that leaves nothing to read must red this test, not make it
+    # unfailable.
+    assert assignments and all(assignments), (
+        "no `admin_exposed = <expression>` assignment found in messagefoundry/__main__.py. If it was "
+        "renamed, update this guard AND docs/SECURITY.md Table A AND _approvals_arms, which all name "
+        "it."
     )
     for banned in ("ui_exposed", "serve_ui"):
-        assert banned not in assignment, (
+        assert not any(banned in names for names in assignments), (
             f"`admin_exposed` is derived from `{banned}`, which the ADR 0143 degrade arms rewrite in "
             f"place further up this same function (BACKLOG #326). Derive it from `instance_exposed` "
-            f"— the console being mounted is a presentation fact, not an exposure fact. Slice was: "
-            f"{assignment!r}"
+            f"— the console being mounted is a presentation fact, not an exposure fact. Its value "
+            f"reads: {sorted(set().union(*assignments))}"
         )
 
 
@@ -1816,37 +2074,23 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
     """The bind/exposure inventory claimed a refusal the code does not implement.
 
     ``admin_exposed + PHI + approvals off`` prints a warning and falls through on EVERY instance;
-    ``__main__.py`` records the refuse arm as an unresolved owner fork. Derived by slicing the
-    approvals block out of the source and asserting it contains no ``return 2``, so promoting it to a
-    refusal later reds the doc.
+    ``__main__.py`` records the refuse arm as an unresolved owner fork. Derived from the AST of that
+    arm: its body must hold no ``return``, no ``raise`` and no exit call, so promoting it to a refusal
+    later reds the doc.
 
-    The slice is taken by **indentation**, not by "up to the next comment banner". The banner boundary
-    was not reference-invariant: it measured whatever happened to sit between the arm and the next
-    banner, so inserting an unrelated refusal after the arm (the ASVS 12.1.1 TLS-floor probe did
-    exactly this) turned the guard red and blamed the approvals arm for a ``return 2`` that was not in
-    it. A gate whose answer depends on unrelated neighbouring code is not measuring its subject.
+    The arm is the ``if`` node and its own body, so nothing that sits after it can be blamed on it.
+    The earlier text slice first ran to the next comment banner and measured whatever sat between,
+    which blamed this arm for the ASVS 12.1.1 TLS-floor probe's ``return 2``. Its indentation-based
+    successor fixed that, and still looked only for the literal ``return 2`` (BACKLOG #1818).
     """
     source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
-    marker = "if admin_exposed and not settings.approvals.enabled"
-    # Slice from the START OF THE LINE, not from the marker itself: the `if`'s own indentation is what
-    # defines its body, and `source.index` lands past the leading whitespace.
-    start = source.rindex("\n", 0, source.index(marker)) + 1
-    lines = source[start:].splitlines(keepends=True)
-    # The arm is the `if` statement and its own body, which is anything indented deeper than the `if`.
-    body_indent = " " * (len(lines[0]) - len(lines[0].lstrip()) + 1)
-    arm_lines = [lines[0]]
-    for line in lines[1:]:
-        if line.strip() and not line.startswith(body_indent):
-            break
-        arm_lines.append(line)
-    arm = "".join(arm_lines)
-    # Liveness receipt: a boundary bug that produced a 1-line slice would make the assertion below
-    # unfailable, so prove the slice actually captured the arm's body before trusting it.
-    assert "warning:" in arm and len(arm_lines) > 5, (
-        f"the arm slice looks wrong ({len(arm_lines)} lines) — the assertion below would pass "
-        f"vacuously. Slice was:\n{arm}"
+    arms = _approvals_arms(source)
+    # Liveness receipt: the assertion below is vacuous unless it is reading the real arm.
+    assert len(arms) == 1 and "print" in {_call_name(n) for n in ast.walk(arms[0])}, (
+        f"expected exactly one `if admin_exposed and not settings.approvals.enabled` arm that prints "
+        f"its warning; found {len(arms)}. Re-locate the arm before trusting the assertion below."
     )
-    assert "return 2" not in arm, (
+    assert not _arm_can_refuse(arms[0]), (
         "the approvals-at-exposure arm now REFUSES to start. Move its row out of the WARN action in "
         "docs/SECURITY.md's Table A (and re-check `_CONTEXT_TABLE_A_ROWS`) in the same change."
     )
