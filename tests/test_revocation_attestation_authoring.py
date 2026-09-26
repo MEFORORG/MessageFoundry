@@ -172,7 +172,7 @@ def test_an_authored_inbound_attestation_crosses_the_enforcing_refusal_and_is_au
         check_inbound_revocation(src, "IB", posture=_ENFORCING)  # no WiringError: the escape works
     audit = " ".join(r.getMessage() for r in caplog.records)
     assert "operator attestation" in audit
-    assert "'IB'" in audit and _REASON in audit
+    assert "connection 'IB';" in audit and _REASON in audit
 
 
 def test_the_same_inbound_unattested_is_still_refused(tmp_path: Path) -> None:
@@ -197,7 +197,8 @@ def test_dest_config_mirrors_the_pair_for_the_smart_token_hop(tmp_path: Path) ->
 
 def test_fhir_lookup_can_author_the_attestation_its_smart_refusal_names(tmp_path: Path) -> None:
     # A lookup's SMART token hop carries the revocation refusal, and that refusal names this lever,
-    # so FhirLookup() must be able to set it: it writes the keys the token provider reads.
+    # so FhirLookup() must be able to set it. The typed fields are what the executor trusts; the
+    # settings keys are a copy for code that reads spec.settings.
     (tmp_path / "lookup.py").write_text(
         f"""
 from messagefoundry import FhirLookup
@@ -208,6 +209,9 @@ FhirLookup("plain", url="https://ehr.example.org/fhir")
         encoding="utf-8",
     )
     lookups = load_config(tmp_path, allow_empty=True).fhir_lookups
+    assert lookups["epic"].tls_revocation_attested is True
+    assert lookups["epic"].tls_revocation_attested_reason == _REASON
+    assert lookups["plain"].tls_revocation_attested is False  # control
     assert lookups["epic"].settings["tls_revocation_attested"] is True
     assert lookups["epic"].settings["tls_revocation_attested_reason"] == _REASON
     assert "tls_revocation_attested" not in lookups["plain"].settings  # control
