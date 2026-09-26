@@ -306,20 +306,33 @@ def reference_frames(plane: str, data: bytes, cap: int) -> tuple[list[bytes], bo
     return frames, False
 
 
-def _blank_segment(payload: bytes) -> bool:
-    """ADR 0191's known finding, recognised by its own narrow discriminator: the frame parses and
-    carries a segment whose id is the empty string.
-
-    Decoded with REPLACEMENT, not strictly, because the defect has two faces. A frame that decodes
-    cleanly raises before its ingress row, so no row and no reply. A frame that fails UTF-8 decode is
-    recorded ERROR first, and then the NAK builder re-parses the bytes leniently and raises, so there
-    is a row and still no reply. Both are this one defect, and a strict decode would miss the second.
-    """
+def _carries_blank_segment(payload: bytes, *, errors: str) -> bool:
     try:
-        peek = Peek.parse(normalize(payload, encoding="utf-8", errors="replace"))
+        peek = Peek.parse(normalize(payload, encoding="utf-8", errors=errors))
         return any(not segment for segment in peek.segments())
-    except ValueError:  # HL7PeekError is a ValueError
+    except ValueError:  # HL7PeekError and UnicodeDecodeError are both ValueErrors
         return False
+
+
+def _blank_segment(payload: bytes) -> bool:
+    """ADR 0191's known finding, recognised by its own narrow discriminator: the frame decodes as
+    UTF-8, parses, and carries a segment whose id is the empty string.
+
+    STRICT decode, because only that face of the defect is still open. Such a frame makes the
+    pre-ACK read raise before its ingress row: since BACKLOG #1619 (engine PR 1583) the listener
+    answers the fault with an AE NAK, but no row is written, so it is still accepted-into-nothing.
+    The face that FAILS UTF-8 decode is recorded ERROR first and, since PR 1583, NAKed too, so it is
+    no longer a defect and must not be tolerated: a regression there reds the run.
+    """
+    return _carries_blank_segment(payload, errors="strict")
+
+
+def _blank_segment_closes(payload: bytes) -> bool:
+    """Whether the listener closes the connection after this frame. Both faces of the blank segment
+    still fault the handler (the invalid-UTF-8 one when its NAK is built), and since PR 1583 a
+    handler fault is answered and then the connection is closed by design, so frames pipelined
+    after it go unanswered and are resent by the sender."""
+    return _carries_blank_segment(payload, errors="replace")
 
 
 def _alphanumeric_field_separator(payload: bytes) -> bool:
@@ -337,9 +350,22 @@ KNOWN_DEFECT_DISCRIMINATORS: dict[str, Callable[[bytes], bool]] = {
 #: The only detectors a known defect may silence. A liveness, time, resource or log finding on the
 #: same case is never tolerated: those would be a SECOND defect riding on the known one.
 KNOWN_DEFECT_DETECTORS = frozenset({"reply", "count_and_log"})
-#: Known defects whose failure closes the connection, measured: the listener's last-resort handler
-#: breaks out of the read loop, so pipelined frames after the defective one are never decoded.
-CONNECTION_DROPPING_DEFECTS = frozenset({"blank-segment"})
+#: Known defects whose frames also close the connection, keyed to the predicate that finds such a
+#: frame. The frames pipelined AFTER the first closing frame are explained; the closing frame itself
+#: is explained only when the defect's own discriminator matches it.
+CONNECTION_CLOSING_FRAMES: dict[str, Callable[[bytes], bool]] = {
+    "blank-segment": _blank_segment_closes,
+}
+
+
+def explained_frames(defect: str, payloads: Sequence[bytes]) -> int:
+    """How many of ``payloads`` the known ``defect`` can account for (0 when it matches none)."""
+    hits = [KNOWN_DEFECT_DISCRIMINATORS[defect](p) for p in payloads]
+    closing = CONNECTION_CLOSING_FRAMES.get(defect)
+    first_close = next((i for i, p in enumerate(payloads) if closing and closing(p)), None)
+    if first_close is None:
+        return sum(hits)
+    return sum(hits[: first_close + 1]) + len(payloads) - first_close - 1
 
 
 def classify_replies(data: bytes) -> tuple[int, int, int]:
@@ -566,14 +592,9 @@ async def _settle(target: IngressTarget, plane: str, seconds: float) -> bool:
 async def run_case(target: IngressTarget, case: Case, budget: Budget) -> CaseResult:
     payloads, overflow = reference_frames(case.plane, case.payload, budget.cap)
     known, known_frames = "", 0
-    for name, hit in KNOWN_DEFECT_DISCRIMINATORS.items():
-        matches = [i for i, payload in enumerate(payloads) if hit(payload)]
-        if matches:
-            # A defect that drops the connection also loses every later frame on it, so those
-            # count as explained; any other defect explains only the frames it matched.
-            dropping = name in CONNECTION_DROPPING_DEFECTS
-            known = name
-            known_frames = len(payloads) - matches[0] if dropping else len(matches)
+    for name in KNOWN_DEFECT_DISCRIMINATORS:
+        if count := explained_frames(name, payloads):
+            known, known_frames = name, count
             break
     result = CaseResult(case.name, case.plane, case.origin, len(payloads), overflow, known)
     before = await _counts(target, case.plane)

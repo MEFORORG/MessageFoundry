@@ -15,7 +15,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   canary that must trip it. The seeded run and the canaries run in the existing required test legs.
   A new advisory `dast-ingress` job in `dast.yml` adds a nightly randomized budget. The first run
   found three engine defects, each pinned by a strict xfail and not fixed here. A blank segment is
-  dropped with no NAK and no ERROR row. An alphanumeric MSH-1 gets an ACK whose MSA-1 cannot be read.
+  NAKed but never recorded. An alphanumeric MSH-1 gets an ACK whose MSA-1 cannot be read.
   The raw-TCP and X12 listeners have no frame deadline. See ADR 0155's 2026-09-26 amendment.
   (`BACKLOG #318`)
 - **Dual control now flags a release whose approver account is new or was just taken over, and an

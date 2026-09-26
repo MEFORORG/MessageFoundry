@@ -271,13 +271,19 @@ in a second.
 xfail, so a fix forces its entry out. The first two are also named in the policy's `known_defects`,
 which the run tolerates only for the `reply` and `count_and_log` detectors:
 
-1. **A blank segment is dropped with no NAK and no ERROR row.** An HL7 frame carrying an empty
-   segment makes the MLLP listener's pre-ACK path raise `IndexError`. The connection closes, and the
-   message is lost outside the count-and-log boundary. A deploying site's sender would retry into the
-   same drop. ADR 0191 recorded the parser half and scoped its effect to loopback re-ingress; the live
-   listener is affected too. The listener also closes the connection, so frames pipelined after
-   the defective one are never decoded. Open engine PR 1579 fixes this at the parser; the strict
-   xfails here flip when it lands.
+1. **A blank segment is NAKed but never recorded.** An HL7 frame that decodes and carries an
+   empty segment makes the MLLP listener's pre-ACK read raise `IndexError` before the ingress row.
+   ADR 0191 recorded the parser half and scoped it to loopback re-ingress; the live listener is
+   affected too. When first found, the frame got no NAK and no row. Engine PR 1583 (BACKLOG #1619,
+   main commit `4f40f3f6e`) now answers any handler fault with an `AE` NAK and closes the
+   connection. So this face now gets a NAK, and still no row: the message is NAKed outside the
+   count-and-log boundary. It stays tolerated and a strict xfail. The face that fails UTF-8 decode
+   was recorded `ERROR` and got no NAK, because the NAK builder re-parsed the bytes and raised. The
+   same commit fixed it, so it is asserted by a plain test, and the tolerance no longer covers it.
+   Either face still closes the connection by design, so frames pipelined after it go unanswered
+   and are resent. Open engine PR 1579 fixes the root cause at the parser. When it lands, the
+   remaining strict xfail passes and fails, and the policy's `blank-segment` entry, its
+   discriminator and the tests that depend on it come out.
 2. **An alphanumeric MSH-1 gets an unreadable ACK.** The message is accepted, and the ACK echoes the
    letter separator, so MSA-1 (itself letters) cannot be read back.
 3. **The raw-TCP and X12 listeners have no frame deadline.** A peer trickling inside

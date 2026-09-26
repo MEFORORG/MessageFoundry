@@ -309,6 +309,24 @@ def test_each_known_defect_discriminator_matches_its_catalogue_case() -> None:
         hit = KNOWN_DEFECT_DISCRIMINATORS[defect]
         assert any(map(hit, reference_frames("mllp", cases[case_name].payload, _CAP)[0])), defect
         assert not any(map(hit, reference_frames("mllp", cases["well-formed"].payload, _CAP)[0]))
+    # The invalid-UTF-8 face of the blank segment was fixed on main by PR 1583, so the discriminator
+    # must NOT match it: a tolerance that covered it would hide a regression.
+    fixed = reference_frames("mllp", cases["blank-segment-invalid-utf8"].payload, _CAP)[0]
+    assert not any(map(KNOWN_DEFECT_DISCRIMINATORS["blank-segment"], fixed))
+
+
+def test_a_closing_frame_explains_its_followers_but_a_fixed_one_not_itself() -> None:
+    """The invalid-UTF-8 blank segment is NAKed and recorded now, so it explains only the frames
+    pipelined after it (the listener closes by design after a handler fault), never its own reply."""
+    from scripts.security.dast_ingress_sweep import explained_frames
+
+    fixed = reference_frames("mllp", _case("mllp", "blank-segment-invalid-utf8").payload, _CAP)[0]
+    open_ = reference_frames("mllp", _case("mllp", "blank-segment").payload, _CAP)[0]
+    good = reference_frames("mllp", _case("mllp", "well-formed").payload, _CAP)[0]
+    assert explained_frames("blank-segment", fixed) == 0
+    assert explained_frames("blank-segment", fixed + good) == 1
+    assert explained_frames("blank-segment", open_ + good) == 2
+    assert explained_frames("blank-segment", good + open_) == 1
 
 
 # =====================================================================================================
@@ -319,17 +337,27 @@ def test_each_known_defect_discriminator_matches_its_catalogue_case() -> None:
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "ENGINE DEFECT: an HL7 frame carrying an empty segment makes the MLLP listener's pre-ACK path "
-        "raise IndexError (Peek's accessor tier, ADR 0191's recorded finding). A frame that decodes "
-        "is dropped with no NAK and no ERROR row; one that fails UTF-8 decode is recorded ERROR and "
-        "then gets no NAK, because the NAK builder re-parses it and raises. A deploying site would "
-        "lose the first outside the count-and-log boundary, and the sender would retry both."
+        "ENGINE DEFECT: an HL7 frame that decodes and carries an empty segment makes the MLLP "
+        "listener's pre-ACK read raise IndexError (Peek's accessor tier, ADR 0191's recorded "
+        "finding) before the ingress row. Since PR 1583 (BACKLOG #1619) the listener answers the "
+        "fault with an AE NAK and closes, but NO row is written, so a deploying site would NAK a "
+        "message it never recorded, outside the count-and-log boundary. Open PR 1579 fixes it."
     ),
 )
-@pytest.mark.parametrize("name", ["blank-segment", "blank-segment-invalid-utf8"])
-async def test_a_blank_segment_is_nakked_and_recorded_error(name: str) -> None:
-    result = await _run_alone(_case("mllp", name), _budget())
+async def test_a_blank_segment_is_nakked_and_recorded_error() -> None:
+    result = await _run_alone(_case("mllp", "blank-segment"), _budget())
     assert not result.findings, result.findings
+
+
+async def test_a_blank_segment_that_fails_utf8_decode_is_nakked_and_recorded_error() -> None:
+    """FIXED ON MAIN, so this is a plain assertion that reds on a regression. The frame is recorded
+    ERROR at the decode step; the NAK builder then faults on the blank segment, and since PR 1583
+    (BACKLOG #1619) the listener answers that fault with an AE NAK instead of dropping silently.
+    Before PR 1583 this frame got an ERROR row and no reply."""
+    result = await _run_alone(_case("mllp", "blank-segment-invalid-utf8"), _budget())
+    assert not result.findings, result.findings
+    assert (result.rejected, result.rows, result.error_rows) == (1, 1, 1)
+    assert result.known_defect == "", "the fixed variant must not be tolerated as a known defect"
 
 
 @pytest.mark.xfail(
