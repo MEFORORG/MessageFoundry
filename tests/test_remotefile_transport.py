@@ -5,6 +5,9 @@
 The remote client is faked (``_make_client`` is monkeypatched, or the ``_SftpClient`` host-key policy
 is exercised against a fake paramiko module), so nothing hits the network or SSH — exactly like the
 DATABASE driver fake and the REST opener fake. paramiko need not be installed.
+
+One exception: where paramiko IS installed, the real-handshake tests near the cipher tests start a
+loopback SSH server on 127.0.0.1 and handshake with it. They skip where it is not.
 """
 
 from __future__ import annotations
@@ -1346,9 +1349,10 @@ def _real_paramiko() -> Any:
 
 
 def _sftp_server_offering(
-    paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path
+    paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path, macs: tuple[str, ...] | None = None
 ) -> tuple[int, Path, Any]:
-    """Start a one-connection loopback SSH server that offers only ``ciphers``.
+    """Start a one-connection loopback SSH server that offers only ``ciphers`` (and only ``macs``,
+    when given; otherwise paramiko's default MAC list, which includes the ETM names).
 
     Returns its port, a ``known_hosts`` file naming its host key (so the client's ``RejectPolicy``
     stays on), and the thread, which the caller joins.
@@ -1385,6 +1389,8 @@ def _sftp_server_offering(
         try:
             transport.add_server_key(host_key)
             transport.get_security_options().ciphers = ciphers
+            if macs is not None:
+                transport.get_security_options().digests = macs
             try:
                 transport.start_server(server=_Server())
             except (paramiko.SSHException, EOFError, OSError):
@@ -1402,7 +1408,11 @@ def _sftp_server_offering(
 
 
 def _connector_handshake(
-    paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    paramiko: Any,
+    ciphers: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    macs: tuple[str, ...] | None = None,
 ) -> str:
     """Run the production ``_SftpClient._connect`` against a server offering ``ciphers``.
 
@@ -1410,7 +1420,7 @@ def _connector_handshake(
     """
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     monkeypatch.setattr(remotefile, "_import_paramiko", lambda: paramiko)
-    port, known_hosts, thread = _sftp_server_offering(paramiko, ciphers, tmp_path)
+    port, known_hosts, thread = _sftp_server_offering(paramiko, ciphers, tmp_path, macs)
     try:
         client = _SftpClient(
             {
@@ -1424,27 +1434,32 @@ def _connector_handshake(
         )
         ssh = client._connect()
         try:
-            return str(ssh.get_transport().remote_cipher)
+            negotiated = str(ssh.get_transport().remote_cipher)
         finally:
             ssh.close()
     finally:
         thread.join(10)
-        assert not thread.is_alive(), "the loopback SSH server did not shut down"
+    # Checked only on the success path, so a failed handshake reports its own exception.
+    assert not thread.is_alive(), "the loopback SSH server did not shut down"
+    return negotiated
 
 
-def _stock_handshake(paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path) -> str:
+def _stock_handshake(
+    paramiko: Any, ciphers: tuple[str, ...], tmp_path: Path, macs: tuple[str, ...] | None = None
+) -> str:
     """The CONTROL: a stock paramiko ``Transport`` with no deny list, against the same server."""
-    port, _known_hosts, thread = _sftp_server_offering(paramiko, ciphers, tmp_path)
+    port, _known_hosts, thread = _sftp_server_offering(paramiko, ciphers, tmp_path, macs)
     try:
         transport = paramiko.Transport(("127.0.0.1", port))
         try:
             transport.start_client(timeout=10)
-            return str(transport.remote_cipher)
+            negotiated = str(transport.remote_cipher)
         finally:
             transport.close()
     finally:
         thread.join(10)
-        assert not thread.is_alive(), "the loopback SSH server did not shut down"
+    assert not thread.is_alive(), "the loopback SSH server did not shut down"
+    return negotiated
 
 
 def test_sftp_real_handshake_negotiates_aes256_gcm(
@@ -2052,3 +2067,19 @@ async def test_remote_source_unsafe_name_refusal_still_logs_no_name_at_all(
     assert "MRN123456789" not in sink.text
     assert SAFE_NAME_LABEL.search(sink.text) is None  # no label either — the name is not touched
     assert IDENTIFIER_SHAPE.search(sink.text) is None
+
+
+def test_sftp_real_handshake_still_needs_an_etm_mac_beside_gcm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """paramiko agrees a MAC even beside an AEAD cipher, so the MAC allow-list still gates the
+    handshake. ``docs/CONNECTIONS.md`` and the CHANGELOG tell server owners so; this pins it.
+
+    CONTROL: a stock client negotiates with the same server, so the refusal is the MAC allow-list's.
+    """
+    paramiko = _real_paramiko()
+    ciphers = ("aes256-gcm@openssh.com",)
+    encrypt_and_mac = ("hmac-sha2-256", "hmac-sha2-512")
+    assert _stock_handshake(paramiko, ciphers, tmp_path / "control", encrypt_and_mac) == ciphers[0]
+    with pytest.raises(paramiko.SSHException, match="(?i)macs"):
+        _connector_handshake(paramiko, ciphers, tmp_path, monkeypatch, encrypt_and_mac)

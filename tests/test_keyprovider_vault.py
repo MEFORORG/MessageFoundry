@@ -240,11 +240,13 @@ def test_an_aes128_kek_is_refused_with_the_steps_that_fix_it(
     message = str(excinfo.value)
     assert repr(_TRANSIT_KEY) in message  # the key, by name
     assert "'aes128-gcm96'" in message  # its type
-    assert "'aes256-gcm96'" in message  # the type to create instead
+    assert "type=aes256-gcm96" in message  # a type to create instead
     assert "MEFOR_STORE_VAULT_TRANSIT_KEY" in message  # the knob to change
     assert "rotating the key keeps its type" in message  # the fix that does not work
-    supported = message.split("Supported types: ", 1)[1]
-    assert "aes256-gcm96" in supported and "aes128" not in supported
+    # The wrapped DEK is sealed under the old key, so a new key alone would fail the next unwrap.
+    assert "re-wrap the DEK" in message and "MEFOR_STORE_VAULT_WRAPPED_DEK" in message
+    supported = message.split("Supported types: ", 1)[1].split(" (ASVS", 1)[0]
+    assert "aes256-gcm96" in supported.split(", ") and "aes128-gcm96" not in supported.split(", ")
     assert KEY_A not in message  # and no key material rides the refusal
     # Refused BEFORE the unwrap: nothing was decrypted under the withdrawn key.
     assert transit.calls == []

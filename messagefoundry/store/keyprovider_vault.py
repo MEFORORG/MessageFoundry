@@ -199,14 +199,15 @@ TRANSIT_KEY_TYPES_AUDIT = TRANSIT_KEY_TYPES_DATA | {"hmac"}
 #: generates this KEK themselves so refusing it costs no counterparty anything.
 TRANSIT_KEY_TYPES_KEK = TRANSIT_KEY_TYPES_DATA | {"rsa-3072", "rsa-4096"}
 
-#: Transit key types an earlier release ACCEPTED and this one refuses, each mapped to the type to
-#: create instead. A deploying site that set one up under the earlier advice would otherwise get
-#: only the supported list, and would not learn that a Vault rotate keeps the type and cannot help.
-_WITHDRAWN_TRANSIT_KEY_TYPES: Mapping[str, str] = {"aes128-gcm96": "aes256-gcm96"}
-
 
 def require_transit_key_type(
-    client: Any, key_name: str, *, allowed: frozenset[str], use: str, selector: str
+    client: Any,
+    key_name: str,
+    *,
+    allowed: frozenset[str],
+    use: str,
+    selector: str,
+    after_switch: str = "",
 ) -> None:
     """Read ``key_name``'s Transit type and REFUSE unless it is one ``use`` can be run under.
 
@@ -220,8 +221,9 @@ def require_transit_key_type(
     check that never runs. Widening a set for a new Transit type is a deliberate edit with the
     requirement in view, not a configuration override.
 
-    A type in :data:`_WITHDRAWN_TRANSIT_KEY_TYPES` gets a refusal that also names the type to
-    create, and says that rotating the key in Vault keeps its type and so cannot fix it.
+    The refusal says how to fix it: Vault cannot change a key's type and a rotate keeps it, so the
+    fix is a new key under ``selector``. ``after_switch`` is appended when that alone is not enough
+    for this use, such as a KEK whose wrapped DEK has to move with it.
 
     Raises :class:`KeyProviderError` so ``open_store`` propagates it and ``serve`` refuses to start
     (ADR 0019 §4 / ADR 0138 fail-closed), never a degrade to a weaker path."""
@@ -234,21 +236,15 @@ def require_transit_key_type(
             f"Vault Transit did not report a key type for {key_name!r} (expected "
             f"response['data']['type']); refusing to start rather than using a key of unknown type."
         )
-    replacement = _WITHDRAWN_TRANSIT_KEY_TYPES.get(key_type)
-    if replacement is not None and key_type not in allowed:
-        raise KeyProviderError(
-            f"Vault Transit key {key_name!r} (from {selector}) is of type {key_type!r}, which "
-            f"this release no longer accepts for {use}. Vault cannot change a key's type, and "
-            f"rotating the key keeps its type, so rotation does not fix this. Create a key of "
-            f"type {replacement!r} (vault write transit/keys/<new-name> type={replacement}) and "
-            f"set {selector} to its name. Supported types: {', '.join(sorted(allowed))}."
-        )
     if key_type not in allowed:
         raise KeyProviderError(
             f"Vault Transit key {key_name!r} (from {selector}) is of type {key_type!r}, which "
             f"cannot be used for {use}. Supported types: {', '.join(sorted(allowed))} "
             f"(ASVS 11.2.3 -- at least 128 bits of security, and the key must support the "
-            f"operation the engine performs on it). Provision a key of a supported type."
+            f"operation the engine performs on it). Vault cannot change a key's type, and "
+            f"rotating the key keeps its type, so create a key of a supported type (for example "
+            f"vault write transit/keys/<new-name> type=aes256-gcm96) and set {selector} to its "
+            f"name. {after_switch}".rstrip()
         )
 
 
@@ -303,6 +299,13 @@ class VaultKeyProvider:
                 transit_key,
                 allowed=TRANSIT_KEY_TYPES_KEK,
                 use="envelope-decrypting the store DEK (Transit decrypt)",
+                # The wrapped DEK is configuration sealed under THIS key, so a new key alone
+                # cannot unwrap it: without this step the next start fails on the decrypt instead.
+                after_switch=(
+                    f"Then re-wrap the DEK: Transit-decrypt {_ENV_WRAPPED_DEK} under the old key, "
+                    f"encrypt the result under the new key, and set {_ENV_WRAPPED_DEK} to that. "
+                    f"The unwrapped DEK is key material: keep it out of shell history and logs."
+                ),
                 selector=_ENV_TRANSIT_KEY,
             )
             # transit.decrypt_data unwraps the DEK inside Vault against the non-extractable KEK and
