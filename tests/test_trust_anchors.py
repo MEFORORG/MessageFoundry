@@ -1047,7 +1047,7 @@ def test_the_ad_anchor_has_the_pin_escape(tmp_path: Path, monkeypatch: pytest.Mo
     path on every bind, so the bytes a pin matched were not the bytes loaded, and this test pinned
     the AD anchor OUT of the pin escape. The bind now loads the checked bytes as ca_certs_data, so a
     matching pin vouches for what is loaded, exactly as it does for every other anchor. Red under:
-    the AD spec still declaring loads_verified_bytes=False."""
+    the pin escape still refusing the AD anchor."""
     body = _block(b"body")
     p = _pem(tmp_path, body)
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
@@ -1056,7 +1056,7 @@ def test_the_ad_anchor_has_the_pin_escape(tmp_path: Path, monkeypatch: pytest.Mo
         ad_tls_ca_cert_file=str(p), ad_tls_ca_cert_pin=hashlib.sha256(body).hexdigest()
     )
     (spec,) = collect_anchor_specs(auth, ApiSettings())
-    assert spec.label == "ad" and spec.loads_verified_bytes is True
+    assert spec.label == "ad"
     enforce_anchor(spec, enforcing=True)
     # The control: with no pin, the same unjudged anchor still refuses at enforce and offers the pin.
     (unpinned,) = collect_anchor_specs(AuthSettings(ad_tls_ca_cert_file=str(p)), ApiSettings())
@@ -1072,19 +1072,14 @@ async def test_the_start_and_the_reload_refuse_an_ad_trusted_certificate_block_a
     """BACKLOG #2034 changed this deliberately. The AD consumer used to read cafile=, which loads a
     TRUSTED CERTIFICATE block, so the reload let one through. It now loads cadata=, which skips the
     block silently, so the bind refuses it at construction and the reload must refuse it too."""
+    from test_tls_cipher_assertion_sites import _ad_settings
+
     from messagefoundry.auth.ldap import LdapAuthenticator
 
     p = _pem(tmp_path, b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n")
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
-    settings = AuthSettings(
-        ad_enabled=True,
-        ad_server="ldaps://dc1.example.test:636",
-        ad_user_search_base="DC=example,DC=test",
-        ad_bind_dn="CN=svc,DC=example,DC=test",
-        ad_bind_password="not-a-real-password",
-        ad_tls_ca_cert_file=str(p),
-    )
+    settings = _ad_settings(ad_tls_ca_cert_file=str(p))
     (ad,) = collect_anchor_specs(settings, ApiSettings())
     with pytest.raises(TrustAnchorError, match="TRUSTED CERTIFICATE"):
         await run_anchor_preflight([ad], store, enforcing=True)
@@ -1210,13 +1205,11 @@ def _pinned_ad_anchor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
     p.write_bytes(good)
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
-    auth = AuthSettings(ad_tls_ca_cert_file=str(p), ad_tls_ca_cert_pin=_sha(good))
+    auth = AuthSettings(
+        ad_tls_ca_cert_file=str(p), ad_tls_ca_cert_pin=hashlib.sha256(good).hexdigest()
+    )
     (spec,) = collect_anchor_specs(auth, ApiSettings())
     return spec, p
-
-
-def _sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 async def _anchored_engine(

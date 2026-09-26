@@ -3561,9 +3561,9 @@ def create_app(
             raise HTTPException(404, "config directory not found") from exc
         except WiringError as exc:
             _log.warning("config reload failed (invalid config): %s", exc)
-            # An inbound connection's trust anchor (BACKLOG #1142, slice 3) is refused inside the
-            # engine and arrives wrapped. It keeps the reason the settings anchors' refusal above
-            # records, so one filter on reason="trust_anchor" sees both.
+            # A trust anchor refused inside the engine arrives wrapped: an inbound connection's CA
+            # (BACKLOG #1142, slice 3) or a settings anchor (BACKLOG #2034). Both record
+            # reason="trust_anchor", so one audit filter sees both.
             anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
             await engine.store.record_audit(
                 "config_reload_failed",

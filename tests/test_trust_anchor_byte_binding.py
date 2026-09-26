@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import datetime
 import hashlib
-import socket
 import ssl
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -41,6 +40,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from test_tls_cipher_assertion_sites import _ad_settings, _context_ldap3_builds
 
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.auth import trust_anchors as ta
@@ -49,7 +49,7 @@ from messagefoundry.auth.ldap import LdapAuthenticator
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, anchor_cadata
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.config.settings import ApiSettings, AuthSettings, ServiceSettings
+from messagefoundry.config.settings import ApiSettings, ServiceSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture, urllib_handler_context
 from messagefoundry.store.base import Row
 from messagefoundry.transports.dicom import _server_ssl_context
@@ -279,41 +279,8 @@ def test_the_api_client_ca_loads_the_checked_bytes_not_the_swapped_file(
 
 def _ad_auth(anchor: Path, pin: str | None, *, enforcing: bool = True) -> LdapAuthenticator:
     """An LDAPS ``LdapAuthenticator`` anchored at ``anchor``. Its constructor runs the check."""
-    settings = AuthSettings(
-        ad_enabled=True,
-        ad_server="ldaps://dc1.example.test:636",
-        ad_user_search_base="DC=example,DC=test",
-        ad_bind_dn="CN=svc,DC=example,DC=test",
-        ad_bind_password="not-a-real-password",
-        ad_tls_ca_cert_file=str(anchor),
-        ad_tls_ca_cert_pin=pin,
-    )
+    settings = _ad_settings(ad_tls_ca_cert_file=str(anchor), ad_tls_ca_cert_pin=pin)
     return LdapAuthenticator(settings, enforcing=enforcing)
-
-
-def _ldap3_context(tls: Any) -> ssl.SSLContext:
-    """The context ldap3's OWN ``Tls.wrap_socket`` builds for a bind, captured off the socket it
-    returns. A socketpair and no handshake: no peer and no network, but ldap3's construction ran."""
-
-    class _Server:
-        host = "localhost"
-
-    class _Conn:
-        def __init__(self, sock: socket.socket) -> None:
-            self.socket: Any = sock
-            self.server = _Server()
-
-    left, right = socket.socketpair()
-    conn = _Conn(left)
-    try:
-        tls.wrap_socket(conn, do_handshake=False)
-        ctx = conn.socket.context
-        assert isinstance(ctx, ssl.SSLContext)
-        return ctx
-    finally:
-        conn.socket.close()
-        left.close()
-        right.close()
 
 
 def test_the_ad_bind_loads_the_checked_bytes_not_the_swapped_file(
@@ -333,7 +300,7 @@ def test_the_ad_bind_loads_the_checked_bytes_not_the_swapped_file(
     for _bind in range(2):  # the service-account bind and the user bind each build a Server
         tls = auth._server().tls
         assert tls.ca_certs_file is None  # the bind never names the path to ldap3
-        ctx = _ldap3_context(tls)
+        ctx = _context_ldap3_builds(tls)
         assert _subjects(ctx) == ["good-ca"]
         _handshake(ctx, _server(good))
         with pytest.raises(ssl.SSLCertVerificationError):
@@ -352,7 +319,7 @@ def test_control_the_old_ad_bind_by_path_picks_up_the_swap(
     swap_after_check(anchor, evil.pem)
     _ad_auth(anchor, hashlib.sha256(good.pem).hexdigest())
 
-    ctx = _ldap3_context(ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=str(anchor)))
+    ctx = _context_ldap3_builds(ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=str(anchor)))
 
     assert _subjects(ctx) == ["evil-ca"]
     _handshake(ctx, _server(evil))

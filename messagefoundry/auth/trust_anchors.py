@@ -115,18 +115,16 @@ class AnchorSpec:
     the configured PEM; ``pin`` is the optional configured SHA-256 pin (any case, optional ``:``
     separators); ``pin_setting`` names where that pin is set, so a refusal can name the escape.
 
-    ``loads_verified_bytes`` says whether the consumer loads the bytes the check read (slice 2's
-    ``cadata=``). Every anchor today does. The AD anchor was the one exception until BACKLOG #2034,
-    because ``ldap3`` read it by path on every bind. Set it ``False`` only for a consumer that reads
-    the file again: a pin cannot stand in for an unreadable ACL or path there, and the PEM shape
-    checks (:func:`anchor_cadata`) do not apply, because ``cafile=`` reads what ``cadata=`` refuses."""
+    Every consumer loads the bytes the check read (slice 2's ``cadata=``), never the file again. That
+    is what lets a matching pin stand in for an unreadable ACL or path, and why every anchor takes
+    the PEM shape checks of :func:`anchor_cadata`. The AD anchor was the one exception, read by path
+    on every bind, until BACKLOG #2034; a consumer that reads by path again must not reuse this."""
 
     label: str
     setting: str
     path: str
     pin: str | None = None
     pin_setting: str | None = None
-    loads_verified_bytes: bool = True
 
 
 @dataclass(frozen=True)
@@ -744,12 +742,6 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
         if windows
         else "a root-owned 755 folder like /etc/messagefoundry/"
     )
-    if not spec.loads_verified_bytes:
-        return (
-            f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-            f"{folder}. A pin does not help here: this anchor is read again by path each time it "
-            "is used, so a pin cannot vouch for the bytes loaded."
-        )
     pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
     return (
         f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
@@ -768,9 +760,7 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
       replace is a finding, not an unknown.
     * An ACL or path that could not be read refuses at ``enforce`` and warns at ``warn`` (BACKLOG
       #1142, slice 3). **A configured pin that matches is the escape**: it warns and loads, at either
-      dial, because the bytes it matched are the bytes the context loads. Not for an anchor whose
-      consumer reads the file again (``loads_verified_bytes`` False): there the pin matched bytes
-      nobody loads."""
+      dial, because the bytes it matched are the bytes the context loads."""
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
@@ -792,7 +782,7 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
     # BACKLOG #1142, slice 3. Slice 2 made the checked bytes the loaded bytes, which is what lets a
     # pin stand in for a read the file system would not give.
     unknown = _indeterminate_message(spec, verdict)
-    if verdict.pin_ok is True and spec.loads_verified_bytes:
+    if verdict.pin_ok is True:
         log.warning(
             "%s\n%s matches the bytes read, and those are the bytes loaded, so it is loaded anyway",
             unknown,
@@ -1072,15 +1062,14 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     **It applies every check a consumer applies**, the PEM shape of :func:`anchor_cadata` included
     (BACKLOG #1142, slice 3). The reload route runs this and builds no context, so before this a
     reload accepted an anchor with no PEM block, or a ``TRUSTED CERTIFICATE`` block, that the next
-    start refuses. The AD anchor takes the shape check too since BACKLOG #2034, because its consumer
-    now loads ``cadata=`` as well. Only an anchor whose consumer reads ``cafile=`` skips it."""
+    start refuses. The AD anchor takes it too since BACKLOG #2034, when its bind moved to the
+    checked bytes."""
     verdict = await asyncio.to_thread(evaluate_anchor, spec)
     shape_error: TrustAnchorError | None = None
-    if spec.loads_verified_bytes:  # a consumer that reads cafile= has no such rule
-        try:
-            anchor_cadata(verdict.data, spec)
-        except TrustAnchorError as exc:
-            shape_error = exc
+    try:
+        anchor_cadata(verdict.data, spec)
+    except TrustAnchorError as exc:
+        shape_error = exc
     previous = await _last_fingerprint(store, spec.label)
     if previous is None:
         await _record(store, spec, "observed", fingerprint=verdict.fingerprint)
@@ -1161,18 +1150,20 @@ def make_settings_anchor_preflight(
     anchor, as it did there."""
     if not specs:
         return None
+    from messagefoundry.config.wiring import WiringError
+
     frozen = tuple(specs)
 
     async def preflight() -> None:
-        from messagefoundry.config.wiring import WiringError
-
         try:
-            try:
-                await run_anchor_preflight(frozen, store, enforcing=enforcing)
-            except (OSError, ValueError) as exc:
-                raise TrustAnchorError(f"a trust anchor could not be read: {exc}") from exc
+            await run_anchor_preflight(frozen, store, enforcing=enforcing)
         except TrustAnchorError as exc:
             raise WiringError(f"a settings trust anchor was refused: {exc}") from exc
+        except (OSError, ValueError) as exc:
+            # An unreadable anchor is a refused anchor, as it was when the reload route ran this.
+            unreadable = TrustAnchorError(f"a trust anchor could not be read: {exc}")
+            unreadable.__cause__ = exc
+            raise WiringError(f"a settings trust anchor was refused: {unreadable}") from unreadable
 
     return preflight
 

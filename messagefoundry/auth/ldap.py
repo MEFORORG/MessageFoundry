@@ -315,10 +315,10 @@ class LdapAuthenticator:
         # file again on every bind. `enforcing` is the [security].enforcement dial, as for the OIDC
         # anchor: a pin mismatch always refuses, and an anchor others can replace refuses at enforce.
         # Only an LDAPS bind loads a CA; a plain ldap:// bind builds no Tls at all.
-        spec = ad_anchor_spec(settings) if self._ldaps else None
-        self._ca_certs_data = (
-            verified_anchor_cadata(spec, enforcing=enforcing) if spec is not None else None
-        )
+        self._ca_certs_data: str | None = None
+        spec = ad_anchor_spec(settings)
+        if self._ldaps and spec is not None:
+            self._ca_certs_data = verified_anchor_cadata(spec, enforcing=enforcing)
         # #329: the instance hop posture (threaded by AuthService from create_app's derived posture).
         # LDAPS is built OUT of the connector-construction gate (AuthService, not build_check_registry),
         # so current_hop_posture() would be None here; the posture must be passed explicitly or the
