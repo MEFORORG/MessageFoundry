@@ -118,13 +118,15 @@ class IngressGuardError(Exception):
     ``"parse"`` for ``Peek.parse`` and ``"strict"`` for strict ``hl7apy`` validation; the dry-run entry
     points never raise any of them.
 
-    **Never raised with the error it replaces on its chain (BACKLOG #1796).** The caught error can hold
+    **Never raised with a body-holding error on its chain (BACKLOG #1796).** The caught error can hold
     the body: a ``UnicodeEncodeError``'s or ``UnicodeDecodeError``'s ``.object`` is the WHOLE text or
     byte string, and an ``HL7PeekError`` from python-hl7 quotes what it failed on. ``from exc`` puts
     that on ``__cause__``. ``from None`` only hides it from the default traceback printer and leaves it
     on ``__context__``, where a structured-logging serializer or a crash reporter still reads it. So
-    each handler here keeps only the content-free reason in a local and raises after the handler has
-    ended, which leaves both empty. ``reason`` is the same text either way.
+    each handler here that catches such an error keeps only the content-free reason in a local and
+    raises after the handler has ended, which leaves both empty. ``reason`` is the same text either
+    way. The one ``from None`` left, :func:`admit_resubmission`'s strict timeout, catches a
+    ``TimeoutError`` that holds nothing.
     """
 
     def __init__(self, reason: str, *, phase: str) -> None:

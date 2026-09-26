@@ -14,7 +14,9 @@ would have leaked on first deployment:
 * ``transports/rest.py`` ``refuse_url_credentials``, where ``urlsplit().port``'s ``ValueError``
   quotes the port field, which is the password in ``https://svc:PW/path``.
 
-Every test here fails against the pre-fix code. Each asserts the planted value is reachable from
+Every refusal test here fails against the pre-fix code; the controls pass on both (measured
+2026-09-26: 9 failed, 5 passed with the four engine files at their parent-commit state). Each refusal
+test asserts the planted value is reachable from
 NEITHER the message NOR anything on ``__cause__``/``__context__``, walking both links at every step.
 The walker is controlled first, and each refusal has a control beside it that still admits.
 Synthetic values only.
