@@ -163,7 +163,7 @@ jobs:
           # Zizmor calls this `artipacked`. It is a low finding in general and worth more here,
           # because this job holds `contents: write` on a `pull_request_target` trigger.
           #
-          # SAFE, AND MEASURED RATHER THAN ASSUMED. The vendored action is a node20 action that
+          # SAFE, AND MEASURED RATHER THAN ASSUMED. The vendored action is a Node action that
           # takes GITHUB_TOKEN through `env:` and talks to the REST API; it never shells out to
           # git, so it does not read these credentials. Against dist/index.js: ZERO matches for
           # child_process|execSync|spawnSync|simple-git, against 357 for octokit/api.github.com.

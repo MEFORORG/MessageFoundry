@@ -17,13 +17,14 @@ from pathlib import Path
 from typing import Literal
 
 from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
-from messagefoundry.auth.trust_anchors import api_client_anchor_spec, enforce_anchor
+from messagefoundry.auth.trust_anchors import api_client_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_crl_check,
     harden_kex_groups,
     harden_verify_flags,
+    narrow_to_approved_suites,
 )
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "ensure_api_tls_material",
     "generated_state_dir",
     "plan_api_tls_material",
+    "plaintext_upstream_hop_unacknowledged",
 ]
 
 log = logging.getLogger(__name__)
@@ -52,7 +54,8 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
 
     #285 (ASVS 6.7.1): when ``tls_client_ca_file`` is set, the client-CA trust anchor is preflighted at
     this construction point — an optional SHA-256 pin (``[api].tls_client_ca_pin``) mismatch refuses
-    always, and a group/world-writable DACL refuses when ``enforcing`` (``[security].enforcement``)."""
+    always, and a group/world-writable DACL refuses when ``enforcing`` (``[security].enforcement``).
+    The context loads the bytes that preflight read, never the file a second time (BACKLOG #1142)."""
     if not api.tls_cert_file:
         raise ValueError("build_api_ssl_context requires [api].tls_cert_file")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -68,13 +71,19 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
     )
     if api.tls_ciphers:
         ctx.set_ciphers(api.tls_ciphers)
+    else:
+        # Unset is no longer "whatever the interpreter enables": the approved AEAD names are the
+        # default on every context the engine builds (BACKLOG #300, the ADR 0188 amendment).
+        narrow_to_approved_suites(ctx)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where the runtime supports it (ASVS 11.6.2)
     harden_cipher_suites(ctx, connector="API/UI listener")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 cert validation (ASVS 12.1.4)
     client_ca = api_client_anchor_spec(api)
     if client_ca is not None:
-        enforce_anchor(client_ca, enforcing=enforcing)  # #285: pin + owner-only-DACL preflight
-        ctx.load_verify_locations(cafile=api.tls_client_ca_file)
+        # #285: pin + owner-only-DACL + path preflight. BACKLOG #1142, slice 2: load the bytes that
+        # preflight read, as cadata=. cafile= would open the file a second time, and a swap between
+        # the two reads would admit a forged client certificate past a pin that matched.
+        ctx.load_verify_locations(cadata=verified_anchor_cadata(client_ca, enforcing=enforcing))
         ctx.verify_mode = ssl.CERT_REQUIRED
         # Opt-in revocation (#1005). NOTE THE POSITION: harden_verify_flags runs ABOVE, before the
         # CA is loaded, and this must NOT sit beside it. The CRL goes into the trust store, so
@@ -112,6 +121,19 @@ def generated_state_dir(store_path: str) -> Path:
 
 # ApiTlsSource and api_tls_source live in messagefoundry.api_tls_source, the stdlib leaf the
 # tray shares, and are re-exported from here.
+
+
+def plaintext_upstream_hop_unacknowledged(api: ApiSettings) -> bool:
+    """True when ``serve`` refuses to start on BACKLOG #1179: the engine serves the proxy-to-engine
+    hop in plaintext (``api_tls_source`` is ``upstream``) and no operator has acknowledged it.
+
+    One predicate for both callers, ``serve`` and the ``upstream-hop-ack`` leg of
+    ``messagefoundry check``, so the refusal and the gate agree by construction.
+    """
+    source = api_tls_source(
+        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
+    )
+    return source == "upstream" and not api.plaintext_upstream_hop_acknowledged
 
 
 @dataclass(frozen=True)

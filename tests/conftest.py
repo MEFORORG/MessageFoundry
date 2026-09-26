@@ -204,6 +204,33 @@ def _allow_insecure_config_source_in_tests() -> Iterator[None]:
             os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = prev
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _pass_the_anchor_path_check_on_windows() -> Iterator[None]:
+    """The trust-anchor path check (BACKLOG #1142, directory arm) reads every directory from the volume
+    root down, and on Windows ``tmp_path`` sits under the user's temp directory. That directory's DACL
+    is the host's, not the test's. Measured on a Windows 11 dev host, 2026-09-24: ``%TEMP%`` grants a
+    local group and an AppContainer capability SID rights that include DELETE, so every ``tmp_path``
+    anchor refuses at ``enforce``, and every test that builds a TLS context from one fails.
+
+    So on win32 only, the name ``trust_anchors`` calls answers ``True``. The check itself is not
+    stubbed: ``tests/test_anchor_path.py`` calls ``anchor_path.anchor_path_verdict`` directly, and
+    its preflight receipts put the real function back. POSIX ``tmp_path`` is a trusted chain (a sticky
+    ``/tmp`` holding the runner's own directory), so the Linux leg runs the real check in every
+    anchor test. The insecure-config escape above is scoped to win32 the same way."""
+    if sys.platform != "win32":
+        yield
+        return
+    from messagefoundry.auth import trust_anchors
+    from messagefoundry.auth.anchor_path import PathVerdict
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(trust_anchors, "anchor_path_verdict", lambda _p: PathVerdict(True, (), "windows"))
+    try:
+        yield
+    finally:
+        patch.undo()
+
+
 # Minimal source-logger set: every background-component child reaches one of these by propagation, so
 # quiescing these five drops a late teardown-window emit at its source. Chosen from the suite's actual
 # late emitters:

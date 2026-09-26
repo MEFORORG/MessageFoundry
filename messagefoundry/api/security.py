@@ -14,7 +14,6 @@ raising, so the caller can close the socket cleanly).
 
 from __future__ import annotations
 
-import datetime
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -24,7 +23,8 @@ from fastapi import HTTPException, Request, WebSocket, status
 
 from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
-from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
+from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.tls_policy import HopDisposition
 
 # Re-imported, not redefined. The cert->principal mapping now lives in the neutral package-root leaf
@@ -68,7 +68,14 @@ _SYSTEM_IDENTITY = Identity.build(
 )
 
 # While an account is flagged to rotate its password, only these self-service routes stay reachable.
-_MUST_CHANGE_EXEMPT_PATHS = frozenset({"/auth/logout", "/auth/me", "/me/password"})
+# /auth/mfa-verify is here for an account that is must-change AND has a factor (admin_reset_password
+# keeps factors): /me/password refuses its pending session until the factor is proven (BACKLOG
+# #1954), so the factor step has to be reachable or the account can do neither. What it adds for
+# every must-change session is that one ceremony: a call draws the sign-in rate budget and, on an
+# account with TOTP, a wrong code counts toward the lockout, exactly as it would unconfined.
+_MUST_CHANGE_EXEMPT_PATHS = frozenset(
+    {"/auth/logout", "/auth/me", "/auth/mfa-verify", "/me/password"}
+)
 
 # ASVS 6.3.3: while a session's second factor is PENDING, only these self-service routes stay
 # reachable. Keyed on (METHOD, path), NOT on path alone like the must-change set above: /me/mfa is
@@ -77,9 +84,10 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset({"/auth/logout", "/auth/me", "/me/password
 #
 # /auth/mfa-verify is HOW a session becomes satisfied, so it must gate itself out; /me/password and
 # /me/reauth are the binding deadlock carve-outs (a fresh account can be must_change AND mfa_pending
-# in the same instant). Enrollment (POST /me/mfa/enroll, /confirm) is NOT listed because it rides
-# require_reauth_only_action, which opts out via mfa_gate=False — an un-enrolled user could never
-# satisfy a gate that stands in front of the only route that enrolls them.
+# in the same instant). /me/password is exempt only for an account with NO factor: see
+# _PASSWORD_CHANGE_ROUTE below. Enrollment (POST /me/mfa/enroll, /confirm) is NOT listed
+# because it rides require_reauth_only_action, which opts out via mfa_gate=False — an un-enrolled
+# user could never satisfy a gate that stands in front of the only route that enrolls them.
 #
 # Deliberately NOT exempt: GET /me/sessions and GET /me/security-events. A pending session has proven
 # ONE factor, which is exactly the attacker-holds-the-password case; handing it the victim's session
@@ -89,8 +97,7 @@ _MUST_CHANGE_EXEMPT_PATHS = frozenset({"/auth/logout", "/auth/me", "/me/password
 #
 # That revocation path serves an account with NO factor, which has nothing to prove at
 # /auth/mfa-verify. An account that HAS one proves it first before that path works (BACKLOG #1951;
-# see AuthService._PENDING_REFUSED_ACTIONS). /me/password is NOT so limited: it revokes every
-# session when it changes the password, from a pending session too.
+# see AuthService._PENDING_REFUSED_ACTIONS). /me/password is limited the same way (#1954).
 _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/auth/logout"),
@@ -101,6 +108,43 @@ _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/me/mfa"),
     }
 )
+
+# BACKLOG #1139 (ASVS 6.3.7): while an account has no notification address and a notice channel is
+# wired (``Identity.must_set_notify_email``), only these routes stay reachable. Keyed on (METHOD,
+# path) for the reason the MFA set above is. /me/notify-email is the way out. The rest are the ways
+# out of the two gates that run first, so neither can deadlock behind this one.
+#
+# THE ``mfa_gate=False`` ROUTES ARE EXEMPT TOO, and they are not listed. Those are the reauth-only
+# factories (TOTP enrolment and confirm, session termination): the escapes an account under
+# ``require_mfa`` with no factor needs. Keying on the flag rather than on a copy of their paths is
+# what keeps this plane and the console's (which exempts every ``allow_mfa_pending`` route) the same.
+#
+# /me/notify-email is deliberately NOT in the MFA set above. A session still owing its factor has
+# proven only the password, and letting that caller choose where the account's notices go would hand
+# a password thief the channel meant to warn the holder.
+_NOTIFY_EMAIL_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("POST", "/auth/logout"),
+        ("GET", "/auth/me"),
+        ("POST", "/auth/mfa-verify"),
+        ("POST", "/me/password"),
+        ("POST", "/me/reauth"),
+        ("GET", "/me/mfa"),
+        ("POST", "/me/notify-email"),
+    }
+)
+
+#: The 403 detail for a session confined by the set above. Clients match on it, so keep it stable.
+NOTIFY_EMAIL_REQUIRED_DETAIL = (
+    "notification address required; POST /me/notify-email to set one, then retry"
+)
+
+# The one exempt route above whose exemption serves an account with NO factor only. A pending
+# session on a non-directory account that HAS one is refused here like anywhere else: a password change
+# revokes every session, so without this a caller holding only the password could lock the real
+# user out and sign them out everywhere (BACKLOG #1954, ASVS 6.3.3).
+# AuthService.password_change_owes_factor decides it; the console's password page asks it too.
+_PASSWORD_CHANGE_ROUTE = ("POST", "/me/password")
 
 # BACKLOG #195a (ASVS 16.3.2): the permissions whose authorization GRANT is worth an audit row when the
 # trail is NARROWED — the sensitive / state-changing / config / user-mgmt surface.
@@ -189,18 +233,11 @@ def pending_credential_deadline(auth: AuthService, user: UserRecord | None) -> f
     refuses this credential on time: no such user, a password the holder chose, or
     ``[auth].initial_password_expiry_hours`` set to 0.
 
-    **The never-claimed first-run bootstrap account gets ``None`` here, on purpose.** WP-3 can retire
-    that ACCOUNT earlier than this CREDENTIAL bound (``bootstrap_expiry_hours`` set shorter), and it
-    is retired outright once a second administrator exists. ``bootstrap-admin.txt`` and the lifespan
-    reminder already state the earlier of the two. Stating the credential bound alone would name a
-    later instant than the real one. The recorded ``password_claimed_at`` stamp is the test, so an
-    ``admin`` account claimed long ago and then reset by another administrator still gets its
-    deadline. The complete answer, one service method that the gate itself calls and that takes the
-    earlier bound, belongs in ``AuthService``.
+    No account is exempt by name. The first-run account named ``admin`` used to get ``None`` here,
+    because the WP-3 sweep could retire it before this bound. ADR 0183 retired that account and its
+    sweep, so an account an operator names ``admin`` is an ordinary account and gets its deadline.
     """
     if user is None or not user.must_change_password:
-        return None
-    if user.username == BOOTSTRAP_USERNAME and user.password_claimed_at is None:
         return None
     return auth.initial_credential_deadline(user.password_changed_at)
 
@@ -220,18 +257,6 @@ def initial_credential_window_hours(auth: AuthService) -> float | None:
     """
     deadline = auth.initial_credential_deadline(0.0)
     return None if deadline is None else deadline / 3600.0
-
-
-def deadline_utc(ts: float) -> str | None:
-    """A deadline instant as a UTC ISO-8601 stamp, for text a client shows to a person.
-
-    ``None`` when the instant cannot be rendered. The expiry setting has no upper bound, and
-    ``fromtimestamp`` raises past year 9999, or past year 3000 on Windows. A deadline that far out
-    is not worth a 500 on the refusal that states it, so the caller drops the sentence instead."""
-    try:
-        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (OverflowError, OSError, ValueError):
-        return None
 
 
 def _allow_no_auth(app_state: object) -> bool:
@@ -340,21 +365,36 @@ def require(
                 ),
             )
         # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
-        # BOTH directions. must_change stays FIRST: a fresh account is must_change AND mfa_pending at
-        # the same instant, and GET /me/mfa is MFA-exempt but NOT must-change-exempt, so leading with
-        # MFA would point that account at /auth/mfa-verify, which it cannot satisfy until it has
-        # rotated — the brick. And this stays ABOVE the permission loop: refusing below it would tell
-        # an unverified caller whether it holds the permission, a free authorization oracle.
-        if (
-            mfa_gate
-            and (request.method, request.url.path) not in _MFA_EXEMPT_ROUTES
-            and not await auth.mfa_satisfied(bearer_token(request))
-        ):
+        # BOTH directions. must_change stays FIRST: a fresh account (a new user) is
+        # must_change AND mfa_pending with NO factor, so leading with MFA would point it at
+        # /auth/mfa-verify with nothing to prove there — the brick. It rotates first instead, and
+        # /me/password lets it, because the factor refusal below skips an account with no factor.
+        # A must-change account that HAS a factor (an admin reset) is sent the other way: /me/password
+        # refuses it with X-MFA-Required, and /auth/mfa-verify is must-change-exempt so it can answer
+        # (BACKLOG #1954). And this stays ABOVE the permission loop: refusing below it would tell an
+        # unverified caller whether it holds the permission, a free authorization oracle.
+        route = (request.method, request.url.path)
+        if mfa_gate and route not in _MFA_EXEMPT_ROUTES:
+            pending = not await auth.mfa_satisfied(bearer_token(request))
+        elif mfa_gate and route == _PASSWORD_CHANGE_ROUTE:
+            pending = await auth.password_change_owes_factor(bearer_token(request))
+        else:
+            pending = False
+        if pending:
             await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 "multi-factor verification required; POST /auth/mfa-verify then retry",
                 headers={"X-MFA-Required": "1"},
+            )
+        # BACKLOG #1139 (ASVS 6.3.7): an account with no notification address sets one first. BELOW
+        # the factor gate, so a password-only session is sent to prove its factor before it can
+        # choose where notices go. ABOVE the permission loop, for the oracle reason given there.
+        if identity.must_set_notify_email and mfa_gate and route not in _NOTIFY_EMAIL_EXEMPT_ROUTES:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                NOTIFY_EMAIL_REQUIRED_DETAIL,
+                headers={"X-Notify-Email-Required": "1"},
             )
         for permission in permissions:
             if not identity.has(permission):
@@ -696,9 +736,11 @@ def _enforce_admin_write_pacing(request: Request, auth: AuthService, identity: I
 
 def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus **step-up re-verification** (ASVS 7.5.3): the caller's session must
-    have re-proved its credential — at login or via ``POST /me/reauth`` — within
-    ``[auth].step_up_max_age_seconds``. Gates the highly sensitive admin / replay / config flows; a
-    stale session is refused with 403 (the console then prompts to re-authenticate and retries). The
+    have re-proved its credential -- at a local login that owes no factor, via ``POST /me/reauth``,
+    or with a code at ``POST /auth/mfa-verify`` (``verify_mfa`` stamps the window), or at their
+    console twins -- within ``[auth].step_up_max_age_seconds``. A directory login opens no window
+    (BACKLOG #1144). Gates the highly sensitive admin / replay / config flows; a stale session is
+    refused with 403 (the console then prompts to re-authenticate and retries). The
     embedding/no-auth path is unaffected (there is no session to step up)."""
     base = require(*permissions)
 
@@ -948,6 +990,10 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     # not tear down an established socket; the connection's own revalidation is the backstop.
     if not await auth.mfa_satisfied(ws_token(websocket)):
         await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
+        return None
+    # BACKLOG #1139: an account that owes a notification address does not stream either. BELOW the
+    # factor check, as in require(), so a password-only probe still leaves its auth.mfa_denied row.
+    if identity.must_set_notify_email:
         return None
     for permission in permissions:
         if not identity.has(permission):

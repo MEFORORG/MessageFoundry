@@ -99,6 +99,37 @@ from typing import Any
 
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
 
+# What ``_parse_config_module`` raises on a config module it cannot turn into a tree (BACKLOG #1858).
+# The advisory legs skip such a file, because ``validate`` runs first and names it: the loader's broad
+# catch reports each of these as ``error loading config module <file>``. Catching ``SyntaxError`` alone
+# let the rest escape as an uncaught traceback. At least these are reachable, each measured by
+# tests/test_parser_refusal_guards.py.
+#
+# * ``SyntaxError`` -- the ordinary broken module, and every encoding failure (see below).
+# * ``MemoryError`` -- the parser's width wall ("Parser stack overflowed"), a bounded parser limit
+#   rather than heap exhaustion, so the interpreter is fully usable afterwards.
+# * ``RecursionError`` -- the depth wall, raised while the parse builds a deeply nested tree.
+# * ``OSError`` -- the file could not be read at all.
+#
+# ``ValueError`` is deliberately absent. ``corepoint_import._verify_compilable`` names it because it
+# compiles a ``str``; these legs parse BYTES, where no ``ValueError`` is reachable. Naming it would turn
+# an unforeseen failure in a security leg into a silent skip rather than a loud one.
+#
+# Never widen this to ``Exception``: the point is to name the failure, and a broad catch would hide a
+# defect in the analysis itself.
+_UNPARSEABLE_MODULE = (SyntaxError, MemoryError, RecursionError, OSError)
+
+
+def _parse_config_module(path: Path) -> ast.Module:
+    """Parse a config module from its BYTES, so its encoding is read the way the loader reads it.
+
+    ``ast.parse`` on bytes honours a PEP 263 coding cookie and a UTF-8 BOM, exactly as the import system
+    does, and turns every decoding failure into a ``SyntaxError`` the loader reports too. Decoding with
+    ``read_text(encoding="utf-8")`` instead diverged from the loader on a module declaring
+    ``# coding: latin-1``: it loads and runs, but the text read fails, so a leg that skipped it would
+    pass the handler-security gate over code nobody scanned, strict mode included (BACKLOG #1858)."""
+    return ast.parse(path.read_bytes())
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -177,14 +208,15 @@ def run_checks(
     the blocking validate leg.
 
     A leg whose SUBJECT survives an empty graph drops the rule unconditionally instead, at its own
-    ``load_config`` — ``build-check``, ``reference-backend``, ``dead-config`` and ``send-target``.
-    Each of their skip arms delegates the reporting to ``validate``, and ``--allow-empty-config`` is
+    ``load_config`` — at least ``build-check``, ``reference-backend``, ``dead-config``,
+    ``send-target`` and ``static-credentials`` (whose settings half dials out with no connection
+    declared). Each of their skip arms delegates the reporting to ``validate``, and ``--allow-empty-config`` is
     exactly when ``validate`` stops reporting it, so a leg that skipped there would be covered by
     nothing — and its "config did not load" line would be false about a config that loaded. Use that
     test when deciding for a new leg: ask whether it reads something a connection-less config still
     has (Routers, Handlers, reference sets), not whether the flag was passed.
 
-    The remaining legs still load with the rule in force and do skip on an empty dir: they report on
+    The other legs still load with the rule in force and do skip on an empty dir: they report on
     connections, and there are none. The skip line they print says "config did not load", which is
     inexact for this one cause; threading the keyword further was left out of scope.
     """
@@ -212,6 +244,13 @@ def run_checks(
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
         ),
+        # BACKLOG #1179: serve refuses a declared terminator whose plaintext hop nobody acknowledged.
+        # Required, so the gate refuses what serve refuses.
+        _check_upstream_hop_ack(
+            config_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
         # ADR 0153: name every outbound that declares cleartext_accepted, so the accepted set is visible
         # in review rather than discoverable only by reading each connection. Advisory — see the check.
         _check_cleartext_accepted(config_dir),
@@ -233,10 +272,13 @@ def run_checks(
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
         ),
-        # #1182 / ASVS 13.2.1: name every DATABASE hop on an unchanging credential. The store's own
-        # precondition is a StoreSettings method and reaches none of these. Advisory, and the refusing
-        # gate is deliberately deferred — see the check.
-        _check_static_db_credentials(config_dir),
+        # #1182 / ASVS 13.2.1: name every backend hop on an unchanging credential or none, graph and
+        # settings. Advisory; the opt-in refusal is [security].require_nonstatic_credentials at serve.
+        _check_static_credentials(
+            config_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
         # #323 layer 3: report whether the [alerts] SMTP hop authenticates the relay. The defect this
         # closes was invisible for exactly as long as nothing reported it. Advisory — see the check.
         _check_alert_smtp_tls(
@@ -395,8 +437,8 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
       so the wrapped f-string flags — pinned by ``test_raise_fstring_flags_call_wrapped_interpolation``.
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
-    A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
-    already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
+    A malformed module never crashes the gate (anything in ``_UNPARSEABLE_MODULE`` → skip that file;
+    ``validate`` already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
     """
     base = Path(config_dir)
     if not base.is_dir():
@@ -406,8 +448,8 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         for node in ast.walk(tree):
@@ -536,8 +578,8 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         for node in ast.walk(tree):
@@ -1205,8 +1247,8 @@ def _check_handler_security(
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         imported = _imported_modules(tree)
@@ -1320,20 +1362,26 @@ _DISPOSITION_ALIASES = {
 }
 
 
-def _expected_disposition(fixture_path: str | Path) -> str | None:
+def _expected_disposition(fixture_path: str | Path, *, cap: int) -> str | None:
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
     Returns the normalized disposition name (one of :data:`_DRYRUN_DISPOSITIONS`), or
     ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
-    Raises ``ValueError`` for an unreadable or unrecognized declaration (a fixture-authoring mistake).
+    Raises ``ValueError`` for an unreadable, over-cap or unrecognized declaration (a fixture-authoring
+    mistake). The sidecar is read under its fixture's ``cap``, so it never lands in memory whole
+    (ASVS 5.1.1, BACKLOG #1127).
     """
+    from messagefoundry.pipeline.dryrun import read_fixture
+
     sidecar = Path(f"{fixture_path}.expect")
     if not sidecar.is_file():
         return None
-    try:
-        raw = sidecar.read_text(encoding="utf-8").strip().upper()
-    except OSError as exc:
-        raise ValueError(f"cannot read {sidecar.name}: {exc}") from exc
+    data = read_fixture(
+        sidecar,
+        cap,
+        advice="an .expect sidecar holds one disposition name",
+    )
+    raw = data.decode("utf-8").strip().upper()
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:
         valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
@@ -1444,7 +1492,8 @@ def _check_dryrun(
         n for n, ic in reg.inbound.items() if ic.deployed and not ic.content_type.is_binary
     ]
     try:
-        message_sets = read_message_sets(mpath, inbound_names, cap=fixture_cap(reg))
+        cap = fixture_cap(reg)
+        message_sets = read_message_sets(mpath, inbound_names, cap=cap)
     except ValueError as exc:
         # An over-cap or unreadable fixture file (BACKLOG #1127) fails the gate with the reader's own
         # message rather than escaping as a traceback.
@@ -1462,7 +1511,7 @@ def _check_dryrun(
     )
     for label, path, raw, target in message_sets:
         try:
-            expected = _expected_disposition(path)
+            expected = _expected_disposition(path, cap=cap)
         except ValueError as exc:
             errors.append(f"{label}: {exc}")
             continue
@@ -1515,6 +1564,33 @@ def _check_dryrun(
     exp_note = f", {asserted} expectation-checked" if asserted else ""
     detail = f"{total} run(s) clean across {len(message_sets)} message(s){pin_note}{exp_note}"
     return CheckResult("dryrun", ok=True, required=True, detail=detail)
+
+
+def _resolve_service_toml(
+    config_dir: str | Path, *, service_config: str | Path | None, suppress_search: bool
+) -> Path | None:
+    """The ``messagefoundry.toml`` a check reads, by the ADR 0050 rules the other checks spell inline:
+    an explicit ``--service-config`` wins, ``--project-root`` confines the look to the config dir, and
+    otherwise the legacy upward walk runs. ``None`` when there is none. New checks call this; the older
+    inline copies are unchanged by BACKLOG #1182."""
+    if service_config is not None:
+        return Path(service_config) if Path(service_config).is_file() else None
+    if suppress_search:
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        return candidate if candidate.is_file() else None
+    return _find_service_toml(config_dir)
+
+
+def _settings_error(exc: Exception) -> str:
+    """A ``load_settings`` failure for a check detail, with no configured value in it.
+
+    ``str(exc)`` on a pydantic error prints ``input_value=``, so an unquoted numeric password would land
+    in check output and any CI log (BACKLOG #1182). Every check's settings arm goes through the one
+    designated renderer, :func:`~messagefoundry.config.settings.settings_error_detail`. Imported
+    lazily, as every engine import in this module is."""
+    from messagefoundry.config.settings import settings_error_detail
+
+    return settings_error_detail(exc)
 
 
 def _find_service_toml(config_dir: str | Path) -> Path | None:
@@ -1581,7 +1657,7 @@ def _check_posture(
             "posture",
             ok=False,
             required=True,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
 
     if settings.ai.environment is None:
@@ -1676,7 +1752,7 @@ def _check_build(
             "build-check",
             ok=False,
             required=True,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
     try:
         # allow_empty: same reason as reference-backend (BACKLOG #1648) -- REQUIRED leg, and its skip
@@ -1784,7 +1860,7 @@ def _check_alert_smtp_tls(
             "alert-smtp-tls",
             ok=False,
             required=False,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
     alerts = settings.alerts
     if not (alerts.email_smtp_host and alerts.email_from):
@@ -2026,8 +2102,8 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
             "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
-            "instance REFUSES these off-loopback at build-check unless the connection declares "
-            "tls_hop_attested or cleartext_accepted"
+            "instance REFUSES these off-loopback at build-check unless that outbound connection "
+            "declares cleartext_accepted with a cleartext_reason (an inbound DatabasePoll cannot)"
         ),
     )
 
@@ -2096,65 +2172,104 @@ def _check_smart_scope(config_dir: str | Path) -> CheckResult:
     )
 
 
-def _check_static_db_credentials(config_dir: str | Path) -> CheckResult:
-    """Surface every declared DATABASE hop that authenticates with an unchanging credential
-    (BACKLOG #1182, ASVS 13.2.1), with its peer.
+def _check_static_credentials(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Surface every backend hop that presents an unchanging credential or none (BACKLOG #1182, ASVS
+    13.2.1), with whether a compliant credential kind exists for it and whether it is opted out.
 
-    ASVS 13.2.1 asks that backend component communications use individual service accounts, short-term
-    tokens or certificates rather than unchanging credentials. The engine has exactly one control on
-    that verb today — the opt-in ``[store].require_managed_identity`` — and it is a ``StoreSettings``
-    method, so it covers the store hop and, by construction, no connector, lookup or reference hop at
-    all. On a first deployment a site could run four database hops on static SQL logins with nothing
-    naming them, while the one flag whose name reads as the engine's database-credential posture
-    reported itself satisfied. This is that report.
+    ASVS 13.2.1 asks that backend component communications use individual service accounts,
+    short-term tokens or certificates rather than unchanging credentials. What counts as a hop, both
+    halves of the set and what is left out are in
+    :mod:`messagefoundry.config.static_credentials`; this check calls its single reader, the same one
+    the serve-time gate and ``GET /security/posture`` call.
 
-    **Advisory (``required=False``), and a refusing gate is deliberately NOT built here.** #1182 records
-    the reason and it is not timidity: a gate shipped before every hop has a reachable compliant
-    credential kind collects an opt-out on precisely the hops that made the requirement fail, so its
-    opt-out list becomes the static-credential inventory. The inventory has to exist and be trusted
-    first. Whether the delegated-identity precondition is then widened, and whether it is scoped per
-    backend, is an owner decision this check does not pre-empt.
+    **Advisory (``required=False``), and the refusal lives at serve.** The opt-in
+    ``[security].require_nonstatic_credentials`` refuses these hops at ``serve`` (owner decision
+    2026-09-23: opt-in, off by default). Blocking here would duplicate that refusal at the wrong
+    altitude and would block a commit on an instance that never turned it on. The line says whether
+    the gate is on, so a reader can tell "listed" from "would refuse".
 
-    **Reported is not gated**, on the standing rule ``docs/DEPLOYMENT.md`` carries for the sibling
-    connection-scoped advisories: naming a hop here changes no disposition anywhere.
+    It reads the graph and, when a ``messagefoundry.toml`` resolves (the ``alert-smtp-tls`` rules,
+    verbatim), the service settings. With no settings file it reports the graph half and SAYS so. It
+    states the clean case out loud, and SKIPs when the graph will not load."""
+    from pydantic import ValidationError
 
-    What it classifies, which table each hop lives in, and the one generic-ODBC case it deliberately
-    stays quiet on are in :func:`~messagefoundry.config.wiring.static_credential_db_hops`.
+    from messagefoundry.config.settings import SecurityEnforcement, ServiceSettings, load_settings
+    from messagefoundry.config.static_credentials import static_credential_hops
+    from messagefoundry.config.wiring import WiringError, load_config
 
-    It states the clean case out loud rather than going quiet, on the ``alert-smtp-tls`` convention, so
-    a passing line is never confused with a check that did not run. SKIPs when the graph will not load
-    — ``validate`` reports that, and a check that reported an empty set on an unloadable config would be
-    worse than one that says it could not look."""
-    from messagefoundry.config.wiring import WiringError, load_config, static_credential_db_hops
-
+    name = "static-credentials"
     try:
-        registry = load_config(config_dir)
+        # allow_empty: same reason as dead-config (BACKLOG #1648). A connection-less graph still has a
+        # settings half -- [store], [secrets], [alerts] and the rest dial out whether or not a
+        # connection is declared -- so under `--allow-empty-config` this leg must report it, not skip
+        # with "config did not load" about a config that loaded.
+        registry = load_config(config_dir, allow_empty=True)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         return CheckResult(
-            "static-db-credentials",
-            ok=True,
-            required=False,
-            skipped=True,
-            detail=f"config did not load: {exc}",
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
         )
-    hops = static_credential_db_hops(registry)
+    toml = _resolve_service_toml(
+        config_dir, service_config=service_config, suppress_search=suppress_search
+    )
+    settings: ServiceSettings | None = None
+    scope = "graph and service settings"
+    if toml is None:
+        scope = "graph only: no messagefoundry.toml, so the service-settings hops were not read"
+    else:
+        try:
+            settings = load_settings(config_path=toml)
+        except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+            # Present-but-refused is a failure, not a skip (BACKLOG #1318, the alert-smtp-tls rule).
+            return CheckResult(
+                name,
+                ok=False,
+                required=False,
+                detail=f"settings did not load: {_settings_error(exc)}",
+            )
+    hops = static_credential_hops(registry=registry, settings=settings)
+    sec = settings.security if settings is not None else None
+    gate_on = sec is not None and sec.require_nonstatic_credentials
+    accepted = sec.static_credential_accepted if sec is not None and gate_on else {}
+    if sec is None:
+        gate = (
+            "whether [security].require_nonstatic_credentials is on is unknown: no settings file "
+            "was read"
+        )
+    elif not gate_on:
+        gate = "[security].require_nonstatic_credentials is off: nothing is refused"
+    elif sec.enforcement is SecurityEnforcement.ENFORCE:
+        gate = (
+            "[security].require_nonstatic_credentials is ON: serve refuses every hop below not "
+            "marked opted-out"
+        )
+    else:
+        gate = (
+            "[security].require_nonstatic_credentials is ON under enforcement = warn: serve warns "
+            "about every hop below not marked opted-out"
+        )
     if not hops:
         return CheckResult(
-            "static-db-credentials",
+            name,
             ok=True,
             required=False,
-            detail="no DATABASE hop authenticates with a static credential",
+            detail=f"no backend hop presents an unchanging credential or none ({scope}); {gate}",
         )
-    listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
+    listed = "; ".join(
+        f"{hop.name}: {hop.credential} credential, {hop.detail}, compliant kind "
+        f"{'available' if hop.compliant_kind else 'NONE in the product'}"
+        + (" [opted out]" if hop.name in accepted else "")
+        for hop in hops
+    )
     return CheckResult(
-        "static-db-credentials",
+        name,
         ok=True,
         required=False,
-        detail=(
-            f"{len(hops)} DATABASE hop(s) authenticate with an unchanging credential — {listed}; "
-            "on SQL Server prefer auth='integrated' (gMSA) or auth='entra'. "
-            "[store].require_managed_identity does NOT cover these hops"
-        ),
+        detail=f"{len(hops)} backend hop(s) present an unchanging credential or none ({scope}) — {listed}; {gate}",
     )
 
 
@@ -2249,7 +2364,7 @@ def _check_oidc_auth_params(
             "oidc-auth-params",
             ok=False,
             required=False,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
     auth = settings.auth
     if not auth.oidc_enabled:
@@ -2377,6 +2492,86 @@ def _check_oidc_auth_params(
     return CheckResult("oidc-auth-params", ok=True, required=False, detail="; ".join(notes))
 
 
+def _check_upstream_hop_ack(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Refuse a declared upstream TLS terminator with no ``[api].tls_cert_file`` and no
+    ``[api].plaintext_upstream_hop_acknowledged`` -- the BACKLOG #1179 refusal ``serve`` applies,
+    brought forward to commit/CI time.
+
+    Without it the gate passes a config that ``serve`` then refuses with exit 2. The decision is
+    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_unacknowledged`, the predicate ``serve``
+    calls, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
+    enforcement mode, so this check reads no dial either.
+
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`: no
+    ``messagefoundry.toml`` → SKIP; present but refused by the loader → FAIL (BACKLOG #1318). Parity
+    holds only for the file this check resolves. A terminator declared through ``MEFOR_API_*``
+    environment variables alone reaches ``serve`` and not this SKIP arm, and the file lookup differs
+    from ``serve``'s in the ways :func:`_check_posture` documents."""
+    from pydantic import ValidationError
+
+    from messagefoundry.api.tls import api_tls_source, plaintext_upstream_hop_unacknowledged
+    from messagefoundry.config.settings import load_settings, settings_error_detail
+
+    if service_config is not None:
+        toml: Path | None = Path(service_config) if Path(service_config).is_file() else None
+    elif suppress_search:
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        toml = candidate if candidate.is_file() else None
+    else:
+        toml = _find_service_toml(config_dir)
+    if toml is None:
+        return CheckResult(
+            "upstream-hop-ack",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail="no messagefoundry.toml",
+        )
+    try:
+        settings = load_settings(config_path=toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        # settings_error_detail, not str(exc): a ValidationError echoes input values, and the
+        # environment-sourced secrets are among them.
+        return CheckResult(
+            "upstream-hop-ack",
+            ok=False,
+            required=True,
+            detail=f"settings did not load: {settings_error_detail(exc)}",
+        )
+    api = settings.api
+    if plaintext_upstream_hop_unacknowledged(api):
+        return CheckResult(
+            "upstream-hop-ack",
+            ok=False,
+            required=True,
+            detail=(
+                "[api].tls_terminated_upstream with no [api].tls_cert_file serves the "
+                "proxy-to-engine hop in plaintext, and [api].plaintext_upstream_hop_acknowledged "
+                "is not set -- serve would refuse to start (exit 2, in every enforcement mode). "
+                "Set the acknowledgement once your site secures that hop, or set "
+                "[api].tls_cert_file (see docs/SECURITY.md)"
+            ),
+        )
+    source = api_tls_source(
+        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
+    )
+    return CheckResult(
+        "upstream-hop-ack",
+        ok=True,
+        required=True,
+        detail=(
+            "plaintext proxy-to-engine hop acknowledged ([api].plaintext_upstream_hop_acknowledged)"
+            if source == "upstream"
+            else f"no plaintext proxy-to-engine hop (API TLS source: {source})"
+        ),
+    )
+
+
 def _check_reference_backend(
     config_dir: str | Path,
     *,
@@ -2435,7 +2630,7 @@ def _check_reference_backend(
             "reference-backend",
             ok=False,
             required=True,
-            detail=f"settings did not load: {exc}",
+            detail=f"settings did not load: {_settings_error(exc)}",
         )
     try:
         # allow_empty: this leg is REQUIRED and its subject is `registry.references`, which exists

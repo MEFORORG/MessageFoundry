@@ -181,8 +181,8 @@ class SmartBackendTokenProvider:
         except InsecureHopRefused as exc:
             raise SmartAuthError(
                 "SMART token endpoint over cleartext http would expose the client_assertion; refused "
-                "by the instance security posture (use https, attest the hop as secure via "
-                "tls_hop_attested, or declare cleartext_accepted with a cleartext_reason)"
+                "by the instance security posture (use https, or declare cleartext_accepted with a "
+                "cleartext_reason)"
             ) from exc
         if not client_id:
             raise SmartAuthError("SMART Backend Services requires a 'smart_client_id' setting")
@@ -440,7 +440,7 @@ def smart_auth_configured(s: Mapping[str, Any]) -> bool:
     ON means ``smart_token_url`` is present and ``smart_enabled`` is not switched off, so any connection
     that never composed :func:`with_smart_backend` is byte-identical. The SINGLE definition, shared by
     :func:`token_provider_from_settings` (which builds the provider), by the mutual-exclusion screen in
-    ``http_auth.build_token_provider`` and by
+    ``http_auth.bearer_provider_from_settings`` and by
     :func:`~messagefoundry.config.wiring.overbroad_smart_scopes` (which grades the requested scope).
 
     It exists because those three readers each carried their own spelling of the same test and the

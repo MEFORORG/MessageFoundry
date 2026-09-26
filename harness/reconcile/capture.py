@@ -20,17 +20,27 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TextIO
 
+from harness.frame_cap import resolve_max_frame_bytes
 from messagefoundry.config.models import AckMode
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.peek import HL7PeekError
-from messagefoundry.transports.mllp import MLLPDecoder, build_ack, frame
+from messagefoundry.transports.mllp import (
+    DEFAULT_MAX_FRAME_BYTES,
+    MLLPDecoder,
+    MLLPFrameError,
+    build_ack,
+    frame,
+)
 
 _READ_BYTES = 65536  # the sink only absorbs + ACKs, never routes
+
+log = logging.getLogger(__name__)
 
 
 class CaptureSink:
@@ -44,11 +54,14 @@ class CaptureSink:
         ports: Sequence[int] = (2800,),
         ack_mode: AckMode = AckMode.ORIGINAL,
         anonymizer: Callable[[str], str] | None = None,
+        max_frame_bytes: int | None = DEFAULT_MAX_FRAME_BYTES,
     ) -> None:
         if not ports:
             raise ValueError("the capture sink needs at least one port")
         self._out = Path(out_path)
         self._host = host
+        # 0 turns the cap off and a negative value is refused (harness/frame_cap.py).
+        self._max_frame_bytes = resolve_max_frame_bytes(max_frame_bytes)
         self._ports = tuple(ports)
         self._ack_mode = ack_mode
         # Optional de-identifier (ADR 0030 §6): when set, each captured message is anonymized at the
@@ -61,6 +74,7 @@ class CaptureSink:
         self.captured = 0
         self.unparseable = 0
         self.anon_failed = 0
+        self.refused = 0  # connections dropped over an over-cap frame
 
     async def start(self) -> None:
         self._out.parent.mkdir(parents=True, exist_ok=True)
@@ -92,18 +106,34 @@ class CaptureSink:
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._writers.add(writer)
-        decoder = MLLPDecoder()
+        # Bounded like the engine's MLLP source: this listener takes frames from another party, so it is
+        # an ASVS 5.1.1 upload feature (docs/CONNECTIONS.md, BACKLOG #1127).
+        decoder = MLLPDecoder(max_frame_bytes=self._max_frame_bytes)
         try:
             while True:
                 chunk = await reader.read(_READ_BYTES)
                 if not chunk:
                     break
                 replies = bytearray()
-                for payload in decoder.feed(chunk):
-                    self._handle(payload, replies)
+                dropping = False
+                try:
+                    for payload in decoder.feed(chunk):
+                        self._handle(payload, replies)
+                except MLLPFrameError as exc:
+                    # Drop the connection rather than buffer, keep or ACK an over-cap frame, as the
+                    # engine does. The feed is lazy, so every frame before it in this read was handled.
+                    # Counted, because a refused delivery is a finding to reconcile, like an
+                    # unparseable one.
+                    dropping = True
+                    self.refused += 1
+                    peer = writer.get_extra_info("peername")
+                    log.warning("MLLP frame from %s over cap; closing connection: %s", peer, exc)
                 if replies:
+                    # Frames accepted before a refusal still get their ACKs, sent before the drop.
                     writer.write(bytes(replies))
                     await writer.drain()
+                if dropping:
+                    break
         except (ConnectionError, OSError):
             pass  # peer reset/closed mid-stream — expected when the sender or run stops
         finally:

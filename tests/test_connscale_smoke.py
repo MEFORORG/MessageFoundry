@@ -338,9 +338,11 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
     empty-claims band was retired (BACKLOG #1211) no SLO grades ``empty_claims_per_msg`` against
     ``_MONOTONIC_TOLERANCE``; the renderer says so on the table it prints, and an OUTSIDE BAND row
     there fails nothing. The width is still imported rather than retyped for a different reason:
-    holding it at the value the harvested readings were measured under is what keeps new rows
-    directly comparable with those already harvested. ``fd_count_monotonic`` does still enforce the
-    same constant, so a second copy here would remain a second definition regardless.
+    holding it at the value the harvested readings were measured under keeps the BAND the same one.
+    The VALUES changed window at BACKLOG #1420, so rows from before that change do not compare with
+    rows after it; the JSON copy's ``rate_window`` says which is which. ``fd_count_monotonic`` does
+    still enforce the same constant, so a second copy here would remain a second definition
+    regardless.
     """
     _append_step_summary(
         report.render_readings_markdown(
@@ -502,10 +504,11 @@ def test_the_sweep_produces_one_record_per_mode_and_count(smoke_report: ConnScal
 def test_every_step_took_at_least_two_in_hold_samples(smoke_report: ConnScaleReport) -> None:
     """BACKLOG #1430, END TO END: the hold must produce a WINDOW, not a point.
 
-    Every rate and every peak this record carries is derived from the step's in-hold readings, and a
-    step that took one reading has a window of zero width -- ``_empty_claim_rates`` and
-    ``_throughput_rates`` then reach two samples only by counting the post-drain final, and
-    ``in_pipeline_peak`` and the wall #1/#2 peaks are each a single instant wearing the word "peak".
+    Every rate this record carries is derived from the step's in-hold readings, and a step that took
+    one reading has a window of zero width -- ``_empty_claim_rates`` and ``_throughput_rates`` read a
+    rate window that EXCLUDES the post-drain final (BACKLOG #1420), so they return zeros and wall #3
+    goes ungraded. ``in_pipeline_peak`` and the wall #1/#2 peaks read that one reading plus the
+    post-drain final, so each is two instants wearing the word "peak".
     That was the state in 20 of 20 cells, and NOTHING FAILED ON IT: no test asserted a floor on the
     sample count, and ``report.py``'s diagnostic text calls a low probe-tick count "a coarse gauge,
     not a fault". This assertion is what makes the state visible.
@@ -532,7 +535,14 @@ def test_no_loss_reconciles_at_every_step(smoke_report: ConnScaleReport) -> None
     """
     for r in smoke_report.records:
         assert r.sent > 0, r
-        assert r.no_loss.ok, (r.sweep_mode, r.count, r.no_loss.detail)
+        # A STRING, not a tuple. Pytest shortens each element of a tuple message, and on
+        # 2026-09-25 that cut the #1292 audit verdict off the end of this line in CI, so the red
+        # read as engine loss while the verdict that cleared the engine sat in the part not shown.
+        assert r.no_loss.ok, (
+            f"{r.sweep_mode}@N={r.count}: sent={r.sent} acked={r.acked} nak={r.nak} "
+            f"timeouts={r.timeouts} reload_stranded={r.reload_stranded} "
+            f"reload_seconds={r.reload_seconds} -- {r.no_loss.detail}"
+        )
 
 
 def test_no_accept_acked_message_is_absent_from_the_stopped_engines_store(

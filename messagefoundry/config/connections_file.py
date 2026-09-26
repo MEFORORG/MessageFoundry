@@ -705,10 +705,10 @@ def _element_fits(value: Any, element: _Accepted) -> bool:
     **WHERE NO REFUSAL EXISTS THE VALUE GOES THROUGH, and that is a HOLE, not a decision this skip
     makes safe.** When #1809 measured it, at least three loaded clean, survived
     ``resolve_env_settings`` unchanged, and reached the connector as a literal ``{'env': ...}`` table.
-    Two now have a refusal at the factory seam: ``headers`` in ``_reject_envref_headers`` (BACKLOG
-    #1649), and ``odbc_params`` in ``_reject_envref_odbc_params``, which tests the raw-dict spelling
-    as well as an ``EnvRef`` (BACKLOG #1806). The third, any ``list[str]`` setting, was answered by
-    nothing at all and is not re-measured here. None of them is #1809 -- this check judges TYPES --
+    All three now have a refusal at the factory seam: ``headers`` in ``_reject_envref_headers``
+    (BACKLOG #1649), ``odbc_params`` in ``_reject_envref_odbc_params``, which tests the raw-dict
+    spelling as well as an ``EnvRef`` (BACKLOG #1806), and a list-valued setting in
+    ``_reject_envref_in_lists`` (BACKLOG #1820). None of them is #1809 -- this check judges TYPES --
     so a hole that remains needs its own row, not a patch here."""
     if isinstance(value, EnvRef) or _is_env_marker(value):
         return True

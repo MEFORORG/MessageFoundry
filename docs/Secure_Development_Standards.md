@@ -6,8 +6,8 @@
 | **Applies to** | Any application developed under this standard. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local owner. |
 | **Status** | Published — adopter-facing |
-| **Version** | 2.7 |
-| **Date** | September 24, 2026 |
+| **Version** | 2.8 |
+| **Date** | September 25, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material architecture or threat change |
 | **Aligns to** | NIST SP 800-218 (SSDF) · NIST SP 800-115 · NIST SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Its Spec-Driven Development practices (§5) are a distilled synthesis by this document — not an external standard or certification. |
@@ -175,6 +175,22 @@ asking what happens to someone who acts on the sentence; **none** was caught by 
   **An understated gap is the dangerous direction.** Fixing every named site produces visible,
   finished-looking work while the unnamed sites stay open. This rule adds no gate: a derivation is
   checked by re-running it.
+- **SDS-3.10 — MUST ask what a record is able to hold before using what it holds to clear or implicate a suspect.** *Evidence:* a capacity note beside the conclusion, naming the state in question, whether the record can hold it, the class that excludes and the class it leaves open.
+  SDS-3.8 governs an instrument's **output**: does its answer match the question. This rule is its
+  sibling about **capacity**. A record that cannot hold a state cannot show who set it, and knowing
+  that can clear a whole class of causes before one entry is read. Measured 2026-09-16: most of a
+  repository's CI workflows were found in the state `disabled_manually`. Recently merged pull requests
+  were the first suspects. One method cleared a suspect pull request by comparing its merge time with
+  the window in which the workflows went dark. That clears one pull request at a time, and each
+  clearance rests on how two clocks line up. The stronger method starts from the state, as SDS-3.9
+  starts from the effect. A person or a token sets `disabled_manually` through the platform's
+  interface or API. A commit changes files, and no file holds that state. So no merge could have set
+  it directly, and every merge falls as a direct cause in one step, with no timestamp read. **Name
+  what the step leaves open, because it is narrower than it looks.** It clears a diff, not the code a
+  diff shipped: a merged workflow step that calls the same API with a permitted token is still a
+  caller. **Both methods reached the same verdict on the first suspect, and that is the danger.** A
+  weaker method that agrees with the right answer passes every check on its result, so nobody
+  examines it. It fails later, on a case where the clocks mislead and nothing checks it.
 
 *Provenance (the evidence is the point):* the completeness-claim and false-premise rules, and the
 governing instruction above, came out of the 2026-07-30 public-documentation audit; the
@@ -183,7 +199,9 @@ state-it-once rule was named by the parallel ASVS review session, which also sup
 parallel-session cluster — four sessions, eleven retractions, none caught by its own author — and was
 named by the repo-security-review session after applying it to its own four and finding four for four;
 the remaining instances were contributed by the ci-margin-correction, announce-hook, sandbox-codec and
-ADR 0154 sessions, each of which had made one. `CLAUDE.md` §11 carries these as bare one-line
+ADR 0154 sessions, each of which had made one. The capacity rule came out of a
+2026-09-16 investigation into disabled CI workflows, where two methods cleared the same suspect and
+only one of them cleared the whole class. `CLAUDE.md` §11 carries these as bare one-line
 imperatives — deliberately duplicated, because an instruction that short cannot meaningfully drift and
 a pointer nobody follows mid-task changes no behaviour. **This section is the source of record for the
 reasoning, the evidence and the dates.**
@@ -830,7 +848,8 @@ resolves to a row below rather than to whatever requirement later took the numbe
 
 | Version | Date | Change |
 |---|---|---|
-| 2.7 | September 24, 2026 | **Independent review is a desired state, not a requirement (owner ruling).** The §6.1 *Independent review* row called the third-party review + penetration test "the project's own pre-production gate (§6.3)", to be done "Before a production release". It now names it a desired state, not a requirement and not an ASVS mandate, and its timing is "Desired before a production release". SDS-6.4.3 is unchanged, and the row now points to it: a release still needs a current independent review or a dated risk acceptance. The companion [Secure Build Standards](Secure_Build_Standards.md) made the same change to signal 10. |
+| 2.8 | September 25, 2026 | **SDS-3.10 added: ask what a record is able to hold before using what it holds to clear a suspect.** It follows SDS-3.9 under "Reviewing security prose". It is a sibling of SDS-3.8, which governs an instrument's output; this rule governs its capacity. A capacity question can clear a whole class of causes in one step. The rule also asks the author to name the class that step leaves open. Its worked case is a workflow set to `disabled_manually`, a state no file in a commit can hold. `CLAUDE.md` section 11 carries it as a short imperative, and the provenance note after the rules records where it came from. **147 requirements now carry an identifier**: the 146 of version 2.7 plus SDS-3.10. **One rule was added**; no rule was removed, weakened or reworded, and no identifier changed. |
+| 2.7 | September 24, 2026 | **Independent review is a desired state, not a requirement (owner ruling).** The §6.1 *Independent review* row called the third-party review + penetration test "the project's own pre-production gate (§6.3)", to be done "Before a production release". It now names it a desired state, not a requirement and not an ASVS mandate, and its timing is "Desired before a production release". SDS-6.4.3 is unchanged, and the row now points to it: a release still needs a current independent review or a dated risk acceptance. The companion [Secure Build Standards](Secure_Build_Standards.md) made the same change to signal 10. **146 requirements now carry an identifier**: the 145 of version 2.3 plus SDS-3.9, added in 2.6. Each release row states this count so a citation checker can confirm it still sees every rule; versions 2.4 to 2.6 omitted it. |
 | 2.6 | September 23, 2026 | **SDS-3.9 added: a list that stands in for a surface states how it was derived.** It follows SDS-3.8 under "Reviewing security prose" and extends SDS-3.6. It covers a list written anyway, usually naming where a gap still stands. The derivation names the query, the corpus, the commit and the direction, so a reader can re-run the list rather than trust it. The rule adds no gate. **One rule was added**; no rule was removed, weakened or reworded, and no identifier changed. |
 | 2.5 | September 21, 2026 | **A.4 and the A.6 SDS-7.4.25 deviation corrected: federated operator SSO is built, not undesigned.** Both said federated SSO would get a dedicated ADR — A.4 "when 0.2 design begins", A.6 "before off-loopback exposure" — when [ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md) already exists and its OIDC authorization-code + PKCE relying party already ships, self-gated behind `[auth].oidc_enabled` in `messagefoundry_webconsole/routes/oidc.py`. **The error runs opposite to 2.4's**: that one understated a *surface*, this one understated **design maturity**, and the consequence is the same shape — a site could skip reviewing a shipping authentication path on the belief that it is a future feature. **SDS-3.4** is the rule at issue: the prose was accurate about ADR 0002's promise and wrong about what a reader would do with it. A.4 now records the mechanism, the default-off self-gating, the config-load preconditions, the hybrid contract in which roles resolve through LDAP and never from a token claim, and that ADR 0142 stands at `Proposed` with its code complete. Its "Designed but deferred" tier is now empty, and the old "OIDC / SAML via Entra" phrasing narrows to **OIDC only** because SAML 2.0 is declined on XML-signature-wrapping grounds. A.6's deviation is **not** withdrawn: it changes character from a missing capability to a **shipped default posture** that does not federate. That row also carried a second stale clause, "native TOTP MFA **for local accounts**", which had understated the coverage since BACKLOG #1144 retired the AD/Entra delegation; the qualifier is dropped and A.4 owns the statement. Corrected in the same pass, because A.4 would otherwise contradict it inside one document: the A.7.1 inventory said "ADRs numbered through 0105" against a measured high-water of **0188** across **178** numbered files, and its lifecycle gloss said `Proposed` means no code yet. **No requirement was added, removed, weakened or strengthened**, and no rule identifier changed. |
 | 2.4 | September 20, 2026 | **A.2 corrected to match the shipped web console, and two control surfaces added.** A.2 described `/ui` as an opt-in, read-only dashboard configured at `[api].serve_ui`. All three were wrong in the shipped code, and each understated the surface. The config default is **on** for a loopback bind (`serve_ui: bool = True`; ADR 0143 makes disabling it surface-*reducing*). The console is **write-capable**, across at least connection control, queue purge, replay, log upload, disaster-recovery activation and user administration. The operator key is `serve_web_console` under `[security]`; the `[api]` spelling is refused at config load (ADR 0118), so the old text named a key that fails. A.2 now also records what the old text left out. The console arrives as a **second wheel** the base distribution does not carry. The **Windows tray** (ADR 0113) does ship in the base wheel, and it starts, stops and restarts the service. The **VS Code extension** (ADR 0112) can do the same. Step-up re-authentication is distinguished from dual-control approval, which is off by default and reaches three operations. **SDS-3.4** is the rule at issue: the old prose was reviewed for accuracy rather than for what an adopter would do with it, and an adopter could have sized their own review against it. A.1's technology-stack line names a retired PySide6 desktop UI and is **not** corrected here; it is rewritten by the change reconciling the message-ordering docs, and two pull requests must not rewrite one sentence. **No requirement was added, removed, weakened or strengthened**, and no rule identifier changed. |

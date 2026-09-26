@@ -100,8 +100,10 @@ import pytest
 # Python-AST clauses have nothing to read there. That is a fact about the LANGUAGE, not a finding that
 # ``ide/`` is free of the things these clauses look for: it ships first-party crypto in TypeScript
 # (``ide/src/cspNonce.ts`` draws CSPRNG bytes from ``node:crypto``; ``ide/src/engineClient.ts`` pins a
-# TLS floor), none of which any Python walker can see. BACKLOG #1164 owns the TypeScript arm; this
-# comment previously stated the exclusion as a property of the tree and that was the wrong fact.
+# TLS floor and suite list), none of which any Python walker can see. The crypto gate's non-Python arms read them
+# instead: randomness under the required run (BACKLOG #1172), every operation class under
+# ``--non-python-operations`` in its own ``crypto-operations`` job in ci.yml (BACKLOG #1164).
+# This comment previously stated the exclusion as a property of the tree and that was the wrong fact.
 #
 # ``scripts/`` is walked by neither the ReDoS nor the single-JSON/URL-parser clause: it is
 # build/release tooling not reachable from untrusted input, and the retired release-sync checker
@@ -586,6 +588,20 @@ _UNSCANNABLE_RE_PATTERNS = {
     # over it, and the whole pattern is anchored ^...\Z -- no nested quantifier, nothing to backtrack.
     "messagefoundry/uploads.py": (
         r"f'^\\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})\\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\\.tmp\\Z'",
+    ),
+    # BACKLOG #1142 -- the icacls line-1 path echo. Unresolvable BY CONSTRUCTION: the pattern is built
+    # from the trust-anchor path being checked, which is runtime configuration, so there is no literal
+    # to write. The per-character template is written inside the call, so it is part of this pin and
+    # an edit to it reds the build. An ASCII character goes through ``re.escape``, which escapes
+    # ``? * + {`` and every other metacharacter; any other character becomes a bare ``.`` (``..``
+    # outside the BMP). So the path part carries no quantifier at all. The only repetition is the
+    # trailing ``\s+``, in an alternation with ``$``, inside no quantified group and followed by
+    # nothing. The two branches overlap before a final newline, which is harmless for the same
+    # reason: there is nothing after the group to retry against. No nested quantifier and no
+    # backtracking. The caller uses the anchored ``.match``, which this scanner does not read; a
+    # switch to ``.search`` would re-walk the path part at every start position.
+    "messagefoundry/auth/trust_anchors.py": (
+        r"""''.join((re.escape(ch) if ch.isascii() else '..' if ord(ch) > 65535 else '.' for ch in anchor_path)) + '(?:\\s+|$)'""",
     ),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is

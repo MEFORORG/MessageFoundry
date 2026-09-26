@@ -124,6 +124,11 @@ from messagefoundry.parsing.sniff import (
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
+from messagefoundry.pipeline.ingress_guards import (
+    STRICT_VALIDATE_TIMEOUT_SECONDS,
+    streaming_over_threshold,
+    strict_validate_timeout,
+)
 from messagefoundry.pipeline.phase_timing import (
     # Explicit re-exports (`as`): the pre-#842 import surface — tests and the harness node-log parser
     # import these names from wiring_runner, not from phase_timing.
@@ -157,7 +162,7 @@ from messagefoundry.store import (
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
-from messagefoundry.store.store import ConnectionEventWrite
+from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -396,26 +401,11 @@ _BATCH_POLL_SECONDS = 0.02
 # pinning a worker thread forever; the orphaned query still completes on the loop and releases its conn.
 _LOOKUP_RESULT_TIMEOUT_SECONDS = 30.0
 
-# How long a single strict hl7apy validate may run before the message dead-letters (#89, DoS backstop).
-# Mirrors the _LOOKUP_RESULT_TIMEOUT_SECONDS rationale: a pathological body that makes hl7apy's
-# structure/cardinality parse spin can otherwise pin the listener's off-loop worker; the timeout frees
-# the listener and routes the message to ERROR/dead-letter. It CANNOT kill the to_thread worker (no
-# thread cancellation in CPython) — the orphaned validate leaks its thread until it returns, bounded by
-# the 16 MiB / segment caps enforce_size_limits fires BEFORE the slow parse (validate.py). Per-inbound
-# `validation.strict_timeout_s` overrides this; <= 0 there disables the backstop entirely. Owner-tunable.
-_STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
-
-
-def _strict_validate_timeout(ic: InboundConnection) -> float | None:
-    """The effective wall-clock (seconds) for this inbound's strict validate, or ``None`` if disabled.
-
-    Resolves the per-connection ``validation.strict_timeout_s`` against the engine default (#89):
-    ``None`` inherits ``_STRICT_VALIDATE_TIMEOUT_SECONDS``; ``<= 0`` disables the backstop (returns
-    ``None`` → the caller runs the validate un-timed, the pre-#89 behaviour). The value is trusted config,
-    not an HL7 field."""
-    configured = ic.validation.strict_timeout_s
-    effective = _STRICT_VALIDATE_TIMEOUT_SECONDS if configured is None else configured
-    return effective if effective > 0 else None
+# The strict-validate DoS backstop (#89) and its per-inbound resolution live in ingress_guards, so the
+# operator resend (BACKLOG #1911) times its strict validate by the same rule. Re-exported under the
+# names this module and the docs have always used.
+_STRICT_VALIDATE_TIMEOUT_SECONDS = STRICT_VALIDATE_TIMEOUT_SECONDS
+_strict_validate_timeout = strict_validate_timeout
 
 
 # Engine-level ingress size ceiling for NON-HL7 content types (SEC-017, CWE-770). The HL7 path already
@@ -2149,16 +2139,21 @@ class RegistryRunner:
         ic = self.registry.inbound.get(name)
         oc = self.registry.outbound.get(name)
         try:
-            if ic is not None:
-                source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
-                check_source_allowed(source_cfg, name, self._egress)
-                return "in", build_source(source_cfg)
-            if oc is not None:
-                dest_cfg = _dest_config(
-                    oc, self._env_values, self._trust_anchor_policy, self._egress
-                )
-                check_egress_allowed(dest_cfg, self._egress)
-                return "out", build_destination(dest_cfg)
+            # Stamped as the live builds are (_start_inbound_unsafe, _start_outbound), so each
+            # posture-keyed cell decides as it does for the running connector. Unstamped, the
+            # inbound CA check enforced under [security].enforcement = warn, and the test reported
+            # a listener that was serving as failed (BACKLOG #1142).
+            with active_hop_posture(self._hop_posture):
+                if ic is not None:
+                    source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+                    check_source_allowed(source_cfg, name, self._egress)
+                    return "in", build_source(source_cfg)
+                if oc is not None:
+                    dest_cfg = _dest_config(
+                        oc, self._env_values, self._trust_anchor_policy, self._egress
+                    )
+                    check_egress_allowed(dest_cfg, self._egress)
+                    return "out", build_destination(dest_cfg)
         except WiringError:
             raise
         except Exception as exc:
@@ -2261,7 +2256,9 @@ class RegistryRunner:
         """stop_outbound body without the reload lock (callers hold it). Sync + returns fast: it flags
         the pause and requests it in whichever claim mode is active, but NEVER awaits the in-flight
         drain (cooperative). NEVER ``task.cancel`` a worker/serializer — a cancelled mid-delivery row
-        strands INFLIGHT forever (``reset_stale_inflight`` is startup/DR-only), defeating require-stopped."""
+        strands INFLIGHT until the next start, promotion or (clustered Postgres) lease sweep -- a
+        reload recovers only a worker that RETURNED, never a cancelled one (ADR 0157 Inc 2) --
+        defeating require-stopped."""
         self._validate_outbound(name)
         self._outbound_paused.add(name)
         # The OPERATOR now owns this lane's down state — a reload must not resume it (#115/#233): drop any
@@ -2684,11 +2681,13 @@ class RegistryRunner:
         await source.validate_startup()
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
-        # The HTTP listen source (ADR 0023) gets a receipt handler returning the committed message_id for
-        # its 202; every other source gets the standard handler whose str return is a wire reply/ACK.
-        make_handler = (
-            self._make_http_handler if ic.spec.type is ConnectorType.HTTP else self._make_handler
-        )
+        # A source that answers the sender with its own protocol status declares wants_receipt, and gets
+        # the receipt handler: the committed message_id, or None when the body was refused and recorded
+        # ERROR. The HTTP listener (ADR 0023) maps that to its 202; the DICOM C-STORE SCP maps None to a
+        # DIMSE failure (BACKLOG #1910). Every other source gets the standard handler, whose str return is
+        # a wire reply/ACK and whose None means both "committed" and "refused". The transport declares the
+        # contract rather than the runner keying on a connector type (CLAUDE.md sec. 4).
+        make_handler = self._make_http_handler if source.wants_receipt else self._make_handler
         try:
             await source.start(make_handler(ic), leader_gate=self._coordinator.is_leader)
         except OSError as exc:
@@ -2933,7 +2932,9 @@ class RegistryRunner:
         it was never delivered, which makes the gap quiet rather than harmless.
 
         **Cooperative in both claim modes, and NEVER a ``task.cancel``** — a cancelled mid-item worker
-        strands its claimed row INFLIGHT and ``reset_stale_inflight`` is startup/DR-only:
+        strands its claimed row INFLIGHT until the next start, promotion or (clustered Postgres)
+        lease sweep; a reload recovers only a worker that RETURNED, never a cancelled one (ADR
+        0157 Inc 2):
 
         * **pooled** (the default): ``pause_lane`` per stage, the same primitive
           :meth:`_stop_outbound_unsafe` uses. A lane mid-episode reaches PAUSED at its quiesce point,
@@ -4662,13 +4663,74 @@ class RegistryRunner:
 
     # --- atomic reload (quiesce-and-swap) ------------------------------------
 
+    async def _recover_stopped_worker_residue(self) -> int:
+        """Reload-time BACKSTOP: re-pend the rows a RETURNED per-lane worker left INFLIGHT (ADR
+        0157 Inc 2, BACKLOG #1497). A stopping worker releases its own tail
+        (:meth:`_release_tail_on_stop`); this catches a release that failed, and anything else a
+        worker left behind when it returned.
+
+        The scope is a worker that returned normally, and nothing wider. A returned worker holds
+        nothing, and each lane has one consumer (ADR 0059), so its INFLIGHT rows are residue. A LIVE
+        worker's lane is never touched: ``reload`` stops no worker, so those rows may be mid-send.
+        A worker that RAISED is skipped because its done-callback respawns it. A cancelled one is
+        skipped because only teardown cancels. The worker state is the discriminator; there is no
+        age and no cutoff.
+
+        It uses the ownership-scoped ``reset_stale_inflight`` (ADR 0073), which every backend
+        implements, and never probes ``reclaim_expired_leases``, so the promotion path's
+        ``hasattr`` gate cannot move. Best effort: a failure logs and leaves the rows for the next
+        start, and never rolls a reload back. Returns the number of rows re-pended.
+
+        A node that is not the leader runs nothing: clustered mode never resets outside promotion,
+        because an ex-leader's rows belong to the successor (engine ``_start_graph``)."""
+        if not self._coordinator.is_leader():
+            return 0
+
+        def returned(task: asyncio.Task[None]) -> bool:
+            return task.done() and not task.cancelled() and task.exception() is None
+
+        scopes: list[tuple[Stage, OwnedLanes]] = []
+        for kind, stage in (
+            ("router", Stage.INGRESS),
+            ("transform", Stage.ROUTED),
+            ("response", Stage.RESPONSE),
+        ):
+            names = frozenset(n for n, t in self._inbound_worker_dict(kind).items() if returned(t))
+            if names:
+                scopes.append((stage, OwnedLanes(channels=names, destinations=frozenset())))
+        # A lane the OUTBOUND dispatcher holds is skipped: its rows may be the dispatcher's.
+        out = self._dispatchers.get(Stage.OUTBOUND)
+        dests = frozenset(
+            n
+            for n, t in self._workers.items()
+            if returned(t) and (out is None or out.phase(n) is None)
+        )
+        if dests:
+            scopes.append((Stage.OUTBOUND, OwnedLanes(channels=frozenset(), destinations=dests)))
+        recovered = 0
+        try:
+            for stage, owned in scopes:
+                recovered += await self.store.reset_stale_inflight(stage=stage.value, owned=owned)
+        except Exception:  # noqa: BLE001 — best effort; see the docstring
+            log.warning(
+                "reload: recovery of rows a stopped worker left in flight failed after %d "
+                "row(s); the rest stay INFLIGHT for reset_stale_inflight at the next start",
+                recovered,
+                exc_info=True,
+            )
+        if recovered:
+            log.info("reload: re-pended %d row(s) a stopped worker left in flight", recovered)
+        return recovered
+
     async def reload(self, new_registry: Registry) -> None:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
 
         Quiesce-and-swap, in this order: (0) build-check every new connector — a bad spec raises
         here, before anything is touched, so the running graph is left intact; (1) stop accepting new
-        inbound messages; (2) swap the registry + restart the inbound listeners from it (Router/
-        Handler changes take effect immediately — the inbound path reads ``self.registry`` live);
+        inbound messages; (1a) re-pend rows a RETURNED worker left in flight
+        (:meth:`_recover_stopped_worker_residue`); (2) swap the registry + restart the inbound
+        listeners from it (Router/Handler changes take effect immediately — the inbound path reads
+        ``self.registry`` live);
         (2a) decide the OUTBOUND lane partition for the lanes this reload ADDS — it MUST sit between
         the swap and the listener restart, because step 2's listeners and step 2b's dispatcher nudge
         both READ that decision and would otherwise take the unknown-lane default (ADR 0066 D4, and
@@ -4696,6 +4758,12 @@ class RegistryRunner:
                 )  # we hold _reload_lock — use the unsafe variant
 
             try:
+                # 1a. ADR 0157 Inc 2: re-pend what a RETURNED worker left in flight. HERE, and no
+                # later: step 2's listener restart re-arms inbound workers (_start_inbound_unsafe
+                # -> _ensure_inbound_workers) and step 3 respawns delivery workers, and a re-armed
+                # worker may claim on the lane before the reset lands. Inside the try so anything
+                # that escapes it still restores the old intake.
+                await self._recover_stopped_worker_residue()
                 # 2. Swap the registry and restart inbound listeners from it (intake back up first).
                 self.registry = new_registry
                 # 2a. ADR 0066 D4: decide the OUTBOUND lane partition for every lane this reload ADDS,
@@ -4868,6 +4936,8 @@ class RegistryRunner:
         # the body was NOT committed: a recorded ERROR from a decode/size guard). The receipt semantics
         # (which the source maps to 202/4xx) are HTTP's own response logic, exactly as the HL7 ACK is
         # MLLP's — the ingress commit + count-and-log + disposition machine are the SAME as _handle_inbound.
+        # Every source declaring wants_receipt binds this handler, the DICOM SCP included (BACKLOG #1910),
+        # so None here must keep meaning "not committed": the SCP answers a DIMSE failure on it.
         async def on_request(raw: bytes) -> str | None:
             return await self._handle_inbound_http(ic, raw)
 
@@ -4923,7 +4993,11 @@ class RegistryRunner:
 
         Shares the SAME store calls, size ceiling, decode handling, and disposition machine as
         :meth:`_handle_inbound`; it differs only in returning the id instead of a wire ACK and in not
-        building an HL7 ACK frame (HTTP is the carrier, the 202 is the receipt)."""
+        building an HL7 ACK frame (HTTP is the carrier, the 202 is the receipt).
+
+        It is the receipt handler for EVERY source that declares ``wants_receipt``, not only HTTP. The
+        DICOM C-STORE SCP answers a DIMSE failure on ``None`` (BACKLOG #1910), so no path here may return
+        ``None`` after ``enqueue_ingress`` has committed, or an accepted object reads as refused."""
         src = ic.spec.type.value
         hl7v2 = ic.content_type is ContentType.HL7V2
 
@@ -4941,7 +5015,7 @@ class RegistryRunner:
                 )
                 return None
             if await self._declared_content_mismatch(ic, raw):
-                return None  # ERROR recorded; HTTP owns its own 202/4xx receipt (no HL7 ACK)
+                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
@@ -4999,7 +5073,7 @@ class RegistryRunner:
                 )
                 return None
             if await self._declared_content_mismatch(ic, raw, text=text):
-                return None  # ERROR recorded; HTTP owns its own 202/4xx receipt (no HL7 ACK)
+                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=text,
@@ -5093,9 +5167,9 @@ class RegistryRunner:
     def _streaming_over_threshold(self, ic: InboundConnection, text: str) -> bool:
         """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at/above
         that threshold — the gate for the over-threshold detach path (#149, ADR 0105 Phase 1a). Below
-        threshold or unset ⇒ False ⇒ the byte-identical no-detach fast path (and no strict downgrade)."""
-        threshold = ic.stream_threshold_bytes
-        return threshold is not None and len(text) >= threshold
+        threshold or unset ⇒ False ⇒ the byte-identical no-detach fast path (and no strict downgrade).
+        The rule lives in ``ingress_guards`` so the operator resend reads it the same way (#1911)."""
+        return streaming_over_threshold(ic, text)
 
     async def _detach_documents(self, ic: InboundConnection, text: str) -> tuple[str, list[str]]:
         """Detach every oversized OBX-5 ED base64 document from an over-threshold HL7 body into the
@@ -5514,8 +5588,9 @@ class RegistryRunner:
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
         claimed row INFLIGHT. Every claim path selects ``status='pending'``, so the surviving worker
-        never reconsiders it, and ``reset_stale_inflight`` runs from ``Engine.start()`` and the
-        cluster promotion path only — **not** from ``reload()``. Without this the row waits for a
+        never reconsiders it, and ``reset_stale_inflight`` runs from ``Engine.start()``, the
+        cluster promotion path, and a ``reload()`` for a worker that has RETURNED (ADR 0157 Inc 2)
+        -- which this surviving worker has not. Without this the row waits for a
         service restart, overtaken by its successors, while ``pending_depth`` (pending rows only)
         reports the lane healthy to the buildup and stall alerts.
 
@@ -5540,6 +5615,38 @@ class RegistryRunner:
             log.warning(
                 "%s worker %r: reschedule_claimed failed for %d claimed row(s); they stay INFLIGHT "
                 "for reset_stale_inflight at the next start",
+                worker,
+                name,
+                len(ids),
+                exc_info=True,
+            )
+
+    async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> None:
+        """Best-effort release of the batch tail a per-lane worker still holds when it RETURNS on a
+        STOPPED outcome (ADR 0157 Inc 2, BACKLOG #1497) -- the per-lane twin of the pooled
+        ``_run_lane`` tail release, so one ``internal_error`` STOP leaves the same queue state in both
+        claim modes.
+
+        The caller passes the rows after the one that stopped; ``release_claimed`` touches only
+        rows still ``inflight``, so a caller that cannot tell them apart may pass its whole batch.
+        NOT ON A NODE THAT HAS LOST LEADERSHIP: the release is unfenced, and those rows belong to
+        the successor's promotion recovery, which may already have re-claimed them. That path
+        keeps releasing only its own head. The tail was never dispatched, so ``release_claimed``
+        (which undoes the claim's ``attempts`` increment) is the
+        right re-pend rather than ``reschedule_claimed``: a stopped lane has no worker to spin.
+
+        Without this the tail stayed INFLIGHT, invisible to every claim, and a worker re-armed by an
+        operator ``start_*`` / ``restart_*`` (or an alert rule's auto-restart) drained newer rows past
+        it until the next start. A failure here logs and leaves the rows for the reload-time backstop
+        (:meth:`_recover_stopped_worker_residue`) or the next start."""
+        if not ids or not self._coordinator.is_leader():
+            return
+        try:
+            await self.store.release_claimed(list(ids))
+        except Exception:  # noqa: BLE001 — a stopping worker must not raise out of its return
+            log.warning(
+                "%s worker %r: release_claimed failed for %d claimed row(s) on stop; they stay "
+                "INFLIGHT for the reload-time backstop or the next start",
                 worker,
                 name,
                 len(ids),
@@ -5638,7 +5745,7 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
-                for item in items:
+                for i, item in enumerate(items):
                     # BACKLOG #82: pace this lane's egress BEFORE the send seam so ONE hook covers both
                     # the single-message and the batch body (below) — a paced batch counts as one
                     # interval. Sits between claim and send (outside the produce→complete transaction),
@@ -5652,6 +5759,7 @@ class RegistryRunner:
                     else:
                         outcome = await self._process_delivery_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
+                        await self._release_tail_on_stop("delivery", name, claimed[i + 1 :])
                         return
             except asyncio.CancelledError:
                 raise
@@ -6234,9 +6342,10 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
-                for item in items:
+                for i, item in enumerate(items):
                     outcome = await self._process_ingress_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
+                        await self._release_tail_on_stop("router", name, claimed[i + 1 :])
                         return
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # ingress backlog is building (a slow/hung router). Uses the global buildup threshold.
@@ -6347,10 +6456,9 @@ class RegistryRunner:
             # drains the backlog). Reschedule with a retry-FOREVER policy (NOT the outbound
             # delivery defaults, whose finite max_attempts would dead-letter an ACKed-but-
             # never-attempted message purely for being removed) so the message is never
-            # dropped. The unprocessed batch tail stays INFLIGHT and is recovered in order by
-            # reset_stale_inflight on the next START (ADR 0058 INV-3) — #1611: NOT on a reload.
-            # reload_detail never calls it, so a reload restoring the inbound re-arms this worker
-            # and drains the PENDING backlog while the tail stays in flight until a restart.
+            # dropped. The worker releases the unprocessed batch tail as it returns
+            # (_release_tail_on_stop, ADR 0157 Inc 2), so the tail keeps its FIFO position and
+            # the reload that restores the inbound drains it with the rest of the backlog.
             # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
             # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
             # purely for outliving a reload — the one thing these three sites exist to prevent.
@@ -6670,6 +6778,7 @@ class RegistryRunner:
                 # sequential per-item loop. Returns True iff the lane must halt (STOP policy / missing
                 # inbound), matching the old `for item in items` early return.
                 if await self._process_routed_batch(name, items):
+                    await self._release_tail_on_stop("transform", name, claimed)
                     return
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # routed (transform) backlog is building behind a slow/hung handler — reported separately
@@ -6786,10 +6895,9 @@ class RegistryRunner:
             # Inbound removed; nothing to transform with until a reload restores it (which
             # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
             # router worker), so the ACKed-but-unprocessed message is never dropped. The
-            # unprocessed batch tail stays INFLIGHT and is recovered in order by
-            # reset_stale_inflight on the next START (ADR 0058 INV-3) — #1611: NOT on a reload.
-            # reload_detail never calls it, so a reload restoring the inbound re-arms this worker
-            # and drains the PENDING backlog while the tail stays in flight until a restart.
+            # worker releases the unprocessed batch tail as it returns (_release_tail_on_stop,
+            # ADR 0157 Inc 2), so the tail keeps its FIFO position and the reload that
+            # restores the inbound drains it with the rest of the backlog.
             # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
             # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
             # purely for outliving a reload — the one thing these three sites exist to prevent.
@@ -8196,6 +8304,27 @@ def check_fhir_lookup_allowed(
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
+#: How the four inbound bind refusals below describe ``--allow-insecure-bind``. They name no
+#: per-connection ``tls_hop_attested``: :func:`_inbound_insecure_bind_permitted` reads it, but no
+#: supported surface sets it -- no factory parameter and no ``connections.toml`` key. Only the
+#: unsupported raw-settings escape hatch (writing ``spec.settings`` directly) reaches it, and a refusal
+#: must not steer an operator there (docs/DEPLOYMENT.md, SDS-3.7).
+_INSECURE_BIND_FLAG_CLAMP = (
+    "(an enforcing instance, which is the default, ignores the flag; "
+    "[security].enforcement = warn lets it apply)"
+)
+
+
+def _insecure_bind_cause(source: Source) -> str:
+    """What let an off-loopback cleartext bind cross, for its WARNING line.
+
+    It names ``tls_hop_attested`` only when the connection carries it, so the line reports a fact
+    rather than offering a field no supported surface sets (see :data:`_INSECURE_BIND_FLAG_CLAMP`)."""
+    if source.tls_hop_attested:
+        return "tls_hop_attested"
+    # serve folds [security].require_encryption_for_remote = false into the same flag (ADR 0118).
+    return "--allow-insecure-bind / require_encryption_for_remote = false"
+
 
 def _inbound_insecure_bind_permitted(
     *, allow_insecure_bind: bool, attested: bool, posture: HopPosture | None
@@ -8258,7 +8387,7 @@ def check_inbound_revocation(
     **Measured on this tree**: the three server builders load a CA, set ``CERT_REQUIRED`` and finish
     with ``harden_verify_flags`` -- strict RFC 5280 path validation, NOT revocation -- so a client
     certificate revoked this morning keeps authenticating until its ``notAfter``. Set
-    ``tls_crl_file`` on the connection (a PEM carrying the CA and its CRL), or declare
+    ``tls_crl_file`` on the connection (a PEM file holding the CA's CRL), or declare
     ``tls_revocation_attested = true`` with a ``tls_revocation_attested_reason`` on the connection if
     your PKI checks revocation outside the engine (ADR 0173). An attestation that suppresses the
     enforcing refusal is logged at WARNING with its reason, so the crossing stays on the record.
@@ -8298,8 +8427,9 @@ def check_inbound_revocation(
         log.warning(
             "inbound %r requires and verifies a client certificate (mTLS) but checks NO revocation: "
             "a revoked partner certificate would keep authenticating until its notAfter. Set "
-            "tls_crl_file on the connection, or tls_revocation_attested=true with a "
-            "tls_revocation_attested_reason if your PKI checks revocation outside the engine.",
+            "tls_crl_file (a PEM file holding the CA's CRL) on the connection, or "
+            "tls_revocation_attested=true with a tls_revocation_attested_reason if your PKI checks "
+            "revocation outside the engine.",
             name,
         )
         return
@@ -8307,7 +8437,7 @@ def check_inbound_revocation(
         f"inbound connection {name!r} requires and verifies a client certificate (mTLS) but checks "
         "no revocation, on an enforcing production-PHI instance; a partner certificate revoked "
         "today would keep authenticating to this interface until its notAfter. Set tls_crl_file "
-        "(a PEM carrying the CA and its CRL) on the connection, or set "
+        "(a PEM file holding the CA's CRL) on the connection, or set "
         "tls_revocation_attested=true with a tls_revocation_attested_reason if a "
         "revocation-checking PKI covers these certificates outside the engine. An HTTP proxy can "
         "terminate neither MLLP nor DIMSE, so for those listeners the documented out-of-engine "
@@ -8332,18 +8462,18 @@ def check_mllp_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r without TLS "
-            "(--allow-insecure-bind / tls_hop_attested); HL7 bodies cross the network in cleartext — "
+            "(%s); HL7 bodies cross the network in cleartext — "
             "set tls=true (+ tls_cert_file/tls_key_file) on it.",
             name,
             host,
+            _insecure_bind_cause(source),
         )
         return
     raise WiringError(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; HL7 bodies would "
         "cross the network in cleartext. Set tls=true (+ tls_cert_file/tls_key_file) on the MLLP "
         "connection, or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
-        "firewalled network (refused even with the flag on a production-PHI instance — set "
-        "tls_hop_attested=true if the segment is secured by other means)."
+        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
     )
 
 
@@ -8368,18 +8498,18 @@ def check_http_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r for an HTTP listener without TLS "
-            "(--allow-insecure-bind / tls_hop_attested); POSTed bodies (frequently PHI) cross the "
+            "(%s); POSTed bodies (frequently PHI) cross the "
             "network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on the Http connection.",
             name,
             host,
+            _insecure_bind_cause(source),
         )
         return
     raise WiringError(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; POSTed bodies "
         "(frequently PHI) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the Http connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network (refused even with the flag on a "
-        "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
     )
 
 
@@ -8601,18 +8731,18 @@ def check_dimse_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r without DICOM-over-TLS "
-            "(--allow-insecure-bind / tls_hop_attested); DICOM PHI (header + pixel data) crosses the "
+            "(%s); DICOM PHI (header + pixel data) crosses the "
             "network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on the DICOM connection.",
             name,
             host,
+            _insecure_bind_cause(source),
         )
         return
     raise WiringError(
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; DICOM PHI (header "
         "+ pixel data) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the DICOM connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network (refused even with the flag on a "
-        "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
+        "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
     )
 
 
@@ -8639,20 +8769,20 @@ def check_tcp_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r for a plaintext-only %s listener "
-            "(--allow-insecure-bind / tls_hop_attested); X12/raw-TCP payloads (frequently PHI) cross "
+            "(%s); X12/raw-TCP payloads (frequently PHI) cross "
             "the network in cleartext — these listeners have no TLS, so firewall/segment them.",
             name,
             host,
             source.type.value.upper(),
+            _insecure_bind_cause(source),
         )
         return
     raise WiringError(
         f"inbound connection {name!r} binds non-loopback host {host!r} on a plaintext-only "
         f"{source.type.value.upper()} listener; raw-TCP/X12 payloads (frequently PHI) would cross the "
         "network in cleartext. TCP/X12 listeners are plaintext-only (no TLS option) — bind loopback, "
-        "firewall/segment the port at the OS level, or pass `serve --allow-insecure-bind` to accept "
-        "the cleartext risk on a trusted, firewalled network (refused even with the flag on a "
-        "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
+        "or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
+        "firewalled network " + _INSECURE_BIND_FLAG_CLAMP + "."
     )
 
 

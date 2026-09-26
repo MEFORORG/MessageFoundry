@@ -36,6 +36,7 @@ from messagefoundry.pipeline.alert_sinks import WebhookTransport, _NoRedirectHan
 from messagefoundry.store.sqlserver import connection_string
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports.file import _content_matches_declared, _looks_like_hl7
+from tests._admin_account import login_admin
 
 # --- WP-4: argon2 parameters pinned -----------------------------------------
 
@@ -138,11 +139,8 @@ async def test_logout_emits_audit_event() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
-        boot = await service.initialize()
-        assert boot is not None
-        out = await service.login("admin", boot.password)
-        assert out.ok and out.token is not None
-        await service.logout(out.token, actor="admin")
+        identity, token, _ = await login_admin(service)
+        await service.logout(token, actor=identity.username)
         actions = [row["action"] for row in await store.list_audit()]
         assert "auth.logout" in actions
     finally:

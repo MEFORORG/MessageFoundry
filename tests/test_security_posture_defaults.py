@@ -314,6 +314,9 @@ def test_every_security_bool_at_its_insecure_value_is_reported() -> None:
         # loosening at either value; both are documented as such.
         "memory_encryption_operator_declared",
         "require_memory_encryption_declaration",
+        # BACKLOG #1182: the opt-in static-credential refusal TIGHTENS. Its opt-outs are what the
+        # registry names (as `static_credential_accepted`), and only while it is on.
+        "require_nonstatic_credentials",
         # ADR 0143: disabling the console SHRINKS attack surface — the opposite of a loosening.
         "serve_web_console",
         # The data-class lever has its own entry keyed on the derived posture, not a plain negation.
@@ -352,6 +355,10 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     "tls_key_file": "material/path, not a posture switch",
     "tls_key_password": "material/path, not a posture switch",
     "tls_ca_file": "material/path, not a posture switch",
+    # BACKLOG #1142, slice 3. A TIGHTENING, like tls_ciphers below: a set pin refuses any other
+    # bytes, and the one thing it relaxes (an unreadable ACL or path loads, with a warning and a
+    # pinned=true audit row) is reported by that row rather than by a posture reader.
+    "tls_ca_pin": "SHA-256 of tls_ca_file: a tightening; its escape writes an audit row",
     # BACKLOG #1005 added this one. It is exempt for BOTH of the reasons already used above, and
     # stating only the first would be the weaker half: it is a material PATH like tls_ca_file
     # beside it, AND its ABSENCE is GATED rather than reported -- check_inbound_revocation refuses
@@ -807,7 +814,8 @@ def test_expiry_relaxed_hops_never_leaks_a_url_credential() -> None:
     )
     peers = dict(expiry_relaxed_hops(reg))
     assert "hunter2" not in peers["OB_REST"]
-    assert peers["OB_REST"] == "https://svc:***@api.example/ingest"
+    # BACKLOG #1182: the label keeps scheme, host and port only, so the user and the path go too.
+    assert peers["OB_REST"] == "https://api.example"
     assert peers["OB_ENV"] == "env(partner_host):7"
 
 

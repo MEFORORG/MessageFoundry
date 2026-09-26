@@ -18,10 +18,11 @@ from messagefoundry.api.auth_models import (
     AdGroupMapEntry,
     AdGroupScopeEntry,
     CustomRoleInfo,
+    FederatedIdentityView,
     RoleInfo,
     UserSummary,
 )
-from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider
 from messagefoundry.auth.permissions import Role
 
 from .._html import Markup, el, page, register_nav, rows_table
@@ -29,6 +30,8 @@ from ._common import _deadline_stamp, _seg
 
 __all__ = [
     "ad_groups_page",
+    "federated_identity_page",
+    "federated_unlink_confirm_page",
     "role_form_page",
     "roles_page",
     "temp_password_page",
@@ -196,6 +199,7 @@ def user_detail_page(
     roles: Sequence[RoleInfo],
     *,
     error: str | None = None,
+    federated: FederatedIdentityView | None = None,
 ) -> Markup:
     """One user's admin page (an ``unlock`` page): profile, roles, channel scope, and account actions.
 
@@ -211,6 +215,26 @@ def user_detail_page(
             el("input", name="display_name", value=user.display_name or ""),
         ),
         el("label", "Email", el("input", name="email", value=user.email or "")),
+        # BACKLOG #1139, ADR 0182 Amendment A: the notification address is its own field, and the
+        # route sends it only when it differs from `notify_email_shown`.
+        el(
+            "label",
+            "Notification address",
+            el(
+                "input",
+                name="notify_email",
+                value=user.notify_email or "",
+                aria_describedby="notify-email-hint",
+            ),
+        ),
+        el("input", type="hidden", name="notify_email_shown", value=user.notify_email or ""),
+        el(
+            "p",
+            "Where security notices for this account are sent. Changing it notifies the old "
+            "address. It cannot be cleared. Changing the Email field does not change it.",
+            id="notify-email-hint",
+            class_="muted",
+        ),
         el(
             "label",
             el("input", type="checkbox", name="disabled", checked=user.disabled),
@@ -332,9 +356,226 @@ def user_detail_page(
         el("div", el("h2", "Profile"), profile, class_="card"),
         el("div", el("h2", "Roles"), roles_section, class_="card"),
         el("div", el("h2", "Channel scope"), scope, class_="card"),
+        _federated_card(user.id, federated),
         el("div", el("h2", "Account actions"), *danger, class_="card"),
         el("p", el("a", "← Users", href="/ui/users")),
         active="users",
+    )
+
+
+# --- federated identity (BACKLOG #1143 / #295, ADR 0184 slice B) -----------------------------------
+
+# The post-redirect notices, keyed by the ?m= code. An allow-list, so the query string can select a
+# sentence but never supply one (the cluster page's rule). Worded for what the link does, not for
+# whether federated sign-in is on: it ships off, and a disabled account signs in with nothing.
+_FEDERATED_NOTICES: dict[str, str] = {
+    "linked": "Linked. A federated sign-in with this subject now reaches this account.",
+    "relinked": (
+        "Relinked. The account's sessions were signed out. A federated sign-in with the new "
+        "subject now reaches this account, and the old subject reaches nothing."
+    ),
+    "unlinked": (
+        "Unlinked. The account's sessions were signed out, and a federated sign-in no longer "
+        "reaches it."
+    ),
+}
+
+_SELF_NOTE = (
+    "Another administrator must change your own link. Relinking or unlinking it ends every "
+    "session you hold, this one included, and on a site where you sign in only through the "
+    "identity provider it can lock you out."
+)
+
+
+def _federated_link_readout(view: FederatedIdentityView) -> Markup:
+    """The account's stored ``(issuer, sub)``, or a sentence saying it has none.
+
+    Both halves are shown as stored, escaped, in a key/value table. Either half alone counts as
+    linked, matching the service's own test, so a half-written row is never shown as unlinked."""
+    if not view.linked:
+        return el("p", "Not linked. No identity provider account can sign in as this user.")
+    return rows_table(
+        ["Field", "Value"],
+        [
+            ["Issuer", view.issuer or "(none)"],
+            ["Subject (sub)", view.subject or "(none)"],
+        ],
+        adjustable=False,
+    )
+
+
+def _shown_fields(view: FederatedIdentityView) -> list[object]:
+    """The pair this page showed, posted back so the route can refuse a stale page."""
+    return [
+        el("input", type="hidden", name="shown_issuer", value=view.issuer or ""),
+        el("input", type="hidden", name="shown_subject", value=view.subject or ""),
+    ]
+
+
+def _link_form(view: FederatedIdentityView, subject: str) -> Markup:
+    """The Link or Relink form, or the sentence that says why there is none."""
+    if view.auth_provider != AuthProvider.AD.value:
+        return el(
+            "p",
+            f"Only a directory (AD) account can be linked. This is a {view.auth_provider} account.",
+            class_="muted",
+        )
+    if view.bind_issuer is None:
+        return el(
+            "p",
+            "Linking needs [auth].oidc_issuer, and it is not set on this engine.",
+            class_="muted",
+        )
+    if not view.has_directory_object_id:
+        # BACKLOG #1143 slice C: the engine refuses this bind, so the form would only spend a
+        # single-use re-authentication on a certain refusal.
+        return el(
+            "p",
+            "This account cannot be linked. It has no immutable directory id (objectGUID), and it "
+            "never gains one. Only a Windows SSO sign-in through a directory that returns "
+            "objectGUID creates an account with one.",
+            class_="muted",
+        )
+    return el(
+        "form",
+        *_shown_fields(view),
+        el(
+            "label",
+            "Identity provider subject (sub)",
+            el(
+                "input",
+                name="subject",
+                value=subject,
+                required=True,
+                maxlength="255",
+                autocomplete="off",
+                spellcheck="false",
+                aria_describedby="federated-subject-hint",
+            ),
+        ),
+        el(
+            "p",
+            "The exact sub value the identity provider sends for this person. It is matched byte "
+            f"for byte, so paste it with no spaces around it. The issuer is {view.bind_issuer}. "
+            "Each change needs its own fresh re-authentication, so you may be asked for your "
+            "password again first.",
+            id="federated-subject-hint",
+            class_="muted",
+        ),
+        *(
+            [el("p", "Relinking signs the account out of every session.", class_="muted")]
+            if view.linked
+            else []
+        ),
+        el("button", "Relink" if view.linked else "Link", type="submit"),
+        method="post",
+        action=f"/ui/users/{_seg(view.user_id)}/federated-identity/link",
+        class_="ctl",
+    )
+
+
+def federated_identity_page(
+    view: FederatedIdentityView,
+    *,
+    is_self: bool,
+    notice: str = "",
+    error: str | None = None,
+    subject: str = "",
+) -> Markup:
+    """View, link, relink and unlink one account's federated identity (ADR 0184 slice B).
+
+    An ``unlock`` page tagged ``admin_federated_identity``: a re-auth aimed here mints the single-use
+    grant the link POST consumes. The forms offered follow the service's refusals, so an operator is
+    not handed a button that can only fail: none on their own account, and no link form on a local
+    account, with no issuer set, or on an account with no directory id (BACKLOG #1143 slice C). The
+    POSTs still refuse all four, because the gate is the handler's, not this page's.
+    """
+    base = f"/ui/users/{_seg(view.user_id)}/federated-identity"
+    message = _FEDERATED_NOTICES.get(notice)
+    actions: list[object] = []
+    if is_self:
+        actions.append(el("p", _SELF_NOTE, class_="muted"))
+    else:
+        actions.append(_link_form(view, subject))
+        if view.linked:
+            actions.append(el("p", el("a", "Unlink this identity", href=f"{base}/unlink-confirm")))
+    return page(
+        f"Federated identity: {view.username}",
+        el("h1", f"Federated identity: {view.username}"),
+        el(
+            "p",
+            f"Which identity provider account may sign in as {view.username}. A federated sign-in "
+            "picks its account by this link, never by the name in the token.",
+            class_="muted",
+        ),
+        el("p", message, class_="banner") if message else Markup(""),
+        _banner(error),
+        el("div", el("h2", "Current link"), _federated_link_readout(view), class_="card"),
+        el("div", el("h2", "Change"), *actions, class_="card"),
+        el("p", el("a", f"<- User {view.username}", href=f"/ui/users/{_seg(view.user_id)}")),
+        active="users",
+    )
+
+
+def federated_unlink_confirm_page(view: FederatedIdentityView, *, is_self: bool) -> Markup:
+    """The confirm step for an unlink: it states the consequence before the one POST that acts.
+
+    An ``unlock`` page tagged ``admin_federated_identity``, the stepdown-confirm shape: a stale
+    unlink POST comes back here, never re-POSTed. It re-reads the account, so a link removed in the
+    meantime renders a sentence and no form, and the form posts back the pair it showed."""
+    base = f"/ui/users/{_seg(view.user_id)}/federated-identity"
+    parts: list[object]
+    if is_self:
+        parts = [el("p", _SELF_NOTE)]
+    elif not view.linked:
+        parts = [el("p", "This account has no federated link to remove.")]
+    else:
+        parts = [
+            _federated_link_readout(view),
+            el(
+                "p",
+                f"Unlinking signs {view.username} out of every session. Their next federated "
+                "sign-in is refused until an administrator links them again. Any other way they "
+                "sign in is not changed.",
+            ),
+            el(
+                "form",
+                *_shown_fields(view),
+                el("button", f"Unlink {view.username}", type="submit"),
+                method="post",
+                action=f"{base}/unlink",
+                class_="ctl",
+            ),
+        ]
+    back = el("p", el("a", "Cancel", href=base))
+    body = el(
+        "div",
+        el("h1", f"Unlink the federated identity of {view.username}"),
+        *parts,
+        back,
+        class_="card detail-card",
+    )
+    return page("Unlink federated identity", body, active="users")
+
+
+def _federated_card(user_id: str, federated: FederatedIdentityView | None) -> Markup:
+    """The user page's Federated sign-in card (BACKLOG #1143). Nothing when the caller passed no
+    view, so the page never claims "not linked" about a pair it was not given."""
+    if federated is None:
+        return Markup("")
+    return el(
+        "div",
+        el("h2", "Federated sign-in"),
+        _federated_link_readout(federated),
+        el(
+            "p",
+            el(
+                "a",
+                "Manage the federated identity",
+                href=f"/ui/users/{_seg(user_id)}/federated-identity",
+            ),
+        ),
+        class_="card",
     )
 
 
