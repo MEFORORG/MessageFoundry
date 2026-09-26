@@ -51,9 +51,9 @@ from typing import Final
 
 import pytest
 from _docs_toml import TOML_FENCE_RE, line_contexts
-from _sequenced_docs import sequenced_documents
 
 from messagefoundry.config.settings import _RELOCATED_TO_SECURITY, _REMOVED_KEYS
+from tests._sequenced_docs import sequenced_documents
 
 #: Every key the loader refuses, whichever way it got there. BACKLOG #1279 added the second
 #: table: a REMOVED key fails at load exactly like a relocated one, and its message cannot name a

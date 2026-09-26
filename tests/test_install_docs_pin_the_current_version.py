@@ -26,9 +26,9 @@ import re
 from pathlib import Path
 
 import pytest
-from _sequenced_docs import sequenced_documents
 
 from messagefoundry import __version__
+from tests._sequenced_docs import sequenced_documents
 
 _ROOT = Path(__file__).resolve().parents[1]
 

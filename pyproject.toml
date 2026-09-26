@@ -544,6 +544,7 @@ ignore_missing_imports = true
 # The scripts names are modules a test loads after putting a scripts/ directory on sys.path, and the
 # two `re._*` names are private stdlib modules typeshed does not ship. Each resolves to Any, so a call
 # into one is unchecked. The cure is the package-qualified import; a NEW bare import fails the gate.
+# IF `mypy tests` says import-not-found for a tests/ helper: write `from tests._x import ...` instead.
 [[tool.mypy.overrides]]
 module = ["_ast_sites", "_bash_resolver", "_cipher_registry", "_docs_toml", "_extras_probe", "_failover_load_support", "_fhir_fixtures", "_ingress_pace_probe", "_mfa_grant", "_pace_probe", "_phi_log_capture", "_session_mail_harness", "_totp_clock", "adr0075_batch_harness", "test_gate_installed_parity", "test_install_gate_wiring", "anchor_provenance", "anchor_report", "forbidden_members", "scan_forbidden", "scorecard", "stale_repo_slug_check", "re._constants", "re._parser"]
 ignore_missing_imports = true
