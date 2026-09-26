@@ -339,6 +339,8 @@ class _FakeWS:
         self.app = app
         self.url = SimpleNamespace(scheme="ws", path="/ws/stats")
         self.cookies = {"mf_session": cookie}
+        # Read by client_ip for the denial row (ADR 0150, BACKLOG #1644), as on a real WebSocket.
+        self.client = SimpleNamespace(host="127.0.0.1", port=123)
 
 
 async def test_the_console_socket_refuses_a_confined_session_below_the_factor_check(

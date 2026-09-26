@@ -113,6 +113,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # `git ls-files` scope -- which is the half that makes it engine-subject.
         "test_escape_sequence_check.py",
         "test_external_link_interstitial.py",
+        # AST-scans messagefoundry/**/*.py for every `raise ... from None` and holds each site to a
+        # reviewed list (BACKLOG #1796). A new site arrives as an ENGINE diff,
+        # which does not trip the tooling path gate, so as tooling it would face nothing there.
+        "test_from_none_is_not_redaction.py",
         "test_licence_header_gate.py",
         # Scans the TRACKED messagefoundry/ and harness/ trees for files the release member gate
         # would refuse, so an engine commit adding one is exactly the diff it has to catch
