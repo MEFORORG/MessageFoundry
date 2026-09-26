@@ -43,17 +43,19 @@ assert _CONSOLE_MATCH is not None, f"no __version__ assignment in {_CONSOLE_INIT
 _CONSOLE_VERSION = _CONSOLE_MATCH[1]
 
 _VERIFY_ASSIGN = re.compile(r'^\$V = "([^"]+)"', re.MULTILINE)
-# A version and nothing after it: a trailing quote, period or comma is punctuation, not version.
-_V = r"(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?)"
-# The engine pin in a pip command or its inline prose. The webconsole wheel has its own version, so
+# A PEP 440 release with its pre, post and dev parts, and nothing after it: a trailing quote, period
+# or comma is punctuation, not version. Truncating `0.4.0.post1` to `0.4.0` would read it as current.
+_V = r"(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?)(?![\w+])"
+# The engine pin in a pip command or its inline prose, in any spelling pip accepts: any case, space
+# around `==`, spaced or hyphenated extras. The webconsole wheel has its own version, so
 # `messagefoundry-webconsole==` must not match; `$V` pins are not literals, so they must not either.
-_ENGINE_PIN = re.compile(rf"(?<![\w-])messagefoundry(?:\[[\w,]+\])?=={_V}")
-_CONSOLE_PIN = re.compile(rf"(?<![\w-])messagefoundry[-_]webconsole=={_V}")
-# Two pin-shaped prose forms: "the console built FOR engine 0.4.0" and a diagram's "engine 0.1.0
-# WHEEL". Narrower than any "engine X.Y.Z" on purpose: "added in engine 0.2.0" is history, true
-# forever, and must not go red on the next release. A placeholder (`X.Y.Z`, `<new>`) is not digits,
-# so an illustrative line stays out by construction.
-_ENGINE_FOR = re.compile(rf"\b(?:for|with)\s+engine\s+`?v?{_V}\b", re.IGNORECASE)
+_ENGINE_PIN = re.compile(rf"(?<![\w-])messagefoundry(?:\[[\w,\s-]+\])?\s*==\s*{_V}", re.IGNORECASE)
+_CONSOLE_PIN = re.compile(rf"(?<![\w-])messagefoundry[-_]webconsole\s*==\s*{_V}", re.IGNORECASE)
+# Two pin-shaped prose forms: "the web console FOR engine 0.4.0" / "BUILT FOR engine 0.4.0", and a
+# diagram's "engine 0.1.0 WHEEL". Narrower than any "engine X.Y.Z" on purpose: "added in engine
+# 0.2.0" and "works with engine 0.2.0 and later" stay true forever and must not go red on the next
+# release. A placeholder (`X.Y.Z`, `<new>`) is not digits, so an illustrative line stays out.
+_ENGINE_FOR = re.compile(rf"\b(?:console|built)\s+for\s+engine\s+`?v?{_V}", re.IGNORECASE)
 _ENGINE_WHEEL = re.compile(rf"\bengine\s+`?v?{_V}`?\s+wheel\b", re.IGNORECASE)
 
 #: Each pattern with the version it must name. The sweep and the planted control share this, so the
@@ -122,10 +124,13 @@ _SHAPES = (
     "pip install 'messagefoundry=={e}'",
     "Install messagefoundry=={e}.",
     'pip install "messagefoundry[harness]=={e}"',
+    'pip install "messagefoundry[harness, postgres]=={e}"',
+    "pip install MessageFoundry == {e}",
     'pip install "messagefoundry-webconsole=={c}"',
     "messagefoundry-webconsole=={c}, the console",
     "pip install messagefoundry_webconsole=={c}",
     "the /ui web console for engine {e}, into the same venv",
+    "the console built for engine {e}.",
     "       engine {e} wheel  engine {e} wheel  (pinned, identical)",
     "       Engine {e} wheel",
     "       engine v{e} wheel",
@@ -134,7 +139,15 @@ _SHAPES = (
 
 
 @pytest.mark.parametrize("shape", _SHAPES)
-@pytest.mark.parametrize(("stale_e", "stale_c"), [("0.1.0", "0.0.1"), ("0.1.0rc1", "0.0.1rc1")])
+@pytest.mark.parametrize(
+    ("stale_e", "stale_c"),
+    [
+        ("0.1.0", "0.0.1"),
+        ("0.1.0rc1", "0.0.1rc1"),
+        # The shipped version plus a suffix: a capture that truncated it would read it as current.
+        (f"{__version__}.post1", f"{_CONSOLE_VERSION}.dev1"),
+    ],
+)
 def test_a_planted_stale_pin_is_caught(shape: str, stale_e: str, stale_c: str) -> None:
     """POSITIVE CONTROL for the sweep: each shape it exists for is reported when stale.
 
@@ -153,7 +166,8 @@ def test_a_planted_stale_pin_is_caught(shape: str, stale_e: str, stale_c: str) -
     [
         "The retry cap was added in engine 0.2.0.",
         "Engine 0.1.0 shipped the first MLLP listener.",
-        "earlier releases, back to the `0.1.0rc1` pre-release, remain installable",
+        "The DICOM connector works with engine 0.2.0 and later.",
+        "The replay bug was fixed for engine 0.2.0.",
     ],
 )
 def test_a_version_named_as_history_is_not_a_pin(history: str) -> None:
