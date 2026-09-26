@@ -56,6 +56,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING — the `Http()` inbound listener answers 400 to a request with no `Host` or with two.**
+  RFC 9112 section 3.2 requires a server to refuse both shapes. In the shipped code an HTTP/1.1
+  request with no `Host` was accepted, and a second `Host` silently replaced the first. The listener
+  routes on no `Host` value, but a fronting proxy that honoured the first `Host` would have disagreed
+  with it about the second. Both shapes are now refused while the request head is read, before any
+  body byte is read or anything is dispatched. Each is a `framing_error` event with no ingress row,
+  and the refusal never echoes the header's value. An HTTP/1.0 request with no `Host` is still
+  accepted, because that version predates the field, and so is an empty `Host:` value. A `Host`
+  value's syntax is not checked. **A deploying sender or health probe that sends HTTP/1.1 with no
+  `Host` would be refused**, and must send one. (`BACKLOG #1972`)
 - **BREAKING: `serve` now refuses to start when the credential reminders have no `[alerts]`
   recipient.** The unclaimed-temporary-password and cert-expiry reminders go to the `[alerts]`
   notifier. That notifier needs `webhook_url`, or `email_to` beside `email_smtp_host` and
