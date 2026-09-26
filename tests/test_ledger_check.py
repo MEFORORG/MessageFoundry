@@ -12,12 +12,14 @@ what is asserted is the contract git will actually invoke.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -961,6 +963,140 @@ def test_ci_mode_skips_the_ownership_rule_but_still_catches_a_reused_number(repo
     code, out = run_check(repo, "--ci")
     assert code == 1
     assert "ADR 0001 already exists" in out
+
+
+# ----------------------------------------------------- a path is a RECORD, not a word (BACKLOG #1871)
+#
+# The gate used to end every path read in `.split()`, which tears a filename at its space. Neither
+# half matches ADR_FILE, so the file was invisible: no collision check, no index-row check. The
+# regex was never at fault -- `[^/]+` matches a space -- the tear happened before it ran.
+#
+# PLAIN IS THE CONTROL. It passes before and after the fix, so a failure on SPACED is attributable
+# to the space rather than to a fixture that staged nothing. ACCENTED is the core.quotePath case:
+# under git's default, a non-ASCII path arrives C-quoted ("docs/adr/0192-caf\303\251.md") in
+# line-oriented output, so splitting lines alone would still hide it. Reading NUL-terminated output
+# with -z is what makes both arrive verbatim.
+
+SPACED = "docs/adr/0190-with space.md"
+PLAIN = "docs/adr/0191-nospace.md"
+ACCENTED = "docs/adr/0192-café.md"
+
+
+@pytest.fixture(scope="module")
+def gate() -> ModuleType:
+    """The hook loaded by path. It is a stdlib script, not a package."""
+    spec = importlib.util.spec_from_file_location("ledger_check", CHECK)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _stage_the_three(repo: Path) -> None:
+    # Pinned, not inherited: with quotePath off, line-oriented output would not quote ACCENTED, and a
+    # regression to .splitlines() would pass this suite on that runner.
+    git(repo, "config", "core.quotePath", "true")
+    for rel in (SPACED, PLAIN, ACCENTED):
+        write(repo, rel, "# ADR\n")
+    git(repo, "add", "-A")
+
+
+def test_added_files_keeps_a_path_with_a_SPACE_whole(
+    repo: Path, gate: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stage_the_three(repo)
+    monkeypatch.chdir(repo)
+
+    seen = gate.Ledger(ci=False).added_files()
+
+    assert PLAIN in seen, f"the control was not seen, so this fixture proves nothing: {seen}"
+    assert SPACED in seen, f"a path holding a space was torn: {seen}"
+    assert ACCENTED in seen, f"a non-ASCII path arrived quoted: {seen}"
+    assert sorted(seen) == sorted([SPACED, PLAIN, ACCENTED]), f"stray fragments: {seen}"
+
+
+def test_added_files_in_CI_mode_keeps_a_path_with_a_SPACE_whole(
+    repo: Path, gate: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stage_the_three(repo)
+    git(repo, "commit", "-qm", "three ADRs")
+    monkeypatch.chdir(repo)
+
+    seen = gate.Ledger(ci=True).added_files()
+
+    assert PLAIN in seen, f"the control was not seen, so this fixture proves nothing: {seen}"
+    assert SPACED in seen, f"a path holding a space was torn: {seen}"
+    assert ACCENTED in seen, f"a non-ASCII path arrived quoted: {seen}"
+    assert sorted(seen) == sorted([SPACED, PLAIN, ACCENTED]), f"stray fragments: {seen}"
+
+
+def test_base_adr_numbers_keeps_a_path_with_a_SPACE_whole(
+    repo: Path, gate: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The BASE side matters on its own: a torn base file is a number missing from the taken set."""
+    _stage_the_three(repo)
+    git(repo, "commit", "-qm", "three ADRs")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    monkeypatch.chdir(repo)
+
+    taken = gate.Ledger(ci=False).base_adr_numbers()
+
+    assert taken.get("0191") == "0191-nospace.md", f"the control was not seen: {taken}"
+    assert taken.get("0190") == "0190-with space.md", f"a path holding a space was torn: {taken}"
+    assert taken.get("0192") == "0192-café.md", f"a non-ASCII path arrived quoted: {taken}"
+    assert taken == {
+        "0001": "0001-first.md",
+        "0190": "0190-with space.md",
+        "0191": "0191-nospace.md",
+        "0192": "0192-café.md",
+    }, f"stray entries: {taken}"
+
+
+def test_paths_refuses_output_that_was_not_NUL_terminated(gate: ModuleType) -> None:
+    """A caller that forgets -z must fail loudly, not read every file as one bogus path."""
+    assert gate._paths("") == []
+    assert gate._paths("a b.md\0c.md\0") == ["a b.md", "c.md"]
+    with pytest.raises(ValueError, match="-z"):
+        gate._paths("docs/adr/0001-a.md\ndocs/adr/0002-b.md\n")
+
+
+@pytest.mark.parametrize(
+    "rel", ["docs/adr/0001-second thing.md", "docs/adr/0001-café.md"], ids=["space", "non-ascii"]
+)
+def test_reusing_a_base_number_under_an_ODD_filename_is_blocked(repo: Path, rel: str) -> None:
+    """The collision itself, end to end, from the added side. Before the fix this exited 0."""
+    git(repo, "config", "core.quotePath", "true")
+    write(repo, rel, "# 0001 -- Second\n")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 already exists" in out
+
+
+def test_a_number_held_on_the_base_by_a_SPACED_filename_is_still_taken(repo: Path) -> None:
+    """The collision from the BASE side. Allocated and indexed, so ONLY the collision rule can refuse."""
+    write(repo, "docs/adr/0002-with space.md", "# 0002 -- Spaced\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="with space", title="Spaced")
+        + "\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base gains a spaced ADR")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    write(repo, "docs/adr/0002-other.md", "# 0002 -- Other\n")
+    allocate(repo, "adr", "0002")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 already exists" in out
 
 
 # --------------------------------------------------------------------------------------------------
