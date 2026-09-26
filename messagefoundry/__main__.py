@@ -5479,10 +5479,17 @@ def _refuse_a_store_that_is_not_an_audit_log(
     if not is_sqlite:
         return None
 
-    tail = "(check --db / [store].path)"
-    if not Path(path).exists():
-        print(f"error: no audit database at {path} — {refusal} {tail}", file=sys.stderr)
+    def refuse(message: str) -> int:
+        # `_emit_error` for the stream and the shape, so all three of this guard's refusals honour
+        # `as_json` -- the unreadable-file one below already did through #1670's reporter; these
+        # two printed text to stderr whatever it said (BACKLOG #1922). Its exit 1 is overridden:
+        # 1 here would read as a BROKEN CHAIN, and this is "could not start", which is 2 (see
+        # `_emit_store_open_error`).
+        _emit_error(f"{message} — {refusal} (check --db / [store].path)", as_json=as_json)
         return 2
+
+    if not Path(path).exists():
+        return refuse(f"no audit database at {path}")
 
     try:
         # `as_uri()` percent-encodes, which SQLite decodes back -- a bare f-string would misread a
@@ -5500,11 +5507,7 @@ def _refuse_a_store_that_is_not_an_audit_log(
         return _emit_store_open_error(exc, path, as_json=as_json)
 
     if found is None:
-        print(
-            f"error: {path} is a SQLite database with no audit_log table — {refusal} {tail}",
-            file=sys.stderr,
-        )
-        return 2
+        return refuse(f"{path} is a SQLite database with no audit_log table")
     return None
 
 

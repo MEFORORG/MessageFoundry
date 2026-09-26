@@ -126,6 +126,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
   pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
+- **`audit-anchor --json` now reports a missing audit database, or one with no `audit_log` table,
+  as JSON on stdout.** Both refusals printed plain text to stderr whatever `--json` said, so a
+  caller piping to `jq` got an empty stdout. They now print `{"error": ...}` on stdout, as the
+  unreadable-file refusal already did. The message and exit code 2 are unchanged, and text mode is
+  byte-identical. (`BACKLOG #1922`)
 - **A dual-control release can no longer run without an audit row, or be recorded as failed after
   it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
   that refused writes would have let a replay or a reload complete with no record of the release,
