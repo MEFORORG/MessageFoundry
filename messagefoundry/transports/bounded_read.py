@@ -588,16 +588,25 @@ def _parse_tree(msg: email.message.Message) -> tuple[object, ...]:
 #   chunk-ext    = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
 #   chunk-ext-val = token / quoted-string
 
-_TOKEN = rb"[" + _TCHARS.encode("ascii") + rb"]+"
-_QUOTED = rb'"(?:[\t \x21\x23-\x5b\x5d-\x7e\x80-\xff]|\\[\t \x21-\x7e\x80-\xff])*"'
+#
+# The patterns are str, matched against each line decoded as latin-1, which maps every byte to the
+# code point of the same value. So \x80-\xff below means the same bytes it would in a bytes pattern,
+# and the static ReDoS scan in tests/test_security_static.py can read them; it reads str only.
+#
+# The extension group repeats POSSESSIVELY (*+). Every repetition starts at a ";" that neither the
+# token class nor the whitespace before it can match, so there is one parse of any line and nothing
+# to give back. Possessive says so to the regex engine and to the scan.
+
+_TOKEN = f"[{_TCHARS}]+"
+_QUOTED = r'"(?:[\t \x21\x23-\x5b\x5d-\x7e\x80-\xff]|\\[\t \x21-\x7e\x80-\xff])*"'
 _CHUNK_EXT = (
-    rb"(?:[ \t]*;[ \t]*" + _TOKEN + rb"(?:[ \t]*=[ \t]*(?:" + _TOKEN + rb"|" + _QUOTED + rb"))?)*"
+    r"(?:[ \t]*;[ \t]*" + _TOKEN + r"(?:[ \t]*=[ \t]*(?:" + _TOKEN + "|" + _QUOTED + r"))?)*+"
 )
-_CHUNK_SIZE_LINE = re.compile(rb"([0-9A-Fa-f]+)" + _CHUNK_EXT)
+_CHUNK_SIZE_LINE = re.compile("([0-9A-Fa-f]+)" + _CHUNK_EXT)
 #: A trailer field line. It is discarded unread, but a line that is not one is a framing fault.
-_TRAILER_LINE = re.compile(_TOKEN + rb":[\t\x20-\x7e\x80-\xff]*")
+_TRAILER_LINE = re.compile(_TOKEN + r":[\t\x20-\x7e\x80-\xff]*")
 #: A folded continuation of the trailer line before it, accepted as a header fold is.
-_TRAILER_FOLD = re.compile(rb"[ \t][\t\x20-\x7e\x80-\xff]*")
+_TRAILER_FOLD = re.compile(r"[ \t][\t\x20-\x7e\x80-\xff]*")
 
 #: The line and field-count limits ``http.client`` applies to header lines, applied here to chunk
 #: lines and trailer fields. Neither is a new number.
@@ -650,7 +659,7 @@ def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
         line = _read_chunk_line(fp, connector)
         if line is None:
             raise _truncated_error(connector)
-        match = _CHUNK_SIZE_LINE.fullmatch(line)
+        match = _CHUNK_SIZE_LINE.fullmatch(line.decode("latin-1"))
         if match is None:
             raise _framing_error(connector, "a chunk-size line that is not plain hexadecimal")
         size = int(match.group(1), 16)
@@ -680,9 +689,10 @@ def _decode_chunked(fp: _SupportsReadline, amt: int, connector: str) -> bytes:
             # too. The last chunk has arrived by then, so the body is settled. http.client accepts
             # this ending as well, because some servers send it.
             return bytes(body)
-        if _TRAILER_LINE.fullmatch(line) is not None:
+        text = line.decode("latin-1")
+        if _TRAILER_LINE.fullmatch(text) is not None:
             field_seen = True
-        elif not (field_seen and _TRAILER_FOLD.fullmatch(line)):
+        elif not (field_seen and _TRAILER_FOLD.fullmatch(text)):
             raise _framing_error(connector, "a trailer line that is not a header field")
     # Folded continuation lines count toward the limit too, which keeps the loop bounded.
     raise _framing_error(connector, "more trailer lines than the reader allows")
