@@ -829,6 +829,7 @@ def refuse_unrevoked_verified_hop(
     *,
     connector: str,
     revocation_attested: bool = False,
+    revocation_attested_reason: str | None = None,
     opener: urllib.request.OpenerDirector | None = None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
@@ -859,6 +860,7 @@ def refuse_unrevoked_verified_hop(
         cell=f"{connector} (verified TLS, no revocation check)",
         description="delivers over verified https but performs no certificate revocation checking",
         attested=revocation_attested,
+        attested_reason=revocation_attested_reason,
         context=None if opener is None else opener_tls_context(opener, connector=connector),
     ).enforce_construction()
 
@@ -1572,6 +1574,7 @@ class RestDestination(DestinationConnector):
                 self.url,
                 connector="REST destination",
                 revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
             )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It

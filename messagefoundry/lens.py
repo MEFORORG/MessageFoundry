@@ -31,8 +31,9 @@ behind an explicit ``contract`` argument (``lens parse --contract N``):
 consumer — it rides v2 instead of minting a version of its own, and an older consumer simply ignores a
 key it does not read (§E.8).
 
-Two contract details worth stating for L3 consumers: a ``lookup`` row may carry an extra ``assign_to``
-field (the assignment target of e.g. ``row = db_lookup(...)`` — within §3's contract, optional). And at
+Two contract details worth stating for L3 consumers: a ``lookup`` row, and the ``read_field`` action
+row (ADR 0089 row 4), may carry an extra read-only ``assign_to`` field (the assignment target of e.g.
+``row = db_lookup(...)`` or ``name = msg.field(...)`` — within §3's contract, optional). And at
 :data:`CONTRACT_V1` a trailing comment *after the last statement* in a def lives **outside** the
 partition (beyond the def's ``node.end_lineno``, which the AST fixes to the last statement's last
 line); at :data:`CONTRACT_V2` the partition is extended over that trailing comment run so it projects
@@ -75,6 +76,28 @@ CONTRACT_V2 = 2
 CONTRACT_LATEST = CONTRACT_V2
 
 _CONTRACTS = frozenset({CONTRACT_V1, CONTRACT_V2})
+
+# What ``ast.parse`` raises, besides ``SyntaxError``, on source it cannot turn into a tree (BACKLOG
+# #1858). Each lens site converts these to its own error type, so the CLI's ``except`` sees a clean
+# refusal instead of an uncaught traceback. At least these are reachable, each measured by
+# tests/test_parser_refusal_guards.py; the classes mirror ``corepoint_import._verify_compilable``.
+#
+# * ``MemoryError`` -- the parser's width wall ("Parser stack overflowed"), a bounded parser limit
+#   rather than heap exhaustion, so the interpreter is fully usable afterwards.
+# * ``RecursionError`` -- the depth wall, raised while the parse builds a deeply nested tree.
+# * ``ValueError`` -- covers ``UnicodeEncodeError``, which a lone surrogate raises. One reaches these
+#   sites through the edit JSON, whose ``\ud800`` escape decodes to exactly that. A base class rather
+#   than a leaf, because enumerating leaves is how this defect was written.
+#
+# ``SyntaxError`` stays its own ``except`` at each site, because only it carries ``msg`` and ``lineno``.
+_PARSER_REFUSALS = (MemoryError, RecursionError, ValueError)
+
+
+def _refusal_reason(exc: Exception) -> str:
+    """Say why the parser refused, naming the class, since none of these carries a line number."""
+    if isinstance(exc, MemoryError | RecursionError):
+        return f"source too complex for the Python parser: {type(exc).__name__}: {exc}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 class LensParseError(ValueError):
@@ -165,18 +188,20 @@ _DIAGNOSTICS = frozenset(_DIAGNOSTIC_PARAMS)
 
 
 class _NativeAction(NamedTuple):
-    """A recognized native ``Message``-API write statement (ADR 0089 Phase A).
+    """A recognized native ``Message``-API statement (ADR 0089 Phase A): a write, or a bound read.
 
     ``action`` is the reused ADR 0076 vocabulary name (``set_field`` / ``copy_field`` /
-    ``delete_segment``). ``slots`` maps each **editable** parameter, in canonical order, to the exact
-    :class:`ast.expr` node whose byte span an edit splices (a positional arg, or — for ``copy_field`` —
+    ``delete_segment``), or ``read_field`` for ``name = msg.field(path)``. ``slots`` maps each
+    **editable** parameter, in canonical order, to the exact :class:`ast.expr` node whose byte span an edit splices (a positional arg, or — for ``copy_field`` —
     the inner ``msg.field(src)`` argument). ``display`` carries read-only, byte-preserved keyword args
     (``occurrence=``/``repetition=``) that are shown on the row but are never editable in Phase A and
-    are never dropped or reordered on a rewrite."""
+    are never dropped or reordered on a rewrite. ``assign_to`` is the bound name of a ``read_field``,
+    emitted read-only on the row; it is None for every write."""
 
     action: str
     slots: list[tuple[str, ast.expr]]
     display: list[tuple[str, ast.expr]]
+    assign_to: str | None = None
 
 
 def _is_msg_method(func: ast.expr, name: str) -> bool:
@@ -219,6 +244,22 @@ def _msg_field_source(value: ast.expr) -> ast.Call | None:
     return None
 
 
+def _native_display(call: ast.Call) -> list[tuple[str, ast.expr]] | None:
+    """The read-only keyword ``display`` fields of a native call, or None when it carries a splat.
+
+    A ``*args`` positional or ``**kwargs`` splat defeats static arity/keyword reasoning, so both native
+    recognizers refuse it (it falls to a ``code`` row), and a splice never mis-targets a hidden
+    argument."""
+    if any(isinstance(a, ast.Starred) for a in call.args):
+        return None
+    display: list[tuple[str, ast.expr]] = []
+    for kw in call.keywords:
+        if kw.arg is None:
+            return None
+        display.append((kw.arg, kw.value))
+    return display
+
+
 def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
     """Classify a native ``msg.<method>(...)`` call into a :class:`_NativeAction`, or None (→ ``code``).
 
@@ -235,13 +276,9 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
     func = call.func
     if not isinstance(func, ast.Attribute) or not _is_msg_method(func, func.attr):
         return None
-    # A ``*args`` positional or ``**kwargs`` splat defeats static arity/keyword reasoning — refuse it so
-    # a splice never mis-targets a hidden argument (fall back to a code row).
-    if any(isinstance(a, ast.Starred) for a in call.args):
+    display = _native_display(call)
+    if display is None:
         return None
-    if any(kw.arg is None for kw in call.keywords):
-        return None
-    display: list[tuple[str, ast.expr]] = [(kw.arg, kw.value) for kw in call.keywords if kw.arg]
     if func.attr == "set":
         if len(call.args) != 2:
             return None
@@ -274,10 +311,55 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
     return None
 
 
+def _recognize_native_read(s: ast.stmt) -> _NativeAction | None:
+    """Classify ``name = msg.field(path[, occurrence=...])`` as a ``read_field`` row, or None (``code``).
+
+    ADR 0089 Phase A row 4 ("Read Field to var"). The bound name rides on ``assign_to``.
+    Only a plain ``ast.Assign`` to ONE bare name qualifies. A tuple, attribute, subscript or chained
+    target, an annotated assignment, and a ``msg.field(...) or ""`` default all stay ``code``. So do a
+    splat, any positional arity but one, and a target named ``msg``: rebinding the receiver every
+    native row reads would shadow the message, so ``msg = msg.field(...)`` is left as text. ``path`` is the one editable slot, and only while it is a
+    literal, exactly as on ``set_field``. Keyword args are read-only ``display`` fields, preserved
+    byte-for-byte as on the write rows.
+
+    The bound name is emitted read-only as ``assign_to``, the field the ``lookup`` rows already use. A
+    rename of the target alone would leave every later use of the old name dangling, so the lens does
+    not offer one. A rename that follows the uses is a design question ADR 0089 does not settle. For
+    the same reason :func:`rewrite_source` refuses ``delete_row`` and ``move_row`` on this row.
+
+    A bare ``msg.field(...)`` expression statement never reaches here. It binds nothing, so it stays a
+    ``code`` row, and :func:`_recognize_native_method` keeps no ``field`` branch."""
+    if not (
+        isinstance(s, ast.Assign)
+        and len(s.targets) == 1
+        and isinstance(s.targets[0], ast.Name)
+        and s.targets[0].id != "msg"
+        and isinstance(s.value, ast.Call)
+        and _is_msg_method(s.value.func, "field")
+    ):
+        return None
+    call = s.value
+    display = _native_display(call)
+    if display is None or len(call.args) != 1:
+        return None
+    return _NativeAction("read_field", [("path", call.args[0])], display, s.targets[0].id)
+
+
+def _recognize_native_stmt(s: ast.stmt) -> _NativeAction | None:
+    """The native row a statement projects as, or None.
+
+    This is the ONE entry point the parser and the rewriter share, so a new native statement shape is
+    added here once and the two can never diverge. A mutating method call is a bare expression
+    statement; a read is a single-name assignment."""
+    if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
+        return _recognize_native_method(s.value)
+    return _recognize_native_read(s)
+
+
 def _native_action_row(
     native: _NativeAction, s: ast.stmt, nesting: int, source: str, contract: int
 ) -> dict[str, Any]:
-    """Build the ADR 0076 ``action`` row contract for a recognized native write (ADR 0089 Phase A).
+    """Build the ADR 0076 ``action`` row contract for a recognized native statement (ADR 0089 Phase A).
 
     ``params`` renders each editable slot (a literal → its value; an expression → verbatim source) then
     each read-only keyword (``occurrence=``), so the row carries the same shape as the wrapper form.
@@ -292,7 +374,7 @@ def _native_action_row(
     slots_and_display = [*native.slots, *native.display]
     params = {name: _render_value(node, source) for name, node in slots_and_display}
     literal_params = [name for name, node in native.slots if isinstance(node, ast.Constant)]
-    return _attach_param_modes(
+    row = _attach_param_modes(
         {
             "kind": "action",
             "action": native.action,
@@ -305,6 +387,9 @@ def _native_action_row(
         {name: _param_mode(node) for name, node in slots_and_display},
         contract,
     )
+    if native.assign_to is not None:
+        row["assign_to"] = native.assign_to
+    return row
 
 
 # --- public entry points -----------------------------------------------------
@@ -320,7 +405,7 @@ def parse_module(path: str | Path, *, contract: int = CONTRACT_V1) -> list[dict[
     p = Path(path)
     try:
         source = p.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise LensParseError(f"{p}: cannot read ({exc})") from exc
     # posix slashes keep the emitted contract (and the committed L3 fixtures) OS-neutral.
     return parse_source(source, module=p.as_posix(), contract=contract)
@@ -334,7 +419,8 @@ def parse_source(
     The file-free entry point (used by tests). ``module`` is echoed into each contract's ``module``
     field. ``contract`` selects the emitted grammar — :data:`CONTRACT_V1` (the default) is the shipped
     handler-only contract, :data:`CONTRACT_V2` adds ``note`` + ``route`` rows and ``@router``
-    projection. Raises :class:`LensParseError` on a syntax error or an unknown ``contract``."""
+    projection. Raises :class:`LensParseError` on source the parser refuses (a syntax error, or one of
+    ``_PARSER_REFUSALS``) or an unknown ``contract``."""
     if contract not in _CONTRACTS:
         raise LensParseError(
             f"unknown contract version {contract!r} (supported: {sorted(_CONTRACTS)})"
@@ -346,6 +432,8 @@ def parse_source(
         tree = ast.parse(source)
     except SyntaxError as exc:
         raise LensParseError(f"{module}: cannot parse ({exc.msg} at line {exc.lineno})") from exc
+    except _PARSER_REFUSALS as exc:
+        raise LensParseError(f"{module}: cannot parse ({_refusal_reason(exc)})") from exc
     # Split on \r\n / \r / \n only (the tokenizer's line model) so a form-feed / NEL / U+2028 never
     # desyncs an AST line number from its text (F2); everything mapping a line number to text uses this.
     lines = _physical_lines(source)
@@ -944,13 +1032,12 @@ def _classify_simple(s: ast.stmt, nesting: int, ctx: _Ctx) -> dict[str, Any] | N
     if call is None:
         return None
 
-    # ADR 0089 Phase A: a native ``msg.set(...)`` / ``msg.delete_segments(...)`` statement (a mutating
-    # method call, so always a bare expression statement — never an assignment) becomes the SAME editable
-    # action row as its wrapper equivalent, without the module being rewritten.
-    if isinstance(s, ast.Expr):
-        native = _recognize_native_method(call)
-        if native is not None:
-            return _native_action_row(native, s, nesting, source, ctx.contract)
+    # ADR 0089 Phase A: a native ``msg.set(...)`` / ``msg.delete_segments(...)`` write (a bare expression
+    # statement) becomes the SAME editable action row as its wrapper equivalent, without the module being
+    # rewritten. The one native assignment recognized is row 4's read, ``name = msg.field(path)``.
+    native = _recognize_native_stmt(s)
+    if native is not None:
+        return _native_action_row(native, s, nesting, source, ctx.contract)
 
     name = _callee_name(call.func)
     if name in _ACTIONS and isinstance(s, ast.Expr):
@@ -1918,6 +2005,8 @@ def rewrite_source(
         tree = ast.parse(src)
     except SyntaxError as exc:
         raise LensRewriteError(f"{module}: cannot parse ({exc.msg} at line {exc.lineno})") from exc
+    except _PARSER_REFUSALS as exc:
+        raise LensRewriteError(f"{module}: cannot parse ({_refusal_reason(exc)})") from exc
 
     # Stale-coordinate guard (F7): the row coords came from a prior *disk*-based ``lens parse``, but the
     # edit runs on the *live* buffer. When the caller carries the projected row's source text, verify it
@@ -1957,6 +2046,17 @@ def rewrite_source(
                 "diagnostic/note/route rows are editable (code and control rows are read-only, "
                 "ADR 0076 §5)"
             )
+
+    # A Read Field row binds a name later statements use (ADR 0089 row 4, BACKLOG #1505). Deleting it, or
+    # moving it below a use or into a block, would leave that use unbound, and the lens does not track
+    # uses. So its STRUCTURE stays as read-only as the code row it used to be; only its path is editable.
+    # A Steps cut is a delete and a drag or up/down is a move, so this one gate covers all of them.
+    if op in ("delete_row", "move_row") and row.get("action") == "read_field":
+        raise LensRewriteError(
+            f"row at lines {line_start}-{line_end} is a Read Field row binding "
+            f"{row.get('assign_to')!r} - {op} is refused because a later use of that name could be left "
+            "unbound; delete or move it in the text editor"
+        )
 
     handler_node = _element_def(tree, row["_handler"], role)
     if handler_node is None:
@@ -2079,6 +2179,11 @@ def _assert_reparses(result: str, module: str) -> None:
         raise LensRewriteError(
             f"{module}: the rewrite would produce invalid Python ({exc.msg} at line {exc.lineno}) - "
             "refused (no change made)"
+        ) from exc
+    except _PARSER_REFUSALS as exc:
+        raise LensRewriteError(
+            f"{module}: the rewrite would produce source the parser refuses "
+            f"({_refusal_reason(exc)}) - refused (no change made)"
         ) from exc
 
 
@@ -2312,7 +2417,7 @@ def _editable_slots(stmt: ast.stmt, kind: str) -> dict[str, ast.expr] | None:
     Returns None for a recognized row that is not a single editable call (a list-of-``Send`` return),
     which the caller round-trips unchanged for a no-op and refuses for a real edit. The mapping is the
     SAME grammar the parser emits: for a **native** ``msg.set(...)`` (ADR 0089 Phase A) it consults
-    :func:`_recognize_native_method` so the splice targets the native method-call args (``path``=arg0,
+    :func:`_recognize_native_stmt` so the splice targets the native method-call args (``path``=arg0,
     ``value``=arg1 — no leading ``msg`` positional; ``copy_field``'s ``src`` is the inner
     ``msg.field(src)`` arg), and read-only keywords (``occurrence=``) are deliberately absent so a splice
     never touches them. For a **wrapper** call (``set_field(msg, …)``) the leading ``msg`` positional is
@@ -2339,12 +2444,12 @@ def _editable_slots(stmt: ast.stmt, kind: str) -> dict[str, ast.expr] | None:
         call = stmt.value
     if call is None:
         return None
-    # Native ``msg.set(...)`` / ``msg.delete_segments(...)`` (a bare mutating statement): the recognizer
-    # is the single source of truth for the editable arg nodes (never the read-only ``occurrence=`` kwarg).
-    if isinstance(stmt, ast.Expr):
-        native = _recognize_native_method(call)
-        if native is not None:
-            return dict(native.slots)
+    # A native write, or row 4's ``name = msg.field(path)`` read: the recognizer is the single source of
+    # truth for the editable arg nodes. The read-only ``occurrence=`` kwarg and a read's bound name are
+    # never slots.
+    native = _recognize_native_stmt(stmt)
+    if native is not None:
+        return dict(native.slots)
     name = _callee_name(call.func)
     param_names = (
         _ACTION_PARAMS.get(name or "")
@@ -2515,10 +2620,23 @@ def _validated_expr(expr: str, pname: str) -> str:
         raise LensRewriteError(
             f"parameter {pname!r}: expression {expr!r} is not a valid Python expression ({exc.msg})"
         ) from exc
+    except _PARSER_REFUSALS as exc:
+        # The expression is left out: only very long source reaches the parser walls.
+        raise LensRewriteError(
+            f"parameter {pname!r}: the expression is not a valid Python expression "
+            f"({_refusal_reason(exc)})"
+        ) from exc
     try:
         probe: ast.expr | None = ast.parse(f"_f({expr})", mode="eval").body
     except SyntaxError:
         probe = None
+    except _PARSER_REFUSALS as exc:
+        # One call deeper than the parse above, so it can trip the wall that parse cleared. Refuse for
+        # that reason, not as the extra-argument refusal below, which would name the wrong cause.
+        raise LensRewriteError(
+            f"parameter {pname!r}: the expression is not a valid call argument "
+            f"({_refusal_reason(exc)})"
+        ) from exc
     if (
         not isinstance(probe, ast.Call)
         or len(probe.args) != 1
@@ -3365,7 +3483,7 @@ def _parse_pasted_block(block: str) -> ast.stmt:
     for header in ("def _f():\n", "async def _f():\n"):
         try:
             wrapped = ast.parse(header + block)
-        except SyntaxError:
+        except (SyntaxError, *_PARSER_REFUSALS):
             continue
         func = wrapped.body[0]
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):

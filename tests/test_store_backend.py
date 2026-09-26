@@ -21,7 +21,8 @@ async def test_open_store_sqlite_returns_working_store(tmp_path: Path) -> None:
         assert isinstance(store, Store)  # runtime_checkable protocol
         assert isinstance(store, MessageStore)
         cur = await store._db.execute("PRAGMA synchronous")  # the FULL setting flowed through
-        assert (await cur.fetchone())[0] == 2
+        sync_row = await cur.fetchone()
+        assert sync_row is not None and sync_row[0] == 2
         # a write round-trips through the protocol surface
         mid = await store.enqueue_message(channel_id="c", raw="MSH|^~\\&|", deliveries=[])
         row = await store.get_message(mid)

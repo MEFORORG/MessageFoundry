@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
 from messagefoundry.config import codeset_edit
 from messagefoundry.config.code_sets import load_code_set, load_code_sets
@@ -755,7 +754,7 @@ def test_cli_upsert_reports_code_set_json_nested_past_the_decoder(
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")
 
-    monkeypatch.setattr(cli.json, "loads", _raise_recursion)
+    monkeypatch.setattr("messagefoundry.__main__.json.loads", _raise_recursion)
     rc, out = _run(
         ["codeset", "upsert", "--config", str(tmp_path), "--data", "[]", "--json"], capsys
     )

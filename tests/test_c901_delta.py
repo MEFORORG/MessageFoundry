@@ -148,6 +148,14 @@ def test_a_function_dropping_below_threshold_is_not_a_regression(tmp_path: Path)
         ),
         # A repo root that itself ends in the scanned package name must not confuse the anchor.
         ("/src/messagefoundry/messagefoundry/a.py", "/src/messagefoundry", "messagefoundry/a.py"),
+        # ...nor, once the scan is whole-repo (BACKLOG #1093), a file OUTSIDE the package.
+        (
+            "/src/messagefoundry/messagefoundry_webconsole/x.py",
+            "/src/messagefoundry",
+            "messagefoundry_webconsole/x.py",
+        ),
+        # A dot-directory keeps its dot: the old lstrip("./") removed a character set.
+        ("/r/.github/scripts/x.py", "/r", ".github/scripts/x.py"),
     ],
 )
 def test_paths_normalise_to_repo_relative_posix(
@@ -405,6 +413,39 @@ def test_a_path_outside_the_scan_root_still_keys_consistently(tmp_path: Path) ->
     # The base tree copy cannot be root-stripped to the same string, so rename tolerance is what
     # keeps it from flooding; either way it must not be reported as new.
     assert delta.classify(base, head)[0] == []
+
+
+def _grown_outside_the_scan_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], *base_root: str
+) -> str:
+    """Run main() on one web console function that grew 20 -> 25 in a whole-repo scan."""
+    root = str(tmp_path)
+    base = [_finding(f"{root}/base-tree/messagefoundry_webconsole/x.py", "grow", 20, 7)]
+    head = [_finding(f"{root}/messagefoundry_webconsole/x.py", "grow", 25, 7)]
+    rc = delta.main(
+        [
+            "--base",
+            _write(tmp_path, "base.json", base),
+            "--head",
+            _write(tmp_path, "head.json", head),
+            "--repo-root",
+            root,
+            *base_root,
+        ]
+    )
+    assert rc == 0
+    return capsys.readouterr().out
+
+
+def test_base_root_keys_a_whole_repo_scan_consistently(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1093 widened the scan to the whole repo. Only --scan-root files survive the anchor
+    cut, so without --base-root a growing function elsewhere reads as NEW, not as increased."""
+    out = _grown_outside_the_scan_root(tmp_path, capsys, "--base-root", str(tmp_path / "base-tree"))
+    assert "title=Complexity increased::`grow` complexity 20 -> 25" in out
+    # Control: the same input keyed from the repo root alone mislabels it, which is the defect.
+    assert "title=New function" in _grown_outside_the_scan_root(tmp_path, capsys)
 
 
 def test_workflow_command_metacharacters_are_escaped() -> None:

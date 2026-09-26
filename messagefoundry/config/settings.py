@@ -625,7 +625,7 @@ class StoreSettings(_Section):
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
     ssl_root_cert: str | None = None
-    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the DB SERVER's certificate.
+    # BACKLOG #299: optional PEM file of CRLs checked against the DB SERVER's certificate.
     # The store hop builds its own context and resolves no trust anchor, so [tls].crl_file never reaches
     # it -- this is its own knob rather than a silent inheritance, the per-hop scoping error that item
     # warns about. POSTGRES ONLY, and only on the `ssl_root_cert` (pinned-CA) branch: that is the one
@@ -954,9 +954,11 @@ class ApiSettings(_Section):
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
     #: Opt-in CRL for the mTLS client certificates `tls_client_ca_file` verifies (BACKLOG #1005).
-    #: A PEM carrying the CA **and** its CRL. Absent, client certificates are verified for chain
-    #: and RFC 5280 conformance but NOT for revocation -- measured, a revoked-but-chain-valid
-    #: client is ACCEPTED. Set it and a revoked partner certificate is refused at the handshake.
+    #: A PEM file holding the client CA's CRL. Put the CA itself in `tls_client_ca_file`, where the
+    #: #285 pin covers it: a certificate in this file the store lacks refuses start (BACKLOG #1890).
+    #: Absent, client certificates are verified for chain and RFC 5280 conformance but NOT for
+    #: revocation -- measured, a revoked-but-chain-valid client is ACCEPTED. Set it and a revoked
+    #: partner certificate is refused at the handshake.
     #:
     #: **An expired CRL refuses EVERY client, not only revoked ones**, so this is read at startup
     #: and refused loudly there rather than at the first partner handshake. See
@@ -1234,7 +1236,7 @@ class TlsSettings(_Section):
     #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
-    # PEM path to a CRL (or a CA+CRL bundle) for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
+    # PEM path to a file of CRLs for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
     # the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
     # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
     # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
@@ -1792,7 +1794,7 @@ class LoggingSettings(_Section):
     forward_tls_verify: bool = True
     # Optional client cert (PEM cert+key chain) for mutual TLS to the collector. None = no client auth.
     forward_tls_client_cert: str | None = None
-    # Optional CRL (PEM, or a CA+CRL bundle) checked against the COLLECTOR's certificate (BACKLOG
+    # Optional PEM file of CRLs checked against the COLLECTOR's certificate (BACKLOG
     # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
     # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
     # would be the per-hop scoping error that item warns about. Applies only with
@@ -2400,7 +2402,7 @@ class AuthSettings(_Section):
     # REFUSES — always, independent of [security].enforcement (a substituted OIDC anchor permits JWKS
     # substitution + forged id_tokens). Dormant when None. Block-scoped (direct-read, not desugared).
     oidc_tls_ca_cert_pin: str | None = None
-    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the IdP's certificate. The
+    # BACKLOG #299: optional PEM file of CRLs checked against the IdP's certificate. The
     # IdP opener resolves no trust anchor, so [tls].crl_file cannot reach it -- this is its own knob
     # rather than a silent inheritance. A revoked IdP cert matters more than on a data hop: this is the
     # leg carrying the client secret, the authorization code and the identity assertion. Same
@@ -3180,6 +3182,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
         # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
         "approval_stale_requester",
+        # BACKLOG #315: a release by an approver account changed after the request, and an
+        # Administrator grant through the console API.
+        "approval_approver_provenance",
+        "administrator_granted",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
         "ad_reconcile_aborted",
@@ -3296,9 +3302,13 @@ class AlertRule(BaseModel):
     # --- match (all conditions must hold) ---
     event_type: str = "any"  # "any" | a member of _ALERT_EVENT_TYPES (validated below)
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
-    min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
+    # `default=` is spelled as a KEYWORD on every Field here, and must stay one: mypy's
+    # dataclass_transform support reads only the keyword, so a positional `Field(None, ...)` types
+    # the field as REQUIRED and every `AlertRule(...)` call that omits it reads as a missing
+    # argument. Runtime is identical either way (BACKLOG #1799 measured 207 such false errors).
+    min_depth: int | None = Field(default=None, ge=1)  # queue_buildup: match at/over this depth
     min_oldest_seconds: float | None = Field(
-        None, ge=0
+        default=None, ge=0
     )  # queue_buildup/message_stall: …or oldest-message age (s)
     # --- outcome ---
     severity: AlertSeverity = AlertSeverity.WARNING
@@ -3306,7 +3316,7 @@ class AlertRule(BaseModel):
         None  # None = every configured transport; [] = suppress entirely (event dropped, never sent)
     )
     cooldown_seconds: float | None = Field(
-        None, gt=0
+        default=None, gt=0
     )  # override realert_seconds for matching events
     # #146 (ADR 0014 amendment): per-rule EMAIL recipient override. None = the global [alerts].email_to
     # is used, byte-identical to before. A non-empty list re-targets the email transport for events this
@@ -4705,16 +4715,10 @@ class SecuritySettings(_Section):
     # An operator who needs a specific one relaxed uses that gate's own switch — allow_unencrypted_phi,
     # block_unlisted_outbound, allow_keeping_phi_indefinitely, allow_single_factor_admin_when_exposed,
     # allow_unverified_alert_smtp_tls, [alerts].security_notifications_required, a per-connection
-    # cleartext_accepted, the process-wide MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement
-    # dial. Each of those is separately named, separately audited and separately reported; the retired
-    # lever was none of those things, and it silenced nineteen gates at once. Setting it is now REFUSED
-    # at load with a message naming this decision (see `_REMOVED_KEYS`).
-    #
-    # NOT `tls_revocation_attested`, which this comment offered beside cleartext_accepted until it was
-    # re-read. The field exists on the outbound model and the connectors consume it, but it has no
-    # factory parameter and no connections.toml key, so an operator cannot author it — and
-    # docs/DEPLOYMENT.md's maintenance rule names that exact field and forbids offering it as a lever.
-    # The blanket env var is the only revocation attestation that can actually be set.
+    # cleartext_accepted or tls_revocation_attested (each with its mandatory reason), the process-wide
+    # MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Each of those is separately
+    # named and separately audited; the retired lever was neither, and it silenced nineteen gates at
+    # once. Setting it is now REFUSED at load with a message naming this decision (see `_REMOVED_KEYS`).
     #
     # The production TIER stays: it is a true property of the instance and it drives the AI
     # data-scope ceiling and the DEBUG-log refusal, neither of which is a PHI gate.
@@ -5141,10 +5145,10 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "(BACKLOG #1279). The PHI gates this used to relax as a group each have their own switch — "
         "[security].allow_unencrypted_phi, block_unlisted_outbound, allow_keeping_phi_indefinitely, "
         "allow_single_factor_admin_when_exposed, allow_unverified_alert_smtp_tls, "
-        "[alerts].security_notifications_required, a per-connection cleartext_accepted, the "
-        "process-wide MEFOR_TLS_REVOCATION_ATTESTED (there is no per-connection revocation lever an "
-        "operator can author), or the [security].enforcement dial. Relax the one you mean, or "
-        "delete this line"
+        "[alerts].security_notifications_required, a per-connection cleartext_accepted or "
+        "tls_revocation_attested (each with its reason), the process-wide "
+        "MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Relax the one you mean, "
+        "or delete this line"
     ),
     ("ai", "data_class"): (
         "the data class was removed, not relocated: every instance now carries patient data "
@@ -5463,8 +5467,9 @@ def security_loosenings(
         out.append(
             (
                 "require_encryption_for_remote",
-                "off-machine access is permitted WITHOUT TLS — bearer tokens and PHI would cross the network "
-                "in cleartext (still refused on a production-PHI bind)",
+                "off-machine access is permitted with no operator certificate — the API serves "
+                "on its self-signed placeholder, which no trust store vouches for, and inbound "
+                "listeners without tls bind in cleartext (still refused under enforcement=enforce)",
             )
         )
     if not sec.external_link_interstitial:

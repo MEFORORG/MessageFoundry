@@ -102,6 +102,10 @@ _INBOUND_CASES: dict[str, Any] = {
     "auto_start": False,
     "deployed": False,
     "flagged": True,  # #131 (ADR 0007 amendment): the object-of-interest flag round-trips too.
+    # ADR 0173: the revocation attestation pair. Dropping it on a save would turn an attested mTLS
+    # listener into a REFUSED one at the next reload.
+    "tls_revocation_attested": True,
+    "tls_revocation_attested_reason": "partner PKI runs OCSP at the site edge",
 }
 _OUTBOUND_CASES: dict[str, Any] = {
     "settings": {"host": "epic.example", "port": 2700},
@@ -124,6 +128,9 @@ _OUTBOUND_CASES: dict[str, Any] = {
     # save would silently turn a declared, reviewed hop into a refused one at the next reload.
     "cleartext_accepted": True,
     "cleartext_reason": "legacy partner has no TLS listener",
+    # ADR 0173: the revocation attestation pair, same reasoning as the inbound case.
+    "tls_revocation_attested": True,
+    "tls_revocation_attested_reason": "partner PKI runs OCSP at the site edge",
 }
 
 _IB_MAX: dict[str, Any] = {**_IB_BASE, **_INBOUND_CASES}
@@ -137,12 +144,18 @@ _COMPANIONS: dict[str, dict[str, Any]] = {
     # loud), so each half needs the other for its single-key round-trip to be load-legal.
     "cleartext_accepted": {"cleartext_reason": "legacy partner has no TLS listener"},
     "cleartext_reason": {"cleartext_accepted": True},
+    # ADR 0173's pair is validated together the same way, on both directions.
+    "tls_revocation_attested": {
+        "tls_revocation_attested_reason": "partner PKI runs OCSP at the site edge"
+    },
+    "tls_revocation_attested_reason": {"tls_revocation_attested": True},
 }
 
 
 def test_case_tables_cover_the_read_schema_exactly() -> None:
     """Completeness pin: the parametrized cases (plus the base's name/transport) must cover the read
-    schema exactly — 35 distinct keys (25 inbound + 18 outbound, 8 shared; 43 per-direction slots).
+    schema exactly. No key count here: the one this docstring carried (25 inbound + 18 outbound) had
+    drifted from the sets it described, and the assertions below are the count.
     A key added to _INBOUND_KEYS/_OUTBOUND_KEYS without a round-trip case fails HERE."""
     assert set(_INBOUND_CASES) | {"name", "transport"} == _INBOUND_KEYS
     assert set(_OUTBOUND_CASES) | {"name", "transport"} == _OUTBOUND_KEYS

@@ -53,6 +53,7 @@ import pytest
 from _docs_toml import TOML_FENCE_RE, line_contexts
 
 from messagefoundry.config.settings import _RELOCATED_TO_SECURITY, _REMOVED_KEYS
+from tests._sequenced_docs import sequenced_documents
 
 #: Every key the loader refuses, whichever way it got there. BACKLOG #1279 added the second
 #: table: a REMOVED key fails at load exactly like a relocated one, and its message cannot name a
@@ -776,3 +777,235 @@ def test_no_doc_presents_a_refused_config_key_as_config(doc: pathlib.Path) -> No
             f"A reader who copies these gets a ValueError at load.\n{shown}\n"
             f"Use the [security] spelling from _RELOCATED_TO_SECURITY instead."
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# THE SIX SEQUENCED OPERATOR DOCUMENTS ARE HELD TO A STRICTER RULE, AT ZERO (BACKLOG #1749).
+#
+# The assignment-shape scan above is right for the corpus and blind to prose. USER-GUIDE told a
+# reader at two sites that the console is served "when `[api].serve_ui` is on" -- an instruction to
+# confirm a key the loader refuses -- and the scan returned nothing for either line, because neither
+# carries an `=`. Widening the scan corpus-wide to any NAMED key would re-baseline the ADRs (which
+# record what a relocated key did, by name, on purpose), pull in docs/SECURITY.md, and land on the
+# two withheld rows nobody can re-measure. So the stricter rule runs only where it matters most:
+# the documents docs/README.md sequences for a first operator, read from that index.
+#
+# The rule: a SENTENCE naming a refused key with its section (`[section].key` or `[section] key`) is
+# a defect unless that sentence says it is refused (`_DISCLAIMS`). No baseline, no replacement-section
+# exemption. The bare `key` spelling is not read: without its section it collides with live keys
+# (see `_dotted_assignment`).
+#
+# WHY A SENTENCE AND NOT A LINE. These documents write a paragraph as one physical line or wrap it
+# over several, and neither is a sentence. Judged per line, one "refused" anywhere in a one-line
+# paragraph exempted every key in it: a refused key planted into USER-GUIDE's posture paragraph read
+# clean because "a non-loopback bind is refused" shared the line. Judged per line the other way, a
+# disclaimer wrapped onto the next line is lost -- DEPLOYMENT.md names `[api].host` on one line and
+# says "rejected at load" on the next. So wrapped prose is joined into units first, then split into
+# sentences, and the disclaimer has to sit in the key's own sentence.
+# ---------------------------------------------------------------------------------------------
+
+_NAMED: tuple[tuple[str, str, re.Pattern[str]], ...] = tuple(
+    (
+        section,
+        key,
+        re.compile(rf"(?<![\w.])\[{re.escape(section)}\](?:\.|\s+){re.escape(key)}(?!\w)"),
+    )
+    for section, key in _REFUSED_KEYS
+)
+
+# A line that is a unit of its own: a heading or a table row.
+_SINGLE_LINE_UNIT = re.compile(r"^\s*(?:#|\|)")
+# A line that opens a new unit rather than continuing the prose above it: a list item.
+_OPENS_A_UNIT = re.compile(r"^\s*(?:[-*+]|\d+\.)\s")
+# A sentence ends at `.`, `!`, `?` or `;`, after any closing `)`, `**`, quote or backtick. Without the
+# closers, `**Refused.** Set [api].host ...` read as one sentence and the lead-in exempted the key.
+_SENTENCE_END = re.compile(r"[.!?;][)*\"'`]*\s+")
+# Abbreviations whose full stop is not a sentence end.
+_ABBREVIATION = re.compile(r"\b(?:e\.g|i\.e|etc|vs)\.[)*\"'`]*$", re.IGNORECASE)
+# A piece this short is a lead-in (`**(Retired.)**`, `**Note.**`), not a sentence, and belongs to
+# the sentence after it. DEPLOYMENT.md's "**(Retired.)** `[security].handles_real_patient_data`
+# ... used to sit here" is the live case: split off, the key would lose the lead-in that disclaims it.
+_LEAD_IN_WORDS = 3
+
+
+def _sentences(unit: str) -> list[str]:
+    """``unit`` split into sentences, keeping abbreviations and short lead-ins attached."""
+    pieces: list[str] = []
+    begin = 0
+    for end in _SENTENCE_END.finditer(unit):
+        # The text up to and including the punctuation and its closers, without the whitespace.
+        if _ABBREVIATION.search(unit[begin : end.start() + len(end.group(0).rstrip())]):
+            continue
+        pieces.append(unit[begin : end.end()])
+        begin = end.end()
+    pieces.append(unit[begin:])
+    sentences: list[str] = []
+    carry = ""
+    for piece in pieces:
+        if len(piece.split()) <= _LEAD_IN_WORDS:
+            carry += piece
+            continue
+        sentences.append(carry + piece)
+        carry = ""
+    if carry:
+        sentences.append(carry)
+    return sentences
+
+
+def _prose_units(text: str) -> list[tuple[int, str]]:
+    """``(first line number, text)`` for each paragraph, list item, heading, row and code line.
+
+    Wrapped prose is joined so a sentence split over lines is read whole. A code line stays alone:
+    joining a comment to the command under it would let one exempt the other. Fences come from
+    `line_contexts`, the same reader the corpus scan uses, so the two cannot disagree on where a
+    block opens and closes.
+    """
+    units: list[tuple[int, str]] = []
+    parts: list[str] = []
+    start = 0
+
+    def flush() -> None:
+        if parts:
+            units.append((start, " ".join(parts)))
+            parts.clear()
+
+    previous: str | None = None
+    for lineno, (raw, context) in enumerate(
+        zip(text.splitlines(), line_contexts(text), strict=True), 1
+    ):
+        # A delimiter reports the state it leaves behind (see LineContext), so a CHANGE of fence
+        # state marks one. Neither delimiter is content.
+        delimiter, previous = context.fence != previous, context.fence
+        if delimiter:
+            flush()
+            continue
+        line = raw.lstrip()
+        if context.fence is None:
+            while line.startswith(">"):  # a blockquote's wrapped lines are still one paragraph
+                line = line[1:].lstrip()
+        if context.fence is not None or not line or _SINGLE_LINE_UNIT.match(line):
+            flush()
+            if line:
+                units.append((lineno, line))
+            continue
+        if _OPENS_A_UNIT.match(line):
+            flush()
+        if not parts:
+            start = lineno
+        parts.append(line)
+    flush()
+    return units
+
+
+def _named_refused_keys(text: str, *, honour_disclaimers: bool = True) -> list[tuple[int, str]]:
+    """``(line, key)`` for each sentence naming a refused key without saying it is refused.
+
+    The line is where the sentence's unit starts, which for wrapped prose can sit a few lines above
+    the key itself. ``honour_disclaimers=False`` counts every naming, which is what arms the sweep.
+    """
+    hits: list[tuple[int, str]] = []
+    for lineno, unit in _prose_units(text):
+        for sentence in _sentences(unit):
+            if honour_disclaimers and _DISCLAIMS.search(sentence):
+                continue
+            hits.extend(
+                (lineno, f"[{section}].{key}")
+                for section, key, pattern in _NAMED
+                if pattern.search(sentence)
+            )
+    return hits
+
+
+# The two USER-GUIDE lines BACKLOG #1749 fixed, as they stood before the fix. The first is verbatim;
+# the second is trimmed to its clause. They are the control because they are the case the rule is for.
+_PRE_FIX_USER_GUIDE_LINES = (
+    "Then open the web console in a browser "
+    "(the engine serves it at `/ui` when `[api].serve_ui` is on):",
+    "confirm the engine is serving, that `[api].serve_ui` is on with the "
+    "`messagefoundry-webconsole` distribution installed, and that your browser is pointed at that "
+    "host/port's `/ui`.",
+)
+
+
+@pytest.mark.parametrize("line", _PRE_FIX_USER_GUIDE_LINES)
+def test_the_strict_rule_catches_what_the_assignment_scan_misses(line: str) -> None:
+    """PAIRED CONTROL: the corpus scan reads the defect as clean, and the strict rule does not.
+
+    If the first assertion ever fails, the corpus scan has learned prose and this rule may be
+    redundant. If the second fails, the strict rule has gone blind and the zero below means nothing.
+    """
+    assert _citations(line) == [], "the assignment scan now sees prose; revisit the strict rule"
+    assert _named_refused_keys(line) == [(1, "[api].serve_ui")]
+
+
+def test_the_strict_rule_exempts_a_line_documenting_the_refusal() -> None:
+    """INSTALL-GUIDE names `[api].serve_ui` to say it is refused. That line is right and passes."""
+    line = (
+        "# [security].serve_web_console = false "
+        "(the old [api].serve_ui spelling is refused at config load)"
+    )
+    assert _named_refused_keys(line) == []
+
+
+def test_an_unrelated_refusal_in_the_next_sentence_does_not_exempt_a_key() -> None:
+    """The per-line form read this as clean. The disclaimer has to be in the key's own sentence."""
+    paragraph = (
+        'A non-loopback bind is refused at startup. Set `[api].host = "0.0.0.0"` to expose the API.'
+    )
+    assert _named_refused_keys(paragraph) == [(1, "[api].host")]
+
+
+def test_a_disclaimer_wrapped_onto_the_next_line_still_exempts() -> None:
+    """DEPLOYMENT.md's shape: the key on one line, "rejected at load" on the next, one sentence."""
+    wrapped = (
+        "   (a non-loopback bind with sign-in disabled is refused). The legacy `[api].host`\n"
+        "   / `[auth].enabled` keys are **rejected at load** -- they moved to `[security]`.\n"
+    )
+    assert _named_refused_keys(wrapped) == []
+
+
+def test_the_spaced_spelling_is_read_too() -> None:
+    assert _named_refused_keys("Confirm `[api] serve_ui` is on.") == [(1, "[api].serve_ui")]
+
+
+def test_a_code_comment_does_not_exempt_the_line_under_it() -> None:
+    """Fence lines stay separate units, so a disclaiming comment covers only its own line."""
+    fence = "```toml\n# the old spelling is refused at load\n[api] serve_ui\n```\n"
+    assert _named_refused_keys(fence) == [(3, "[api].serve_ui")]
+
+
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        "**A non-loopback bind is refused.** Set `[api].host` to widen it.",
+        "(A non-loopback bind is refused.) Set `[api].host` to widen it.",
+        "A non-loopback bind is refused; set `[api].host` to widen it.",
+    ],
+)
+def test_a_closer_or_semicolon_still_ends_the_disclaiming_sentence(paragraph: str) -> None:
+    assert _named_refused_keys(paragraph) == [(1, "[api].host")]
+
+
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        "Old keys are refused at load, e.g. `[api].host`.",
+        "**(Retired.)** `[security].handles_real_patient_data = false` used to sit here.",
+    ],
+)
+def test_an_abbreviation_or_a_lead_in_does_not_split_off_the_disclaimer(paragraph: str) -> None:
+    assert _named_refused_keys(paragraph) == []
+
+
+def test_the_sequenced_documents_name_no_refused_key() -> None:
+    """The six sequenced documents name no refused key without saying it is refused."""
+    docs = {rel: (REPO / rel).read_text(encoding="utf-8") for rel in sequenced_documents()}
+    # Armed: the documents DO name refused keys, each time to say they are refused. A reader that
+    # stopped seeing the documents would find none and read the zero below as clean.
+    named = sum(len(_named_refused_keys(text, honour_disclaimers=False)) for text in docs.values())
+    assert named, "no refused key is named anywhere in the sequenced documents; the reader is blind"
+    found = {rel: hits for rel, text in docs.items() if (hits := _named_refused_keys(text))}
+    assert not found, (
+        "a sequenced operator document names a key the loader REFUSES, without saying so:\n"
+        + "\n".join(f"    {rel} line {n}: {key}" for rel, hits in found.items() for n, key in hits)
+    )

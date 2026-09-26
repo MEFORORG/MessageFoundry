@@ -34,6 +34,7 @@ from pathlib import (
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry import __version__
+from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
     LogFile,
@@ -84,16 +85,9 @@ def main(argv: list[str] | None = None) -> int:
     # --help/usage printer and runtime log/print() lines bypass _safe_print, so a non-cp1252 char
     # (an arrow or other symbol in a help string or log line) would otherwise abort with
     # UnicodeEncodeError. errors="replace" is lossy for such chars, but the machine-read JSON
-    # subcommands stay ASCII (json.dumps ensure_ascii=True). Guarded: some stream wrappers
-    # (PYTHONLEGACYWINDOWSSTDIO, pytest capture) lack reconfigure or reject it, and the hardening
-    # must never itself crash the CLI.
-    for _stream in (sys.stdout, sys.stderr):
-        _reconfigure = getattr(_stream, "reconfigure", None)
-        if _reconfigure is not None:
-            try:  # noqa: SIM105
-                _reconfigure(errors="replace")
-            except (ValueError, OSError):
-                pass
+    # subcommands stay ASCII (json.dumps ensure_ascii=True), so this keeps the stream's codec. The
+    # shared helper is the one chokepoint every console entry point calls (BACKLOG #1875).
+    harden_console_streams()
 
     # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
     # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled
@@ -105,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
     # INSTALLING THE HOOK CHANGES NO EXIT CODE: the interpreter still exits 1 after calling
     # `sys.excepthook`. That is why this shape was taken over the alternative of wrapping the dispatch
     # and exiting 2, which would have made every CLI exit-code assertion in the suite a fresh question.
+    # The dispatch IS now wrapped (BACKLOG #1863, at the foot of this function), but it returns 1,
+    # so that reasoning still holds. The hooks stay: they cover everything outside that `try`.
     #
     # LATE IMPORT, DELIBERATELY. Two `tests/test_config_anchoring.py` monkeypatches target the module
     # attribute `messagefoundry.last_resort.install_excepthook`; importing the name at module scope
@@ -183,10 +179,15 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument(
         "--allow-insecure-bind",
         action="store_true",
-        help="permit a non-loopback bind address WITHOUT TLS (bearer tokens and PHI would cross the "
-        "network in cleartext); a dev override for a trusted, firewalled network. Prefer configuring "
-        "[api].tls_cert_file (+ tls_key_file) for in-process TLS, which is allowed off-loopback "
-        "without this flag. Does not relax the no-auth refuse.",
+        help="a dev override for a trusted, firewalled network, honoured only under "
+        "[security].enforcement=warn. For the API it permits a non-loopback bind with NO operator "
+        "certificate: the engine then serves TLS on its generated self-signed placeholder, which no "
+        "trust store vouches for, so a remote client can authenticate the engine only by pinning "
+        "that exact certificate, handed over out of band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
+        "X12 listeners it permits a non-loopback CLEARTEXT bind, and PHI crosses the network "
+        "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file), which is allowed off-loopback "
+        "without this flag, and per-connection tls where the connector has it (raw-TCP and X12 have "
+        "none). Does not relax the no-auth refuse or the /ui refuse.",
     )
 
     supervise = sub.add_parser(
@@ -517,6 +518,10 @@ def main(argv: list[str] | None = None) -> int:
         "match the 'lens parse --contract' that produced them, so a v1 client's coordinates resolve "
         "against the v1 partition and a v2 client's against the v2 one",
     )
+    # `lens rewrite` has no --json flag, yet every error it reports is JSON on stdout. Setting the
+    # attribute lets `main` treat it as a --json command: its logging goes to stderr (BACKLOG #1489),
+    # and an uncaught exception still yields `{"error": ...}` (#1863). `_lens_rewrite` never reads it.
+    lens_rewrite.set_defaults(json=True)
 
     lens_schema = lens_sub.add_parser(
         "schema",
@@ -1070,9 +1075,29 @@ def main(argv: list[str] | None = None) -> int:
     # PHI-redaction + control-char-scrub filter chain, which is strictly more than the UNFILTERED
     # `logging.lastResort` a handler-less subcommand degrades to today. `serve` and `supervise` take
     # no `--json`, print no payload and are untouched: they still log to the stdout NSSM captures.
-    if getattr(args, "json", False):
+    as_json = bool(getattr(args, "json", False))
+    if as_json:
         configure_stderr_logging()
-    return _DISPATCH[args.command](args)
+    # THE FLOOR UNDER `_emit_error`'s --json CONTRACT (BACKLOG #1863). Without this `try`, an exception
+    # no subcommand arm names went to `sys.excepthook`: one redacted CRITICAL line on stderr, exit 1,
+    # and stdout EMPTY. A machine consumer could not tell that from a command with no output. Now it
+    # gets `{"error": ...}` on stdout under --json. Text mode prints nothing new, as before; only the
+    # log line appears, on whatever sink logging uses (stdout for `serve`/`supervise`, per NSSM).
+    #
+    # The exit code stays 1, the same 1 the hook path gave, so #1674's reasoning above still holds.
+    # `report_uncaught` is the hook's own rendering, so the stderr line is unchanged and the stdout
+    # text is the same PHI-redacted string. Never format `exc` here.
+    #
+    # `Exception`, not `BaseException`: Ctrl-C and `SystemExit` keep their own meaning. A command that
+    # printed part of its JSON before raising still leaves two documents on stdout; this catch cannot
+    # take back what was already written.
+    try:
+        return _DISPATCH[args.command](args)
+    except Exception as exc:
+        from messagefoundry.last_resort import report_uncaught
+
+        text = report_uncaught(exc)
+        return _emit_error(text, as_json=True) if as_json else 1
 
 
 def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
@@ -1717,9 +1742,10 @@ def _serve(args: argparse.Namespace) -> int:
     enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
 
     # ADR 0118: [security].require_encryption_for_remote=false is the config-file twin of
-    # --allow-insecure-bind (accept cleartext for off-machine access). It rides the SAME exposed-bind
-    # gate + the SAME ADR 0092 production-PHI clamp below — it can never relax a production-PHI cleartext
-    # bind. Fold both escapes into one flag the exposed-gate + create_managed_app read.
+    # --allow-insecure-bind (accept off-machine access on the API's self-signed placeholder, and on a
+    # cleartext inbound listener; BACKLOG #1672). It rides the SAME exposed-bind gate + the SAME
+    # ADR 0092 clamp below, keyed on [security].enforcement — it cannot relax either bind under
+    # enforcement=enforce. Fold both escapes into one flag the exposed-gate + create_managed_app read.
     insecure_bind_ok = (
         args.allow_insecure_bind or not settings.security.require_encryption_for_remote
     )
@@ -2241,10 +2267,20 @@ def _serve(args: argparse.Namespace) -> int:
         env_file,
     )
     # A non-loopback API bind puts bearer tokens + PHI on the wire. The exposed-gate (ADR 0002 §0):
-    # TLS configured → the first-class secure path (allow); no TLS but --allow-insecure-bind → a loud
-    # dev override (warn); otherwise → refuse fail-closed. The auth-disabled case is refused above
-    # regardless of this flag — serving full-privilege admin to the network is never one "I accept the
-    # risk" away.
+    # an operator certificate → the first-class secure path (allow); none but --allow-insecure-bind →
+    # a loud dev override (warn); otherwise → refuse fail-closed. The auth-disabled case is refused
+    # above regardless of this flag — serving full-privilege admin to the network is never one "I
+    # accept the risk" away.
+    #
+    # BACKLOG #1672: WITHOUT AN OPERATOR CERTIFICATE THE HOP IS NOT CLEARTEXT. The unconditional
+    # ensure_api_tls_material call further down (ADR 0172) mints a self-signed pair and serves
+    # https on it, so every no-certificate arm below would still encrypt. The reason to refuse is
+    # that no trust store vouches for the placeholder, so a client can authenticate the engine only
+    # by pinning that exact certificate, handed over out of band.
+    # Owner ruling 2026-08-17, amendment to ruling 3 (vault docs/security/OWNER-RULINGS-2026-08-17.md):
+    # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
+    # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
+    # messages say why.
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
             # WP-13a: TLS terminates in-process, so tokens + PHI are encrypted on the wire and HSTS
@@ -2262,26 +2298,39 @@ def _serve(args: argparse.Namespace) -> int:
                 settings.api.trusted_proxies,
             )
         elif insecure_bind_ok and not enforcing:
+            # The engine goes on to serve https on the minted placeholder (ADR 0172), which
+            # tests/test_api_tls.py::test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder
+            # proves by handshaking the context uvicorn is handed. Keep this wording true to that.
             print(
                 f"warning: API bound to non-loopback host {settings.api.host!r} with "
-                "--allow-insecure-bind and NO TLS; bearer tokens and PHI cross the network in "
-                "cleartext — configure [api].tls_cert_file (+ tls_key_file) for real remote access.",
+                "--allow-insecure-bind (or [security].require_encryption_for_remote=false) and NO "
+                "operator certificate; it serves TLS on the engine's generated self-signed "
+                "placeholder, which no trust store vouches for. A remote client can authenticate the "
+                "engine only by pinning that exact certificate, handed over out of band; any other "
+                "client cannot tell the engine from an on-path attacker presenting a certificate of "
+                "its own. "
+                "Configure [api].tls_cert_file (+ tls_key_file) for real remote access.",
                 file=sys.stderr,
             )
         elif insecure_bind_ok:
             # #200 (ADR 0092, decision 2) + [security].enforcement: --allow-insecure-bind is CLAMPED
-            # shut while the security dial is ENFORCING — a PHI listener refuses cleartext even WITH the
-            # flag (a staging PHI instance under the default enforce refuses exactly like prod; the same
-            # decoupling as every other posture gate — set [security].enforcement=warn to accept the
-            # risk). Serving bearer tokens + PHI in the clear under strict enforcement is never one
-            # "I accept the risk" away.
+            # shut while the security dial is ENFORCING — the API refuses an off-loopback bind on the
+            # untrusted placeholder even WITH the flag (a staging instance under the default
+            # enforce refuses exactly like prod; the same decoupling as every other posture gate — set
+            # [security].enforcement=warn to accept the risk). Serving bearer tokens + PHI behind a
+            # certificate no trust store vouches for, under strict enforcement, is never one "I accept
+            # the risk" away.
             print(
                 "error: refusing to serve the API on non-loopback host "
-                f"{settings.api.host!r} without TLS on a PHI instance under "
-                f"[security].enforcement=enforce ({env_name!r}) — --allow-insecure-bind cannot relax a "
-                "PHI cleartext bind under strict enforcement (#200). Configure [api].tls_cert_file for "
-                "in-process TLS, set [api].tls_terminated_upstream (+ trusted_proxies) if a proxy "
-                "terminates TLS, or set [security].enforcement=warn to accept the cleartext risk on a "
+                f"{settings.api.host!r} without an operator certificate under "
+                f"[security].enforcement=enforce ({env_name!r}). The only certificate available is "
+                "the engine's generated self-signed placeholder, which no trust store vouches for, "
+                "so a remote client can authenticate the engine only by pinning that exact "
+                "certificate, handed over out of band; --allow-insecure-bind cannot relax that under strict "
+                "enforcement (#200), and neither can [security].require_encryption_for_remote=false. "
+                "Configure [api].tls_cert_file for in-process "
+                "TLS, set [api].tls_terminated_upstream (+ trusted_proxies) if a proxy terminates "
+                "TLS, or set [security].enforcement=warn to accept serving on the placeholder on a "
                 "trusted, firewalled network.",
                 file=sys.stderr,
             )
@@ -2289,10 +2338,14 @@ def _serve(args: argparse.Namespace) -> int:
         else:
             print(
                 "error: refusing to serve the API on non-loopback host "
-                f"{settings.api.host!r} without TLS; bearer tokens and PHI would cross the network in "
-                "cleartext. Configure [api].tls_cert_file for in-process TLS, set "
-                "[api].tls_terminated_upstream (+ trusted_proxies) if a proxy terminates TLS, or pass "
-                "--allow-insecure-bind to accept the cleartext risk on a trusted, firewalled network.",
+                f"{settings.api.host!r} without an operator certificate. The only certificate "
+                "available is the engine's generated self-signed placeholder, which no trust store "
+                "vouches for, so a remote client can authenticate the engine only by pinning that "
+                "exact certificate, handed over out of band. Configure "
+                "[api].tls_cert_file for in-process TLS, set [api].tls_terminated_upstream "
+                "(+ trusted_proxies) if a proxy terminates TLS, or, under "
+                "[security].enforcement=warn, pass --allow-insecure-bind to accept serving on the "
+                "placeholder on a trusted, firewalled network.",
                 file=sys.stderr,
             )
             return 2
@@ -2548,8 +2601,9 @@ def _serve(args: argparse.Namespace) -> int:
     # The browser ops dashboard ([api].serve_ui, ADR 0065) is a STRICTER surface than the JSON API: it
     # puts an HttpOnly session cookie and PHI-rendering HTML on the wire. An off-loopback /ui bind
     # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
-    # refused even under --allow-insecure-bind (that dev override covers only the JSON API's cleartext
-    # risk, never the browser surface). The loopback default never trips this.
+    # refused even under --allow-insecure-bind (that dev override covers only the JSON API served on
+    # the self-signed placeholder, never the browser surface; BACKLOG #1672). The loopback default
+    # never trips this.
     # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
     # #1361). This gate is reachable TWO ways, and the remediation below is verified on only one:
     #  1. BY CONFIG: [security].local_access_only=false with a non-loopback listen_address. The loader
@@ -3742,7 +3796,8 @@ def _serve(args: argparse.Namespace) -> int:
 
     # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
     # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
-    # serving lifespan, inside the running loop.
+    # serving lifespan, inside the loop uvicorn owns. Every other loop the CLI starts gets it from
+    # `last_resort.run_guarded` (BACKLOG #1789).
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -3756,9 +3811,8 @@ def _supervise(args: argparse.Namespace) -> int:
     config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
     API port. Monitors + restarts crashed shards, and stops them all cleanly on SIGINT/SIGTERM. A single
     (default) shard yields a single subprocess — identical to a plain `serve`."""
-    import asyncio
-
     from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.supervisor import supervise
 
     configure_logging("INFO")
@@ -3788,7 +3842,7 @@ def _supervise(args: argparse.Namespace) -> int:
         print(f"error: {detail}", file=sys.stderr)
         return 2
 
-    return asyncio.run(
+    return run_guarded(
         supervise(
             config,
             store_backend=settings.store.backend,
@@ -4812,9 +4866,9 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
     resolves the lockout, and a reset would hand whoever runs this a working account.
     """
-    import asyncio
     import getpass
 
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     settings = _host_gated_store_settings(args)
@@ -4843,7 +4897,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        outcome, was = asyncio.run(run())
+        outcome, was = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "no-such-user":
@@ -4953,7 +5007,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
     policy checks itself, so for those this ordering is a courtesy and not the control. The length
     limits are this command's alone: the service method does not apply them.
     """
-    import asyncio
     import getpass
 
     from pydantic import ValidationError
@@ -4966,6 +5019,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         ProvisionedAdministrator,
     )
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     cli: dict[str, dict[str, object]] = {}
@@ -5046,7 +5100,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.store.crypto import StoreKeylessError
 
     try:
-        exists = asyncio.run(administrator_exists())
+        exists = run_guarded(administrator_exists())
     except StoreKeylessError as exc:
         return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -5114,7 +5168,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        outcome, store_path = asyncio.run(run())
+        outcome, store_path = run_guarded(run())
     except (FirstAdministratorRefused, _KeylessProvisionRefused) as exc:
         return _emit_error(str(exc), as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -5185,11 +5239,11 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     Re-running with the address already in place is a success that writes nothing, so an automated
     install step can be repeated.
     """
-    import asyncio
     import getpass
 
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.permissions import Role
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
     from messagefoundry.store.crypto import StoreKeylessError
     from messagefoundry.store.store import require_notify_email
@@ -5267,7 +5321,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        outcome, username, extra = asyncio.run(run())
+        outcome, username, extra = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     refusals = {
@@ -5364,11 +5418,10 @@ def _refuse_a_store_that_is_not_an_audit_log(
 
 
 def _audit_verify(args: argparse.Namespace) -> int:
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
@@ -5412,7 +5465,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        ok, message, count = asyncio.run(run())
+        ok, message, count = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; this catch is what a server backend and any error raised after the open
@@ -5449,11 +5502,10 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     gets one. The anchor is a row count plus a digest — no PHI, no secret — so it is safe to store in
     a ticket, an object store, or a compliance job's own database.
     """
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     cli: dict[str, dict[str, object]] = {}
@@ -5488,7 +5540,7 @@ def _audit_anchor(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        count, head = asyncio.run(run())
+        count, head = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     anchor = f"{count}:{head}"
@@ -5515,11 +5567,10 @@ def _rekey_audit(args: argparse.Namespace) -> int:
     FIRST re-verifies the existing keyless chain (refusing to bless a broken/forged one), then sets the
     keying watermark to the next id without rewriting any existing ``row_hash``. Run with the engine
     stopped so no concurrent append races the watermark move."""
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import open_store
 
     cli: dict[str, dict[str, object]] = {}
@@ -5549,7 +5600,7 @@ def _rekey_audit(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        ok, message = asyncio.run(run())
+        ok, message = run_guarded(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path)
     print(("OK: " if ok else "FAIL: ") + message)
@@ -5574,12 +5625,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
     (so an interrupted rotation still accounts for everything it already re-encrypted — it cannot
     silently under-count the new key), and ``store.close()`` settles the remainder exactly.
     """
-    import asyncio
     from pathlib import Path
 
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.base import open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
@@ -5672,7 +5723,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        count, uploads, (rolled_ok, rolled_msg) = asyncio.run(run())
+        count, uploads, (rolled_ok, rolled_msg) = run_guarded(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -5732,12 +5783,11 @@ def _backup(args: argparse.Namespace) -> int:
     store, bundle the config dir, encrypt to a ``.mfbak`` archive at the destination, restore-verify,
     and prune to keep-N. PHI-safe output (paths/counts/fingerprints only — never a body or key bytes).
     Run any time; it is read-only against the live store and writes one ``dr_backup`` audit row."""
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry import __version__
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
     from messagefoundry.store.base import StoreNotFoundError, open_store
@@ -5783,7 +5833,7 @@ def _backup(args: argparse.Namespace) -> int:
             await store.close()
 
     try:
-        result = asyncio.run(run())
+        result = run_guarded(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
     except StoreNotFoundError as exc:  # #1780: could not start, so exit 2 like #1670 below
@@ -5825,12 +5875,12 @@ def _restore_verify(args: argparse.Namespace) -> int:
     snapshot under THIS instance's real store settings (cipher, keyring, key provider) and decrypts +
     authenticates its cipher-covered cells. Reports ``PASS``/``FAIL``/``KEY_MISMATCH``; PHI-safe (counts
     + a reason only, never a body)."""
-    import asyncio
     from pathlib import Path
 
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import run_restore_verify
 
     if not Path(args.archive).is_file():
@@ -5846,7 +5896,7 @@ def _restore_verify(args: argparse.Namespace) -> int:
     # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
     # call is inside `_full_open_check`, which already catches broadly and reports FAIL with a
     # reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
-    result = asyncio.run(
+    result = run_guarded(
         run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
     )
     payload = {
@@ -5880,11 +5930,10 @@ def _restore(args: argparse.Namespace) -> int:
     refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. **Never
     overwrites:** an existing destination is refused rather than clobbered. PHI-safe output (paths,
     counts, fingerprints — never a body or key bytes)."""
-    import asyncio
-
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import BackupError, run_restore
 
     try:
@@ -5897,7 +5946,7 @@ def _restore(args: argparse.Namespace) -> int:
         # downgrade guard (a plaintext archive on a box that has a store key) stays at its strictest on
         # the one path that writes bytes to disk. It used to carry one this call withheld, and the
         # refusal then prescribed a setting this path never read.
-        result = asyncio.run(
+        result = run_guarded(
             run_restore(
                 args.archive,
                 dest_store_path=args.to,
@@ -6817,9 +6866,9 @@ def _load_operator_json(raw: str, what: str) -> Any:
     has established is at fault. The stack has already unwound to this shallow frame before either
     clause runs, so raising cannot re-trip the limit.
 
-    Each caller keeps its OWN arm rather than one dispatch-level catch because the callers differ in
-    where the report goes: four pass ``as_json=args.json``, while ``lens rewrite`` has no ``--json``
-    flag and always emits JSON. A single catch could not pick the right output stream.
+    Each caller keeps its OWN arm even though ``main`` now has a dispatch-level catch (BACKLOG #1863).
+    That catch is only a floor: it reports the exception type and redacted message, and cannot say
+    WHICH operator input was at fault. The arm here can, so it is the better report where it applies.
 
     DO NOT DRIVE A TEST OF THE RECURSION ARM WITH REAL DEEPLY-NESTED INPUT -- manufacture the
     exception. The depth where ``json``'s C accelerator gives out is a property of the runner, not

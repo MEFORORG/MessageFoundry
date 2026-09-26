@@ -177,6 +177,23 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
     STOP = "stop"
 
 
+def _check_flag_with_reason(
+    flag: bool, reason: str | None, *, flag_name: str, reason_name: str, flag_means: str, why: str
+) -> None:
+    """The three fail-loud rules every flag-plus-mandatory-reason pair shares: a reason without the
+    flag, the flag without a reason, and a blank reason. One body, so the pairs cannot drift apart;
+    each caller supplies only its names and the sentence saying why the reason is required."""
+    if reason is not None and not flag:
+        raise ValueError(
+            f"{reason_name} is set without {flag_name}=true — set the flag to {flag_means}, "
+            "or drop the reason"
+        )
+    if flag and reason is None:
+        raise ValueError(f"{flag_name}=true requires {reason_name} — {why}")
+    if flag and reason is not None and not reason.strip():
+        raise ValueError(f"{reason_name} must be non-empty when provided")
+
+
 def _check_hop_attestation(attested: bool, reason: str | None) -> None:
     """Load-validate the per-connection insecure-hop attestation pair (#200, ADR 0092 / 0153).
 
@@ -194,18 +211,15 @@ def _check_hop_attestation(attested: bool, reason: str | None) -> None:
     as "the ``[logging]`` sibling of a connection's ``tls_hop_attested``" and ``docs/PHI.md`` already
     described its reason as mandatory, so scoping the rule away from it would keep a documented
     guarantee un-enforced in exactly the place an auditor would look."""
-    if reason is not None and not attested:
-        raise ValueError(
-            "tls_hop_attested_reason is set without tls_hop_attested=true — set the flag to attest "
-            "the hop is secure, or drop the reason"
-        )
-    if attested and reason is None:
-        raise ValueError(
-            "tls_hop_attested=true requires tls_hop_attested_reason — an attestation that this hop is "
-            "secure by means the engine cannot see must record WHY, for the audit trail (ADR 0153)"
-        )
-    if attested and reason is not None and not reason.strip():
-        raise ValueError("tls_hop_attested_reason must be non-empty when provided")
+    _check_flag_with_reason(
+        attested,
+        reason,
+        flag_name="tls_hop_attested",
+        reason_name="tls_hop_attested_reason",
+        flag_means="attest the hop is secure",
+        why="an attestation that this hop is secure by means the engine cannot see must record WHY, "
+        "for the audit trail (ADR 0153)",
+    )
 
 
 def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
@@ -239,18 +253,34 @@ def _check_cleartext_acceptance(accepted: bool, reason: str | None) -> None:
     Same three fail-loud rules: the flag without a reason, a blank/whitespace-only reason, and a reason
     without the flag. The engine can check a reason is *present and non-blank*; it cannot check that it
     is *true* — a placeholder reason is a review problem, not a load problem."""
-    if reason is not None and not accepted:
-        raise ValueError(
-            "cleartext_reason is set without cleartext_accepted=true — set the flag to accept the "
-            "cleartext hop, or drop the reason"
-        )
-    if accepted and reason is None:
-        raise ValueError(
-            "cleartext_accepted=true requires cleartext_reason — an accepted risk that stops being "
-            "visible has stopped being accepted and started being forgotten (ADR 0153)"
-        )
-    if accepted and reason is not None and not reason.strip():
-        raise ValueError("cleartext_reason must be non-empty when provided")
+    _check_flag_with_reason(
+        accepted,
+        reason,
+        flag_name="cleartext_accepted",
+        reason_name="cleartext_reason",
+        flag_means="accept the cleartext hop",
+        why="an accepted risk that stops being visible has stopped being accepted and started being "
+        "forgotten (ADR 0153)",
+    )
+
+
+def _check_revocation_attestation(attested: bool, reason: str | None) -> None:
+    """Load-validate the per-connection revocation-attestation pair (ADR 0173 §1.5 item 4).
+
+    ``tls_revocation_attested`` says *a revocation-checking PKI covers this verifying hop outside the
+    engine*. It can cross an enforcing refusal, so it carries a mandatory
+    ``tls_revocation_attested_reason`` the audit line records, exactly as ADR 0153's
+    ``cleartext_reason`` does for an accepted cleartext hop. The engine can check a reason is
+    present; it cannot check that it is true."""
+    _check_flag_with_reason(
+        attested,
+        reason,
+        flag_name="tls_revocation_attested",
+        reason_name="tls_revocation_attested_reason",
+        flag_means="attest revocation checking for this hop",
+        why="name the PKI or terminator that checks revocation for this hop, so the audit record "
+        "says what was relied on",
+    )
 
 
 class Source(BaseModel):
@@ -286,12 +316,18 @@ class Source(BaseModel):
     #
     # Default False -> keyed purely on posture, so every existing inbound is byte-identical.
     # DISTINCT from tls_hop_attested: that one attests a hop is secure DESPITE no/weak TLS; this one
-    # attests that a VERIFYING hop's certificates are checked for revocation elsewhere.
+    # attests that a VERIFYING hop's certificates are checked for revocation elsewhere. Authored as a
+    # top-level inbound key (inbound() / connections.toml) and filled by the runner's _source_config;
+    # `tls_revocation_attested_reason` is mandatory with it and rides into the audit line.
     tls_revocation_attested: bool = False
+    tls_revocation_attested_reason: str | None = None
 
     @model_validator(mode="after")
     def _validate_hop_attestation(self) -> Source:
         _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
+        _check_revocation_attestation(
+            self.tls_revocation_attested, self.tls_revocation_attested_reason
+        )
         return self
 
 
@@ -673,7 +709,10 @@ class Destination(BaseModel):
     # operator taking responsibility for revocation, exactly like the ADR 0078 in-process [api] gate.
     # Default False → keyed purely on posture (existing verifying outbounds are byte-identical). Distinct
     # from tls_hop_attested (which attests a CLEARTEXT/verify-off hop is secure by other means, #200).
+    # Authored as a top-level outbound key (outbound() / connections.toml), threaded by _dest_config;
+    # `tls_revocation_attested_reason` is mandatory with it and rides into the guard's audit line.
     tls_revocation_attested: bool = False
+    tls_revocation_attested_reason: str | None = None
     # #190 (ADR 0093): the instance-wide [tls] client trust-anchor policy, threaded by the runner's
     # _dest_config so the internal-outbound TLS context builders (MLLP/DICOM/FTPS) resolve the same
     # anchor at build_check AND live construction. Default = system/None → a no-op (the OS trust store
@@ -692,6 +731,9 @@ class Destination(BaseModel):
     def _validate_hop_attestation(self) -> Destination:
         _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
         _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
+        _check_revocation_attestation(
+            self.tls_revocation_attested, self.tls_revocation_attested_reason
+        )
         return self
 
 

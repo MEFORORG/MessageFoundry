@@ -134,9 +134,9 @@ def test_the_recorder_would_see_a_missing_policy(monkeypatch: pytest.MonkeyPatch
     WITHOUT the policy as `None`, so a green above is a statement about the shipped call and not an
     artifact of the fake swallowing kwargs it does not recognise."""
     recorder = _install_fake_hvac(monkeypatch)
-    import hvac  # noqa: PLC0415 — resolves to the fake installed just above
+    import hvac  # type: ignore[import-untyped]  # noqa: PLC0415 — resolves to the fake installed just above
 
-    hvac.Client(url="https://vault.example:8200", token="t")  # type: ignore[attr-defined]
+    hvac.Client(url="https://vault.example:8200", token="t")
 
     assert recorder.calls[0].get("allow_redirects") is None
     assert recorder.calls[0]["url"] == "https://vault.example:8200", (

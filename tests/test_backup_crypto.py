@@ -44,7 +44,8 @@ def test_key_id_matches_store_cipher_fingerprint() -> None:
     # AC-3: the archive key_id must equal the store cipher's active_key_id (same DEK = same fingerprint),
     # so a backup is provably sealed under the key the store uses.
     key = os.urandom(32)
-    cipher = AesGcmCipher(key)
+    # A bytearray COPY: the cipher owns and zeroizes the buffer it is given, so `key` stays intact.
+    cipher = AesGcmCipher(bytearray(key))
     assert bc.key_fingerprint(key) == cipher.active_key_id
 
 

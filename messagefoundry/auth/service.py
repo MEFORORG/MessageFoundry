@@ -34,6 +34,7 @@ from messagefoundry.auth import oidc, reconcile, totp, webauthn
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError, kerberos_principal
 from messagefoundry.auth.notifications import (
+    ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
@@ -86,6 +87,7 @@ from messagefoundry.store.store import (
     UserRecord,
     WebAuthnCredential,
     require_notify_email,
+    seed_notify_email,
 )
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -285,6 +287,10 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: account carries no ``directory_object_id`` (BACKLOG #1143 slice C, ADR 0184 AC-5). Written into the
 #: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
+
+#: The text ``POST /users`` answers a taken username with, from its pre-check and from
+#: :class:`UsernameTaken` alike (BACKLOG #1808).
+USERNAME_TAKEN = "username already exists"
 
 _T = TypeVar("_T")
 
@@ -500,6 +506,11 @@ class FederatedSubjectHeld(RuntimeError):
     """
 
 
+class UsernameTaken(RuntimeError):
+    """:meth:`AuthService.create_local_user` lost a concurrent create's race for its username
+    (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text."""
+
+
 class DirectoryObjectIdMissing(ValueError):
     """:meth:`AuthService.bind_federated_subject` refused an account that carries no
     ``directory_object_id`` (BACKLOG #1143 slice C, ADR 0184 AC-5).
@@ -542,14 +553,21 @@ class FederatedBinding:
 
 
 def _is_integrity_refusal(exc: BaseException) -> bool:
-    """Whether ``exc`` is a backend's UNIQUE-constraint refusal, matched by MRO NAME.
+    """Whether ``exc`` is a backend's integrity refusal, matched by MRO NAME.
+
+    It matches a foreign-key refusal as well as a UNIQUE one. sqlite3 raises the same
+    ``IntegrityError`` for both (measured). asyncpg's ``ForeignKeyViolationError`` sits under
+    ``IntegrityConstraintViolationError`` in its documented hierarchy, not measured here because
+    asyncpg is an optional install. ``finish_webauthn_registration`` depends on this, since it tells
+    the two apart only after this returns true (BACKLOG #1807).
 
     Each backend raises its own class -- ``sqlite3.IntegrityError``, asyncpg's
     ``UniqueViolationError``, pyodbc's ``IntegrityError`` -- and naming them would make this module
     import-aware of every driver and silently stop covering a backend added later. The ONE copy of
-    this test: the webauthn duplicate-label race (ADR 0068 section 4), the cached-username refresh and
-    the federated bind all call it. ``_refresh_cached_username`` records why the test is on
-    "Integrity" and not "IntegrityError", and the one engine class the name test would wrongly absorb.
+    this test. At least these call it: the webauthn duplicate-label race (ADR 0068 section 4), the
+    cached-username refresh, the federated bind, and the local-account username race (BACKLOG
+    #1808). ``_refresh_cached_username`` records why the test is on "Integrity" and not
+    "IntegrityError", and the one engine class the name test would wrongly absorb.
     """
     mro = "".join(t.__name__ for t in type(exc).__mro__)
     return "Integrity" in mro or "UniqueViolation" in mro
@@ -726,7 +744,7 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
 _IDP_WAYS_ACROSS = (
     "Set [auth].oidc_tls_crl_file to a PEM file holding a CRL from each CA that issues the token "
     "and JWKS endpoint certificates, so the engine checks revocation on both legs. Put only CRLs "
-    "in it: a certificate in that file becomes a trusted root for this hop."
+    "in it: a certificate not already in the hop's trust store refuses start."
 )
 
 #: Stands in for a URL with no host. NOT the empty string: `is_loopback_hop_host("")` is True, so an
@@ -2530,7 +2548,7 @@ class AuthService:
         operator can find out.
 
         ``resolve_principal`` is the password-free service-account lookup the Kerberos path uses. It
-        already rejects a disabled account (``userAccountControl & 0x2``) by returning ``None`` on
+        already rejects an account ``auth.ldap._account_enabled`` refuses by returning ``None`` on
         either key, and returns the group set, so the role re-diff below costs no extra round trip.
         """
         assert self._ldap is not None  # guarded by directory_reconcile_enabled
@@ -2810,9 +2828,10 @@ class AuthService:
             # a rename of one asyncpg class cannot silently drop the backend.
             #
             # THIS APPLIES TO THE TWO SIBLING SITES TOO, and since BACKLOG #1143 there is one copy:
-            # `_is_integrity_refusal`, which this site, the webauthn label race and the federated
-            # bind all call. `__mro__` appears once in the engine, inside it. Until #1143 it appeared
-            # three times, all in this module, all in this substring form.
+            # `_is_integrity_refusal`, which at least this site, the webauthn label race, the
+            # federated bind and the local-account create (BACKLOG #1808) call. `__mro__` appears
+            # once in the engine, inside it. Until #1143 it appeared three times, all in this
+            # module, all in this substring form.
             #
             # THE COST OF A NAME TEST, NAMED ONCE: it matches on a string, so an unrelated class whose
             # name happens to contain "Integrity" would be swallowed here. The engine HAS one --
@@ -2820,9 +2839,10 @@ class AuthService:
             # error -- and this predicate does absorb it. It is NOT reachable today: its only raise
             # site is inside `run_startup_attestation`, which runs before any listener binds, and
             # neither `store/` nor `auth/` imports the module. Recorded because the day something
-            # raises it from a store or auth path, all three of these handlers would silently report a
-            # username conflict instead of a refused attestation -- a fail-closed control absorbed by
-            # a fail-open one. If that class ever moves, test on identity here, not on a name.
+            # raises it from a store or auth path, every handler that calls this predicate could
+            # silently report a conflict instead of a refused attestation -- a fail-closed control
+            # absorbed by a fail-open one. If that class ever moves, test on identity here, not on a
+            # name.
             if not _is_integrity_refusal(exc):
                 raise
             # Re-read rather than guess who won: this is an error path, the cost is irrelevant, and an
@@ -4553,9 +4573,14 @@ class AuthService:
             # The concurrent duplicate-label race (ADR 0068 §4): each backend raises its own
             # integrity class (sqlite3.IntegrityError / asyncpg UniqueViolationError / pyodbc
             # IntegrityError) — rendered as the same legible error as a pre-checked duplicate.
-            if _is_integrity_refusal(exc):
-                raise ValueError("label already in use") from exc
-            raise
+            if not _is_integrity_refusal(exc):
+                raise
+            # BACKLOG #1807: the same classes carry the user_id foreign-key refusal, raised when the
+            # account is deleted mid-enrolment. Told apart by re-reading the account, never by the
+            # driver's message: that text can echo the operator-chosen label.
+            if await self._store.get_user(user.id) is None:
+                raise ValueError("no such user") from exc
+            raise ValueError("label already in use") from exc
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
         # rotated — the reverse order writes nothing and still reports success.
@@ -4820,23 +4845,59 @@ class AuthService:
         email: str | None,
         roles: Sequence[str],
         actor: str,
+        client: str | None = None,
     ) -> str:
+        """Create a local account with an admin-set, must-change initial password.
+
+        ``client`` is the creating administrator's address. It lands on the ``user.created`` row
+        (ADR 0150, BACKLOG #315), so the step that can mint a second dual-control approver is
+        attributed to a host like the approval rows are. The new account's notification address is
+        told it was created (``ACCOUNT_CREATED``).
+
+        Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
+        own check (BACKLOG #1808)."""
         user_id = uuid4().hex
-        await self._store.create_user(
-            user_id=user_id,
-            username=username,
-            auth_provider=AuthProvider.LOCAL.value,
-            display_name=display_name,
-            email=email,
-            password_hash=await self._argon2(hash_password, password),
-            # Admin-set the credential is a one-time temp: force rotation on first login so the
-            # operator never sets a lasting password the user keeps (ASVS 6.4.6 / WP-L3-12).
-            must_change_password=True,
-        )
+        # Hashed before the insert so the handler below covers the store call alone.
+        password_hash = await self._argon2(hash_password, password)
+        try:
+            await self._store.create_user(
+                user_id=user_id,
+                username=username,
+                auth_provider=AuthProvider.LOCAL.value,
+                display_name=display_name,
+                email=email,
+                password_hash=password_hash,
+                # Admin-set the credential is a one-time temp: force rotation on first login so the
+                # operator never sets a lasting password the user keeps (ASVS 6.4.6 / WP-L3-12).
+                must_change_password=True,
+            )
+        except Exception as exc:
+            if not _is_integrity_refusal(exc):
+                raise
+            # Re-read rather than assume the name index fired: only a row now holding the name
+            # makes this a username conflict. Anything else re-raises untouched.
+            if await self._store.get_user_by_username(username) is None:
+                raise
+            raise UsernameTaken(USERNAME_TAKEN) from exc
         await self._store.set_user_roles(user_id, roles, assigned_by=actor)
         await self._audit(
-            "user.created", actor=actor, detail=_json({"username": username, "roles": list(roles)})
+            "user.created",
+            actor=actor,
+            detail=_json({"username": username, "roles": list(roles)}),
+            client=client,
         )
+        # The address create_user seeded. None means nobody to tell yet: the holder is asked for one
+        # at first sign-in (the NOTIFY_EMAIL_SET path) rather than told about this afterwards.
+        notify = seed_notify_email(email)
+        if notify:
+            await self._notify_security(
+                ACCOUNT_CREATED,
+                username=username,
+                email=notify,
+                # No `client`: the address is admin-typed and unverified, and no other admin-initiated
+                # notice sends the administrator's address to the account's mailbox.
+                detail={"roles": list(roles)},
+            )
         return user_id
 
     async def update_user(

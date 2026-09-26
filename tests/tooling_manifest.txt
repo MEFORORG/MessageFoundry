@@ -40,6 +40,7 @@ tests/test_blanket_stage_guard.py
 tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
 tests/test_ci_faulthandler_belts.py
+tests/test_ci_gate_annotation.py
 tests/test_ci_leg_data_class.py
 tests/test_ci_merge_group_gate.py
 tests/test_ci_odbc_installer_pipefail.py
@@ -56,6 +57,7 @@ tests/test_codex_bridge.py
 tests/test_connscale_harvest.py
 tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_reentrancy.py
+tests/test_coord_alloc_retired_tombstone.py
 tests/test_coord_fleet_fetch_clock.py
 # The four below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
 # real post-commit hook. They are listed rather than left off because the diff that can break them is
@@ -96,6 +98,7 @@ tests/test_coord_workflow_cost.py
 tests/test_doc_guards_lane.py
 tests/test_install_gate_allowlist_merge.py
 tests/test_install_gate_records_the_install.py
+tests/test_install_gate_upstream_provenance.py
 tests/test_npm_audit_retry.py
 tests/test_quality_expiry_audit.py
 tests/test_coord_seat_roster_verdict.py
@@ -126,6 +129,7 @@ tests/test_ledger_check.py
 tests/test_link_resolution.py
 tests/test_lint_scope_parity.py
 tests/test_merge_gate_controls.py
+tests/test_mypy_tests_scope.py
 tests/test_negative_controls.py
 tests/test_net_helper_signing_scope.py
 tests/test_new_dependency_check.py

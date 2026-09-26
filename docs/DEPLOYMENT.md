@@ -30,15 +30,25 @@ and the cleartext-hop authority) apply to a loopback-bound engine **exactly** as
 one. What follows about *binding* is what changes when you deliberately put a listener on a routable
 address.
 
-**Fail-closed rule (ADR 0002 §0):** a non-loopback **API** bind is *refused at startup* unless TLS is
-configured (or an upstream TLS terminator is trusted), and every inbound **listen** type — MLLP, HTTP,
-DICOM C-STORE SCP, raw TCP/X12 — is refused off-loopback without TLS at wiring time.
+**Fail-closed rule (ADR 0002 §0):** a non-loopback **API** bind is *refused at startup* unless you
+configure a certificate (`[api].tls_cert_file`) or trust an upstream TLS terminator, and every inbound
+**listen** type — MLLP, HTTP, DICOM C-STORE SCP, raw TCP/X12 — is refused off-loopback without TLS at
+wiring time.
 
-**The cleartext-bind escapes are clamped shut on the shipped posture** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
+**The API refusal is not about cleartext.** With no certificate configured, the engine still serves
+TLS: it mints a self-signed placeholder on first run
+([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+No trust store vouches for the placeholder, so a remote client can authenticate the engine only by
+pinning that exact certificate, handed over out of band. That is why
+an exposed bind is refused until a real certificate is configured (BACKLOG #1672). The inbound
+listeners are different: without `tls` they really are cleartext.
+
+**The bind escapes are clamped shut on the shipped posture** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
 ADR 0092 decision 2). `serve --allow-insecure-bind` — and its config twin
 `[security].require_encryption_for_remote = false` — only warn-and-cross while the instance is **not**
-enforcing. `[security].enforcement` defaults `enforce`, so a **stock instance refuses the cleartext
-bind even with the flag**. Crossing it is a deliberate, recorded loosening: set
+enforcing. For the API, crossing means serving off-loopback on the self-signed placeholder; for an
+inbound listener, it means a cleartext bind. `[security].enforcement` defaults `enforce`, so a **stock
+instance refuses the bind even with the flag**. Crossing it is a deliberate, recorded loosening: set
 `[security].enforcement = warn`. That is now the only way — the synthetic declaration that also did it
 was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md), and it is not a supported production setting either.
 
@@ -273,13 +283,15 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
 
 Legend: **Bind** = default bind/connect posture · **TLS** = transport encryption support · **Auth** =
 authentication on the channel · **Egress gate** = the `[egress]` allow-list that confines it ·
-**Off-loopback guarded?** = whether a non-loopback bind is refused without TLS.
+**Off-loopback guarded?** = whether a non-loopback bind is refused without TLS (for the Engine API:
+without an operator certificate or a trusted terminator, since the engine otherwise serves TLS on a
+self-signed placeholder).
 
 ### Inbound (listeners — the engine binds a socket)
 
 | Channel | Bind default | TLS support | Auth | Ingress/egress gate | Off-loopback guarded? |
 |---|---|---|---|---|---|
-| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **required by default** (`[security].require_sign_in`, default `true`); `false` is refused on a non-loopback bind or a loopback bind behind a declared TLS terminator, and on a bare loopback bind with no declared terminator yields a full-privilege *system* identity with no RBAC | — (auth-gated) | **Yes** — refused without TLS or a trusted terminator, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default); also refused if sign-in is disabled on a non-loopback bind or a loopback bind behind a declared terminator |
+| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **required by default** (`[security].require_sign_in`, default `true`); `false` is refused on a non-loopback bind or a loopback bind behind a declared TLS terminator, and on a bare loopback bind with no declared terminator yields a full-privilege *system* identity with no RBAC | — (auth-gated) | **Yes** — refused without an operator certificate or a trusted terminator, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default); also refused if sign-in is disabled on a non-loopback bind or a loopback bind behind a declared terminator |
 | **MLLP source** | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`; ≥TLS 1.2. **Plaintext by default** | None (MLLP has no app auth) | — | **Yes** — non-loopback plaintext refused (`check_mllp_tls_exposure`) |
 | **HTTP source** (`Http()`, ADR 0023) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | mTLS client cert only — **no bearer/basic partner auth**, and **neither mTLS nor the IP allow-list is required**: with TLS on and both unset the listener accepts any peer | per-connection `source_ip_allowlist` — **optional, defaults to no restriction** | **Yes** — non-loopback plaintext refused (`check_http_tls_exposure`) — but the gate checks **only** that TLS is on, **never** that a peer control exists (unlike the DICOM SCP row below) |
 | **DICOM C-STORE SCP** (`DICOM()`, ADR 0025) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + cert/key; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `calling_ae_allowlist` / `require_called_ae_title` / mTLS (DIMSE has no transport auth of its own) | per-connection `source_ip_allowlist` | **Yes** — non-loopback plaintext refused (`check_dimse_tls_exposure`), **and** a non-loopback SCP with *no* peer control (calling-AE allow-list, IP allow-list, or mTLS) is refused at construction |
@@ -537,10 +549,12 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
 ## Bind-guard behavior (summary)
 
 - **API** ([`__main__.py`](../messagefoundry/__main__.py)): a non-loopback bind is refused unless
-  in-process TLS is configured, or `tls_terminated_upstream` + `trusted_proxies` are set; also refused if
-  `[security].require_sign_in = false`, which no flag covers. Override (dev only):
-  `serve --allow-insecure-bind` — **clamped inert on an enforcing PHI instance**, i.e. on the shipped
-  default.
+  `[api].tls_cert_file` is configured, or `tls_terminated_upstream` + `trusted_proxies` are set; also
+  refused if `[security].require_sign_in = false`, which no flag covers. The refusal is not a cleartext
+  one: without a certificate the engine would serve TLS on its self-signed placeholder, which no trust
+  store vouches for. Override (dev only): `serve --allow-insecure-bind`, which serves
+  off-loopback on that placeholder — **clamped inert on an enforcing PHI instance**, i.e. on the
+  shipped default.
   **This is not the whole API gate.** At least three further `return 2` refusals layer on top of that
   ladder, and **none is covered by `--allow-insecure-bind`**: an in-process-TLS off-loopback bind also needs
   `MEFOR_TLS_REVOCATION_ATTESTED=1` ([ADR 0078](adr/0078-certificate-revocation-posture.md) — see
@@ -691,10 +705,15 @@ attestation:
    left intact), and it still crosses an outbound hop on a **non-enforcing** instance, where the
    alternative is a warning rather than a refusal. An attestation that suppresses a would-be refusal
    is **logged at WARNING at every construction**, so it stays visible.
-   (A per-connection `tls_revocation_attested` field exists on the outbound model and the connectors do
-   read it — but like `tls_hop_attested` it has **no authoring surface**: no connector-factory parameter
-   and no `connections.toml` key, so it is unreachable from config today. The blanket env var is the
-   only attestation you can actually set. Do not plan a per-hop revocation posture around it.)
+   **The attestation that does cross an enforcing outbound hop is per-connection:**
+   `tls_revocation_attested = true` plus a mandatory `tls_revocation_attested_reason`, set on that one
+   connection (an `outbound()` keyword or a top-level `connections.toml` key, not a `[settings]` key —
+   [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
+   It names the hop whose PKI you reviewed, which is what the blanket variable cannot do. Each
+   construction it lets through on an enforcing instance logs a WARNING carrying your reason. The
+   same pair on an `inbound()` mTLS listener clears the listener-side revocation gate
+   (`check_inbound_revocation`) in the same way; `tls_crl_file` is still the better fix there,
+   because it checks revocation in the engine.
 3. **Stay on loopback**, which neither gate reaches.
 4. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
    outbound gate entirely** — ALLOW before the refuse arm, on every hop, with no per-hop record. It was
@@ -720,7 +739,10 @@ ungated, never covered by an "every verifying hop" sentence; a weakening with no
 (`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no refusal keys
 on it — **reported is not gated**, and the two must never be written as if either implied the other;
 and a field with no factory parameter and no `connections.toml`
-key (`tls_hop_attested`, `tls_revocation_attested`) must never be offered as an operator lever.
+key (`tls_hop_attested`) must never be offered as an operator lever. (`tls_revocation_attested` left
+this list when it gained both, under ADR 0173. `tests/test_hop_refusal_revocation.py` and
+`tests/test_hop_refusal_wiring.py` pin that this one lever is settable wherever the connection
+refusals name it; they do not check the other levers those refusals name.)
 Two more rules of thumb: state a control **with its default and its off-switch** (`require_sign_in`,
 `enforcement`), and never describe `[egress]` as bounding a *transform* —
 it bounds declared **destinations**.

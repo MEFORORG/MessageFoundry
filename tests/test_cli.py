@@ -823,8 +823,9 @@ def test_serve_custom_env_with_posture_starts(
 def test_serve_refuses_non_loopback_bind_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Auth is enabled by default, so this exercises the cleartext-bind refuse, not the no-auth gate:
-    # Phase 1 has no API TLS, so a non-loopback bind must fail closed unless the operator opts in.
+    # Auth is enabled by default, so this exercises the exposed-bind refuse, not the no-auth gate:
+    # with no operator certificate the only one available is the self-signed placeholder, so a
+    # non-loopback bind must fail closed unless the operator opts in (BACKLOG #1672).
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet and only the bind gate decides.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
@@ -836,7 +837,10 @@ def test_serve_refuses_non_loopback_bind_by_default(
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
-    assert "refusing to serve the API on non-loopback" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "refusing to serve the API on non-loopback" in err
+    # BACKLOG #1672: the hop would be TLS on the minted pair, so the refusal must not call it cleartext.
+    assert "self-signed placeholder" in err and "cleartext" not in err
 
 
 def test_serve_allows_non_loopback_bind_with_flag(
@@ -864,7 +868,9 @@ def test_serve_allows_non_loopback_bind_with_flag(
         == 0
     )
     err = capsys.readouterr().err
-    assert "--allow-insecure-bind" in err and "cleartext" in err  # warned, but served
+    # Warned, but served -- on the minted placeholder, which test_api_tls.py's
+    # test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder proves by handshake.
+    assert "--allow-insecure-bind" in err and "self-signed placeholder" in err
 
 
 def test_serve_loopback_bind_needs_no_flag(
@@ -1011,7 +1017,7 @@ def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
         == 2
     )
     err = capsys.readouterr().err
-    assert "enforcement=enforce" in err and "cannot relax a PHI cleartext bind" in err
+    assert "enforcement=enforce" in err and "--allow-insecure-bind cannot relax" in err
     # enforcement=warn reproduces the historical non-production dial: the same bind warns + serves.
     (tmp_path / "messagefoundry.toml").write_text(
         base + 'security.enforcement = "warn"\n', encoding="utf-8"
@@ -1023,6 +1029,34 @@ def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
         == 0
     )
     assert "--allow-insecure-bind" in capsys.readouterr().err  # warned, served
+
+
+def test_serve_config_twin_alone_names_itself_in_both_bind_arms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #1672: [security].require_encryption_for_remote=false reaches the same two arms as the
+    # flag (it folds into insecure_bind_ok), so an operator who set only the config key must see it
+    # named rather than being told about a flag they never passed. No --allow-insecure-bind here.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # pass the keyless gate
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    base = (
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        "security.block_unlisted_outbound = true\n"
+        "security.require_encryption_for_remote = false\n"
+    )
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]
+    (tmp_path / "messagefoundry.toml").write_text(base, encoding="utf-8")
+    assert main(argv) == 2  # default enforce: the clamp refuses the twin exactly like the flag
+    err = capsys.readouterr().err
+    assert "neither can [security].require_encryption_for_remote=false" in err
+    (tmp_path / "messagefoundry.toml").write_text(
+        base + 'security.enforcement = "warn"\n', encoding="utf-8"
+    )
+    assert main(argv) == 0
+    err = capsys.readouterr().err
+    assert "(or [security].require_encryption_for_remote=false)" in err
+    assert "self-signed placeholder" in err
 
 
 # --- MFA-at-exposure posture (sec-mfa-on; off-loopback bind + [auth].require_mfa) ----------------
@@ -2778,28 +2812,35 @@ def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
         sys.excepthook, threading.excepthook = sys_hook, thread_hook
 
 
+@pytest.mark.parametrize("as_json", [True, False], ids=["json", "text"])
 def test_an_uncaught_exception_in_a_non_serve_subcommand_prints_no_traceback(
-    tmp_path: Path,
+    tmp_path: Path, as_json: bool
 ) -> None:
-    """End to end, in a CHILD interpreter, because `sys.excepthook` only fires at the interpreter's
-    top level -- inside pytest the exception never gets there, so an in-process check would assert
-    nothing. A dispatch entry is replaced with a raiser: that is the only honest way to produce an
+    """End to end, in a CHILD interpreter, so the real process streams and exit code are what is
+    measured. A dispatch entry is replaced with a raiser: that is the only honest way to produce an
     *unhandled* exception now that every shipped subcommand's known escapes are handled.
 
-    The exit code is asserted UNCHANGED at 1. Installing an excepthook does not alter it -- the
-    interpreter still exits 1 once the hook returns -- which is exactly why this shape was taken over
-    the row's alternative of wrapping the dispatch and exiting 2.
+    Since BACKLOG #1863 the exception no longer reaches `sys.excepthook`: `main` catches it at the
+    dispatch and logs it through `last_resort.report_uncaught`, the hook's own rendering. So the
+    stderr line is unchanged. What is new is stdout under `--json`: it carries `{"error": ...}` with
+    the SAME redacted text, where before it was empty and a machine consumer could not tell failure
+    from no output. Text mode keeps stdout empty.
+
+    The exit code is asserted UNCHANGED at 1 in both modes. #1674 declined wrapping the dispatch
+    because the proposal exited 2; this wrap returns 1, so every exit-code assertion still holds.
+    The message carries an HL7 segment so the test proves the redaction reached BOTH streams.
     """
     import subprocess
     import sys
 
+    argv = ["hl7schema", "--json"] if as_json else ["hl7schema"]
     driver = tmp_path / "raise_in_a_subcommand.py"
     driver.write_text(
         "import messagefoundry.__main__ as m\n"
         "def _boom(args):\n"
-        "    raise RuntimeError('synthetic failure carrying DOE^JANE')\n"
+        "    raise RuntimeError('synthetic failure PID|1||123456^^^MRN||DOE^JANE')\n"
         "m._DISPATCH['hl7schema'] = _boom\n"
-        "raise SystemExit(m.main(['hl7schema', '--json']))\n",
+        f"raise SystemExit(m.main({argv!r}))\n",
         encoding="utf-8",
     )
     proc = subprocess.run(
@@ -2814,6 +2855,66 @@ def test_an_uncaught_exception_in_a_non_serve_subcommand_prints_no_traceback(
     assert "last-resort: uncaught exception" in proc.stderr, (
         "the error vanished instead of being logged -- the guarantee is redact-and-report, not drop"
     )
+    assert "DOE^JANE" not in proc.stderr + proc.stdout, "the message reached a stream unredacted"
+    if as_json:
+        error = json.loads(proc.stdout)["error"]
+        assert error.startswith("RuntimeError: synthetic failure PID|"), error
+        assert "[redacted]" in error, error
+        assert f"last-resort: uncaught exception: {error}" in proc.stderr, (
+            "stdout and stderr must carry the SAME redacted text, from the one rendering"
+        )
+    else:
+        assert proc.stdout == "", "text mode must keep stdout for results only"
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [(SystemExit(3), SystemExit), (KeyboardInterrupt(), KeyboardInterrupt)],
+    ids=["system-exit", "keyboard-interrupt"],
+)
+def test_the_dispatch_floor_catches_exception_but_not_base_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    raised: BaseException,
+    expected: type[BaseException],
+) -> None:
+    """`main`'s dispatch floor (BACKLOG #1863) catches `Exception` only. A subcommand's own
+    `SystemExit` keeps its exit code, and Ctrl-C stays an interrupt rather than a logged error.
+
+    RED when: the catch is widened to `BaseException` -- both would then return 1 with a JSON error."""
+    import messagefoundry.__main__ as cli
+
+    def _raise(_args: object) -> int:
+        raise raised
+
+    monkeypatch.setitem(cli._DISPATCH, "hl7schema", _raise)
+    with pytest.raises(expected):
+        main(["hl7schema", "--json"])
+    assert capsys.readouterr().out == ""
+
+
+def test_lens_rewrite_counts_as_a_json_command_for_an_uncaught_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`lens rewrite` has no --json flag, yet every error it reports is JSON on stdout (the IDE reads
+    it there). Its subparser sets `json=True` so `main`'s dispatch floor (BACKLOG #1863) emits a
+    JSON error for it too, rather than the text-mode empty stdout.
+
+    RED when: the `set_defaults(json=True)` on the rewrite subparser is dropped."""
+    from messagefoundry import lens
+
+    def _boom(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("synthetic rewrite failure")
+
+    monkeypatch.setattr(lens, "rewrite_module", _boom)
+    module = tmp_path / "h.py"
+    module.write_text("x = 1\n", encoding="utf-8")
+    rc = main(["lens", "rewrite", str(module), "--edit", '{"line_start": 1, "line_end": 1}'])
+
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "RuntimeError: synthetic rewrite failure"
+    }
 
 
 # --- `--version` says which tree answered (BACKLOG #1677) -------------------------------------------

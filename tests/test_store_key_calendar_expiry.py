@@ -496,7 +496,7 @@ def test_the_gate_and_the_alert_read_the_SAME_overdue_expression() -> None:
         stamps,
         _REF.date(),
         enforcement=SecurityEnforcement.ENFORCE,
-        alert_sink=sink,  # type: ignore[arg-type]
+        alert_sink=sink,
     )
     with pytest.raises(StoreKeyRotationOverdueError) as exc:
         _enforce(stamps=stamps)

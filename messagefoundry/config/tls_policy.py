@@ -240,6 +240,24 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
     peer, after the CA is loaded.
 
+    **A CRL load must add no trust anchor (BACKLOG #1890).** ``cafile=`` adds every certificate in
+    the file as well as every CRL, so a CA+CRL bundle in a CRL slot used to make its CA a trust
+    anchor for the hop, beside any pinned CA and outside the pin's check. Measured before this fix,
+    CPython 3.14.6 / OpenSSL 3.5.7: a pinned-CA context given a CRL file that also carried a second
+    CA went from ``x509_ca`` 1 to 2. So the load is refused when it changes the store's TOTAL
+    certificate count (``x509``, which also counts a non-CA certificate; ``x509_ca`` does not).
+    OpenSSL does not add a certificate the store already holds, so a bare CRL and a bundle whose
+    certificates the hop already trusts both load, and any other certificate refuses. The documented
+    shape is a bare CRL. "Already holds" means loaded into the store now: a CA that OpenSSL would
+    read lazily from a hashed directory is not counted, so a bundle carrying it refuses. **This also
+    relies on the CA loading first**, as every call site does; a CRL bundle loaded before its CA is
+    refused. Both cases fail closed rather than widening. Stripping the
+    certificates before the load was the alternative, and it was not taken: it needs a PEM parser
+    that agrees with OpenSSL's and a temporary file, to keep a shape that gains nothing over a bare
+    CRL. A refusal leaves the certificate in ``ctx``, so the caller must discard the context, which
+    every call site does by letting the ``ValueError`` abort construction. Calling this again on the
+    same context after a refusal would pass, because the certificate is then already counted.
+
     **Three refusals, and each one is a measured failure mode rather than defensive habit.**
     Re-measured on this worktree, CPython 3.14.6 / OpenSSL 3.5.7, TLS 1.2 pinned so client auth is
     in-handshake:
@@ -286,8 +304,18 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
             "revoked ones, so this would take the listener down at the first partner handshake"
         )
 
+    certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
-    loaded = ctx.cert_store_stats().get("crl", 0)
+    stats = ctx.cert_store_stats()
+    added = stats["x509"] - certs_before
+    if added:
+        raise ValueError(
+            f"[tls] crl file {crl_file!r} carries {added} certificate(s) not already in this hop's "
+            "trust store; loading them would make each one a trust anchor for the hop, outside any "
+            "check on its CA setting. Remove the certificates and give this setting a bare CRL "
+            "(BACKLOG #1890)"
+        )
+    loaded = stats.get("crl", 0)
     if loaded < 1:
         raise ValueError(
             f"[tls] crl file {crl_file!r} loaded no CRL into the trust store "
@@ -1549,13 +1577,10 @@ def revocation_hop_disposition(
 #: inheriting levers it cannot use (BACKLOG #1498). Deliberately **not** annotated with how many
 #: hops consume it: that is the hardened-count liability SDS-3.6 names, and this very change moved
 #: four documents off such a count. Find the consumers by symbol.
-#:
-#: It names no per-connection ``tls_revocation_attested``. That field is read by the guard but has
-#: no factory parameter and no ``connections.toml`` key, so an operator cannot set it, and
-#: docs/DEPLOYMENT.md forbids offering such a field as a lever (SDS-3.7).
 _CONNECTION_WAYS_ACROSS = (
-    "Configure [tls].crl_file so the engine checks a CRL on this hop, or terminate at a "
-    "revocation-checking egress proxy."
+    "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
+    "revocation-checking egress proxy, or set tls_revocation_attested=true with a "
+    "tls_revocation_attested_reason on this connection."
 )
 
 
@@ -1595,6 +1620,10 @@ class RevocationHopGuard:
     #: refusal whose remedy cannot be performed, which is the SDS-3.7 false-premise defect wearing a
     #: helpful voice. A non-connection hop passes the setting that actually closes its own gate.
     ways_across: str | None = None
+    #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
+    #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
+    #: a hop that carries no per-connection attestation.
+    attested_reason: str | None = None
 
     @classmethod
     def capture(
@@ -1608,6 +1637,7 @@ class RevocationHopGuard:
         context: ssl.SSLContext | None = None,
         posture: HopPosture | None = None,
         ways_across: str | None = None,
+        attested_reason: str | None = None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -1641,6 +1671,7 @@ class RevocationHopGuard:
             blanket_attested=tls_revocation_attested(),
             crl_checked=context_checks_revocation(context),
             ways_across=ways_across,
+            attested_reason=attested_reason,
         )
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
@@ -1690,9 +1721,13 @@ class RevocationHopGuard:
         ):
             logger.warning(
                 "verified TLS hop crossed WITHOUT certificate revocation checking on operator "
-                "attestation — %s: %s",
+                "attestation — %s: %s (reason: %s)",
                 self.cell,
                 self._detail(),
+                # A proven terminator ALLOWs without any per-connection attestation, so say which.
+                (self.attested_reason or "(none provided)")
+                if self.attested
+                else "revocation proven by a declared egress terminator",
             )
         enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
 
@@ -1731,7 +1766,7 @@ class TrustAnchorPolicy:
 
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"
-    #: ``[tls].crl_file`` — a PEM CRL (or CA+CRL bundle) applied to the OUTBOUND hops this policy
+    #: ``[tls].crl_file``: a PEM file of CRLs applied to the OUTBOUND hops this policy
     #: reaches (BACKLOG #299). Independent of ``mode``: revocation is orthogonal to which roots anchor
     #: the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
     #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.

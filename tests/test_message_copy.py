@@ -103,7 +103,7 @@ def test_copy_is_not_parse_encode(monkeypatch: pytest.MonkeyPatch) -> None:
     rather than being re-parsed under the default one)."""
     src = _std()
 
-    def _boom(cls, raw):  # type: ignore[no-untyped-def]
+    def _boom(cls, raw):
         raise AssertionError("copy() must not call Message.parse")
 
     monkeypatch.setattr(Message, "parse", classmethod(_boom))

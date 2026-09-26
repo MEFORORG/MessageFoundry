@@ -31,14 +31,11 @@ from harness.acceptance.report import (
     write_xlsx_status,
 )
 from harness.acceptance.runner import run_matrix
+from messagefoundry.console_streams import harden_console_streams
 
 
 def main(argv: list[str] | None = None) -> int:
-    for _stream in (sys.stdout, sys.stderr):
-        try:  # noqa: SIM105 - suppress() would add an import to satisfy a pure style preference
-            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-        except (AttributeError, ValueError, OSError):
-            pass
+    harden_console_streams(encoding="utf-8")
 
     parser = argparse.ArgumentParser(
         prog="harness.acceptance",

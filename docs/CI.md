@@ -90,8 +90,11 @@ The same endpoint read the settings that decide a merge, on 2026-09-04:
 gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '{n: (.required_status_checks.contexts|length), strict: .required_status_checks.strict, enforce_admins: .enforce_admins.enabled, approvals: .required_pull_request_reviews.required_approving_review_count}'
 ```
 
-It returned `{"approvals":0,"enforce_admins":true,"n":13,"strict":true}`. `strict` and `enforce_admins`
-did not move; the review context is simply not among what is required.
+It returned `{"approvals":0,"enforce_admins":true,"strict":true}`, plus an `n` count of the required
+set. The count is left out here on purpose (BACKLOG #1870). A number copied into prose goes stale
+with nothing to flag it, and the first command above reads the live set. `strict` and
+`enforce_admins` did not move that day, and the review context is simply not among what is
+required. Those two values are readings from 2026-09-04.
 
 **Read what that leaves, because the two halves were always separate.** `required_approving_review_count`
 is 0 and stays 0 -- every session pushes as one GitHub identity, so a human-approval rule would wedge
@@ -120,7 +123,7 @@ day, and both files were deleted on 2026-09-13 (BACKLOG #1490).
 
 ### Consolidating the seven security contexts
 
-`security.yml` owns **two** of the eight required contexts — the two composites, since 2026-09-16.
+`security.yml` owns **two** of the required contexts — the two composites, since 2026-09-16.
 It owned **nine** of fifteen for two days before that, the seven original scan jobs included; the seven
 still exist and still run, and are simply no longer required. Each scan job is a separate job that
 acquires a separate runner slot. Five of the seven finish inside **55 seconds**, so seven

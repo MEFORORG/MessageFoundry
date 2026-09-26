@@ -47,6 +47,11 @@ Add a synchronous, handler-callable `db_lookup(connection, statement, params)` r
   so a value can never inject SQL. The engine builds one `DatabaseLookupExecutor` from the graph's
   declarations; pools open lazily, one per connection, autocommit (read-only).
 
+  > **CORRECTION 2026-09-25 (BACKLOG #1791). "autocommit (read-only)" is wrong: autocommit does not
+  > make the pool read-only.** The line above is kept as authored. Autocommit means a write that got
+  > past the statement gate would commit at once. The correction under *Scope* below says what does
+  > bound a lookup.
+
 - **Off the event loop, gated.** When the graph declares **≥1** `DatabaseLookup`, the transform worker
   runs the handler **in a worker thread** (`asyncio.to_thread`), which copies the run context (the
   ADR-0009 provider views *and* the active lookup runner) into the thread. `db_lookup` bridges the query
@@ -88,3 +93,14 @@ Add a synchronous, handler-callable `db_lookup(connection, statement, params)` r
 - **Scope:** transform-only for now (Handlers, not Routers); SQL Server backend only (production /
   supported, like the DATABASE connector). A read-only convention is by design — the executor neither commits nor exposes
   a write path. Extending `db_lookup` to Routers, or adding a dedicated lookup thread pool, are deferred.
+
+  > **CORRECTION 2026-09-25 (BACKLOG #1791). "the executor neither commits nor exposes a write path" is
+  > false.** The sentence above is kept as authored, because it records what was believed.
+  > `DatabaseLookupExecutor` opens each lookup pool with `autocommit=True`. A write that got past the
+  > statement gate would therefore commit. A crash-replay of the transform would then apply it again.
+  > The executor has no write method, yet it runs whatever statement the gate admits.
+  >
+  > What bounds a lookup is the privilege of the account it dials. The engine cannot set that
+  > privilege; the account is provisioned outside it. The `_require_read_only` statement gate and
+  > `ApplicationIntent=ReadOnly` are defence in depth only. The statement of record, with what each layer can and cannot do, is
+  > [`docs/CONNECTIONS.md`](../CONNECTIONS.md#give-db_lookup-a-read-only-login).

@@ -97,6 +97,9 @@ def mllp_cfg(
         type=ConnectorType.MLLP,
         settings=settings,
         tls_revocation_attested=revocation_attested,
+        tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
+        if revocation_attested
+        else None,
         **_hop_fields(attested, reason, accepted, accept_reason),
     )
 

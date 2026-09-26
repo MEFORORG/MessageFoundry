@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 import pytest
 
@@ -86,7 +87,8 @@ def _poller_over(
     poller = EnginePoller(
         ["http://shard-a", "http://shard-b", "http://shard-c"], None, origin=time.perf_counter()
     )
-    poller._clients = [_FakeClient(s) for s in per_shard_scripts]  # type: ignore[list-item]
+    fakes: list[Any] = [_FakeClient(s) for s in per_shard_scripts]  # duck-typed EngineClients
+    poller._clients = fakes
 
     def fake_sample_shard(client: object) -> _ShardSample | None:
         assert isinstance(client, _FakeClient)
