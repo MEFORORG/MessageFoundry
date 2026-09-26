@@ -9137,22 +9137,17 @@ class MessageStore:
             received_to,
         )
         async with self._read() as db:
-            cur = await db.execute(self._list_messages_sql(where), (*params, limit, offset))
+            cur = await db.execute(
+                "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
+                f" status, error, summary, metadata, {_LAST_EVENT_COLUMN}"
+                f" FROM messages{where}"
+                " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            )
             return [
                 self._decode_row(r, "messages", (r["id"],), "error", "summary", "metadata")
                 for r in await cur.fetchall()
             ]
-
-    @staticmethod
-    def _list_messages_sql(where: str) -> str:
-        """The page query :meth:`list_messages` runs, split out so a test can read its plan
-        (BACKLOG #1726). ``where`` comes from :meth:`_message_filter`; LIMIT and OFFSET are bound."""
-        return (
-            "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
-            f" status, error, summary, metadata, {_LAST_EVENT_COLUMN}"
-            f" FROM messages{where}"
-            " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?"
-        )
 
     async def count_messages(
         self,

@@ -15,8 +15,9 @@ No row is deleted and no figure changes meaning; retention is out of scope here.
 
 from __future__ import annotations
 
+import contextlib
 import random
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -148,14 +149,56 @@ async def _has_index(store: MessageStore) -> bool:
     return await cur.fetchone() is not None
 
 
+_FILTER_KEYS = (
+    "channel_id",
+    "status",
+    "message_type",
+    "control_id",
+    "allowed_channels",
+    "received_from",
+    "received_to",
+)
+_NO_FILTER: tuple[Any, ...] = (None,) * len(_FILTER_KEYS)
+
+
+async def _shipped_sql(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, f: tuple[Any, ...]
+) -> str:
+    """The SQL ``list_messages`` really executes for filter ``f``, read off its read connection.
+
+    Captured rather than rebuilt, so the plan and differential tests cannot drift from the method.
+    Its filter params are ``_message_filter(*f)``'s; LIMIT and OFFSET are the last two."""
+    seen: list[str] = []
+    real_read = store._read
+
+    class _Spy:
+        def __init__(self, db: Any) -> None:
+            self._db = db
+
+        async def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
+            seen.append(sql)
+            return await self._db.execute(sql, params)
+
+    @contextlib.asynccontextmanager
+    async def spy_read() -> AsyncIterator[_Spy]:
+        async with real_read() as db:
+            yield _Spy(db)
+
+    with monkeypatch.context() as m:
+        m.setattr(store, "_read", spy_read)
+        await store.list_messages(**dict(zip(_FILTER_KEYS, f, strict=True)), limit=1)
+    [sql] = seen
+    return sql
+
+
 # --- plan ------------------------------------------------------------------------------------------
 
 
 async def test_list_messages_page_one_walks_the_index_and_sorts_nothing(
-    store: MessageStore,
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await _seed(store, n=30)
-    plan = await _plan(store, MessageStore._list_messages_sql(""), (50, 0))
+    plan = await _plan(store, await _shipped_sql(store, monkeypatch, _NO_FILTER), (50, 0))
     # An index walk in ORDER BY order that stops at LIMIT; never a bare table scan.
     assert f"SCAN messages USING INDEX {_INDEX}" in plan, plan
     assert "SCAN messages" not in plan, plan
@@ -167,20 +210,25 @@ async def test_list_messages_page_one_walks_the_index_and_sorts_nothing(
     ), plan
 
 
-async def test_list_messages_date_filter_seeks_the_index(store: MessageStore) -> None:
+async def test_list_messages_date_filter_seeks_the_index(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
     await _seed(store, n=30)
-    where, params = MessageStore._message_filter(None, None, None, None, None, 105.0, 108.0)
-    plan = await _plan(store, MessageStore._list_messages_sql(where), (*params, 50, 0))
+    f = (None, None, None, None, None, 105.0, 108.0)
+    _, params = MessageStore._message_filter(*f)
+    plan = await _plan(store, await _shipped_sql(store, monkeypatch, f), (*params, 50, 0))
     assert any(line.startswith(f"SEARCH messages USING INDEX {_INDEX}") for line in plan), plan
     assert not any("TEMP B-TREE" in line for line in plan), plan
 
 
-async def test_the_old_plan_sorted_the_whole_table(store: MessageStore) -> None:
+async def test_the_old_plan_sorted_the_whole_table(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Control: without the index the same query scans messages and sorts it, so the plan test
     above is measuring the index and not a query that could never sort."""
     await _seed(store, n=30)
     await _drop_index(store)
-    plan = await _plan(store, MessageStore._list_messages_sql(""), (50, 0))
+    plan = await _plan(store, await _shipped_sql(store, monkeypatch, _NO_FILTER), (50, 0))
     assert "SCAN messages" in plan, plan
     assert any("TEMP B-TREE FOR ORDER BY" in line for line in plan), plan
 
@@ -206,26 +254,29 @@ _PAGES = ((50, 0), (50, 50), (7, 13), (500, 0), (50, 10_000))
 
 
 async def _every_page(
-    store: MessageStore, sql_for: Callable[[str], str]
+    store: MessageStore, sqls: Sequence[str]
 ) -> dict[tuple[int, int, int], list[tuple[Any, ...]]]:
-    """Every filter in _FILTERS times every page in _PAGES, keyed (filter no, limit, offset)."""
+    """Every filter in _FILTERS (``sqls[i]`` is filter i's SQL) times every page in _PAGES, keyed
+    (filter no, limit, offset)."""
     out: dict[tuple[int, int, int], list[tuple[Any, ...]]] = {}
     for f_no, f in enumerate(_FILTERS):
-        where, params = MessageStore._message_filter(*f)
+        _, params = MessageStore._message_filter(*f)
         for limit, offset in _PAGES:
-            out[(f_no, limit, offset)] = await _rows(
-                store, sql_for(where), (*params, limit, offset)
-            )
+            out[(f_no, limit, offset)] = await _rows(store, sqls[f_no], (*params, limit, offset))
     return out
 
 
-async def test_list_messages_old_and_new_return_the_same_rows(store: MessageStore) -> None:
+async def test_list_messages_old_and_new_return_the_same_rows(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Differential: the pre-#1726 world (old SQL, no index) against the new one (new SQL, index)
     on one store, for several filters and pages, including an offset past the end."""
     await _seed(store)
-    new = await _every_page(store, MessageStore._list_messages_sql)
+    new_sqls = [await _shipped_sql(store, monkeypatch, f) for f in _FILTERS]
+    new = await _every_page(store, new_sqls)
     await _drop_index(store)
-    old = await _every_page(store, lambda where: _OLD_LIST_SQL.format(where=where))
+    old_sqls = [_OLD_LIST_SQL.format(where=MessageStore._message_filter(*f)[0]) for f in _FILTERS]
+    old = await _every_page(store, old_sqls)
     assert old == new
     # The seed must exercise what the comparison is about, or equality proves nothing.
     everything = new[(0, 500, 0)]  # no filter, one page holding every row
