@@ -399,11 +399,13 @@ def test_an_env_var_naming_no_checkout_falls_through(env: Env) -> None:
 def test_a_relative_env_var_is_printed_absolute(env: Env) -> None:
     chosen = make_korus(env.base / "pinned")
     env.append(tools(MIN_TOOLS))
-    # The hook resolves a relative value against its own cwd. Run it from inside the temp tree
-    # rather than naming the checkout relative to the suite's cwd: a runner that checks out on D:
-    # with its temp dir on C: has no relative path between the two, and os.path.relpath raises.
-    rel = os.path.join("..", "pinned")
-    reason = blocked(env.run(env={"MEFOR_KORUS_CHECKOUT": rel}, cwd=env.repo))["reason"]
+    # Resolve-Korus calls GetFullPath with no Set-Location, so a relative value resolves against
+    # the hook PROCESS cwd. Run the hook from env.base, which is not the payload cwd (env.repo):
+    # resolving against the payload cwd would name primary/pinned, which does not exist.
+    # The value is relative to a cwd inside the temp tree, never to the suite's cwd: a runner that
+    # checks out on D: with its temp dir on C: has no relative path between the two.
+    reason = blocked(env.run(env={"MEFOR_KORUS_CHECKOUT": "pinned"}, cwd=env.base))["reason"]
+    assert f'"{chosen}/scripts/wiki/query.ps1"' in query_line(reason)
     assert f'"{chosen}/scripts/wiki/write.ps1"' in write_line(reason)
     assert "(from MEFOR_KORUS_CHECKOUT)" in reason
 
