@@ -1018,8 +1018,8 @@ row:
 | `approved` | The operation ran and returned | `approval.approved` |
 | `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
 | `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
-| `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolved` (against the resolver) |
-| `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolved` (against the resolver) |
+| `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
+| `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
@@ -1036,14 +1036,16 @@ the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resol
   the operation afresh, through dual control;
 - answers **409** for a row that is not `interrupted`, including one another operator resolved first;
 - writes `approval.resolve_attempted` against the resolver **before** the row moves, naming the
-  requester, the releasing approver, the outcome and the new status. If the audit log refuses it, the
-  resolve answers **503** and the row stays `interrupted`. After the move it writes
+  requester, the releasing approver, the outcome, the new status and the cut-off time. If the audit
+  log refuses it, the resolve answers **503** and the row stays `interrupted`. After the move it writes
   `approval.resolved` with the same detail; if only that later row fails, the error is logged and the
   resolve still succeeds, because the attempt row already records it. The row keeps the releasing
-  approver.
+  approver. One case the audit rows cannot settle alone: two resolvers race with the same outcome and
+  the winner's `approval.resolved` is lost. The logged error, which names the approval id, then says
+  who won.
 
-`GET /approvals` lists at most 100 `interrupted` rows, oldest first, so the rows that have waited
-longest are never the ones cut off.
+`GET /approvals` lists at most 100 `interrupted` rows, oldest request first, so the requests that
+have waited longest are never the ones cut off.
 
 A process that dies mid-operation leaves its row at
 `executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes

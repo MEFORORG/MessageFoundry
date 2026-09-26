@@ -372,6 +372,8 @@ async def _assert_interrupted_resolution_contract(store: Any) -> None:
             "approver": _APPROVER,
             "outcome": outcome,
             "status": status,
+            # The status write replaced decided_at, so the audit rows carry the cut-off time.
+            "interrupted_at": float(listed[0]["decided_at"]),
         }
         audited = await _resolved_rows(store, approval_id)
         assert len(audited) == 1
@@ -386,3 +388,53 @@ async def _assert_interrupted_resolution_contract(store: Any) -> None:
         # Resolving writes no second outcome row: the trail still says the release was cut off.
         actions = await _audit_actions(store, approval_id)
         assert actions == ["approval.interrupted"]
+
+    await _assert_interrupted_listing_is_oldest_first(store)
+
+
+async def _assert_interrupted_listing_is_oldest_first(store: Any) -> None:
+    """Interrupted rows never expire, so the capped listing is OLDEST request first: newest first
+    would hide the longest-waiting rows past the cap for good. Written straight through the store's
+    own transitions, with requested_at values chosen far apart."""
+    ids = {"older": "contractinterruptedolder00000001", "newer": "contractinterruptednewer00000001"}
+    for name, requested_at in (("newer", 20.0), ("older", 10.0)):  # inserted newest first
+        await store.create_pending_approval(
+            approval_id=ids[name],
+            operation="dead_letter_replay",
+            params="{}",
+            requester=_REQUESTER,
+            requester_user_id=_REQUESTER_ID,
+            requested_at=requested_at,
+            expires_at=None,
+        )
+        assert await store.decide_pending_approval(
+            ids[name], status="executing", approver=_APPROVER, decided_at=requested_at + 1.0
+        )
+        assert await store.decide_pending_approval(
+            ids[name],
+            status="interrupted",
+            approver=_APPROVER,
+            decided_at=requested_at + 2.0,
+            from_status="executing",
+        )
+    try:
+        order = [
+            str(r["id"])
+            for r in await store.list_interrupted_approvals(limit=_LIST_LIMIT)
+            if str(r["id"]) in ids.values()
+        ]
+        assert order == [ids["older"], ids["newer"]]
+        # And the cap keeps the oldest. The server legs share the table, so the one row a limit of
+        # 1 returns is at least as old as ours rather than necessarily ours.
+        first = await store.list_interrupted_approvals(limit=1)
+        assert len(first) == 1 and float(first[0]["requested_at"]) <= 10.0
+    finally:
+        # Leave no interrupted rows behind: they would sit at the head of this listing for good.
+        for approval_id in ids.values():
+            await store.decide_pending_approval(
+                approval_id,
+                status="resolved_not_applied",
+                approver=_APPROVER,
+                decided_at=3_000.0,
+                from_status="interrupted",
+            )

@@ -3497,8 +3497,9 @@ def create_app(
             raise HTTPException(503, "approval workflow is not available")
         pending = await gate.list_pending()
         interrupted = await gate.list_interrupted()
-        # Two reads, so a release cut off between them can appear in both. Its later status wins,
-        # and a row can only ever move from pending to interrupted, never back.
+        # Two reads, so a release cut off between them can appear in both. The interrupted read is
+        # the later one and a row never returns to pending, so that status wins. A row released and
+        # settled between the reads still shows as pending; approving it then answers 409.
         cut_off = {a["id"] for a in interrupted}
         rows = [a for a in pending if a["id"] not in cut_off] + interrupted
         return ApprovalList(approvals=[PendingApprovalInfo(**a) for a in rows])
@@ -3556,7 +3557,8 @@ def create_app(
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalResolveResult:
         """Record what an ``interrupted`` release did: ``effects_applied`` or ``effects_not_applied``
-        (BACKLOG #1562 part B). Audited as ``approval.resolved``; the operation is never re-run. The
+        (BACKLOG #1562 part B). Audited as ``approval.resolve_attempted`` before the row moves and
+        ``approval.resolved`` after; the operation is never re-run. The
         requester cannot resolve their own request, and a row not ``interrupted`` answers 409."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")

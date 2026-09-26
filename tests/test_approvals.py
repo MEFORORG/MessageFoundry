@@ -1126,6 +1126,9 @@ async def test_resolve_records_the_outcome_audits_it_and_never_runs(
     _gate, c = _app_client(engine, service, runs)
     async with c:
         approval_id = await _interrupted_row(engine, "op", op_id)
+        cut_off = await engine.store.get_pending_approval(approval_id)
+        assert cut_off is not None
+        interrupted_at = float(cut_off["decided_at"])
         admin = await _token(c, "resolver")
         r = await c.post(_resolve_url(approval_id), headers=admin, json={"outcome": outcome})
         assert r.status_code == 200, r.text
@@ -1153,7 +1156,11 @@ async def test_resolve_records_the_outcome_audits_it_and_never_runs(
         "approver": "releaser",
         "outcome": outcome,
         "status": status,
+        "interrupted_at": interrupted_at,
     }
+    # The row's decided_at is now the resolution time; the audit rows keep the cut-off time.
+    resolved_row = await engine.store.get_pending_approval(approval_id)
+    assert resolved_row is not None and float(resolved_row["decided_at"]) != interrupted_at
     for action in ("approval.resolve_attempted", "approval.resolved"):
         rows = await engine.store.list_audit(action=action)
         assert len(rows) == 1, action
@@ -1367,6 +1374,8 @@ async def test_a_failed_resolved_row_still_resolves_and_is_logged(
     assert any(
         r.levelno == logging.ERROR
         and approval_id in r.getMessage()
+        # Names the resolver: in a same-outcome race this line is what says who won.
+        and "resolver a moved the row" in r.getMessage()
         and "approval.resolved audit row failed" in r.getMessage()
         for r in caplog.records
     )

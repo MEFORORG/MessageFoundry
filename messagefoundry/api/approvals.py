@@ -919,7 +919,12 @@ class ApprovalGate:
         dies between the status write and ``approval.resolved``. That later row failing is logged at
         ERROR and the resolve still succeeds, because the row has already moved. A resolver who
         loses a race to another leaves an attempted row with no ``approval.resolved`` after it; the
-        row's status says what won.
+        row's status says what won. One case the trail cannot settle alone: two resolvers race with
+        the SAME outcome and the winner's ``approval.resolved`` is lost. Two matching attempt rows
+        then remain, and the ERROR log line, which names the approval id, is what says which won.
+
+        The status write replaces ``decided_at``, so both audit rows carry the cut-off time as
+        ``interrupted_at``.
 
         The status write and ``approval.resolved`` run shielded, so a cancel cannot split them."""
         status = RESOLVE_OUTCOMES.get(outcome)
@@ -953,6 +958,7 @@ class ApprovalGate:
                 "approver": releaser,
                 "outcome": outcome,
                 "status": status,
+                "interrupted_at": (None if row["decided_at"] is None else float(row["decided_at"])),
             }
         )
         try:
@@ -1025,9 +1031,11 @@ class ApprovalGate:
             )
         except Exception:  # noqa: BLE001 - the row has moved; approval.resolve_attempted records it
             log.exception(
-                "approval %s: the row moved to '%s', but its approval.resolved audit row failed; "
-                "the approval.resolve_attempted row still records the resolution. Lost detail: %s",
+                "approval %s: resolver %s moved the row to '%s', but its approval.resolved audit "
+                "row failed; the approval.resolve_attempted row still records the resolution. "
+                "Lost detail: %s",
                 approval_id,
+                resolver,
                 status,
                 detail,
             )
