@@ -106,10 +106,47 @@ def handle(msg):
 """
 
 
-def _write_config(tmp_path: Path, *, clean: bool = False) -> Path:
+#: ADR 0173's attestation, authored in BOTH directions: an mTLS listener (a CA is loaded, so client
+#: certificates are required) and a verifying https outbound. Cert paths are never opened by the
+#: checks asserted here. `IB_PLAIN` and `OB_PLAIN` are the same shapes left unattested, so a check
+#: that listed every TLS connection would fail the assertions below as surely as one that listed none.
+_ATTESTED_MODULE = """
+from messagefoundry import MLLP, Rest, Send, handler, inbound, outbound, router
+
+_MTLS = dict(tls=True, tls_cert_file="c.pem", tls_key_file="k.pem", tls_ca_file="ca.pem")
+inbound("IB_PLAIN", MLLP(port=15098, **_MTLS), router="r")
+inbound(
+    "IB_MTLS",
+    MLLP(port=15099, **_MTLS),
+    router="r",
+    tls_revocation_attested=True,
+    tls_revocation_attested_reason="site CA publishes a CRL the edge enforces",
+)
+outbound("OB_PLAIN", Rest(url="https://plain.example.invalid/ingest"))
+outbound(
+    "OB_ATTESTED",
+    Rest(url="https://partner.example.invalid/ingest"),
+    tls_revocation_attested=True,
+    tls_revocation_attested_reason="partner PKI runs OCSP at the edge",
+)
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def handle(msg):
+    return Send("OB_ATTESTED", msg)
+"""
+
+
+def _write_config(tmp_path: Path, *, clean: bool = False, module: str | None = None) -> Path:
     cfg = tmp_path / "config"
     cfg.mkdir()
-    (cfg / "feed.py").write_text(_CLEAN_MODULE if clean else _CONFIG_MODULE, encoding="utf-8")
+    body = module if module is not None else (_CLEAN_MODULE if clean else _CONFIG_MODULE)
+    (cfg / "feed.py").write_text(body, encoding="utf-8")
     (tmp_path / "messagefoundry.toml").write_text(_TOML, encoding="utf-8")
     return cfg
 
@@ -144,6 +181,20 @@ def test_check_surfaces_the_generic_db_hops_in_both_directions(tmp_path: Path) -
     assert "inbound:IB_PG_ORDERS" in r.detail and "SSLmode=disable" in r.detail
 
 
+def test_check_surfaces_the_revocation_attested_set_in_both_directions(tmp_path: Path) -> None:
+    """ADR 0173. The attestation suppresses a posture-keyed revocation refusal, and its only report was
+    a WARNING at construction. `check` runs at commit/CI time and names the whole set, with reasons."""
+    from messagefoundry.checks import run_checks
+
+    report = run_checks(_write_config(tmp_path, module=_ATTESTED_MODULE), run_lint=False)
+    r = _result(report, "tls-revocation-attested")
+    assert r.ok and not r.required and not r.skipped
+    assert "2 connection(s)" in r.detail
+    assert "OB_ATTESTED (partner PKI runs OCSP at the edge)" in r.detail
+    assert "inbound:IB_MTLS (site CA publishes a CRL the edge enforces)" in r.detail
+    assert "PLAIN" not in r.detail
+
+
 def test_check_says_none_explicitly_when_there_is_nothing_to_report(tmp_path: Path) -> None:
     """The negative control, and it must SAY "none" rather than go quiet: an absent line is
     indistinguishable from a check that did not run, which is how a green gate stops being evidence."""
@@ -154,6 +205,10 @@ def test_check_says_none_explicitly_when_there_is_nothing_to_report(tmp_path: Pa
     assert (
         "no generic-ODBC DATABASE connection leaves TLS unenforced"
         in _result(report, "generic-db-tls").detail
+    )
+    assert (
+        "no connection declares tls_revocation_attested"
+        in _result(report, "tls-revocation-attested").detail
     )
 
 
@@ -166,7 +221,7 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
     cfg.mkdir()
     (cfg / "feed.py").write_text("this is not python(", encoding="utf-8")
     report = run_checks(cfg, run_lint=False)
-    for name in ("tls-allow-expired", "generic-db-tls"):
+    for name in ("tls-allow-expired", "generic-db-tls", "tls-revocation-attested"):
         r = _result(report, name)
         assert r.skipped and r.ok and "config did not load" in r.detail
 
@@ -203,6 +258,7 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
         ConnectionSpec,
         Database,
         Registry,
+        build_inbound_connection,
         build_outbound_connection,
     )
 
@@ -231,20 +287,52 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
             ),
         )
     )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ATTESTED",
+            ConnectionSpec(
+                type=ConnectorType.REST,
+                settings={"url": "https://partner.example.invalid/ingest"},
+            ),
+            tls_revocation_attested=True,
+            tls_revocation_attested_reason="partner PKI runs OCSP at the edge",
+        )
+    )
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_MTLS",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={
+                    "port": 15099,
+                    "tls": True,
+                    "tls_cert_file": "c.pem",
+                    "tls_key_file": "k.pem",
+                    "tls_ca_file": "ca.pem",
+                },
+            ),
+            router="r",
+            tls_revocation_attested=True,
+            tls_revocation_attested_reason="site CA publishes a CRL the edge enforces",
+        )
+    )
     engine.add_registry(reg)
     switches = {e["switch"]: e["risk"] for e in _loosenings(await _posture(engine))}
     assert "OB_BRIDGE" in switches["tls_allow_expired"]
     assert "OB_PG_RESULTS" in switches["generic_odbc_tls_unenforced"]
+    assert "OB_ATTESTED" in switches["tls_revocation_attested"]
+    assert "inbound:IB_MTLS" in switches["tls_revocation_attested"]
 
 
-async def test_posture_route_scope_names_all_three_connection_deviations(engine: Engine) -> None:
-    """With no graph the route cannot see ANY per-connection declaration, and the marker must name all
-    three. Naming only ``cleartext_accepted`` made the DECLARED scope itself incomplete — the same
+async def test_posture_route_scope_names_every_connection_deviation(engine: Engine) -> None:
+    """With no graph the route cannot see ANY per-connection declaration, and the marker must name
+    each of them. Naming only ``cleartext_accepted`` made the DECLARED scope itself incomplete — the same
     defect one level up from the one this item fixes."""
     scope = str((await _posture(engine))["loosenings_scope"])
     assert "cleartext_accepted" in scope
     assert "tls_allow_expired" in scope
     assert "DATABASE" in scope
+    assert "tls_revocation_attested" in scope
 
 
 def _loosenings(body: dict[str, object]) -> list[dict[str, str]]:
