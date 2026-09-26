@@ -94,6 +94,12 @@ LEAVE_SEEN_CACHE_MAX = 100_000
 # the decompressed output also bounds post-split expansion. A falsy value (None/0) disables the cap.
 DEFAULT_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024  # 64 MiB
 
+# How long FileSource.stop() waits for the poll task before it gives up on a blocked share call
+# (BACKLOG #1620). A dead SMB/UNC share blocks each call for the OS redirector's timeout, tens of
+# seconds, and nothing engine-side can interrupt the thread. Matches the credential context's own
+# drain bound (wincred._CLOSE_DRAIN_TIMEOUT_S), the other "give up on a wedged share" arm.
+_STOP_GRACE_S = 5.0
+
 # Compression algorithms the FILE connector supports on its compress=/decompress= option. The connector
 # is restricted to single-stream gzip (ADR 0123); multi-entry zip / raw deflate stay Handler-composed
 # via messagefoundry.parsing.compression.
@@ -468,6 +474,10 @@ class FileSource(SourceConnector):
         self._skipping = False  # whether the last tick was gated out (for a single transition log)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        # True while the poll task is inside a pipeline hand-off, which stop() never cancels, and when
+        # the last one ended, so stop() gives the task a full grace after it (#1620).
+        self._handing_off = False
+        self._handoff_ended = 0.0
         # Alternate Windows/UNC credential (ADR 0132, #111). None (the default) => the ambient
         # service-account identity, byte-identical. On a non-Windows host a configured credential
         # raises CredentialUnsupportedError here (a build error), never a silent no-op.
@@ -581,13 +591,55 @@ class FileSource(SourceConnector):
         return False
 
     async def stop(self) -> None:
+        """Stop polling, bounded even when a share call is blocked (BACKLOG #1620).
+
+        The poll task sees the stop signal between files and between a batch file's hand-offs, so in
+        the ordinary case it returns at once. What it cannot do is leave a share call early: every
+        list, stat, read and move runs on a thread, and a dead SMB/UNC share holds that thread for the
+        OS timeout. So after :data:`_STOP_GRACE_S` the task is cancelled and the abandonment is logged.
+        The thread finishes on its own; nothing waits for it.
+
+        **A pipeline hand-off is never cancelled.** While the task is inside one, stop() keeps waiting
+        in grace-sized steps, as it did before this bound existed: the hand-off is the durable store
+        commit, and cutting it would leave the message's fate to the store's cancellation handling.
+        Cancelling anywhere else is safe for count-and-log: a file is moved only after every one of
+        its messages is handed off, so an interrupted file is re-read whole on the next start
+        (at-least-once, the same shape as a failed hand-off). The grace restarts when a hand-off
+        ends, so the task always gets a full one to reach its next stop check before it is cut."""
         self._stop.set()
-        if self._task is not None:
+        task, self._task = self._task, None
+        if task is not None:
+            deadline = time.monotonic() + _STOP_GRACE_S
+            try:
+                while True:
+                    timeout = max(0.0, deadline - time.monotonic())
+                    done, _pending = await asyncio.wait({task}, timeout=timeout)
+                    if done:
+                        break
+                    if self._handing_off:
+                        # A hand-off is finishing its commit: never cut it; look again in a grace.
+                        deadline = time.monotonic() + _STOP_GRACE_S
+                        continue
+                    deadline = max(deadline, self._handoff_ended + _STOP_GRACE_S)
+                    if time.monotonic() < deadline:
+                        continue
+                    task.cancel()
+                    logger.warning(
+                        "file source %s: the poll task did not stop within %.1fs, most likely a share "
+                        "call blocked on an unreachable directory; cancelled it. The blocked call "
+                        "finishes on its own thread, and any file it was working on is left in place "
+                        "and re-read on the next start.",
+                        self.directory,
+                        _STOP_GRACE_S,
+                    )
+                    break
+            except asyncio.CancelledError:
+                task.cancel()  # our caller gave up on this stop; do not leave the poll task running
+                raise
             # return_exceptions: a faulted poll task must not re-raise here — stop() runs during
             # reload quiesce, outside its rollback (review H-4). _run already guards scans; this is
-            # the belt-and-suspenders.
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
+            # the belt-and-suspenders. It also collects the cancellation from the arm above.
+            await asyncio.gather(task, return_exceptions=True)
         # Release the alternate-credential context (worker thread + any token) AFTER the poll task has
         # quiesced, so no identity leaks across a stop/reload. No-op when no credential is configured.
         if self._cred_ctx is not None:
@@ -722,8 +774,9 @@ class FileSource(SourceConnector):
                     safe_exc(exc, file_name=path.name),
                 )
                 continue
+            self._handing_off = True
             try:
-                await self._emit(raw)
+                completed = await self._emit(raw)
             except Exception as exc:
                 # The handler records every message-level outcome (parse/validation/routing → ERROR)
                 # itself and returns, so an exception escaping here is an infrastructure failure: the
@@ -743,6 +796,19 @@ class FileSource(SourceConnector):
                     safe_exc(exc, file_name=path.name),
                 )
                 continue
+            finally:
+                self._handing_off = False
+                self._handoff_ended = time.monotonic()
+            if not completed:
+                # Stopped between a batch file's hand-offs (#1620). The file stays put, so the next
+                # start re-reads it whole and re-emits every message (at-least-once, no dropped tail).
+                logger.info(
+                    "file source %s: stopping mid-batch; %s left in place to be re-read on the next "
+                    "start",
+                    self.directory,
+                    safe_name(path.name),
+                )
+                break
             await self._run_fs(self._after_processing, path, read_sig)
             disposed += 1
             if self.after_read == "leave" and file_key is not None:
@@ -840,8 +906,10 @@ class FileSource(SourceConnector):
         if self.processed_ledger is not None:
             await self.processed_ledger.mark_processed(file_key)
 
-    async def _emit(self, raw: bytes) -> None:
-        """Hand every HL7 message in ``raw`` to the pipeline handler, in file order (FIFO).
+    async def _emit(self, raw: bytes) -> bool:
+        """Hand every HL7 message in ``raw`` to the pipeline handler, in file order (FIFO). Returns
+        ``False`` when a stop arrived between a batch's hand-offs and the rest were not handed off
+        (BACKLOG #1620): the caller then leaves the file in place, so the next start re-emits it whole.
 
         **Non-hl7v2 ingress** (ADR 0004): when the inbound declares a non-HL7 ``content_type``
         (binary/x12/dicom/text/json) the raw file bytes are handed off **verbatim** with no batch
@@ -876,7 +944,7 @@ class FileSource(SourceConnector):
             # Non-hl7v2: hand the file's RAW BYTES off verbatim — no text-decode, no HL7 batch split
             # (see the docstring). A binary payload's exact bytes survive to RawMessage.from_bytes.
             await self._handler(raw)
-            return
+            return True
         try:
             text = raw.decode(self.encoding)
         except (UnicodeDecodeError, LookupError):
@@ -884,7 +952,7 @@ class FileSource(SourceConnector):
             # boundaries, so hand the raw bytes off unchanged — the pipeline's strict-decode then
             # records ERROR for it, exactly as in the pre-split single-hand-off path. Never a drop.
             await self._handler(raw)
-            return
+            return True
         messages = split_batch(
             text
         )  # str in → no UTF-8 re-decode (normalize only fixes line endings)
@@ -892,11 +960,14 @@ class FileSource(SourceConnector):
             # Fast path / strict back-compat: a lone message is handed off verbatim (its original
             # bytes), so a non-batch file behaves byte-for-byte as before the split was introduced.
             await self._handler(raw)
-            return
-        for message in messages:
+            return True
+        for index, message in enumerate(messages):
+            if index and self._stop.is_set():
+                return False  # stopping: the rest are re-emitted with the whole file next start
             # FIFO per connection: emit in file order, awaiting each so a slow/failing hand-off
             # back-pressures the rest (and a failure stops the file from being moved — see above).
             await self._handler(message.encode(self.encoding))
+        return True
 
     def _candidates(self) -> list[Path]:
         """Files ready to process, honoring recursion, min-age, and sort order.

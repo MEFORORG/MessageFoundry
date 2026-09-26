@@ -76,13 +76,11 @@ _LOGON32_PROVIDER_WINNT50 = 3
 #: called with a delivery in flight, so the drain runs and a wedged share can no longer make that
 #: teardown wait on it.
 #:
-#: IT DOES NOT COVER AN INBOUND SOURCE, AND AN INBOUND SOURCE'S STOP IS STILL UNBOUNDED.
-#: ``FileSource.stop`` awaits ``asyncio.gather(self._task, ...)`` with no cancel and no timeout
-#: (``file.py:520``) and only reaches ``close`` afterwards (``:525``). The poll task is inside
-#: ``_run_fs``, which is this context's ``run``, so on a wedged share that gather never returns,
-#: ``close`` is never reached, and ``_inflight`` is therefore always zero by the time it is. The
-#: drain below and its warning are UNREACHABLE on that path. Making them reachable means
-#: cancelling the poll task or bounding the gather, which is a behaviour change and not this one.
+#: ON AN INBOUND SOURCE IT IS NOW REACHABLE TOO (BACKLOG #1620). ``FileSource.stop`` waits for its
+#: poll task for ``file._STOP_GRACE_S``, then cancels it and reaches ``close`` with the wedged share
+#: call still in flight on this worker. The drain below then waits its own bound and logs, so a
+#: source's stop against a dead share costs at most the two bounds together. It used to await the
+#: poll task with no timeout and never reach ``close`` at all, which left this drain unreachable.
 #:
 #: See :meth:`CredentialContext.close` for why the wait cannot simply be blocking.
 _CLOSE_DRAIN_TIMEOUT_S = 5.0
