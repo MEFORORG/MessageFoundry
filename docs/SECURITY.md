@@ -327,9 +327,9 @@ apply. What each **adds** over plain `require()`:
 The one WebSocket route, `/ws/stats`, runs up to two gates in turn, all **before** `accept()`:
 
 1. **`authorize_ui_ws`, when the web console is mounted.** It takes only a browser handshake whose
-   `Origin` matches ours. With `[security].web_console_public_address` set, that is an exact match,
-   scheme included. Unset, it compares host and port with the `Host` header and ignores the scheme.
-   It then reads the session cookie and checks the must-change lockout, the second factor, the
+   `Origin` matches ours. With `[security].web_console_public_address` set, scheme, host and port must
+   all match, ignoring case. Unset, it compares host and port with the `Host` header and ignores the
+   scheme. It then reads the session cookie and checks the must-change lockout, the second factor, the
    notification address and the permission.
 2. **`authorize_ws`, when step 1 yields no identity or the console is not mounted.** It checks any
    `Origin` against `[api].ws_allowed_origins`, whose default `[]` refuses every browser. Then it
