@@ -427,6 +427,38 @@ def _kill_next_claims(
     return fired
 
 
+_HOLD_DELAY = 0.37  # a sleep length no other sleep in the dispatcher uses
+
+
+class _Hold:
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()  # the test sets this to let the held claimer go on
+        self.reached = asyncio.Event()  # set when the claimer parks, proving the hold engaged
+
+
+def _hold_respawn_backoff(dispatcher: Any, monkeypatch: pytest.MonkeyPatch) -> _Hold:
+    """Park a respawned claimer in its opening backoff sleep of ``_HOLD_DELAY`` seconds, which runs
+    before it releases or claims anything, until the test sets ``gate``.
+
+    A test waits on ``reached`` before relying on the hold: if the dispatcher ever stops sleeping
+    exactly ``_HOLD_DELAY`` there, the hold would silently fall through to a real sleep, and the
+    wait turns that into a failure. The park still returns on a dispatcher stop, as
+    ``_sleep_or_stop`` does."""
+    hold = _Hold()
+    real_sleep = dispatcher._sleep_or_stop
+
+    async def held_sleep(seconds: float) -> None:
+        if seconds != _HOLD_DELAY:
+            await real_sleep(seconds)
+            return
+        hold.reached.set()
+        while not hold.gate.is_set() and not dispatcher._stop.is_set():
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(dispatcher, "_sleep_or_stop", held_sleep)
+    return hold
+
+
 async def test_pooled_dead_ingress_claimer_is_respawned_and_its_stage_drains(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -438,6 +470,21 @@ async def test_pooled_dead_ingress_claimer_is_respawned_and_its_stage_drains(
         dispatcher = runner._dispatchers[Stage.INGRESS]
         first = dispatcher._claimers[0].task
         assert first is not None and not first.done()
+
+        # The order assertion below only means something if M1609B is already PENDING on the lane
+        # while M1609A sits stranded in flight. The first respawn is immediate, so hold the
+        # replacement at its very top (before it releases OR claims anything) until M1609B is
+        # pending. The supervisor's own delay is recorded, so the immediate respawn stays pinned;
+        # the zero-delay replacement itself runs end to end in the mid-chunk unit test below.
+        requested: list[float] = []
+        real_spawn = dispatcher._spawn_task
+
+        def held_spawn(index: int | None, *, delay: float = 0.0) -> None:
+            requested.append(delay)
+            real_spawn(index, delay=_HOLD_DELAY)
+
+        monkeypatch.setattr(dispatcher, "_spawn_task", held_spawn)
+        hold = _hold_respawn_backoff(dispatcher, monkeypatch)
         fired = _kill_next_claims(dispatcher, monkeypatch, times=1)
 
         ib = runner.registry.inbound["IB"]
@@ -452,17 +499,24 @@ async def test_pooled_dead_ingress_claimer_is_respawned_and_its_stage_drains(
 
         await _until(_replaced, timeout=5.0)
         assert "exited unexpectedly; respawning" in caplog.text
+        assert requested == [0.0]  # a first death respawns at once; only the test holds it
+        await asyncio.wait_for(hold.reached.wait(), timeout=5.0)
 
         # A message enqueued AFTER the death reaches its outbound, and so does the one whose claim
         # killed the claimer: its INFLIGHT row was released, not stranded until a restart.
-        await runner._handle_inbound(ib, _hl7("M1609B"))
+        await runner._handle_inbound(ib, _hl7("M1609B"))  # returns once its ingress row commits
+        # The premise the order assertion needs: A still stranded in flight, B pending behind it.
+        assert await _inflight_rows(store) == 1
+        assert await _pending_at(store, Stage.INGRESS) == 1
+        assert collector.deliveries == []  # nothing has moved past the dead claimer yet
+        hold.gate.set()
 
         async def _both_delivered() -> bool:
             return await _delivered_count(store) >= 2
 
         await _until_async(_both_delivered, timeout=10.0)
         # In ORDER: had the replacement claimed before releasing, M1609B would overtake M1609A.
-        assert [p.split("|")[9] for p in collector.deliveries] == ["M1609A", "M1609B"]
+        assert _control_ids(collector) == ["M1609A", "M1609B"]
         assert await _inflight_rows(store) == 0
         assert runner.degraded_stages() == {}  # recovered, so nothing is reported degraded
     finally:
@@ -914,28 +968,19 @@ async def test_a_dead_pooled_claimer_at_a_later_stage_is_respawned_and_delivers_
     this stage. A replacement that claimed before releasing P1 would take P2 first."""
     from messagefoundry.pipeline import stage_dispatcher
 
-    gate_delay = 0.37  # a value no other sleep in the dispatcher uses
-    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_BACKOFF_BASE_SECONDS", gate_delay)
+    monkeypatch.setattr(stage_dispatcher, "_RESPAWN_BACKOFF_BASE_SECONDS", _HOLD_DELAY)
     store, runner, collector = await _start_runner(tmp_path, "pooled")
     try:
         dispatcher = runner._dispatchers[stage]
         first = dispatcher._claimers[0].task
         assert first is not None and not first.done()
-        gate = asyncio.Event()
-        real_sleep = dispatcher._sleep_or_stop
-
-        async def gated_sleep(seconds: float) -> None:
-            if seconds == gate_delay:
-                await gate.wait()
-                return
-            await real_sleep(seconds)
-
-        monkeypatch.setattr(dispatcher, "_sleep_or_stop", gated_sleep)
+        hold = _hold_respawn_backoff(dispatcher, monkeypatch)
         fired = _kill_next_claims(dispatcher, monkeypatch, times=2)
         ib = runner.registry.inbound["IB"]
         await runner._handle_inbound(ib, _hl7("M1614P1"))
         await _until(lambda: fired["n"] == 2 and dispatcher.respawns == 2, timeout=5.0)
         assert first.done() and isinstance(first.exception(), RuntimeError)
+        await asyncio.wait_for(hold.reached.wait(), timeout=5.0)
 
         await runner._handle_inbound(ib, _hl7("M1614P2"))
 
@@ -943,8 +988,10 @@ async def test_a_dead_pooled_claimer_at_a_later_stage_is_respawned_and_delivers_
             return await _pending_at(store, stage) >= 1
 
         await _until_async(_p2_waiting, timeout=5.0)
+        # The premise the order assertion needs: P1 still stranded in flight, P2 pending behind it.
+        assert await _inflight_rows(store) == 1
         assert collector.deliveries == []  # nothing has moved past the dead claimer yet
-        gate.set()
+        hold.gate.set()
 
         await _until_delivered(store, 2)
         assert _control_ids(collector) == ["M1614P1", "M1614P2"]
