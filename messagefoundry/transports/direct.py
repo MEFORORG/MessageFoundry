@@ -74,6 +74,7 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    NegativeAckError,
     encode_wire_body,
     register_destination,
 )
@@ -585,8 +586,11 @@ class DirectDestination(DestinationConnector):
 
     def _send(self, payload: str) -> None:
         # PHI/secret-safe error text: the host + failure class only, never the body, the recipients'
-        # PHI, or the password. Crypto failures (a key/cert problem that slipped past construction) map
-        # to a non-transient DeliveryError so the message dead-letters rather than spinning on retry.
+        # PHI, or the password. A build failure (a key/cert problem that slipped past construction) is
+        # deterministic, so it is a PERMANENT NegativeAckError: the delivery worker dead-letters it on
+        # the first attempt. A plain DeliveryError is the transient class and would be retried to the
+        # attempt ceiling for a message that can never build (BACKLOG #1919). An un-encodable body is
+        # already permanent: encode_wire_body raises it, and this arm does not catch it.
         #
         # The raise sits OUTSIDE the handler on purpose (BACKLOG #1920): `from exc` would chain the
         # build error as `__cause__`, and `from None` would still leave it on `__context__`. Only the
@@ -598,7 +602,11 @@ class DirectDestination(DestinationConnector):
         except (ValueError, TypeError) as exc:
             failure = type(exc).__name__
         if msg is None:
-            raise DeliveryError(f"Direct {self.host}:{self.port} S/MIME encode failed: {failure}")
+            raise NegativeAckError(
+                f"Direct {self.host}:{self.port} S/MIME build failed: {failure} (no retry)",
+                code="smime-build",
+                permanent=True,
+            )
         try:
             with self._connect() as smtp:
                 if self.username is not None:

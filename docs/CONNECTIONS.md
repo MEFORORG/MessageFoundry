@@ -1842,9 +1842,11 @@ hostname/SAN match is done: a Direct address is an email, not a TLS SNI. Errors 
 never the material or a cert subject (which can identify a patient's provider).
 
 **Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
-`allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. Both an SMTP
-failure and an S/MIME **encode** failure raise `DeliveryError`, so the lane **retries** per its
-`RetryPolicy`. Delivery is **at-least-once** and a Direct mailbox has no idempotency key, so a rare duplicate
+`allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. An SMTP
+failure raises `DeliveryError`, so the lane **retries** per its `RetryPolicy`. A message that cannot be
+**built** (a body the `encoding` cannot represent, or a crypto failure while signing or encrypting) raises a
+**permanent** `NegativeAckError` and dead-letters on the first attempt, because a retry would fail the same
+way. Its error names the failure class, or the codec and character position, and never the body. Delivery is **at-least-once** and a Direct mailbox has no idempotency key, so a rare duplicate
 is possible and **accepted by design** (a duplicate beats a drop), exactly as with `Email(...)`.
 `test_connection` does connect / STARTTLS / EHLO / optional login / NOOP — never `MAIL FROM` or `DATA`.
 

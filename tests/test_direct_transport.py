@@ -45,7 +45,7 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.direct import DirectDestination
 
 # A synthetic (never-real-PHI) HL7 body for the crypto round-trip (CLAUDE.md §9).
@@ -429,6 +429,43 @@ async def test_encode_failure_leaves_no_exception_chain(
     assert "\\xd1" not in rendered and "Ñ" not in rendered  # the offending character
     assert "ascii" in rendered  # still actionable: names the codec
     assert _FakeSMTP.instances == []  # nothing dialled for a message that never built
+
+
+# BACKLOG #1919. A message that cannot be BUILT will not build on a retry either, so it must reach
+# the delivery worker as a permanent NegativeAckError, which it dead-letters on the first attempt. A
+# plain DeliveryError is the transient class: the worker retries it up to the attempt ceiling.
+
+
+async def test_encode_failure_is_permanent(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki, encoding="ascii"))
+    with pytest.raises(NegativeAckError) as ei:
+        await d.send(_UNENCODABLE_HL7)
+    assert ei.value.permanent is True
+    assert ei.value.credential_fault is False  # a bad message, not a bad credential
+
+
+async def test_crypto_build_failure_is_permanent_and_content_free(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    # A real library failure, not a stub: an EC recipient cert reaching the envelope builder raises
+    # `TypeError: Only RSA keys are supported at this time` on the pinned cryptography. Construction
+    # now refuses that cert (#1918), so it is swapped in afterwards -- the "slipped past construction"
+    # case the send-time arm exists for.
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki))
+    _, ec_cert = _mint_ec_leaf("ec-recipient@hisp.example", pki["ca_key"], pki["ca_cert"])
+    d._recipient_cert = ec_cert
+    with pytest.raises(NegativeAckError) as ei:
+        await d.send(_SYNTHETIC_HL7)
+    exc = ei.value
+    assert exc.permanent is True
+    assert exc.credential_fault is False
+    assert "TypeError" in str(exc)
+    assert exc.__cause__ is None and exc.__context__ is None  # the #1920 shape holds here too
+    assert _FakeSMTP.instances == []
 
 
 # --- test_connection probe: connect + EHLO + NOOP only, no MAIL FROM / DATA --------------------------
