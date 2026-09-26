@@ -250,6 +250,21 @@ class DicomScpSource(SourceConnector):
         self._max_object_bytes: int = min(
             configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
         )
+        # BACKLOG #1962: say so when an operator's own number is clamped. The shipped default is
+        # exempt: the factory always passes it, so it cannot be told from an explicit setting, and a
+        # warning on every default SCP would be noise that teaches operators to ignore this one.
+        if (
+            configured is not None
+            and configured > self._max_object_bytes
+            and configured != DEFAULT_MAX_OBJECT_BYTES
+        ):
+            logger.warning(
+                "DICOM SCP %r: max_object_bytes %d is above the engine's binary ingress ceiling of "
+                "%d bytes; the SCP refuses any larger object",
+                config.name or "",
+                configured,
+                self._max_object_bytes,
+            )
         # The deflate guard keeps the CONFIGURED value. The ingress ceiling above measures the
         # re-encoded bytes, which stay deflated, so it says nothing about how far they inflate;
         # this bound is a memory bound on the pre-decode inflate and #1910 does not move it.

@@ -14,6 +14,7 @@ are read from the same send. Each pins both halves together, never one alone."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from io import BytesIO
 from pathlib import Path
 
@@ -22,7 +23,7 @@ import pytest
 pytest.importorskip("pydicom", reason="DICOM SCP tests need the [dicom] extra")
 pytest.importorskip("pynetdicom", reason="DICOM SCP tests need the [dicom] extra")
 
-from messagefoundry.config.models import ContentType  # noqa: E402
+from messagefoundry.config.models import ConnectorType, ContentType, Source  # noqa: E402
 from messagefoundry.config.wiring import DICOM, Registry, build_inbound_connection  # noqa: E402
 from messagefoundry.pipeline import wiring_runner  # noqa: E402
 from messagefoundry.pipeline.wiring_runner import RegistryRunner  # noqa: E402
@@ -155,29 +156,58 @@ async def test_a_committed_object_still_answers_success(store: MessageStore) -> 
     assert rows[0]["status"] != MessageStatus.ERROR.value
 
 
-@pytest.mark.parametrize("configured", [128 * _MIB, None, 0])
-def test_the_scp_cap_never_exceeds_the_engine_ingress_ceiling(configured: int | None) -> None:
-    """The shipped 128 MiB default, and an uncapped SCP, both resolve to the engine's binary ingress
-    ceiling. An object above it could only ever be recorded ERROR, so the SCP must not accept one."""
-    from messagefoundry.config.models import ConnectorType, Source
-
-    settings: dict[str, object] = {"ae_title": _SCP_AE, "host": "127.0.0.1", "port": 0}
-    settings["max_object_bytes"] = configured
-    scp = DicomScpSource(Source(type=ConnectorType.DIMSE, settings=settings))
-    assert scp._max_object_bytes == wiring_runner._INGRESS_MAX_BYTES
-
-
-def test_a_cap_below_the_ceiling_is_kept() -> None:
-    from messagefoundry.config.models import ConnectorType, Source
-
+def _scp(max_object_bytes: int | None, name: str | None = None) -> DicomScpSource:
     settings: dict[str, object] = {
         "ae_title": _SCP_AE,
         "host": "127.0.0.1",
         "port": 0,
-        "max_object_bytes": _MIB,
+        "max_object_bytes": max_object_bytes,
     }
-    scp = DicomScpSource(Source(type=ConnectorType.DIMSE, settings=settings))
-    assert scp._max_object_bytes == _MIB
+    return DicomScpSource(Source(type=ConnectorType.DIMSE, name=name, settings=settings))
+
+
+@pytest.mark.parametrize("configured", [128 * _MIB, None, 0])
+def test_the_scp_cap_never_exceeds_the_engine_ingress_ceiling(configured: int | None) -> None:
+    """The shipped 128 MiB default, and an uncapped SCP, both resolve to the engine's binary ingress
+    ceiling. An object above it could only ever be recorded ERROR, so the SCP must not accept one."""
+    assert _scp(configured)._max_object_bytes == wiring_runner._INGRESS_MAX_BYTES
+
+
+def test_a_cap_below_the_ceiling_is_kept() -> None:
+    assert _scp(_MIB)._max_object_bytes == _MIB
+
+
+@pytest.mark.parametrize(
+    ("configured", "warns"),
+    [
+        (64 * _MIB, True),
+        (wiring_runner._INGRESS_MAX_BYTES + 1, True),
+        (wiring_runner._INGRESS_MAX_BYTES, False),
+        (_MIB, False),
+        # The shipped default is clamped too, but the factory always passes it, so it cannot be told
+        # from an explicit setting. Warning on every default SCP would be noise.
+        (128 * _MIB, False),
+    ],
+)
+def test_a_clamped_cap_is_logged_at_build(
+    configured: int, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1962: an operator who sets a cap above the ingress ceiling is told, at build, that the
+    SCP will refuse anything over the ceiling. A cap at or below it, and the shipped default, stay
+    silent."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"):
+        _scp(configured, name=_NAME)
+
+    hits = [r for r in caplog.records if "ingress ceiling" in r.getMessage()]
+    if not warns:
+        assert hits == []
+        return
+    assert len(hits) == 1
+    assert hits[0].levelno == logging.WARNING
+    message = hits[0].getMessage()
+    assert _NAME in message
+    assert str(configured) in message
+    assert str(wiring_runner._INGRESS_MAX_BYTES) in message
 
 
 def test_the_receipt_contract_is_declared_by_the_transport() -> None:
