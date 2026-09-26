@@ -2002,6 +2002,19 @@ class RegistryRunner:
         Empty when every outbound came up."""
         return {name: reason for (kind, name), reason in self._failed.items() if kind == "outbound"}
 
+    def degraded_stages(self) -> dict[str, str]:
+        """Snapshot of ``{stage: reason}`` for pooled pipeline stages with a claimer that died and has
+        not recovered (BACKLOG #1609) -- the stage-level twin of :meth:`degraded_inbound`. See
+        :attr:`StageDispatcher.claimer_faults` for when an entry clears. It exists because nothing
+        else reports this: ``running`` and every connection read healthy while a stage has stopped
+        draining. Empty in ``per_lane`` mode, whose workers are respawned by their own supervisors."""
+        out: dict[str, str] = {}
+        for stage, dispatcher in self._dispatchers.items():
+            faults = dispatcher.claimer_faults
+            if faults:
+                out[stage.value] = "; ".join(faults[name] for name in sorted(faults))
+        return out
+
     def inbound_filtered(self, name: str) -> str | None:
         """The reason the DR run-profile parked this INBOUND (its resolved priority tier is below
         ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is **not**
