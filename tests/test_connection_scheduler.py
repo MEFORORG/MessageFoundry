@@ -376,6 +376,13 @@ async def _start_credential_fault_rig(
         runner.notify_work()
         await _wait_until(lambda: "OB_SCHED" in sink.stopped)
         assert faulty.sends == 1
+        # Let the lane finish stopping. The alert comes well before a pooled lane reads STOPPED, and a
+        # restart that lands in that gap only cancels a pending pause, so the lane would STOP after it.
+        if claim_mode == "pooled":
+            out = runner._dispatchers[Stage.OUTBOUND]
+            await _wait_until(lambda: out.stopped("OB_SCHED"))
+        else:
+            await _wait_until(lambda: runner._workers["OB_SCHED"].done())
     except BaseException:
         await runner.stop()
         raise
@@ -446,10 +453,7 @@ async def test_a_pooled_broadcast_that_re_arms_a_stopped_lane_ends_its_hold(
     clock = _Clock(_IN_WINDOW)
     runner, faulty = await _start_credential_fault_rig(store, tmp_path, "pooled", clock, schedule)
     try:
-        assert ("outbound", "OB_SCHED") in runner._stop_held
-        # The record lands before the lane reaches STOPPED; a broadcast in that gap re-arms nothing.
-        out = runner._dispatchers[Stage.OUTBOUND]
-        await _wait_until(lambda: out.stopped("OB_SCHED"))
+        assert ("outbound", "OB_SCHED") in runner._stop_held  # the rig waited for STOPPED
         runner.notify_work()
         assert ("outbound", "OB_SCHED") not in runner._stop_held
         await _wait_until(lambda: faulty.sends == 2)  # the broadcast really did re-arm it

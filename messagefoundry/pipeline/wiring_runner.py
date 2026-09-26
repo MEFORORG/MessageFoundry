@@ -2622,7 +2622,8 @@ class RegistryRunner:
             self._stop_hold_logged.add(key)
             log.warning(
                 "schedule: %s connection %r is held by an operator-required STOP; the schedule "
-                "leaves it stopped until an operator starts it",
+                "leaves it stopped until it is re-armed (fix the cause, then restart the "
+                "connection or reload)",
                 kind,
                 name,
             )
@@ -4064,7 +4065,9 @@ class RegistryRunner:
         # A fresh worker is what re-arms a lane whose worker a STOP returned, whichever door spawned
         # it (an operator start, a reload), so the operator hold ends here. Every caller spawns only
         # over a missing or finished worker, and a STOP records its hold before its worker returns.
-        self._release_operator_hold(name, "outbound")
+        # Not while the #122 delivery halt holds: the new worker returns at the claim gate.
+        if not self._delivery_halted:
+            self._release_operator_hold(name, "outbound")
 
     def _on_worker_done(self, name: str, task: asyncio.Task[None]) -> None:
         """A delivery worker should only finish on shutdown — its loop swallows + backs off on
@@ -4134,7 +4137,9 @@ class RegistryRunner:
         # A respawned router or transform worker re-arms the lane a STOP halted (only those two STOP
         # on content), whichever door called this: an operator start, a reload, a rollback. Not when
         # both were alive: a STOP records its hold before its worker returns, so that hold is live.
-        if rearmed:
+        # Not while a #122 log halt holds the inbound either: the new worker returns at its halt gate
+        # on its first turn, so nothing was re-armed.
+        if rearmed and name not in self._log_halted:
             self._release_operator_hold(name, "inbound")
 
     def _spawn_inbound_worker(self, kind: str, name: str) -> None:
