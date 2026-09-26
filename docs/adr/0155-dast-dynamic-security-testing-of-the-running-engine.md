@@ -271,19 +271,27 @@ in a second.
 xfail, so a fix forces its entry out. The first two are also named in the policy's `known_defects`,
 which the run tolerates only for the `reply` and `count_and_log` detectors:
 
-1. **A blank segment is NAKed but never recorded.** An HL7 frame that decodes and carries an
-   empty segment makes the MLLP listener's pre-ACK read raise `IndexError` before the ingress row.
-   ADR 0191 recorded the parser half and scoped it to loopback re-ingress; the live listener is
-   affected too. When first found, the frame got no NAK and no row. Engine PR 1583 (BACKLOG #1619,
-   main commit `4f40f3f6e`) now answers any handler fault with an `AE` NAK and closes the
-   connection. So this face now gets a NAK, and still no row: the message is NAKed outside the
-   count-and-log boundary. It stays tolerated and a strict xfail. The face that fails UTF-8 decode
-   was recorded `ERROR` and got no NAK, because the NAK builder re-parsed the bytes and raised. The
-   same commit fixed it, so it is asserted by a plain test, and the tolerance no longer covers it.
-   Either face still closes the connection by design, so frames pipelined after it go unanswered
-   and are resent. Open engine PR 1579 fixes the root cause at the parser. When it lands, the
-   remaining strict xfail passes and fails, and the policy's `blank-segment` entry, its
-   discriminator and the tests that depend on it come out.
+1. **A blank segment still faults the inbound handler.** An HL7 frame with an empty segment makes
+   an accessor read raise `IndexError` on the pre-ACK path. ADR 0191 recorded the parser half and
+   scoped it to loopback re-ingress; the live listener is affected too. The frame has two faces:
+   - **The frame decodes.** The fault comes before the ingress row, so no row is written.
+   - **The frame fails UTF-8 decode.** The runner records `ERROR`, then faults while building its
+     `AR` NAK.
+
+   When first found, neither face got any reply. Engine PR 1583 (BACKLOG #1619, main commit
+   `4f40f3f6e`) now answers every handler fault with an `AE` internal-error NAK and then closes the
+   connection. Both faces now get that NAK. That gives the second face one NAK and one `ERROR` row,
+   which a plain test now asserts. Two problems remain:
+   - The first face is NAKed but never recorded, which breaks the count-and-log rule.
+   - Both faces get `AE`, which tells a sender to retry, not the runner's own reply. The second
+     face should get `AR`, since that message can never decode.
+
+   Each remaining problem is a strict xfail. Frames pipelined after a fault go unanswered by
+   design and are resent. The pass now counts any handler-fault NAK as a finding, so a fault stays
+   visible though it no longer shows as silence. Only a fault on a blank-segment frame is
+   tolerated. Open engine PR 1579 fixes the root cause. When it lands, the strict xfails start to
+   pass, and strict mode turns each pass into a failure. Then the `blank-segment` policy entry, its
+   discriminator and the tests built on it come out.
 2. **An alphanumeric MSH-1 gets an unreadable ACK.** The message is accepted, and the ACK echoes the
    letter separator, so MSA-1 (itself letters) cannot be read back.
 3. **The raw-TCP and X12 listeners have no frame deadline.** A peer trickling inside

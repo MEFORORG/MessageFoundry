@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.mllpcodec import frame
+from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT
 from scripts.security.dast_ingress_sweep import (
     KNOWN_DEFECT_DISCRIMINATORS,
     Budget,
@@ -215,6 +216,10 @@ def _ack(code: str) -> bytes:
     return frame(f"MSH|^~\\&|A|B|C|D|20260101||ACK|X|P|2.5.1\rMSA|{code}|X\r")
 
 
+#: The listener's handler-fault NAK (BACKLOG #1619), built from the engine's own constant.
+_FAULT = frame(f"MSH|^~\\&|A|B|C|D|20260101||ACK|X|P|2.5.1\rMSA|AE|X|{_HANDLER_FAILURE_NAK_TEXT}\r")
+
+
 @pytest.mark.parametrize(
     ("result", "got", "detector"),
     [
@@ -226,6 +231,7 @@ def _ack(code: str) -> bytes:
         (_result(plane="tcp", rows=1), b"x", "reply"),  # a reply from a listener that never replies
         (_result(plane="tcp", rows=0), b"", "count_and_log"),  # a raw-TCP frame silently dropped
         (_result(frames=0, overflow=True), b"", "count_and_log"),  # oversize with no event
+        (_result(rows=1, error_rows=1), _FAULT, "reply"),  # a handler fault, however well-formed
     ],
 )
 def test_the_oracle_names_each_violation(result: CaseResult, got: bytes, detector: str) -> None:
@@ -244,7 +250,17 @@ def test_the_oracle_is_silent_on_a_correct_exchange() -> None:
 
 
 def test_classify_replies_reads_msa_1() -> None:
-    assert classify_replies(_ack("AA") + _ack("AE") + _ack("AR") + _ack("CA")) == (2, 2, 0)
+    assert classify_replies(_ack("AA") + _ack("AE") + _ack("AR") + _ack("CA")) == (2, 2, 0, 0, None)
+    assert classify_replies(_ack("AA") + _FAULT) == (1, 1, 0, 1, 1)
+
+
+def test_frames_after_a_handler_fault_are_unanswered_by_design() -> None:
+    """The listener closes after a fault NAK, so a third frame's silence is not a second finding."""
+    result = _result(frames=3, rows=1, error_rows=1, accepted=0)
+    _judge(result, _ack("AA") + _FAULT)
+    assert result.handled == 2
+    details = [f["detail"] for f in result.findings if f["detector"] == "reply"]
+    assert len(details) == 1 and "inbound handler" in details[0], result.findings
 
 
 def test_the_frame_oracle_follows_the_decoder() -> None:
@@ -280,20 +296,34 @@ def test_a_known_defect_cannot_hide_a_second_defect_in_the_same_case() -> None:
     """One blank-segment frame among three may explain ONE missing reply and row, never three."""
     from scripts.security.dast_ingress_sweep import _explained
 
-    one_short = _result(frames=3, rows=2, accepted=2)
-    all_short = _result(frames=3, rows=0, accepted=0)
+    one_short = _result(frames=3, handled=3, rows=2, accepted=2)
+    all_short = _result(frames=3, handled=3, rows=0, accepted=0)
     assert _explained(one_short, 1)
     assert not _explained(all_short, 1)
 
 
-async def test_a_dropping_defect_explains_the_frames_after_it_and_no_earlier_one() -> None:
-    """The blank-segment drop loses the frames AFTER it on the same connection, never before."""
+async def test_a_handler_fault_explains_the_frames_after_it_and_no_earlier_one() -> None:
+    """A blank segment faults the handler, which NAKs and closes. Frames pipelined after it go
+    unanswered by design; a frame before it must still be answered and recorded."""
     good = frame(b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|G1|P|2.5.1\rPID|1\r")
     blank = _case("mllp", "blank-segment").payload
     first = await _run_alone(Case("blank-first", "mllp", blank + good), _budget())
+    assert first.handled == 1 and first.faults == 1, first
     assert first.findings and all(f["known_defect"] == "blank-segment" for f in first.findings)
     last = await _run_alone(Case("blank-last", "mllp", good + blank), _budget())
+    assert (last.handled, last.accepted, last.faults) == (2, 1, 1), last
     assert all(f["known_defect"] == "blank-segment" for f in last.findings), last.findings
+
+
+def test_a_handler_fault_on_an_unknown_frame_is_never_tolerated() -> None:
+    from scripts.security.dast_ingress_sweep import known_defect_for
+
+    faulted = _result(rows=1, error_rows=1)
+    _judge(faulted, _FAULT)
+    well_formed = reference_frames("mllp", _case("mllp", "well-formed").payload, _CAP)[0]
+    blank = reference_frames("mllp", _case("mllp", "blank-segment").payload, _CAP)[0]
+    assert known_defect_for(well_formed, faulted) == ("", 0)
+    assert known_defect_for(blank, faulted) == ("blank-segment", 1)
 
 
 def test_each_known_defect_discriminator_matches_its_catalogue_case() -> None:
@@ -309,24 +339,6 @@ def test_each_known_defect_discriminator_matches_its_catalogue_case() -> None:
         hit = KNOWN_DEFECT_DISCRIMINATORS[defect]
         assert any(map(hit, reference_frames("mllp", cases[case_name].payload, _CAP)[0])), defect
         assert not any(map(hit, reference_frames("mllp", cases["well-formed"].payload, _CAP)[0]))
-    # The invalid-UTF-8 face of the blank segment was fixed on main by PR 1583, so the discriminator
-    # must NOT match it: a tolerance that covered it would hide a regression.
-    fixed = reference_frames("mllp", cases["blank-segment-invalid-utf8"].payload, _CAP)[0]
-    assert not any(map(KNOWN_DEFECT_DISCRIMINATORS["blank-segment"], fixed))
-
-
-def test_a_closing_frame_explains_its_followers_but_a_fixed_one_not_itself() -> None:
-    """The invalid-UTF-8 blank segment is NAKed and recorded now, so it explains only the frames
-    pipelined after it (the listener closes by design after a handler fault), never its own reply."""
-    from scripts.security.dast_ingress_sweep import explained_frames
-
-    fixed = reference_frames("mllp", _case("mllp", "blank-segment-invalid-utf8").payload, _CAP)[0]
-    open_ = reference_frames("mllp", _case("mllp", "blank-segment").payload, _CAP)[0]
-    good = reference_frames("mllp", _case("mllp", "well-formed").payload, _CAP)[0]
-    assert explained_frames("blank-segment", fixed) == 0
-    assert explained_frames("blank-segment", fixed + good) == 1
-    assert explained_frames("blank-segment", open_ + good) == 2
-    assert explained_frames("blank-segment", good + open_) == 1
 
 
 # =====================================================================================================
@@ -337,11 +349,9 @@ def test_a_closing_frame_explains_its_followers_but_a_fixed_one_not_itself() -> 
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "ENGINE DEFECT: an HL7 frame that decodes and carries an empty segment makes the MLLP "
-        "listener's pre-ACK read raise IndexError (Peek's accessor tier, ADR 0191's recorded "
-        "finding) before the ingress row. Since PR 1583 (BACKLOG #1619) the listener answers the "
-        "fault with an AE NAK and closes, but NO row is written, so a deploying site would NAK a "
-        "message it never recorded, outside the count-and-log boundary. Open PR 1579 fixes it."
+        "ENGINE DEFECT (ADR 0155, 2026-09-26 amendment, defect 1): a frame that decodes and carries "
+        "an empty segment faults the inbound handler before its ingress row, so it gets the "
+        "listener's internal-error NAK and no row. Open engine PR 1579 fixes it."
     ),
 )
 async def test_a_blank_segment_is_nakked_and_recorded_error() -> None:
@@ -350,14 +360,25 @@ async def test_a_blank_segment_is_nakked_and_recorded_error() -> None:
 
 
 async def test_a_blank_segment_that_fails_utf8_decode_is_nakked_and_recorded_error() -> None:
-    """FIXED ON MAIN, so this is a plain assertion that reds on a regression. The frame is recorded
-    ERROR at the decode step; the NAK builder then faults on the blank segment, and since PR 1583
-    (BACKLOG #1619) the listener answers that fault with an AE NAK instead of dropping silently.
-    Before PR 1583 this frame got an ERROR row and no reply."""
+    """The part main now holds, as a plain assertion so a regression reds: the frame is recorded
+    ERROR and gets exactly one NAK. Before engine PR 1583 it got the row and no reply."""
+    result = await _run_alone(_case("mllp", "blank-segment-invalid-utf8"), _budget())
+    assert (result.rejected, result.rows, result.error_rows) == (1, 1, 1), result
+    assert all(f["known_defect"] == "blank-segment" for f in result.findings), result.findings
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "ENGINE DEFECT (ADR 0155, 2026-09-26 amendment, defect 1): the NAK for this frame should be "
+        "the runner's AR decode-error NAK, but building it faults on the blank segment, so the "
+        "listener's AE internal-error NAK answers instead. AE tells a sender to retry a message "
+        "that can never decode. Open engine PR 1579 fixes it."
+    ),
+)
+async def test_a_blank_segment_that_fails_utf8_decode_gets_the_runners_own_nak() -> None:
     result = await _run_alone(_case("mllp", "blank-segment-invalid-utf8"), _budget())
     assert not result.findings, result.findings
-    assert (result.rejected, result.rows, result.error_rows) == (1, 1, 1)
-    assert result.known_defect == "", "the fixed variant must not be tolerated as a known defect"
 
 
 @pytest.mark.xfail(

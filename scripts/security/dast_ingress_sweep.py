@@ -12,7 +12,10 @@ the ingress path must do, and each judgement is a DETECTOR with a positive contr
 
 * ``reply`` -- every MLLP frame that reaches decode gets exactly one synchronous reply, an ACK or a
   NAK, never silence and never a spare. The expected frame count comes from running the SAME decoder
-  class over the SAME bytes, so framing tolerance is the engine's own, not a guess.
+  class over the SAME bytes, so framing tolerance is the engine's own, not a guess. The listener's
+  handler-fault NAK (BACKLOG #1619) is a finding too: a fault that raised inside the inbound handler
+  used to show as silence, and now shows as a well-formed AE, so it is recognised by its fixed text.
+  Frames pipelined after it go unanswered by design, because the listener closes.
 * ``count_and_log`` -- every decoded frame is persisted: an accepted reply matches a new non-ERROR row
   and a NAK matches a new ERROR row. A raw-TCP or X12 frame gets no reply by design, so there the row
   count alone must equal the frame count. An oversize frame closes the connection and must leave a
@@ -61,7 +64,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from fuzz.targets import TARGETS  # noqa: E402
+from fuzz.targets import TARGETS, _hl7_has_blank_segment  # noqa: E402
 from messagefoundry.logging_setup import _install_phi_filters  # noqa: E402
 from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, frame  # noqa: E402
 from messagefoundry.parsing.peek import Peek, normalize  # noqa: E402
@@ -69,6 +72,7 @@ from messagefoundry.parsing.x12.errors import X12FrameError  # noqa: E402
 from messagefoundry.parsing.x12.interchange import X12FrameReader  # noqa: E402
 from messagefoundry.store import MessageStatus  # noqa: E402
 from messagefoundry.transports.framing import STX_ETX_CODEC, FrameDecoder, FrameError  # noqa: E402
+from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT  # noqa: E402
 from scripts.security.dast_auth_sweep import _run, annotation_level  # noqa: E402
 from scripts.security.dast_ingress_target import (  # noqa: E402
     CANARY_DETECTOR,
@@ -306,33 +310,15 @@ def reference_frames(plane: str, data: bytes, cap: int) -> tuple[list[bytes], bo
     return frames, False
 
 
-def _carries_blank_segment(payload: bytes, *, errors: str) -> bool:
-    try:
-        peek = Peek.parse(normalize(payload, encoding="utf-8", errors=errors))
-        return any(not segment for segment in peek.segments())
-    except ValueError:  # HL7PeekError and UnicodeDecodeError are both ValueErrors
-        return False
-
-
 def _blank_segment(payload: bytes) -> bool:
-    """ADR 0191's known finding, recognised by its own narrow discriminator: the frame decodes as
-    UTF-8, parses, and carries a segment whose id is the empty string.
-
-    STRICT decode, because only that face of the defect is still open. Such a frame makes the
-    pre-ACK read raise before its ingress row: since BACKLOG #1619 (engine PR 1583) the listener
-    answers the fault with an AE NAK, but no row is written, so it is still accepted-into-nothing.
-    The face that FAILS UTF-8 decode is recorded ERROR first and, since PR 1583, NAKed too, so it is
-    no longer a defect and must not be tolerated: a regression there reds the run.
-    """
-    return _carries_blank_segment(payload, errors="strict")
-
-
-def _blank_segment_closes(payload: bytes) -> bool:
-    """Whether the listener closes the connection after this frame. Both faces of the blank segment
-    still fault the handler (the invalid-UTF-8 one when its NAK is built), and since PR 1583 a
-    handler fault is answered and then the connection is closed by design, so frames pipelined
-    after it go unanswered and are resent by the sender."""
-    return _carries_blank_segment(payload, errors="replace")
+    """ADR 0191's known finding, by ADR 0191's own discriminator (reused, not copied): the frame
+    parses and carries a segment whose id is the empty string. Decoded with replacement, because
+    both faces of the defect, the one that decodes and the one that fails UTF-8 decode, still fault
+    the inbound handler. ADR 0155's 2026-09-26 amendment says what each face does today."""
+    try:
+        return _hl7_has_blank_segment(Peek.parse(normalize(payload, errors="replace")))
+    except ValueError:  # HL7PeekError is a ValueError
+        return False
 
 
 def _alphanumeric_field_separator(payload: bytes) -> bool:
@@ -342,7 +328,9 @@ def _alphanumeric_field_separator(payload: bytes) -> bool:
 #: Known engine defects, each recognised by a NARROW structural condition on the frames a case sent,
 #: never by an exception type or a case name alone (a mutation can reproduce one by chance). Which of
 #: these a run tolerates is the policy's ``known_defects`` list; tests/test_dast_ingress_sweep.py holds
-#: a strict xfail per entry, so the day a defect is fixed its entry has to come out.
+#: a strict xfail per entry, so the day a defect is fixed its entry has to come out. A defect in
+#: HANDLER_FAULT_DEFECTS is matched against the frame the handler faulted on and explains that one
+#: frame; any other is matched against every frame and explains each frame it matches.
 KNOWN_DEFECT_DISCRIMINATORS: dict[str, Callable[[bytes], bool]] = {
     "blank-segment": _blank_segment,
     "alphanumeric-field-separator": _alphanumeric_field_separator,
@@ -350,38 +338,40 @@ KNOWN_DEFECT_DISCRIMINATORS: dict[str, Callable[[bytes], bool]] = {
 #: The only detectors a known defect may silence. A liveness, time, resource or log finding on the
 #: same case is never tolerated: those would be a SECOND defect riding on the known one.
 KNOWN_DEFECT_DETECTORS = frozenset({"reply", "count_and_log"})
-#: Known defects whose frames also close the connection, keyed to the predicate that finds such a
-#: frame. The frames pipelined AFTER the first closing frame are explained; the closing frame itself
-#: is explained only when the defect's own discriminator matches it.
-CONNECTION_CLOSING_FRAMES: dict[str, Callable[[bytes], bool]] = {
-    "blank-segment": _blank_segment_closes,
-}
+HANDLER_FAULT_DEFECTS = frozenset({"blank-segment"})
 
 
-def explained_frames(defect: str, payloads: Sequence[bytes]) -> int:
-    """How many of ``payloads`` the known ``defect`` can account for (0 when it matches none)."""
-    hits = [KNOWN_DEFECT_DISCRIMINATORS[defect](p) for p in payloads]
-    closing = CONNECTION_CLOSING_FRAMES.get(defect)
-    first_close = next((i for i, p in enumerate(payloads) if closing and closing(p)), None)
-    if first_close is None:
-        return sum(hits)
-    return sum(hits[: first_close + 1]) + len(payloads) - first_close - 1
+class Replies(NamedTuple):
+    accepted: int
+    rejected: int
+    unreadable: int
+    #: NAKs carrying the listener's fixed handler-fault text (BACKLOG #1619): the frame raised
+    #: inside the inbound handler. Counted inside ``rejected`` too.
+    faults: int
+    #: Position in the reply stream of the first handler-fault NAK, or None. Every earlier frame got
+    #: one reply, so this is also the index of the frame that faulted.
+    first_fault: int | None
 
 
-def classify_replies(data: bytes) -> tuple[int, int, int]:
-    """``(accepted, rejected, unreadable)`` MLLP replies in ``data``, read off each reply's MSA-1."""
-    accepted = rejected = unreadable = 0
-    for payload in MLLPDecoder(max_frame_bytes=None).feed(data):
+def classify_replies(data: bytes) -> Replies:
+    """The MLLP replies in ``data``, read off each reply's MSA-1 and, for a NAK, its MSA-3."""
+    accepted = rejected = unreadable = faults = 0
+    first_fault: int | None = None
+    for index, payload in enumerate(MLLPDecoder(max_frame_bytes=None).feed(data)):
         text = payload.decode("utf-8", errors="replace")
         msa = next((s for s in text.replace("\n", "\r").split("\r") if s.startswith("MSA")), "")
-        code = msa.split(msa[3])[1] if len(msa) > 4 else ""
+        fields = msa.split(msa[3]) if len(msa) > 4 else []
+        code = fields[1] if len(fields) > 1 else ""
         if code in ("AA", "CA"):
             accepted += 1
         elif code in ("AE", "AR", "CE", "CR"):
             rejected += 1
+            if _HANDLER_FAILURE_NAK_TEXT in fields[3:]:
+                faults += 1
+                first_fault = index if first_fault is None else first_fault
         else:
             unreadable += 1
-    return accepted, rejected, unreadable
+    return Replies(accepted, rejected, unreadable, faults, first_fault)
 
 
 # =====================================================================================================
@@ -413,6 +403,11 @@ class CaseResult:
     accepted: int = 0
     rejected: int = 0
     unreadable: int = 0
+    #: Frames the listener handled: all of them, or up to and including the first handler fault,
+    #: after which the listener closes the connection by design (BACKLOG #1619).
+    handled: int = 0
+    faults: int = 0
+    first_fault: int | None = None
     rows: int = 0
     error_rows: int = 0
     oversize_events: int = 0
@@ -452,7 +447,9 @@ async def _read_replies(reader: asyncio.StreamReader, count: int, seconds: float
     got = b""
     deadline = time.monotonic() + seconds
     with suppress(TimeoutError, ConnectionError, OSError):
-        while sum(classify_replies(got)) < count and (left := deadline - time.monotonic()) > 0:
+        while (r := classify_replies(got)).accepted + r.rejected + r.unreadable < count and (
+            left := deadline - time.monotonic()
+        ) > 0:
             chunk = await asyncio.wait_for(reader.read(65536), left)
             if not chunk:
                 break
@@ -591,12 +588,7 @@ async def _settle(target: IngressTarget, plane: str, seconds: float) -> bool:
 
 async def run_case(target: IngressTarget, case: Case, budget: Budget) -> CaseResult:
     payloads, overflow = reference_frames(case.plane, case.payload, budget.cap)
-    known, known_frames = "", 0
-    for name in KNOWN_DEFECT_DISCRIMINATORS:
-        if count := explained_frames(name, payloads):
-            known, known_frames = name, count
-            break
-    result = CaseResult(case.name, case.plane, case.origin, len(payloads), overflow, known)
+    result = CaseResult(case.name, case.plane, case.origin, len(payloads), overflow)
     before = await _counts(target, case.plane)
     events_before = await _oversize_events(target, case.plane) if overflow else 0
     started = time.monotonic()
@@ -629,12 +621,26 @@ async def run_case(target: IngressTarget, case: Case, budget: Budget) -> CaseRes
     after = await _counts(target, case.plane)
     result.rows, result.error_rows = after.rows - before.rows, after.errors - before.errors
     _judge(result, got)
-    if known and not _explained(result, known_frames):
-        # A multi-frame case where the known frames cannot account for the whole shortfall: the
-        # rest is a SECOND defect riding on the known one, so nothing on this case is tolerated.
+    known, known_frames = known_defect_for(payloads, result)
+    if known and _explained(result, known_frames):
+        # Only when the known frames account for the whole shortfall: anything more is a SECOND
+        # defect riding on the known one, and then nothing on this case is tolerated.
+        result.known_defect = known
         for f in result.findings:
-            f["known_defect"] = ""
+            f["known_defect"] = known
     return result
+
+
+def known_defect_for(payloads: Sequence[bytes], result: CaseResult) -> tuple[str, int]:
+    """``(defect, frames it explains)`` for this case, or ``("", 0)``."""
+    for name, hit in KNOWN_DEFECT_DISCRIMINATORS.items():
+        if name in HANDLER_FAULT_DEFECTS:
+            faulted = result.first_fault
+            if faulted is not None and faulted < len(payloads) and hit(payloads[faulted]):
+                return name, 1
+        elif count := sum(map(hit, payloads)):
+            return name, count
+    return "", 0
 
 
 def _explained(result: CaseResult, known_frames: int) -> bool:
@@ -642,11 +648,12 @@ def _explained(result: CaseResult, known_frames: int) -> bool:
     replies = result.accepted + result.rejected + result.unreadable
     nonerror = result.rows - result.error_rows
     gaps = (
-        result.frames - replies,
-        result.frames - result.rows,
+        result.handled - replies,
+        result.handled - result.rows,
         abs(result.accepted - nonerror),
         abs(result.rejected - result.error_rows),
         result.unreadable,
+        result.faults,
     )
     return all(0 <= gap <= known_frames for gap in gaps[:2]) and all(
         gap <= known_frames for gap in gaps[2:]
@@ -654,16 +661,28 @@ def _explained(result: CaseResult, known_frames: int) -> bool:
 
 
 def _judge(result: CaseResult, got: bytes) -> None:
-    frames = result.frames
+    frames = result.handled = result.frames
     if result.plane == "mllp":
-        result.accepted, result.rejected, result.unreadable = classify_replies(got)
+        r = classify_replies(got)
+        result.accepted, result.rejected, result.unreadable = r.accepted, r.rejected, r.unreadable
+        result.faults, result.first_fault = r.faults, r.first_fault
+        if r.first_fault is not None:
+            # The listener NAKs a handler fault and then closes (BACKLOG #1619), so frames pipelined
+            # after it go unanswered BY DESIGN and the sender resends them. The fault itself is the
+            # finding: before BACKLOG #1619 it was silence, and this is what keeps it visible.
+            result.handled = frames = min(frames, r.first_fault + 1)
+            result.find(
+                "reply",
+                f"{r.faults} frame(s) raised inside the inbound handler and got the listener's "
+                "internal-error NAK instead of the runner's own ACK or NAK",
+            )
         replies = result.accepted + result.rejected + result.unreadable
         if replies < frames:
             result.find(
                 "reply", f"{frames} frame(s) reached decode, {replies} reply(ies) came back"
             )
-        elif replies > frames:
-            result.find("reply", f"{replies} replies for {frames} decoded frame(s)")
+        elif replies > result.frames:
+            result.find("reply", f"{replies} replies for {result.frames} decoded frame(s)")
         if result.unreadable:
             result.find("reply", f"{result.unreadable} reply(ies) carried no readable MSA-1")
         if result.accepted != result.rows - result.error_rows:
