@@ -108,6 +108,7 @@ __all__ = [
     "tls_revocation_attested",
     "validate_proxy_tls_posture",
     "validate_tls_ciphers",
+    "refuse_lowered_security_level",
 ]
 
 #: NIST SP 800-52r2 minimum negotiated TLS versions (shared with the in-process floor validation).
@@ -568,6 +569,20 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
             f"security (ASVS 11.2.3); these are rated below it: {', '.join(weak)}. A truncated "
             "authentication tag weakens a suite whose cipher and key length look fine."
         )
+    # BACKLOG #2106. A directive changes no suite name, so every check above passes it, and
+    # @SECLEVEL=0 drops the context from level 2 to 0. Every '@' token is refused, not a list of
+    # known ones, so a directive a later OpenSSL adds is refused too. Outside the allow-list guard
+    # because the proxy declaration needs it as well.
+    directives = _cipher_directives(value)
+    if directives:
+        raise ValueError(
+            f"tls_ciphers must name cipher suites only; it carries the OpenSSL directive(s) "
+            f"{', '.join(directives)}. A directive changes how OpenSSL applies the list, not which "
+            "suites it holds, so the checks here cannot see it, and @SECLEVEL=0 lets a peer present "
+            "an RSA-1024 certificate that the default security level refuses (BACKLOG #2106). "
+            "Remove every '@' token and list the suite names only; the context then keeps the "
+            "security level of this OpenSSL build."
+        )
     if not require_approved_suites:
         return value
     # The allow-list is last so an operator hitting a specific property failure above gets the precise
@@ -773,6 +788,37 @@ def apply_connection_tls_ciphers(
         ctx.set_ciphers(text)
     except (ValueError, ssl.SSLError) as exc:
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
+    refuse_lowered_security_level(ctx, connector=connector)  # BACKLOG #2106, defence in depth
+
+
+def _cipher_directives(value: str) -> list[str]:
+    """The ``@`` tokens in an OpenSSL cipher string, in order (BACKLOG #2106).
+
+    OpenSSL separates tokens with ``:``, ``,``, ``;`` or a space, measured on OpenSSL 3.5.7. A token
+    counts if it holds ``@`` anywhere, because no suite or alias name does."""
+    for sep in ",; ":
+        value = value.replace(sep, ":")
+    return [token for token in value.split(":") if "@" in token]
+
+
+def refuse_lowered_security_level(ctx: ssl.SSLContext, *, connector: str) -> None:
+    """Raise if ``ctx`` runs below the OpenSSL security level of a stock context of its protocol.
+
+    BACKLOG #2106, defence in depth. :func:`validate_tls_ciphers` refuses every ``@`` directive, so a
+    validated string cannot lower the level. This checks the context itself after the string is
+    applied, so a path that skipped the validator still cannot go below the floor.
+
+    The floor is read off a stock context rather than written here, because the OpenSSL build sets
+    it: 2 on CPython 3.14.6 / OpenSSL 3.5.7. At 2 a client refuses a peer certificate with an
+    RSA-1024 key; at 0 it accepts one."""
+    floor = ssl.SSLContext(ctx.protocol).security_level
+    if ctx.security_level < floor:
+        raise ValueError(
+            f"{connector}: the TLS context runs at OpenSSL security level {ctx.security_level}, "
+            f"below the level {floor} this build sets (BACKLOG #2106). A lower level accepts weaker "
+            "peer keys, such as an RSA-1024 certificate. Remove any @SECLEVEL directive from "
+            "tls_ciphers."
+        )
 
 
 #: Suites an operator-configured ``tls_ciphers`` string may resolve to (BACKLOG #1317, ASVS 12.1.2).

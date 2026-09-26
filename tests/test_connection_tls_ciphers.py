@@ -205,6 +205,7 @@ def test_opt_in_removes_the_suites_the_allow_list_excludes(seam: str, tmp_path: 
         ("AES256-SHA:@SECLEVEL=0", "static RSA key exchange — no forward secrecy"),
         ("ECDHE-RSA-AES256-SHA384", "sound but NOT on the AEAD-only approved list"),
         ("this-is-not-a-cipher-string", "unparseable by OpenSSL"),
+        (f"@SECLEVEL=0:{NARROW}", "an @ directive lowers the security level (BACKLOG #2106)"),
     ],
 )
 def test_a_suite_the_shared_policy_refuses_is_refused_here(
