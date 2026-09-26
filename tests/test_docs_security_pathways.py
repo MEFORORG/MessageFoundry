@@ -399,6 +399,40 @@ def test_the_intake_row_states_the_modes_and_the_unauthenticated_default() -> No
     )
 
 
+def _passes_header(source: str, name: str, value: str) -> bool:
+    """Whether a call in ``source`` passes ``headers={name: value, ...}`` as string literals.
+
+    An AST read, not a substring scan (BACKLOG #1818): a comment or docstring in the function that
+    quotes the header kept the old scan green after the real header was changed.
+    """
+    return any(
+        isinstance(node, ast.keyword)
+        and node.arg == "headers"
+        and isinstance(node.value, ast.Dict)
+        and any(
+            isinstance(k, ast.Constant)
+            and k.value == name
+            and isinstance(v, ast.Constant)
+            and v.value == value
+            for k, v in zip(node.value.keys, node.value.values, strict=True)
+        )
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+    )
+
+
+def test_passes_header_ignores_mentions() -> None:
+    """The helper reads code only: a quoted header is ABSENT, the real keyword PRESENT."""
+    mention = (
+        "def refusal(self):\n"
+        '    """Answers 429 with headers={"Retry-After": "60"}."""\n'
+        '    # headers={"Retry-After": "60"}\n'
+        '    return Error(429, headers={"Retry-After": "30"})\n'
+    )
+    assert not _passes_header(mention, "Retry-After", "60")
+    real = 'def refusal(self):\n    return Error(429, headers={"Retry-After": "60"})\n'
+    assert _passes_header(real, "Retry-After", "60")
+
+
 def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
     """The intake rows quote defaults and floors; pin each one to the code that sets it.
 
@@ -417,7 +451,9 @@ def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
     assert params["intake_api_key_header"].default == "x-api-key"
     assert params["intake_auth_health"].default == "require"
     assert (_INTAKE_ALLOWLIST_MIN_PREFIX_V4, _INTAKE_ALLOWLIST_MIN_PREFIX_V6) == (8, 32)
-    assert '"Retry-After": "60"' in inspect.getsource(http_listener.HttpSource._rate_limit_refusal)
+    assert _passes_header(
+        inspect.getsource(http_listener.HttpSource._rate_limit_refusal), "Retry-After", "60"
+    ), "the intake 429 no longer passes headers={'Retry-After': '60'}"
     row = " ".join(next(r for r in _primary_table()[1:] if r[0].startswith("**HTTP intake")))
     for quoted in ("`intake_auth_rate_limit` 10/min", "`intake_auth_rate_limit_global` 60/min"):
         assert quoted in row, f"the HTTP intake row no longer quotes {quoted!r}"
