@@ -347,9 +347,20 @@ class FileDestination(DestinationConnector):
             else:
                 _claim_unique(tmp, target)  # hard-links tmp → a free name
         finally:
-            # Remove the temp; after a successful os.replace it's already gone (suppressed).
-            with suppress(OSError):
-                os.unlink(tmp)
+            # os.replace consumes the temp, so a missing file is expected. On the hard-link path this
+            # unlink is the only cleanup, and a failure orphans the .part for good (BACKLOG #1862):
+            # never raise (the target is published, or a real error is in flight), but never silent.
+            # The name is mkstemp's random one, not partner-chosen, so it needs no safe_name.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "file destination could not remove its temp file %s (errno %s: %s); an orphaned "
+                    ".part file is left in the destination directory",
+                    tmp,
+                    exc.errno,
+                    exc.strerror,
+                )
 
 
 class FileSource(SourceConnector):

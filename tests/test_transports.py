@@ -8,6 +8,7 @@ so the framing and ACK round-trip are exercised end-to-end, not mocked."""
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import re
@@ -799,6 +800,48 @@ async def test_file_destination_created_directory_is_logged(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         await dest.send(ADT)
     assert "CREATED missing directory" not in caplog.text  # only a real creation is loud
+
+
+def _fail_part_unlink(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``os.unlink`` raise ``PermissionError`` for a ``.part`` temp only; the rest is real."""
+    real_unlink = os.unlink
+
+    def unlink(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
+        if os.fspath(path).endswith(".part"):
+            raise PermissionError(errno.EACCES, "Access is denied", os.fspath(path))
+        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "unlink", unlink)
+
+
+async def test_file_destination_failed_temp_unlink_warns_and_still_delivers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # BACKLOG #1862. A failed temp unlink on the default hard-link path orphans the .part. The
+    # delivery was already published, so it must still succeed; only the silence changes.
+    _fail_part_unlink(monkeypatch)
+    dest = _file_dest(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        await dest.send(ADT)  # the arm that must not regress: no DeliveryError
+    assert (tmp_path / "msg.hl7").read_text(encoding="utf-8") == ADT
+    orphans = list(tmp_path.glob("*.part"))
+    assert len(orphans) == 1
+    assert "could not remove its temp file" in caplog.text
+    assert str(orphans[0]) in caplog.text  # names the path an operator has to clean up
+    assert f"errno {errno.EACCES}" in caplog.text
+
+
+async def test_file_destination_consumed_temp_on_overwrite_is_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # os.replace consumes the temp, so every overwrite delivery finds it gone. That must not warn, or
+    # the #1862 warning would fire on every message and train operators to ignore it.
+    dest = _file_dest(tmp_path, overwrite=True)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        await dest.send(ADT)
+    assert (tmp_path / "msg.hl7").exists()
+    assert not list(tmp_path.glob("*.part"))
+    assert "could not remove its temp file" not in caplog.text
 
 
 async def test_file_destination_non_directory_at_the_path_still_errors(tmp_path: Path) -> None:
