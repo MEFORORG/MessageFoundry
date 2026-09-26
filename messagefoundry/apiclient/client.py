@@ -1478,10 +1478,11 @@ class EngineClient:
         username: str,
         password: str,
         *,
+        email: str,
         display_name: str | None = None,
-        email: str | None = None,
         roles: list[str] | None = None,
     ) -> UserSummary:
+        """``email`` is required: it becomes the account's notification address (BACKLOG #2018)."""
         body = {
             "username": username,
             "password": password,

@@ -376,6 +376,16 @@ async def test_content_search_scan_decrypt(store) -> None:
     assert res4.scanned == 1 and res4.truncated is True
 
 
+async def test_content_search_select_is_capped_at_scan_limit_plus_one(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2068 backend parity: the candidate SELECT reads at most scan_limit + 1 rows.
+    (Runs against a real server in the gated CI leg.)"""
+    from tests._content_search_contract import assert_search_select_is_capped
+
+    await assert_search_select_is_capped(store, monkeypatch)
+
+
 async def test_replay_dead_only_dead_rows(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], now=100.0

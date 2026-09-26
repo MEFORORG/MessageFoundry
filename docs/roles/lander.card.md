@@ -7,8 +7,9 @@ Life: as needed.
 
 ## What this seat owns
 
-**The merge**, and flipping row statuses after items merge. Standing authority on the
-engine repo and the vault, with no per-action owner approval.
+**The merge**, flipping row statuses after items merge, flagging stale hooks and merged
+worktrees your merges leave (2026-09-26). Standing authority on the engine repo and the vault,
+with no per-action owner approval.
 
 What enters the queue, and in what order.
 

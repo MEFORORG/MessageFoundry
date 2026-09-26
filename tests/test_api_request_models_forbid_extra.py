@@ -145,7 +145,7 @@ def test_request_model_base_is_what_carries_the_rule() -> None:
 
 
 def test_unknown_key_is_refused_at_the_model_with_a_control() -> None:
-    good = {"username": "op", "password": "pw", "roles": ["viewer"]}
+    good = {"username": "op", "password": "pw", "roles": ["viewer"], "email": "op@example.org"}
     assert UserCreateRequest.model_validate(good).username == "op"
     with pytest.raises(ValidationError, match="extra_forbidden|Extra inputs"):
         UserCreateRequest.model_validate({**good, "rolez": ["admin"]})

@@ -87,7 +87,7 @@ from messagefoundry.store.base import (
     warm_pool_connections,
     warm_pool_target,
 )
-from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -169,6 +169,7 @@ from messagefoundry.store.store import (
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
+    birth_notify_email,
     build_audit_mac_keys,
     delivery_key,
     next_lockout_state,
@@ -177,7 +178,6 @@ from messagefoundry.store.store import (
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
-    seed_notify_email,
     settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
@@ -6095,16 +6095,20 @@ class PostgresStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
+        # The inner SELECT picks the newest `fetch_limit` ids without selecting `raw`; only those rows
+        # are read whole (BACKLOG #2068, see ``MessageStore.search_messages``).
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata, raw,"
             " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
             "  ORDER BY e.id DESC LIMIT 1) AS last_event"
-            f" FROM messages{where}"
-            " ORDER BY received_at DESC, id DESC",
+            " FROM messages WHERE id IN"
+            f" (SELECT id FROM messages{where}"
+            f"  ORDER BY received_at DESC, id DESC LIMIT ${len(params) + 1})",
             *params,
+            spec.fetch_limit,
         )
-        return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
+        return await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit)
 
     def _scan_rows(
         self, spec: SearchSpec, candidates: Sequence[Any], limit: int
@@ -6651,6 +6655,7 @@ class PostgresStore:
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
+        notify_email: str | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -6663,7 +6668,7 @@ class PostgresStore:
             auth_provider,
             display_name,
             email,
-            seed_notify_email(email) if adopt_notify_email else None,
+            birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
             now,
             password_hash,
             now if password_hash is not None else None,

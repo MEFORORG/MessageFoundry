@@ -1037,7 +1037,9 @@ class QueueStore(StoreLifecycle, Protocol):
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): metadata pre-filter in SQL, then decrypt +
         match each candidate body in memory off the event loop — the only mechanism that works while the
-        store cipher is on (the at-rest bytes are per-row random-nonced AES-GCM ciphertext)."""
+        store cipher is on (the at-rest bytes are per-row random-nonced AES-GCM ciphertext). What the
+        scan cap bounds (rows held in memory, since BACKLOG #2068) is stated once, on
+        ``MessageStore.search_messages``."""
         ...
 
     async def list_dead(
@@ -1638,7 +1640,8 @@ class AuditStore(Protocol):
         the ACTIVE key. Verifies the whole chain first and refuses on a break; then appends one range row,
         MAC'd under the active key, carrying a digest of the range it closes, so that range stays
         provable after its key is dropped. Rewrites no existing row. A no-op when the current range is
-        already under the active key or the chain is keyless. Run offline. Returns ``(ok, message)``."""
+        already under the active key (verified first, BACKLOG #1945) or the chain is keyless. Run
+        offline. Returns ``(ok, message)``."""
         ...
 
     def audit_chain_unkeyed(self) -> bool:
@@ -1685,13 +1688,16 @@ class AuthStore(Protocol):
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
+        notify_email: str | None = None,
     ) -> None:
         """Insert one account row.
 
         ``notify_email`` is seeded from ``email`` through ``seed_notify_email`` unless
         ``adopt_notify_email`` is ``False``, which binds NULL and keeps ``email`` as the profile
         mirror. The directory birth passes ``False`` for a ``mail`` the address form would not
-        suggest (BACKLOG #2014); every other caller keeps the default."""
+        suggest (BACKLOG #2014); every other caller keeps the default. ``notify_email``, when given,
+        is bound as the notification address instead: an administrator's checked address for a
+        directory account created without a sign-in (BACKLOG #2021)."""
         ...
 
     async def get_user(self, user_id: str) -> UserRecord | None: ...
