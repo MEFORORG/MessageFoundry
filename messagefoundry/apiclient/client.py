@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import logging
 import ssl
+import threading
 from collections.abc import Callable, Sequence
 from json import JSONDecodeError
+from pathlib import Path
 from types import TracebackType
 from typing import TypeVar
 from urllib.parse import quote, urlsplit
@@ -401,6 +403,33 @@ def _build_verify_context(
     return ctx
 
 
+def _read_pin(cacert: str) -> bytes | None:
+    """The pinned file's bytes now, or ``None`` when it cannot be read. Quiet, for a caller that
+    will try again on its next request."""
+    try:
+        return Path(cacert).read_bytes()
+    except OSError:
+        return None
+
+
+def _is_cert_verification_failure(exc: BaseException) -> bool:
+    """True when ``exc`` is, or wraps, a failure to verify the peer's certificate.
+
+    httpx raises its own ``ConnectError`` over httpcore's, over the stdlib
+    ``SSLCertVerificationError`` (measured on httpx 0.28.1 / httpcore 1.0.9), so the chain is walked
+    through both ``__cause__`` and ``__context__``. A refused connection, a timeout or a reset reads
+    as False, and so does a chain that loops back on itself.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class _TokenCell:
     """The bearer token, in a cell SHARED by a client and every :meth:`EngineClient.for_polling`
     clone it makes.
@@ -432,6 +461,10 @@ class EngineClient:
     (``api-generated-cert.pem``; ``messagefoundry cert inventory --service-config <toml>`` prints
     its path). Without it the first request fails certificate verification. That failure is
     deliberate: this client never turns verification off.
+
+    The engine renews that certificate early, at startup, into the same file. A pinned client
+    follows the renewal on the first request that fails verification against it, without being
+    rebuilt; see :meth:`_follow_renewed_pin`.
     """
 
     def __init__(
@@ -462,14 +495,34 @@ class EngineClient:
         # and building the default context imports the [console]-extra `truststore` — so an http client
         # (the load harness, any non-[console] install) must NOT need it just to construct a client.
         verify: ssl.SSLContext | bool = True
+        #: The pinned file's bytes the current transport was built from, or None when unknown (the
+        #: file changed during the build). Only a pinned https client records them; see
+        #: _follow_renewed_pin.
+        self._pin_pem: bytes | None = None
+        #: The last changed pin bytes that would not load, so a file that stays broken logs once.
+        self._pin_refused: bytes | None = None
+        self._follows_pin = False
+        #: Serialises a rebuild between threads sharing a poll client.
+        self._pin_lock = threading.Lock()
+        #: Transports replaced by a renewal. Kept open until close(): another thread may still be
+        #: mid-request on one, and closing it under that thread raises a bare RuntimeError.
+        self._retired_http: list[httpx.Client] = []
         if self.base_url.lower().startswith("https"):
+            before = _read_pin(cacert) if cacert is not None else None
             try:
                 verify = _build_verify_context(cacert, tls_client_cert, tls_client_key)
             except OSError as exc:  # ssl.SSLError is an OSError
                 # A missing or non-PEM path is operator input, so it surfaces as the ApiError every
                 # caller already handles rather than as a traceback out of a GUI slot or a CLI run.
                 raise ApiError(f"cannot load TLS material for {self.base_url}: {exc}") from exc
-        self._http = httpx.Client(base_url=self.base_url, timeout=timeout, verify=verify)
+            if cacert is not None:
+                self._follows_pin = True
+                # Read on both sides of the build, so the recorded bytes are the ones the context
+                # holds. A rewrite in between leaves them unknown, and the next verification
+                # failure then follows whatever loadable file is there.
+                if before is not None and _read_pin(cacert) == before:
+                    self._pin_pem = before
+        self._http = self._open_transport(verify)
         self._token_cell = _TokenCell()
         self._user: CurrentUser | None = None
         #: Invoked when the engine demands step-up re-verification (403 + X-Step-Up-Required); the GUI
@@ -507,7 +560,76 @@ class EngineClient:
         self.close()
 
     def close(self) -> None:
+        with self._pin_lock:
+            retired, self._retired_http = self._retired_http, []
+        for transport in retired:
+            transport.close()
         self._http.close()
+
+    def _open_transport(self, verify: ssl.SSLContext | bool) -> httpx.Client:
+        return httpx.Client(base_url=self.base_url, timeout=self._timeout, verify=verify)
+
+    def _follow_renewed_pin(self, failed: httpx.Client) -> bool:
+        """After a certificate-verification failure on ``failed``, trust a renewed pinned file.
+
+        True means the caller should retry the request once, on :attr:`_http`.
+
+        The engine renews its self-signed API certificate early, at startup (BACKLOG #1276), and
+        writes it to the file ``cacert`` names. A context reads that file once, when it is built,
+        so without this a long-lived client (the harness monitor, a CLI session, every
+        :meth:`for_polling` clone) fails each request against the restarted engine until it is
+        rebuilt by hand.
+
+        **The trigger is the verification failure itself, not a read of the file per request.**
+        The tray reads its pin every tick because its probes fold every transport error into one
+        DOWN reading and cannot tell a failed handshake from a refused connection. This client can:
+        httpx carries the stdlib ``SSLCertVerificationError`` in the exception chain. So a request
+        that verifies costs nothing extra, and the file is read only on the one event a renewal
+        produces. A retry is safe for any method, because verification fails inside the handshake,
+        before a byte of the request is written.
+
+        **The pin is never dropped or widened.** Only changed bytes that LOAD replace the
+        transport, and the new one pins the same file alone. A missing, unreadable, empty or
+        half-written file keeps the current context and the caller gets the ordinary
+        ``ApiError``; the next failing request looks again. Unchanged bytes mean the engine
+        presented a certificate the pin does not hold, so nothing is rebuilt and the request
+        fails as it always did. Nothing here reaches for the OS trust store or turns
+        verification off.
+
+        A thread that failed on a transport another thread has already replaced retries on the
+        replacement without reloading.
+        """
+        if not self._follows_pin or self._cacert is None:
+            return False
+        with self._pin_lock:
+            if self._http is not failed:
+                return True
+            current = _read_pin(self._cacert)
+            if current is None or current == self._pin_pem:
+                return False
+            try:
+                context: ssl.SSLContext | None = _build_verify_context(
+                    self._cacert, self._tls_client_cert, self._tls_client_key
+                )
+            except OSError:  # ssl.SSLError is an OSError: empty, half-written, not a certificate
+                context = None
+            # A rewrite during the load leaves the context's bytes unknown; try again next time.
+            if context is None or _read_pin(self._cacert) != current:
+                if current != self._pin_refused:
+                    self._pin_refused = current
+                    _log.info(
+                        "engine certificate %s changed but does not load; keeping the current pin",
+                        self._cacert,
+                    )
+                return False
+            self._retired_http.append(self._http)
+            self._http = self._open_transport(context)
+            self._pin_pem = current
+            self._pin_refused = None
+        _log.info(
+            "engine certificate %s has changed; now trusting the renewed certificate", self._cacert
+        )
+        return True
 
     def for_polling(self) -> EngineClient:
         """A second client dedicated to **background (off-thread) reads** — the nav health poll, the
@@ -580,8 +702,12 @@ class EngineClient:
         *,
         _allow_step_up: bool = True,
         _allow_mfa: bool = True,
+        _follow_pin: bool = True,
         **kw: object,
     ) -> httpx.Response:
+        # One read of the transport for this attempt: a renewal on another thread may replace
+        # `_http`, and _follow_renewed_pin needs to know which transport THIS attempt failed on.
+        transport = self._http
         if self._token is not None:
             self._refuse_credential_on_cleartext("a bearer token")
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
@@ -598,7 +724,7 @@ class EngineClient:
         # step, so this asks the same question the transport will answer. ``send`` then dispatches
         # the already-built request, which is exactly what ``request()`` does internally — the auth
         # and follow-redirects client defaults are unchanged.
-        request = self._http.build_request(method, path, headers=headers, **kw)  # type: ignore[arg-type]
+        request = transport.build_request(method, path, headers=headers, **kw)  # type: ignore[arg-type]
         resolved_url = str(request.url)
         if len(resolved_url) > MAX_REQUEST_URL_LEN:
             raise ApiError(
@@ -624,11 +750,28 @@ class EngineClient:
         # escaping as a raw httpx error out of a Qt slot. The over-the-bound refusal is an `ApiError`
         # and so passes through this handler untouched; `_buffer_bounded` releases the connection on
         # its own `finally` either way.
+        #
+        # A certificate-verification failure against a pinned engine gets ONE retry when the pinned
+        # file has been renewed (BACKLOG #1276); see _follow_renewed_pin for why that is the trigger
+        # and why the retry cannot deliver a request twice.
         try:
             response = _buffer_bounded(
-                self._http.send(request, stream=True), limit=MAX_RESPONSE_BYTES
+                transport.send(request, stream=True), limit=MAX_RESPONSE_BYTES
             )
         except httpx.HTTPError as exc:
+            if (
+                _follow_pin
+                and _is_cert_verification_failure(exc)
+                and self._follow_renewed_pin(transport)
+            ):
+                return self._request(
+                    method,
+                    path,
+                    _allow_step_up=_allow_step_up,
+                    _allow_mfa=_allow_mfa,
+                    _follow_pin=False,
+                    **kw,
+                )
             raise ApiError(f"could not reach engine at {self.base_url}: {exc}") from exc
         # Second factor (WP-14, ASVS 6.3.3): the engine refuses a sensitive op with 403 +
         # X-MFA-Required when this session hasn't satisfied MFA. Prompt for a code (the handler calls
@@ -641,8 +784,14 @@ class EngineClient:
             and self._mfa_handler is not None
             and self._mfa_handler()
         ):
+            # A new attempt after a prompt, so it may follow a renewal again.
             return self._request(
-                method, path, _allow_step_up=_allow_step_up, _allow_mfa=False, **kw
+                method,
+                path,
+                _allow_step_up=_allow_step_up,
+                _allow_mfa=False,
+                _follow_pin=True,
+                **kw,
             )
         # Step-up re-verification (ASVS 7.5.3): the engine refuses a sensitive op with 403 +
         # X-Step-Up-Required when this session hasn't re-proved its credential recently. Prompt the
@@ -660,7 +809,12 @@ class EngineClient:
             self._pending_step_up_action = response.headers.get("X-Step-Up-Action")
             if self._step_up_handler():
                 return self._request(
-                    method, path, _allow_step_up=False, _allow_mfa=_allow_mfa, **kw
+                    method,
+                    path,
+                    _allow_step_up=False,
+                    _allow_mfa=_allow_mfa,
+                    _follow_pin=True,
+                    **kw,
                 )
         if response.status_code >= 400:
             raise ApiError(_error_detail(response), status=response.status_code)
