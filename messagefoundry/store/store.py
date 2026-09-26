@@ -9226,22 +9226,20 @@ class MessageStore:
         per-row AES-GCM decrypt + HL7 parse is CPU work). The scan stops after ``spec.scan_limit``
         decrypts (``truncated=True``) or ``limit`` matches, whichever first — the hard cost ceiling that
         keeps this slow-by-construction read safe to expose. The candidate ``SELECT`` is itself capped
-        at ``spec.scan_limit + 1`` rows, so the cap bounds the rows read into memory, not only the
+        at ``spec.fetch_limit`` rows, so the cap bounds the rows read into memory, not only the
         decrypts (BACKLOG #2068)."""
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
         # Read candidates newest-first under one read snapshot; decrypt+match each off the loop. Each
-        # candidate carries the list-view columns plus `raw`, so the SELECT itself is capped (#2068):
-        # without the LIMIT every candidate body was loaded before the scan cap applied. One row past
-        # the cap is fetched so `_scan_rows` can still tell "stopped at the cap" from "saw them all".
+        # candidate carries the list-view columns plus `raw`, hence the LIMIT (see the docstring).
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
                 f" status, error, summary, metadata, raw, {_LAST_EVENT_COLUMN}"
                 f" FROM messages{where}"
                 " ORDER BY received_at DESC, id DESC LIMIT ?",
-                (*params, spec.scan_limit + 1),
+                (*params, spec.fetch_limit),
             )
             candidates = list(await cur.fetchall())
         return await asyncio.to_thread(self._scan_rows, spec, candidates, limit)

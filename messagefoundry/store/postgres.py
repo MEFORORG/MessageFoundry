@@ -6095,8 +6095,7 @@ class PostgresStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
-        # Capped at scan_limit + 1 rows (#2068): each candidate carries `raw`, and one row past the cap
-        # lets `_scan_rows` report `truncated`. See ``MessageStore.search_messages``.
+        # Capped at spec.fetch_limit rows because each candidate carries `raw` (BACKLOG #2068).
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata, raw,"
@@ -6105,7 +6104,7 @@ class PostgresStore:
             f" FROM messages{where}"
             f" ORDER BY received_at DESC, id DESC LIMIT ${len(params) + 1}",
             *params,
-            spec.scan_limit + 1,
+            spec.fetch_limit,
         )
         return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
 

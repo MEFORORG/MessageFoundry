@@ -13,9 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
@@ -30,7 +29,6 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.content_search import (
     ContentSearchError,
-    SearchSpec,
     SearchTarget,
     make_spec,
     row_matches,
@@ -184,59 +182,16 @@ async def test_scan_cap_truncates(tmp_path: Path) -> None:
         await store.close()
 
 
-def _count_fetched(store: Any, monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """Spy on the store's `_scan_rows` and record how many candidate rows the SELECT handed it --
-    the rows read into memory, which is what BACKLOG #2068 bounds, not the rows decrypted."""
-    fetched: list[int] = []
-    real = store._scan_rows
-
-    def _spy(spec: SearchSpec, candidates: Sequence[Any], limit: int) -> Any:
-        fetched.append(len(candidates))
-        return real(spec, candidates, limit)
-
-    monkeypatch.setattr(store, "_scan_rows", _spy)
-    return fetched
-
-
-@pytest.mark.parametrize(
-    ("seeded", "fetched", "scanned", "truncated"),
-    [
-        # Exactly scan_limit candidates: all read, none left over, so NOT truncated.
-        (3, 3, 3, False),
-        # One past the cap: the extra row is read only to prove the scan stopped short.
-        (4, 4, 3, True),
-        # Well past the cap: still scan_limit + 1 rows read. Without the LIMIT this reads 12, and
-        # the (4, 4) arm above cannot tell the difference, which is why this arm exists.
-        (12, 4, 3, True),
-    ],
-)
 async def test_scan_cap_bounds_the_rows_fetched(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    seeded: int,
-    fetched: int,
-    scanned: int,
-    truncated: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #2068: the candidate SELECT is capped at scan_limit + 1, so a search reads at most that
     many bodies into memory however large the store is, and `truncated` stays exact at the edge."""
+    from tests._content_search_contract import assert_search_select_is_capped
+
     store = await MessageStore.open(tmp_path / "enc.db", cipher=make_cipher(generate_key()))
     try:
-        for i in range(seeded):
-            await store.enqueue_message(
-                channel_id="IB_A", raw=ADT2, deliveries=[], control_id=f"C{i}"
-            )
-        counts = _count_fetched(store, monkeypatch)
-        spec = make_spec(
-            content="no-such-needle-xyz", field_path=None, field_value=None, scan_limit=3
-        )
-        result = await store.search_messages(spec)
-        assert counts == [fetched]
-        assert result.scanned == scanned and result.truncated is truncated
-        # The metadata pre-filter path is capped the same way.
-        counts.clear()
-        result = await store.search_messages(spec, channel_id="IB_A")
-        assert counts == [fetched] and result.truncated is truncated
+        await assert_search_select_is_capped(store, monkeypatch)
     finally:
         await store.close()
 
