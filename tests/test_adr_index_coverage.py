@@ -151,3 +151,43 @@ def test_the_shared_companion_predicate(ledger_check: ModuleType) -> None:
     assert not ledger_check.row_names_file(row, "0013-stray.md")
     assert ledger_check.index_row(README_HEAD + row + "\n", "0013") == row
     assert ledger_check.index_row(README_HEAD + row + "\n", "0014") == ""
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [
+        "0013-mai.md",  # a prefix of the row's own link
+        "0013-design-v2.md",  # the companion's name plus a suffix: a prefix match the other way
+        "0013-desig.md",
+        "0013-main.m.md",
+    ],
+)
+def test_a_near_miss_filename_is_not_named_by_the_row(ledger_check: ModuleType, stray: str) -> None:
+    # BACKLOG #2001. The predicate was `basename.removesuffix(".md") in row`, a substring test, so
+    # `0013-mai` matched inside `0013-main.md` and the stray file read as a declared companion.
+    row = "| [0013](0013-main.md) | Main. Companion: [0013-design](0013-design.md) | Accepted |"
+    assert not ledger_check.row_names_file(row, stray)
+
+
+@pytest.mark.parametrize(
+    "target", ["0013-design.md", "./0013-design.md", "docs/adr/0013-design.md", "0013-design.md#a"]
+)
+def test_every_accepted_link_form_names_the_file(ledger_check: ModuleType, target: str) -> None:
+    row = f"| [0013](0013-main.md) | Main. Companion: [design]({target}) | Accepted |"
+    assert ledger_check.row_names_file(row, "0013-design.md")
+
+
+def test_a_near_miss_file_in_the_corpus_is_reported(
+    tmp_path: Path, ledger_check: ModuleType
+) -> None:
+    # The ledger item's own example, through the corpus check that shares the predicate.
+    adr = _corpus(
+        tmp_path,
+        rows=["| [0001](0001-first.md) | First | Accepted |"],
+        files=["0001-first.md", "0001-fir.md"],
+    )
+
+    coverage = ledger_check.adr_index_coverage(adr)
+
+    assert coverage.unrepresented == ["0001-fir.md"]
+    assert coverage.companions == []

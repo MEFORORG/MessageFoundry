@@ -43,6 +43,11 @@ ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
 #: invisible to the companion check and to adr_index_coverage. `[ \t]*`, not `\s*`: under re.M a
 #: `\s*` crosses a newline, so findall over the whole file could count a row index_row never sees.
 INDEX_ROW = re.compile(r"^\|[ \t]*\[(\d{4})\]", re.M)
+#: A Markdown link target that names an ADR file from docs/adr/README.md (BACKLOG #2001): the
+#: sibling form `(NNNN-name.md)`, or `(./NNNN-name.md)` or `(docs/adr/NNNN-name.md)`, with an
+#: optional `#fragment`. Group 1 is the basename. A space is allowed in it because ADR_FILE allows
+#: one (BACKLOG #1871).
+ADR_LINK = re.compile(r"\]\((?:\./|docs/adr/)?(\d{4}-[^)/#]+\.md)(?:#[^)]*)?\)")
 
 #: How far back the restore carve-out (BACKLOG #1468) will look for a blob one ADR path once carried.
 #: Bounded because this runs inside a pre-commit hook; see Ledger._history_of_this_number, which
@@ -169,8 +174,12 @@ def row_names_file(row: str, basename: str) -> bool:
     tell a declared companion from an undeclared reuse of a number. adr_index_coverage uses it to ask
     whether every existing file is represented. Two copies of this test would drift apart silently,
     so there is one.
+
+    EXACT LINK TARGETS, NOT A SUBSTRING (BACKLOG #2001). The test used to be
+    `basename.removesuffix(".md") in row`, so a stray `0001-fir.md` passed under a row naming
+    `0001-first.md`. Now the file must be a link target in the row, as ADR_LINK reads one.
     """
-    return basename.removesuffix(".md") in row
+    return basename in ADR_LINK.findall(row)
 
 
 class AdrCoverage(NamedTuple):

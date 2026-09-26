@@ -174,6 +174,20 @@ def test_a_declared_companion_under_the_same_number_is_allowed(repo: Path) -> No
     assert code == 0, out
 
 
+def test_a_NEAR_MISS_of_the_rows_filename_is_not_a_declared_companion(repo: Path) -> None:
+    """BACKLOG #2001. `0001-fir` is a substring of the row's `0001-first.md`, and that used to pass.
+
+    The row names no such file, so this is an undeclared reuse of 0001: the collision the gate stops.
+    """
+    write(repo, "docs/adr/0001-fir.md", "# 0001 -- Stray\n")
+    allocate(repo, "adr", "0001")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 already exists" in out
+
+
 def test_a_new_adr_number_must_be_allocated(repo: Path) -> None:
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
