@@ -11,7 +11,8 @@ runs everywhere, in two halves:
    written reason. It reads the emitted SQL from the AST, for the reason that file gives.
 2. **Behaviour against fake cursors**: a rejected resolve rolls back, never commits, re-pends
    through ``release_claimed`` (D1) and counts once. The unfenced path is character-identical to
-   pre-Inc-3 and never reads the rowcount.
+   pre-Inc-3 and reads no result. The fake cursor reports ``rowcount`` as ``-1``, so a fence that
+   trusts it cannot pass here.
 
 No test here cancels a statement mid-flight. That path can natively crash pyodbc on SQL Server, and
 it is a separate ledger item, not this increment's.
@@ -240,10 +241,10 @@ class _NoRead(AssertionError):
 
 
 class _Cursor:
-    """Records every statement, and models a pooled connection under ``SET NOCOUNT ON``.
+    """Records every statement, and models a session-wide ``SET NOCOUNT ON``.
 
-    ``rowcount`` is always ``-1``, which is what the hosted SQL Server legs showed a guarded UPDATE
-    reporting there, so a fence that trusts ``rowcount`` never fires against this cursor. The truth
+    ``rowcount`` is always ``-1``, the DB-API "not reported" value, so a fence that trusts
+    ``rowcount`` never fires against this cursor. The truth
     is the OUTPUT rowset: after a queue status UPDATE ``fetchall`` returns ``matched`` rows. It RAISES
     when ``read_forbidden`` is set, which is how a test proves the unfenced path reads nothing."""
 

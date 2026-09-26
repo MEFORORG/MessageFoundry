@@ -655,13 +655,13 @@ def _render_batch(group: Sequence[tuple[str, tuple[Any, ...]]]) -> tuple[str, tu
     the same ``SET NOCOUNT ON`` (via the finalize applock) on every handoff, so batching adds no new
     exposure.
 
-    **CORRECTED 2026-09-26 (ADR 0157 Inc 3, PR 1576 CI).** This docstring used to say NOCOUNT does
-    not corrupt the ``cursor.rowcount``-dependent ops because ``SQLRowCount`` is still populated. On
-    the hosted SQL Server legs a guarded UPDATE that matched NO row, run under ``SET NOCOUNT ON``, did
-    not report 0. So a reader that branches on a zero rowcount can take the wrong branch on a pooled
-    connection. The ADR 0075 parity test does not guard this: it does not pin the connection, it
-    asserts ``>= 1``, and it never runs a zero-match statement. The epoch fence was moved to an OUTPUT
-    rowset for this reason. The other rowcount readers were not examined."""
+    **CORRECTED 2026-09-26 (ADR 0157 Inc 3, PR 1576 CI).** This docstring used to say
+    ``SQLRowCount`` is still populated under NOCOUNT. With a session-wide ``SET NOCOUNT ON`` (an
+    unparameterized batch), a zero-match UPDATE did NOT report 0 on the hosted SQL Server legs. This
+    batch runs parameterized, and SQL Server restores NOCOUNT when that call returns, so by reading it
+    does not leak; ``test_resend_plain_parity_ss`` backs that by reading rowcount 0 right after the
+    applock. The ADR 0075 parity test below does not guard it: it does not pin the connection, asserts
+    ``>= 1``, and never runs a zero-match statement. Keep this batch parameterized."""
     parts = ["SET NOCOUNT ON;"]
     params: list[Any] = []
     for sql, p in group:
@@ -962,8 +962,8 @@ _EPOCH_GUARD_RESOLVE = (
 )
 
 #: Spliced between a fenced resolve's SET list and its WHERE, so the rows the UPDATE touched come back
-#: as a rowset. The fence reads THAT, never ``cursor.rowcount``, which ``SET NOCOUNT ON`` suppresses
-#: (see ``SqlServerStore._exec_terminal``). Only present when the guard is.
+#: as a rowset. The fence reads THAT, never ``cursor.rowcount``, which a session-wide
+#: ``SET NOCOUNT ON`` suppresses (see ``SqlServerStore._exec_terminal``). Only present with the guard.
 _RESOLVE_OUTPUT = " OUTPUT inserted.id"
 
 
@@ -3695,8 +3695,9 @@ class SqlServerStore:
         """Run a TERMINAL resolve UPDATE, raising :class:`_FencedWrite` when the fence rejected it.
 
         When ``checked``, the UPDATE carries ``OUTPUT inserted.id`` and a rejection is an EMPTY rowset.
-        Never ``cursor.rowcount``: under the ``SET NOCOUNT ON`` pooled connections keep, a zero-match
-        UPDATE did not report 0 on the hosted SQL Server legs, so the fence never fired. ``checked`` is
+        Never ``cursor.rowcount``: under a session-wide ``SET NOCOUNT ON`` a zero-match UPDATE did not
+        report 0 on the hosted SQL Server legs. Production is not believed to leave NOCOUNT on (ADR
+        0157, Inc 3 as built), but the OUTPUT rowset does not depend on it either way. ``checked`` is
         False when no guard was spliced, so the unfenced path reads nothing."""
         await cur.execute(sql, params)
         if checked and not await cur.fetchall():

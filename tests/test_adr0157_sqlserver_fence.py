@@ -312,9 +312,9 @@ async def test_fenced_batch_is_all_or_nothing_and_repends_every_member(store: An
 def _force_nocount(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """Run ``SET NOCOUNT ON`` on every cursor this store opens.
 
-    That is the production state: the finalize applock opens with ``SET NOCOUNT ON`` and a pooled
-    connection keeps it. A fresh test store has not run a finalize yet, so without this a fence test
-    can pass against a row count production never sees."""
+    A STRESS state, not the production one: production sets NOCOUNT only inside parameterized
+    calls, which SQL Server restores on return. Under a session-wide NOCOUNT ``cursor.rowcount`` did
+    not report 0 for a zero-match UPDATE, so these tests pin that the fence does not depend on it."""
     real_cursor = store._cursor
 
     @asynccontextmanager

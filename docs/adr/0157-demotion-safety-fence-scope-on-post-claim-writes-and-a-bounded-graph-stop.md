@@ -626,16 +626,25 @@ mid-flight.
    > **Corrected 2026-09-26, on PR 1576's first CI run.** The first build read `cursor.rowcount`, and
    > this item said a gated test pinned that the count arrives under `SET NOCOUNT ON`. **That was
    > false, and the test that said so failed** on both SQL Server legs (jobs 108370811011 and
-   > 108370810994). Under NOCOUNT a guarded UPDATE that matched no row did not report 0, so the fence
-   > did not fire. This matters in production. The finalize applock opens with `SET NOCOUNT ON`, the
-   > setting is session-scoped, and a pooled connection keeps it, so almost every resolve runs under
-   > it. The other gated fence tests passed only because each opens a fresh store whose connections
-   > had not yet run a finalize. As first built, **the resolve fence would have been inert on almost
-   > every write of a real deployment**, with every test green. The claim guards were never affected,
-   > because they read the claimed rows, not a count. The exact value reported is not recorded: the
-   > failing assertion shows only that it was not 0. The fix reads the OUTPUT rowset, which SQL Server
-   > returns whatever NOCOUNT says, as the claim paths already do. Two gated tests now force
-   > `SET NOCOUNT ON` on every cursor and check both directions.
+   > 108370810994). With `SET NOCOUNT ON` in force for the session, a guarded UPDATE that matched no
+   > row did not report 0, so a rowcount check did not fire. The exact value is not recorded; the
+   > failing assertion shows only that it was not 0.
+   >
+   > **What that says about production is narrower, and it is a reading, not a measurement.** That
+   > test turned NOCOUNT on with an unparameterized `SET NOCOUNT ON;`, which lasts for the session.
+   > Every production site found that sets NOCOUNT (the finalize applock, `_render_batch`, the claim
+   > batch and procs, `list_fifo_lanes`) runs it inside a parameterized statement or a procedure, and
+   > SQL Server restores NOCOUNT when that call returns. One gated test backs this:
+   > `tests/test_sqlserver_store.py::test_resend_plain_parity_ss` passes on both legs, and it needs
+   > `cursor.rowcount` to read exactly 0 right after the applock on the same cursor. So the first build
+   > was probably not inert in production. An earlier revision of this note said it would have been
+   > inert "on almost every write"; that claim rested on a session-persistence premise the evidence
+   > above contradicts, and it is withdrawn.
+   >
+   > The fence reads the OUTPUT rowset anyway. SQL Server returns that rowset whatever NOCOUNT says,
+   > as the claim paths already rely on, so the fence no longer depends on a session setting nobody
+   > can see at the call site. Two gated tests force a session-wide `SET NOCOUNT ON` on every cursor
+   > and check both directions. That is a stress state, not the production state.
 3. **The claim guard became one constant.** The three FIFO claims carried it as an inline literal. It
    is now `_EPOCH_GUARD_CLAIM`, byte-identical, and a test pins that.
 
@@ -673,10 +682,10 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
 - A cancel that commits a `claim_fifo_heads` claim leaves the row for the next start or promotion, as
   above.
 - A laptop run proves nothing about the T-SQL. The runtime tests skip without a server.
-- Other store methods still read `cursor.rowcount` on pooled connections that may have NOCOUNT ON:
-  `reset_stale_inflight`'s recovered count, `_execute`'s return value, the purge counts and others.
-  None of them gates a write the way the fence does, but their counts may be wrong on a reused
-  connection. Recorded, not examined here.
+- At least six other store methods decide a write on `cursor.rowcount`, among them `resend_to`'s
+  exactly-once gate, `reingress`, the attachment increfs, `rekey_audit_chain` and
+  `upsert_alert_instance`. They are correct only while no session-wide `SET NOCOUNT ON` is in force.
+  By the reading above none is; that is not measured for a zero-match statement in general.
 - **Flagged for a decision, not built.** C1 leaves `mark_failed`'s retry branch unguarded, and on SQL
   Server it has no `status='inflight'` conjunct either. So a stalled ex-leader whose send then fails
   can re-pend a row the successor already finished as DONE, and the row is sent again. That is a
