@@ -655,7 +655,13 @@ enforce` the bind is refused *even with it*. Treat the flag as a lab tool, not a
 and answered **`202 Accepted`** carrying the engine `message_id` the instant it is durably committed — the
 HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery failure happens *after* the
 `202` and is **not** reflected in the HTTP status; it surfaces as the message's `ERROR`/dead-letter
-disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A **pre-ingress** refusal answers
+disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A body the engine **refuses at
+ingress**, after reading it, answers **`422`** with `{"error":"message was not accepted"}` and no
+`message_id`. That covers at least an undecodable body, a NUL in a text body, a body over the engine's
+ingress ceiling, a body that does not match the declared `content_type`, and an HL7 parse or strict-validation
+failure. The message is still recorded, with status `ERROR`, so it is counted and never silently dropped
+(owner ruling 2026-09-26, [ADR 0154 amendment](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths)).
+A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
 request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
 `max_header_bytes`), `400` (a malformed request line or header, or framing this listener will not guess at -- including at least any `Transfer-Encoding`, a duplicated or non-digit `Content-Length`, whitespace before a header colon, a folded header line, a bare CR or LF, a control character in a header value, an HTTP version other than 1.x, a missing `Host` on any version but HTTP/1.0, more than one `Host`, and a non-zero body declared on a method other than `POST`/`PUT`/`PATCH`), `411` (a `POST`/`PUT`/`PATCH` with no `Content-Length`; the body is never read to EOF), `503` (at
@@ -668,8 +674,9 @@ then returns that reply as the response body — a proxy API rather than a recei
 the sole authority** for the returned bytes: every in-process signal is only a latency hint and the waiter
 re-reads the store, which is what keeps this correct under engine sharding, HA failover, every claim mode,
 and any race between the capturing worker and the reader. A reply is therefore returned only once it is
-durable and replayable. An inbound **without** `reply_from` keeps the `202`-on-receipt path above byte for
-byte.
+durable and replayable. An inbound **without** `reply_from` keeps the receipt path above: `202` for a
+committed body, `422` for a body refused at ingress. A `reply_from` inbound answers that same `422` for a
+refused body, before it would wait for any reply.
 
 Refused at **check time** (`messagefoundry check`) rather than at runtime: a `reply_from` naming no
 deployed outbound; an outbound that does not capture responses; `reply_content_type="passthrough"` against
