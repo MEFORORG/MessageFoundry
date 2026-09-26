@@ -56,6 +56,7 @@ import io
 import logging
 import posixpath
 import ssl
+import threading
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
@@ -132,6 +133,9 @@ RETRIEVE_CHUNK_BYTES = 1024 * 1024  # 1 MiB
 #: This bounds each individual read, not the whole transfer. A slow but live transfer keeps resetting
 #: it, so a large file over a thin link is unaffected; only a peer that goes silent for this long is
 #: cut off. The refusal is transient -- the caller retries it.
+#:
+#: The same value bounds opening the SFTP session, before the first read (BACKLOG #1936; see
+#: :func:`_open_sftp_within`).
 SFTP_CHANNEL_READ_TIMEOUT_SECONDS = 120.0
 
 
@@ -663,6 +667,61 @@ def _bound_sftp_channel_reads(sftp: Any) -> None:
     sock.settimeout(SFTP_CHANNEL_READ_TIMEOUT_SECONDS)
 
 
+def _open_sftp_within(client: Any, seconds: float) -> Any:
+    """``client.open_sftp()``, refused as a transient :class:`_RemoteError` if it takes longer than
+    ``seconds`` (BACKLOG #1936, ASVS 15.4.4).
+
+    THIS DOCSTRING IS THE ONE PLACE THE PARAMIKO FACTS BELOW ARE STATED; the tests and
+    ``docs/CONNECTIONS.md`` point here rather than restating them. Read against paramiko 5.0.0.
+
+    Opening the session waits on the server at least three times after authentication.
+    ``Transport.open_channel`` waits for the channel open for ``channel_timeout``, an hour by
+    default. ``Channel.invoke_subsystem`` then waits on a bare ``threading.Event.wait()`` for the
+    reply to the ``sftp`` subsystem request. Last, ``SFTPClient.__init__`` reads the server's VERSION
+    packet from a channel with no socket timeout yet, because :func:`_bound_sftp_channel_reads` can
+    only run once this call returns. Without this bound, a peer that authenticates and then goes
+    silent would park the calling worker thread on first deployment, for good at either of the last
+    two waits.
+
+    Those waits take no timeout, so the open runs on a helper thread and the caller waits for it
+    with one. Past ``seconds`` the caller closes the whole client and raises. ``Transport.close``
+    marks the transport inactive and closes every channel. That sets the event the subsystem wait is
+    parked on and closes the buffer the VERSION read is parked on, so the helper normally returns
+    promptly with an error nobody reads. ``_op`` closes the client in its own ``finally`` anyway, so
+    closing it early loses nothing.
+
+    **The caller returns once the bound passes and the close completes; the helper almost always
+    does too.** One narrow race
+    is paramiko's: ``invoke_subsystem`` checks the channel is open and only then clears its event, so
+    a close landing between those two steps is erased and nothing wakes the wait after it. A helper
+    caught in that window of a few bytecodes stays parked on a closed transport. It is a daemon
+    thread outside the shared pool, which is why the open runs on one rather than on the caller.
+    """
+    done = threading.Event()
+    outcome: list[Any] = []
+    failure: list[BaseException] = []
+
+    def _open() -> None:
+        try:
+            outcome.append(client.open_sftp())
+        except BaseException as exc:  # handed to the caller below, never lost
+            failure.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=_open, name="mefor-sftp-open", daemon=True).start()
+    if not done.wait(seconds):
+        client.close()
+        raise _RemoteError(
+            f"SFTP session open timed out after {seconds:g}s: the server authenticated and then did "
+            "not finish the channel open, the sftp subsystem request or the SFTP version exchange",
+            permanent=False,
+        )
+    if failure:
+        raise failure[0]
+    return outcome[0]
+
+
 class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
@@ -838,7 +897,7 @@ class _SftpClient(_RemoteClient):
         except (OSError, EOFError) as exc:
             raise _RemoteError(f"SFTP connect failed: {exc}", permanent=False) from exc
         try:
-            sftp = client.open_sftp()
+            sftp = _open_sftp_within(client, SFTP_CHANNEL_READ_TIMEOUT_SECONDS)
             _bound_sftp_channel_reads(sftp)
             try:
                 return fn(sftp)
