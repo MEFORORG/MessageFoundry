@@ -527,7 +527,7 @@ class ConnectionRow(BaseModel):
     channel_name: str
     destination: str | None  # destination name; None for the source row
     name: str  # display name
-    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running) | "log_halted" (outbound: the engine cannot write its application log and has fail-closed, so NO lane delivers, #122 ADR 0189 — process-wide and NOT an operator pause; the fix is the disk, not this row's start button)
+    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced, OR the graph is not running at all, #1568/#1814 — so purge-eligibility is the separate ``paused`` field, never this word) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running) | "log_halted" (outbound: the engine cannot write its application log and has fail-closed, so NO lane delivers, #122 ADR 0189 — process-wide and NOT an operator pause; the fix is the disk, not this row's start button)
     direction: str  # "in" (source) | "out" (destination)
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
@@ -650,8 +650,9 @@ class StatsResponse(BaseModel):
     # backend reports 0 (counting is wired on SQLite + SQL Server).
     committed_txns: int = 0
     body_copies: int = 0
-    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres only; 0
-    # elsewhere). Non-zero == a superseded ex-leader was stopped mid-write. MUST be declared here:
+    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres and SQL
+    # Server; 0 on SQLite). Non-zero == a superseded ex-leader was stopped mid-write. MUST be
+    # declared here, because
     # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
     # and /stats would never grow the field.
     fenced_writes: int = 0

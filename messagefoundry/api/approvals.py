@@ -119,7 +119,8 @@ class _Operation:
 
 class ApprovalError(Exception):
     """A pending-approval decision could not be made. ``status`` is the HTTP code the API should map
-    to — at least 404 unknown, 409 already-decided/expired/unapprovable, 403 self-approval."""
+    to — at least 404 unknown, 409 already-decided/expired/unapprovable, 403 self-approval, and 503
+    when the audit log refuses the release row (the operation is then not run)."""
 
     def __init__(self, status: int, detail: str) -> None:
         super().__init__(detail)
@@ -247,7 +248,14 @@ class ApprovalGate:
         ``[approvals].expiry_hours`` apart (``users.username`` became mutable in BACKLOG #1532), so a
         name comparison is wrong in both directions: a requester renamed inside the window passes the
         refusal and releases their own request, and whoever is later given the freed name is refused
-        as a self-approver they are not. ``users.id`` never changes, so it is the key."""
+        as a self-approver they are not. ``users.id`` never changes, so it is the key.
+
+        **The audit log must accept the release before the operation runs (BACKLOG #1940).** An
+        ``approval.release_attempted`` row is written first; if that write fails the approve is
+        refused with 503 and the request stays pending. Once the operation has run, a failed
+        ``approval.approved`` AUDIT write is logged at ERROR and the release still reports success.
+        A failed ``executing`` to ``approved`` STATUS write still raises (BACKLOG #1562); see
+        :meth:`_record_approved_execution`."""
         row = await self._require_pending(approval_id)
         requester_user_id = row["requester_user_id"]
         if not requester_user_id:
@@ -336,6 +344,42 @@ class ApprovalGate:
         # sits between the transition and the executor. The flag is written in the `finally` below.
         changed = await self._approver_changes(approver_user_id, float(row["requested_at"]))
         requester = str(row["requester"])
+        # BACKLOG #1940: prove the audit log can record this release BEFORE anything moves. The
+        # approval.approved row is written only after the executor has run, so an audit log that
+        # refused writes would otherwise let a replay or reload complete with no record of the
+        # release. This row names both identities, so a completed operation always has one. It sits
+        # before the claim so that a refusal leaves the request exactly as it was: still pending,
+        # nothing executed, and the approver can simply approve again.
+        #
+        # What it costs: at least a release that then loses the double-approve race, meets a
+        # concurrent reject, is cancelled before its claim commits, or whose claim raises, leaves
+        # this row with no outcome row (approval.approved, approval.failed or approval.interrupted)
+        # after it. That is why it says ATTEMPTED. The request row's status, and the winner's own
+        # rows, say what won.
+        try:
+            await self._store.record_audit(
+                "approval.release_attempted",
+                actor=approver,
+                detail=json.dumps(
+                    {
+                        "approval_id": approval_id,
+                        "operation": operation,
+                        "requester": requester,
+                    }
+                ),
+                client=client,  # ADR 0150: the approver's address, matching this row's actor
+            )
+        except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+            log.exception(
+                "approval %s: the audit log refused the release row, so the operation was not run "
+                "and the request is still pending",
+                approval_id,
+            )
+            raise ApprovalError(
+                503,
+                "the audit log could not record this release, so the operation did not run and the "
+                "request is still pending; approve it again once the audit log accepts writes",
+            ) from exc
         # Claim the row FIRST (atomic, guards a double-approve race); only then execute. The claim
         # moves it to 'executing', not 'approved' (BACKLOG #1562): 'approved' is written only once the
         # executor has returned, so the status never asserts an outcome the gate has not seen.
@@ -465,10 +509,11 @@ class ApprovalGate:
         """Move a completed release from ``executing`` to ``approved`` and write ``approval.approved``.
 
         The audit row is written even when the status write fails, because the operation ran either
-        way. A failure of either write raises to a caller that is still waiting, as the audit write
-        did before BACKLOG #1562; once the caller is cancelled, :func:`_shielded` logs it. Which record
-        should win when the operation ran and its audit write fails is BACKLOG #1940, and is not
-        decided here."""
+        way. The two writes fail differently. A failed STATUS write raises to a caller that is still
+        waiting (BACKLOG #1562), and the row may be left ``executing``. A failed AUDIT write is logged at
+        ERROR with the lost detail and does not raise (BACKLOG #1940): the operation has run, and the
+        ``approval.release_attempted`` row written before the claim already records the release
+        against both identities. Once the caller is cancelled, :func:`_shielded` logs any error."""
         settle_error: Exception | None = None
         try:
             # Guarded on 'executing', so it can only move the row this call claimed.
@@ -491,22 +536,41 @@ class ApprovalGate:
                 approval_id,
             )
             settle_error = exc
-        await self._store.record_audit(
-            "approval.approved",
-            actor=approver,
-            detail=json.dumps(
-                {
-                    "approval_id": approval_id,
-                    "operation": operation,
-                    "requester": requester,
-                    "result": result,
-                }
-            ),
-            # ADR 0150: the APPROVER's address — matching this row's actor. The requester's own
-            # address is on their earlier approval.requested row, so dual control records both
-            # halves of the ceremony from two independently-attributed hosts.
-            client=client,
+        # BACKLOG #1940: the operation HAS run by this point, so a failed audit write here must not
+        # turn into an error. A 500 would tell the approver the release failed, and a re-request
+        # would run a replay or a reload a second time. The approval.release_attempted row already
+        # records the release against both identities. What is lost is the result summary, so the
+        # loss is logged at ERROR, result included (the executors return counts and step names,
+        # never message content).
+        #
+        # The detail is built OUTSIDE the try, so a result that cannot be serialized is still a
+        # loud programming error rather than a line blaming the audit log.
+        approved_detail = json.dumps(
+            {
+                "approval_id": approval_id,
+                "operation": operation,
+                "requester": requester,
+                "result": result,
+            }
         )
+        try:
+            await self._store.record_audit(
+                "approval.approved",
+                actor=approver,
+                detail=approved_detail,
+                # ADR 0150: the APPROVER's address — matching this row's actor. The requester's own
+                # address is on their earlier approval.requested row, so dual control records both
+                # halves of the ceremony from two independently-attributed hosts.
+                client=client,
+            )
+        except Exception:  # noqa: BLE001 - see above; the operation already ran
+            log.exception(
+                "approval %s: operation '%s' RAN, but its approval.approved audit row failed; the "
+                "approval.release_attempted row still records the release. Lost detail: %s",
+                approval_id,
+                operation,
+                approved_detail,
+            )
         if settle_error is not None:
             raise settle_error
 

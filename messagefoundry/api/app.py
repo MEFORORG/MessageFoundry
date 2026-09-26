@@ -507,6 +507,23 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     return f"outbound {name!r} is not running — start it before resending"
 
 
+def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
+    """One outbound's live display state, gated on the runner's own ``running`` flag.
+
+    ``outbound_status`` reports "running" for any lane merely ABSENT from ``_outbound_paused`` and never
+    reads the graph flag, so ungated it answers "running" on a node whose graph is down -- the ADR 0157
+    demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
+    reads of ``outbound_status`` go through here so the rows and graph nodes built from it cannot
+    disagree (BACKLOG #1568 gated the standalone row; #1814 the traffic-edge row and
+    ``/graph/edges``). The literal "draining" an edge row gives an outbound the live graph no longer
+    declares is NOT a read of it and is not gated here.
+
+    ``outbound_status`` itself stays ungated on purpose: ``_outbound_down_detail`` asks it only whether
+    the cause is a log halt. A log halt still surfaces here while the graph is up, because neither halt
+    site clears ``_running``; only a teardown does, and a torn-down lane is honestly "stopped"."""
+    return rr.outbound_status(name) if rr.running else "stopped"
+
+
 def _backlog(depth: int, recent: int) -> float | None:
     """Estimated seconds to clear the queue: 0 if empty, None if queued but nothing draining."""
     if depth == 0:
@@ -711,12 +728,22 @@ def _build_approval_gate(
             # The actor is the REQUESTER, matching the inline row; no `client` accompanies it, per
             # _record_reload_audit's docstring (ADR 0150).
             requester = p.get("requester")
-            await engine.store.record_audit(
-                "dead_letter_replay",
-                actor=str(requester) if requester else None,
-                channel_id=channel_id,
-                detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
-            )
+            # BACKLOG #1940: the deliveries are already re-queued. A raise here would reach the
+            # gate's ASVS 2.3.3 compensation and record a replay that ran as 'failed'. Log instead:
+            # approval.approved still carries this executor's {"requeued": N} result.
+            try:
+                await engine.store.record_audit(
+                    "dead_letter_replay",
+                    actor=str(requester) if requester else None,
+                    channel_id=channel_id,
+                    detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
+                )
+            except Exception:  # noqa: BLE001 - every store backend raises its own type
+                _log.exception(
+                    "released replay re-queued %d deliveries, but its dead_letter_replay audit "
+                    "row failed",
+                    requeued,
+                )
         return {"requeued": requeued}
 
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
@@ -752,17 +779,25 @@ def _build_approval_gate(
         # gate surfaces it). The same fingerprint-bearing config_reload audit row is written so the
         # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
         config_dir = p.get("config_dir")
+        # Read BEFORE the reload (BACKLOG #1940): a KeyError raised after the swap would reach the
+        # gate's compensation and record a reload that ran as 'failed'.
+        actor = str(p["requester"])
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
         outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
         registry = outcome.registry
-        await _record_reload_audit(
-            engine,
-            actor=str(p["requester"]),
-            dir_arg=config_dir,
-            failed_steps=[f.step for f in outcome.failures],
-        )
+        # BACKLOG #1940: the graph has swapped. A raise here would be compensated into 'failed' for
+        # a reload that ran, so log instead; approval.approved still records the release.
+        try:
+            await _record_reload_audit(
+                engine,
+                actor=actor,
+                dir_arg=config_dir,
+                failed_steps=[f.step for f in outcome.failures],
+            )
+        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            _log.exception("released config reload swapped the graph, but its audit row failed")
         return {
             "inbound": len(registry.inbound),
             "outbound": len(registry.outbound),
@@ -2349,7 +2384,7 @@ def create_app(
                         else (
                             "failed"
                             if dfail
-                            else ("filtered" if dfiltered else rr.outbound_status(dname))
+                            else ("filtered" if dfiltered else _live_outbound_status(rr, dname))
                         )
                     )
                 else:
@@ -2421,7 +2456,8 @@ def create_app(
             # the moment an operator reached for it and recovery would mean the JSON API. Recording the
             # state unconditionally also means a state added later surfaces here with no edit.
             #
-            # `rr.running` gates the live state because `outbound_status` reports "running" for any lane
+            # `rr.running` gates the live state (`_live_outbound_status`, shared with the traffic-edge row
+            # above and `/graph/edges` since #1814) because `outbound_status` reports "running" for any lane
             # merely ABSENT from `_outbound_paused` — it never consults the graph flag (the same trap
             # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
             # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
@@ -2438,11 +2474,7 @@ def create_app(
                 # and silently omit the rest. The `rr.running` gate does not mask it as "stopped":
                 # neither halt site clears `_running` (the mid-run halt leaves it set, and a start
                 # into an unwritable log starts HALTED rather than refusing), so only a teardown does.
-                status = (
-                    "not_deployed"
-                    if not oc.deployed
-                    else (rr.outbound_status(oname) if rr.running else "stopped")
-                )
+                status = "not_deployed" if not oc.deployed else _live_outbound_status(rr, oname)
                 standalone[oname] = (status, None)
             # BACKLOG #1817: `null` on a count means "not measured" and `0` means "measured as zero", and
             # a standalone row can be either. The metrics above group EVERY outbound-stage queue row, and
@@ -5468,7 +5500,8 @@ def create_app(
                 return "failed"
             if rr.outbound_filtered(name):
                 return "filtered"
-            return rr.outbound_status(name)
+            # Gated (#1814): the inbound node beside it already reads "stopped" on a down graph.
+            return _live_outbound_status(rr, name)
 
         # Node set: every inbound/outbound connection + every router/handler, keyed by (kind, name).
         nodes: dict[tuple[str, str], GraphNode] = {}

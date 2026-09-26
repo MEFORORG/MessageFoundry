@@ -749,6 +749,193 @@ async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id(
         await store.close()
 
 
+async def test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name() -> None:
+    """ADR 0184 AC-5 for the binding slice C does not reach (BACKLOG #2027).
+
+    ``legacy`` is bound while carrying no id, the state a binding made before slice C is in; it is
+    planted through the store, because the bind now refuses it. Its only directory key is its
+    name, so the pass must not ask about it at all. It is skipped the way an account the pass cannot
+    ask about is skipped: its session is left alone, not revoked, and the skip is audited once.
+
+    Two controls share the pass. An id-bearing bound row is still probed by its id, and an UNBOUND
+    id-less row is still probed by name, so the name-keyed arm is narrowed to exactly the bound
+    rows rather than switched off.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "jdoe": _principal("jdoe"),
+                "nobody": replace(_principal("nobody"), directory_object_id=None),
+                "legacy": replace(_principal("legacy"), directory_object_id=None),
+            }
+        )
+        settings = _ad_settings(oidc_issuer="https://idp.test.invalid")
+        service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+        await _signed_in_ad_user(service, store, "nobody")
+        token = await _signed_in_ad_user(service, store, "legacy")
+        jdoe = await store.get_user_by_username("jdoe")
+        legacy = await store.get_user_by_username("legacy")
+        assert jdoe is not None and legacy is not None and legacy.directory_object_id is None
+        await service.bind_federated_subject(jdoe.id, "S-1-jdoe", actor="admin")
+        with pytest.raises(DirectoryObjectIdMissing):
+            await service.bind_federated_subject(legacy.id, "S-1-legacy", actor="admin")
+        assert await store.set_user_federated_subject(
+            legacy.id, "https://idp.test.invalid", "S-1-legacy"
+        )
+        ldap.present.pop("legacy")  # gone from the directory: a name probe would strike it
+
+        ldap.probe_keys.clear()
+        for _ in range(3):  # past the strike threshold, so a name probe would have revoked
+            plan = await service.reconcile_directory_sessions()
+            assert plan.aborted is None and plan.revocations == ()
+
+        assert ("username", "legacy") not in ldap.probe_keys
+        assert sorted(set(ldap.probe_keys)) == [
+            ("object_id", _object_id_for("jdoe")),
+            ("username", "nobody"),
+        ]
+        assert token is not None and await service.identity_for_token(token) is not None
+        skipped = [
+            json.loads(a["detail"])
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_reconcile_binding_unkeyed"
+        ]
+        assert skipped == [
+            {"reason": "directory_object_id_missing", "user_id": legacy.id, "username": "legacy"}
+        ], "the skip was not audited, or was audited on every pass"
+    finally:
+        await store.close()
+
+
+async def test_a_pass_whose_only_candidate_is_a_bound_id_less_row_is_not_an_outage() -> None:
+    """The skipped row is filtered before probing, not answered as UNAVAILABLE (BACKLOG #2027).
+
+    As an UNAVAILABLE probe it would be the pass's only probe, and a pass whose every probe failed
+    aborts as ``directory_unavailable`` and audits an outage the directory is not having.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"legacy": replace(_principal("legacy"), directory_object_id=None)})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "legacy")
+        legacy = await store.get_user_by_username("legacy")
+        assert legacy is not None
+        assert await store.set_user_federated_subject(
+            legacy.id, "https://idp.test.invalid", "S-1-legacy"
+        )
+        ldap.probe_keys.clear()
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert plan.aborted is None and plan.probed == 0
+        assert ldap.probe_keys == []
+        details = [
+            json.loads(a["detail"])
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_reconcile_binding_unkeyed"
+        ]
+        assert [d["reason"] for d in details] == ["directory_object_id_missing"]
+        assert not any(a["action"] == "auth.ad_reconcile_skipped" for a in await store.list_audit())
+    finally:
+        await store.close()
+
+
+async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins() -> None:
+    """The once-per-process mark survives a gap with no session, and ends with the binding.
+
+    A mark kept only for signed-in rows would drop whenever the sessions lapse, and the account
+    would be reported again on its next sign-in. After the unbind the row is ordinary again, so its
+    mark goes, and the pass probes it by name like any unbound id-less row.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"legacy": replace(_principal("legacy"), directory_object_id=None)})
+        settings = _ad_settings(oidc_issuer="https://idp.test.invalid")
+        service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "legacy")
+        legacy = await store.get_user_by_username("legacy")
+        assert legacy is not None
+        assert await store.set_user_federated_subject(
+            legacy.id, "https://idp.test.invalid", "S-1-legacy"
+        )
+
+        async def reported() -> int:
+            return sum(
+                a["action"] == "auth.ad_reconcile_binding_unkeyed" for a in await store.list_audit()
+            )
+
+        await service.reconcile_directory_sessions()
+        await store.revoke_user_sessions(legacy.id)
+        await service.reconcile_directory_sessions()  # no session: not a candidate at all
+        await _signed_in_ad_user(service, store, "legacy")
+        await service.reconcile_directory_sessions()
+        assert await reported() == 1, "the account was reported again after a sign-in"
+
+        await service.unbind_federated_subject(legacy.id, actor="admin")
+        await _signed_in_ad_user(service, store, "legacy")
+        ldap.probe_keys.clear()
+        await service.reconcile_directory_sessions()
+        assert ldap.probe_keys == [("username", "legacy")]
+        assert await reported() == 1
+    finally:
+        await store.close()
+
+
+async def test_a_failed_skip_report_neither_stops_the_pass_nor_is_forgotten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The skip report runs after the pass's work, and is marked only once written (BACKLOG #2027).
+
+    One failed audit write must not stop the probes of every other account, which is what a report
+    made before probing would do on every pass while the write kept failing. And the failed report
+    must be retried, not recorded as done.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "jdoe": _principal("jdoe"),
+                "legacy": replace(_principal("legacy"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+        await _signed_in_ad_user(service, store, "legacy")
+        legacy = await store.get_user_by_username("legacy")
+        assert legacy is not None
+        assert await store.set_user_federated_subject(
+            legacy.id, "https://idp.test.invalid", "S-1-legacy"
+        )
+        real_record = store.record_audit
+
+        async def failing(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_binding_unkeyed":
+                raise sqlite3.OperationalError("synthetic: disk I/O error")
+            await real_record(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", failing)
+        ldap.probe_keys.clear()
+        with pytest.raises(sqlite3.OperationalError):
+            await service.reconcile_directory_sessions()
+        assert ldap.probe_keys == [("object_id", _object_id_for("jdoe"))], "the pass never probed"
+
+        monkeypatch.setattr(store, "record_audit", real_record)
+        await service.reconcile_directory_sessions()
+        assert [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_reconcile_binding_unkeyed"
+        ], "the failed report was marked done and never retried"
+    finally:
+        await store.close()
+
+
 async def test_a_genuinely_absent_account_is_still_revoked_under_the_id_keyed_probe() -> None:
     """THE CONTROL ON THE FIX. Re-keying the probe must not disarm the security control it sits in.
 
