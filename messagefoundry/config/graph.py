@@ -232,7 +232,9 @@ def _parse_module(path: str, cache: dict[str, _ModuleInfo | None]) -> _ModuleInf
         try:
             with open(path, encoding="utf-8") as f:
                 cache[path] = _ModuleInfo(ast.parse(f.read()))
-        except (OSError, SyntaxError, ValueError):
+        except (OSError, SyntaxError, ValueError, MemoryError, RecursionError):
+            # MemoryError and RecursionError are the parser's width and depth walls, not SyntaxError
+            # subclasses (BACKLOG #1858). RecursionError also covers _ModuleInfo's own recursive walk.
             cache[path] = None
     return cache[path]
 

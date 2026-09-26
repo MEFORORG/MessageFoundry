@@ -54,6 +54,8 @@ class FilePanel(QWidget):
         self._written = 0
         self._rng = random.Random()
         self._watch_count = 0
+        self._watch_refused = 0
+        self._watch_last_refusal = ""
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._build_drop())
@@ -190,11 +192,14 @@ class FilePanel(QWidget):
     def _build_watch(self) -> QGroupBox:
         self._watcher = FolderWatcher()
         self._watcher.received.connect(self._on_received)
+        self._watcher.refused.connect(self._on_refused)
 
         self._watch_dir = QLineEdit("./harness_io/out")
         self._watch_btn = QPushButton("Start watching")
         self._watch_btn.clicked.connect(self._toggle_watch)
         self._watch_status = QLabel("stopped")
+        # Plain text: a refusal reason carries a filename the engine wrote, which may look like HTML.
+        self._watch_status.setTextFormat(Qt.TextFormat.PlainText)
 
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Directory:"))
@@ -239,8 +244,22 @@ class FilePanel(QWidget):
                 item.setData(_RAW_ROLE, rec.raw)  # keep raw on the row, survives re-sort
             self._watch_table.setItem(0, col, item)
         self._watch_table.setSortingEnabled(True)
-        if self._watcher.is_watching():
-            self._watch_status.setText(f"watching · {self._watch_count} seen")
+        self._show_watch_count()
+
+    def _on_refused(self, reason: str) -> None:
+        # An over-cap file is skipped and is never a row (BACKLOG #1127 follow-up); say so here,
+        # beside the watching state and count rather than in place of them.
+        self._watch_refused += 1
+        self._watch_last_refusal = reason
+        self._show_watch_count()
+
+    def _show_watch_count(self) -> None:
+        if not self._watcher.is_watching():
+            return
+        text = f"watching · {self._watch_count} seen"
+        if self._watch_refused:
+            text += f" · {self._watch_refused} refused (last: {self._watch_last_refusal})"
+        self._watch_status.setText(text)
 
     def _show_detail(self) -> None:
         items = self._watch_table.selectedItems()

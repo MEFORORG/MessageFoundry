@@ -276,7 +276,7 @@ def _tls_row(settings: ServiceSettings) -> CheckResult:
         )
     except TrustAnchorError as exc:
         return CheckResult(rid, title, Status.FAIL, f"the engine refuses this anchor: {exc}")
-    except ValueError as exc:  # harden_crl_check: a missing, expired or empty CRL file
+    except ValueError as exc:  # harden_crl_check: a missing, expired, CRL-less or cert-bearing file
         return CheckResult(rid, title, Status.FAIL, f"the engine refuses this CRL file: {exc}")
     except Exception as exc:
         return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")

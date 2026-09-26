@@ -30,9 +30,9 @@ though it were a flaky test earns a re-queue that cannot help, which is this ite
 TWO ATTRIBUTION RULES OF ITS OWN, and both exist because the naive read misreports:
 
   * **A roll-up job is never named as the cause** (``_ROLLUP_JOBS``). ``CI gate`` fails in every one
-    of the eight runs above and its own failing step is ``Fail -- a gated leg FAILED``, which points
-    at a leg it does not name. Reporting it would send every reader to the one job whose log is
-    guaranteed to be empty of the answer.
+    of the eight runs above and its own failing step is ``Fail -- a gated leg FAILED``. Since
+    BACKLOG #1776 that step's annotation names the leg, but only as a pointer: the leg's own first
+    failing step is the answer, so reporting the roll-up would leave every reader one hop short.
   * **A watchdog step is reported as a watchdog** (``_TIMING_STEP_PREFIXES``), and only when a step
     that RUNS work concluded ``success`` in the same job. The second condition is not redundant:
     every pytest step in ``ci.yml`` carries an ``if:`` on the change filter, so a SKIPPED work step
@@ -111,8 +111,9 @@ PR_FIELDS = "number,title,state,headRefName"
 RUNS_PAGE: int = 100
 
 #: Jobs that only MIRROR another job's verdict, and so must never be named as a cause. `CI gate` is
-#: the required roll-up: its failing step reads `Fail -- a gated leg FAILED` and names no leg, so a
-#: reader sent there learns nothing. Matched case-insensitively on the job name up to its matrix
+#: the required roll-up: its failing step reads `Fail -- a gated leg FAILED`, and its annotation only
+#: POINTS at the leg (BACKLOG #1776), so a reader sent there is one hop short of the leg's own failing
+#: step. Matched case-insensitively on the job name up to its matrix
 #: suffix, because a roll-up gains legs over time and this must not silently stop matching.
 _ROLLUP_JOBS: frozenset[str] = frozenset({"ci gate"})
 

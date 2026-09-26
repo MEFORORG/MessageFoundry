@@ -3521,15 +3521,21 @@ class SqlServerStore:
         rows = await self._fetchall(sql, params)
         return rows[0] if rows else None
 
-    async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        """Run a single write statement (or T-SQL batch) in its own committed transaction."""
+    async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
+        the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
+        stepdown reads it to say truthfully whether its owner-scoped release matched a row."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, params)
+                # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
+                count = getattr(cur, "rowcount", -1)
+                rows = count if isinstance(count, int) else -1
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+        return rows
 
     def _event_stmt(
         self,

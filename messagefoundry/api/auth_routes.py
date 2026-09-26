@@ -100,11 +100,13 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
     STEP_UP_ACTION_SESSION_TERMINATE,
+    USERNAME_TAKEN,
     AuthService,
     CurrentPasswordCheck,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
     NotifyEmailAlreadySet,
+    UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
@@ -840,21 +842,25 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> UserSummary:
         await _validate_roles(service, body.roles)
         if await service.store.get_user_by_username(body.username) is not None:
-            raise HTTPException(status.HTTP_409_CONFLICT, "username already exists")
+            raise HTTPException(status.HTTP_409_CONFLICT, USERNAME_TAKEN)
         violations = service.password_violations(body.password, username=body.username)
         if violations:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
             )
-        user_id = await service.create_local_user(
-            username=body.username,
-            password=body.password,
-            display_name=body.display_name,
-            email=body.email,
-            roles=body.roles,
-            actor=identity.username,
-            client=_client(request),  # ADR 0150, BACKLOG #315: attribute the user.created row
-        )
+        try:
+            user_id = await service.create_local_user(
+                username=body.username,
+                password=body.password,
+                display_name=body.display_name,
+                email=body.email,
+                roles=body.roles,
+                actor=identity.username,
+                client=_client(request),  # ADR 0150, BACKLOG #315: attribute the user.created row
+            )
+        except UsernameTaken as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        # Only after the create succeeded: a lost username race (409 above) granted nobody anything.
         if Role.ADMINISTRATOR.value in body.roles:
             _alert_administrator_granted(
                 app, f"user:{body.username}", via="account_created", granted_by=identity.username

@@ -81,6 +81,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   editor and the rename planner refuse it before writing, and the Corepoint importer folds a
   generated connection name that would fail it. **Migration:** rename such connections to fit the pattern;
   stored history stays under the old name. ([BACKLOG #1107](docs/BACKLOG.md))
+- **`POST /cluster/stepdown` now drains a node that has already self-fenced.** Such a node has
+  cleared its leader flag, but its lease row stays live until `leader_lease_ttl_seconds` runs out.
+  In 0.4.0 the stepdown sent no write there and answered `409` "not the current leader", while
+  `GET /cluster/nodes` still named the node as `lease_owner`. Now the stepdown expires that row and
+  answers `200`, so a standby can take the lease at once. `ClusterStepdownResult` and the
+  `cluster_stepdown` audit row gain a `lease_released` field, which says whether the call expired a
+  lease row naming this node. A self-fenced drain reads `was_leader: false, lease_released: true`.
+  The endpoint answers `409` only when both are false. A retry after a `release-unconfirmed` `503`
+  now answers `200` while the row still names this node, and `409` once a standby has taken it.
+  The new field changes the web console engine UI seam, so install the engine and the console
+  together. ([BACKLOG #1508](docs/BACKLOG.md))
+- **Documented: leader preference does not steer a planned failover.** A stepdown writes the lease
+  expiry as zero, so every promotable sibling can take a released lease on its next heartbeat,
+  whatever its `acquire_delay_seconds`. The delay still applies to a lease that expired on its own.
+  No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
+  pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
 ### Fixed
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
@@ -107,6 +123,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   failure status where it used to get Success. A `max_object_bytes` above 16 MiB no longer raises
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
+- **`POST /users` answers `409 username already exists` when two creates race for one name.** The
+  route checks the name before it creates the account, but two requests can both pass that check.
+  The second insert then met the store's UNIQUE index, and that error reached the API's catch-all
+  handler as a `500`. The engine now catches it and answers `409` with the same text the check
+  gives. The web console's create-user form shows that text too. (`BACKLOG #1808`)
+- **On SQLite and PostgreSQL, adding a passkey to an account deleted mid-enrolment now says `no
+  such user`.** It used to say `label already in use`, because every store refusal of the insert
+  got that answer. On those two backends the insert is refused by the foreign key to the account.
+  The engine now re-reads the account to tell the two refusals apart. SQL Server has no such foreign
+  key, so there the insert is not refused and this change does not apply. (`BACKLOG #1807`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
@@ -125,6 +151,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a CRL file can no longer add trust anchors.** Each CRL setting loaded its file as
+  a CA file, so any certificate in it became a trusted CA for the hop. That CA skipped the hop's
+  pin and permission checks. It covers at least `[api].tls_client_crl_file`, an inbound
+  connection's `tls_crl_file`, `[tls].crl_file`, `[logging].forward_tls_crl_file`,
+  `[auth].oidc_tls_crl_file` and `[store].ssl_crl_file`. The engine now refuses to build the hop
+  when its CRL file carries a certificate not already in the hop's trust store. A file holding a
+  CA already loaded for that hop, plus that CA's CRL, still loads. A bare CRL always does, so
+  give each CRL setting a bare CRL. The inbound revocation refusal no longer tells an operator to
+  put the CA in the CRL file. ([BACKLOG #1890](docs/BACKLOG.md))
 - **BREAKING: under `enforce`, a trust anchor whose permissions or path the engine cannot read now
   refuses to start, unless its SHA-256 pin matches.** This covers `[auth].oidc_tls_ca_cert_file`,
   `[auth].ad_tls_ca_cert_file`, `[api].tls_client_ca_file` and, new in this release, the mTLS CA
@@ -178,7 +213,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   cleartext guards as the live build, so a hop the live build refuses now fails the test too. A
   refused CA answers the test with `trust anchor refused; see the server log`. The path and
   SHA-256 go to the log, not to the caller or the audit row. Not covered: the CAs of outbound connections, and an inbound `tls_crl_file`, which is still
-  read by path, so a certificate inside it is trusted unchecked.
+  read by path. A certificate inside it was trusted unchecked until BACKLOG #1890, later in this release.
   ([BACKLOG #1142](docs/BACKLOG.md))
 - **A config reload now refuses a trust anchor that the next start would refuse.** The reload
   check ran the pin, ACL and path checks, but not the check that the file holds a loadable PEM
@@ -626,6 +661,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   code drifts from it. The doc names the parts kept by hand, and the test does not check those for
   gaps. **Migration:** split a fixture file over the cap into smaller files.
   (`BACKLOG #1127`)
+- **The test harness's MLLP receivers, the IDE's Steps view sample, and `check`'s `.expect`
+  sidecars are now capped (ASVS 5.1.1).** The harness Receive tab, load sink and reconcile capture sink
+  each bound a frame at `DEFAULT_MAX_FRAME_BYTES` (16 MiB) and drop an over-cap frame's connection with
+  no ACK. The VS Code extension refuses a Steps view sample over 16 MiB when it is picked, and its own
+  read of that sample is capped. `messagefoundry check` reads each `.expect` sidecar under its
+  fixture's cap. A frame the harness accepts before a refusal in the same read still gets its ACK
+  before the connection drops, a delayed Receive-tab ACK included. `max_frame_bytes` and
+  `harness.reconcile capture --max-frame-bytes` read `0` as no cap, as the engine does, and refuse a
+  negative value. The File tab's watch pane caps each file at `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB),
+  checks the size before it reads, and skips an over-cap file with a logged, counted reason. The
+  inventory in [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) now lists the harness receivers and watch
+  pane as one upload row. It lists the live-debug sample choice as an IDE picker, and its test
+  checks both rows. ([BACKLOG #1127](docs/BACKLOG.md))
 - **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
   `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
   that topology the engine mints no certificate (ADR 0172 decision 3). So the
@@ -735,8 +783,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `messagefoundry verify` reports it ahead of time. ADR 0173 section 4.3 called for this guard,
   and ADR 0173 AC-4 records these limits. **Migration:** with OIDC on, set
   `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the token and
-  JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file becomes a
-  trusted root for this hop. `[security].enforcement = "warn"` also lets `serve` start, but it
+  JWKS endpoint certificates. Put only CRLs in it. A certificate in that file became a trusted
+  root for this hop until BACKLOG #1890, later in this release, made it refuse instead. `[security].enforcement = "warn"` also lets `serve` start, but it
   turns every enforce-only refusal in the instance into a warning, not this one alone.
   (`BACKLOG #1887`)
 - **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine

@@ -330,7 +330,7 @@ def test_factory_carries_tls_key_password_and_redacts_it() -> None:
 
 
 def _ca_and_crl(tmp_path: Path, *, revoked_serial: int = 4000) -> str:
-    """A CA bundled with its own fresh CRL, written as one PEM -- the shape harden_crl_check loads.
+    """A CA bundled with its own fresh CRL, written as one PEM -- it loads only where the same CA is loaded first (BACKLOG #1890).
 
     Separate from :func:`_cert` because that one is self-signed-and-CA:TRUE for convenience, while a
     CRL has to be signed by the key whose certificate is the trust anchor.

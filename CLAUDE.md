@@ -919,7 +919,7 @@ mypy messagefoundry
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
 python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 
-# open the web console (operator UI) — browse to the engine's /ui (e.g. http://127.0.0.1:8765/ui)
+# open the web console (operator UI) — browse to the engine's /ui (e.g. https://127.0.0.1:8765/ui)
 
 # launch the standalone PySide6 test harness (separate process; attaches to the API)
 python -m harness

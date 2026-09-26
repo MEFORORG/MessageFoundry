@@ -1064,8 +1064,14 @@ class ClusterStepdownResult(BaseModel):
     ``was_leader`` and ``released_at`` are what the coordinator's ``step_down_leadership()`` RETURNED,
     never a prior ``is_leader()`` read: a fence or a lost-lease tick can flip leadership between the
     read and the release, so a pre-read could report a failover that released nothing.
-    ``released_at`` is the epoch-seconds instant this node was demoted, ``None`` when it held no
-    leadership. Cluster metadata only — no PHI.
+    ``released_at`` is the epoch-seconds instant this call cleared the in-memory leader flag,
+    ``None`` when the flag was already clear, which includes a self-fenced drain. Cluster metadata only — no PHI.
+
+    ``lease_released`` says whether the release expired a lease row naming this node (BACKLOG
+    #1508). It differs from ``was_leader`` in the self-fence window, where the node has already
+    cleared its in-memory flag while its row is still live: that stepdown reads ``was_leader=false,
+    lease_released=true`` and answers ``200``, because releasing the row is the drain. A ``409``
+    means both are false.
 
     ``new_leader_eligible`` says whether another promotable node had a fresh heartbeat in the
     membership read taken before the release, the same read the ``412`` refusal checks. It names no
@@ -1077,6 +1083,7 @@ class ClusterStepdownResult(BaseModel):
     node_id: str
     was_leader: bool
     released_at: float | None
+    lease_released: bool
     new_leader_eligible: bool
     force: bool
 

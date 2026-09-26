@@ -11,6 +11,7 @@ import pytest
 
 from messagefoundry import __version__
 from messagefoundry.__main__ import main
+from messagefoundry.api.tls import _generated_pair
 from messagefoundry.scaffold import scaffold
 
 _EXPECTED = {
@@ -60,6 +61,11 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # to the store, so it is never committed
     gitignore = (repo / ".gitignore").read_text()
     assert "bootstrap-admin.txt" in gitignore
+    # ...and the API TLS pair it mints beside the store (ADR 0172), the key above all. The names come
+    # from the minting code, so a rename there cannot leave this list silently stale.
+    ignored = set(gitignore.splitlines())
+    for minted in _generated_pair(repo):
+        assert minted.name in ignored
     # the template + README teach WS-1's env-anchor so a config repo run under a service (CWD != repo
     # root) still resolves environments/<env>.toml (ADR 0017): base_dir in the toml, --project-root in docs
     assert "base_dir" in toml
