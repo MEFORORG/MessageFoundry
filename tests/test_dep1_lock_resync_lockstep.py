@@ -17,14 +17,22 @@ integration test), matching the house style of ``test_dependabot_automerge_guard
 
 from __future__ import annotations
 
+import ast
 import re
+import sys
 from pathlib import Path
+
+import yaml
 
 from tests._workflow_contexts import load_workflow
 
-_WORKFLOWS = Path(__file__).resolve().parent.parent / ".github" / "workflows"
+_ROOT = Path(__file__).resolve().parent.parent
+_WORKFLOWS = _ROOT / ".github" / "workflows"
 _GATE = _WORKFLOWS / "security.yml"
 _RESYNC = _WORKFLOWS / "dependabot-lock-resync.yml"
+#: The file the resync derives from the core-lock export, and the command that derives it.
+_CLOSURE = "security/runtime-closure-core.txt"
+_REGENERATOR = "python3 scripts/security/runtime_closure.py"
 
 # Every `uv export <flags> -o <path>` line, whichever workflow it lives in.
 _EXPORT_RE = re.compile(r"^\s*uv export\s+(?P<flags>.*?)\s+-o\s+(?P<path>\S+)\s*$", re.MULTILINE)
@@ -97,16 +105,127 @@ def test_export_flags_are_identical_per_lock_file() -> None:
 
 
 def test_every_exported_lock_is_verified_and_staged() -> None:
-    """The gate must diff, and the resync must both short-circuit on and stage, every export."""
+    """The gate must diff, and the resync must both short-circuit on and stage, every export.
+
+    The resync also stages the one file it DERIVES from an export, the runtime-closure inventory,
+    so its lists are the export set plus that file. DEP-1 does not diff it; the closure test in
+    ``tests/test_risky_component_designation.py`` does.
+    """
     exported = set(_exports(_GATE))
+    staged = exported | {_CLOSURE}
     assert set(_paths(_DIFF_EXIT_RE, _GATE)) == exported, "DEP-1 exports a lock it never diffs"
-    assert set(_paths(_DIFF_QUIET_RE, _RESYNC)) == exported, (
-        "the resync's `git diff --quiet` short-circuit omits an exported lock — it would report "
-        "'already in sync' and skip the push while that lock is stale"
+    assert set(_paths(_DIFF_QUIET_RE, _RESYNC)) == staged, (
+        "the resync's `git diff --quiet` short-circuit omits an exported lock or the closure file "
+        "-- it would report 'already in sync' and skip the push while that file is stale"
     )
-    assert set(_paths(_GIT_ADD_RE, _RESYNC)) == exported, (
-        "the resync re-exports a lock it never `git add`s — the push would carry an incomplete set"
+    assert set(_paths(_GIT_ADD_RE, _RESYNC)) == staged, (
+        "the resync writes a file it never `git add`s -- the push would carry an incomplete set"
     )
+
+
+def test_the_resync_regenerates_the_closure_file() -> None:
+    """RED when: the resync stops rewriting the closure file from the fresh core lock, or a failed
+    rewrite can block the lock push or pass silently.
+
+    ``security/runtime-closure-core.txt`` must equal the pin lines of
+    ``docker/locks/requirements-core.lock`` (BACKLOG #1812). A Dependabot PR that moves a core
+    package re-exports that lock here. Without this step the closure test would then go red with
+    no bot-reachable path to green, the #1193 shape again.
+
+    The step order carries the contract. The rewrite runs after the core export, or it copies the
+    stale lock. It runs before the commit step, or its output is never pushed. It may not block the
+    commit, or one closure problem strands every re-exported lock. A later step must still fail the
+    run when it fails.
+    """
+    steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
+    names = [str(step.get("name", "")) for step in steps]
+
+    def index_of(needle: str) -> int:
+        found = [i for i, step in enumerate(steps) if needle in str(step.get("run", ""))]
+        assert len(found) == 1, f"expected one resync step running {needle!r}, found {found}"
+        return found[0]
+
+    export = index_of("-o docker/locks/requirements-core.lock")
+    regen = index_of(_REGENERATOR)
+    commit = index_of("git commit")
+    assert export < regen < commit, (
+        f"the closure rewrite must sit between the export and the commit steps: {names}"
+    )
+    step = steps[regen]
+    assert step.get("continue-on-error") is True, (
+        "the closure rewrite must not block the commit step, or its failure strands the locks"
+    )
+    step_id = step.get("id")
+    assert step_id, "the closure rewrite step needs an id, so a later step can read its outcome"
+    failing = [
+        s
+        for s in steps[commit + 1 :]
+        if f"steps.{step_id}.outcome == 'failure'" in str(s.get("if", ""))
+        and "exit 1" in str(s.get("run", ""))
+    ]
+    assert failing, "no step after the commit fails the run when the closure rewrite fails"
+    script = _ROOT / _REGENERATOR.split()[1]
+    assert script.is_file(), f"the resync runs {script}, which does not exist"
+
+
+def test_the_resync_checks_out_the_triggering_sha() -> None:
+    """RED when: the resync checks out the moving branch tip instead of the triggering SHA.
+
+    The closure step runs a repository script while the App token sits in the checkout's
+    credential config. Pinned to the SHA, a commit pushed after the trigger never runs, and the
+    push is refused if the branch has moved.
+    """
+    steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
+    checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
+    assert len(checkouts) == 1, f"expected one checkout step, found {len(checkouts)}"
+    assert checkouts[0]["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+
+
+def test_the_zizmor_suppression_still_points_at_the_actor_check() -> None:
+    """RED when: a line added above the job's ``if:`` moves the actor check off its zizmor anchor.
+
+    ``.github/zizmor.yml`` suppresses the ``bot-conditions`` finding on ONE line of this workflow,
+    on purpose (its comment says why). Any edit above that line moves it, zizmor then reports the
+    finding on the new line, and the scan goes red. Adding the closure step's comments did exactly
+    that (BACKLOG #1812), and nothing local caught it.
+    """
+    config = yaml.safe_load((_ROOT / ".github" / "zizmor.yml").read_text(encoding="utf-8"))
+    ignores = config["rules"]["bot-conditions"]["ignore"]
+    anchors = [e for e in ignores if str(e).startswith(f"{_RESYNC.name}:")]
+    assert len(anchors) == 1, f"expected one {_RESYNC.name} anchor in zizmor.yml, found {anchors}"
+    # `file:line`, or zizmor's `file:line:col`; the line is the second field either way.
+    line_no = int(str(anchors[0]).split(":")[1])
+    line = _RESYNC.read_text(encoding="utf-8").splitlines()[line_no - 1]
+    assert "github.triggering_actor == 'dependabot[bot]'" in line, (
+        f"zizmor.yml anchors {anchors[0]}, but that line is now {line.strip()!r}. Re-anchor it to "
+        "the line holding the triggering_actor check."
+    )
+
+
+def test_the_regenerator_imports_only_the_standard_library() -> None:
+    """RED when: the regenerator imports anything a bare runner python3 does not have.
+
+    The resync installs no project and no packages, on purpose (its SECURITY MODEL block), so a
+    third-party import would fail there and leave every Dependabot PR red. The runner's python3 is
+    older than this project's (3.12 on ubuntu-24.04), so the grammar is checked at 3.12 as well.
+    ``sys.stdlib_module_names`` is this interpreter's list, so a module new since 3.12 still passes
+    here; the script-mode run in ``tests/test_risky_component_designation.py`` does not catch that
+    either. It is a residual, and a narrow one.
+    """
+    script = _ROOT / _REGENERATOR.split()[1]
+    tree = ast.parse(script.read_text(encoding="utf-8"), feature_version=(3, 12))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {a.name.partition(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            # Run as a file, the script has no package, so a relative import cannot resolve.
+            assert node.level == 0, f"{script.name} has a relative import, which fails as a script"
+            if node.module:
+                imported.add(node.module.partition(".")[0])
+    assert "re" in imported, "the import walk found nothing it should; the parser has broken"
+    outside = sorted(imported - sys.stdlib_module_names - {"__future__"})
+    assert not outside, f"{script.name} imports outside the standard library: {outside}"
 
 
 def test_constraints_lock_is_in_the_set() -> None:

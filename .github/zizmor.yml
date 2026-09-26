@@ -138,7 +138,7 @@ rules:
       # gate, which is the shape that IS exploitable. Accepted residual: an in-place rewrite that keeps
       # the line count would not re-fire the finding — that is what the test is for. If the line moves,
       # RE-ANCHOR it; do not broaden it to the file.
-      - dependabot-lock-resync.yml:76
+      - dependabot-lock-resync.yml:84
 
   self-repository:
     ignore:

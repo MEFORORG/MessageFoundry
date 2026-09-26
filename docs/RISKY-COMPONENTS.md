@@ -136,8 +136,10 @@ turns it red. The test is the reason the arithmetic above can be trusted after t
 bump.
 
 The same test holds the closure file to the lock it copies, in every name and version (BACKLOG
-#1812). A dependency bump that changes the closure turns it red in the same pull request. The closure
-file's header names that lock and the command that regenerates the file.
+#1812). The file's header names that lock and the command that regenerates it.
+
+A bump that moves the lock without that command turns the test red in the same pull request. On a
+Dependabot pull request, the lock-resync workflow runs the command for you.
 
 Adding a dependency therefore means classifying it. Designating it is a judgement call; leaving it
 out of both tables is not available.

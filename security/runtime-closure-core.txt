@@ -8,11 +8,15 @@
 # Each line below is a copy of a pin line in docker/locks/requirements-core.lock. That file is
 # `uv export --no-emit-project --no-dev` of uv.lock, and the DEP-1 gate in security.yml fails when
 # it differs from a fresh export. Lines are name==version, lowercase and sorted, with markers and
-# hashes dropped. A test holds this copy to that lock in every name and version (BACKLOG #1812).
-# A version edited here by hand changes nothing that installs, and the test refuses it.
+# hashes dropped. tests/test_risky_component_designation.py holds this copy to that lock in every
+# name and version (BACKLOG #1812). A version edited here by hand changes nothing that installs,
+# and the test refuses it.
 #
-# Regenerate after the lock moves, from the repository root:
-#     python tests/test_risky_component_designation.py
+# Regenerate after the lock moves:
+#     python scripts/security/runtime_closure.py
+#
+# On a Dependabot PR, .github/workflows/dependabot-lock-resync.yml runs the command above.
+# .github/dependabot.yml says why, and how far, Dependabot is kept from editing this file directly.
 #
 # The same test file fails when this file and the designation document disagree, so a dependency
 # that enters the lock without being classified there is a loud failure.

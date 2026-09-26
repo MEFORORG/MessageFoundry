@@ -20,14 +20,19 @@ Each test names the mutation that must turn it RED.
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from packaging.utils import canonicalize_name
+
+from scripts.security import runtime_closure
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "RISKY-COMPONENTS.md"
+_DEPENDABOT = _ROOT / ".github" / "dependabot.yml"
 _CLOSURE = _ROOT / "security" / "runtime-closure-core.txt"
 _LOCK = _ROOT / "requirements.lock"
 #: The lock the closure file copies. The closure file's header says what it is.
@@ -46,11 +51,7 @@ _ROW_NAME_GROUP = re.compile(
 
 def _closure_lines() -> list[str]:
     """The closure file's pin lines, stripped, in file order. Comments and blanks are skipped."""
-    return [
-        s
-        for s in (raw.strip() for raw in _CLOSURE.read_text(encoding="utf-8").splitlines())
-        if s and not s.startswith("#")
-    ]
+    return runtime_closure.closure_lines(_CLOSURE.read_text(encoding="utf-8"))
 
 
 def _closure_pins() -> dict[str, str]:
@@ -64,7 +65,7 @@ def _closure_pins() -> dict[str, str]:
         if "==" not in line:
             continue
         name, _, version = line.partition("==")
-        key = canonicalize_name(name.strip())
+        key = runtime_closure.canonical_name(name)
         assert key not in pins, f"{_CLOSURE.name} lists {key} twice"
         pins[key] = version.strip()
     return pins
@@ -75,39 +76,12 @@ def _closure() -> set[str]:
     return set(_closure_pins())
 
 
-def _lock_versions(path: Path, *, strict: bool = False) -> dict[str, list[str]]:
-    """Name to every version an exported lock pins for it, in file order.
-
-    A pin line reads ``name==version ; marker \\`` and the hash lines under it are indented. A list,
-    because an export writes one line per marker fork. Each caller decides which names must be
-    unambiguous, so a fork in a package it never reads is not its failure.
-
-    With ``strict``, a top-level line that is not an ``==`` pin fails. A URL or ``===`` requirement
-    would otherwise vanish from the parsed set, and so from the denominator, with nothing reporting it.
-    """
-    pins: dict[str, list[str]] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line or line.startswith((" ", "#")):
-            continue
-        if "==" not in line or "===" in line:
-            assert not strict, f"{path.name} has a requirement this parser cannot read: {line!r}"
-            continue
-        name, _, rest = line.partition("==")
-        version = re.split(r"[\s;\\]", rest.strip(), maxsplit=1)[0]
-        pins.setdefault(canonicalize_name(name.strip()), []).append(version)
-    return pins
-
-
 def _core_lock_pins() -> dict[str, str]:
-    """Name to version for the core closure, read from the DEP-1 core lock (BACKLOG #1812)."""
-    pins: dict[str, str] = {}
-    for name, versions in _lock_versions(_CORE_LOCK, strict=True).items():
-        assert len(set(versions)) == 1, (
-            f"{_CORE_LOCK.name} pins {name} at {versions}, a per-platform fork. The closure file "
-            "records one version per name, so it cannot say which one a default install takes."
-        )
-        pins[name] = versions[0]
-    return pins
+    """Name to version for the core closure, read from the DEP-1 core lock (BACKLOG #1812).
+
+    The regenerator's own reader, so the gate and the rewrite cannot read the lock differently.
+    """
+    return runtime_closure.core_lock_pins(_CORE_LOCK)
 
 
 def _diff_pins(label: str, recorded: dict[str, str], actual: dict[str, str]) -> list[str]:
@@ -124,11 +98,6 @@ def _diff_pins(label: str, recorded: dict[str, str], actual: dict[str, str]) -> 
         if recorded[n] != actual[n]
     ]
     return lines
-
-
-def _expected_closure_lines(core: dict[str, str]) -> list[str]:
-    """The closure file's pin lines as the core lock says they must read: sorted ``name==version``."""
-    return [f"{name}=={version}" for name, version in sorted(core.items())]
 
 
 def _designated_and_excluded() -> tuple[set[str], set[str]]:
@@ -149,9 +118,11 @@ def _designated_and_excluded() -> tuple[set[str], set[str]]:
     def names(block: str) -> set[str]:
         # The same PEP 503 form the closure side uses, so `ruamel.yaml` in a table row matches
         # `ruamel-yaml` in the lock.
-        out: set[str] = {canonicalize_name(m.group(1)) for m in _ROW_NAME.finditer(block)}
+        out: set[str] = {
+            runtime_closure.canonical_name(m.group(1)) for m in _ROW_NAME.finditer(block)
+        }
         for m in _ROW_NAME_GROUP.finditer(block):
-            out |= {canonicalize_name(n.strip(" `")) for n in m.group(1).split(",")}
+            out |= {runtime_closure.canonical_name(n.strip(" `")) for n in m.group(1).split(",")}
         return out
 
     return names(head), names(tail)
@@ -242,7 +213,7 @@ def test_the_counts_printed_on_the_page_are_the_real_ones() -> None:
     assert f"That is **{closure_size} distributions**" in text, (
         f"the scope section does not state the closure size, {closure_size}"
     )
-    lock_size = len(_lock_versions(_LOCK))
+    lock_size = len(runtime_closure.lock_versions(_LOCK))
     assert f"| `requirements.lock` | {lock_size} |" in text, (
         f"the denominator table's requirements.lock row does not say {lock_size}"
     )
@@ -287,16 +258,17 @@ def test_the_closure_file_is_the_core_lock() -> None:
     lock installed one carrying three.
 
     The whole line list is compared, so a duplicate, an unsorted line or a stray format also fails.
-    To fix it, run this module as a script, which rewrites the pin lines from the lock.
+    To fix it, run ``scripts/security/runtime_closure.py``, which rewrites the pin lines from the
+    lock. The Dependabot lock-resync workflow runs the same script when a Dependabot PR moves it.
     """
     core = _core_lock_pins()
     drift = _diff_pins(_CORE_LOCK.name, _closure_pins(), core)
-    expected = _expected_closure_lines(core)
+    expected = runtime_closure.expected_closure_lines(core)
     assert not drift and _closure_lines() == expected, (
         f"security/runtime-closure-core.txt does not match {_CORE_LOCK.name}. The lock is what "
         "installs; never edit it to match this file. Differences:\n  "
         + ("\n  ".join(drift) or "none by name or version; the lines are unsorted or malformed")
-        + "\nRegenerate with: python tests/test_risky_component_designation.py"
+        + "\nRegenerate with: python scripts/security/runtime_closure.py"
     )
 
 
@@ -311,7 +283,7 @@ def test_every_closure_pin_is_the_version_requirements_lock_installs() -> None:
     catches that too, but in another workflow; this check holds the closure file to the audited lock
     on the same test run. The fix is to re-export both locks, then regenerate the closure file.
     """
-    lock = _lock_versions(_LOCK)
+    lock = runtime_closure.lock_versions(_LOCK)
     closure = _closure_pins()
     assert len(lock) > len(closure), (
         "requirements.lock parsed to no more names than the core closure; it is an --all-extras "
@@ -327,6 +299,32 @@ def test_every_closure_pin_is_the_version_requirements_lock_installs() -> None:
     )
 
 
+def test_dependabot_does_not_write_the_closure_file() -> None:
+    """RED when: the uv Dependabot entry stops excluding the closure file.
+
+    Dependabot's uv ecosystem reads any requirements-shaped ``.txt`` in a top-level directory as a
+    manifest, and this file is one. It bumped pins here without moving the lock, twice (PR 1068 and
+    PR 1295), and those are the wrong pins BACKLOG #1812 found. With the gate above, every such
+    weekly PR would go red. ``exclude-paths`` keeps the version track off the file. An open
+    dependabot-core report (issue 14408) says the security track ignores that key, so the
+    lock-resync workflow's rewrite from the lock is what holds the file to it on both tracks.
+
+    The pattern is relative to the entry's ``directory``, so a moved directory would silently
+    stop matching. That is why the directory is pinned too.
+    """
+    doc = yaml.safe_load(_DEPENDABOT.read_text(encoding="utf-8"))
+    uv = [u for u in doc["updates"] if u.get("package-ecosystem") == "uv"]
+    assert len(uv) == 1, f"expected one uv entry in {_DEPENDABOT.name}, found {len(uv)}"
+    assert uv[0].get("directory") == "/", (
+        "exclude-paths patterns are relative to the entry's directory; this test assumes '/'"
+    )
+    closure = _CLOSURE.relative_to(_ROOT).as_posix()
+    assert closure in (uv[0].get("exclude-paths") or []), (
+        f"the uv entry in {_DEPENDABOT.name} does not exclude {closure}, so Dependabot will "
+        "bump its pins without moving the lock and the closure gate above goes red"
+    )
+
+
 @pytest.mark.parametrize("path", [_DOC, _CLOSURE, _CORE_LOCK])
 def test_the_tracked_paths_exist(path: Path) -> None:
     """RED when: any file the guard grades or grades against is deleted or moved.
@@ -337,22 +335,69 @@ def test_the_tracked_paths_exist(path: Path) -> None:
     assert path.is_file(), f"{path} is missing; the designation guard cannot run"
 
 
-def _rewrite_closure() -> int:
-    """Replace the closure file's pin lines with the core lock's.
+def test_the_regenerator_names_packages_as_packaging_does() -> None:
+    """RED when: the regenerator's stdlib name normalizer stops agreeing with ``packaging``.
 
-    Keeps the leading comment block and drops everything after it, so a comment placed between
-    pins is lost. The file's contract is header, then pins.
+    The regenerator cannot import ``packaging`` (it runs with nothing installed), so it carries its
+    own PEP 503 normalizer. This pins the two together on the separators PEP 503 folds.
     """
-    header: list[str] = []
-    for raw in _CLOSURE.read_text(encoding="utf-8").splitlines():
-        if raw.strip() and not raw.lstrip().startswith("#"):
-            break
-        header.append(raw)
-    lines = _expected_closure_lines(_core_lock_pins())
-    _CLOSURE.write_bytes(("\n".join([*header, *lines]) + "\n").encode("utf-8"))
-    print(f"wrote {len(lines)} pins to {_CLOSURE.relative_to(_ROOT)}")
-    return 0
+    for raw in ("ruamel.yaml", "Typing_Extensions", "zope..interface", "argon2-cffi", "PyYAML"):
+        assert runtime_closure.canonical_name(raw) == canonicalize_name(raw), raw
 
 
-if __name__ == "__main__":
-    sys.exit(_rewrite_closure())
+def test_the_regenerator_defaults_to_the_files_this_module_grades() -> None:
+    """RED when: the script moves, or its default paths stop naming the tracked files.
+
+    The resync workflow runs the script with no arguments, so its defaults are the whole contract.
+    """
+    assert runtime_closure.CLOSURE == _CLOSURE
+    assert runtime_closure.CORE_LOCK == _CORE_LOCK
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "foo @ https://example.invalid/foo.whl ; sys_platform == 'win32'",
+        "foo===1.0",
+        "foo[bar]==1.0",
+        "foo==1.*",
+        "foo==1.0,<2",
+    ],
+)
+def test_the_core_lock_reader_refuses_a_line_it_cannot_copy(tmp_path: Path, line: str) -> None:
+    """RED when: the strict reader turns a non-pin line into a pin instead of refusing it.
+
+    The resync pushes whatever the regenerator writes, unattended. A URL requirement whose marker
+    holds ``==`` used to split at the marker and write a garbage pin.
+    """
+    lock = tmp_path / "core.lock"
+    lock.write_text(f"hl7==0.4.5 \\\n    --hash=sha256:00\n{line} \\\n", encoding="utf-8")
+    with pytest.raises(runtime_closure.LockFormatError):
+        runtime_closure.core_lock_pins(lock)
+
+
+def test_the_regenerator_rewrites_a_drifted_closure(tmp_path: Path) -> None:
+    """RED when: the regenerator stops repairing a wrong pin, loses the header, or needs a package.
+
+    The resync workflow runs it as a script under a bare python3, so this does too. ``-S`` skips
+    site-packages, the nearest local stand-in for a runner with nothing installed. Not ``-I``: that
+    also drops the script's own directory from the import path, which the runner keeps.
+
+    The expected text is the tracked file, which the gate above holds to the lock. Comparing with
+    ``render_closure`` instead would pass whatever that function returned.
+    """
+    text = _CLOSURE.read_text(encoding="utf-8")
+    # A wrong version, the shape Dependabot's direct bumps left, plus a name the lock does not pin.
+    wrong = text.replace("\nanyio==", "\nanyio==0.0.0\nanyio-stale==", 1)
+    assert wrong != text, "the closure file no longer pins anyio; pick another package here"
+    closure = tmp_path / "closure.txt"
+    closure.write_text(wrong, encoding="utf-8")
+    script = Path(runtime_closure.__file__)
+    run = subprocess.run(
+        [sys.executable, "-S", "-E", "-s", str(script), "--closure", str(closure)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    assert closure.read_text(encoding="utf-8") == text
