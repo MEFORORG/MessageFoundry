@@ -74,7 +74,7 @@ def _mint(key: rsa.RSAPrivateKey, kid: str, claims: Mapping[str, Any]) -> str:
 
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 def _policy(nonce: str = "n-123", **over: Any) -> oidc.OidcClaimPolicy:
@@ -116,6 +116,26 @@ def _good_claims(nonce: str = "n-123", **over: Any) -> dict[str, Any]:
 def test_rsa_jwk_round_trips(rsa_key: rsa.RSAPrivateKey) -> None:
     key = oidc.jwk_to_public_key(_rsa_jwk(rsa_key, "k1"))
     assert isinstance(key, rsa.RSAPublicKey)
+
+
+def test_a_2048_bit_idp_key_is_still_accepted() -> None:
+    """POSITIVE CONTROL at the JWKS floor, which stays 2048 (BACKLOG #1166: an IdP key is a
+    counterparty's). The fixtures above moved to 3072 because they also SIGN through
+    CompactJwtSigner, whose floor BACKLOG #300 raised, so without this nothing here would go red if
+    verification started refusing the 2048-bit keys common IdPs publish."""
+    two_k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = oidc.jwk_to_public_key(_rsa_jwk(two_k, "k2048"))
+    assert isinstance(key, rsa.RSAPublicKey) and key.key_size == 2048
+
+
+def test_a_2048_bit_idp_token_verifies_end_to_end() -> None:
+    """The full verify path, not just the JWK decode above, still accepts a 2048-bit IdP key.
+    ``_mint_with_typ`` signs through the low-level ``_sign``, which has no floor, so it can mint
+    what a real IdP publishes; ``CompactJwtSigner`` now refuses to."""
+    two_k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jws = _mint_with_typ(two_k, "k1", _good_claims(), typ="JWT")
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(two_k), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
 
 
 def test_undersized_rsa_is_refused() -> None:
@@ -301,7 +321,7 @@ def test_claim_rungs_reject_with_closed_slugs(
 
 def test_bad_signature_is_rejected(rsa_key: rsa.RSAPrivateKey) -> None:
     """A token signed by a different key than the JWKS advertises for that kid."""
-    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other = rsa.generate_private_key(public_exponent=65537, key_size=3072)
     jws = _mint(other, "k1", _good_claims())
     with pytest.raises(oidc.ClaimsError) as exc:
         oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)

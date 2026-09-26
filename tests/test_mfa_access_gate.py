@@ -33,6 +33,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import WebAuthnCredential
+from tests._admin_account import create_admin
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -732,14 +733,14 @@ async def test_a_must_change_account_with_no_factor_still_rotates_from_a_pending
 ) -> None:
     """RED when: the refusal over-reaches and blocks an account with no factor.
 
-    Both shipped producers of a must-change account with no factor: an administrator-created user
-    and the bootstrap administrator. Each is pending under the default ``require_mfa`` and has
-    nothing to prove at ``/auth/mfa-verify``, so rotating first is the only way forward. This is
-    also why must-change stays ahead of the MFA gate in ``require()``.
+    A must-change account with no factor, as an Administrator and as a Viewer. The first-run
+    bootstrap administrator was the Administrator arm until ADR 0183 retired it; ``create_admin``
+    writes an Administrator in the same state. Each is pending under the default ``require_mfa``
+    and has nothing to prove at ``/auth/mfa-verify``, so rotating first is the only way forward.
+    This is also why must-change stays ahead of the MFA gate in ``require()``.
     """
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
-    boot = await service.initialize()  # the FIRST initialize mints the bootstrap admin
-    assert boot is not None
+    admin = await create_admin(service)
     await service.create_local_user(
         username="newbie",
         password=PW,
@@ -749,7 +750,7 @@ async def test_a_must_change_account_with_no_factor_still_rotates_from_a_pending
         actor="test",
     )
     async with _client(engine, service) as c:
-        for username, password in ((boot.username, boot.password), ("newbie", PW)):
+        for username, password in ((admin.username, admin.password), ("newbie", PW)):
             r = await c.post("/auth/login", json={"username": username, "password": password})
             assert r.status_code == 200 and r.json()["must_change_password"] is True
             tok = str(r.json()["token"])

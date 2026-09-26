@@ -8,11 +8,10 @@ and stalling commits -- collapsed the numerator while the denominator kept ticki
 fell and the gate went red with **no engine change**. Measured on one commit, one box: four contended
 replicates spread **0.451 to 2.49** against a 0.75 floor. That is a coin flip, not a detector.
 
-The fix reads ``empty_claims_per_msg`` instead. Both inputs are deltas over the SAME window --
-``samples[0]`` to ``samples[-1]`` -- so the span cancels and the quantity is exactly
-``Δempty_claims / Δread``. That window is the hold PLUS the step's post-drain tail, NOT the hold
-alone; it is defined once, in ``harness.load.connscale.runner._empty_claim_rates``, and this
-paragraph used to call it "in-hold", which the final sample is not (BACKLOG #1420).
+The fix reads ``empty_claims_per_msg`` instead. Both inputs are deltas over the SAME rate window,
+so the span cancels and the quantity is exactly ``Δempty_claims / Δread``. That window EXCLUDES the
+step's post-drain final; it is defined once, in ``harness.load.connscale.runner._empty_claim_rates``,
+and this paragraph does not restate it (BACKLOG #1420).
 
 **These tests exist to stop the fix from being the WRONG kind of fix.** A metric that never fails is
 not an improvement on one that fails at random, and a correction is the easiest place to skip
@@ -363,9 +362,10 @@ def test_a_dead_lane_is_still_caught_beside_a_healthy_one() -> None:
 # NOTHING HERE WIDENS THE BAND, AND LIMB TWO DID NOT WIDEN IT EITHER. The hold this block used to
 # carry -- "that is limb two, and it stays blocked until the samples exist" -- is DISCHARGED: the
 # samples exist (894 lane transitions from 153 CI runs) and limb two shipped. It did not touch the
-# rendered band's width, deliberately, so these rows stay directly comparable with the 454 payloads
-# already harvested. What it did was RETIRE the band as a verdict: the emitter still prints OUTSIDE
-# BAND and nothing fails on it. The tests in this section cover the RECORDING, which is unchanged.
+# rendered band's width, deliberately, so the band stays the one the 454 payloads already harvested
+# were rendered under. (Their VALUES are a separate matter: BACKLOG #1420 changed the rate window, and
+# the payload's `rate_window` field marks it.) What it did was RETIRE the band as a verdict: the
+# emitter still prints OUTSIDE BAND and nothing fails on it. The tests in this section cover the RECORDING, which is unchanged.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -459,9 +459,10 @@ def test_the_emitted_band_tracks_the_slo_tolerance_rather_than_a_second_copy() -
     emitter reads its tolerance rather than carrying its own.
 
     THE WIDTH ITSELF IS DELIBERATELY UNCHANGED BY BACKLOG #1211 limb two, which retired this band as a
-    verdict without touching it as a number -- so these rows stay directly comparable with the 454
-    readings already harvested, and that corpus is what a later item reads to decide whether any floor
-    can become a gate. Do not widen it here to make a test pass.
+    verdict without touching it as a number -- so the band stays the one the 454 readings already
+    harvested were rendered under, and that corpus is what a later item reads to decide whether any
+    floor can become a gate. Their VALUES changed window at BACKLOG #1420, which the payload's
+    ``rate_window`` marks. Do not widen the band here to make a test pass.
     """
     report = _report(
         _rec("fixed_per_conn", 12, per_msg=100.0), _rec("fixed_per_conn", 24, per_msg=90.0)
@@ -1029,12 +1030,18 @@ def test_the_payload_version_moved_and_the_harvested_ratio_ROWS_did_not() -> Non
     THE RATIO ROW SHAPE IS PINNED BESIDE IT, and that is the load-bearing half: 454 version-1 payloads
     were harvested for BACKLOG #1211, and a later item reads them together with everything written
     after this. A key added to, renamed in or dropped from a ratio row splits that corpus in two.
+
+    THE ``rate_window`` MARKER IS PINNED HERE TOO, as a LITERAL. BACKLOG #1420 changed the window the
+    values are computed over without changing the row shape, so this top-level field is the only
+    thing that splits the corpus where it really splits. A harvest filters on this exact name and
+    value; reading the constant back would pass a rename.
     """
     report = _report(
         _rec("fixed_aggregate", 12, per_msg=48.0), _rec("fixed_aggregate", 24, per_msg=30.0)
     )
     payload = report.readings_payload(_METRIC, _KEY, tolerance=0.25, base_count=12)
     assert payload["schema_version"] == 2
+    assert payload["rate_window"] == "in_hold_excl_drain"
 
     rows = payload["readings"]
     assert isinstance(rows, list) and len(rows) == 2
@@ -1113,6 +1120,14 @@ _EXPECTED_DIAGNOSTIC_LABELS = frozenset(
         "fd_probe_ticks",
         "fd_probe_degraded_ticks",
         "cpu_util_cores_mean",
+        # BACKLOG #1292, added 2026-09-25. The reload probe closes every connection, and on a loaded
+        # runner what it strands was read as intake loss. This separates the two on every run.
+        "reload_stranded",
+        # BACKLOG #1292, added 2026-09-25 after merge-group run 36166728739. Post-reload sends were
+        # all stored and none drew a reply in the stop grace. These separate a slow engine, a silent
+        # one, and a second close that took the replies.
+        "post_reload_reply_s",
+        "post_reload_drops",
     }
 )
 

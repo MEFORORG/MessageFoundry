@@ -13,8 +13,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   stored stamp the login gate checks. It is `null` in at least these cases: no change is owed, or
   `[auth].initial_password_expiry_hours` is `0` or less. `GET /users` always returns `null` here.
   That route needs only `users:read`, and a list of live temporary passwords is a target list. The
-  never-claimed bootstrap account also gets `null`, because `bootstrap-admin.txt` already states its
-  earlier deadline. The web console's create-user form now states how many hours the password
+  web console's create-user form now states how many hours the password
   lasts. Its user page and forced change-password page state the time, and so does the IDE's
   must-change warning. (`BACKLOG #1141`)
 - **`messagefoundry admin-set-notify-email` sets a missing notification address on an enabled
@@ -53,6 +52,35 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING — the engine no longer creates an account on its own.** A `serve` on a store with no
+  users used to create an enabled Administrator named `admin` and write its one-time password to
+  `bootstrap-admin.txt` beside the store. It now creates no account and writes no file. Create the
+  first Administrator at the host with `messagefoundry provision-admin --username <name> --email
+  <address>`, before the first start or after one that was refused. At the shipped posture a start
+  with no enabled Administrator is refused, and the refusal names that command. A start refused
+  because no Administrator has an address now names `admin-set-notify-email` instead. Under
+  `[security].enforcement = "warn"`, or with security notices off or waived in writing, the engine
+  starts and routes HL7, logs one warning naming `provision-admin`, and nobody can sign in until it
+  runs. The WP-3 lifecycle that disabled the first-run account went with it, and so did its expiry
+  reminder. An account an operator names `admin` is now an ordinary account, so it gets a
+  `credential_expires_at` like any other. `provision-admin` now refuses before it asks for a password
+  when an enabled Administrator already exists or an argument is out of range. It opens the store
+  only after the password passes the policy, so a refusal leaves no new SQLite store file behind.
+  Its `--username`, `--email` and `--display-name` are limited to 256 characters, as in the web
+  console.
+  The two settings that timed the first-run account are removed as well; see the next entry.
+  **Migration:** run `provision-admin` once at the host, as the account that installs the service,
+  against the store and service config the service uses. ADR 0183 Amendment A, Wave 2. (`BACKLOG #1136`)
+- **BREAKING — `[auth].bootstrap_expiry_hours`, `[auth].bootstrap_warn_hours` and the
+  `bootstrap_admin_expiring` alert event are gone.** They timed and announced the first-run account,
+  which the engine no longer creates. A service config file that sets either key now fails to load,
+  with the same "unrecognized config key" error as a typo. An `[[alerts.rules]]` rule whose `event_type`
+  is `bootstrap_admin_expiring` also fails to load. Nothing emitted that event after the account was
+  retired, so such a rule could never match. The environment variables
+  `MEFOR_AUTH_BOOTSTRAP_EXPIRY_HOURS` and `MEFOR_AUTH_BOOTSTRAP_WARN_HOURS` are now ignored without
+  an error, as the environment layer ignores any variable that names no setting. **Migration:**
+  delete both keys from `[auth]`, unset the two variables, and delete or retarget any rule that
+  names the event. ADR 0183 Amendment A, Wave 3. (`BACKLOG #1136`)
 - **BREAKING — the config loader refuses a connection name that does not match
   `^[A-Za-z][A-Za-z0-9_-]{0,255}$`.** In 0.4.0 such a name still loaded and ran, and only the API
   refused it. Now a code-first `inbound()` or `outbound()` call, or a `connections.toml` entry,
@@ -61,6 +89,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   generated connection name that would fail it. **Migration:** rename such connections to fit the pattern;
   stored history stays under the old name. ([BACKLOG #1107](docs/BACKLOG.md))
 ### Fixed
+- **On Windows, the service account and the operator who runs `provision-admin` can now each open
+  the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
+  `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other
+  out. A provisioned store stopped the service starting, and a store the service created refused
+  `provision-admin`. In a data directory hardened the way `install-service.ps1` leaves it, each open
+  now writes one protected ACL on those files naming SYSTEM, Administrators and the one service
+  account. It is the same whoever opens, and it reaches every member of Administrators whose token
+  carries the group enabled, not only the operator who provisioned. `install-service.ps1` now also
+  makes Administrators the owner of the data directory, because the engine requires that. Outside a
+  hardened directory, the old owner-only behaviour is unchanged. What this widens and narrows is
+  stated in the ADR 0163 note of 2026-09-24; the measurement is ADR 0183 Wave 0 and 0b.
+  (`BACKLOG #1136`)
 - **The DICOM C-STORE SCP no longer answers Success for an object the engine does not accept.**
   The SCP's `max_object_bytes` defaults to 128 MiB, but the engine's binary ingress records any
   object over 16 MiB as `ERROR` and never processes it. So an object between 16 and 128 MiB was
@@ -74,7 +114,258 @@ All notable changes to MessageFoundry are documented here. The format follows
   failure status where it used to get Success. A `max_object_bytes` above 16 MiB no longer raises
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
+### Added
+- **The reset notice now states when a temporary password stops working, and the operator gets a
+  reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
+  already enforced it. The `PASSWORD_RESET` security notice to the holder now states that instant,
+  and asks them to choose a new password before then. A disabled account's notice carries no
+  deadline line. A new `[alerts]` event, `initial_credential_expiring`, reminds the operator while
+  an admin-issued temporary password is still unclaimed. It fires at most once per credential per
+  engine process, in the last third of the window, capped at 24 hours (24 hours at the default 72).
+  It names the holder as `user:<username>` and carries the deadline and whole hours left, never the
+  password. With no `[alerts]` transport it goes to the log (`LoggingAlertSink`), where no rule
+  applies. At `initial_password_expiry_hours = 0` no reminder runs. **Catch-all alert rules match
+  this event**, because a rule's `connection` defaults to `*`. When such a rule is the first match,
+  its `mute` or `transports = []` silences the reminder. Its `control_action` is dispatched at
+  `user:<username>`, or, with `control_target` set, at that real connection, which it restarts.
+  Scope such rules to real connection names or to one `event_type`.
+  ([BACKLOG #1141](docs/BACKLOG.md))
+
 ### Security
+- **BREAKING: under `enforce`, a trust anchor whose permissions or path the engine cannot read now
+  refuses to start, unless its SHA-256 pin matches.** This covers `[auth].oidc_tls_ca_cert_file`,
+  `[auth].ad_tls_ca_cert_file`, `[api].tls_client_ca_file` and, new in this release, the mTLS CA
+  of every inbound connection. Before, an unreadable ACL or path only wrote an
+  `acl_indeterminate` or `path_indeterminate` row and a warning. Now, under the default
+  `[security].enforcement = enforce`, the engine refuses. The message names what it could not
+  read, the anchor's SHA-256, and both fixes. **The escape is the pin:** set the anchor's pin to
+  its SHA-256, after checking it is the CA you mean to trust. The engine loads the exact bytes it
+  hashed, so a matching pin rules out a swapped file. It then starts with a warning, and the audit
+  row carries `"pinned": true`. At `warn`, the engine starts with a warning, as before. A pin does
+  not excuse an anchor that another account CAN replace; that still refuses. **The AD anchor has
+  no pin escape:** `ldap3` reads `[auth].ad_tls_ca_cert_file` by path on every bind, so its pin
+  cannot vouch for the bytes loaded. An AD anchor the engine cannot judge must move. **At least these
+  placements started under 0.4.0 and now refuse under `enforce` with no pin:**
+  - on Windows, an anchor under `C:\Windows\Temp` when the engine's account cannot read that
+    folder's permissions. Measured on one Windows 11 host, as a non-elevated user;
+  - an anchor on a network share, a mapped drive, or a FAT or exFAT volume;
+  - on Linux, an anchor on a mount other than ext2/3/4, xfs, btrfs, tmpfs or overlay, such as NFS,
+    a FUSE mount, or a Docker Desktop bind mount;
+  - a path the check cannot finish: a link loop, an alternate data stream, or a folder it cannot
+    read;
+  - on Windows, an anchor whose `icacls` output is empty, cannot be run, or grants write to a group
+    name the engine does not know, such as a localized `Everyone`.
+
+  **Migration:** move the anchor into a folder the engine can read and only administrators and the
+  engine's account can change. On Windows that is the engine's data folder under `C:\ProgramData`.
+  On POSIX it is a root-owned `755` folder such as `/etc/messagefoundry/`. Both pass with no pin.
+  Or set the pin: `[auth].oidc_tls_ca_cert_pin`, `[api].tls_client_ca_pin`, or the new
+  `tls_ca_pin` on the connection. For the AD anchor, only the move works.
+  ([BACKLOG #1142](docs/BACKLOG.md))
+- **BREAKING: the mTLS CA of every inbound MLLP, HTTP and DICOM connection now gets the same
+  checks as the auth anchors.** This is any inbound connection with `tls=True` and a
+  `tls_ca_file`, which makes it require a client certificate. For the DICOM listener that CA is
+  the whole peer authentication decision. Before, the engine read the file by path and checked
+  nothing. Now each gets the SHA-256 pin, the ACL check and the path check, when the connection is
+  built and at every config reload. The listener then loads the bytes the check read, never a
+  second read of the file. The new optional `tls_ca_pin` on `MLLP(...)`, `Http(...)` and
+  `DICOM(...)` is that CA's SHA-256; a pin that does not match always refuses. Each check writes
+  its `auth.trust_anchor` rows under the label `inbound:<connection name>`. **These started under
+  0.4.0 and now refuse under `enforce`:** an inbound CA another account can replace, as the
+  directory-arm entry below lists, and an inbound CA the engine cannot judge, as the entry above
+  lists. An inbound CA with no PEM block, or with a `TRUSTED CERTIFICATE` block, refuses at both
+  dials. `tls_ca_pin` set on an outbound connection, or on one without `tls` and `tls_ca_file`,
+  refuses, because nothing would check it. A pin that is set but empty or whitespace also
+  refuses, and the message names the setting. That covers `tls_ca_pin`,
+  `[api].tls_client_ca_pin`, `[auth].oidc_tls_ca_cert_pin` and `[auth].ad_tls_ca_cert_pin`, for
+  example when an `env()` value or an environment variable is set to nothing. Leave the pin out
+  for no pin. The connection test (`POST /connections/{name}/test`) now builds a connector under
+  the same enforcement dial as the live build. So under `warn` it no longer fails a CA the
+  listener loads. For an outbound connection, the test now applies the same `enforce` clamp and
+  cleartext guards as the live build, so a hop the live build refuses now fails the test too. A
+  refused CA answers the test with `trust anchor refused; see the server log`. The path and
+  SHA-256 go to the log, not to the caller or the audit row. Not covered: the CAs of outbound connections, and an inbound `tls_crl_file`, which is still
+  read by path, so a certificate inside it is trusted unchecked.
+  ([BACKLOG #1142](docs/BACKLOG.md))
+- **A config reload now refuses a trust anchor that the next start would refuse.** The reload
+  check ran the pin, ACL and path checks, but not the check that the file holds a loadable PEM
+  block. So a reload accepted an anchor with no PEM block, or a `TRUSTED CERTIFICATE` block, and
+  the next start refused it. The reload now applies every check and writes a `pem_refused` row.
+  The AD anchor is the exception: `ldap3` loads a `TRUSTED CERTIFICATE` block, so the reload does
+  not refuse one there either.
+  ([BACKLOG #1142](docs/BACKLOG.md))
+- **BREAKING: a Windows SSO (Kerberos) sign-in through `POST /auth/negotiate` no longer opens a
+  step-up window.** Now no directory sign-in opens it: Kerberos by either route, and the federated
+  (OIDC) callback, which already did not. Local password sign-in is unchanged.
+  (`BACKLOG #1144`, step 5)
+  - **What it was.** The engine stamped the new session as freshly re-verified, so its own sign-in
+    stamp passed the step-up check for `[auth].step_up_max_age_seconds` (300 seconds by default).
+    Nothing checked with the directory again. The console's `GET /ui/sso` never opened the window,
+    so one sign-in method had two postures.
+  - **Who it reached.** An account with no engine second factor. With `[security].require_mfa`
+    off, it owed no factor. A bearer client could then run the step-up-gated actions that use the
+    session window on the ticket alone, such as purge, export, replay, config deploy and user admin.
+  - **With `require_mfa` on, it reached further than it looked.** The session owed a factor first,
+    so the window reached only the routes that skip that gate, and only with
+    `[auth].require_action_step_up` off: at least factor enrollment and session termination. But
+    enrollment let the session bind its own TOTP and clear the MFA gate with it. The seeded window
+    then covered every window-gated action until it closed.
+  - **Accounts that hold an engine factor see no change.** The session meets `403` with
+    `X-MFA-Required: 1` first, as before. A TOTP or recovery code sent to `POST /auth/mfa-verify`
+    opens the window. That route takes no passkey.
+  - **Accounts with no engine factor now step up.** On the paths above, the first step-up-gated
+    action returns `403` with `X-Step-Up-Required: 1`. The client answers with `POST /me/reauth` and
+    the account's directory password, which the engine checks by a live bind.
+  - **A session from `POST /auth/negotiate` on an account with no engine factor and no password the
+    engine can bind with cannot step up.** A smart-card-only or passwordless AD account is one. ADR
+    0068 accepted the same limit for `GET /ui/sso`. An engine TOTP opens the session window at the
+    MFA gate, but a route that needs an action-bound proof still needs a bindable password. No
+    shipped client calls `POST /auth/negotiate`.
+  - `AuthService.authenticate_kerberos` and `AuthService.authenticate_oidc` no longer take a
+    `seed_reauth` argument, so no caller can open the window at sign-in. The web console seam moved
+    with it.
+- **BREAKING: the OIDC and API client-CA trust anchors now load the bytes their check read, not a
+  second read of the file.** `[auth].oidc_tls_ca_cert_file` and `[api].tls_client_ca_file` were
+  checked once, for the SHA-256 pin, the ACL and the path, and then opened again by path. A file
+  swapped between the two reads was trusted unchecked, under a pin that had matched. Both now load
+  the checked bytes as `cadata=`. Measured on Windows, CPython 3.14.6 with OpenSSL 3.5.7, over a
+  localhost socket: for a valid PEM, `cadata=` and `cafile=` verify the same CA, refuse the same
+  wrong one, and each load exactly one anchor, on the client side and the server side. Non-ASCII
+  text outside the PEM blocks still loads, and a UTF-8 byte-order mark still loads where OpenSSL
+  reads one: at the start of the file, and straight after a block. **At least these anchors loaded under 0.4.0 and now refuse or change:**
+  - an anchor holding a `TRUSTED CERTIFICATE` block, as `openssl x509 -trustout` writes, refuses at
+    startup. Re-export each certificate in it as a plain `CERTIFICATE` block. `openssl x509 -in
+    <one cert> -out <plain.pem>` converts one certificate per run;
+  - a CRL inside the anchor file is no longer loaded. A CRL reaches these contexts only through
+    `[auth].oidc_tls_crl_file` or `[api].tls_client_crl_file`. With revocation checking on, an
+    issuer whose CRL sat only in the anchor file now fails every handshake with `unable to get
+    certificate CRL`. Put that CRL, and no certificate, in the CRL file. The CRL file is still read
+    by path, and a certificate in it is trusted with no pin, ACL or path check;
+  - an anchor file that holds a CRL and no certificate refuses at startup. It never verified a
+    handshake.
+
+  `verify --section federation` no longer reports the `fed.idp_tls` row as PASS with no anchor set.
+  The IdP hop then trusts every root in the OS trust store, so the row is MANUAL. With an anchor
+  set, the row passes the pin, the CRL file and the `[security].enforcement` dial the engine uses,
+  and it prints the ACL and path verdict. It names the account that ran the check, because that is
+  not the service account. The AD anchor, `[auth].ad_tls_ca_cert_file`, still loads by path.
+  ([BACKLOG #1142](docs/BACKLOG.md))
+- **BREAKING: a federated (OIDC) sign-in no longer links itself to an account. An administrator
+  links it first, through the API.** The engine now picks the account by the identity provider's
+  verified issuer and `sub`, before it reads any username. Before, it picked the account by the
+  username the token claimed. On that account's first federated sign-in it then linked whatever
+  `sub` arrived. So a token that claimed the name of a directory account that had never signed in
+  this way could take over that account and its roles. Now a sign-in whose `sub` is linked to no
+  account is refused and links nothing. Its audit row names the issuer and `sub` that arrived, so
+  an administrator can link it, and is filed under `<oidc>` rather than the name the token claimed.
+  The refusal reason is `federated_subject_not_bound`. The web
+  console's login page tells the person to ask an administrator. Roles come from the directory
+  entry of the linked account, never from the name in the token. A link on a local (non-directory)
+  account is refused as `local_account_conflict`. The refusal `federated_subject_conflict` is no
+  longer emitted. **What an operator must do before turning on `[auth].oidc_enabled`:** link each
+  account with `PUT /users/{user_id}/federated-identity` and a body of `{"subject": "<the IdP
+  sub>"}`. The issuer is always `[auth].oidc_issuer`, which must be set. The account must already
+  exist as a directory account; a Windows SSO (Kerberos) sign-in creates one. Nothing else creates
+  one yet, so a site with no Kerberos sign-in cannot link anyone until a later change adds that.
+  The same route with a new `sub` moves the link and signs the account out. `DELETE` on the same
+  path removes the link and signs the account out. Both routes need `users:manage` and a fresh
+  re-authentication for the action `admin_federated_identity`. Each write leaves an audit row
+  (`auth.federated_subject_bound`, `auth.federated_subject_rebound` or
+  `auth.federated_subject_unbound`) naming the administrator. Linking and unlinking each notify
+  the account holder; unlinking sends the new notice `federated_identity_unbound`. An
+  administrator cannot change their own link. The web console has a screen for this too; see the
+  next entry. Federation still ships off. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184)
+- **The web console can now link, relink and unlink a federated (OIDC) identity.** A user's page
+  shows the account's link, its issuer and `sub`, or says it has none. The new screen
+  `/ui/users/{user_id}/federated-identity` links the account to a `sub`, or moves the link to a
+  new one. Unlinking goes through a confirm page that states the consequence first. Each change
+  calls the same code as `PUT` and `DELETE /users/{user_id}/federated-identity`, so the checks,
+  the audit rows and the notices to the holder are the same. Each needs `users:manage` and a fresh
+  re-authentication for the action `admin_federated_identity`, as the API does. A recent sign-in
+  is not enough, unless the site set `[auth].require_action_step_up = false`, which the API honours
+  the same way. An administrator cannot change their own link here either. Each form posts back
+  the link its page showed, and the console refuses the submit when the stored link has changed
+  since. That check runs before the engine's handler and does not serialise against a concurrent
+  write. So a stale page can still replace or remove a link another administrator set at the same
+  moment. A later slice would move the check into the service's bind and unbind. The screen
+  offers no Link form on a local account or when `[auth].oidc_issuer` is unset, and shows the engine's refusals in words. The engine gains the `AuthService.oidc_issuer`
+  property and a `FederatedIdentityView` model the console renders; no JSON route returns it, and
+  `GET /users` is unchanged. (`BACKLOG #1143`, `BACKLOG #295`, ADR 0184 slice B)
+- **BREAKING: a federated (OIDC) identity now links only to a directory account that carries its
+  immutable directory id.** `PUT /users/{user_id}/federated-identity` and the console's Link refuse
+  an account with no `directory_object_id`, the normalised `objectGUID` a Windows SSO sign-in
+  writes when it creates the account. The API answers `400` with a detail that starts
+  `directory_object_id_missing:`. The console's federated-identity screen offers no Link form on
+  such an account and says why, and a hand-made POST gets the same words. The refusal writes an
+  `auth.federated_bind_refused` audit row naming the administrator. It links nothing, signs nobody
+  out and sends no notice. `FederatedIdentityView` gains `has_directory_object_id`, so the web
+  console seam moved.
+  - **Why.** The engine finds an account with no id by its username, at sign-in and on each
+    directory recheck. A directory can give a freed username to a new person, and a linked
+    account would then take that person's groups. Now every new link sits on an account the engine
+    finds by its `objectGUID` (ADR 0184 AC-5).
+  - **Which accounts now refuse.** A directory account created by a Windows SSO sign-in through a
+    directory that returned no readable `objectGUID`. Before this change it could be linked.
+  - **The cost.** A site whose directory returns no readable `objectGUID` can link nobody, so
+    nobody there can sign in through the identity provider. Directory sign-in still works there.
+  - **An account never gains an id after it is created.** To link one, make the directory return
+    `objectGUID`, turn Windows SSO on if it is off, delete the account, and have the person sign in
+    once with Windows SSO. Nothing else creates a directory account. The new account has a new
+    `user_id`, so the old one's uploads, upload quota and saved searches do not follow.
+  - **A link made before this change on such an account is left in place.** This change adds no
+    sign-in refusal for it, and it can still be removed. It cannot be moved to another `sub`. On a
+    directory that now returns `objectGUID`, its sign-in is already refused as
+    `directory_identity_conflict`, as it was before this change.
+
+  Federation still ships off. (`BACKLOG #1143`, slice C, ADR 0184)
+- **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
+  `PATCH /users/{id}` copied any non-blank `email` into `users.notify_email`, and sent no notice
+  unless the profile email changed. The route fills an omitted `email` from the stored profile, and
+  the web console's user form posts it back on every save. So a display-name edit or a disable
+  copied the profile address into the notification address. On a directory account that address is
+  the directory's `mail`, so the save did the directory repoint ADR 0182 blocks. On an account with
+  no notification address it filled one from the directory. Now `email` sets the profile address
+  only. A new `notify_email` field on `PATCH /users/{id}` is the one way an administrator moves
+  the notification address. Omitted, it leaves the address as it is. Sending the stored address
+  back changes nothing. A new value must be one plain mailbox, and `null` or a blank value is
+  refused with `400`, because the address can be changed but not cleared. A move writes a
+  `user.notify_email_changed` audit row that holds no address. It sends an `email_changed` notice
+  to the old address, which names the new one, or a `notify_email_set` notice to the new address
+  when there was none. Both say an administrator made the change. The console's user page has a
+  Notification address field for it. **What changes for a client:** a `PATCH` that sets `email` to
+  repoint notices now moves only the profile address. Send `notify_email` too. (`BACKLOG #1139`,
+  ADR 0182 Amendment A)
+- **BREAKING: an account with no notification address must set one at sign-in, whenever this
+  instance sends security notices.** A security notice goes to the account's engine-owned address,
+  `users.notify_email`. An account without one was told nothing about a password reset or any other
+  change to how it signs in. At least three paths create such an account: a user created with no
+  email, `provision-admin` without `--email`, and a directory sign-in where the directory returns no
+  `mail`. Now, while `[auth].notify_security_events` is on and an `[alerts]` SMTP
+  relay is configured, that account is confined at sign-in. The JSON API answers other routes with
+  `403` `notification address required` and `X-Notify-Email-Required: 1`. The web console sends other
+  pages to `/ui/account/notify-address`. `POST /me/notify-email` sets the address, which must read as one
+  plain mailbox. It only fills a missing one and answers `409` when one is set, so an administrator still changes an existing
+  address. It stays behind the second-factor gate, so a session that has proven only the password
+  cannot choose the address. Setting it writes `auth.notify_email_set` and sends a `notify_email_set`
+  notice to the new address. A site with no mail relay is not confined. **Who is confined:** every
+  existing account with no `notify_email`, at its next sign-in on an instance that sends notices. That
+  includes API clients and scripts that sign in with a password. Each one gets the `403` until the
+  address is set. (`BACKLOG #1139`)
+- **Removing a passkey now always sends a notice.** Removing one passkey while another factor remained
+  wrote an audit row and sent nothing. It now sends `mfa_credential_removed`. Removing the last factor
+  still sends `mfa_disabled`. (`BACKLOG #1139`)
+- **A dropped security notice is now logged.** With notices on and no SMTP relay configured, the engine
+  dropped every notice without a word. Each drop now logs a warning naming the event type and the
+  username, never the event detail. (`BACKLOG #1139`)
+- **The web console's notification-address page now suggests the address already on the account.**
+  At `/ui/account/notify-address`, the input starts with the account's profile address,
+  `users.email`, when it passes the same checks as a submitted address. On a directory account that
+  is the last `mail` the directory supplied. A line under the input says where it came from and
+  asks the holder to change it if it is not theirs. A pre-filled input is not focused on load, so a
+  stray Enter does not accept it. Opening the page writes nothing. The address becomes `notify_email` only when the holder submits
+  the form, through the same check, audit row and notice as before. The directory still never sets
+  `notify_email` itself. The API is unchanged and suggests nothing. A client with no browser still
+  sets its address with `POST /me/notify-email`, or an administrator sets it. (`BACKLOG #1139`)
 - **An approval can no longer be granted faster than a person could read it.** A new setting,
   `[approvals].min_dwell_seconds`, sets the youngest age at which a pending request may be
   approved. It defaults to 2.0 seconds, which is provisional and derived from the keystroke-level
@@ -84,6 +375,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   path meets it. `0` means no floor. `[approvals].expiry_hours` now also refuses NaN, infinity and
   overflow, and with dual control on, startup refuses a floor at or past the expiry. Dual control
   (`[approvals].enabled`) still ships off. ([BACKLOG #287](docs/BACKLOG.md))
+- **A failed step-up re-auth or password change now counts toward the account lockout, and each
+  session gets at most `lockout_threshold` of them.** In 0.4.0, `POST /me/reauth`, the web console's
+  `POST /ui/reauth` and `POST /me/password` checked a password but counted no failure. So someone
+  holding a stolen session could keep guessing, bounded only by the per-actor ceremony budget. A
+  failure now counts on the account's sign-in counter, so it can lock sign-in and raise the lockout
+  notice. It is also charged to the session, and the failure that reaches `lockout_threshold` (5 by
+  default) revokes that session, so a stolen session gets 5 password guesses in total. The account
+  lock does not refuse a live session's password re-proofs, so an attacker who locks the account from
+  the sign-in page cannot take step-up or the password change away from the owner's live sessions,
+  once those sessions have met their second factor. Wrong TOTP or recovery codes still count on the
+  account alone. A rejected
+  directory (AD) re-bind counts too. The engine never writes a lock to the directory, but each
+  rejected re-bind still reaches the domain controller, so the domain's own lockout policy can still
+  lock the domain account. A directory the engine cannot reach, or one with no such account, is not
+  counted. The per-session count lives in each engine process: a restart resets it, and each engine
+  shard serving its own API port keeps its own, so there the cap is per process rather than in
+  total. The crossing attempt writes `auth.account_locked`. A
+  re-auth that clears a run of three or more failures writes `auth.login_after_failures`. A failed
+  current-password check at `POST /me/password` is now audited as `auth.password_change_failed`.
+  (`BACKLOG #1138`)
 - **BREAKING: the `Http()` inbound listener now refuses any `Transfer-Encoding`, not only
   `chunked`.** The listener decodes no transfer coding. In 0.4.0 it refused the header only when its
   whole value was `chunked`. A coding list such as `gzip, chunked` got through, and so did `chunked,`
@@ -109,6 +420,61 @@ All notable changes to MessageFoundry are documented here. The format follows
   - any HTTP version other than 1.x.
 
   **A deploying sender relying on any of these would be refused.** ([BACKLOG #1125](docs/BACKLOG.md))
+- **BREAKING — every TLS context the engine builds now defaults to the approved AEAD TLS 1.2
+  suites, MLLP and DICOM included, and the engine's own signing key must be RSA-3072 or larger.**
+  A CBC-only TLS 1.2 peer that connected on 0.4.0 would now fail the handshake. For MLLP and DICOM
+  the owner ruled on 2026-09-23 to drop the six CBC-SHA2 suites with no peer census. There is no
+  override setting: a legacy CBC-only peer is served only by a reviewed code change to
+  `_APPROVED_TLS_SUITES`. TLS 1.3 is unaffected, and the IDE client pins the same suite list.
+  [ADR 0188](docs/adr/0188-per-connection-tls-ciphers-on-the-mllp-and-dicom-connectors.md) is
+  amended with a per-hop table. Separately, `transports/signing.py` now refuses an RSA signing key
+  below 3072 bits, for outbound detached-JWS signing and the SMART `client_assertion`; 0.4.0
+  accepted 2048. Counterparty keys, such as an IdP's JWKS key and the `Direct()` signer, keep the
+  2048-bit floor. **Migration:** generate an RSA key of at least 3072 bits, or an EC key for
+  ES256 / ES384, and register its public half with the counterparty.
+  ([BACKLOG #300](docs/BACKLOG.md))
+- **BREAKING: a trust anchor that another account can replace through its folder now refuses to
+  start.** This covers `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and
+  `[api].tls_client_ca_file`. 0.4.0 checked only the anchor file's own permissions. An account with
+  delete-child on the anchor's folder could delete it and plant its own CA, and the engine trusted
+  the copy. The engine now also checks the path. It reads every folder from the drive root or `/`
+  down to the anchor, each link on the way, and the file itself. On Windows it reads each owner and
+  DACL by SID, in process. On POSIX it reads each owner and mode. Under the default
+  `[security].enforcement = enforce`, an object an untrusted account can delete, rename,
+  re-permission or own refuses. At `warn` the engine starts and writes a `path_insecure` row under
+  `auth.trust_anchor`. The message names each object, the account and the right, and gives the
+  `icacls` or `chown` and `chmod` commands that fix it. On a folder, only removing or renaming an
+  entry counts. Adding files does not, so `C:\`, `C:\ProgramData` and a new folder under it pass as
+  Windows ships them. The trusted accounts include at least SYSTEM, Administrators,
+  TrustedInstaller, direct members of local Administrators, and the account the check runs as.
+  LocalService and NetworkService are not trusted as the engine's own. An owner is also trusted
+  when its SID ends in a well-known admin RID (500, 512, 518 or 519) in any domain, as the config
+  guard trusts it. On POSIX, root and the engine's uid are trusted, and only root when the engine
+  runs as root. The verdict depends on the account the check runs as, so run
+  `mefor verify federation` as the service account. Some paths the engine cannot judge: an unreadable folder, a network
+  share or mapped drive, a FAT volume, or a Linux mount other than ext2/3/4, xfs, btrfs, tmpfs or
+  overlay. They write a `path_indeterminate` row. Under `enforce` they refuse unless the pin
+  matches, as the first Security entry above says; at `warn` the engine starts with a warning. The
+  file check still runs beside the path check. **These placements, at least, started under 0.4.0
+  and now refuse:**
+  - a Windows anchor whose own permissions are locked, in a new folder under `C:\Users\Public`;
+  - an anchor under a folder where a named account or local group can delete or rename entries.
+    0.4.0 caught only broad groups. One Windows 11 host's `%TEMP%` refuses this way;
+  - an anchor whose file or any folder above it is owned by an account that is neither an
+    administrator nor the engine's own, such as a folder a standard user made under
+    `C:\ProgramData`;
+  - on POSIX, an anchor or any folder above it owned by a uid other than root or the engine's;
+  - on POSIX, a group- or world-writable folder in the path, unless it is sticky and the entry
+    below it belongs to root or the engine. A link to a good bundle, kept in such a folder, refuses
+    too.
+
+  **Migration:** keep each anchor in a folder that only administrators and the engine's account can
+  change. On Windows that is the engine's data folder under `C:\ProgramData`. On POSIX it is a
+  root-owned `755` folder such as `/etc/messagefoundry/`. The container's `/config`, owned by uid
+  10001 as `docker/README.md` requires, passes when it sits on one of the mount types above. A
+  Docker Desktop bind mount does not, so there it answers indeterminate, and under `enforce` it
+  refuses unless the pin matches.
+  ([BACKLOG #1142](docs/BACKLOG.md))
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
@@ -180,8 +546,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   `icacls` output was empty or was not `icacls` output. It also passed a write grant to a bare
   name it did not know, such as the German `Jeder` for Everyone, and a line-1 write grant it could
   not split from the echoed path. Those now read as indeterminate. The engine logs a warning,
-  writes a new `acl_indeterminate` row under the `auth.trust_anchor` audit action, and still
-  starts, under `enforce` as under `warn`. 0.4.0 wrote no row for an ACL it could not read.
+  writes a new `acl_indeterminate` row under the `auth.trust_anchor` audit action. Under
+  `enforce` it then refuses unless the pin matches, as the first Security entry above says; at
+  `warn` it starts. 0.4.0 wrote no row for an ACL it could not read.
   Under the default `[security].enforcement = enforce`, the check now refuses a write or DELETE
   grant to broad principals 0.4.0 missed. They include at least `NT AUTHORITY\INTERACTIVE`,
   `SERVICE`, `BATCH`, `NETWORK`, `ANONYMOUS LOGON` and `Local account`, `Guests`, `Domain
@@ -290,6 +657,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   default-credential words such as `admin` and `password`. `docs/SECURITY.md` already published the
   list in full, and a new test holds it equal to `CONTEXT_WORDS`. **Migration:** a client that
   matches the old clause in the `detail` must match the new one. (`BACKLOG #1135`, `#1132`)
+- **An opt-in refusal of backend hops on an unchanging credential, and an inventory of every such
+  hop.** `[security].require_nonstatic_credentials` ships off. When on, `serve` refuses every backend
+  hop that presents a password, API key, static token or no credential at all, unless
+  `[security].static_credential_accepted` names it with a reason. The inventory covers the connection
+  graph and six service-settings sections. It appears in `GET /security/posture` as
+  `static_credential_hops`, served `Cache-Control: no-store`, and in `messagefoundry check`. Each
+  hop's detail names its peer as scheme, host and port only. **BREAKING for anything that parses
+  `check` output:** the `static-db-credentials` check line is renamed `static-credentials`, because it
+  now covers every backend hop and not only database hops. (`BACKLOG #1182`)
 - **BREAKING — an operator resend now meets the target inbound's ingress guards.** `POST
   /uploads/{file_id}/resend` and `POST /messages/{message_id}/edit-resend` wrote the stage row
   directly, so the inbound's size ceiling and declared-type checks never ran on them. An uploaded file
@@ -302,12 +678,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   row, and writes no message. **A resend that 0.4.0 accepted can now be refused**: an oversize body,
   a body that does not match the inbound's declared type, or an HL7 body `Peek.parse` rejects.
   An admitted body is committed in the listener's form: HL7 with `\r` line endings, and a binary
-  inbound's body as `mfb64:v1:` carriage. Strict `hl7apy` validation is still not run on a
-  resubmission. A re-route whose origin inbound this engine does not hold (removed, or owned by
+  inbound's body as `mfb64:v1:` carriage. Strict `hl7apy` validation is covered by the next
+  entry. A re-route whose origin inbound this engine does not hold (removed, or owned by
   another engine shard) is now refused with 409 rather than written unchecked. The edit-resend
   direct path (`to` set) writes an outbound row, so only the NUL rule applies there in practice; its
   body is already held below 16 MiB by the 1 MiB request cap. The web console shows an uploaded-log
   resend refused this way as its own notice. ([BACKLOG #1911](docs/BACKLOG.md))
+- **BREAKING — a resend into a strictly validated inbound now meets its strict validation.** Where
+  the target inbound sets `validation.strict`, `POST /uploads/{file_id}/resend` and an edit-resend
+  re-route now run the listener's strict `hl7apy` validation before anything is written. It runs
+  under the same `validation.strict_timeout_s` backstop, and a failure or a timeout is refused with
+  422. The refusal writes the same `upload.resend_reject` or `message_edit_resend_reject` audit row
+  as the other guards, with phase `strict`, and writes no message. Its reason counts the
+  validation errors and quotes none, because `hl7apy` can echo a field value; a dry run against
+  the inbound lists them. **A resend that 0.4.0 accepted can now be refused**: an HL7 body that passes `Peek.parse`
+  but not the inbound's strict validation. As on the listener, a streaming inbound's body at or over
+  `stream_threshold_bytes` gets header-only checking. The edit-resend direct path meets no inbound,
+  so strict validation does not apply to it. ([BACKLOG #1911](docs/BACKLOG.md))
 - **BREAKING — a session that has not proved its second factor can no longer change the password of
   an account that has one.** In 0.4.0 `POST /me/password` accepted an MFA-pending session on the
   password alone, and a change ends every session, so a caller holding only the password could lock
@@ -321,6 +708,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   returns, and retry. The JSON API has no passkey leg, so a passkey-only account proves its factor on
   the web console.
   ([BACKLOG #1954](docs/BACKLOG.md))
+- **A new sign-in now ends the session it replaces.** A console sign-in by password,
+  Windows SSO or OIDC ends the session the browser already held, and the IDE revokes
+  the token a new sign-in replaces. The bearer `POST /auth/login` and
+  `/auth/negotiate` legs revoke nothing, because they return a token without
+  replacing one; ending the old token is the client's job there.
+  ([BACKLOG #1146](docs/BACKLOG.md))
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,

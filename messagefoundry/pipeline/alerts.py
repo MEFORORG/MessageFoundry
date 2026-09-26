@@ -155,16 +155,28 @@ class AlertSink(Protocol):
         :meth:`cert_expiry`) so an operator can route a rotation reminder apart from a cert-expiry alert."""
         ...
 
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
-        """The first-run **bootstrap admin** is still UNCLAIMED (never password-changed) and now sits
-        inside its retirement warn window — an operator must sign in and change the password (or stand
-        up a second administrator) before the unclaimed credential is auto-disabled (ASVS 6.4.5). ``name``
-        labels the credential (``"bootstrap-admin"``); ``expires_at`` is the ISO instant it is disabled;
-        ``hours_remaining`` is the whole hours left (``0`` in the final hour). Carries **only** the
-        deadline + hours — **never** the password or any secret, and no message content (no PHI). Emitted
-        once per process (an in-memory latch on :class:`~messagefoundry.auth.service.AuthService`) by the
-        API-lifespan reminder task. Dedicated (not reusing :meth:`secret_rotation_due`) so an operator can
-        route a first-run-credential reminder apart from a long-lived-secret rotation reminder."""
+    def initial_credential_expiring(
+        self, name: str, *, expires_at: str, hours_remaining: int
+    ) -> None:
+        """An **admin-issued temporary password** (a create-user or reset credential, still
+        ``must_change_password``) is UNCLAIMED and near the instant the login gate stops accepting it
+        (ASVS 6.4.5, BACKLOG #1141). ``name`` is ``user:<holder's username>``, so the throttle and
+        the alert instance key per account; ``expires_at`` is the ISO instant; ``hours_remaining`` is
+        the whole hours left (``0`` in the final hour).
+
+        The prefix does not hide the event from rules. ``AlertRule.connection`` defaults to ``"*"``,
+        so a catch-all rule matches it. Where a catch-all rule is the first match, its ``mute`` or
+        ``transports=[]`` silences this reminder. Its ``control_action`` is dispatched at ``name``,
+        or, when the rule sets ``control_target``, at that real connection, which it restarts. Scope
+        such rules to real connection names or to one ``event_type``. Rules apply only where
+        ``[alerts]`` has a transport; without one, :class:`LoggingAlertSink` logs every event.
+
+        The engine cannot reach the holder of a credential it handed to an administrator, so this goes
+        to the operator: tell the holder, or, if the credential lapses unclaimed, reset it again. The
+        alert does not resolve itself when the holder claims it, so check the account before a
+        reset. Carries **only** the
+        username, the deadline and the hours: never the password, and no message content (no PHI).
+        Emitted once per credential per process by the API-lifespan reminder task."""
         ...
 
     def approval_stale_requester(self, approval_id: str, *, operation: str, reason: str) -> None:
@@ -439,10 +451,13 @@ class LoggingAlertSink:
                 last_rotated,
             )
 
-    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
+    def initial_credential_expiring(
+        self, name: str, *, expires_at: str, hours_remaining: int
+    ) -> None:
         log.warning(
-            "ALERT bootstrap_admin_expiring: %r is UNCLAIMED and is auto-disabled in %d hour(s) "
-            "(expires %s) — sign in and change the password, or add a second admin, before then",
+            "ALERT initial_credential_expiring: the temporary password issued to %r is UNCLAIMED and "
+            "stops working in %d hour(s) (expires %s) -- the holder must sign in and change it, or "
+            "an administrator must reset it again after it lapses",
             name,
             hours_remaining,
             expires_at,
