@@ -344,7 +344,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # (ssl.create_default_context), plus opt-in client-cert mTLS (load_cert_chain). Builds the
     # client-side TLS verification context, and on either branch pins the TLS 1.2 suites to
     # _APPROVED_TLS12_SUITES with set_ciphers (BACKLOG #300), so it offers nothing wider than
-    # the engine listener's AEAD default.
+    # the engine listener's AEAD default. It pins the TLS 1.3 suites with set_ciphersuites too,
+    # where the interpreter has that method (BACKLOG #2042; absent on CPython 3.14).
     "messagefoundry/apiclient/client.py": frozenset({"ssl", "truststore"}),
     # BACKLOG #1276 part A: the engine always serves TLS now and mints a self-signed placeholder when
     # no operator cert is configured. This harness supplies its own certificate instead — one pair
@@ -837,7 +838,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.load_cert_chain()",
             "tls_context:.load_verify_locations()",
             "tls_context:.minimum_version =",
-            "tls_context:.set_ciphers()",
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:ssl.SSLContext",
             "tls_context:via messagefoundry.config.tls_policy",
@@ -847,6 +847,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "tls_context:.load_cert_chain()",
             "tls_context:.set_ciphers()",
+            "tls_context:.set_ciphersuites()",
             "tls_context:ssl.create_default_context",
             "tls_context:truststore.SSLContext",
         }
@@ -939,6 +940,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.post_handshake_auth = True",
             "tls_context:.set_ciphers()",
+            "tls_context:.set_ciphersuites()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
             "tls_context:.verify_mode =",

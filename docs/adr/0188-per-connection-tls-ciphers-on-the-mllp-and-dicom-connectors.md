@@ -286,19 +286,26 @@ order. The apiclient and IDE copies lose the same three.
 
 TLS 1.3 is out of reach of `set_ciphers`. A new `tls_policy.narrow_tls13_suites(ctx)` calls
 `SSLContext.set_ciphersuites` with `APPROVED_TLS13_SUITES` where the method exists, and returns
-whether it did. `narrow_to_approved_suites` calls it, and so does each branch that applies an
-operator `tls_ciphers` string.
+whether it did. `narrow_to_approved_suites` calls it. So does the new `apply_operator_tls_ciphers`,
+the one function both seams now use to apply an operator `tls_ciphers` string. The apiclient keeps
+its own copy, which reaches the inner context of a `truststore` wrapper; the wrapper does not
+forward `set_ciphersuites`.
 
 | Where | TLS 1.2 | TLS 1.3 |
 |---|---|---|
-| Every engine-built hop in the first amendment's table, and the apiclient | 5 suites, no AES-128 | CPython 3.14: all three suites, `TLS_AES_128_GCM_SHA256` included. **A recorded gap, not an override.** CPython 3.15: 2 suites, with no code change |
-| IDE extension client (Node) | 5 suites, no AES-128 | 2 suites now: Node's `ciphers` option reaches TLS 1.3 |
+| Every engine-built hop in the first amendment's table, and the apiclient | 5 suites, no AES-128 | CPython 3.14: all three suites, `TLS_AES_128_GCM_SHA256` included. **A recorded gap, not an override.** Where `set_ciphersuites` exists: 2 suites |
+| IDE extension client | 5 suites, no AES-128 | all three suites. VS Code's Electron (BoringSSL) ignores TLS 1.3 names in `ciphers`, measured on Electron 42.10.0. A gap of the same kind that R4 does not name |
 | The library-built hops the first amendment lists as unchanged | unchanged | unchanged |
+
+**That `set_ciphersuites` arrives in CPython 3.15 is read off typeshed, not measured.** Typeshed
+guards the method at `sys.version_info >= (3, 15)`. A tripwire test goes red on the first
+interpreter that has it, so this section is re-derived then, by handshake.
 
 **The CPython 3.14 residual is recorded, not accepted by override.** CPython 3.14 has no
 `set_ciphersuites`, so no engine code can remove the TLS 1.3 AES-128 suite there. The allow-list
 admits `TLS_AES_128_GCM_SHA256` only on an interpreter without that method, because a string the
-operator cannot change must not fail validation. On 3.15 the admission and the suite leave together.
+operator cannot change must not fail validation. Where the method exists, the admission and the
+suite leave together.
 
 **A legacy peer that needs AES-128 is served by a reviewed change that widens the allow-list**, as
 the 2026-09-23 CBC ruling already provides. There is no setting. `tls_ciphers` cannot select an
@@ -321,6 +328,9 @@ In `tests/test_tls_default_suites.py`:
   `APPROVED_TLS13_SUITES`; WHERE it does not, the call SHALL report that it did nothing.
   -> `test_narrow_tls13_suites_applies_the_approved_tls13_list_where_the_method_exists`,
   `test_narrow_tls13_suites_reports_nothing_done_without_the_method`,
-  `test_the_tls13_aes128_residual_is_measured_as_the_recorded_gap`
-- **AC-12** -- Every branch that applies an operator `tls_ciphers` string SHALL also narrow TLS 1.3.
-  -> `test_every_operator_cipher_branch_narrows_tls13_too`
+  `test_the_tls13_aes128_residual_is_measured_as_the_recorded_gap` (the tripwire),
+  `test_the_apiclient_narrows_the_inner_truststore_context`
+- **AC-12** -- An operator `tls_ciphers` string SHALL reach a context only through
+  `apply_operator_tls_ciphers`, which also narrows TLS 1.3.
+  -> `test_every_operator_cipher_branch_narrows_tls13_too`,
+  `test_no_engine_module_applies_a_cipher_string_outside_the_policy_module`

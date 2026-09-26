@@ -682,10 +682,11 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **BREAKING: the default TLS suites no longer include AES-128.** The engine, the apiclient and
   the IDE client drop `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-RSA-AES128-GCM-SHA256` and
   `DHE-RSA-AES128-GCM-SHA256`. Five TLS 1.2 suites remain: AES-256-GCM and ChaCha20. A TLS 1.2 peer
-  that offers only AES-128-GCM now fails the handshake. At TLS 1.3 the IDE client drops
-  `TLS_AES_128_GCM_SHA256` now. The engine drops it on Python 3.15, which adds
-  `SSLContext.set_ciphersuites`. On Python 3.14 the engine still offers it, a gap the owner's
-  2026-09-26 ruling records rather than overrides. A `tls_ciphers` or `[api].tls_ciphers` string
+  that offers only AES-128-GCM now fails the handshake. At TLS 1.3 the engine and the apiclient
+  drop `TLS_AES_128_GCM_SHA256` on a Python that has `SSLContext.set_ciphersuites` (3.15, per its
+  type stubs). On Python 3.14 they still offer it, a gap the owner's 2026-09-26 ruling records
+  rather than overrides. The IDE client still offers it too: VS Code's runtime ignores TLS 1.3
+  suite names. A `tls_ciphers` or `[api].tls_ciphers` string
   that reaches an AES-128 suite now refuses at load. That includes `ECDHE+AESGCM:ECDHE+CHACHA20`,
   the string the 0.4.0 migration note below recommends. **Migration:** use
   `ECDHE+AESGCM+AES256:ECDHE+CHACHA20`, or leave `tls_ciphers` unset. There is no setting that

@@ -81,10 +81,13 @@ CBC_ONLY = "ECDHE-ECDSA-AES128-SHA256"
 AEAD_ONLY = "ECDHE-ECDSA-AES256-GCM-SHA384"
 AES128_GCM_ONLY = "ECDHE-ECDSA-AES128-GCM-SHA256"
 
+#: The suite names this build's interpreter default offers, read once for the two markers below.
+_DEFAULT_SUITE_NAMES = {str(c["name"]) for c in ssl.create_default_context().get_ciphers()}
+
 #: Whether this build's interpreter default offers the AES-128-GCM suite. The R4 controls need it,
 #: for the reason the CBC controls need ``_DEFAULT_OFFERS_MORE`` below.
 _needs_default_aes128 = pytest.mark.skipif(
-    AES128_GCM_ONLY not in {str(c["name"]) for c in ssl.create_default_context().get_ciphers()},
+    AES128_GCM_ONLY not in _DEFAULT_SUITE_NAMES,
     reason="this build's default does not offer the AES-128-GCM suite",
 )
 
@@ -93,7 +96,7 @@ _needs_default_aes128 = pytest.mark.skipif(
 #: talk to a CBC-only peer either, and "the narrowing did it" cannot be shown. They SKIP there rather
 #: than fail, because the product is still correct on such a build; only the control is unavailable.
 _DEFAULT_OFFERS_MORE = bool(
-    {str(c["name"]) for c in ssl.create_default_context().get_ciphers()}
+    _DEFAULT_SUITE_NAMES
     - set(APPROVED_TLS12_SUITES)
     - {"TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256", "TLS_AES_128_GCM_SHA256"}
 )
@@ -470,15 +473,20 @@ def test_narrow_tls13_suites_reports_nothing_done_without_the_method() -> None:
     assert narrow_tls13_suites(_NoMethod()) is False  # type: ignore[arg-type]
 
 
-@pytest.mark.skipif(
-    hasattr(ssl.SSLContext, "set_ciphersuites"),
-    reason="this interpreter can narrow TLS 1.3, so the R4 gap is closed here",
-)
 def test_the_tls13_aes128_residual_is_measured_as_the_recorded_gap() -> None:
-    """RECORDED GAP of ruling R4, measured rather than restated. On an interpreter without
-    ``set_ciphersuites`` a narrowed context still offers ``TLS_AES_128_GCM_SHA256``, and the
-    allow-list admits it for that reason alone. The day that changes, this test skips."""
+    """RECORDED GAP of ruling R4, measured rather than restated, and a TRIPWIRE.
+
+    Asserted UNCONDITIONALLY, as the key-exchange tripwire in ``test_tls_policy.py`` is: a ``skipif``
+    on the interpreter would go quiet on exactly the day the gap closes. On the first interpreter
+    with ``set_ciphersuites`` this goes red. That is the signal to replace it with a real TLS 1.3
+    handshake against a peer offering only ``TLS_AES_128_GCM_SHA256``, with a stock control, and to
+    re-derive the ``narrow_tls13_suites`` docstring and the ADR 0188 amendment of 2026-09-26."""
+    assert not hasattr(ssl.SSLContext, "set_ciphersuites"), (
+        "set_ciphersuites exists here: the R4 TLS 1.3 gap may be closed. Prove it by handshake and "
+        "re-derive the docs named in this test's docstring."
+    )
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    assert narrow_tls13_suites(ctx) is False
     narrow_to_approved_suites(ctx)
     tls13 = [str(c["name"]) for c in ctx.get_ciphers() if c["protocol"] == "TLSv1.3"]
     assert "TLS_AES_128_GCM_SHA256" in tls13
@@ -495,34 +503,45 @@ def test_the_allow_list_admits_tls13_aes128_only_where_it_cannot_be_removed() ->
 def test_every_operator_cipher_branch_narrows_tls13_too(
     pki: _Pki, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An operator string reaches TLS 1.2 only, so each place that applies one must also call
-    ``narrow_tls13_suites``: the API listener, a connection's ``tls_ciphers``, and the validator's
-    probe, which models an engine context."""
-    import messagefoundry.api.tls as api_tls
+    """An operator string reaches TLS 1.2 only, so the two seams that apply one go through
+    ``apply_operator_tls_ciphers``, which narrows TLS 1.3 after it. So does the validator's probe,
+    which models an engine context. The spy records which context each narrowing reached."""
+    seen: list[ssl.SSLContext] = []
 
-    seen: list[str] = []
+    def spy(ctx: ssl.SSLContext) -> bool:
+        seen.append(ctx)
+        return False
 
-    def spy(where: str) -> Callable[[ssl.SSLContext], bool]:
-        def _spy(ctx: ssl.SSLContext) -> bool:
-            seen.append(where)
-            return False
-
-        return _spy
-
-    monkeypatch.setattr(api_tls, "narrow_tls13_suites", spy("api"))
-    monkeypatch.setattr(tls_policy, "narrow_tls13_suites", spy("policy"))
+    monkeypatch.setattr(tls_policy, "narrow_tls13_suites", spy)
     one = "ECDHE-ECDSA-AES256-GCM-SHA384"
     api = ApiSettings(tls_cert_file=pki.cert, tls_key_file=pki.key, tls_ciphers=one)
     seen.clear()  # constructing the settings may run the validator; only the build is measured
-    build_api_ssl_context(api)
-    assert seen == ["api"], seen
+    built = build_api_ssl_context(api)
+    assert seen == [built], "the API listener's operator branch did not narrow its own context"
     seen.clear()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     tls_policy.apply_connection_tls_ciphers(ctx, {"tls_ciphers": one}, connector="MLLP test")
-    assert seen == ["policy", "policy"], seen  # the validator's probe, then the connection ctx
+    assert len(seen) == 2 and seen[1] is ctx, "the probe, then the connection's own context"
     seen.clear()
     tls_policy.validate_tls_ciphers(one)
-    assert seen == ["policy"], seen
+    assert len(seen) == 1, seen
+
+
+def test_no_engine_module_applies_a_cipher_string_outside_the_policy_module() -> None:
+    """The structural half of the test above. Outside ``tls_policy.py`` only two modules call
+    ``set_ciphers``: the apiclient, which may not import ``config/``, and the TLS floor probe, which
+    deliberately hardens nothing. A new seam that applies an operator string must go through
+    ``apply_operator_tls_ciphers``, or it keeps TLS 1.3 AES-128 where the interpreter could drop it.
+    The allowed set doubles as the control: the scan must find both, or it found nothing."""
+    allowed = {"messagefoundry/apiclient/client.py", "messagefoundry/config/tls_probe.py"}
+    found = set()
+    for path in sorted((_ROOT / "messagefoundry").rglob("*.py")):
+        rel = path.relative_to(_ROOT).as_posix()
+        if rel == "messagefoundry/config/tls_policy.py":
+            continue
+        if call_sites(ast.parse(path.read_text(encoding="utf-8")), "set_ciphers"):
+            found.add(rel)
+    assert found == allowed, f"set_ciphers outside tls_policy.py: {sorted(found ^ allowed)}"
 
 
 @pytest.mark.parametrize("hop", sorted(CLIENT_HOPS | SERVER_HOPS))
@@ -563,10 +582,16 @@ def test_an_operator_api_tls_ciphers_still_wins_over_the_default(pki: _Pki) -> N
 
 def _rank(name: str) -> tuple[int, int]:
     """ECDHE before DHE; within one key exchange AES-256-GCM, then ChaCha20. AES-128-GCM sat
-    between the two until owner ruling R4 of 2026-09-26 removed it."""
+    between the two until owner ruling R4 of 2026-09-26 removed it.
+
+    A suite of any other kind has NO rank and fails here, so a later change that adds one must state
+    where it belongs in the rule rather than sort into place by default."""
     kx = 0 if name.startswith("ECDHE-") else 1
-    cipher = 0 if "AES256-GCM" in name else 1
-    return kx, cipher
+    if "AES256-GCM" in name:
+        return kx, 0
+    if "CHACHA20-POLY1305" in name:
+        return kx, 1
+    raise AssertionError(f"{name} has no place in the stated order rule; extend _rank first")
 
 
 def test_the_approved_order_follows_the_stated_rule() -> None:
@@ -579,6 +604,12 @@ def test_the_rank_rule_can_reject_a_wrong_order() -> None:
     swapped = list(APPROVED_TLS12_SUITES)
     swapped[0], swapped[-1] = swapped[-1], swapped[0]
     assert swapped != sorted(swapped, key=_rank)
+
+
+def test_the_rank_rule_refuses_a_suite_it_cannot_place() -> None:
+    """CONTROL: the removed AES-128-GCM suite, re-added, cannot sort into place unnoticed."""
+    with pytest.raises(AssertionError, match="no place"):
+        _rank(AES128_GCM_ONLY)
 
 
 @_needs_wider_default
@@ -625,21 +656,17 @@ def test_the_ide_copy_matches_the_engine_tuple() -> None:
     assert tuple(names) == APPROVED_TLS12_SUITES
 
 
-def test_the_tls13_copies_match_the_engine_tuple() -> None:
-    """Ruling R4 gave the engine a TLS 1.3 tuple, and both clients carry a copy of it. The IDE's
-    is live today: Node can restrict TLS 1.3 through ``ciphers``, which CPython 3.14 cannot."""
+def test_the_apiclient_tls13_copy_matches_the_engine_tuple() -> None:
+    """Ruling R4 gave the engine a TLS 1.3 tuple. The apiclient carries a copy; the IDE carries
+    none, because its runtime ignores TLS 1.3 names (``engineClient.ts`` records the measurement)."""
     assert apiclient._APPROVED_TLS13_SUITES == APPROVED_TLS13_SUITES
-    text = (_ROOT / "ide" / "src" / "engineClient.ts").read_text(encoding="utf-8")
-    match = re.search(r"export const TLS_13_SUITES: readonly string\[\] = \[(.*?)\];", text, re.S)
-    assert match, "TLS_13_SUITES array literal not found in ide/src/engineClient.ts"
-    assert tuple(re.findall(r'"([^"]+)"', match.group(1))) == APPROVED_TLS13_SUITES
 
 
 def test_the_apiclient_narrows_tls13_where_the_method_exists(
     monkeypatch: pytest.MonkeyPatch, pki: _Pki
 ) -> None:
-    """The apiclient cannot import ``narrow_tls13_suites``, so its own ``getattr`` branch is driven
-    here with the stand-in context, on the pinned-``cacert`` branch."""
+    """The apiclient cannot import ``narrow_tls13_suites``, so its own branch is driven here with
+    the stand-in context, on the pinned-``cacert`` branch."""
     made: list[_Tls13CapableContext] = []
 
     def fake_default_context(*, cafile: str) -> ssl.SSLContext:
@@ -651,6 +678,20 @@ def test_the_apiclient_narrows_tls13_where_the_method_exists(
     monkeypatch.setattr(ssl, "create_default_context", fake_default_context)
     apiclient._build_verify_context(pki.ca, None, None)
     assert [c.tls13_calls for c in made] == [[":".join(APPROVED_TLS13_SUITES)]]
+
+
+def test_the_apiclient_narrows_the_inner_truststore_context() -> None:
+    """The default branch builds a ``truststore.SSLContext``, which forwards only the methods it
+    names, and ``set_ciphersuites`` is not one. The narrowing must reach the INNER context that
+    performs the handshake. Driven by putting the stand-in in the inner slot. The outer wrapper is a
+    real ``ssl.SSLContext``, so its inherited method would have succeeded silently on 3.15."""
+    truststore = pytest.importorskip("truststore")
+    ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    assert hasattr(ctx, "_ctx"), "truststore moved its inner context; re-derive _narrow_tls13"
+    inner = _Tls13CapableContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx._ctx = inner
+    assert apiclient._narrow_tls13(ctx) is True
+    assert inner.tls13_calls == [":".join(APPROVED_TLS13_SUITES)]
 
 
 # --- the call-site count: every engine module that asserts a suite list narrows one -----------------

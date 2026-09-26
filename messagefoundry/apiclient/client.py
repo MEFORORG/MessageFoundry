@@ -364,6 +364,23 @@ _APPROVED_TLS13_SUITES = (
 )
 
 
+def _narrow_tls13(ctx: ssl.SSLContext) -> bool:
+    """This client's copy of ``tls_policy.narrow_tls13_suites``, whose docstring states when it acts
+    and why its no-op on CPython 3.14 is a recorded gap. Returns whether it narrowed.
+
+    **One difference, and it is why this is not a one-line copy.** A ``truststore.SSLContext``
+    forwards only the methods it names to the inner context that performs the handshake, and
+    ``set_ciphersuites`` is not one of them. Called on the wrapper, the inherited base-class method
+    would narrow the unused outer context and succeed silently. So the call goes to the inner
+    context where there is one. ``_ctx`` is private to truststore; if it moves, this falls back to
+    the wrapper, and the apiclient test in ``tests/test_tls_default_suites.py`` goes red."""
+    target = getattr(ctx, "_ctx", ctx)
+    if not hasattr(target, "set_ciphersuites"):
+        return False
+    target.set_ciphersuites(":".join(_APPROVED_TLS13_SUITES))
+    return True
+
+
 def _build_verify_context(
     cacert: str | None,
     client_cert: str | None,
@@ -385,6 +402,7 @@ def _build_verify_context(
 
     **The TLS 1.2 suites are pinned** to :data:`_APPROVED_TLS12_SUITES` on either branch (BACKLOG
     #300), so this client offers the AEAD suites the engine listener defaults to and nothing wider.
+    The TLS 1.3 suites are pinned too, where the interpreter allows it (:func:`_narrow_tls13`).
 
     An opt-in **client** certificate (mTLS, ASVS 12.3.5) is loaded onto whichever context is built — this
     is also what replaces httpx 0.28's deprecated ``cert=`` keyword. Plaintext ``http`` never reaches
@@ -404,11 +422,7 @@ def _build_verify_context(
     # security level is written back in front of the names, as the engine's
     # narrow_to_approved_suites does, so it is stated rather than left to the OpenSSL build.
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
-    # TLS 1.3, ruling R4 (BACKLOG #2042): set_ciphersuites arrives in CPython 3.15. On 3.14 it is
-    # absent, so TLS_AES_128_GCM_SHA256 stays offered: a RECORDED GAP of R4, not an override.
-    set_ciphersuites = getattr(ctx, "set_ciphersuites", None)
-    if set_ciphersuites is not None:
-        set_ciphersuites(":".join(_APPROVED_TLS13_SUITES))
+    _narrow_tls13(ctx)
     if client_cert is not None:
         # keyfile=None is valid: the private key may be bundled in the client cert PEM.
         ctx.load_cert_chain(client_cert, client_key)
