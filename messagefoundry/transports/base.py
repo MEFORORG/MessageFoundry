@@ -69,7 +69,7 @@ __all__ = [
 #: exactly the sources that set :attr:`SourceConnector.polls_shared_resource`. **It ships ON.** One
 #: tick hands at most this many items to the pipeline and leaves the rest where they are; the next
 #: tick takes the next batch. Each connector exposes it as its own setting (``poll_max_files`` on the
-#: two file sources, ``poll_max_rows`` on the database poll), and a falsy value (None/0) disables it.
+#: two file sources, ``poll_max_rows`` on the database poll), and None/0 (in any spelling) disables it.
 #:
 #: **Why a poll source may default this ON while the MLLP message pacer deliberately ships OFF**
 #: (``transports/mllp.py`` ``DEFAULT_MAX_MESSAGES_PER_SECOND``, ruled 2026-08-11). Here a ceiling is a
@@ -137,9 +137,14 @@ def positive_cap[NumT: (int, float)](
     that truncated to zero (a TOML ``0.5``). Each one is a cap that refuses all traffic, or, for a
     timeout, closes every peer the moment it connects, and nobody writes one on purpose. Refused here,
     the typo surfaces at wiring and in ``messagefoundry check``, not as a connection that reports
-    running and accepts nothing. Written ``not cap > 0`` rather than ``cap <= 0`` so NaN is refused too:
-    every comparison with NaN is false, so ``cap_setting`` cannot read it as off either."""
-    cap = cap_setting(value, convert)
+    running and accepts nothing. Written ``not cap > 0`` rather than ``cap <= 0`` so a NaN float cap is
+    refused too: every comparison with NaN is false, so ``cap_setting`` cannot read it as off either.
+    A value the conversion itself rejects (NaN or ``"1e3"`` on an ``int`` cap, or text that is not a
+    number) is re-raised naming the setting, so every refusal says which key to fix."""
+    try:
+        cap = cap_setting(value, convert)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{transport} {knob}={value!r} is not a valid number") from exc
     if cap is not None and not cap > 0:
         raise ValueError(
             f"{transport} {knob}={value!r} must be above zero (use None or 0 to disable it)"

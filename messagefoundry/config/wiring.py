@@ -1735,7 +1735,8 @@ def Http(
     port: int | EnvRef,
     # INBOUND only — the bind interface is a service setting ([inbound].bind_host), so there is no host.
     encoding: str = "utf-8",  # charset the POSTed body is decoded with (non-binary content types)
-    # DoS guards (HTTP analogs of the MLLP frame/connection/idle caps; pass None/0 to disable):
+    # DoS guards (HTTP analogs of the MLLP frame/connection/idle caps; pass None/0 to disable, except
+    # max_header_bytes, which cannot be disabled: None takes its default and 0 is refused):
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float
     | None = 60.0,  # bound the whole-request read (slow-loris guard), seconds

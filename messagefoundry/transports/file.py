@@ -77,8 +77,8 @@ _T = TypeVar("_T")
 #: ``(size, mtime_ns)``: what the partial-write guard compares (BACKLOG #116).
 _FileSig = tuple[int, int]
 
-# Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). A
-# falsy value (None/0) in settings disables the cap; see docs/CONNECTIONS.md.
+# Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). None/0 in
+# settings, in any spelling, disables the cap; see docs/CONNECTIONS.md.
 DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB — matches the MLLP frame cap
 
 # Cap the leave-in-place (#142) in-memory dedup fast-path so it can't outgrow the durable
@@ -104,7 +104,7 @@ SETTLE_MISS_LIMIT = 3
 # When `decompress=` is set, this bounds the *decompressed* output (ADR 0123): `max_file_bytes` only
 # caps the COMPRESSED input (`st_size`), so a small gzip can expand to gigabytes (a decompression bomb).
 # Because the batch split, the sniff, and every downstream stage run on the decompressed bytes, bounding
-# the decompressed output also bounds post-split expansion. A falsy value (None/0) disables the cap.
+# the decompressed output also bounds post-split expansion. None/0 (in any spelling) disables the cap.
 DEFAULT_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024  # 64 MiB
 
 # Compression algorithms the FILE connector supports on its compress=/decompress= option. The connector
@@ -438,8 +438,8 @@ class FileSource(SourceConnector):
         )
         # Per-tick intake ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
         # poll source may default this on are stated once, in transports/base.py). Caps how many files
-        # ONE scan disposes of; the rest stay in the drop directory and the next scan takes them. A
-        # falsy value (None/0) disables the cap, matching max_file_bytes above.
+        # ONE scan disposes of; the rest stay in the drop directory and the next scan takes them.
+        # None/0 (in any spelling) disables the cap, matching max_file_bytes above.
         self.poll_max_files: int | None = resolve_poll_ceiling(
             s.get("poll_max_files", DEFAULT_MAX_ITEMS_PER_POLL),
             knob="poll_max_files",
@@ -449,7 +449,7 @@ class FileSource(SourceConnector):
         # AV scan / batch split (they must see the real HL7). None (default) is byte-identical to before.
         self.decompress: str | None = _validate_compression(s.get("decompress"), "decompress")
         # Bounds the DECOMPRESSED output (a bomb guard `max_file_bytes` — a compressed-`st_size` cap —
-        # cannot provide). A falsy value disables it. Only consulted when `decompress` is set.
+        # cannot provide). None/0 disables it. Only consulted when `decompress` is set.
         self.max_decompressed_bytes: int | None = positive_cap(
             s.get("max_decompressed_bytes", DEFAULT_MAX_DECOMPRESSED_BYTES),
             int,

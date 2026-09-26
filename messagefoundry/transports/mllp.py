@@ -118,7 +118,7 @@ logger = logging.getLogger(__name__)
 # engine callers and tests that import them from this module keep working.
 
 # Resource caps (DoS guards). All are overridable per connection via MLLP() settings; see
-# docs/CONNECTIONS.md. A falsy value (None/0) in settings disables the cap explicitly. The frame
+# docs/CONNECTIONS.md. None/0 in settings, in any spelling, disables the cap explicitly. The frame
 # cap, DEFAULT_MAX_FRAME_BYTES, is defined in `messagefoundry.mllpcodec` beside the decoder.
 DEFAULT_MAX_CONNECTIONS = 256  # bound concurrent inbound clients (connection-flood guard)
 DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this long (slowloris guard)
@@ -682,7 +682,7 @@ class MLLPDestination(DestinationConnector):
         # re-attached very-large document (#149, ADR 0105 Phase 1b — a base64 PDF spliced back into
         # OBX-5.5 for an inline MDM) or a Handler-built large MDM streams inline to a receiver that does
         # not cap the frame (Epic). Raise/lower it per outbound only to bound a partner's ACK size; a
-        # falsy value disables the ACK cap entirely (`max_frame_bytes=0`).
+        # None/0 disables the ACK cap entirely (`max_frame_bytes=0`).
         self.max_frame_bytes: int | None = positive_cap(
             s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES),
             int,
@@ -693,8 +693,8 @@ class MLLPDestination(DestinationConnector):
         # adjudicated default is connect-per-message (today's proven posture, BACKLOG #82.1 "stays off
         # by default"); persistent=true is the documented opt-in that removes the per-message
         # TIME_WAIT port pressure, with the default flip planned once the §8 trigger is met. Key absent
-        # → off; the two freshness knobs follow the receive_timeout convention: present-but-falsy
-        # (None/0) = disabled.
+        # → off; the two freshness knobs follow the receive_timeout convention: None/0 in any
+        # spelling = disabled, a negative = refused.
         self.persistent: bool = bool(s.get("persistent", False))
         self.idle_timeout_seconds: float | None = positive_cap(
             s.get("idle_timeout_seconds", 60.0),
@@ -1565,22 +1565,29 @@ class _MessagePacer:
         return cls(rate, burst, now=time.monotonic(), name=name) if rate else None
 
 
-def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
+def _pacing_settings(
+    settings: Mapping[str, Any], *, transport: str = "MLLP source"
+) -> tuple[float | None, float]:
     """Read ``(max_messages_per_second, message_burst)`` from one connection's settings.
 
     Shared by every intake that paces, so a rename, a default change or a coercion fix lands once
     instead of in four places that must agree. Absent rate -> OFF, deliberately against this
     module's "key absent -> secure default" convention; see :data:`DEFAULT_MAX_MESSAGES_PER_SECOND`.
     Burst defaults to one second's worth, so a peer that sends in bursts is not paced until it
-    exceeds the SUSTAINED rate; it is meaningless when pacing is off.
+    exceeds the SUSTAINED rate; it is meaningless when pacing is off. Both read ``"0"`` as their
+    ``0`` and refuse a negative or NaN at build (BACKLOG #1872). ``transport`` only names the
+    connector in that refusal; the MLLP listener takes the default so its call site is unchanged.
     """
     rate = positive_cap(
         settings.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND),
         float,
         knob="max_messages_per_second",
-        transport="inbound",
+        transport=transport,
     )
-    return rate, float(settings.get("message_burst") or rate or 0.0)
+    burst = positive_cap(
+        settings.get("message_burst"), float, knob="message_burst", transport=transport
+    )
+    return rate, float(burst or rate or 0.0)
 
 
 class MLLPSource(SourceConnector):

@@ -271,9 +271,13 @@ class DicomScpSource(SourceConnector):
             knob="max_associations_per_second",
             transport="DICOM SCP source",
         )
-        self.association_burst: float = float(
-            s.get("association_burst") or self.max_associations_per_second or 0.0
+        burst = positive_cap(
+            s.get("association_burst"),
+            float,
+            knob="association_burst",
+            transport="DICOM SCP source",
         )
+        self.association_burst: float = float(burst or self.max_associations_per_second or 0.0)
         self._pacer = _MessagePacer.for_rate(
             self.max_associations_per_second, self.association_burst
         )

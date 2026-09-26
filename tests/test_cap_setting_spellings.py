@@ -161,6 +161,35 @@ def test_the_dicom_scp_object_cap_reads_a_string_zero_as_uncapped() -> None:
         _SCP({"max_object_bytes": -1})
 
 
+_BURSTS = [
+    pytest.param(_MLLP_IN, "message_burst", "max_messages_per_second", id="mllp-burst"),
+    pytest.param(_TCP_IN, "message_burst", "max_messages_per_second", id="tcp-burst"),
+    pytest.param(_X12_IN, "message_burst", "max_messages_per_second", id="x12-burst"),
+    pytest.param(_HTTP_IN, "message_burst", "max_messages_per_second", id="http-burst"),
+    pytest.param(
+        _SCP, "association_burst", "max_associations_per_second", id="scp-association-burst"
+    ),
+]
+
+
+@pytest.mark.parametrize(("build", "key", "rate_key"), _BURSTS)
+def test_a_string_zero_burst_defaults_to_the_rate_like_a_number_zero(
+    build: Build, key: str, rate_key: str
+) -> None:
+    """A burst of ``0`` means "one second's worth", the rate. A string ``"0"`` used to become a burst
+    of zero, which the pacer floors to one, so every burst past one message was paced.
+
+    Red mutation: restore ``float(v or rate or 0.0)`` for the burst. The ``"0"`` case reads 0.0."""
+    burst_attr = key
+    zero = build({rate_key: 100, key: 0})
+    string_zero = build({rate_key: 100, key: "0"})
+    assert getattr(zero, burst_attr) == 100.0
+    assert getattr(string_zero, burst_attr) == 100.0
+    assert getattr(build({rate_key: 100, key: "7"}), burst_attr) == 7.0  # the control
+    with pytest.raises(ValueError, match=key):
+        build({rate_key: 100, key: -1})
+
+
 # === max_header_bytes: a cap with no "off" =========================================================
 
 
@@ -242,14 +271,17 @@ def test_the_mllp_listener_refuses_its_other_negative_caps(key: str, attr: str) 
 
 def test_mllp_reads_the_shared_cap_helper_rather_than_a_copy() -> None:
     """Moving the helper must not leave MLLP on a private copy that can drift from the shared one."""
-    assert mllp._cap_setting is cap_setting
+    # vars() because strict mypy does not treat an `import ... as _name` as an explicit re-export.
+    assert vars(mllp)["_cap_setting"] is cap_setting
 
 
 def test_positive_cap_refuses_what_is_left_after_zero_reads_as_off() -> None:
     assert positive_cap("0", int, knob="k", transport="t") is None
     assert positive_cap(" 0 ", float, knob="k", transport="t") is None
     assert positive_cap("3", int, knob="k", transport="t") == 3
-    for bad in (-1, "-1", 0.5):  # 0.5 truncates to an int cap of zero, which refuses everything
+    # 0.5 truncates to an int cap of zero, which refuses everything; NaN, "1e3" and text fail inside
+    # int() itself, and must still name the setting.
+    for bad in (-1, "-1", 0.5, math.nan, "1e3", "lots"):
         with pytest.raises(ValueError, match="t k="):
             positive_cap(bad, int, knob="k", transport="t")
     for bad_seconds in (-0.5, "-0.5", math.nan):

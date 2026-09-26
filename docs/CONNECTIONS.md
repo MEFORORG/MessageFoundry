@@ -147,9 +147,10 @@ transport = "mllp"
   an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
-  cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too, on
-  every connector. A negative cap, or `nan`, is refused at load in either spelling. The one cap with no
-  "off", the HTTP listener's `max_header_bytes`, refuses `0` in either spelling.
+  cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
+  those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
+  spelling. The one cap with no "off", the HTTP listener's `max_header_bytes`, refuses `0` in either
+  spelling. DICOM `max_pdu_size` is handed to the DICOM library as written and is not covered.
   A setting whose type is a **table** or an **array** — `headers`, `odbc_params`,
   `capture_response_headers`, `proxy_no_proxy` — is held to its shape, so `headers = 5` is refused;
   where the entries have a readable type it is held to those too, one level in, so
@@ -2895,8 +2896,8 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 ### Per-tick poll ceilings
 
 The three **poll** sources — `File(...)`, `Sftp(...)`/`Ftp(...)` and `DatabasePoll(...)` — each take at
-most **500 items per tick** (`poll_max_files`, `poll_max_rows`). The ceiling **ships on**, and a falsy
-value (`None`/`0`) turns it off.
+most **500 items per tick** (`poll_max_files`, `poll_max_rows`). The ceiling **ships on**, and `None` or `0`
+(in any spelling, including the text `"0"`) turns it off.
 
 **It is a deferral, not a drop.** A file the scan does not reach is still in the drop directory; a row
 the poll does not fetch is still in the table, unmarked. The next tick takes it. Nothing is quarantined,

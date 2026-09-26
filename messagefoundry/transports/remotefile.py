@@ -1170,8 +1170,8 @@ class RemoteFileSource(SourceConnector):
         )
         # Per-tick intake ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
         # poll source may default this on are stated once, in transports/base.py). Caps how many files
-        # ONE poll disposes of; the rest stay on the remote share and the next poll takes them. A falsy
-        # value (None/0) disables the cap, matching max_file_bytes above.
+        # ONE poll disposes of; the rest stay on the remote share and the next poll takes them.
+        # None/0 (in any spelling) disables the cap, matching max_file_bytes above.
         self._poll_max_files: int | None = resolve_poll_ceiling(
             s.get("poll_max_files", DEFAULT_MAX_ITEMS_PER_POLL),
             knob="poll_max_files",

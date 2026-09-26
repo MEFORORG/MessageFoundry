@@ -122,7 +122,7 @@ class X12Destination(DestinationConnector):
         # ADR 0067 §9 (BACKLOG #97): persistent outbound connection — opt-in reuse of ONE lazily-
         # established TCP connection across deliveries (default False = connect-per-send, byte-identical).
         # Same knobs/semantics as MLLP (ADR 0067) minus TLS (X12-over-TCP has none). Key absent → off; the
-        # two freshness knobs follow the receive_timeout convention (present-but-falsy None/0 = disabled).
+        # two freshness knobs follow the receive_timeout convention (None/0 in any spelling = disabled).
         self.persistent: bool = bool(s.get("persistent", False))
         self.idle_timeout_seconds: float | None = positive_cap(
             s.get("idle_timeout_seconds", 60.0),
@@ -527,7 +527,9 @@ class X12Source(SourceConnector):
         # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. One
         # token per INTERCHANGE, which is what this connector's frame is. The port changed
         # REACHABILITY, never the default -- a stock X12 inbound still has no rate bound.
-        self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        self.max_messages_per_second, self.message_burst = _pacing_settings(
+            s, transport="X12 source"
+        )
         # Carried only so a pacing report can name this connection (BACKLOG #290).
         self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.

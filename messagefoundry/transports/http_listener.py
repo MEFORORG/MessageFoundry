@@ -77,7 +77,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 # Resource caps (DoS guards), HTTP analogs of the MLLP frame/connection/idle caps. All overridable per
-# connection via Http() settings; a falsy value (None/0) disables a cap explicitly where noted.
+# connection via Http() settings; None/0 (in any spelling) disables a cap explicitly where noted.
 DEFAULT_MAX_BODY_BYTES = (
     16 * 1024 * 1024
 )  # 16 MiB — matches the MLLP frame cap + the engine ceiling
@@ -617,7 +617,9 @@ class HttpSource(SourceConnector):
         # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
         # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. The
         # port changed REACHABILITY, never the default -- a stock HTTP inbound still has no bound.
-        self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        self.max_messages_per_second, self.message_burst = _pacing_settings(
+            s, transport="HTTP source"
+        )
         #: ONE bucket for the whole listener, not one per connection. This connector answers exactly
         #: one request per connection (build_response hardcodes Connection: close), so a
         #: per-connection bucket would be charged once and thrown away — a rate knob that paced
