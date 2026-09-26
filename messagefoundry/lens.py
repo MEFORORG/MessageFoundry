@@ -191,8 +191,8 @@ class _NativeAction(NamedTuple):
     """A recognized native ``Message``-API statement (ADR 0089 Phase A): a write, or a bound read.
 
     ``action`` is the reused ADR 0076 vocabulary name (``set_field`` / ``copy_field`` /
-    ``delete_segment``), or ``read_field`` for ``name = msg.field(path)``. ``slots`` maps each **editable** parameter, in canonical order, to the exact
-    :class:`ast.expr` node whose byte span an edit splices (a positional arg, or — for ``copy_field`` —
+    ``delete_segment``), or ``read_field`` for ``name = msg.field(path)``. ``slots`` maps each
+    **editable** parameter, in canonical order, to the exact :class:`ast.expr` node whose byte span an edit splices (a positional arg, or — for ``copy_field`` —
     the inner ``msg.field(src)`` argument). ``display`` carries read-only, byte-preserved keyword args
     (``occurrence=``/``repetition=``) that are shown on the row but are never editable in Phase A and
     are never dropped or reordered on a rewrite. ``assign_to`` is the bound name of a ``read_field``,
@@ -248,7 +248,8 @@ def _native_display(call: ast.Call) -> list[tuple[str, ast.expr]] | None:
     """The read-only keyword ``display`` fields of a native call, or None when it carries a splat.
 
     A ``*args`` positional or ``**kwargs`` splat defeats static arity/keyword reasoning, so both native
-    recognizers refuse it (→ a ``code`` row) and a splice never mis-targets a hidden argument."""
+    recognizers refuse it (it falls to a ``code`` row), and a splice never mis-targets a hidden
+    argument."""
     if any(isinstance(a, ast.Starred) for a in call.args):
         return None
     display: list[tuple[str, ast.expr]] = []
@@ -311,18 +312,20 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
 
 
 def _recognize_native_read(s: ast.stmt) -> _NativeAction | None:
-    """Classify ``name = msg.field(path[, occurrence=…])`` as a ``read_field`` row, or None (→ ``code``).
+    """Classify ``name = msg.field(path[, occurrence=...])`` as a ``read_field`` row, or None (``code``).
 
-    ADR 0089 Phase A row 4 ("Read Field → var"). The bound name rides on ``assign_to``.
+    ADR 0089 Phase A row 4 ("Read Field to var"). The bound name rides on ``assign_to``.
     Only a plain ``ast.Assign`` to ONE bare name qualifies. A tuple, attribute, subscript or chained
     target, an annotated assignment, and a ``msg.field(...) or ""`` default all stay ``code``. So do a
-    splat and any positional arity but one. ``path`` is the one editable slot, and only while it is a
+    splat, any positional arity but one, and a target named ``msg``: rebinding the receiver every
+    native row reads would shadow the message, so ``msg = msg.field(...)`` is left as text. ``path`` is the one editable slot, and only while it is a
     literal, exactly as on ``set_field``. Keyword args are read-only ``display`` fields, preserved
     byte-for-byte as on the write rows.
 
     The bound name is emitted read-only as ``assign_to``, the field the ``lookup`` rows already use. A
     rename of the target alone would leave every later use of the old name dangling, so the lens does
-    not offer one. A rename that follows the uses is a design question ADR 0089 does not settle.
+    not offer one. A rename that follows the uses is a design question ADR 0089 does not settle. For
+    the same reason :func:`rewrite_source` refuses ``delete_row`` and ``move_row`` on this row.
 
     A bare ``msg.field(...)`` expression statement never reaches here. It binds nothing, so it stays a
     ``code`` row, and :func:`_recognize_native_method` keeps no ``field`` branch."""
@@ -330,6 +333,7 @@ def _recognize_native_read(s: ast.stmt) -> _NativeAction | None:
         isinstance(s, ast.Assign)
         and len(s.targets) == 1
         and isinstance(s.targets[0], ast.Name)
+        and s.targets[0].id != "msg"
         and isinstance(s.value, ast.Call)
         and _is_msg_method(s.value.func, "field")
     ):
@@ -355,7 +359,7 @@ def _recognize_native_stmt(s: ast.stmt) -> _NativeAction | None:
 def _native_action_row(
     native: _NativeAction, s: ast.stmt, nesting: int, source: str, contract: int
 ) -> dict[str, Any]:
-    """Build the ADR 0076 ``action`` row contract for a recognized native write (ADR 0089 Phase A).
+    """Build the ADR 0076 ``action`` row contract for a recognized native statement (ADR 0089 Phase A).
 
     ``params`` renders each editable slot (a literal → its value; an expression → verbatim source) then
     each read-only keyword (``occurrence=``), so the row carries the same shape as the wrapper form.
@@ -1028,10 +1032,9 @@ def _classify_simple(s: ast.stmt, nesting: int, ctx: _Ctx) -> dict[str, Any] | N
     if call is None:
         return None
 
-    # ADR 0089 Phase A: a native ``msg.set(...)`` / ``msg.delete_segments(...)`` statement (a mutating
-    # method call, so always a bare expression statement — never an assignment) becomes the SAME editable
-    # action row as its wrapper equivalent, without the module being rewritten.
-    # Row 4 adds the one bound read, ``name = msg.field(path)`` (Read Field).
+    # ADR 0089 Phase A: a native ``msg.set(...)`` / ``msg.delete_segments(...)`` write (a bare expression
+    # statement) becomes the SAME editable action row as its wrapper equivalent, without the module being
+    # rewritten. The one native assignment recognized is row 4's read, ``name = msg.field(path)``.
     native = _recognize_native_stmt(s)
     if native is not None:
         return _native_action_row(native, s, nesting, source, ctx.contract)
@@ -2044,6 +2047,17 @@ def rewrite_source(
                 "ADR 0076 §5)"
             )
 
+    # A Read Field row binds a name later statements use (ADR 0089 row 4, BACKLOG #1505). Deleting it, or
+    # moving it below a use or into a block, would leave that use unbound, and the lens does not track
+    # uses. So its STRUCTURE stays as read-only as the code row it used to be; only its path is editable.
+    # A Steps cut is a delete and a drag or up/down is a move, so this one gate covers all of them.
+    if op in ("delete_row", "move_row") and row.get("action") == "read_field":
+        raise LensRewriteError(
+            f"row at lines {line_start}-{line_end} is a Read Field row binding "
+            f"{row.get('assign_to')!r} - {op} is refused because a later use of that name could be left "
+            "unbound; delete or move it in the text editor"
+        )
+
     handler_node = _element_def(tree, row["_handler"], role)
     if handler_node is None:
         raise LensRewriteError(
@@ -2403,7 +2417,7 @@ def _editable_slots(stmt: ast.stmt, kind: str) -> dict[str, ast.expr] | None:
     Returns None for a recognized row that is not a single editable call (a list-of-``Send`` return),
     which the caller round-trips unchanged for a no-op and refuses for a real edit. The mapping is the
     SAME grammar the parser emits: for a **native** ``msg.set(...)`` (ADR 0089 Phase A) it consults
-    :func:`_recognize_native_method` so the splice targets the native method-call args (``path``=arg0,
+    :func:`_recognize_native_stmt` so the splice targets the native method-call args (``path``=arg0,
     ``value``=arg1 — no leading ``msg`` positional; ``copy_field``'s ``src`` is the inner
     ``msg.field(src)`` arg), and read-only keywords (``occurrence=``) are deliberately absent so a splice
     never touches them. For a **wrapper** call (``set_field(msg, …)``) the leading ``msg`` positional is
@@ -2430,9 +2444,9 @@ def _editable_slots(stmt: ast.stmt, kind: str) -> dict[str, ast.expr] | None:
         call = stmt.value
     if call is None:
         return None
-    # Native ``msg.set(...)`` / ``msg.delete_segments(...)`` (a bare mutating statement): the recognizer
-    # is the single source of truth for the editable arg nodes (never the read-only ``occurrence=`` kwarg).
-    # ``name = msg.field(path)`` (ADR 0089 row 4) gives ``path`` only: the bound name is never a slot.
+    # A native write, or row 4's ``name = msg.field(path)`` read: the recognizer is the single source of
+    # truth for the editable arg nodes. The read-only ``occurrence=`` kwarg and a read's bound name are
+    # never slots.
     native = _recognize_native_stmt(stmt)
     if native is not None:
         return dict(native.slots)

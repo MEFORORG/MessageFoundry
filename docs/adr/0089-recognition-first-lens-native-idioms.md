@@ -58,9 +58,12 @@ Recognition is added in phases, ordered by leverage (statement counts from the s
 > an edit. The bound name rides as `assign_to`, the field lookup rows use, and it is **not**
 > editable: renaming the target alone would leave its later uses pointing at the old name, and this
 > ADR does not say whether a rename should follow them. That is an open design question, not a
-> build gap. Only a plain assignment to one bare name qualifies; a tuple, attribute, subscript or
-> chained target, an annotated or augmented assignment, the `msg.field(...) or ""` default, and any
-> read inside a `@router` stay `code` rows. A separate recognizer, `_recognize_native_read`, carries
+> build gap. For the same reason the row's STRUCTURE stays as read-only as the code row it was:
+> `lens rewrite` refuses `delete_row` and `move_row` on it (so a Steps cut, drag or up/down too),
+> and the Steps view offers none of them. Inserting a Read Field is not built. Only a plain
+> assignment to one bare name qualifies; a `msg` target, a tuple, attribute, subscript or chained
+> target, an annotated or augmented assignment, the `msg.field(...) or ""` default, and any read
+> inside a `@router` stay `code` rows. A separate recognizer, `_recognize_native_read`, carries
 > it, so `_recognize_native_method` still has no `field` branch and a bare `msg.field(...)`
 > statement stays `code`. Tests: `tests/test_lens_native_read.py`.
 >

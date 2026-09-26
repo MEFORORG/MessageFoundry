@@ -110,6 +110,7 @@ def test_read_field_param_modes_ride_contract_v2() -> None:
         'name = msg.field("PID-5.1", **kw)',  # keyword splat
         'name = other.field("PID-5.1")',  # not the msg receiver
         'name = msg.fields("PID-5.1")',  # a lookalike method
+        'msg = msg.field("PID-5.1")',  # rebinding the receiver would shadow the message
     ],
 )
 def test_other_shapes_stay_code(body: str) -> None:
@@ -165,6 +166,65 @@ def test_the_bound_name_and_the_kwargs_are_not_editable(param: str) -> None:
     src = _src('name = msg.field("PID-5.1", occurrence=2)')
     with pytest.raises(LensRewriteError, match="unknown or absent"):
         _edit(src, {param: "x"})
+
+
+# --- structure stays read-only: the row binds a name later statements use ----------
+
+#: A read on line 6, its use on line 7, a guard block on lines 8-9, then the send.
+BOUND = (
+    "from messagefoundry import handler, Send\n\n\n"
+    '@handler("h")\n'
+    "def h(msg):\n"
+    '    name = msg.field("PID-5.1")\n'
+    '    msg.set("NK1-2.1", name)\n'
+    "    if flag:\n"
+    '        msg.set("PID-8", "U")\n'
+    '    return Send("OB", msg)\n'
+)
+
+
+def test_delete_row_on_a_read_field_is_refused() -> None:
+    # Deleting line 6 would leave ``name`` on line 7 unbound (a NameError at run time). A Steps cut is
+    # this same op, so the refusal covers cut too.
+    with pytest.raises(LensRewriteError, match="Read Field row binding 'name'"):
+        rewrite_source(BOUND, {"line_start": 6, "line_end": 6, "op": "delete_row"})
+
+
+@pytest.mark.parametrize(
+    "move",
+    [
+        {"direction": "down"},  # below its use: UnboundLocalError
+        {"direction": "up"},
+        {"to_line_start": 7, "to_line_end": 7, "to_position": "after"},  # a drag below the use
+        {"to_line_start": 9, "to_line_end": 9, "to_position": "after"},  # a drag into the if body
+    ],
+    ids=["down", "up", "drag-below-use", "drag-into-block"],
+)
+def test_move_row_on_a_read_field_is_refused(move: dict[str, Any]) -> None:
+    with pytest.raises(LensRewriteError, match="Read Field row binding 'name'"):
+        rewrite_source(BOUND, {"line_start": 6, "line_end": 6, "op": "move_row", **move})
+
+
+def test_the_path_stays_editable_where_structure_is_refused() -> None:
+    out = _edit(BOUND, {"path": "PID-5.2"})
+    assert out == BOUND.replace('"PID-5.1"', '"PID-5.2"')
+
+
+def test_insert_row_of_a_read_field_is_out_of_scope_and_refused() -> None:
+    # Inserting a Read Field is not built (BACKLOG #1505 scope). The IDE offers no such item; a
+    # hand-built spec is refused rather than guessed.
+    with pytest.raises(LensRewriteError):
+        rewrite_source(
+            BOUND,
+            {
+                "line_start": 7,
+                "line_end": 7,
+                "op": "insert_row",
+                "action": "read_field",
+                "params": {"path": "PID-3.1"},
+                "assign_to": "mrn",
+            },
+        )
 
 
 def test_a_nonliteral_path_refuses_a_scalar_but_takes_an_expr() -> None:

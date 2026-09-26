@@ -470,6 +470,16 @@ export function isRowMutable(row: { kind: RowKind; pragma?: boolean }): boolean 
 }
 
 /**
+ * Whether a row is a Read Field (`name = msg.field(path)`, ADR 0089 row 4). It binds a name later steps
+ * use, so deleting it, or moving it below a use or into a block, would leave that use unbound. The engine
+ * refuses delete_row and move_row on it (BACKLOG #1505), so the webview offers neither: no trash, no
+ * arrows, no drag, no cut. Its `path` stays editable.
+ */
+export function isBindingRead(row: { kind: RowKind; action?: string }): boolean {
+  return row.kind === "action" && row.action === "read_field";
+}
+
+/**
  * Whether a row can be REORDERED within its suite (drag-and-drop or ↑/↓): a recognized action/lookup/send
  * row, OR a whole `if`/`for` control BLOCK (its header row moves the block — header + body — as one unit,
  * ADR 0089). An `elif`/`else` header is part of its `if`, not independently movable; a `code` row is the
@@ -482,7 +492,7 @@ export function isRowMovable(row: LensRow): boolean {
   // A `note` is NOT movable in v1: a comment is not a statement, so the engine has nothing to relocate,
   // and ADR 0076 A.6 records that move/delete of a recognized row ALREADY re-attaches neighbouring
   // comments to the wrong step — a movable note would render that misattribution as a confident caption.
-  if (row.kind === "note") {
+  if (row.kind === "note" || isBindingRead(row)) {
     return false;
   }
   return (
@@ -498,6 +508,9 @@ export function isRowMovable(row: LensRow): boolean {
  * (so the webview greys the trash to avoid an error toast, F6).
  */
 export function isRowDeletable(row: LensRow): boolean {
+  if (isBindingRead(row)) {
+    return false;
+  }
   return isRowMutable(row) || (row.kind === "control" && (row.control === "if" || row.control === "for"));
 }
 
@@ -1437,6 +1450,7 @@ export function contextMenuEnablement(
     scaffold?: string;
     filtered?: boolean;
     pragma?: boolean;
+    action?: string;
   },
   ctx: { canMoveUp: boolean; canMoveDown: boolean },
 ): ContextMenuEnablement {
@@ -1447,9 +1461,9 @@ export function contextMenuEnablement(
     // normal step, not a return.
     // A `route` row is a return too: a step after a routing return is dead code.
     insertAfter: !isReturnRow(row) && row.kind !== "route",
-    deleteRow: isRowMutable(row),
-    moveUp: ctx.canMoveUp,
-    moveDown: ctx.canMoveDown,
+    deleteRow: isRowMutable(row) && !isBindingRead(row),
+    moveUp: ctx.canMoveUp && !isBindingRead(row),
+    moveDown: ctx.canMoveDown && !isBindingRead(row),
     // ADR 0104 fan-out: add another destination — on any real send (returned or appended), never the filter.
     addDestination: row.kind === "send" && row.filtered !== true,
   };
@@ -2486,6 +2500,7 @@ const INDENT_PX = 20; // per nesting level
 // a code/control row.
 const HL7_PATH_PARAMS: Record<string, string[]> = {
   set_field: ["path"],
+  read_field: ["path"],
   copy_field: ["src", "dst"],
   append_to_field: ["path"],
   format_date: ["path"],
@@ -2736,6 +2751,9 @@ export function renderRowHtml(
     // ADR 0076 Amendment A: a PRAGMA note is read-only, so the webview mirror greys its edit/delete/move
     // controls rather than letting the user discover the engine's refusal as an error toast (F6).
     `data-pragma="${row.pragma ? "true" : ""}" ` +
+    // BACKLOG #1505: a Read Field binds a name, so the mirror greys its delete/move items (the engine
+    // refuses both). `movable` is already false for it, which drops its arrows, drag and cut.
+    `data-binding-read="${isBindingRead(row) ? "true" : ""}" ` +
     // ADR 0076 Amendment D: the enclosing element's role, so the Add-palette can grey the items this
     // role may not author rather than letting the user meet the engine's refusal as an error toast (F6).
     `data-role="${escapeHtml(role)}" ` +

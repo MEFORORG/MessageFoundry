@@ -10,7 +10,11 @@ import {
   REDACTED_LIVE_VALUE,
   buildHandlerViewModels,
   buildLensTraceArgs,
+  contextMenuEnablement,
+  isRowDeletable,
+  isRowMovable,
   mergeLiveValues,
+  pickMode,
   renderHandlersHtml,
   renderRowHtml,
   shouldAttachLiveValues,
@@ -186,6 +190,22 @@ suite("stepsModel — kind → row-type + params display", () => {
     assert.strictEqual(read.title, "Read Field");
     assert.strictEqual(read.subtitle, "→ name");
     assert.deepStrictEqual(read.editableParams, ["path"]);
+    assert.strictEqual(pickMode("read_field", "path"), "path", "its path gets the HL7 field picker");
+
+    // BACKLOG #1505: it binds a name, so the engine refuses delete_row and move_row on it. The view must
+    // not offer them: no drag, no arrows, no cut (all keyed on `movable`), no trash, no menu items.
+    const lensRow = parse.handlers[0].rows[0];
+    assert.strictEqual(read.movable, false);
+    assert.strictEqual(isRowMovable(lensRow), false);
+    assert.strictEqual(isRowDeletable(lensRow), false);
+    const menu = contextMenuEnablement(lensRow, { canMoveUp: true, canMoveDown: true });
+    assert.strictEqual(menu.deleteRow, false);
+    assert.strictEqual(menu.moveUp, false);
+    assert.strictEqual(menu.moveDown, false);
+    const html = renderRowHtml(read, "h");
+    assert.ok(!html.includes('draggable="true"'), "a Read Field row is not a drag source");
+    assert.ok(!html.includes('data-op="deleteRow"'), "a Read Field row has no trash button");
+    assert.ok(html.includes('data-binding-read="true"'), "the webview mirror can grey its menu items");
   });
 });
 
