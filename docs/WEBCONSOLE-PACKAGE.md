@@ -251,9 +251,21 @@ python -m pytest packaging/messagefoundry-webconsole/tests -q
   requires adding that matrix in the same change.
 - Lint/type-check cover both trees:
   `ruff check messagefoundry messagefoundry_webconsole` and `mypy messagefoundry messagefoundry_webconsole`.
-- The **package-absent** path (engine boots + refuses `serve_ui` cleanly with the console uninstalled) is
-  exercised by [`tests/test_webconsole_absent.py`](../tests/test_webconsole_absent.py) without needing a
-  second venv.
+- The **package-absent** path is exercised by
+  [`tests/test_webconsole_absent.py`](../tests/test_webconsole_absent.py) without needing a second
+  venv. With the console uninstalled, the engine still imports, and `create_app(serve_ui=False)`
+  builds a JSON-only app. `serve` decides before it builds any app, and the result turns on whether
+  `serve_web_console` was set explicitly, in the file or the environment:
+
+  | `serve_web_console` | `serve` with the console absent | Test |
+  |---|---|---|
+  | unset (on by default) | warns, serves the JSON API only, keeps running | `test_serve_default_on_soft_degrades_to_json_only_when_absent` |
+  | explicit `true` | prints an error and exits with code 2 | `test_serve_explicit_console_refuses_when_absent` |
+  | explicit `false` | serves the JSON API only and never looks for the console | none |
+
+  Both tests mock the app and the server, so they check the exit code and the message, not a live
+  JSON-only serve. An embedder that calls `create_app(serve_ui=True)` directly gets a clear
+  `RuntimeError`, not a bare `ImportError`.
 
 ---
 

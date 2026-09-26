@@ -61,7 +61,13 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
-from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.models import (
+    ConnectorType,
+    ContentType,
+    Destination,
+    Source,
+    remote_file_protocol,
+)
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -72,6 +78,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_kex_groups,
     harden_verify_flags,
+    narrow_to_approved_suites,
     relax_verify_expiry,
     resolve_trust_anchor,
 )
@@ -386,6 +393,7 @@ def _ftps_ssl_context(
         pw_arg = key_password if key_password is not None else (lambda: b"")
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(
         ctx, connector="remote-file (FTPS) connection"
     )  # assert forward secrecy (ASVS 12.1.2)
@@ -862,7 +870,7 @@ def _make_client(
     real server/SSH is needed; both connectors call it per operation-batch. ``trust_anchor_policy``
     (#190, ADR 0093) is the outbound FTPS verify-path internal-CA fallback; the source passes ``None``
     (byte-identical) and SFTP/plain-FTP ignore it (no server-cert verify)."""
-    protocol = str(settings.get("protocol", "sftp")).lower()
+    protocol = remote_file_protocol(settings)
     if protocol == "sftp":
         return _SftpClient(settings)
     if protocol == "ftp":
@@ -891,7 +899,7 @@ def _anon_ftp_guard(
     The acceptance pair arrives as arguments rather than out of ``s``: it is a top-level OUTBOUND key,
     not a transport setting, and it is **Destination-only** (ADR 0153 decision 2), so the inbound
     ``RemoteFileSource`` path leaves it at its default."""
-    if str(s.get("protocol", "sftp")).lower() != "ftp":
+    if remote_file_protocol(s) != "ftp":
         return None
     if s.get("username") or s.get("password"):
         return None  # credentialed ftp — covered by _validate_common's cleartext-credential refusal
@@ -926,7 +934,7 @@ def _validate_common(
     for req in ("host", "remote_dir"):
         if not s.get(req):
             raise ValueError(f"REMOTEFILE connector requires a {req!r} setting")
-    protocol = str(s.get("protocol", "sftp")).lower()
+    protocol = remote_file_protocol(s)
     if protocol not in _PROTOCOLS:
         raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
     if protocol == "ftp" and (s.get("username") or s.get("password")):

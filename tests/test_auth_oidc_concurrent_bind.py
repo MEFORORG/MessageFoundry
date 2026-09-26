@@ -1,40 +1,45 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #1256: two concurrent FIRST logins for one federated subject must not both bind.
+"""BACKLOG #1256: two concurrent binds of one federated subject to two accounts must not both land.
 
-**THE APPLICATION GUARD IS CORRECT AND IS NOT WHAT THIS TESTS.** ``auth/service.py`` resolves the
-presenting subject, refuses with ``federated_subject_already_bound`` when a different account holds it,
-and only then records the binding. Every non-concurrent case is covered, and
-``test_one_subject_cannot_bind_two_accounts`` in the sibling module pins exactly that.
+**MOVED FROM THE LOGIN PATH TO THE ADMIN BIND BY BACKLOG #1143 / #295 (ADR 0184).** Until then a
+federated login bound the presented subject on the account's first federated login, and this module
+raced two such FIRST LOGINS. A login no longer binds -- it selects its account by the pair, and an
+unbound pair is refused -- so that race cannot happen any more. The same race now lives at the one
+path that binds, ``AuthService.bind_federated_subject``, and this module races two of those.
+
+**THE APPLICATION GUARD IS CORRECT AND IS NOT WHAT THIS TESTS.** The bind reads the pair's current
+holder and refuses with ``FederatedSubjectHeld`` when a different account holds it, and only then
+writes. ``test_one_subject_cannot_be_bound_to_two_accounts`` in the sibling module pins the
+sequential case.
 
 What the guard cannot do is make its own read-then-write atomic. The read and the write are separate
-awaits, so two logins interleaving between them can both observe "no holder" and both bind.
-``ux_users_federated_subject`` closes that, and the caller renders the loser's integrity error as the
-same refusal the sequential path returns.
+awaits, so two binds interleaving between them can both observe "no holder" and both write.
+``ux_users_federated_subject`` closes that, and the bind renders the loser's integrity error as the
+same refusal the sequential path raises.
 
-***WHY NOT SIMPLY ASSERT THE INDEX EXISTS.*** Because that test PASSES ON THE DEFECT. The guard's own
-in-code comment already records "no UNIQUE constraint names these columns on any backend" -- so a test
-that measures constraints re-derives a comment and says nothing about the race. #1256's correction block
-says this in as many words. The acceptance had to demonstrate the race itself.
+***WHY NOT SIMPLY ASSERT THE INDEX EXISTS.*** Because that test PASSES ON THE DEFECT: it measures a
+declaration and says nothing about the race. The acceptance has to demonstrate the race itself.
 
-***THE INTERLEAVING IS FORCED, NOT HOPED FOR.*** A test that merely starts two coroutines and hopes they
-interleave is a coin flip that passes on the defect whenever the scheduler happens to serialise them --
-silently, and more often on a fast machine. The barrier below makes both reads complete before either
-write can proceed, so the race is deterministic. ``test_the_race_was_actually_exercised`` asserts the
-barrier did its job; without it a green run here would not distinguish "the index held" from "the two
-logins never actually raced".
+***THE INTERLEAVING IS FORCED, NOT HOPED FOR.*** Two coroutines started together and left to the
+scheduler may serialise, and then the test passes on the defect. The barrier below makes both reads
+complete before either write can proceed. ``test_the_race_was_actually_exercised`` asserts the barrier
+did its job; without it a green run here would not tell "the index held" from "the two binds never
+raced".
 """
 
 from __future__ import annotations
 
 import asyncio
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.auth import oidc
 from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.service import FederatedBinding, FederatedSubjectHeld
 from messagefoundry.store.store import MessageStore
 from tests.test_auth_oidc_service import (
     PRINCIPAL,
@@ -45,7 +50,7 @@ from tests.test_auth_oidc_service import (
     _service,
 )
 
-#: One verified identity, presenting twice at the same instant.
+#: One verified identity, asked for by two accounts at the same instant.
 SUBJECT = "S-1-concurrent"
 
 
@@ -54,45 +59,34 @@ def rsa_key() -> rsa.RSAPrivateKey:
     """Local rather than imported: ``rsa_key`` is a module-scoped FIXTURE in the sibling suite, and a
     fixture is resolved by name in the module that requests it -- importing the function object does
     not register it here. Same key size, same scope, so the cost is identical."""
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
+
+
+async def _two_accounts(store: MessageStore) -> tuple[str, str]:
+    """Two directory mirror rows, as Kerberos sign-ins through a directory returning objectGUID
+    would leave them: unbound, each carrying its immutable id (BACKLOG #1143 slice C)."""
+    first, second = uuid4().hex, uuid4().hex
+    await store.create_user(
+        user_id=first, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+    )
+    await store.create_user(
+        user_id=second, username="bsmith", auth_provider="ad", directory_object_id="guid-bsmith"
+    )
+    return first, second
 
 
 async def _run_race(
-    store: MessageStore,
-    rsa_key: rsa.RSAPrivateKey,
-    monkeypatch: pytest.MonkeyPatch,
+    store: MessageStore, rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[list[Any], list[bool]]:
-    """Two federated logins for ONE subject, held open until both have read the current holder.
+    """Two admin binds of ONE subject to two accounts, held open until both have read the holder.
 
-    Returns the two outcomes and what each login OBSERVED at the read -- the second is what proves the
+    Returns the two outcomes and what each bind OBSERVED at the read -- the second is what proves the
     race happened rather than the two calls quietly serialising.
     """
-    other = AdPrincipal(
-        username="bsmith",  # a genuinely different on-prem object, not a rename
-        display_name="B Smith",
-        email="bsmith@corp.example",
-        dn="CN=bsmith,DC=corp,DC=example",
-        groups=PRINCIPAL.groups,
-    )
-    ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "bsmith": other})
-    service = await _service(store, rsa_key, ldap=ldap)
+    service = await _service(store, rsa_key, bind=None)
+    first, second = await _two_accounts(store)
 
-    # The token endpoint is a module global, so a per-call stub would have the two logins overwrite
-    # each other's token and collapse onto one account. Hand each caller its own token instead, keyed
-    # by the code it presents.
-    tokens = {
-        "code-jdoe": _mint(rsa_key, _claims(sub=SUBJECT, preferred_username="jdoe@corp.example")),
-        "code-bsmith": _mint(
-            rsa_key, _claims(sub=SUBJECT, preferred_username="bsmith@corp.example")
-        ),
-    }
-
-    def fake_exchange(**kwargs: Any) -> dict[str, object]:
-        return {"id_token": tokens[kwargs["code"]], "access_token": "at-never-stored"}
-
-    monkeypatch.setattr(oidc, "exchange_code", fake_exchange)
-
-    # FORCE THE INTERLEAVE. Both logins must finish reading the holder before either writes.
+    # FORCE THE INTERLEAVE. Both binds must finish reading the holder before either writes.
     barrier = asyncio.Barrier(2)
     observed: list[bool] = []
     real_read = store.get_user_by_federated_subject
@@ -100,57 +94,40 @@ async def _run_race(
     async def read_then_wait(*args: Any, **kwargs: Any) -> Any:
         holder = await real_read(*args, **kwargs)
         observed.append(holder is None)
-        # BOUNDED, AND THE BOUND IS NOT ABOUT THIS TEST'S OWN LOGIC. If either login returns before
-        # reaching this point -- ANY early exit in `authenticate_oidc`, of which there are several --
-        # then only one party ever arrives and an unbounded `wait()` hangs the whole worker. That is
-        # not a slow test: pytest-timeout's `thread` method calls `os._exit(1)`, so the WORKER PROCESS
-        # dies and xdist reports `worker 'gwN' crashed` with no stack and no failing assertion. It has
-        # happened twice, on unrelated pull requests, and cost a merge-queue eviction each time.
-        #
-        # 10s is far above the microseconds a healthy interleave needs and far below both per-test
-        # caps (60s on ubuntu, 120s on the windows legs), so a real hang fails here, named, rather
-        # than being killed upstream anonymously. Measured: with one party skipped, this fails in
-        # 10.6s with `a login raised rather than returning: TimeoutError()`.
-        #
-        # A TRAP FOR WHOEVER EDITS `authenticate_oidc`: `TimeoutError` IS a subclass of `OSError` on
-        # 3.11+. Today the patched read sits outside every `except` in that chain, so this propagates
-        # cleanly -- but widen an `except OSError` across that region and this bound goes SILENT,
-        # restoring the very hang it exists to prevent.
+        # BOUNDED. If either bind returns before reaching this point, only one party ever arrives
+        # and an unbounded `wait()` hangs the worker; pytest-timeout's `thread` method then kills the
+        # xdist worker with no stack. 10s is far above what a healthy interleave needs and far below
+        # the per-test caps, so a real hang fails here, named.
         await asyncio.wait_for(barrier.wait(), timeout=10)
         return holder
 
     monkeypatch.setattr(store, "get_user_by_federated_subject", read_then_wait)
-
-    async def login(code: str) -> Any:
-        return await service.authenticate_oidc(
-            code, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
-        )
-
     outcomes = await asyncio.gather(
-        login("code-jdoe"), login("code-bsmith"), return_exceptions=True
+        service.bind_federated_subject(first, SUBJECT, actor="admin"),
+        service.bind_federated_subject(second, SUBJECT, actor="admin"),
+        return_exceptions=True,
     )
+    monkeypatch.undo()
     return list(outcomes), observed
 
 
 async def test_only_one_of_two_concurrent_binds_succeeds(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """THE DEFECT ITSELF: before ux_users_federated_subject, BOTH of these bound."""
+    """THE DEFECT ITSELF: without ux_users_federated_subject, BOTH of these would bind."""
     store = await MessageStore.open(":memory:")
     try:
         outcomes, _ = await _run_race(store, rsa_key, monkeypatch)
-        for out in outcomes:
-            assert not isinstance(out, BaseException), (
-                f"a login raised rather than returning: {out!r}"
-            )
-        ok = [o for o in outcomes if o.ok]
-        refused = [o for o in outcomes if not o.ok]
-        assert len(ok) == 1, f"expected exactly one bind to win, got {len(ok)}: {outcomes!r}"
-        assert len(refused) == 1
-        assert refused[0].reason == "federated_subject_already_bound", (
-            "the race loser must get the SAME refusal the sequential path returns, not a 500 or a "
-            f"different reason: {refused[0]!r}"
+        won = [o for o in outcomes if isinstance(o, FederatedBinding)]
+        lost = [o for o in outcomes if isinstance(o, BaseException)]
+        assert len(won) == 1, f"expected exactly one bind to win, got {len(won)}: {outcomes!r}"
+        assert len(lost) == 1
+        assert isinstance(lost[0], FederatedSubjectHeld), (
+            "the race loser must get the SAME refusal the sequential path raises, not an integrity "
+            f"error surfacing as a 500: {lost[0]!r}"
         )
+        holders = [u for u in await store.list_users() if u.oidc_subject == SUBJECT]
+        assert len(holders) == 1
     finally:
         await store.close()
 
@@ -160,17 +137,15 @@ async def test_the_race_was_actually_exercised(
 ) -> None:
     """THE CONTROL ON THE TEST ABOVE, and it is the row that makes its green mean something.
 
-    If the two logins serialised -- scheduler, a lock, a future refactor -- the second would read a
-    holder that already exists, the ordinary guard would refuse it, and the test above would pass
-    WITHOUT the index ever being consulted. It would then keep passing after a revert.
-
+    If the two binds serialised, the second would read a holder that already exists, the ordinary
+    guard would refuse it, and the test above would pass WITHOUT the index ever being consulted.
     Both reads observing "no holder" is what says the interleave really happened.
     """
     store = await MessageStore.open(":memory:")
     try:
         _, observed = await _run_race(store, rsa_key, monkeypatch)
         assert observed == [True, True], (
-            "both logins had to observe NO holder for this to be the concurrent case; "
+            "both binds had to observe NO holder for this to be the concurrent case; "
             f"observed {observed!r} -- the calls serialised and the index was never exercised"
         )
     finally:
@@ -180,8 +155,9 @@ async def test_the_race_was_actually_exercised(
 async def test_a_second_bind_for_a_DIFFERENT_subject_is_untouched(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """NEGATIVE CONTROL. The index is filtered and two-column, so two accounts binding two DIFFERENT
-    subjects must both succeed -- otherwise this change would refuse ordinary federation."""
+    """NEGATIVE CONTROL. The index is filtered and two-column, so two accounts bound to two DIFFERENT
+    subjects must both bind, and both then sign in -- otherwise this change would refuse ordinary
+    federation."""
     store = await MessageStore.open(":memory:")
     try:
         other = AdPrincipal(
@@ -190,9 +166,13 @@ async def test_a_second_bind_for_a_DIFFERENT_subject_is_untouched(
             email="bsmith@corp.example",
             dn="CN=bsmith,DC=corp,DC=example",
             groups=PRINCIPAL.groups,
+            directory_object_id="guid-bsmith",
         )
         ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "bsmith": other})
-        service = await _service(store, rsa_key, ldap=ldap)
+        service = await _service(store, rsa_key, ldap=ldap, bind=None)
+        first, second = await _two_accounts(store)
+        await service.bind_federated_subject(first, "S-1-alice", actor="admin")
+        await service.bind_federated_subject(second, "S-2-bob", actor="admin")
 
         tokens = {
             "c1": _mint(rsa_key, _claims(sub="S-1-alice", preferred_username="jdoe@corp.example")),
@@ -203,11 +183,12 @@ async def test_a_second_bind_for_a_DIFFERENT_subject_is_untouched(
             "exchange_code",
             lambda **kw: {"id_token": tokens[kw["code"]], "access_token": "at"},
         )
-        for code in ("c1", "c2"):
+        for code, user_id in (("c1", first), ("c2", second)):
             out = await service.authenticate_oidc(
                 code, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
             )
             assert out.ok, f"a distinct subject was refused: {out!r}"
+            assert out.identity is not None and out.identity.user_id == user_id
     finally:
         await store.close()
 
@@ -217,8 +198,9 @@ def test_the_index_is_declared_on_every_backend() -> None:
 
     Asserting the index exists cannot see the race and would pass on the defect if the columns were
     unconstrained. It earns its place only as a parity check that no backend was missed, which the
-    race test above cannot give: it runs on SQLite alone, because the Postgres and SQL Server suites
-    need live servers.
+    race test above cannot give: it runs on SQLite alone. Each backend's refusal of a second holder
+    is exercised against a live server by ``tests/_federated_unbind_store_contract.py``, which the
+    gated Postgres and SQL Server suites run.
     """
     import pathlib
 

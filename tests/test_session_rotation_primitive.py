@@ -156,6 +156,22 @@ async def test_the_new_ip_dedupe_survives_rotation(engine: Engine) -> None:
     assert service._new_ip_seen.get(hash_token(rotated)) == "10.11.12.13"
 
 
+async def test_the_reproof_budget_survives_rotation(engine: Engine) -> None:
+    """RED when: _rekey_token_state stops moving _reproof_session_failures.
+
+    Stranded, any rotation -- a verified code, a passkey, an enrollment confirm -- would hand the
+    session a fresh budget of password guesses (BACKLOG #1138).
+    """
+    service, token = await _service_and_token(engine)
+    service._reproof_session_failures[hash_token(token)] = (4, 1.0)
+
+    rotated = await service._rotate_session_token(token)
+    assert rotated is not None
+
+    assert hash_token(token) not in service._reproof_session_failures
+    assert service._reproof_session_failures.get(hash_token(rotated)) == (4, 1.0)
+
+
 def test_rekey_carries_the_ceremony_deadline_rather_than_refreshing_it() -> None:
     """RED when: ChallengeCache.rekey re-stamps the deadline instead of carrying it.
 

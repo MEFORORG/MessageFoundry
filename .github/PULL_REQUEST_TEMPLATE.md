@@ -2,9 +2,8 @@
 
 ## What this changes
 
-<!-- A short description of the change and the motivation. Link any related issue or ADR. -->
-
-Closes #
+<!-- A short description of the change and the motivation. Link any related ADR or
+     Discussion. -->
 
 <!-- Maintainers: if this PR implements a planned item, name it here as `BACKLOG #N`. The ledger
      itself is not in this repository, so nothing here can check the number and its banner is
@@ -25,7 +24,7 @@ Implements: BACKLOG #
 
 - [ ] I have read [CONTRIBUTING.md](../CONTRIBUTING.md) and will agree to the [CLA](../CLA.md) (the bot records it).
 - [ ] If this touches the reliability invariants, store/queue, staged pipeline, auth/RBAC, or the
-      code-first graph model, I **discussed it first** via an issue/ADR (see [GOVERNANCE.md](../GOVERNANCE.md)).
+      code-first graph model, I **discussed it first** (see [GOVERNANCE.md](../GOVERNANCE.md)).
 - [ ] **No real PHI or customer data** anywhere in the diff, tests, fixtures, screenshots, or commit
       messages — synthetic HL7 only (`python -m messagefoundry generate`).
 - [ ] Tests added/updated for new behavior.

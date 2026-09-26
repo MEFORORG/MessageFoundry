@@ -39,7 +39,7 @@ _RS256 = [SignatureAlgorithm.RS256]
 
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 @pytest.fixture(scope="module")
@@ -146,7 +146,7 @@ def test_tampered_signature_fails(rsa_key: rsa.RSAPrivateKey) -> None:
 
 
 def test_signature_from_a_different_key_fails(rsa_key: rsa.RSAPrivateKey) -> None:
-    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other = rsa.generate_private_key(public_exponent=65537, key_size=3072)
     jws = _mint(other, SignatureAlgorithm.RS256)
     with pytest.raises(InvalidSignature):
         verify_compact_jws(jws, rsa_key.public_key(), allowed_algorithms=_RS256)

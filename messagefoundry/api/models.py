@@ -1210,6 +1210,35 @@ class StorePrivilegeView(BaseModel):
     detail: str = ""
 
 
+#: ``SecurityPosture.static_credential_hops_scope`` when the inventory was not read at all.
+STATIC_CREDENTIAL_HOPS_NOT_READ = "not read: this posture was built without the inventory"
+#: The same field when both halves of the inventory were read.
+STATIC_CREDENTIAL_HOPS_COMPLETE = (
+    "complete: the connection graph and the service settings were read"
+)
+#: The same field's prefix when a half could not be read; the route appends which half and why.
+STATIC_CREDENTIAL_HOPS_PARTIAL = "partial, not read: "
+
+
+class StaticCredentialHopView(BaseModel):
+    """One backend hop that presents an unchanging credential or none (BACKLOG #1182, ASVS 13.2.1),
+    as ``config.static_credentials.static_credential_hops`` names it.
+
+    ``name`` is the key an operator opts the hop out with. ``credential`` is ``static`` or ``none``.
+    ``compliant_kind`` says whether the product offers ANY compliant credential kind for this hop; when
+    it is false no configuration clears the hop. ``accepted`` is true when the opt-in refusal is on and
+    ``[security].static_credential_accepted`` names the hop; with the refusal off no opt-out is
+    honoured, so it is false. ``detail`` names what the hop presents and its peer as scheme, host and
+    port only. It cannot carry a secret: it is fixed text plus a label built from parsed address parts,
+    and an address that does not parse is withheld (``config.static_credentials`` module docstring)."""
+
+    name: str
+    credential: str
+    compliant_kind: bool
+    accepted: bool
+    detail: str
+
+
 class SecurityPosture(BaseModel):
     """The instance's **effective** PHI-at-rest security posture (M5), behind the authenticated,
     permission-gated ``GET /security/posture`` route. Surfaces what protection is *actually* in effect
@@ -1259,6 +1288,14 @@ class SecurityPosture(BaseModel):
     store_privilege: StorePrivilegeView = Field(
         default_factory=lambda: StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
     )
+    # BACKLOG #1182 (ASVS 13.2.1): every backend hop that presents an unchanging credential or none.
+    # This is the INVENTORY, reported whether or not the opt-in refusal
+    # ([security].require_nonstatic_credentials, echoed in `security` above) is on. The scope is always
+    # a sentence and never absent: it says both halves were read, or names the half this engine could
+    # not see (no loaded graph, or no resolved service configuration). Its default says the inventory
+    # was not read at all, so a posture built without it can never pass for a clean, complete list.
+    static_credential_hops: list[StaticCredentialHopView] = Field(default_factory=list)
+    static_credential_hops_scope: str = STATIC_CREDENTIAL_HOPS_NOT_READ
     # `synthetic_relaxation` SAT HERE and is gone with the declaration it described (BACKLOG #1279).
     # It reported that the strict PHI controls were relaxed instance-wide. Every instance carries
     # patient data now, so there is no such state to report: a relaxed control is a per-gate switch and
