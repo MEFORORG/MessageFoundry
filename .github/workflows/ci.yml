@@ -3988,8 +3988,56 @@ jobs:
           # Pass the needs context via env, not inline ${{ }} in the run block (defense-in-depth against
           # template injection — a job output could in theory carry a quote that breaks out of echo).
           NEEDS_JSON: ${{ toJSON(needs) }}
+          GATE_ARM: failure
+        # THE ANNOTATION NAMES THE LEG, and the check list is why (BACKLOG #1776). A reader classifying
+        # the check rows against the required set sees `CI gate` red beside a leg that is not required,
+        # and cannot join the two: the needs dump uses job ids, the check list uses display names. So
+        # both arms print the culprit's id AND its check-list name. The Python is byte-identical in the
+        # two steps -- only GATE_ARM differs -- and a crash in it cannot turn the step green: the
+        # `|| echo` keeps the dump and the unconditional `exit 1` below it.
         run: |
-          echo "::error::A gated CI leg FAILED. This is a real break -- see the needs dump below."
+          python3 - <<'PY' || echo "::error::CI gate could not name the leg; read the needs dump below."
+          import json
+          import os
+
+          # Job id -> the name the check list shows, `*` standing for a matrix value. The two differ,
+          # and `tooling` showing as `repo harness tests (...)` is the gap BACKLOG #1776 records.
+          # tests/test_ci_gate_annotation.py pins this against every need's own `name:`.
+          CHECK_NAMES = {
+              "changes": "detect server-DB + docker changes",
+              "sqlserver-store": "sql server (store + connector) *",
+              "postgres-store": "postgres store",
+              "load-test": "load test (smoke, sqlite)",
+              "load-test-sqlserver": "load test (smoke, sqlserver) *",
+              "windows-service-smoke": "windows service smoke (*, py*)",
+              "webconsole": "web console tests (*, py*)",
+              "tooling": "repo harness tests (*)",
+              "packaging-build": "packaging-build",
+          }
+
+
+          def label(job_id):
+              shown = CHECK_NAMES.get(job_id, job_id)
+              return job_id if shown == job_id else f'{job_id} (check list: "{shown}")'
+
+
+          def legs(result):
+              ids = sorted(k for k, v in NEEDS.items() if (v or {}).get("result") == result)
+              return ", ".join(label(k) for k in ids) or "none"
+
+
+          NEEDS = json.loads(os.environ["NEEDS_JSON"])
+          if os.environ["GATE_ARM"] == "failure":
+              print(f"::error::CI gate failed: {legs('failure')} FAILED. This is a real break; open that leg's log.")
+              cancelled = legs("cancelled")
+              if cancelled != "none":
+                  print(f"::error::Also CANCELLED, so untested: {cancelled}.")
+          else:
+              print(f"::error::CI gate failed: {legs('cancelled')} CANCELLED. A cancelled leg tested nothing.")
+              print("::error::Superseded if a newer run on the same ref exists: that NEWER run gates the merge.")
+              print("::error::Timed out if the leg's own log says it hit its job timeout-minutes cap: a real problem.")
+              print("::error::Otherwise some other cause, for example a hand cancellation to free runners: re-run it.")
+          PY
           echo "$NEEDS_JSON"
           exit 1
 
@@ -3999,10 +4047,57 @@ jobs:
           contains(needs.*.result, 'cancelled')
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          GATE_ARM: cancelled
+        # AT LEAST THREE CAUSES END A LEG `cancelled`, and this message used to name one. Supersession
+        # by `cancel-in-progress` is the common one (the census above). A job that runs past its own
+        # JOB-level `timeout-minutes` also lands as `cancelled` -- measured from the `toJSON(needs)`
+        # dump under BACKLOG #1410, see tests/test_gate_liveness.py; how a STEP-level cap kill reports
+        # is not measured here. And an operator cancelling a run by hand, for example to free starved
+        # runners, does too; a reader told only "check the newer run" finds none and no explanation
+        # (BACKLOG #1776). The list is not closed, so the last line says "some other cause".
         run: |
-          echo "::error::A gated CI leg was CANCELLED, so it tested nothing and cannot read as a pass."
-          echo "::error::If this run was superseded by a newer push to the same ref, the NEWER run is"
-          echo "::error::what gates the merge and this red is expected. Check the newer run first."
+          python3 - <<'PY' || echo "::error::CI gate could not name the leg; read the needs dump below."
+          import json
+          import os
+
+          # Job id -> the name the check list shows, `*` standing for a matrix value. The two differ,
+          # and `tooling` showing as `repo harness tests (...)` is the gap BACKLOG #1776 records.
+          # tests/test_ci_gate_annotation.py pins this against every need's own `name:`.
+          CHECK_NAMES = {
+              "changes": "detect server-DB + docker changes",
+              "sqlserver-store": "sql server (store + connector) *",
+              "postgres-store": "postgres store",
+              "load-test": "load test (smoke, sqlite)",
+              "load-test-sqlserver": "load test (smoke, sqlserver) *",
+              "windows-service-smoke": "windows service smoke (*, py*)",
+              "webconsole": "web console tests (*, py*)",
+              "tooling": "repo harness tests (*)",
+              "packaging-build": "packaging-build",
+          }
+
+
+          def label(job_id):
+              shown = CHECK_NAMES.get(job_id, job_id)
+              return job_id if shown == job_id else f'{job_id} (check list: "{shown}")'
+
+
+          def legs(result):
+              ids = sorted(k for k, v in NEEDS.items() if (v or {}).get("result") == result)
+              return ", ".join(label(k) for k in ids) or "none"
+
+
+          NEEDS = json.loads(os.environ["NEEDS_JSON"])
+          if os.environ["GATE_ARM"] == "failure":
+              print(f"::error::CI gate failed: {legs('failure')} FAILED. This is a real break; open that leg's log.")
+              cancelled = legs("cancelled")
+              if cancelled != "none":
+                  print(f"::error::Also CANCELLED, so untested: {cancelled}.")
+          else:
+              print(f"::error::CI gate failed: {legs('cancelled')} CANCELLED. A cancelled leg tested nothing.")
+              print("::error::Superseded if a newer run on the same ref exists: that NEWER run gates the merge.")
+              print("::error::Timed out if the leg's own log says it hit its job timeout-minutes cap: a real problem.")
+              print("::error::Otherwise some other cause, for example a hand cancellation to free runners: re-run it.")
+          PY
           echo "$NEEDS_JSON"
           exit 1
 
