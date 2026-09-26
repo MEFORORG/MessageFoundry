@@ -344,8 +344,8 @@ authentication is on, because a browser cannot set the `Authorization` header on
 
 The two gates audit differently. Under the default audit setting, `authorize_ws` writes one
 `auth.permission_granted` row per authorized handshake, before the route's connection-cap check.
-`authorize_ui_ws` writes no grant row. Its denial rows carry the client address, read through the
-same `client_ip()` the engine's gates use (ADR 0150, BACKLOG #1644).
+`authorize_ui_ws` writes no grant row. Its denial rows carry the client address, as those of
+`authorize_ws` do, read through the same `client_ip()` (ADR 0150, BACKLOG #1644).
 
 ### Permission catalogue (29)
 

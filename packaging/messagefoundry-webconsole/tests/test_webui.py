@@ -2477,6 +2477,9 @@ async def test_console_purge_writes_the_connection_purge_row(
         "scope": "all",
         "cancelled": 1,
     }
+    # The console hands purge_connection its live request, so the row names the browser's host too.
+    # "127.0.0.1" is httpx ASGITransport's default peer, which _client leaves in place.
+    assert rows[0]["client"] == "127.0.0.1"
 
 
 def test_connections_fragment_renders_selection_checkbox() -> None:
