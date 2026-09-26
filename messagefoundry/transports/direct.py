@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
@@ -604,6 +604,10 @@ class DirectDestination(DestinationConnector):
         # attempt ceiling for a message that can never build (BACKLOG #1919). An un-encodable body is
         # already permanent: encode_wire_body raises it, and this arm does not catch it.
         #
+        # UnsupportedAlgorithm is caught too: it subclasses Exception, not ValueError, so it escaped
+        # this arm to the worker's "internal error" path. Reported for a FIPS-enabled OpenSSL, where
+        # the envelope builder refuses to construct; mapped defensively, NOT reproduced (#1921).
+        #
         # The raise sits OUTSIDE the handler on purpose (BACKLOG #1920): `from exc` would chain the
         # build error as `__cause__`, and `from None` would still leave it on `__context__`. Only the
         # type NAME survives the handler. See `encode_wire_body` in transports/base.py.
@@ -611,7 +615,7 @@ class DirectDestination(DestinationConnector):
         failure = ""
         try:
             msg = self._build_smime(payload)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
             failure = type(exc).__name__
         if msg is None:
             raise NegativeAckError(

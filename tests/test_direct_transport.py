@@ -36,6 +36,7 @@ from typing import Any
 
 import pytest
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
@@ -465,6 +466,32 @@ async def test_crypto_build_failure_is_permanent_and_content_free(
     assert exc.credential_fault is False
     assert "TypeError" in str(exc)
     assert exc.__cause__ is None and exc.__context__ is None  # the #1920 shape holds here too
+    assert _FakeSMTP.instances == []
+
+
+async def test_unsupported_algorithm_from_the_envelope_build_is_permanent(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    """BACKLOG #1921. Reported: under a FIPS-enabled OpenSSL, constructing PKCS7EnvelopeBuilder raises
+    UnsupportedAlgorithm, which subclasses Exception and not ValueError, so it escaped the build arm
+    and reached the delivery worker as an "internal error". NOT reproduced -- no FIPS OpenSSL here --
+    so this simulates the raise and pins the mapping: permanent, content-free, chain severed."""
+
+    def _fips_refusal() -> Any:
+        raise UnsupportedAlgorithm("synthetic FIPS refusal ZZLIBDETAIL")
+
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki))
+    monkeypatch.setattr(
+        "messagefoundry.transports.direct.pkcs7.PKCS7EnvelopeBuilder", _fips_refusal
+    )
+    with pytest.raises(NegativeAckError) as ei:
+        await d.send(_SYNTHETIC_HL7)
+    exc = ei.value
+    assert exc.permanent is True
+    assert "UnsupportedAlgorithm" in str(exc)
+    assert "ZZLIBDETAIL" not in "".join(traceback.format_exception(exc))
+    assert exc.__cause__ is None and exc.__context__ is None
     assert _FakeSMTP.instances == []
 
 
