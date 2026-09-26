@@ -5282,7 +5282,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.permissions import Role
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import open_store
+    from messagefoundry.store.base import open_store, store_driver_errors
     from messagefoundry.store.crypto import StoreKeylessError
     from messagefoundry.store.store import require_notify_email
 
@@ -5306,9 +5306,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     # also finds it.
     wanted = args.username.strip()
     actor = f"cli:{getpass.getuser()}"
-    # Store failures a refused write can raise on SQLite. `RuntimeError` covers the audit chain's
-    # keyed-append refusal and the store's own acquire timeout.
-    store_errors = (RuntimeError, sqlite3.DatabaseError)
+    # Store failures a refused write can raise on every backend (BACKLOG #1983). `RuntimeError` covers
+    # the audit chain's keyed-append refusal and the store's own acquire timeout; `OSError` a server
+    # backend's lost connection; the rest are the drivers' own bases, which subclass neither.
+    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
 
     async def run() -> tuple[str, str, str]:
         """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
@@ -5344,8 +5345,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 return ("audit-refused", user.username, str(exc))
             try:
                 await store.set_user_notify_email(user.id, email=address)
-            except store_errors as exc:
+            except Exception as exc:
                 # The row above now records a change that did not happen, so say so in the log too.
+                # Whatever the failure was (BACKLOG #1983): the compensating row must not depend on
+                # this command recognising the error, since a missed class leaves a false log.
                 try:
                     await store.record_audit(
                         "auth.admin_notify_email_set_failed", actor=actor, detail=detail
@@ -5353,6 +5356,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                     logged = "a matching _failed audit row was appended"
                 except store_errors as follow:
                     logged = f"appending the matching _failed audit row also failed ({follow})"
+                if not isinstance(exc, store_errors):
+                    raise  # not a store refusal but a defect: the dispatch floor reports it
                 return ("write-failed", user.username, f"{exc}; {logged}")
             return ("set", user.username, store.path)
         finally:

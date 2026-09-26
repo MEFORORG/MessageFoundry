@@ -525,6 +525,203 @@ def test_a_keyed_store_with_encrypted_rows_is_refused_at_open(
     assert "audit row goes first" not in error
 
 
+# --- 6. a server backend's driver errors (BACKLOG #1983) ----------------------------------------
+#
+# The command opens its store through `open_store`, so it also runs on PostgreSQL and SQL Server.
+# Their drivers raise asyncpg's and pyodbc's own classes, which subclass neither `sqlite3.Error` nor
+# `RuntimeError`. Before #1983 such a refusal escaped every `except` arm, so a failed address write
+# after the audit row landed would never append the matching `_failed` row. The drivers are optional
+# extras, so each test installs a stand-in module of the same name; the store is a double whose
+# methods raise it. `test_a_failed_write_after_the_audit_row_is_reported_not_ok` is the SQLite control.
+
+
+class _DriverStore:
+    """A store double for a server backend: one enabled Administrator with no address."""
+
+    path = "db.example.invalid/messagefoundry"
+
+    def __init__(
+        self,
+        *,
+        audit: BaseException | None = None,
+        write: BaseException | None = None,
+        failed_audit: BaseException | None = None,
+    ) -> None:
+        self._audit, self._write, self._failed_audit = audit, write, failed_audit
+        self.audited: list[str] = []
+        self.written = False
+
+    async def get_user_by_username(self, username: str) -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(id="u-admin", username=username, disabled=False, notify_email=None)
+
+    async def get_user_role_ids(self, _user_id: str) -> list[str]:
+        return [Role.ADMINISTRATOR.value]
+
+    async def record_audit(self, action: str, **_k: object) -> None:
+        raise_this = self._failed_audit if action.endswith("_failed") else self._audit
+        if raise_this is not None:
+            raise raise_this
+        self.audited.append(action)
+
+    async def set_user_notify_email(self, *_a: object, **_k: object) -> None:
+        if self._write is not None:
+            raise self._write
+        self.written = True
+
+    async def close(self) -> None:
+        return None
+
+
+def _fake_drivers(monkeypatch: pytest.MonkeyPatch) -> dict[str, type[Exception]]:
+    """Stand-ins for the asyncpg and pyodbc modules, carrying the classes the store layer names."""
+    import sys
+    from types import ModuleType
+
+    asyncpg, pyodbc = ModuleType("asyncpg"), ModuleType("pyodbc")
+    classes: dict[str, type[Exception]] = {
+        "asyncpg.PostgresError": type("PostgresError", (Exception,), {}),
+        "asyncpg.InterfaceError": type("InterfaceError", (Exception,), {}),
+        "asyncpg.InternalClientError": type("InternalClientError", (Exception,), {}),
+        "pyodbc.Error": type("Error", (Exception,), {}),
+    }
+    for dotted, cls in classes.items():
+        module, name = dotted.split(".")
+        setattr(asyncpg if module == "asyncpg" else pyodbc, name, cls)
+    monkeypatch.setitem(sys.modules, "asyncpg", asyncpg)
+    monkeypatch.setitem(sys.modules, "pyodbc", pyodbc)
+    return classes
+
+
+def _run_on(
+    store: _DriverStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, name: str
+) -> int:
+    """Run the command against ``store``. The SQLite file exists only to pass the host gate."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / f"{name}.db"
+    _seed(db)
+
+    async def opened(*_a: object, **_k: object) -> _DriverStore:
+        return store
+
+    monkeypatch.setattr("messagefoundry.store.base.open_store", opened)
+    return main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"])
+
+
+@pytest.mark.parametrize(
+    "driver",
+    [
+        "asyncpg.PostgresError",
+        "asyncpg.InterfaceError",
+        "asyncpg.InternalClientError",
+        "pyodbc.Error",
+        "OSError",
+    ],
+)
+def test_a_server_backend_write_failure_is_reported_and_audited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], driver: str
+) -> None:
+    classes = _fake_drivers(monkeypatch)
+    error = ConnectionResetError if driver == "OSError" else classes[driver]
+    store = _DriverStore(write=error("refused by the server"))
+    assert _run_on(store, tmp_path, monkeypatch, name="write") == 1
+    message = _error(capsys)
+    assert "NOT set" in message and "refused by the server" in message
+    assert "a matching _failed audit row was appended" in message
+    assert store.audited == [_ACTION, f"{_ACTION}_failed"]
+    assert store.written is False
+
+
+def test_a_server_backend_failed_row_that_also_fails_is_said(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The one case where the log can still read as a completed change, so it must be named."""
+    postgres = _fake_drivers(monkeypatch)["asyncpg.PostgresError"]
+    store = _DriverStore(write=postgres("write refused"), failed_audit=postgres("append refused"))
+    assert _run_on(store, tmp_path, monkeypatch, name="both") == 1
+    message = _error(capsys)
+    assert "NOT set" in message
+    assert "appending the matching _failed audit row also failed (append refused)" in message
+    assert store.audited == [_ACTION]
+
+
+def test_a_server_backend_audit_refusal_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = _DriverStore(audit=_fake_drivers(monkeypatch)["pyodbc.Error"]("audit refused"))
+    assert _run_on(store, tmp_path, monkeypatch, name="audit") == 1
+    assert "audit row goes first" in _error(capsys)
+    assert store.audited == [] and store.written is False
+
+
+def test_a_server_backend_that_cannot_be_reached_is_an_error_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The outer catch stays SQLite's #1670 arm on purpose. It wraps the reads and ``close()`` too,
+    so widening it would name any late driver error "cannot open the store". A server that cannot be
+    reached reaches the dispatch floor instead (BACKLOG #1863): exit 1, a redacted error object."""
+    interface = _fake_drivers(monkeypatch)["asyncpg.InterfaceError"]
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "unreachable.db"
+    _seed(db)
+
+    async def unreachable(*_a: object, **_k: object) -> _DriverStore:
+        raise interface("connection refused")
+
+    monkeypatch.setattr("messagefoundry.store.base.open_store", unreachable)
+    assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 1
+    assert "InterfaceError" in _error(capsys)
+
+
+def test_a_write_error_that_is_not_a_store_error_is_still_audited_but_not_reported_as_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The compensating row does not depend on recognising the error, since a class this command
+    misses would otherwise leave a false log. The message does: a bug is not a store refusal, so it
+    is re-raised to the dispatch floor rather than dressed as one."""
+    _fake_drivers(monkeypatch)
+    store = _DriverStore(write=KeyError("a bug, not a refusal"))
+    assert _run_on(store, tmp_path, monkeypatch, name="bug") == 1
+    assert "NOT set" not in _error(capsys)
+    assert store.audited == [_ACTION, f"{_ACTION}_failed"]
+    assert store.written is False
+
+
+def test_store_driver_errors_names_each_installed_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from messagefoundry.store.base import store_driver_errors
+
+    classes = _fake_drivers(monkeypatch)
+    assert set(store_driver_errors()) == {sqlite3.Error, *classes.values()}
+    # An absent extra is left out rather than failing the import. `None` in sys.modules makes the
+    # import raise ImportError, as a missing package does.
+    monkeypatch.setitem(sys.modules, "asyncpg", None)
+    monkeypatch.setitem(sys.modules, "pyodbc", None)
+    assert store_driver_errors() == (sqlite3.Error,)
+
+
+@pytest.mark.parametrize(
+    ("driver", "roots"),
+    [
+        ("asyncpg", ("PostgresError", "InterfaceError", "InternalClientError")),
+        ("pyodbc", ("Error",)),
+    ],
+)
+def test_store_driver_errors_names_the_real_driver_roots(
+    driver: str, roots: tuple[str, ...]
+) -> None:
+    """Against the real driver, where its extra is installed: the stand-ins above cannot catch a
+    renamed class. Skipped where the extra is absent."""
+    from messagefoundry.store.base import store_driver_errors
+
+    module = pytest.importorskip(driver)
+    named = store_driver_errors()
+    for root in roots:
+        assert getattr(module, root) in named
+
+
 def test_help_names_the_host_gate(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exc:
         main([_CMD, "--help"])
