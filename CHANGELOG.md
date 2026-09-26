@@ -467,7 +467,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   - a header line that is not a field line, such as a line with no colon or a space before the
     colon. 0.4.0 dropped every header after that line. It then framed the body without them. So it
     could return three bytes of raw chunk framing as the answer. Or it could read to close and take
-    in a second response as part of the body;
+    in a second response as part of the body. This holds under any `Content-Type`. Under
+    `multipart/*` or `message/*`, 0.4.0 built the lost lines into MIME parts and read the body
+    without them all the same;
   - a header line with no name, a first line that is a continuation, a `From ` line, a field
     name that is not an RFC 9110 token, or a field value holding a control character such as NUL;
   - a chunk-size line that is not plain hex digits, such as `-5`, `1_0`, `+5`, `0x5`, ` 5` or
@@ -481,8 +483,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   Chunk extensions, trailer fields (folded or not), upper-case hex and leading zeros still read.
   So does a `multipart/*` reply, such as SOAP with MTOM. A chunked body still reads when its stream
   ends cleanly after the last chunk, or between trailer lines, with no final CRLF. 0.4.0 read that
-  too. One shape is not caught yet: a bare CR followed by text that reads as a field line. Connection probes
-  and the alert webhook discard the body and are not refused. They stop reading at the first bad
+  too. Still missed, at least: a bare CR followed by text that reads as a field line. The engine
+  sees only the header block the HTTP reader parsed, so any lost line that leaves no trace there
+  is missed the same way. Connection probes and the alert webhook discard the body and are not refused. They stop reading at the first bad
   chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
   send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
   [BACKLOG #1979](docs/BACKLOG.md))

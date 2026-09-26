@@ -419,6 +419,16 @@ def test_oidc_jwks_fetch_reads_unambiguous_framing() -> None:
 #: A second, complete response the peer appends. Read to close, it came back inside the body.
 _SECOND = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nworld"
 
+#: The code-review probe: under multipart/mixed a CR CR LF hides a Transfer-Encoding, and before the
+#: fix read_bounded returned b"5\r\n", raw chunk framing, with no fault. Its control is
+#: "crcrlf-hides-chunked" below: the same hiding line with no multipart type.
+_MULTIPART_HIDES_CHUNKED = (
+    _OK
+    + b"Content-Type: multipart/mixed; boundary=b\r\nContent-Length: 3\r\n"
+    + b"X-A: a\r\r\nTransfer-Encoding: chunked\r\n--b\r\r\n--b--\r\n\r\n"
+    + _CHUNKS
+)
+
 _BAD_HEADERS: dict[str, bytes] = {
     # read b"hello" + the whole second response, to close: the Content-Length after the bad line
     # was lost, so nothing framed the body
@@ -462,6 +472,24 @@ _BAD_HEADERS: dict[str, bytes] = {
     # read b"hello": a closing "From " line under message/rfc822 became the nested envelope
     "message-type-mbox-line-last": _OK
     + b"Content-Type: message/rfc822\r\nContent-Length: 5\r\nFrom nobody\r\n\r\nhello",
+    # read b"5\r\n": under multipart/* the lost lines land in the MIME preamble, parts and epilogue,
+    # which the first cut of this check never looked at (code-review finding, BACKLOG #1125)
+    "multipart-type-hides-chunked": _MULTIPART_HIDES_CHUNKED,
+    # read b"5\r\n": the hidden line is the whole of the multipart body, with no boundary at all
+    "multipart-body-hides-chunked": _OK
+    + b"Content-Type: multipart/mixed; boundary=b\r\nContent-Length: 3\r\n"
+    + b"X-A: a\r\r\nTransfer-Encoding: chunked\r\n\r\n"
+    + _CHUNKS,
+    # read b"5\r\n": the hidden line sits after the close boundary, in the epilogue
+    "multipart-epilogue-hides-chunked": _OK
+    + b"Content-Type: multipart/mixed; boundary=b\r\nContent-Length: 3\r\n"
+    + b"X-A: a\r\r\n--b\r\n\r\n--b--\r\nTransfer-Encoding: chunked\r\n\r\n"
+    + _CHUNKS,
+    # read b"5\r\n": under MTOM's multipart/related, the hidden line opens a part never closed
+    "multipart-related-part-hides-chunked": _OK
+    + b"Content-Type: multipart/related; boundary=b\r\nContent-Length: 3\r\n"
+    + b"X-A: a\r\r\n--b\r\nTransfer-Encoding: chunked\r\n\r\n"
+    + _CHUNKS,
 }
 
 #: Header blocks that are legal, though the email parser records defects or nests parts for them.
@@ -474,7 +502,61 @@ _HEADER_CONTROLS: dict[str, bytes] = {
     "message-rfc822": _OK + b"Content-Type: message/rfc822\r\nContent-Length: 5\r\n\r\nhello",
     "obs-fold": _OK + b"X-Folded: a\r\n b\r\nContent-Length: 5\r\n\r\nhello",
     "obs-text-value": _OK + b"X-A: caf\xe9\tb\r\nContent-Length: 5\r\n\r\nhello",
+    # The email parser records a defect for this pair, but every header line is a field line.
+    # Refused before the header check compared parse trees; read since.
+    "multipart-with-transfer-encoding-field": _OK
+    + b"Content-Type: multipart/related; boundary=x\r\nContent-Transfer-Encoding: base64\r\n"
+    + b"Content-Length: 5\r\n\r\nhello",
 }
+
+#: A SOAP-with-MTOM reply as a partner would send it: multipart/related with the XOP parameters, a
+#: root part and one attachment, in the body. The header check must pass it, and the body must come
+#: back whole, under either framing.
+_MTOM_BODY = (
+    b"--uuid:mf-1\r\n"
+    b'Content-Type: application/xop+xml; charset=UTF-8; type="text/xml"\r\n'
+    b"Content-Transfer-Encoding: binary\r\n"
+    b"Content-ID: <root.message@example.test>\r\n\r\n"
+    b'<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>'
+    b'<r><xop:Include xmlns:xop="http://www.w3.org/2004/08/xop/include" href="cid:a1"/></r>'
+    b"</soap:Body></soap:Envelope>\r\n"
+    b"--uuid:mf-1\r\n"
+    b"Content-Type: application/octet-stream\r\n"
+    b"Content-Transfer-Encoding: binary\r\n"
+    b"Content-ID: <a1>\r\n\r\n"
+    b"MSH|^~\\&|SYNTHETIC\r\n"
+    b"--uuid:mf-1--\r\n"
+)
+_MTOM_TYPE = (
+    b'Content-Type: multipart/related; type="application/xop+xml"; boundary="uuid:mf-1"; '
+    b'start="<root.message@example.test>"; start-info="text/xml"\r\n'
+)
+
+
+def _chunked(body: bytes) -> bytes:
+    return b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n"
+
+
+@pytest.mark.parametrize("framing", ["length", "chunked"])
+def test_a_legitimate_mtom_reply_still_reads_whole(framing: str) -> None:
+    if framing == "length":
+        raw = _OK + _MTOM_TYPE + b"Content-Length: %d\r\n\r\n" % len(_MTOM_BODY) + _MTOM_BODY
+    else:
+        raw = _OK + _MTOM_TYPE + b"Transfer-Encoding: chunked\r\n\r\n" + _chunked(_MTOM_BODY)
+    assert reply_framing_fault(_wire(raw)) is None
+    with _serve(raw) as url, _open(url) as resp:
+        assert read_bounded(resp, connector="c") == _MTOM_BODY
+
+
+def test_a_multipart_type_does_not_hide_a_lost_header_line() -> None:
+    """The code-review probe and its control. Before the fix the multipart form returned b"5\\r\\n"
+    with no fault, while the same hiding line with no multipart type was already refused."""
+    for raw in (_MULTIPART_HIDES_CHUNKED, _BAD_HEADERS["crcrlf-hides-chunked"]):
+        fault = reply_framing_fault(_wire(raw))
+        assert fault is not None
+        assert "header" in fault
+        with pytest.raises(AmbiguousFramingError):
+            read_bounded(_wire(raw), connector="c")
 
 
 @pytest.mark.parametrize("shape", list(_HEADER_CONTROLS), ids=list(_HEADER_CONTROLS))

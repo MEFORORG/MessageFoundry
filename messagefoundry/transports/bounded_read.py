@@ -85,8 +85,8 @@ and so do the OIDC token and JWKS reads.
 
 from __future__ import annotations
 
-import email.errors
 import email.message
+import email.parser
 import http.client
 import logging
 import re
@@ -320,12 +320,16 @@ def reply_framing_fault(reader: object) -> str | None:
       defect, and keeps every later line as unparsed payload. So a ``Content-Length`` or
       ``Transfer-Encoding`` after a malformed line, or after a name with whitespace before its
       colon, is silently lost, and the body is framed by what came before it or read to close.
-      Also refused: an mbox ``From `` line, which that parser takes silently, a field name
-      that is not an RFC 9110 token, and a field value holding a control character. This check
-      runs first, on every status and on ``HEAD``. **It misses one bare-CR shape.** When a
-      bare CR is followed by text that reads as a field line, the email parser splits the line
-      there and records nothing. That text then counts as a header of its own. Catching it needs
-      the raw header lines, and ``http.client`` discards them before this function runs.
+      Under a ``multipart/*`` or ``message/*`` type the lost lines are built into a preamble,
+      parts, an epilogue or a nested message instead, and are refused all the same. Also refused:
+      an mbox ``From `` line, which that parser takes silently, a field name that is not an RFC
+      9110 token, and a field value holding a control character. This check runs first, on every
+      status and on ``HEAD``. How it decides is on :func:`_header_block_fault`.
+      **Known to be missed, at least:** a bare CR followed by text that reads as a field line.
+      The email parser splits the line there and records nothing, so that text counts as a header
+      of its own, and the parse tree looks clean. Catching it needs the raw header bytes, and
+      ``http.client`` discards them before this function runs. Other shapes that leave no trace in
+      the parse tree would be missed the same way.
     * ``Transfer-Encoding`` on an HTTP/1.0 reply. Section 6.1 says the framing is then faulty.
     * ``Transfer-Encoding`` beside ``Content-Length``. Section 6.1 calls this a possible smuggling
       attempt that "ought to be handled as an error".
@@ -496,11 +500,22 @@ _VALUE_CTL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 def _header_block_fault(headers: email.message.Message) -> str | None:
     """Why the header block did not parse as RFC 9112 field lines, or ``None`` when it did.
 
+    The test is a comparison, not a list of places a lost line can land. ``http.client`` discards
+    the raw header bytes before any caller sees the reply, so this rebuilds the block from the
+    fields the email parser DID find, parses that with an empty body, and requires the two parse
+    trees to match. A clean block has an empty body, so its tree is exactly the reference's. A line
+    the parser did not take as a field line must have gone somewhere else: a defect, an mbox
+    envelope, a body string, a nested message, or a ``multipart/*`` preamble, part or epilogue.
+    Each of those makes the trees differ, whatever the ``Content-Type`` says (BACKLOG #1125).
+
+    The rebuilt block has one known blind spot, at least: see :func:`reply_framing_fault`.
+
     Each reason is a fixed string that names the header block, and never echoes a field value.
     """
-    if any(not isinstance(d, _BODY_STRUCTURE_DEFECTS) for d in headers.defects):
+    reference = _reparse_fields(headers)
+    if _defect_names(headers) != _defect_names(reference):
         return "a header line the HTTP reader could not parse"
-    if _has_leftover(headers):
+    if _parse_tree(headers) != _parse_tree(reference):
         return "header lines the HTTP reader left unparsed"
     for name, value in headers.raw_items():
         if not _FIELD_NAME.fullmatch(name):
@@ -510,39 +525,49 @@ def _header_block_fault(headers: email.message.Message) -> str | None:
     return None
 
 
-#: Defects about a MIME body's structure. The email parser records them for any ``multipart/*``
-#: header block, because the body it parses is always empty here. They say nothing about a header
-#: line, so a clean MTOM reply must not be refused for them.
-_BODY_STRUCTURE_DEFECTS = (
-    email.errors.StartBoundaryNotFoundDefect,
-    email.errors.MultipartInvariantViolationDefect,
-    email.errors.NoBoundaryInMultipartDefect,
-    email.errors.CloseBoundaryNotFoundDefect,
-)
+def _reparse_fields(msg: email.message.Message) -> email.message.Message:
+    """``msg``'s own fields, re-parsed as a clean header block with an empty body.
 
-
-def _has_leftover(msg: email.message.Message) -> bool:
-    """Whether the parser kept anything after the header block's end, or an mbox envelope line.
-
-    ``http.client`` hands the parser the header lines only, so a clean block leaves an empty body.
-    Lines pushed back after a malformed one land in that body. Under a ``message/*`` type they are
-    parsed as a nested message, so the check walks the parts. A "From " line is kept as an
-    envelope, with no defect, when it opens the block or a nested part.
+    The same parser class and policy ``http.client`` used, so a ``multipart/*`` or ``message/*``
+    type builds the same empty structure it builds for a clean reply. Values are raw, folds
+    included, and the parser strips the space after the colon, so each field parses back as itself.
     """
-    if msg.get_unixfrom() is not None:
-        return True
+    block = "".join(f"{name}: {value}\r\n" for name, value in msg.raw_items()) + "\r\n"
+    reparsed: email.message.Message = email.parser.Parser(
+        _class=type(msg), policy=msg.policy
+    ).parsestr(block)
+    return reparsed
+
+
+def _defect_names(msg: email.message.Message) -> list[str]:
+    return [type(d).__name__ for d in msg.defects]
+
+
+def _parse_tree(msg: email.message.Message) -> tuple[object, ...]:
+    """Everything the email parser built from a header block, as a comparable value.
+
+    Covers each place the parser can put a line: the fields, an mbox envelope, the defects, the
+    preamble and epilogue of a ``multipart/*`` body, and the payload, recursing into nested parts.
+    """
     payload = msg.get_payload()
-    if isinstance(payload, str):
-        return bool(payload)
+    # A parsed empty body is "", and a Message built in code with no body is None. Neither holds a
+    # line, so they compare equal: a header block handed over without a parse lost nothing to one.
+    body: object = "" if payload is None else payload
     if isinstance(payload, list):
-        return any(
-            not isinstance(part, email.message.Message)
-            or bool(part.keys())
-            or bool(part.defects)
-            or _has_leftover(part)
+        body = tuple(
+            _parse_tree(part)
+            if isinstance(part, email.message.Message)
+            else ("not a message", type(part).__name__)
             for part in payload
         )
-    return payload is not None
+    return (
+        msg.get_unixfrom(),
+        tuple(msg.raw_items()),
+        _defect_names(msg),
+        msg.preamble,
+        msg.epilogue,
+        body,
+    )
 
 
 # --- the chunked body -----------------------------------------------------------------------------
