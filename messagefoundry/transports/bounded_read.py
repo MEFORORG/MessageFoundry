@@ -512,13 +512,17 @@ def _header_block_fault(headers: email.message.Message) -> str | None:
     trees to match. A clean block has an empty body, so its tree is exactly the reference's. A line
     the parser did not take as a field line must have gone somewhere else: a defect, an mbox
     envelope, a body string, a nested message, or a ``multipart/*`` preamble, part or epilogue.
-    Each of those makes the trees differ, whatever the ``Content-Type`` says (BACKLOG #1125).
+    A line that lands in any of those makes the trees differ, whatever the ``Content-Type`` says
+    (BACKLOG #1125). A line lost without leaving a trace in the tree is missed. At least one such
+    shape is known: see :func:`reply_framing_fault`.
 
-    The rebuilt block has one known blind spot, at least: see :func:`reply_framing_fault`.
+    A Message built in code, with no body parsed, has no lost line to find. Its payload is
+    ``None``, which the parser never leaves on a block it read, so the comparison is skipped.
 
     Each reason is a fixed string that names the header block, and never echoes a field value.
     """
-    reference = _reparse_fields(headers)
+    parsed = headers.get_payload() is not None or bool(headers.defects)
+    reference = _reparse_fields(headers) if parsed else headers
     if _defect_names(headers) != _defect_names(reference):
         return "a header line the HTTP reader could not parse"
     if _parse_tree(headers) != _parse_tree(reference):
@@ -556,9 +560,7 @@ def _parse_tree(msg: email.message.Message) -> tuple[object, ...]:
     preamble and epilogue of a ``multipart/*`` body, and the payload, recursing into nested parts.
     """
     payload = msg.get_payload()
-    # A parsed empty body is "", and a Message built in code with no body is None. Neither holds a
-    # line, so they compare equal: a header block handed over without a parse lost nothing to one.
-    body: object = "" if payload is None else payload
+    body: object = payload
     if isinstance(payload, list):
         body = tuple(
             _parse_tree(part)

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import email.message
 import http.client
 import io
 import logging
@@ -559,6 +560,21 @@ def test_a_multipart_type_does_not_hide_a_lost_header_line() -> None:
         assert "header" in fault
         with pytest.raises(AmbiguousFramingError):
             read_bounded(_wire(raw), connector="c")
+
+
+def test_a_code_built_multipart_header_block_is_not_refused() -> None:
+    """A Message built in code has no parsed body, so no line can be lost in it. Re-parsing its
+    multipart type would add body-structure defects it never had, and refuse a clean block."""
+
+    class _Built:
+        status = 200
+
+        def __init__(self) -> None:
+            self.headers = email.message.Message()
+            self.headers["Content-Type"] = "multipart/related; boundary=b"
+            self.headers["Content-Length"] = "5"
+
+    assert reply_framing_fault(_Built()) is None
 
 
 def test_the_framing_error_survives_pickle_and_copy() -> None:
