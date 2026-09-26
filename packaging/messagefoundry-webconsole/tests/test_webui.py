@@ -6666,6 +6666,58 @@ async def test_oidc_login_link_tracks_availability(engine: Engine) -> None:
         assert r.headers["location"].startswith("https://idp.example/authorize?")
 
 
+@pytest.mark.parametrize(("status", "link_stays"), [(400, True), (401, True), (503, False)])
+async def test_a_bad_authorization_code_cannot_hide_the_oidc_link(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, status: int, link_stays: bool
+) -> None:
+    """BACKLOG #1948, driven as a signed-out caller would: start a flow, then call back with a code
+    the token endpoint refuses. The real ``exchange_code`` runs against an opener that answers
+    ``status``, so the sequence reaches the service the way it would live.
+
+    Any 4xx is the endpoint answering. A 400 is RFC 6749's ``invalid_grant``, the caller's own doing,
+    and the link and ``/auth/providers`` must survive it, or any visitor could switch federated
+    sign-in off. A 401 is the engine's own secret, and it is audited rather than hidden, so that no
+    body has to be read to tell the two apart. The 503 arm is the control: an IdP that is down must
+    still hide the link, so this test can fail."""
+    import io
+    import urllib.error
+
+    class _TokenEndpoint:
+        def open(self, req: object, timeout: float = 0.0) -> object:
+            raise urllib.error.HTTPError(
+                "https://idp.example/token",
+                status,
+                "refused",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(b'{"error":"invalid_grant"}'),
+            )
+
+    async def _no_pad(_deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_pad)
+    service = _oidc_service(engine)
+    await service.initialize()
+    service._oidc_opener = _TokenEndpoint()  # type: ignore[assignment]
+    async with _oidc_client(engine, service) as c:
+        start = await c.post("/ui/oidc/start", follow_redirects=False)
+        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        r = await c.get(
+            "/ui/oidc/callback",
+            params={"code": "not-a-code-the-idp-issued", "state": state},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+            },
+            follow_redirects=False,
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=oidc_failed"
+        assert ("/ui/oidc/start" in (await c.get("/ui/login")).text) is link_stays
+        assert (await c.get("/auth/providers")).json()["oidc"] is link_stays
+    assert service.oidc_available is link_stays
+
+
 async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: Engine) -> None:
     service = _oidc_service(engine)
     await service.initialize()

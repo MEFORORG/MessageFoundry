@@ -183,6 +183,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   removed nor emptied, the verify names the directory to delete: a `PASS` becomes `FAIL`, another
   verdict keeps its status, and an exception carries it as a note.
   `docs/PHI.md` says the same. (`BACKLOG #1721`)
+- **A failed federated sign-in now answers at the same fixed deadline as the other sign-in
+  paths.** `complete_oidc_login` and `authenticate_oidc` returned their refusals as soon as they
+  were decided. A refusal after the token exchange, such as an unlinked identity, a disabled or
+  locked account, or an account the directory no longer holds, costs more store and directory work
+  than one before it, so its timing could tell them apart. Both now hold every failed outcome to a
+  fixed deadline, as the password and Windows SSO paths already do (ASVS 6.3.8). A refusal after
+  the identity provider round trip counts that deadline from the end of the round trip, so the
+  provider's latency cannot split refusals across it. A success is not delayed.
+  (`BACKLOG #1947`)
+- **A bad authorization code no longer hides the federated sign-in link.** A token endpoint that
+  refuses the code a caller presents answers with an HTTP 4xx, and the engine used to read that as
+  an identity provider outage. That set `oidc_available` to false, which hides the link on
+  `/ui/login` and reports `oidc: false` from `/auth/providers`. So any signed-out visitor who
+  started a flow could turn federated sign-in off for everyone by calling back with a junk code.
+  The token exchange now raises `TokenRefusedError` for any 4xx, since the endpoint answered. The
+  engine audits it as a failed sign-in with reason `token_refused`, the HTTP status and the client
+  address, and leaves the flag alone. The engine's own faults, such as a wrong client secret, are
+  4xx too: they are told apart by the status on the audit row, not by the flag, so no error body is
+  read. A transport failure, 3xx or 5xx is still an outage.
+  (`BACKLOG #1948`)
 - **The Python engine client now ends the session a new sign-in replaces.** `EngineClient.login`
   used to overwrite the bearer token it held and never revoke it, so the old session would have
   stayed valid on first deployment until it idled out. It now calls `POST /auth/logout` with the

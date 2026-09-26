@@ -181,6 +181,7 @@ def test_no_directory_entry_point_lets_a_caller_choose_the_seeding() -> None:
         AuthService.authenticate_kerberos,
         AuthService._authenticate_kerberos,
         AuthService.authenticate_oidc,
+        AuthService._authenticate_oidc,
         AuthService._complete_ad_login,
     ):
         assert "seed_reauth" not in inspect.signature(method).parameters, method.__name__
