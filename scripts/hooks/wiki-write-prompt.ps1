@@ -10,8 +10,9 @@
     a lesson after", and nothing prompted it at the moment a lesson happens. Owner decision
     2026-09-26: a Stop hook prompts for it.
 
-    WHEN IT FIRES. All three must hold, counted over the window since the last prompt or the last
-    wiki write, whichever is later:
+    WHEN IT FIRES. Only in an attended session (see ATTENDED SESSIONS ONLY below). Then all three
+    must hold, counted over the window since the last prompt or the last wiki write, whichever is
+    later:
       1. substantive work: at least $MinToolUses tool uses, or at least one `git commit` / `git push`;
       2. no call to the wiki's write.ps1 in the window (a write empties the window);
       3. at least $CooldownMinutes minutes since this session was last prompted.
@@ -46,10 +47,15 @@
       - Claude Code sets CLAUDE_CODE_SESSION_ATTENDED to "1" or "0" in every command hook's
         environment. It is "0" for a bg or daemon session and for a teammate agent. It is "1" for an
         interactive session. A print-mode session gets "1" only when it is not a child session and
-        its entrypoint is a host surface such as claude-desktop or claude-vscode. So a `claude -p`
-        Builder spawned from a Desktop session reads "0".
+        its entrypoint is a host surface such as claude-desktop or claude-vscode. The hook's own
+        Claude Code process computes that value and writes it over any copy it inherited; the
+        inherited copy feeds a separate spawnedByAttendedSession flag the computation does not read.
+        So a `claude -p` Builder spawned from a Desktop session reads "0".
       - A host marks its own scheduled runs with CLAUDE_CODE_HOST_SCHEDULED_RUN=1, and the attended
         test above ignores it. So a scheduled run is refused here on its own, when a hook can see it.
+        Any value but an explicit no counts as scheduled, the quiet side.
+    A skipped session writes no state and no log line, by design. So the log cannot show a gate that
+    wrongly stays quiet; if prompts stop in sessions a person is at, check this reading first.
       - When the attended variable is absent (an older Claude Code), CLAUDE_CODE_ENTRYPOINT decides,
         and only "cli" counts. Claude Code rewrites an inherited "cli" to "sdk-cli" in print mode,
         but keeps any other inherited value, so a print-mode child of a Desktop session still reads
@@ -90,7 +96,8 @@ $WriteRegex = [regex]::new(
     'IgnoreCase, Singleline', $RegexTimeout)
 
 function Test-Truthy([string]$Value) {
-    # The truthy set Claude Code itself parses an environment flag with.
+    # Claude Code writes the attended flag as 1 or 0. The wider set is its general flag parser's,
+    # accepted in case a host writes a word.
     return @('1', 'true', 'yes', 'on') -contains $Value.Trim().ToLowerInvariant()
 }
 
@@ -98,7 +105,8 @@ function Test-AttendedSession {
     # True only when a person is at this session to answer. The header says which reading this
     # rests on. Every doubtful case is false: a missed prompt costs one note, a wrong one costs a
     # headless run its report.
-    if (Test-Truthy ([string]$env:CLAUDE_CODE_HOST_SCHEDULED_RUN)) { return $false }
+    $scheduled = ([string]$env:CLAUDE_CODE_HOST_SCHEDULED_RUN).Trim().ToLowerInvariant()
+    if ($scheduled -and @('0', 'false', 'no', 'off') -notcontains $scheduled) { return $false }
     if ($null -ne $env:CLAUDE_CODE_SESSION_ATTENDED) { return (Test-Truthy $env:CLAUDE_CODE_SESSION_ATTENDED) }
     if (@('bg', 'daemon', 'daemon-worker') -contains [string]$env:CLAUDE_CODE_SESSION_KIND) { return $false }
     return ([string]$env:CLAUDE_CODE_ENTRYPOINT -eq 'cli')
@@ -207,10 +215,6 @@ function Get-Reason([string]$Coord, [string]$Seat) {
 
 try {
     if ($env:MEFOR_WIKI_PROMPT -eq 'off') { exit 0 }
-    # Before any read or write: a session nobody attends is never prompted, so its state and the
-    # log are left alone. Attendance does not change within a session, so the offset kept in any
-    # existing state stays correct.
-    if (-not (Test-AttendedSession)) { exit 0 }
 
     # Claude Code sends UTF-8, and git prints UTF-8. The console default is the OEM code page, which
     # garbles any non-ASCII path in the payload or in git's output.
@@ -219,6 +223,12 @@ try {
 
     $raw = ''
     if ([Console]::IsInputRedirected) { $raw = [Console]::In.ReadToEnd() }
+    # After stdin is drained, so the writer never meets a closed pipe, and before any state or log
+    # is touched: a session nobody attends is never prompted. Its saved offset, if any, is left as
+    # it was. Should the same session id later run attended (a resume on another surface), the first
+    # attended Stop counts from that offset, so it also counts this session's unattended work, capped
+    # at $MaxReadBytes. That is still this session's work, so a prompt for it is fair.
+    if (-not (Test-AttendedSession)) { exit 0 }
     if (-not $raw.Trim()) { exit 0 }
     $hook = $raw | ConvertFrom-Json
 

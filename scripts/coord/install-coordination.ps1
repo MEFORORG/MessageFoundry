@@ -298,8 +298,8 @@ $WIRING = @(
     @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/seat-record.ps1"; Timeout = 25; Msg = "Recording this seat's episode"; Marker = $SEAT_MARKER; Shim = "notice"
         Notice = "[seat] scripts/hooks/seat-record.ps1 is missing from this checkout -- the seat recorder is wired but resolving nothing, so this session is NOT being recorded and a cold start would not see it." }
     # The fleet wiki write prompt. Stop, because the end of a turn is where a lesson has just happened.
-    # It blocks the Stop only after real work, with a cooldown between prompts, and never while
-    # stop_hook_active is set. Timeout 25: the script caps its transcript read so it ends well inside that.
+    # It blocks the Stop only in an attended session, only after real work, with a cooldown between
+    # prompts, and never while stop_hook_active is set. Timeout 25: the script caps its transcript read so it ends well inside that.
     @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/wiki-write-prompt.ps1"; Timeout = 25; Msg = "Checking for a fleet wiki note"; Marker = $WIKI_MARKER; Shim = "notice"
         Notice = "[wiki] scripts/hooks/wiki-write-prompt.ps1 is missing from this checkout -- the fleet wiki write prompt is wired but resolving nothing." }
 

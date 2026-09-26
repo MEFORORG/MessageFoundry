@@ -143,8 +143,11 @@ seat can act on. If a fact matters, put it in the commit, the PR body, or the BA
 
 A lesson that outlives the item belongs in the fleet wiki, and another Stop hook asks for one. It is
 `scripts/hooks/wiki-write-prompt.ps1`, wired by the same installer under the marker `mefor-wiki`. It
-fires after enough tool uses or a `git commit` or `git push`, with a cooldown between prompts, and
-never while `stop_hook_active` is set. The thresholds are named constants at the top of that
+prompts only an attended session. A headless `claude -p` run, a spawned Builder or a scheduled job
+is never prompted, because the prompt would replace its final report. The script header says which
+reading of Claude Code that rests on. In an attended session it fires after enough tool uses or a
+`git commit` or `git push`, with a cooldown between prompts, and never while `stop_hook_active` is
+set. The thresholds are named constants at the top of that
 script. If nothing qualifies, reply `wiki: nothing to record`. To turn it off, create the file
 `mefor-coord/wiki-prompt/OFF`, which reaches sessions already running. `MEFOR_WIKI_PROMPT=off` works
 too, but only for sessions started with it set. Each prompt it fires is logged under

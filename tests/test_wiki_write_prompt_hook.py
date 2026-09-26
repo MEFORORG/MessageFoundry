@@ -230,8 +230,14 @@ def test_stop_hook_active_never_blocks(env: Env) -> None:
         {"CLAUDE_CODE_SESSION_ATTENDED": "1"},
         {"CLAUDE_CODE_SESSION_ATTENDED": "true", "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"},
         {"CLAUDE_CODE_ENTRYPOINT": "cli"},
+        {"CLAUDE_CODE_SESSION_ATTENDED": "1", "CLAUDE_CODE_HOST_SCHEDULED_RUN": "0"},
     ],
-    ids=["attended-1", "attended-true-wins-over-entrypoint", "absent-with-interactive-cli"],
+    ids=[
+        "attended-1",
+        "attended-true-wins-over-entrypoint",
+        "absent-with-interactive-cli",
+        "scheduled-run-explicitly-no",
+    ],
 )
 def test_an_attended_session_is_prompted(env: Env, session: dict[str, str]) -> None:
     env.append(tools(MIN_TOOLS))
@@ -251,6 +257,8 @@ def test_an_attended_session_is_prompted(env: Env, session: dict[str, str]) -> N
         {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"},
         {"CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SESSION_KIND": "bg"},
         {"CLAUDE_CODE_SESSION_ATTENDED": "1", "CLAUDE_CODE_HOST_SCHEDULED_RUN": "1"},
+        # A value that is not a boolean still marks a scheduled run: the quiet side.
+        {"CLAUDE_CODE_SESSION_ATTENDED": "1", "CLAUDE_CODE_HOST_SCHEDULED_RUN": "nightly"},
         {},
     ],
     ids=[
@@ -262,6 +270,7 @@ def test_an_attended_session_is_prompted(env: Env, session: dict[str, str]) -> N
         "absent-claude-desktop",
         "absent-cli-bg-kind",
         "scheduled-run",
+        "scheduled-run-non-boolean",
         "both-absent",
     ],
 )
