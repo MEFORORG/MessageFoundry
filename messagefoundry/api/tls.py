@@ -213,8 +213,8 @@ def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
     DEBRIS: without it, a lone key could be another process's mint in progress (BACKLOG #1276).
 
     A half-pair is unusable -- reuse needs both -- and the key half is also a TRAP: the mint falls
-    through, :func:`_write_private_key`'s ``O_EXCL`` refuses the surviving key,
-    and the engine fails to start. On EVERY start, permanently, naming no file to delete. ADR 0172
+    through, :func:`_write_private_key`'s ``O_EXCL`` refuses the surviving key, and the engine
+    fails to start. On EVERY start, permanently, naming no file to delete. ADR 0172
     makes the generated pair the default first-run path, so that is a fresh deployment that never
     comes up rather than an edge case.
 
@@ -294,8 +294,8 @@ def _discard_unusable_pair(cert_path: Path, key_path: Path, reason: str) -> None
     Reached only under :func:`_generated_pair_lock`, with both files present and
     :func:`_why_generated_pair_is_unusable` naming a content refusal. **This is not a rotation.** A
     pair that loads is never replaced; this one cannot serve, and reusing it failed every start
-    until someone deleted it by hand. The mismatched shape is exactly what two processes minting into one
-    state dir used to leave (BACKLOG #1276), and a disk fault can leave the others.
+    until someone deleted it by hand. The mismatched shape is exactly what two processes minting
+    into one state dir used to leave (BACKLOG #1276), and a disk fault can leave the others.
 
     Logged at WARNING, per ADR 0172 decision 6: replacing a key on disk is never silent. The reason
     is the TLS layer's error text, which names the refusal and carries no key material.
@@ -360,10 +360,11 @@ def _generated_pair_lock(state_dir: Path) -> Iterator[None]:
     """Hold the ONE-WRITER lock for the generated pair in ``state_dir``, waiting a bounded time.
 
     **Why the pair needs one.** ``serve --shards`` starts N engine processes that all derive the
-    same state dir, so on a first run they all find no pair at once. Unserialised, one process won the
-    key's ``O_EXCL`` create and every other died with ``FileExistsError``; worse, a process arriving
-    between another's key and cert writes read a lone key as debris, deleted it, and minted its own,
-    and the first then overwrote that cert, leaving a mismatched pair that failed every later start.
+    same state dir, so on a first run they all find no pair at once. Unserialised, one process won
+    the key's ``O_EXCL`` create and every other died with ``FileExistsError``; worse, a process
+    arriving between another's key and cert writes read a lone key as debris, deleted it, and minted
+    its own, and the first then overwrote that cert, leaving a mismatched pair that failed every
+    later start.
     Under this lock exactly one process mints, and every other waits, then reuses that pair.
 
     **One shared pair for all shards** is what this keeps, and it is correct: the minted identity is
