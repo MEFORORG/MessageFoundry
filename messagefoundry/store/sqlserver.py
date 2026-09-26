@@ -3072,7 +3072,13 @@ class SqlServerStore:
         naming the statement a DBA runs once. It also refuses when the probe cannot connect or cannot
         read the state, since either way RCSI is unverified, and a pool opened after a transient probe
         failure would run in exactly the mode this check exists to exclude.
-        ``ALLOW_SNAPSHOT_ISOLATION`` still only warns: no store path depends on it."""
+        ``ALLOW_SNAPSHOT_ISOLATION`` still only warns: no store path depends on it.
+
+        Concurrent opens (engine shards, cluster nodes) are handled only where our own ALTER fails:
+        the state is re-read on fresh connections and a peer's successful ALTER lets the open go on.
+        A narrower window stays: a peer's ``ROLLBACK IMMEDIATE`` landing on our initial connect or
+        state read still fails this open, and a restart recovers it. Pre-enabling RCSI, as the deploy
+        docs require for a least-privilege login, closes it entirely."""
         import aioodbc
 
         db = settings.database
@@ -3150,6 +3156,9 @@ class SqlServerStore:
                         db,
                         exc,
                     )
+                    # Our connection may be dead, and the peer's open runs the same snapshot step,
+                    # so a warning from a doomed ALTER here would only mislead.
+                    snapshot_on = True
             if not snapshot_on:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).

@@ -63,6 +63,7 @@ class _ProbeConn:
     def __init__(self, cursor: _ProbeCursor) -> None:
         self._cursor = cursor
         self.closed = False
+        self.rereads: list[_ProbeConn] = []  # later connections, recorded on the first one
 
     async def cursor(self) -> _ProbeCursor:
         return self._cursor
@@ -97,8 +98,12 @@ def _install(
         connects += 1
         if connect_fails:
             raise RuntimeError("login timeout expired")
-        if connects > 1 and later_row is not None:
-            return _ProbeConn(_ProbeCursor(later_row, set(denied)))
+        if connects > 1:
+            # Every re-read gets its OWN connection, so ``conn.closed`` below proves the outer
+            # finally closed the first one rather than a re-read closing a shared object.
+            later = _ProbeConn(_ProbeCursor(later_row or row, set(denied)))
+            conn.rereads.append(later)
+            return later
         return conn
 
     async def _create_pool(**kwargs: Any) -> Any:
@@ -125,10 +130,10 @@ async def test_rcsi_off_and_alter_denied_refuses_the_open(monkeypatch: pytest.Mo
     )
     assert pools == []  # refused BEFORE any pool (or its executor) exists
     assert _ALTER_RCSI in cursor.executed
-    # It re-read the state (a peer might have won the ALTER) before refusing.
-    rereads = [sql for sql in cursor.executed if "is_read_committed_snapshot_on FROM" in sql]
-    assert len(rereads) == sqlserver_module._RCSI_REREADS
-    assert conn.closed
+    # It re-read the state on fresh connections (a peer might have won the ALTER) before refusing,
+    # and closed every one of them as well as the first.
+    assert len(conn.rereads) == sqlserver_module._RCSI_REREADS
+    assert conn.closed and all(c.closed for c in conn.rereads)
 
 
 async def test_a_concurrent_opener_that_enabled_rcsi_lets_the_open_proceed(
