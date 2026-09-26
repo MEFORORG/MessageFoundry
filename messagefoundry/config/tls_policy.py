@@ -1426,8 +1426,9 @@ def _audit_connection(connection: str | None) -> str:
     ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``.
     Inbound and outbound names cannot reach that shape: registration refuses any name outside
     ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space, ``:`` or
-    ``=``. Residual: a ``FhirLookup`` name is not held to that rule, so a lookup name that contains
-    one of those characters can still be scrubbed from its SMART token hop's record."""
+    ``=``. A name that does not pass registration can still be scrubbed. That includes at least a
+    ``FhirLookup`` name, which its read hop and SMART token hop both render, and a raw
+    ``cleartext_connection`` key in a lookup's settings."""
     return repr(connection) if connection else "(unnamed)"
 
 

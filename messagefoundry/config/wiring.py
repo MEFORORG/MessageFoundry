@@ -724,15 +724,22 @@ class FhirLookupSpec:
     Mutable ``settings`` dict so :func:`~messagefoundry.transports.smart.with_smart_backend` can compose
     SMART auth onto it (the dataclass stays frozen — only the dict is mutated).
 
-    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) are the declaration
-    :func:`FhirLookup` validated, held OUTSIDE the mutable ``settings`` so a raw settings key cannot
-    forge one. The runner strips the raw keys and re-mirrors these fields before the read executor
-    sees the settings, as ``_dest_config`` does for an outbound."""
+    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) are the declaration,
+    held outside the mutable ``settings``; why is in ``wiring_runner._fhir_lookup_settings``. They are
+    coherence-checked here too, so a spec built directly cannot attest without a reason."""
 
     name: str
     settings: dict[str, Any]
     tls_revocation_attested: bool = False
     tls_revocation_attested_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            _check_revocation_attestation(
+                self.tls_revocation_attested, self.tls_revocation_attested_reason
+            )
+        except ValueError as exc:
+            raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
 
 
 def FhirLookup(
@@ -829,9 +836,8 @@ def FhirLookup(
         settings["cleartext_reason"] = cleartext_reason
         settings["cleartext_connection"] = name
     if tls_revocation_attested:
-        # A copy for the readers of spec.settings (the settings view, reload impact, the loosening
-        # reader). The executor never trusts it: the runner strips these keys and re-mirrors the typed
-        # fields below, so a raw write here after load neither attests nor renames the SMART hop.
+        # A copy for code that reads spec.settings. The executor never trusts it: it gets the typed
+        # fields below, re-mirrored by wiring_runner._fhir_lookup_settings.
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
         settings["tls_revocation_attested_connection"] = name

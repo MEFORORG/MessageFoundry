@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -36,6 +38,7 @@ from messagefoundry.config.wiring import (
     FHIR,
     ConnectionSpec,
     DICOMweb,
+    FhirLookupSpec,
     Registry,
     Rest,
     Soap,
@@ -43,6 +46,7 @@ from messagefoundry.config.wiring import (
     load_config,
 )
 from messagefoundry.pipeline.wiring_runner import (
+    RegistryRunner,
     _dest_config,
     _source_config,
     build_check_registry,
@@ -348,8 +352,8 @@ def _lookup_registry(tmp_path: Path, smart_key: str, *, declared: bool) -> Regis
 
 
 def _build_check(reg: Registry) -> None:
-    # The real call site: build_check_registry constructs the FhirLookupExecutor, whose __init__ hands
-    # the resolved settings to token_provider_from_settings for the SMART token hop.
+    # build_check_registry constructs the FhirLookupExecutor, whose __init__ hands the resolved
+    # settings to token_provider_from_settings for the SMART token hop.
     build_check_registry(
         reg,
         inbound_bind_host="127.0.0.1",
@@ -359,26 +363,56 @@ def _build_check(reg: Registry) -> None:
     )
 
 
+def _build_live(reg: Registry) -> None:
+    # The live builder start and reload use. It reads only these five attributes, so a stand-in for
+    # the runner drives the real method without a store.
+    runner = SimpleNamespace(
+        registry=reg,
+        _env_values={},
+        _egress=EgressSettings(),
+        _hop_posture=_ENFORCING,
+        _trust_anchor_policy=None,
+    )
+    RegistryRunner._build_fhir_lookup_executor(cast(RegistryRunner, runner))
+
+
+# Both places that build the executor, so neither can keep an unstripped settings path.
+_BUILDERS = pytest.mark.parametrize("build", [_build_check, _build_live], ids=["check", "live"])
+
+
+@_BUILDERS
 def test_raw_lookup_keys_cannot_attest_the_real_executors_smart_hop(
-    tmp_path: Path, smart_key: str
+    tmp_path: Path, smart_key: str, build: Callable[[Registry], None]
 ) -> None:
     # Undeclared lookup plus raw keys: the SMART token hop is refused, as an undeclared one is.
     reg = _lookup_registry(tmp_path, smart_key, declared=False)
-    with pytest.raises(WiringError, match="revocation"):
-        _build_check(reg)
+    with pytest.raises((WiringError, InsecureHopRefused), match="revocation"):
+        build(reg)
 
 
+@_BUILDERS
 def test_raw_lookup_keys_cannot_rename_or_reword_a_declared_lookups_audit_line(
-    tmp_path: Path, smart_key: str, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    smart_key: str,
+    caplog: pytest.LogCaptureFixture,
+    build: Callable[[Registry], None],
 ) -> None:
     # Declared lookup plus raw keys: the hop crosses on the DECLARATION, so the line names the lookup
     # and its declared reason, never the connection or reason the raw keys chose.
     reg = _lookup_registry(tmp_path, smart_key, declared=True)
     with caplog.at_level(logging.WARNING):
-        _build_check(reg)
+        build(reg)
     audit = _audit(caplog)
     assert "connection 'epic';" in audit and _REASON in audit
     assert "OB_OTHER" not in audit and "spoofed" not in audit
+
+
+def test_a_directly_built_lookup_spec_cannot_attest_without_a_reason() -> None:
+    # The typed fields are what the executor trusts, so they carry the factory's coherence rule.
+    with pytest.raises(WiringError, match="fhir lookup 'epic'"):
+        FhirLookupSpec(
+            "epic", {"url": "https://ehr.example.org/fhir"}, tls_revocation_attested=True
+        )
 
 
 def test_an_empty_name_renders_unnamed(caplog: pytest.LogCaptureFixture) -> None:
