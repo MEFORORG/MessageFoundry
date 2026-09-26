@@ -239,7 +239,7 @@ _GITIGNORE = """\
 *.db-shm
 *.db-wal
 *.log
-# the one-time bootstrap admin credential the engine writes next to the store
+# the one-time bootstrap admin credential engines before ADR 0183 Wave 2 wrote beside the store
 bootstrap-admin.txt
 .env
 .env.*

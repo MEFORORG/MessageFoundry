@@ -45,7 +45,7 @@ LADDER_CLOCK = LADDER_NOW + 100
 
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 def _validate(rsa_key: rsa.RSAPrivateKey, claims: dict[str, Any], **policy: Any) -> Any:

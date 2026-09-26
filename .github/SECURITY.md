@@ -22,8 +22,9 @@ verify a report against current `main` before filing.
   third-party form service.
 
 If you cannot reach a maintainer privately within a few business days, you may request a contact via a
-**non-detail** public issue (title only, e.g. "requesting a private security contact") — **never** put
-vulnerability details, reproduction steps, or any message content in a public issue.
+**non-detail** public post in [GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions)
+(title only, e.g. "requesting a private security contact") — **never** put vulnerability details,
+reproduction steps, or any message content in a public post.
 
 Please include: affected component (e.g. MLLP/file transport, store, API/auth, console),
 a description and impact, and reproduction steps or a proof of concept. Do **not** include

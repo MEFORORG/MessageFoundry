@@ -439,7 +439,7 @@ def smart_auth_configured(s: Mapping[str, Any]) -> bool:
     ON means ``smart_token_url`` is present and ``smart_enabled`` is not switched off, so any connection
     that never composed :func:`with_smart_backend` is byte-identical. The SINGLE definition, shared by
     :func:`token_provider_from_settings` (which builds the provider), by the mutual-exclusion screen in
-    ``http_auth.build_token_provider`` and by
+    ``http_auth.bearer_provider_from_settings`` and by
     :func:`~messagefoundry.config.wiring.overbroad_smart_scopes` (which grades the requested scope).
 
     It exists because those three readers each carried their own spelling of the same test and the

@@ -2,15 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 6.3.2 (BACKLOG #1136, ADR 0183) -- the offline first-administrator provisioning command.
 
-``tests/test_first_run_default_account.py`` pins what the SHIPPED DEFAULT still does: run ``serve``
-against an empty store and the engine mints an enabled account named ``admin``. This module pins the
-route out of it. An operator who runs ``messagefoundry provision-admin`` before the first ``serve``
-gets an install whose user table is non-empty, so the seeding path declines and no default account
-is ever present.
-
-That is the "not present" arm of the verb, reached by an operator action. The two files are
-complementary and both must stay: the default is still what it was, and retiring the auto-create is
-the remaining half of the item.
+``tests/test_first_run_default_account.py`` pins that the engine creates no account on its own (ADR
+0183 Amendment A, Wave 2). This module pins the one way an install gets its first administrator:
+``messagefoundry provision-admin`` at the host, before the first ``serve`` or after a refused one.
 
 Severity is conditional (CLAUDE.md section 0): MessageFoundry has zero deployments, so everything
 here describes what a deploying site would inherit, never a live exposure.
@@ -21,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import time
 import types
 from pathlib import Path
 
@@ -30,11 +23,7 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import (
-    BOOTSTRAP_USERNAME,
-    AuthService,
-    FirstAdministratorRefused,
-)
+from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
@@ -49,11 +38,11 @@ from tests.test_first_run_default_account import _directory_signed_in
 _PASSWORD = "a-long-enough-operator-passphrase"
 
 
-async def test_provisioning_first_means_no_default_account_is_ever_present() -> None:
-    """The headline: provision, then start, and the account named ``admin`` never exists.
+async def test_a_provisioned_administrator_is_usable_and_a_start_adds_no_account() -> None:
+    """AC-1, reworded at Wave 2: provision, then start, and the store holds exactly that account.
 
-    Both halves are asserted, because either alone would be satisfied for the wrong reason -- the
-    provisioned administrator has to be usable, AND the seeding path has to decline.
+    Before Wave 2 this was the only way to avoid the default account, so it asserted the seeding path
+    declined. Nothing seeds now, so the second half is that a start adds nothing beside it.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -73,14 +62,14 @@ async def test_provisioning_first_means_no_default_account_is_ever_present() -> 
         assert out.ok and out.must_change_password is False
         assert out.identity is not None and Role.ADMINISTRATOR in out.identity.roles
 
-        # CLAIMED AT BIRTH. `password_claimed_at` is what keeps this account out of the WP-3
-        # retirement sweep, and it is why there is no half-claimed state to restart into.
+        # CLAIMED AT BIRTH, so there is no half-claimed state to restart into.
         claimed = await store.get_user_by_username("site-admin")
         assert claimed is not None and claimed.password_claimed_at is not None
 
-        # And the sharp end: startup declines, so no default account is present.
-        assert await service.initialize() is None
-        assert await store.get_user_by_username(BOOTSTRAP_USERNAME) is None
+        # A start after it adds no account beside it.
+        await service.initialize()
+        assert await store.count_users() == 1
+        assert await store.get_user_by_username("admin") is None
     finally:
         await store.close()
 
@@ -90,7 +79,9 @@ async def test_it_refuses_once_an_enabled_administrator_exists() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
-        assert await service.initialize() is not None  # the shipped default seeds one
+        await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test"
+        )
         assert await service.has_enabled_administrator() is True
 
         with pytest.raises(FirstAdministratorRefused, match="already has an enabled Administrator"):
@@ -240,38 +231,6 @@ async def test_a_weak_password_is_refused_and_writes_nothing() -> None:
                 username="site-admin", password="short", actor="test"
             )
         assert await store.count_users() == 0
-    finally:
-        await store.close()
-
-
-async def test_provisioning_an_account_named_admin_survives_a_restart_past_the_expiry() -> None:
-    """An operator may legitimately choose the name ``admin``, and it must not be auto-retired.
-
-    ``_unclaimed_bootstrap`` matches on the username, so an unclaimed row under that name would be
-    disabled once ``bootstrap_expiry_hours`` lapsed -- disabling the deployment's only administrator,
-    headless, on the next boot. Stamping the claim at creation is what closes that.
-
-    Driven through the operator-facing trigger the way the neighbouring WP-3 tests are: age
-    ``created_at`` past the window, then run ``initialize()`` as a restart would, rather than calling
-    the private sweep. That also proves the second half -- the restart does not re-bootstrap.
-    """
-    store = await MessageStore.open(":memory:")
-    try:
-        settings = AuthSettings(bootstrap_expiry_hours=72)
-        outcome = await AuthService(store, settings).provision_first_administrator(
-            username=BOOTSTRAP_USERNAME, password=_PASSWORD, actor="test"
-        )
-        await store._db.execute(  # arm the expiry arm: older than the window
-            "UPDATE users SET created_at=? WHERE id=?",
-            (time.time() - 99 * 3600, outcome.user_id),
-        )
-        await store._db.commit()
-
-        restarted = AuthService(store, settings)
-        assert await restarted.initialize() is None, "a non-empty store must not re-bootstrap"
-        row = await store.get_user_by_username(BOOTSTRAP_USERNAME)
-        assert row is not None and row.disabled is False
-        assert (await restarted.login(BOOTSTRAP_USERNAME, _PASSWORD)).ok
     finally:
         await store.close()
 
@@ -435,8 +394,8 @@ def test_cli_provisions_and_names_the_store_it_wrote_to(
 
     Unlike ``admin-unlock`` this command legitimately CREATES the SQLite store, so it cannot carry
     M-31's "refuse a missing store" guard. Naming the path is the substitute: a mistyped ``--db``
-    would otherwise provision into a store ``serve`` never opens, and ``serve`` would then mint the
-    default account anyway -- with the command having reported success.
+    would otherwise provision into a store ``serve`` never opens, and ``serve`` would then start with
+    no Administrator -- with the command having reported success.
     """
     monkeypatch.chdir(tmp_path)
     key = _key_in_this_shell(monkeypatch)
@@ -467,9 +426,9 @@ def test_cli_provisions_and_names_the_store_it_wrote_to(
             row = await store.get_user_by_username("site-admin")
             assert row is not None
             assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(row.id)
-            # The seeding path declines against this store, which is the whole point.
-            assert await AuthService(store, AuthSettings()).initialize() is None
-            assert await store.get_user_by_username(BOOTSTRAP_USERNAME) is None
+            # A start adds nothing beside it.
+            await AuthService(store, AuthSettings()).initialize()
+            assert await store.count_users() == 1
         finally:
             await store.close()
 
@@ -491,3 +450,116 @@ def test_cli_warns_when_no_notification_address_is_given(
         main(["provision-admin", "--username", "site-admin", "--db", str(tmp_path / "p.db")]) == 0
     )
     assert "WARNING: no notification address" in capsys.readouterr().out
+
+
+# --- AC-15: refuse before prompting where it can, and leave no new store file ------------------
+
+
+def _no_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Present a terminal whose prompt fails the test if it is ever read.
+
+    A terminal is present on purpose: without one, the no-terminal refusal would fire first and
+    every assertion below would pass for that reason instead.
+    """
+
+    def prompted(*_a: object, **_k: object) -> str:
+        raise AssertionError("provision-admin prompted for a password it was going to refuse")
+
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", prompted)
+
+
+@pytest.mark.parametrize(
+    ("argv", "needle"),
+    [
+        pytest.param(["--username", "   "], "username", id="blank-username"),
+        pytest.param(["--username", "u" * 257], "256", id="over-long-username"),
+        pytest.param(
+            ["--username", "site-admin", "--email", "a" * 241 + "@example.invalid"],
+            "256",
+            id="over-long-address",
+        ),
+        pytest.param(
+            ["--username", "site-admin", "--display-name", "d" * 257], "256", id="over-long-name"
+        ),
+    ],
+)
+def test_an_argument_it_will_refuse_is_refused_before_the_prompt_and_the_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    needle: str,
+) -> None:
+    """AC-15. The limits are the web console's, so this offline surface admits nothing it refuses.
+
+    The address limit is the one ``admin-set-notify-email`` applies (a Manager decision carried from
+    Wave 1c), and a blank address is still no address rather than a refusal (AC-9).
+    """
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _no_prompt(monkeypatch)
+    db = tmp_path / "never.db"
+    assert main(["provision-admin", *argv, "--db", str(db), "--json"]) == 1
+    assert needle in json.loads(capsys.readouterr().out)["error"]
+    assert not db.exists(), "a refused provision left a store behind"
+
+
+def test_a_password_the_policy_refuses_leaves_no_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-15, password half. The prompt cannot be skipped for this one, but the open can.
+
+    Before Wave 2 the store was opened with ``create=True`` first, so a refused password left an
+    empty store secured to the operator, which a service started later could not open.
+    """
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _tty(monkeypatch, "short", "short")
+    db = tmp_path / "never.db"
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
+    assert "error" in json.loads(capsys.readouterr().out)
+    assert not db.exists(), "a refused password left a store behind"
+
+
+def test_an_existing_administrator_is_refused_before_the_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-15, and the answer the IDE Start flow reads as go-ahead (ADR 0183, Wave 5).
+
+    Asking for a password it is about to refuse would make a scripted "provision, then serve" step
+    type a credential for nothing, and leave an operator unsure whether it was used.
+    """
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    db = tmp_path / "provisioned.db"
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    _no_prompt(monkeypatch)
+    assert main(["provision-admin", "--username", "other", "--db", str(db), "--json"]) == 1
+    assert "already has an enabled Administrator" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_an_existing_store_with_no_administrator_still_prompts_and_provisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control on the test above: the early answer is about an ADMINISTRATOR, not about a store.
+
+    A store that exists but holds none, the state a refused start leaves, must still get the prompt.
+    Without this arm, a probe that refused every existing store would pass the test above.
+    """
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "empty.db"
+
+    async def create_empty() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        await store.close()
+
+    asyncio.run(create_empty())
+    assert db.exists()
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0

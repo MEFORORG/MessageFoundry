@@ -30,6 +30,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_kex_groups,
     harden_verify_flags,
+    narrow_to_approved_suites,
 )
 from messagefoundry.verify.model import CheckResult, Status
 
@@ -274,6 +275,7 @@ def live_smoke_ssl_context(*, ca_file: str | None = None) -> ssl.SSLContext:
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = True
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    narrow_to_approved_suites(ctx)  # offer what the engine listener serves (BACKLOG #300)
     harden_cipher_suites(ctx, connector="verify live smoke")  # forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of the engine cert (ASVS 12.1.4)
     return ctx

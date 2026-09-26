@@ -14,7 +14,6 @@ raising, so the caller can close the socket cleanly).
 
 from __future__ import annotations
 
-import datetime
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -24,7 +23,8 @@ from fastapi import HTTPException, Request, WebSocket, status
 
 from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
-from messagefoundry.auth.service import BOOTSTRAP_USERNAME, AuthService
+from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.tls_policy import HopDisposition
 
 # Re-imported, not redefined. The cert->principal mapping now lives in the neutral package-root leaf
@@ -107,6 +107,36 @@ _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/me/reauth"),
         ("GET", "/me/mfa"),
     }
+)
+
+# BACKLOG #1139 (ASVS 6.3.7): while an account has no notification address and a notice channel is
+# wired (``Identity.must_set_notify_email``), only these routes stay reachable. Keyed on (METHOD,
+# path) for the reason the MFA set above is. /me/notify-email is the way out. The rest are the ways
+# out of the two gates that run first, so neither can deadlock behind this one.
+#
+# THE ``mfa_gate=False`` ROUTES ARE EXEMPT TOO, and they are not listed. Those are the reauth-only
+# factories (TOTP enrolment and confirm, session termination): the escapes an account under
+# ``require_mfa`` with no factor needs. Keying on the flag rather than on a copy of their paths is
+# what keeps this plane and the console's (which exempts every ``allow_mfa_pending`` route) the same.
+#
+# /me/notify-email is deliberately NOT in the MFA set above. A session still owing its factor has
+# proven only the password, and letting that caller choose where the account's notices go would hand
+# a password thief the channel meant to warn the holder.
+_NOTIFY_EMAIL_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("POST", "/auth/logout"),
+        ("GET", "/auth/me"),
+        ("POST", "/auth/mfa-verify"),
+        ("POST", "/me/password"),
+        ("POST", "/me/reauth"),
+        ("GET", "/me/mfa"),
+        ("POST", "/me/notify-email"),
+    }
+)
+
+#: The 403 detail for a session confined by the set above. Clients match on it, so keep it stable.
+NOTIFY_EMAIL_REQUIRED_DETAIL = (
+    "notification address required; POST /me/notify-email to set one, then retry"
 )
 
 # The one exempt route above whose exemption serves an account with NO factor only. A pending
@@ -203,18 +233,11 @@ def pending_credential_deadline(auth: AuthService, user: UserRecord | None) -> f
     refuses this credential on time: no such user, a password the holder chose, or
     ``[auth].initial_password_expiry_hours`` set to 0.
 
-    **The never-claimed first-run bootstrap account gets ``None`` here, on purpose.** WP-3 can retire
-    that ACCOUNT earlier than this CREDENTIAL bound (``bootstrap_expiry_hours`` set shorter), and it
-    is retired outright once a second administrator exists. ``bootstrap-admin.txt`` and the lifespan
-    reminder already state the earlier of the two. Stating the credential bound alone would name a
-    later instant than the real one. The recorded ``password_claimed_at`` stamp is the test, so an
-    ``admin`` account claimed long ago and then reset by another administrator still gets its
-    deadline. The complete answer, one service method that the gate itself calls and that takes the
-    earlier bound, belongs in ``AuthService``.
+    No account is exempt by name. The first-run account named ``admin`` used to get ``None`` here,
+    because the WP-3 sweep could retire it before this bound. ADR 0183 retired that account and its
+    sweep, so an account an operator names ``admin`` is an ordinary account and gets its deadline.
     """
     if user is None or not user.must_change_password:
-        return None
-    if user.username == BOOTSTRAP_USERNAME and user.password_claimed_at is None:
         return None
     return auth.initial_credential_deadline(user.password_changed_at)
 
@@ -234,18 +257,6 @@ def initial_credential_window_hours(auth: AuthService) -> float | None:
     """
     deadline = auth.initial_credential_deadline(0.0)
     return None if deadline is None else deadline / 3600.0
-
-
-def deadline_utc(ts: float) -> str | None:
-    """A deadline instant as a UTC ISO-8601 stamp, for text a client shows to a person.
-
-    ``None`` when the instant cannot be rendered. The expiry setting has no upper bound, and
-    ``fromtimestamp`` raises past year 9999, or past year 3000 on Windows. A deadline that far out
-    is not worth a 500 on the refusal that states it, so the caller drops the sentence instead."""
-    try:
-        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (OverflowError, OSError, ValueError):
-        return None
 
 
 def _allow_no_auth(app_state: object) -> bool:
@@ -354,7 +365,7 @@ def require(
                 ),
             )
         # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
-        # BOTH directions. must_change stays FIRST: a fresh account (new user, bootstrap admin) is
+        # BOTH directions. must_change stays FIRST: a fresh account (a new user) is
         # must_change AND mfa_pending with NO factor, so leading with MFA would point it at
         # /auth/mfa-verify with nothing to prove there — the brick. It rotates first instead, and
         # /me/password lets it, because the factor refusal below skips an account with no factor.
@@ -375,6 +386,15 @@ def require(
                 status.HTTP_403_FORBIDDEN,
                 "multi-factor verification required; POST /auth/mfa-verify then retry",
                 headers={"X-MFA-Required": "1"},
+            )
+        # BACKLOG #1139 (ASVS 6.3.7): an account with no notification address sets one first. BELOW
+        # the factor gate, so a password-only session is sent to prove its factor before it can
+        # choose where notices go. ABOVE the permission loop, for the oracle reason given there.
+        if identity.must_set_notify_email and mfa_gate and route not in _NOTIFY_EMAIL_EXEMPT_ROUTES:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                NOTIFY_EMAIL_REQUIRED_DETAIL,
+                headers={"X-Notify-Email-Required": "1"},
             )
         for permission in permissions:
             if not identity.has(permission):
@@ -716,9 +736,11 @@ def _enforce_admin_write_pacing(request: Request, auth: AuthService, identity: I
 
 def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus **step-up re-verification** (ASVS 7.5.3): the caller's session must
-    have re-proved its credential — at login or via ``POST /me/reauth`` — within
-    ``[auth].step_up_max_age_seconds``. Gates the highly sensitive admin / replay / config flows; a
-    stale session is refused with 403 (the console then prompts to re-authenticate and retries). The
+    have re-proved its credential -- at a local login that owes no factor, via ``POST /me/reauth``,
+    or with a code at ``POST /auth/mfa-verify`` (``verify_mfa`` stamps the window), or at their
+    console twins -- within ``[auth].step_up_max_age_seconds``. A directory login opens no window
+    (BACKLOG #1144). Gates the highly sensitive admin / replay / config flows; a stale session is
+    refused with 403 (the console then prompts to re-authenticate and retries). The
     embedding/no-auth path is unaffected (there is no session to step up)."""
     base = require(*permissions)
 
@@ -968,6 +990,10 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     # not tear down an established socket; the connection's own revalidation is the backstop.
     if not await auth.mfa_satisfied(ws_token(websocket)):
         await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
+        return None
+    # BACKLOG #1139: an account that owes a notification address does not stream either. BELOW the
+    # factor check, as in require(), so a password-only probe still leaves its auth.mfa_denied row.
+    if identity.must_set_notify_email:
         return None
     for permission in permissions:
         if not identity.has(permission):

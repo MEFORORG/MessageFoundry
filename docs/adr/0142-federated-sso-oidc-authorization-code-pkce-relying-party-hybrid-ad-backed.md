@@ -341,6 +341,10 @@ binding. AD-password and Kerberos callers pass `None` and stay byte-identical.
 (2026-09-06 and 2026-09-23): only the administrative binding surface may create a binding, and an unbound
 federated login is refused. ADR 0184's pair-first selection (its AC-1) also bears on the rest of A.2;
 where the two differ, ADR 0184 governs.]*
+*[BUILT 2026-09-25 under BACKLOG #1143 / #295 (ADR 0184 slice A). The account is now selected by the
+pair before any username is read, so the username-keyed check A.2 describes is gone and
+`federated_subject_conflict` is no longer emitted. A reassigned username presenting a new `sub` is refused
+as `federated_subject_not_bound` instead.]*
 
 ### A.3 What this overturns, precisely
 - **"Zero store work" is superseded** by the minimum a continuity guard requires: two **nullable** columns
@@ -360,6 +364,8 @@ A **legitimately** reassigned username — a *new* person taking over an old use
 failure direction (refuse rather than take over) and is narrow, but a real availability edge. **Recommended
 follow-on:** an operator **rebind** action that clears/re-binds an account's `(oidc_issuer, oidc_subject)`
 after an out-of-band identity check, so a genuine reassignment is an admin operation rather than a lockout.
+*[Both halves of this residual are stale since 2026-09-25 (BACKLOG #1143): the refusal is now
+`federated_subject_not_bound`, and the recommended rebind exists as `PUT /users/{user_id}/federated-identity`.]*
 
 **⚠️ SECOND RESIDUAL, added 2026-08-09 — the guard is trust-on-first-use, so A.1's attack still succeeds
 against an UNBOUND account.** This section previously stated only the availability edge above, which read as
@@ -409,6 +415,9 @@ window is open.
   *[The clause "WHEN the account is unbound, it SHALL record the binding on that login" is SUPERSEDED by ADR
   0184 AC-4 (accepted 2026-09-23): an unbound federated login is refused and creates no binding. ADR 0184
   AC-1 (pair-first selection) also bears on the first clause; where the two differ, ADR 0184 governs.]*
+  *[Built 2026-09-25 (BACKLOG #1143): the first clause's `federated_subject_conflict` is no longer emitted,
+  because a username no longer selects the account. Its regression tests were restated for pair-first
+  selection in `tests/test_auth_oidc_service.py`.]*
 
 ---
 

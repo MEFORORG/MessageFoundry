@@ -30,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import datetime
 import json
 import logging
 import os
@@ -39,6 +38,7 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -82,6 +82,8 @@ from messagefoundry.api.metrics import (
     render_metrics,
 )
 from messagefoundry.api.models import (
+    STATIC_CREDENTIAL_HOPS_COMPLETE,
+    STATIC_CREDENTIAL_HOPS_PARTIAL,
     STORE_PRIVILEGE_NOT_PROBED,
     AiChatRequest,
     AiChatResponse,
@@ -164,6 +166,7 @@ from messagefoundry.api.models import (
     SecurityLoosening,
     SecurityPosture,
     ServiceStatusInfo,
+    StaticCredentialHopView,
     StatsResetRequest,
     StatsResetResult,
     StatsResponse,
@@ -188,9 +191,11 @@ from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     authorize_ws,
     client_ip,
+    deadline_utc,
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
     optional_identity,
+    pending_credential_deadline,
     require,
     require_paced,
     require_phi_read,
@@ -219,10 +224,11 @@ from messagefoundry.api.validation import (
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.reconcile import ReconcilePlan
-from messagefoundry.auth.service import AuthService, BootstrapAdmin
+from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
+    make_registry_anchor_preflight,
     run_anchor_preflight,
 )
 from messagefoundry.config.ai_policy import (
@@ -269,6 +275,7 @@ from messagefoundry.config.settings import (
     SecretsSettings,
     SecurityEnforcement,
     SecuritySettings,
+    ServiceSettings,
     ServiceStatusSettings,
     ShadowSettings,
     StoreBackend,
@@ -279,6 +286,7 @@ from messagefoundry.config.settings import (
     hop_posture_from_ai,
     security_loosenings,
 )
+from messagefoundry.config.static_credentials import static_credential_hops
 from messagefoundry.config.tls_policy import (
     fips_attestation,
     kex_groups_report,
@@ -315,7 +323,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
+from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.wiring_runner import (
     NotDeployedError,
@@ -340,7 +348,6 @@ from messagefoundry.store.content_search import (
 )
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.store import _secure_file
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -416,6 +423,10 @@ _NO_STORE_ROUTE_PATHS = frozenset(
         "/alerts/{alert_id}/resolve",
         "/alerts/{alert_id}/suspend",
         "/alerts/{alert_id}/resume",
+        # Not a PL-rated column: the static-credential inventory (BACKLOG #1182) names every backend
+        # hop on a weak credential and its peer, a map worth keeping out of a browser or proxy cache.
+        # Set here, not in the route, because the web console calls the route's handler directly.
+        "/security/posture",
     }
 )
 _log = logging.getLogger(__name__)
@@ -1206,8 +1217,15 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 #: The status a refused operator resubmission answers with, by the ingress guard that refused it
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
 #: the same status the upload route gives a non-text file. A body the listener could not have decoded,
-#: or an HL7 body ``Peek.parse`` refuses, is 422.
-_INGRESS_GUARD_STATUS: dict[str, int] = {"size": 413, "type": 415, "decode": 422, "parse": 422}
+#: an HL7 body ``Peek.parse`` refuses, or one a ``validation.strict`` inbound's strict hl7apy validation
+#: refuses or times out on, is 422.
+_INGRESS_GUARD_STATUS: dict[str, int] = {
+    "size": 413,
+    "type": 415,
+    "decode": 422,
+    "parse": 422,
+    "strict": 422,
+}
 
 
 async def _guard_resubmission(
@@ -1224,17 +1242,18 @@ async def _guard_resubmission(
     """Admit a resubmitted body as the target inbound's listener would, or refuse it (BACKLOG #1911).
 
     The upload resend and the edit-resend paths write the stage row directly, so the listener's size
-    ceiling and declared-type checks never ran on them. This runs the same guards
-    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmitted_body`) before anything is written
+    ceiling, declared-type checks and strict validation never ran on them. This runs the same guards
+    (:func:`~messagefoundry.pipeline.ingress_guards.admit_resubmission`) before anything is written
     and returns the form to commit, which the caller writes instead of the body it was handed. A
     refusal is an HTTP 4xx, an ``action`` audit row and a log line, and no message row is written, so
     count-and-log holds: no body is accepted and then dropped. Off the event loop, because the body can
     be as large as an upload.
 
     The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
-    of the body, so neither the row nor the 4xx detail echoes PHI."""
+    of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal counts hl7apy's
+    errors rather than quoting them, since that text can echo a field value."""
     try:
-        return await asyncio.to_thread(admit_resubmitted_body, raw, inbound)
+        return await admit_resubmission(raw, inbound)
     except IngressGuardError as exc:
         await engine.store.record_audit(
             action,
@@ -1301,6 +1320,26 @@ async def _record_control_audit(
     )
 
 
+#: What the connection-test routes return for a refused trust anchor, in place of its text.
+_ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
+
+
+def _caused_by_trust_anchor(exc: BaseException) -> bool:
+    """Whether ``exc`` wraps a :class:`TrustAnchorError` through its explicit ``__cause__`` chain.
+
+    Only ``raise ... from``, the way ``build_test_connector`` wraps a build failure. An implicit
+    ``__context__`` is not followed: an unrelated error raised while handling an anchor refusal
+    would then be hidden as one."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, TrustAnchorError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return False
+
+
 async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
@@ -1348,6 +1387,12 @@ async def _run_connection_test(
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
+        if _caused_by_trust_anchor(exc):
+            # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
+            # full text goes to the operator log, as the reload route's does; the caller and the
+            # audit row get a fixed line (BACKLOG #1142).
+            _log.warning("connection test refused %r (trust anchor): %s", name, exc)
+            return _result(supported=True, success=False, ms=0.0, detail=_ANCHOR_REFUSED_DETAIL)
         return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
     start = time.monotonic()
     supported, success, detail = True, False, None
@@ -2040,6 +2085,40 @@ def create_app(
                 engine.store.audit_chain_unkeyed(),
             )
         ]
+        # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
+        # read live off the running graph, like the loosenings above; the settings half from the resolved
+        # service configuration `serve` stashed. Either may be missing, and the scope then says which.
+        cred_settings = getattr(request.app.state, "static_credential_settings", None)
+        # An opt-out is honoured only while the refusal is on; with it off every entry is inert, and
+        # reporting it as accepted would contradict security_loosenings(), which does not name it.
+        opt_outs = (
+            security.static_credential_accepted if security.require_nonstatic_credentials else {}
+        )
+        static_hops = [
+            StaticCredentialHopView(**asdict(hop), accepted=hop.name in opt_outs)
+            for hop in static_credential_hops(
+                registry=runner.registry if runner is not None else None, settings=cred_settings
+            )
+        ]
+        unseen = [
+            half
+            for half, missing in (
+                ("the connection graph (none is loaded)", runner is None),
+                ("the service settings (none were stashed by serve)", cred_settings is None),
+                (
+                    "connections other engine shards own (messagefoundry check reads them all)",
+                    # Set only when the config has two or more engine shards (ADR 0073).
+                    runner is not None and runner.registry.all_shard_ids is not None,
+                ),
+            )
+            if missing
+        ]
+        if runner is None and cred_settings is None:
+            static_hops_scope = "not read: " + "; ".join(unseen)
+        elif unseen:
+            static_hops_scope = STATIC_CREDENTIAL_HOPS_PARTIAL + "; ".join(unseen)
+        else:
+            static_hops_scope = STATIC_CREDENTIAL_HOPS_COMPLETE
         store_privilege_view = (
             StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
             if store_privilege is None
@@ -2093,6 +2172,8 @@ def create_app(
             loosenings=loosenings,
             loosenings_scope=loosenings_scope,
             store_privilege=store_privilege_view,
+            static_credential_hops=static_hops,
+            static_credential_hops_scope=static_hops_scope,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
             kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?
@@ -3467,6 +3548,10 @@ def create_app(
             raise HTTPException(404, "config directory not found") from exc
         except WiringError as exc:
             _log.warning("config reload failed (invalid config): %s", exc)
+            # An inbound connection's trust anchor (BACKLOG #1142, slice 3) is refused inside the
+            # engine and arrives wrapped. It keeps the reason the settings anchors' refusal above
+            # records, so one filter on reason="trust_anchor" sees both.
+            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
             await engine.store.record_audit(
                 "config_reload_failed",
                 actor=user.username,
@@ -3474,7 +3559,7 @@ def create_app(
                     {
                         "requested": req.config_dir,
                         "dry_run": req.dry_run,
-                        "reason": "invalid_config",
+                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
                     }
                 ),
                 client=client_ip(request),
@@ -6561,6 +6646,17 @@ def create_app(
     return app
 
 
+#: The one host command that creates the first Administrator. Named by every message below that
+#: tells an operator the store has none (ADR 0183 Amendment A, AC-11 and AC-12). ``{store}`` is the
+#: opened store's cross-backend ``path`` descriptor, so an operator whose service runs with a
+#: non-default config or store sees which one to point the command at: a provision into any other
+#: store reports OK and leaves this one refused.
+_PROVISION_ADMIN_HINT = (
+    "Create one at the host with `messagefoundry provision-admin --username <name> --email "
+    "<address>`, pointed at this store ({store}) and the service's own config, then start again"
+)
+
+
 async def _assert_security_notice_is_deliverable(
     store: Store,
     *,
@@ -6576,26 +6672,36 @@ async def _assert_security_notice_is_deliverable(
     The serve gate in ``messagefoundry/__main__.py`` already refuses without a notification channel,
     but it computes readiness from ``notify_security_events`` + ``email_smtp_host`` + ``email_from``
     -- **SMTP wiring alone**. That asks *"is a transport configured"* and never *"can the account
-    that matters actually receive"*: the instrument answering the adjacent question (SDS-3.8). On a
-    first run the only account that exists is the bootstrap administrator, created with no address,
-    so the gate passes green while every one of the ten notice types about the account holding
-    ``frozenset(Permission)`` silently no-ops -- including ``LOGIN_AFTER_FAILURES``, the classic
-    someone-guessed-it signal.
+    that matters actually receive"*: the instrument answering the adjacent question (SDS-3.8). An
+    Administrator with no address passes that gate green while every one of the ten notice types
+    about the account holding ``frozenset(Permission)`` silently no-ops -- including
+    ``LOGIN_AFTER_FAILURES``, the classic someone-guessed-it signal.
 
     **This check must live here and not beside the transport gate.** ``_serve`` is synchronous and
     opens no store, so at that point there is no user table to ask. The ASGI lifespan is the only
-    place the store and the freshly minted bootstrap admin are both in hand -- which is why the
-    owner's ruling (option (b), 2026-08-13) corrected the item's own stated fix location.
+    place the store is in hand -- which is why the owner's ruling (option (b), 2026-08-13) corrected
+    the item's own stated fix location.
+
+    **The refusal says which half failed, because the fix differs (ADR 0183 Amendment A).** The
+    engine creates no account on its own since Wave 2, so a store nobody has provisioned holds no
+    enabled Administrator at all. That half names ``provision-admin``, which succeeds against such a
+    store (AC-11). An Administrator with no address is the other half; ``provision-admin`` refuses
+    there, so it names the offline setter ``admin-set-notify-email`` and the audited waiver (AC-16).
+
+    **It is also where a skipped gate still says that nobody can sign in (AC-12).** With sign-in
+    required, notices off or waived in writing, and no enabled Administrator, the engine starts and
+    routes HL7 but no one can reach the console. That is logged as ONE WARNING naming
+    ``provision-admin``. Under ``warn`` the refusal's own WARNING already says it, so nothing more is
+    logged. With sign-in not required no Administrator is needed and nothing is logged. It stays a
+    warning rather than a refusal on purpose: NSSM restarts a service at boot with nobody present,
+    and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
 
     **Why deliverability rather than "require an email at creation".** A fix resting on an OPERATOR
     ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
-    table can. This paragraph used to justify that by saying an address a human sets on an AD or OIDC
-    account is overwritten at the holder's next sign-in, and **BACKLOG #1139 made that half false**:
-    ``update_user_profile`` still issues ``UPDATE users SET display_name=?, email=?`` unconditionally
-    on every directory login, but ``email`` is now the mirror only. The address this check reads --
-    ``notify_email`` -- is engine-owned and named by no directory-sync statement, so a directory login
-    no longer moves it. The conclusion stands on the narrower ground: an operator can still forget,
-    and a first-run bootstrap administrator is still minted with no address at all.
+    table can. BACKLOG #1139 narrowed that ground: the address this check reads -- ``notify_email``
+    -- is engine-owned and named by no directory-sync statement, so a directory login no longer
+    moves it. The conclusion stands on what is left: an operator can still forget, and
+    ``provision-admin`` without ``--email`` succeeds with a warning.
 
     **It reads ``notify_email`` and not ``email`` for the reason the split exists.** They are two
     columns now, and only one of them is where a notice is addressed. Asking about ``email`` would be
@@ -6606,80 +6712,55 @@ async def _assert_security_notice_is_deliverable(
     which is a different and much larger change.
     """
     auth_settings = auth_settings or AuthSettings()
-    if not auth_settings.enabled or not auth_settings.notify_security_events:
-        return  # no notices to deliver; the transport gate already governs whether that is allowed
+    if not auth_settings.enabled:
+        return  # sign-in is not required, so no Administrator is needed to reach the engine
     alerts = alerts_settings or AlertsSettings()
-    if not alerts.security_notifications_required:
-        return  # the audited, in-writing opt-out -- the pull-only feed is accepted
-    for user in await store.list_users():
-        if user.disabled or not user.notify_email:
-            continue
-        if Role.ADMINISTRATOR.value in await store.get_user_role_ids(user.id):
-            return
-    detail = (
-        "no enabled Administrator has a notification address, so every out-of-band security notice about "
-        "the most privileged accounts would be silently dropped (SecurityEventNotifier returns "
-        "early when the recipient has no address). The [alerts] SMTP transport being configured "
-        "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
-        "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
-        "/me/security-events feed in writing via [alerts].security_notifications_required=false. "
-        "(On a NEW install, `messagefoundry provision-admin --username <name> --email <address>` "
-        "before the first serve avoids this state entirely -- BACKLOG #1136. It is not a fix for "
-        "the instance that just refused: it declines once an enabled Administrator exists, which "
-        "by this point one does.)"
+    # The two preconditions of the deliverability question. Either one false skips the refusal: the
+    # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
+    gated = auth_settings.notify_security_events and alerts.security_notifications_required
+    # Addressed accounts first, so the common start stops at the first addressed Administrator and
+    # never reads the roles of the rest of the table. Once an Administrator WITHOUT an address is
+    # reached, every account after it lacks one too, so the question is settled there.
+    enabled = sorted(
+        (u for u in await store.list_users() if not u.disabled), key=lambda u: not u.notify_email
     )
+    administrator_exists = False
+    for user in enabled:
+        if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
+            continue
+        if user.notify_email or not gated:
+            return
+        administrator_exists = True
+        break
+    if not administrator_exists:
+        # A SQLite store file named absolutely, since the operator's shell may sit in another
+        # directory than the service; a server backend's descriptor is server/database, names no
+        # file, and is left as it is.
+        where = str(Path(store.path).resolve()) if Path(store.path).is_file() else store.path
+        detail = (
+            "no enabled Administrator exists in this store, so nobody can sign in, and every "
+            "out-of-band security notice about the most privileged accounts would reach nobody. The "
+            f"engine creates no account on its own. {_PROVISION_ADMIN_HINT.format(store=where)}."
+        )
+        if not gated:
+            # AC-12: the gate is skipped, so this is the one line that says the console is unreachable.
+            _log.warning("the engine is starting with no way to sign in: %s", detail)
+            return
+    else:
+        detail = (
+            "no enabled Administrator has a notification address, so every out-of-band security "
+            "notice about the most privileged accounts would be silently dropped "
+            "(SecurityEventNotifier returns early when the recipient has no address). The [alerts] "
+            "SMTP transport being configured does not make a notice deliverable. Set an address at "
+            "the host with `messagefoundry admin-set-notify-email --username <administrator> "
+            "--email <address>`, run against this store with the engine stopped, or accept the "
+            "pull-only /me/security-events feed in writing via "
+            "[alerts].security_notifications_required=false"
+        )
     enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
         raise RuntimeError(f"refusing to start a PHI instance: {detail}")
     _log.warning("PHI instance with no deliverable security-notice recipient: %s", detail)
-
-
-def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettings) -> None:
-    """Persist the one-time bootstrap password to a restricted file — never the rotating log.
-
-    Until rotated it is a standing Administrator credential, so it must not land in NSSM's broadly
-    readable stdout capture. Write it to an owner-only file the operator consumes and deletes; log
-    only the location. Paired with server-side must_change_password enforcement, it dies at first login.
-    """
-    base = Path(store_settings.path or ".").resolve()
-    secret_file = base.parent / "bootstrap-admin.txt"
-    body = f"username: {bootstrap.username}\npassword: {bootstrap.password}\n"
-    # ASVS 6.4.5: state the renewal deadline WITH the credential — an unclaimed bootstrap is
-    # auto-disabled at this instant, so the "sign in and change it before then" instruction ships
-    # alongside the secret rather than being an out-of-band assumption. None when expiry is off.
-    deadline = (
-        datetime.datetime.fromtimestamp(bootstrap.expires_at, tz=datetime.UTC).isoformat()
-        if bootstrap.expires_at is not None
-        else None
-    )
-    if deadline is not None:
-        body += (
-            f"expires: {deadline} — sign in and change this password before then, "
-            "or the unclaimed credential is disabled.\n"
-        )
-    # Create the file owner-only from the instant it exists, closing the POSIX create-then-chmod TOCTOU
-    # (SEC-020): O_EXCL + 0o600 means the secret is never group/world-readable even momentarily, and
-    # O_EXCL also refuses to follow a pre-planted symlink/file at that path. A second service start
-    # before the operator deletes the prior file would hit FileExistsError — remove the stale file we
-    # own, then re-create exclusively.
-    flags = os.O_CREAT | os.O_WRONLY | os.O_EXCL | os.O_TRUNC
-    try:
-        fd = os.open(str(secret_file), flags, 0o600)
-    except FileExistsError:
-        secret_file.unlink()  # the prior owner-only file we wrote; replace it under the same mode
-        fd = os.open(str(secret_file), flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(body)
-    # On Windows os.open's mode is minimal, so still apply the icacls owner-only DACL (the store's
-    # platform-correct primitive: chmod on POSIX is a no-op here since O_EXCL already set 0o600).
-    _secure_file(secret_file)
-    _log.warning(
-        "Created bootstrap admin %r; one-time password written to %s — sign in, change it, then "
-        "delete that file%s.",
-        bootstrap.username,
-        secret_file,
-        f" (expires {deadline} unless claimed)" if deadline is not None else "",
-    )
 
 
 _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound the sessions table
@@ -6753,32 +6834,89 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_session_revoked(revocation.username, reason=revocation.reason)
 
 
-_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL = 3600.0  # re-check the bootstrap warn window hourly
+_INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
 
 
-async def _bootstrap_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
-    """Remind an operator, ONCE, that an UNCLAIMED first-run bootstrap admin is nearing its auto-disable
-    deadline (ASVS 6.4.5 arm 2). API-lifespan-owned (like :func:`_session_reaper`), NOT engine-owned — it
-    reaches the :class:`AuthService` directly. ``auth.bootstrap_expiry_warning()`` evaluates the warn
-    window and latches once-per-process; a non-None result is the fresh reminder to emit as the PHI-free
-    ``bootstrap_admin_expiring`` alert (the ISO deadline + whole hours remaining — never the password).
+def _initial_credential_warn_lead(auth: AuthService) -> float | None:
+    """How long before an admin-issued credential's deadline to remind an operator, in seconds.
 
-    A transient store error must not kill the loop for the process lifetime (that would silently drop the
-    reminder) — log and retry next interval, the session-reaper precedent."""
+    BACKLOG #1141 (ASVS 6.4.5). The last third of the window, capped at 24 hours: 24 hours at the
+    shipped 72, and a holder never gets reminded about a credential it was handed moments ago on a
+    short window. No setting, deliberately: the reminder is advisory and a knob would be one more
+    loosening to inventory. ``None`` when ``[auth].initial_password_expiry_hours`` is 0, where
+    nothing expires and there is nothing to remind about."""
+    window = auth.initial_credential_deadline(
+        0.0
+    )  # the window in seconds, from the gate's arithmetic
+    if window is None:
+        return None
+    return min(_INITIAL_CREDENTIAL_MAX_LEAD, window / 3)
+
+
+async def _remind_expiring_initial_credentials(
+    auth: AuthService,
+    sink: AlertSink,
+    *,
+    lead: float,
+    warned: dict[str, float],
+    now: float | None = None,
+) -> None:
+    """One pass: alert once for each unclaimed admin-issued credential inside its warn window.
+
+    The deadline is :func:`pending_credential_deadline`, the route-layer function the refusal and the
+    console pages read. It returns :meth:`AuthService.initial_credential_deadline` under the gate's
+    own ``must_change_password`` condition, so the reminder names the instant the gate refuses on. A
+    disabled account is skipped: it cannot sign in whatever the credential does.
+
+    ``warned`` maps a user id to the deadline already reminded about. A new credential on the same
+    account has a new deadline, so it is reminded about again. An entry is dropped once its account
+    leaves every window (claimed, lapsed, disabled or deleted), so the map stays as small as the set
+    of live reminders."""
+    now = time.time() if now is None else now
+    live: set[str] = set()
+    for user in await auth.store.list_users():
+        if user.disabled:
+            continue
+        deadline = pending_credential_deadline(auth, user)
+        if deadline is None or not (deadline - lead <= now < deadline):
+            continue
+        live.add(user.id)
+        if warned.get(user.id) == deadline:
+            continue
+        expires = deadline_utc(deadline)
+        if expires is None:
+            continue
+        sink.initial_credential_expiring(
+            f"user:{user.username}",
+            expires_at=expires,
+            hours_remaining=max(0, int((deadline - now) // 3600)),
+        )
+        warned[user.id] = deadline
+    for user_id in warned.keys() - live:
+        del warned[user_id]
+
+
+async def _initial_credential_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
+    """Remind an operator before an admin-issued temporary password lapses unclaimed (ASVS 6.4.5,
+    BACKLOG #1141). The engine hands that credential to an ADMINISTRATOR and has no channel to its
+    holder, so the reminder goes to the ``[alerts]`` sink as ``initial_credential_expiring``.
+
+    The poll runs at half the warn lead, capped at an hour, so every window holds at least one pass.
+    The :func:`_session_reaper` shape: API-lifespan-owned, and a failed pass is logged and retried
+    rather than ending the loop."""
+    lead = _initial_credential_warn_lead(auth)
+    if lead is None:
+        return
+    interval = min(3600.0, lead / 2)
+    warned: dict[str, float] = {}
     while True:
         try:
-            warning = await auth.bootstrap_expiry_warning()
-            if warning is not None:
-                expires_at, hours_remaining = warning
-                iso = datetime.datetime.fromtimestamp(expires_at, tz=datetime.UTC).isoformat()
-                sink.bootstrap_admin_expiring(
-                    "bootstrap-admin", expires_at=iso, hours_remaining=hours_remaining
-                )
+            await _remind_expiring_initial_credentials(auth, sink, lead=lead, warned=warned)
         except asyncio.CancelledError:
             raise
         except Exception:
-            _log.exception("bootstrap expiry reminder: pass failed; will retry next interval")
-        await asyncio.sleep(_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL)
+            _log.exception("initial credential reminder: pass failed; will retry next interval")
+        await asyncio.sleep(interval)
 
 
 def create_managed_app(
@@ -6859,6 +6997,8 @@ def create_managed_app(
     trusted_proxies: Sequence[str] = (),
     phi_read_hop_secure: bool = True,
     registry_filter: Callable[[Registry], Registry] | None = None,
+    registry_guard: Callable[[Registry], None] | None = None,
+    static_credential_settings: ServiceSettings | None = None,
     log_dir: str | None = None,
     configured_log_level: str | None = None,
     trust_anchor_specs: Sequence[AnchorSpec] = (),
@@ -6868,14 +7008,18 @@ def create_managed_app(
 
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
-    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService`, seeds the
-    built-in roles, and creates a bootstrap admin on first run. The store is opened via the
+    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService` and seeds the
+    built-in roles; it creates no account (ADR 0183). The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
     — the CLI server passes it; in-process/test callers omit it (no separate API socket is bound).
     ``registry_filter`` (L3 sharding) is an optional pure transform applied to the loaded graph at
     startup AND on every reload — ``serve --shard X`` passes ``filter_registry_for_shard(.., X)`` so
     this process owns only shard X's inbounds; ``None`` = the whole graph (unchanged default).
+    ``registry_guard`` refuses a graph by raising ``WiringError``; it runs on the first load and on
+    every reload (the opt-in static-credential gate, BACKLOG #1182). ``static_credential_settings`` is
+    the resolved service configuration ``GET /security/posture`` reads the static-credential
+    inventory's settings half from; ``None`` makes that route say it could not read it.
     """
     if store_settings is None:
         if db_path is None:
@@ -7147,13 +7291,37 @@ def create_managed_app(
             coordinator=coordinator,
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
+            registry_guard=registry_guard,
+            # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
+            # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
+            # every real reload. Each connector's own build then enforces again and loads the bytes
+            # it read. Dormant when no inbound names a CA: no store call, no audit row.
+            registry_preflight=make_registry_anchor_preflight(
+                store, enforcing=trust_anchors_enforcing
+            ),
         )
         if config_dir is not None:
-            loaded = load_config(config_dir)
-            # L3 sharding: a `serve --shard X` process owns only shard X's inbounds (the filter is
-            # re-applied on every reload inside the engine). None = the whole graph (unchanged default).
-            if registry_filter is not None:
-                loaded = registry_filter(loaded)
+            # The first graph load, under the same teardown discipline as the preflights above: a
+            # refusal here (a bad config, the shard guard, or the BACKLOG #1182 static-credential
+            # guard) happens after the store and notifier are open and before the span below that
+            # tears them down, so they are closed here. Left open, aiosqlite's non-daemon worker keeps
+            # the process from exiting (#1257).
+            try:
+                loaded = load_config(config_dir)
+                # Before the shard filter, as the reload path does inside the engine: the guard judges
+                # the whole graph.
+                engine.guard_registry(loaded)
+                # L3 sharding: a `serve --shard X` process owns only shard X's inbounds (the filter is
+                # re-applied on every reload inside the engine). None = the whole graph.
+                if registry_filter is not None:
+                    loaded = registry_filter(loaded)
+                # After the filter, as the reload path does: the anchors this process will load.
+                await engine.preflight_registry(loaded)
+            except BaseException:
+                if notifier is not None:
+                    await notifier.aclose()
+                await store.close()
+                raise
             engine.add_registry(loaded)
         # #1257: hoisted above the try because the finally below now guards STARTUP too, and it
         # reaches these names before it reaches engine.stop(). Left in place inside the span, a
@@ -7164,10 +7332,11 @@ def create_managed_app(
         upload_retention_runner: UploadRetentionRunner | None = None
         reaper: asyncio.Task[None] | None = None
         reconciler: asyncio.Task[None] | None = None
-        bootstrap_reminder: asyncio.Task[None] | None = None
+        # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
+        credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
-        # the engine, both notifiers, the retention runner, the three tasks -- was otherwise
+        # the engine, both notifiers, the retention runner, the tasks -- was otherwise
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
@@ -7195,6 +7364,8 @@ def create_managed_app(
             app.state.trust_anchor_specs = tuple(trust_anchor_specs)
             app.state.trust_anchors_enforcing = trust_anchors_enforcing
             app.state.store_settings = resolved  # back GET /security/posture (M5)
+            # BACKLOG #1182: the settings half of the static-credential inventory, for the same route.
+            app.state.static_credential_settings = static_credential_settings
             app.state.alerts_settings = alerts_settings
             # #143: expose the running notifier so POST /alerts/{id}/suspend|resume can update its in-memory
             # suspend cache live (None here in a JSON-only/no-transport deployment — the durable store governs).
@@ -7302,10 +7473,8 @@ def create_managed_app(
                     # connector-construction gate, so the clamp is inert unless the posture arrives here).
                     hop_posture=_hop_posture,
                 )
-                bootstrap = await auth.initialize()
+                await auth.initialize()
                 app.state.auth = auth
-                if bootstrap is not None:
-                    _emit_bootstrap_admin(bootstrap, resolved)
                 await _assert_security_notice_is_deliverable(
                     store,
                     auth_settings=auth_settings,
@@ -7356,21 +7525,12 @@ def create_managed_app(
                         auth_settings.oidc_redirect_path,
                     )
                 reaper = asyncio.create_task(_session_reaper(store))
-                if auth.bootstrap_deadline_configured:
-                    # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
-                    # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
-                    # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
-                    # (LoggingAlertSink fallback) or notifies. No task when NEITHER bound is configured.
-                    #
-                    # BACKLOG #1141: this open-coded `auth_settings.bootstrap_expiry_hours > 0`, a THIRD copy
-                    # of a question `bootstrap_expiry_warning` answers over TWO bounds — WP-3 account
-                    # retirement AND the ASVS 6.4.1 credential expiry. At bootstrap_expiry_hours=0 with
-                    # initial_password_expiry_hours set, that method computed a correct deadline and this
-                    # task — ITS ONLY CONSUMER — was never created, so the warning arm was SILENTLY DEAD.
-                    # BACKLOG #1245 corrected the two computations in auth/service.py and never reached the
-                    # gate deciding whether they run. Ask the AuthService, which owns the predicate now.
-                    bootstrap_reminder = asyncio.create_task(
-                        _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
+                if _initial_credential_warn_lead(auth) is not None:
+                    # BACKLOG #1141 (ASVS 6.4.5): a nudge for every unclaimed temporary password an
+                    # administrator issued. Gated on the predicate the task itself reads, so the gate
+                    # cannot drift from the task.
+                    credential_reminder = asyncio.create_task(
+                        _initial_credential_expiry_reminder(auth, notifier or LoggingAlertSink())
                     )
                 if auth.directory_reconcile_enabled:
                     # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
@@ -7409,11 +7569,9 @@ def create_managed_app(
                 # previously-died reaper stored, so it can't propagate here and skip engine.stop()
                 # (review M-33).
                 await asyncio.gather(reaper, return_exceptions=True)
-            if bootstrap_reminder is not None:
-                bootstrap_reminder.cancel()
-                # gather(return_exceptions): absorb our cancellation + any stored exception so it can't
-                # propagate here and skip engine.stop() (the reaper precedent).
-                await asyncio.gather(bootstrap_reminder, return_exceptions=True)
+            if credential_reminder is not None:
+                credential_reminder.cancel()
+                await asyncio.gather(credential_reminder, return_exceptions=True)
             # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
             # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
             # called it, so every clean restart dropped the open hour's PHI-summary access audit --

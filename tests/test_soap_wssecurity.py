@@ -90,6 +90,14 @@ class _FakeCtx:
     def get_ciphers(self) -> list[dict[str, object]]:
         return _REAL_DEFAULT_SUITES
 
+    # BACKLOG #300: the opener now narrows to the approved suites before asserting, so the stand-in
+    # must accept the two attributes narrow_to_approved_suites touches. The suite list itself is
+    # covered on a real context by tests/test_tls_default_suites.py.
+    security_level = 2
+
+    def set_ciphers(self, value: str) -> None:
+        self.ciphers = value
+
 
 def test_client_cert_opener_loads_chain_and_floors_tls(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeCtx()
