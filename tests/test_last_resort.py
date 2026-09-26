@@ -231,9 +231,10 @@ def test_an_unawaited_task_exception_under_a_non_serve_subcommand_reaches_last_r
     ``gc.collect()`` while the loop is still alive. That is when asyncio asks the loop's exception
     handler. Asserting that ``run_guarded`` was called would pass on a wrapper that installs nothing.
 
-    RED when: any site reverts to a bare ``asyncio.run``, or ``run_guarded`` stops setting the
-    handler. The stdlib default then logs to the ``asyncio`` logger instead, with the raw message
-    in its traceback, and nothing reaches this logger."""
+    RED when: the ``restore-verify`` site reverts to a bare ``asyncio.run``, or ``run_guarded``
+    stops setting the handler. The stdlib default then logs to the ``asyncio`` logger instead, with
+    the raw message in its traceback, and nothing reaches this logger. The other sites are held by
+    the syntax guard below, not by this test."""
     import json
     import subprocess
     import sys
@@ -261,40 +262,74 @@ def test_an_unawaited_task_exception_under_a_non_serve_subcommand_reaches_last_r
     assert not any("DOE" in m or "JANE" in m for m in messages), "PHI reached the log unredacted"
 
 
-def _bare_asyncio_runs(source: str, filename: str) -> list[str]:
-    """Every ``asyncio.run(...)`` call, and every ``from asyncio import run``, in ``source``."""
+_LOOP_STARTERS = frozenset({"run", "Runner", "new_event_loop"})
+
+
+def _direct_loop_starts(source: str, filename: str) -> list[str]:
+    """Every place ``source`` starts an event loop directly rather than through ``run_guarded``.
+
+    A syntax check, so it covers at least these spellings and not every one: ``asyncio.run``,
+    ``asyncio.Runner`` and ``asyncio.new_event_loop``, through an ``import asyncio as x`` alias or
+    the ``asyncio.runners`` submodule too; a ``from asyncio[.runners] import`` of any of them; and
+    any ``.run_until_complete(`` call."""
     import ast
 
-    def _is_bare_call(node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "run"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "asyncio"
-        )
+    tree = ast.parse(source, filename=filename)
+    aliases = {"asyncio"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases.update(a.asname for a in node.names if a.name == "asyncio" and a.asname)
 
-    def _is_run_import(node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.ImportFrom)
-            and node.module == "asyncio"
-            and any(alias.name in ("run", "Runner") for alias in node.names)
-        )
+    def _rooted_in_asyncio(expr: ast.expr) -> bool:
+        while isinstance(expr, ast.Attribute):
+            expr = expr.value
+        return isinstance(expr, ast.Name) and expr.id in aliases
+
+    def _starts_a_loop(node: ast.AST) -> bool:
+        if isinstance(node, ast.ImportFrom):
+            return node.module in ("asyncio", "asyncio.runners", "asyncio.events") and any(
+                a.name in _LOOP_STARTERS for a in node.names
+            )
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return False
+        if node.func.attr == "run_until_complete":
+            return True
+        return node.func.attr in _LOOP_STARTERS and _rooted_in_asyncio(node.func.value)
 
     return [
         f"{filename}:{getattr(node, 'lineno', 0)}"
-        for node in ast.walk(ast.parse(source, filename=filename))
-        if _is_bare_call(node) or _is_run_import(node)
+        for node in ast.walk(tree)
+        if _starts_a_loop(node)
     ]
 
 
-def test_no_engine_module_starts_a_loop_without_run_guarded() -> None:
-    """Every loop the engine starts outside ``serve`` must come from ``last_resort.run_guarded``
-    (BACKLOG #1789). A bare ``asyncio.run`` gets the stdlib default handler, which prints a task's
-    raw exception text. The one allowed site is ``run_guarded`` itself.
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import asyncio\nasyncio.run(main())\n",
+        "import asyncio as aio\naio.run(main())\n",
+        "import asyncio\nwith asyncio.Runner() as r:\n    r.run(main())\n",
+        "import asyncio\nasyncio.runners.run(main())\n",
+        "from asyncio.runners import run\n",
+        "from asyncio import Runner\n",
+        "import asyncio\nasyncio.new_event_loop().run_until_complete(main())\n",
+    ],
+    ids=["run", "alias", "runner", "runners-module", "from-runners", "from-asyncio", "loop"],
+)
+def test_the_loop_guard_fires_on_each_spelling_it_claims(source: str) -> None:
+    """Positive controls for the guard below: without them, its empty result could be a scanner
+    that sees nothing."""
+    assert _direct_loop_starts(source, "control.py"), f"the guard is blind to:\n{source}"
 
-    Two controls keep a zero from being a dead instrument. The scanner must find the allowed site
-    in the REAL tree, and it must fire on a synthetic bare call."""
+
+def test_no_engine_module_starts_a_loop_without_run_guarded() -> None:
+    """Every loop the engine starts must come from ``last_resort.run_guarded`` (BACKLOG #1789),
+    except the one uvicorn owns under ``serve``. A loop started directly gets the stdlib default
+    handler, which prints a task's raw exception text. ``run_guarded`` itself is the one allowed
+    site.
+
+    Controls keep a zero from being a dead instrument. The scanner must find ``run_guarded``'s own
+    two calls in the REAL tree, and it must fire on each spelling in the test above."""
     import messagefoundry
 
     root = Path(messagefoundry.__file__).resolve().parent
@@ -303,15 +338,12 @@ def test_no_engine_module_starts_a_loop_without_run_guarded() -> None:
     hits: list[str] = []
     allowed_hits: list[str] = []
     for path in files:
-        found = _bare_asyncio_runs(path.read_text(encoding="utf-8"), str(path))
+        found = _direct_loop_starts(path.read_text(encoding="utf-8"), str(path))
         (allowed_hits if path == allowed else hits).extend(found)
 
     assert len(files) > 100, f"scanned only {len(files)} files under {root}"
-    assert len(allowed_hits) == 1, f"run_guarded's own call was not found: {allowed_hits}"
-    assert _bare_asyncio_runs("import asyncio\nasyncio.run(main())\n", "control.py") == [
-        "control.py:2"
-    ], "the scanner cannot see a bare asyncio.run"
+    assert len(allowed_hits) == 2, f"run_guarded's own calls were not found: {allowed_hits}"
     assert hits == [], (
-        "a loop is started without the last-resort handler; call "
-        f"messagefoundry.last_resort.run_guarded instead of asyncio.run: {hits}"
+        "a loop is started without the last-resort handler; use "
+        f"messagefoundry.last_resort.run_guarded instead: {hits}"
     )

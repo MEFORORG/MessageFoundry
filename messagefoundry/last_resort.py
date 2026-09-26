@@ -72,22 +72,24 @@ def install_loop_exception_handler(loop: asyncio.AbstractEventLoop | None = None
 def run_guarded[T](coro: Coroutine[Any, Any, T]) -> T:
     """``asyncio.run(coro)``, with :func:`_handle_loop_exception` installed on the loop it creates.
 
-    Use this for EVERY event loop the engine starts outside ``serve`` (BACKLOG #1789). ``serve``
-    gets the handler from the API lifespan, inside the loop uvicorn owns. Any other loop, such as
-    ``supervise``, ``backup`` or a ``restore-verify`` open check, would otherwise report a task
-    exception nothing awaited through the stdlib default, which prints the raw exception text.
+    Use this for EVERY event loop the engine starts, except the one uvicorn owns (BACKLOG #1789).
+    That loop gets the handler from the API lifespan. Any other loop would otherwise report a task
+    exception nothing awaited through the stdlib default, which prints the raw exception text. That
+    includes loops started while ``serve`` runs: the scheduled backup's full restore-verify opens a
+    nested loop in a worker thread, and the lifespan's handler does not reach it.
 
     The handler is set in the ``loop_factory``, before the loop runs anything, so no task can raise
     first. It could not be hoisted to ``main()`` the way the sync and thread hooks were (#1674): it
-    is per loop, and no loop exists there yet. ``tests/test_last_resort.py`` fails on a bare
-    ``asyncio.run(`` anywhere under ``messagefoundry/``, so a new site cannot skip this function.
-    ``asyncio`` is imported here for the cost reason given on
+    is per loop, and no loop exists there yet. ``tests/test_last_resort.py`` fails on at least the
+    common ways to start a loop directly under ``messagefoundry/``: ``asyncio.run``, an aliased
+    ``asyncio``, ``Runner``, ``new_event_loop`` and ``run_until_complete``. It is a syntax check, so
+    it cannot see every spelling. ``asyncio`` is imported here for the cost reason given on
     :func:`install_loop_exception_handler`."""
     import asyncio
 
     def _loop_with_handler() -> asyncio.AbstractEventLoop:
         loop = asyncio.new_event_loop()
-        loop.set_exception_handler(_handle_loop_exception)
+        install_loop_exception_handler(loop)
         return loop
 
     return asyncio.run(coro, loop_factory=_loop_with_handler)
