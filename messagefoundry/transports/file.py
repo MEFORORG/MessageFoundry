@@ -358,6 +358,7 @@ class FileDestination(DestinationConnector):
         # deliveries can't clobber each other (FILE-5: replaces the TOCTOU exists()-then-rename).
         fd, tmp_name = tempfile.mkstemp(dir=self.directory, suffix=".part")
         tmp = Path(tmp_name)
+        consumed = False
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
@@ -369,15 +370,35 @@ class FileDestination(DestinationConnector):
                 os.fsync(handle.fileno())
             if self._overwrite:
                 os.replace(tmp, target)  # atomic overwrite; consumes tmp
+                consumed = True
             else:
-                _claim_unique(tmp, target)  # hard-links tmp → a free name
+                _claim_unique(tmp, target)  # hard-links (or copies) tmp to a free name
             # The new directory entry belongs to the directory, not the file, so the published NAME
             # needs its own flush to survive a crash as well as the bytes.
             self._fsync_directory()
         finally:
-            # Remove the temp; after a successful os.replace it's already gone (suppressed).
-            with suppress(OSError):
-                os.unlink(tmp)
+            if not consumed:
+                self._remove_temp(tmp)
+
+    @staticmethod
+    def _remove_temp(tmp: Path) -> None:
+        """Remove the ``.part`` temp, best-effort, and log a WARNING if it stays (BACKLOG #1862).
+
+        Only called while the temp should still exist, so ``FileNotFoundError`` is not treated as
+        success: on Windows a dropped UNC share also surfaces as ``FileNotFoundError``, and the
+        orphan is still there when the share returns. This never raises. After a claim the target
+        is already published, so the delivery must not fail. After a failure, the real error must
+        not be replaced by a cleanup error. The temp's name is random from ``mkstemp``, not chosen
+        by a partner, so it needs no ``safe_name``."""
+        try:
+            tmp.unlink()
+        except OSError as exc:
+            logger.warning(
+                "file destination could not remove its temp file %s: %s; a .part file may be left "
+                "in the destination directory",
+                tmp,
+                safe_exc(exc),
+            )
 
     def _fsync_directory(self) -> None:
         """Flush the destination directory's entries after a publish, on POSIX (BACKLOG #1618).

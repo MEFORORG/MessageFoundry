@@ -33,7 +33,7 @@ _GROUP_MAX = 512
 class LoginRequest(RequestModel):
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
-    provider: str = Field("local", max_length=16)  # 'local' | 'ad'
+    provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
 
 
 class CurrentUser(BaseModel):

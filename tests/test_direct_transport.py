@@ -41,7 +41,6 @@ from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
 
-import messagefoundry.transports.direct as direct_mod
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
@@ -253,8 +252,8 @@ def _install_fake(
     ) -> _FakeSMTP:
         return _FakeSMTP(host, port, timeout, fail_at=fail_at, context=context)
 
-    monkeypatch.setattr(direct_mod.smtplib, "SMTP", factory)
-    monkeypatch.setattr(direct_mod.smtplib, "SMTP_SSL", factory)
+    monkeypatch.setattr("messagefoundry.transports.direct.smtplib.SMTP", factory)
+    monkeypatch.setattr("messagefoundry.transports.direct.smtplib.SMTP_SSL", factory)
     return _FakeSMTP
 
 

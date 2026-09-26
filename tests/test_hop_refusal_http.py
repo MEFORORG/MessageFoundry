@@ -95,6 +95,9 @@ def _build(
             # tests that build a prod-PHI verified remote hop and expect SUCCESS attest revocation here
             # so the (distinct) cleartext #200 assertions stay the subject under test.
             tls_revocation_attested=revocation_attested,
+            tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
+            if revocation_attested
+            else None,
         )
     )
 

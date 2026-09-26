@@ -38,7 +38,7 @@ def test_oserror_text_is_kept_without_duplicating_errno() -> None:
 def test_winerror_only_oserror_is_not_blank() -> None:
     # A proactor-style OSError carrying only winerror (str(exc) == "") — the WinError-10055 shape.
     exc = OSError()
-    exc.winerror = 10055  # type: ignore[attr-defined]
+    exc.winerror = 10055  # type: ignore[attr-defined, unused-ignore]  # win32 stubs declare it
     out = _describe(exc)
     assert "OSError" in out and "winerror=10055" in out
 

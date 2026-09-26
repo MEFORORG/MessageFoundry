@@ -85,7 +85,7 @@ def _reachable(annotation: object, out: set[str]) -> None:
 def _partition() -> tuple[dict[str, type[BaseModel]], set[str], set[str]]:
     """(every declared model, the request-body set, the response set) as FastAPI sees them."""
     declared = {**_declared(models_mod), **_declared(auth_models_mod)}
-    app = create_app(engine=None, allow_no_auth=True)  # type: ignore[arg-type]
+    app = create_app(engine=None, allow_no_auth=True)
     body: set[str] = set()
     resp: set[str] = set()
     for route in app.routes:

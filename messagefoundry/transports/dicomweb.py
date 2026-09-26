@@ -268,6 +268,7 @@ class DicomWebDestination(DestinationConnector):
                 self.base_url,
                 connector="DICOMweb destination",
                 revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
             )
             # #1180 (ADR 0093): the client trust anchor for this STOW-RS hop.
             anchor = http_family_trust_anchor(

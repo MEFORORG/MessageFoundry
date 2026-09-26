@@ -53,7 +53,7 @@ def _drain(runner: RegistryRunner) -> list[dict]:
     assert q is not None
     out: list[dict] = []
     while not q.empty():
-        out.append(q.get_nowait())
+        out.append(dict(q.get_nowait()))
     return out
 
 

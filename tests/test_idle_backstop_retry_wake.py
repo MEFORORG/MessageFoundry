@@ -31,7 +31,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.pipeline.wiring_runner import (
     _PER_LANE_IDLE_BACKSTOP_SECONDS,
     RegistryRunner,
@@ -75,7 +75,7 @@ def _registry(inbox: Path, out_dir: Path) -> Registry:
     )
     reg.add_router("r", lambda m: ["h"])
 
-    def handle(msg: Message) -> list[Send]:
+    def handle(msg: Message | RawMessage) -> list[Send]:
         return [Send("out_a", msg)]
 
     reg.add_handler("h", handle)
@@ -146,11 +146,11 @@ async def test_transient_failure_on_idle_lane_retries_on_schedule(
         failures = 2
         calls = {"n": 0}
 
-        async def flaky_send(payload: str) -> Any:
+        async def flaky_send(payload: str, **kwargs: Any) -> Any:
             calls["n"] += 1
             if calls["n"] <= failures:
                 raise DeliveryError("transient partner outage (test)")
-            return await real_send(payload)
+            return await real_send(payload, **kwargs)
 
         connector.send = flaky_send  # type: ignore[method-assign]
         (inbox / "m.hl7").write_bytes(ADT.format(cid="MSG1").encode("utf-8"))

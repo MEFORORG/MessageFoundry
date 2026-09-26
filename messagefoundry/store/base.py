@@ -2495,7 +2495,16 @@ def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -
         except Exception:  # noqa: BLE001 - hygiene only; there is no caller left to inform
             log.debug("%s: releasing a late pool borrow failed", backend, exc_info=True)
 
-    asyncio.ensure_future(_release())
+    # The loop holds only a WEAK reference to a task, so an unreferenced release could be collected
+    # mid-flight and leak the very connection this function exists to return (ruff RUF006, BACKLOG
+    # #1093). The set keeps it alive until done.
+    task = asyncio.ensure_future(_release())
+    _LATE_RELEASES.add(task)
+    task.add_done_callback(_LATE_RELEASES.discard)
+
+
+#: Strong references to in-flight :func:`_salvage_late_borrow` releases (see the comment there).
+_LATE_RELEASES: set[asyncio.Future[None]] = set()
 
 
 async def acquire_pooled(pool: Any, *, timeout: float, backend: str) -> Any:

@@ -36,6 +36,7 @@ from messagefoundry.auth.notifications import (
 from messagefoundry.auth.service import AuthService, InvalidNotifyEmail
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.base import AuditStore
 from messagefoundry.store.store import MessageStore
 
 PW = "a-strong-test-passphrase"
@@ -66,7 +67,7 @@ async def _account(store: MessageStore, *, notify: str | None, profile: str | No
     await store.update_user_profile("u1", display_name="Bob", email=profile)
 
 
-async def _rows(store: MessageStore) -> list[Any]:
+async def _rows(store: AuditStore) -> list[Any]:
     return [r for r in await store.list_audit(limit=200) if r["action"] == _ACTION]
 
 

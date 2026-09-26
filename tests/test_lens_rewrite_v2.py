@@ -122,7 +122,7 @@ def _assert_partition(source: str) -> None:
                     if dec.args and isinstance(dec.args[0], ast.Constant)
                     else node.name
                 )
-                assert node.end_lineno is not None
+                assert isinstance(name, str) and node.end_lineno is not None
                 ranges[name] = (node.body[0].lineno, node.end_lineno)
     for contract in parse_source(source):
         rows = contract["rows"]

@@ -273,13 +273,18 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > refused **once they point off-box** — including the worked examples below, which are written to show
 > the connector, not to pass the posture.
 >
-> **At the shipped default there are exactly two ways across**, and neither is a per-connection setting:
-> keep the hop on **loopback**, or set the process-wide environment variable
-> **`MEFOR_TLS_REVOCATION_ATTESTED=1`** — a *blanket* attestation that a revocation-checking PKI or
-> terminator backs **every** hop in the process, logged at WARNING at each construction. The
-> per-connection `tls_revocation_attested` field the connectors read has **no authoring surface** (no
-> factory parameter, no `connections.toml` key), so do not plan a per-hop revocation posture around it;
-> and routing egress through a revocation-checking proxy does **not** change the decision — the
+> **At the shipped default the ways across are:** keep the hop on **loopback**; load a CRL with
+> `[tls].crl_file` where it reaches the hop; or attest this one connection with
+> **`tls_revocation_attested = true`** plus a mandatory **`tls_revocation_attested_reason`** — an
+> `outbound()` keyword, or a **top-level** `connections.toml` key beside `cleartext_accepted` (not under
+> `[settings]`). The attestation says a revocation-checking PKI or terminator backs *this* hop, and
+> each construction it lets through on an enforcing instance logs a WARNING carrying the reason
+> ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
+> The same pair on an `inbound()` mTLS listener clears the listener's revocation gate, where
+> `tls_crl_file` is the in-engine fix to prefer. The process-wide
+> `MEFOR_TLS_REVOCATION_ATTESTED=1` no longer crosses an enforcing outbound hop (BACKLOG #299): one
+> variable cannot say which hop's PKI was reviewed. Routing egress through a revocation-checking
+> proxy does **not** change the decision — the
 > authority has an input for it that no call site sets. Anything else is a *posture change* rather than
 > a fix: `[security].enforcement = warn` downgrades it to a WARN. Nothing silences it instance-wide
 > any more — the synthetic declaration that did was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
