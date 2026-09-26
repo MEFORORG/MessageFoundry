@@ -330,7 +330,11 @@ Python** (`import socket`/`requests`/`pyodbc`) that bypasses every in-engine all
 egress. This residual is **owned by the org's network/DB perimeter** (deny-by-default egress firewalling +
 NetFlow alerting; DB firewall + least-privilege DB credentials) — not engine-enforced — and must be a
 documented **hard deployment prerequisite**, cross-referencing the deferred runtime-isolation track
-(WP-L3-17). Two colluding insiders defeat dual-control. "Provably impossible" is unreachable for any
+(WP-L3-17). **One Administrator is enough to defeat dual-control; this line said two colluding
+insiders until BACKLOG #315 corrected it.** Every approver is an Administrator, and every
+Administrator can create or take over another approver account. The engine flags the cheap routes
+(docs/SECURITY.md, dual-control approval) but cannot enforce that two people concurred. "Provably
+impossible" is unreachable for any
 code-first engine; "hard, attributable, detected" is.
 
 ## To resolve on acceptance

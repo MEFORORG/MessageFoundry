@@ -1013,6 +1013,36 @@ does not disable its row. It re-diffs roles only for principals that hold a live
 requester who was disabled, deleted or demoted in the directory after making a request can still pass
 this check. Probing the directory at release is not built.
 
+**One Administrator is enough to defeat dual control (BACKLOG #315).** The control cannot prove
+that two people concurred, and nothing in the engine can. Only an Administrator holds
+`approvals:approve`, and every Administrator also holds `users:manage`. So an Administrator can create
+a second Administrator account and choose its password. An Administrator can also take over an
+existing one: `POST /users/{id}/reset-password` returns the temporary password to the caller, and
+`POST /users/{id}/reset-mfa` removes the target's second factors. Either way, that one person can then
+request an action and approve it. Creating accounts and changing roles cannot be placed under
+approval, because `[approvals].operations` has no user-management key. The server does refuse
+self-approval by user id. A second account is a second user id, so that refusal does not stop this.
+
+An auditor would be wrong to read `approval.approved` as proof that two people agreed. Treat it as
+proof that two accounts did.
+
+What the engine does instead is make the cheap routes loud. It refuses none of them:
+
+| Signal | When | Where it goes |
+|---|---|---|
+| `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, or `PUT /users/{id}/roles` adds it | Alert keyed `user:<username>`, naming the granting administrator |
+| `client` on the `user.created` audit row | Every local account creation | The creating administrator's address, like the approval rows |
+| `account_created` notice | Every local account creation that has a notification address | The new account's own notification address |
+
+**Two limits apply to these signals.** An approver account minted or taken over *before* the request
+passes all three timestamp comparisons, so the release is not flagged. The `administrator_granted`
+alert is the signal for that route. A directory (AD) account that gets Administrator from the
+AD-group map at sign-in raises no `administrator_granted` alert, because that grant happens in the
+directory. And the provenance check flags rather than refuses on purpose. A refusal would stop only
+the careless route, and it would also refuse an honest directory approver whose engine row is created
+at first sign-in.
+
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
 sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
@@ -1090,7 +1120,8 @@ gate **also** requires the session's second factor: an MFA-required caller is re
 `X-MFA-Required` until `POST /auth/mfa-verify` succeeds (TOTP or a single-use recovery code), so these
 routes need both a fresh step-up window **and** the MFA factor. The window is not always a password:
 a code proved at the MFA gate stamps it too (see above). The step-up window composes with the
-dual-control approval above (the requester re-verifies; an independent approver still releases the action).
+dual-control approval above: the requester re-verifies, and a second account releases the action.
+That second account need not belong to a second person; see BACKLOG #315 under dual-control approval.
 
 ### Multi-factor authentication (TOTP, WP-14)
 
