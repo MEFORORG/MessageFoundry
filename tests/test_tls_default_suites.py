@@ -242,6 +242,11 @@ def _peer_client(pki: _Pki, suites: str) -> ssl.SSLContext:
     return ctx
 
 
+def _tls13(ctx: ssl.SSLContext) -> list[str]:
+    """The TLS 1.3 suites ``ctx`` offers, in its preference order."""
+    return [str(c["name"]) for c in ctx.get_ciphers() if c["protocol"] == "TLSv1.3"]
+
+
 def _tls12(ctx: ssl.SSLContext) -> list[str]:
     """The TLS 1.2 suites ``ctx`` offers, in its preference order (TLS 1.3 is outside the claim)."""
     return [str(c["name"]) for c in ctx.get_ciphers() if c["protocol"] != "TLSv1.3"]
@@ -485,11 +490,13 @@ def test_the_tls13_aes128_residual_is_measured_as_the_recorded_gap() -> None:
         "set_ciphersuites exists here: the R4 TLS 1.3 gap may be closed. Prove it by handshake and "
         "re-derive the docs named in this test's docstring."
     )
+    stock = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     assert narrow_tls13_suites(ctx) is False
     narrow_to_approved_suites(ctx)
-    tls13 = [str(c["name"]) for c in ctx.get_ciphers() if c["protocol"] == "TLSv1.3"]
-    assert "TLS_AES_128_GCM_SHA256" in tls13
+    # Measured RELATIVE to a stock context, not as "AES-128 is present": an OpenSSL config file can
+    # remove the suite process-wide (see narrow_tls13_suites), and a host that did must not read red.
+    assert _tls13(ctx) == _tls13(stock), "narrowing changed TLS 1.3 without set_ciphersuites"
     assert "TLS_AES_128_GCM_SHA256" in tls_policy._APPROVED_TLS_SUITES
 
 
@@ -656,10 +663,14 @@ def test_the_ide_copy_matches_the_engine_tuple() -> None:
     assert tuple(names) == APPROVED_TLS12_SUITES
 
 
-def test_the_apiclient_tls13_copy_matches_the_engine_tuple() -> None:
-    """Ruling R4 gave the engine a TLS 1.3 tuple. The apiclient carries a copy; the IDE carries
-    none, because its runtime ignores TLS 1.3 names (``engineClient.ts`` records the measurement)."""
+def test_the_tls13_copies_match_the_engine_tuple() -> None:
+    """Ruling R4 gave the engine a TLS 1.3 tuple, and both clients carry a copy. The IDE's takes
+    effect on plain Node and not under the desktop's Electron; ``engineClient.ts`` records both."""
     assert apiclient._APPROVED_TLS13_SUITES == APPROVED_TLS13_SUITES
+    text = (_ROOT / "ide" / "src" / "engineClient.ts").read_text(encoding="utf-8")
+    match = re.search(r"export const TLS_13_SUITES: readonly string\[\] = \[(.*?)\];", text, re.S)
+    assert match, "TLS_13_SUITES array literal not found in ide/src/engineClient.ts"
+    assert tuple(re.findall(r'"([^"]+)"', match.group(1))) == APPROVED_TLS13_SUITES
 
 
 def test_the_apiclient_narrows_tls13_where_the_method_exists(
@@ -680,18 +691,32 @@ def test_the_apiclient_narrows_tls13_where_the_method_exists(
     assert [c.tls13_calls for c in made] == [[":".join(APPROVED_TLS13_SUITES)]]
 
 
-def test_the_apiclient_narrows_the_inner_truststore_context() -> None:
+@pytest.mark.parametrize("narrow", ["engine", "apiclient"])
+def test_both_tls13_narrowings_reach_the_inner_truststore_context(narrow: str) -> None:
     """The default branch builds a ``truststore.SSLContext``, which forwards only the methods it
     names, and ``set_ciphersuites`` is not one. The narrowing must reach the INNER context that
     performs the handshake. Driven by putting the stand-in in the inner slot. The outer wrapper is a
     real ``ssl.SSLContext``, so its inherited method would have succeeded silently on 3.15."""
     truststore = pytest.importorskip("truststore")
     ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    assert hasattr(ctx, "_ctx"), "truststore moved its inner context; re-derive _narrow_tls13"
+    assert hasattr(ctx, "_ctx"), "truststore moved its inner context; re-derive both narrowings"
     inner = _Tls13CapableContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx._ctx = inner
-    assert apiclient._narrow_tls13(ctx) is True
+    fn = narrow_tls13_suites if narrow == "engine" else apiclient._narrow_tls13
+    assert fn(ctx) is True
     assert inner.tls13_calls == [":".join(APPROVED_TLS13_SUITES)]
+
+
+def test_an_engine_tls13_list_the_build_refuses_is_not_blamed_on_the_operator() -> None:
+    """A build whose ``set_ciphersuites`` refuses the approved list raises RuntimeError naming the
+    engine's list, so ``apply_connection_tls_ciphers`` cannot report it as a bad ``tls_ciphers``."""
+
+    class _Refusing(ssl.SSLContext):
+        def set_ciphersuites(self, suites: str) -> None:
+            raise ssl.SSLError("no cipher match")
+
+    with pytest.raises(RuntimeError, match="approved TLS 1.3 suites"):
+        narrow_tls13_suites(_Refusing(ssl.PROTOCOL_TLS_CLIENT))
 
 
 # --- the call-site count: every engine module that asserts a suite list narrows one -----------------

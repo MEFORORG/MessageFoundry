@@ -533,14 +533,13 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     the 11.6.2 gap that a misconfigured ``tls_ciphers`` could widen the key exchange below policy and
     the 11.2.3 gap that it could drop the negotiated strength below 128 bits."""
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # The probe models an engine context, so the string reaches it the way it reaches every engine
+    # context: through apply_operator_tls_ciphers, TLS 1.3 narrowing included. An ssl.SSLError here
+    # is the operator's string; the engine's own TLS 1.3 list fails with RuntimeError instead.
     try:
-        probe.set_ciphers(value)
+        apply_operator_tls_ciphers(probe, value)
     except ssl.SSLError as exc:
         raise ValueError(f"tls_ciphers is not a valid OpenSSL cipher string: {exc}") from exc
-    # The probe models an engine context, and every engine context narrows TLS 1.3 where it can.
-    # Without this, where narrow_tls13_suites works the probe would still resolve the TLS 1.3 AES-128
-    # suite, which the allow-list admits only where it cannot be removed, and refuse every string.
-    narrow_tls13_suites(probe)
     resolved = probe.get_ciphers()
     non_fs = sorted({str(c.get("name", "?")) for c in resolved if not _is_forward_secret(c)})
     if non_fs:
@@ -619,8 +618,9 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     **Since BACKLOG #300 every engine-built seam narrows BEFORE this runs, and this still only
     asserts.** Each seam calls :func:`narrow_to_approved_suites` first (MLLP and DICOM through
     :func:`apply_connection_tls_ciphers`), which applies the approved suite NAMES rather than the
-    preference string rejected above, so it adds nothing and drops only the six CBC-SHA2 suites. The
-    ADR 0188 amendment records the two rulings that allowed it; the comment below keeps the history.
+    preference string rejected above, so it adds nothing. It drops the six CBC-SHA2 suites and, since
+    owner ruling R4 of 2026-09-26 (BACKLOG #2042), the three AES-128-GCM suites. The ADR 0188
+    amendments record the rulings that allowed it; the comment below keeps the history.
 
     Raises :class:`ValueError` at construction — the same class the surrounding TLS config errors use,
     so it surfaces at ``check`` / dry-run / ``serve`` rather than as a wire-time surprise.
@@ -894,26 +894,43 @@ def narrow_tls13_suites(ctx: ssl.SSLContext) -> bool:
     ``sys.version_info >= (3, 15)``, and ``hasattr`` is ``False`` on CPython 3.14.6 here, so on 3.14
     this is a no-op that returns ``False``. That 3.15 turns it on is read off typeshed, not measured.
 
-    **The 3.14 residual is a RECORDED GAP of ruling R4, not an override.** Every 3.14 context still
-    offers ``TLS_AES_128_GCM_SHA256`` at TLS 1.3, because no API can remove it. The allow-list admits
-    it for that reason alone. ``tests/test_tls_default_suites.py`` measures the gap, and goes red the
-    day the method appears, so that this text and the ADR 0188 amendment are re-derived then.
+    **The 3.14 residual is a RECORDED GAP of ruling R4, not an override.** No Python API on 3.14 can
+    remove ``TLS_AES_128_GCM_SHA256`` from a context, so a stock 3.14 context still offers it at TLS
+    1.3. The allow-list admits it for that reason alone. An OpenSSL config file CAN remove it for the
+    whole process: measured on CPython 3.14.6 / OpenSSL 3.5.7, ``OPENSSL_CONF`` naming a file whose
+    ``system_default`` section sets ``Ciphersuites`` to the two approved names leaves only those two.
+    The engine ships no such file; that is an operator's process-level choice, outside this module.
+    ``tests/test_tls_default_suites.py`` measures that this call changes nothing on 3.14, and goes red
+    the day the method appears, so that this text and the ADR 0188 amendment are re-derived then.
+
+    **A ``truststore.SSLContext`` is narrowed through its inner context.** The wrapper forwards only
+    the methods it names, and ``set_ciphersuites`` is not one of them, so the call on the wrapper
+    would narrow an outer context that never handshakes. ``_ctx`` is truststore's private name for
+    the inner one; a test pins it, so a truststore that moves it goes red rather than quiet.
 
     **The return value is for callers and tests; no posture field reports it yet.** The seams drop
-    it. A call that raises is not caught, so a list OpenSSL refuses fails the context at construction
-    rather than reading as narrowed."""
-    if not hasattr(ctx, "set_ciphersuites"):
+    it. An OpenSSL build that refuses the approved list raises :class:`RuntimeError` naming the
+    engine's list, so the failure is never reported as a fault in an operator's ``tls_ciphers``."""
+    target = getattr(ctx, "_ctx", ctx)
+    if not hasattr(target, "set_ciphersuites"):
         return False  # the recorded gap described above
-    ctx.set_ciphersuites(":".join(APPROVED_TLS13_SUITES))
+    try:
+        target.set_ciphersuites(":".join(APPROVED_TLS13_SUITES))
+    except ssl.SSLError as exc:
+        raise RuntimeError(
+            f"this OpenSSL build refused the engine's approved TLS 1.3 suites "
+            f"{APPROVED_TLS13_SUITES} (BACKLOG #2042): {exc}"
+        ) from exc
     return True
 
 
 def apply_operator_tls_ciphers(ctx: ssl.SSLContext, ciphers: str) -> None:
     """Apply an operator ``tls_ciphers`` string to ``ctx``, then narrow TLS 1.3 as every seam does.
 
-    The ONE place an operator string meets a context, so no seam can apply one and forget the TLS 1.3
-    half: the string reaches TLS 1.2 only (:func:`narrow_tls13_suites`). It does not validate. The
-    caller has validated the string already, at settings load or in :func:`apply_connection_tls_ciphers`."""
+    The ONE place an operator string meets a context, the validator's probe included, so no seam can
+    apply one and forget the TLS 1.3 half: the string reaches TLS 1.2 only (:func:`narrow_tls13_suites`).
+    It does not validate. The seams validate first, at settings load or in
+    :func:`apply_connection_tls_ciphers`; :func:`validate_tls_ciphers` calls this on its own probe."""
     ctx.set_ciphers(ciphers)
     narrow_tls13_suites(ctx)
 

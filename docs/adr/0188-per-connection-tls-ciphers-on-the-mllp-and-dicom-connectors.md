@@ -294,16 +294,14 @@ forward `set_ciphersuites`.
 | Where | TLS 1.2 | TLS 1.3 |
 |---|---|---|
 | Every engine-built hop in the first amendment's table, and the apiclient | 5 suites, no AES-128 | CPython 3.14: all three suites, `TLS_AES_128_GCM_SHA256` included. **A recorded gap, not an override.** Where `set_ciphersuites` exists: 2 suites |
-| IDE extension client | 5 suites, no AES-128 | all three suites. VS Code's Electron (BoringSSL) ignores TLS 1.3 names in `ciphers`, measured on Electron 42.10.0. A gap of the same kind that R4 does not name |
+| IDE extension client | pins 5 names, none AES-128 (a runtime without a suite drops it) | pins the 2 approved names. Plain Node, a remote extension host, honours them. VS Code's desktop Electron (BoringSSL) ignores them and keeps all three, measured on Electron 42.10.0: a gap of the same kind that R4 does not name |
 | The library-built hops the first amendment lists as unchanged | unchanged | unchanged |
 
-**That `set_ciphersuites` arrives in CPython 3.15 is read off typeshed, not measured.** Typeshed
-guards the method at `sys.version_info >= (3, 15)`. A tripwire test goes red on the first
-interpreter that has it, so this section is re-derived then, by handshake.
+`narrow_tls13_suites`'s docstring is the one statement of when the TLS 1.3 half acts, where its
+3.15 date comes from, and what an OpenSSL config file can do on 3.14. It is not restated here.
 
-**The CPython 3.14 residual is recorded, not accepted by override.** CPython 3.14 has no
-`set_ciphersuites`, so no engine code can remove the TLS 1.3 AES-128 suite there. The allow-list
-admits `TLS_AES_128_GCM_SHA256` only on an interpreter without that method, because a string the
+**The CPython 3.14 residual is recorded, not accepted by override.** The allow-list admits
+`TLS_AES_128_GCM_SHA256` only on an interpreter without `set_ciphersuites`, because a string the
 operator cannot change must not fail validation. Where the method exists, the admission and the
 suite leave together.
 

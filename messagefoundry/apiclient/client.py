@@ -365,15 +365,10 @@ _APPROVED_TLS13_SUITES = (
 
 
 def _narrow_tls13(ctx: ssl.SSLContext) -> bool:
-    """This client's copy of ``tls_policy.narrow_tls13_suites``, whose docstring states when it acts
-    and why its no-op on CPython 3.14 is a recorded gap. Returns whether it narrowed.
-
-    **One difference, and it is why this is not a one-line copy.** A ``truststore.SSLContext``
-    forwards only the methods it names to the inner context that performs the handshake, and
-    ``set_ciphersuites`` is not one of them. Called on the wrapper, the inherited base-class method
-    would narrow the unused outer context and succeed silently. So the call goes to the inner
-    context where there is one. ``_ctx`` is private to truststore; if it moves, this falls back to
-    the wrapper, and the apiclient test in ``tests/test_tls_default_suites.py`` goes red."""
+    """This client's copy of ``tls_policy.narrow_tls13_suites``, whose docstring states when it acts,
+    why its no-op on CPython 3.14 is a recorded gap, and why it targets a ``truststore`` wrapper's
+    inner ``_ctx``. This client's default branch builds exactly such a wrapper. A copy, because
+    ``apiclient/`` may not import ``config/``. Returns whether it narrowed."""
     target = getattr(ctx, "_ctx", ctx)
     if not hasattr(target, "set_ciphersuites"):
         return False
