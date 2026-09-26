@@ -314,7 +314,9 @@ class LdapAuthenticator:
         # file swapped after this check is never trusted. ldap3 used to get the path, and read the
         # file again on every bind. `enforcing` is the [security].enforcement dial, as for the OIDC
         # anchor: a pin mismatch always refuses, and an anchor others can replace refuses at enforce.
-        # Only an LDAPS bind loads a CA; a plain ldap:// bind builds no Tls at all.
+        # Only an LDAPS bind loads a CA; a plain ldap:// bind builds no Tls at all. So rotating the AD
+        # CA now takes a restart, as the OIDC anchor already did: a reload re-checks and audits the
+        # file, but no reload rebuilds this authenticator.
         self._ca_certs_data: str | None = None
         spec = ad_anchor_spec(settings)
         if self._ldaps and spec is not None:

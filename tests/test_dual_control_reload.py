@@ -246,10 +246,14 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
 
             anchor.write_bytes(b"-----BEGIN CERTIFICATE-----\nevil\n")
             refused = await hold_and_release()
-            assert refused.status_code >= 400
+            # 422 as the inline route answers, not an unhandled 500 (raise_app_exceptions=False
+            # would turn a crash into a response, so the exact code is what proves the handling).
+            assert refused.status_code == 422, refused.text
             assert engine.registry_runner is live and live.registry is before  # nothing swapped
         rows = await store.list_audit(limit=100)
         assert "approval.failed" in [r["action"] for r in rows]
+        failed = [json.loads(r["detail"]) for r in rows if r["action"] == "config_reload_failed"]
+        assert failed == [{"requested": None, "dry_run": False, "reason": "trust_anchor"}]
         events = [json.loads(r["detail"])["event"] for r in rows if r["action"] == ta.AUDIT_ACTION]
         assert "pin_mismatch" in events
     finally:

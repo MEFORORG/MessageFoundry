@@ -707,6 +707,7 @@ class Engine:
         at/above ``[dr].priority_threshold`` (the rest report ``status:"filtered"``). A reload (not a
         cold start) so a box already serving its full graph drops to the critical set in place, with
         in-flight rows preserved (the reload is quiesce-and-swap)."""
+        was_active = self._dr_active
         self._dr_active = True
         rr = self._registry_runner
         if rr is None:
@@ -716,11 +717,18 @@ class Engine:
         # config dir is configured; otherwise (embedding) re-run the runner over its current registry,
         # which re-evaluates the DR filter in place. propagate=False — a local DR decision, never a
         # cluster-wide config bump.
-        if self.config_dir is not None:
-            await self.reload(self.config_dir, propagate=False)
-        else:
-            await self.preflight_settings()  # reload_detail runs it on the branch above (#2034)
-            await rr.reload(rr.registry)
+        try:
+            if self.config_dir is not None:
+                await self.reload(self.config_dir, propagate=False)
+            else:
+                await self.preflight_settings()  # reload_detail runs it on the branch above (#2034)
+                await rr.reload(rr.registry)
+        except Exception:
+            # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile, so
+            # the latch goes back too. Left set, the next operator reload would park the feeds below
+            # the threshold on a box the DR coordinator reports as not active.
+            self._dr_active = was_active
+            raise
 
     async def _dr_release_drain(self) -> None:
         """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound

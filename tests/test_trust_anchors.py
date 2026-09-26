@@ -1280,10 +1280,12 @@ async def test_the_dr_profile_reload_without_a_config_dir_refuses_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The DR profile reload re-runs the live graph in place when the engine has no config dir, and
-    that branch never reaches reload_detail, so it runs the preflight itself."""
+    that branch never reaches reload_detail, so it runs the preflight itself. A refusal also leaves
+    the DR latch off, or the next reload would park feeds on a box that is not DR-active."""
     from messagefoundry.config.wiring import WiringError, load_config
 
     spec, anchor = _pinned_ad_anchor(tmp_path, monkeypatch)
+    good = anchor.read_bytes()
     engine, cfg = await _anchored_engine(tmp_path, spec, with_config_dir=False)
     reloaded: list[object] = []
     try:
@@ -1293,13 +1295,15 @@ async def test_the_dr_profile_reload_without_a_config_dir_refuses_too(
             reloaded.append(registry)
 
         monkeypatch.setattr(rr, "reload", spy)
-        await engine._dr_activate_profile()  # the control: an unchanged anchor re-applies
-        assert len(reloaded) == 1
-
         anchor.write_bytes(_block(b"evil"))
         with pytest.raises(WiringError, match="a settings trust anchor was refused"):
             await engine._dr_activate_profile()
-        assert len(reloaded) == 1  # the graph was not re-applied
+        assert reloaded == []  # the graph was not re-applied
+        assert engine.dr_active is False  # and the latch did not stay on
+
+        anchor.write_bytes(good)  # the control: the pinned anchor back, and it re-applies
+        await engine._dr_activate_profile()
+        assert len(reloaded) == 1 and engine.dr_active is True
     finally:
         await engine.stop()
 

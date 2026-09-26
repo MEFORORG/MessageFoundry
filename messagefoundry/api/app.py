@@ -756,7 +756,26 @@ def _build_approval_gate(
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
-        outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+        try:
+            outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+        except WiringError as exc:
+            # BACKLOG #2034: a release the engine refuses (a settings or inbound trust anchor, or a
+            # bad config) answers 422 and records the row the inline route records, rather than
+            # escaping the approve route as a 500. The gate still marks the approval failed.
+            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+            _log.warning("released config reload refused: %s", exc)
+            await engine.store.record_audit(
+                "config_reload_failed",
+                actor=str(p["requester"]),
+                detail=json.dumps(
+                    {
+                        "requested": config_dir,
+                        "dry_run": False,
+                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
+                    }
+                ),
+            )
+            raise ApprovalError(422, "invalid configuration") from exc
         registry = outcome.registry
         await _record_reload_audit(
             engine,
@@ -3560,11 +3579,15 @@ def create_app(
             )
             raise HTTPException(404, "config directory not found") from exc
         except WiringError as exc:
-            _log.warning("config reload failed (invalid config): %s", exc)
             # A trust anchor refused inside the engine arrives wrapped: an inbound connection's CA
             # (BACKLOG #1142, slice 3) or a settings anchor (BACKLOG #2034). Both record
             # reason="trust_anchor", so one audit filter sees both.
             anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+            _log.warning(
+                "config reload %s: %s",
+                "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
+                exc,
+            )
             await engine.store.record_audit(
                 "config_reload_failed",
                 actor=user.username,
