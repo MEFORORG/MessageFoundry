@@ -740,3 +740,63 @@ async def test_AC3_restore_refuses_rather_than_place_a_store_it_could_not_resalt
             result.archive_path, dest_store_path=dest, store_settings=_store_settings(dest, key)
         )
     assert not dest.exists()
+
+
+async def test_AC6_frames_a_cancelled_run_reports_late_are_charged_to_their_own_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A build cancelled on the loop keeps sealing on its worker thread and reports its frames AFTER
+    that run's charge. The next run must charge them under the key they were sealed under, not its
+    own -- which differs after a re-salt or a rotation."""
+    key = generate_key()
+    dek = base64.b64decode(key)
+    db = tmp_path / "live.db"
+    store, cipher = await _live_store(db, key)
+    first_salt = cipher.store_salt
+    assert first_salt is not None
+    first_id = store_data_key_id(dek, first_salt)
+    stashed: list[object] = []
+    real = bc.encrypt_stream
+
+    def _reports_nothing_yet(src, dst, k, *, chunk_size=None, on_frames=None, salt=None):
+        stashed.append(on_frames)  # the report a still-running worker would make later
+        return real(src, dst, k, chunk_size=chunk_size, on_frames=None, salt=salt)
+
+    monkeypatch.setattr(dr, "encrypt_stream", _reports_nothing_yet)
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "backups")),
+        store_settings=_store_settings(db, key),
+        config_dir=None,
+        instance="dev",
+    )
+    try:
+        assert await runner.run_once(now=1000.0) is not None
+        before_first = await store.cipher_invocations(first_id)
+        late = stashed[0]
+        assert callable(late)
+        late(7)  # the cancelled run's worker finally reports
+
+        # The next run seals under a different sub-key, as it would after a re-salt.
+        second_salt = os.urandom(STORE_SALT_BYTES)
+        second_id = store_data_key_id(dek, second_salt)
+        monkeypatch.setattr(runner, "_store_salt", lambda: second_salt)
+        own: list[int] = []
+
+        def _counts(src, dst, k, *, chunk_size=None, on_frames=None, salt=None):
+            def _record(n: int) -> None:
+                own.append(n)
+                if on_frames is not None:
+                    on_frames(n)
+
+            return real(src, dst, k, chunk_size=chunk_size, on_frames=_record, salt=salt)
+
+        monkeypatch.setattr(dr, "encrypt_stream", _counts)
+        before_second = await store.cipher_invocations(second_id)
+        assert await runner.run_once(now=90000.0) is not None
+        # The late 7 land on the key they were sealed under, and none of them on the new one.
+        assert await store.cipher_invocations(first_id) - before_first == 7
+        assert sum(own) > 0
+        assert await store.cipher_invocations(second_id) - before_second == sum(own)
+    finally:
+        await store.close()

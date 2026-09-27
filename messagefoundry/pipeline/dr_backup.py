@@ -35,6 +35,7 @@ the event loop via :func:`asyncio.to_thread`.
 from __future__ import annotations
 
 import asyncio
+import functools
 import io
 import json
 import logging
@@ -43,6 +44,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -303,7 +305,14 @@ class BackupRunner:
         # ASVS 11.3.4: AES-GCM frame counts reported by the codec from the worker thread, drained and
         # charged to the key's persisted invocation bound after each run. Backup is a leader-only
         # singleton with one run in flight at a time, so a plain list is sufficient.
-        self._frames: list[int] = []
+        #
+        # Each entry carries the cipher_meta id of the key its frames were sealed under (ADR 0196
+        # AC-6). A build cancelled on the loop keeps running on its worker thread and reports its
+        # frames AFTER this run's charge has run; the next run then charges them under the id they
+        # were sealed under, never under its own. The lock covers the append (worker thread) and the
+        # drain (event loop), so a late report cannot land in a list that was just swapped out.
+        self._frames: list[tuple[str, int]] = []
+        self._frames_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -481,6 +490,7 @@ class BackupRunner:
                     key=key,
                     key_id=key_id,
                     salt=salt,
+                    charge_key_id=charge_key_id,
                     config_only=config_only,
                     now=now,
                 )
@@ -492,7 +502,7 @@ class BackupRunner:
                 # spent them under this run's key. Charged after the run only on success, they stayed
                 # queued in `_frames` and were charged by the NEXT run that finished -- under its own
                 # key, if the key had been rotated in between -- or never, for a one-shot backup.
-                await self._charge_archive_invocations(charge_key_id)
+                await self._charge_archive_invocations()
 
         verify: VerifyResult | None = None
         if s.verify_after_backup:
@@ -551,28 +561,38 @@ class BackupRunner:
         bound = bounded_cipher(self._store.cipher())
         return bound.store_salt if bound is not None else None
 
-    async def _charge_archive_invocations(self, key_id: str | None) -> None:
+    def _record_frames(self, key_id: str, count: int) -> None:
+        """The codec's ``on_frames`` for one run, called on the worker thread."""
+        with self._frames_lock:
+            self._frames.append((key_id, count))
+
+    async def _charge_archive_invocations(self) -> None:
         """Charge this run's DR-frame AES-GCM invocations to the PERSISTED invocation bound of the key
         they were sealed under (ASVS 11.3.4; ADR 0196 AC-6) — a post-run aggregate add, since the
-        frames are written on a worker thread that holds no store handle. ``key_id`` is the store data
-        sub-key's id for a salted archive, the DEK's for an unsalted one.
+        frames are written on a worker thread that holds no store handle. Each queued entry is charged
+        to its own key id: the store data sub-key's for a salted archive, the DEK's for an unsalted
+        one -- including frames a cancelled earlier run reported late.
 
         Without this the bound under-counts by every backup run: ``backup_codec`` constructs its own
         ``AESGCM`` over the same key bytes and never reaches ``AesGcmCipher._count_invocation``, yet a 10 GB
         store at the 1 MiB default chunk is ~10k invocations per run under that same key. Best-effort —
         an accounting failure must never fail an otherwise-successful backup."""
-        frames = sum(self._frames)
-        self._frames.clear()
-        if not frames or key_id is None:
-            return
-        try:
-            await self._store.add_cipher_invocations(key_id, frames)
-        except Exception:  # noqa: BLE001 — advisory accounting; never fail a good backup
-            log.warning(
-                "DR backup: could not charge %d archive frame(s) to the AES-GCM invocation bound",
-                frames,
-                exc_info=True,
-            )
+        with self._frames_lock:
+            pending, self._frames = self._frames, []
+        per_key: dict[str, int] = {}
+        for key_id, count in pending:
+            per_key[key_id] = per_key.get(key_id, 0) + count
+        for key_id, frames in per_key.items():
+            if not frames:
+                continue
+            try:
+                await self._store.add_cipher_invocations(key_id, frames)
+            except Exception:  # noqa: BLE001 — advisory accounting; never fail a good backup
+                log.warning(
+                    "DR backup: could not charge %d archive frame(s) to the AES-GCM invocation bound",
+                    frames,
+                    exc_info=True,
+                )
 
     # --- publishing the canonical name ---------------------------------------
 
@@ -640,6 +660,7 @@ class BackupRunner:
         config_only: bool,
         now: float,
         salt: bytes | None = None,
+        charge_key_id: str | None = None,
     ) -> tuple[str, dict[str, int], int]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
@@ -693,7 +714,14 @@ class BackupRunner:
                     # ASVS 11.3.4: every DR frame is an AES-GCM invocation under the SAME store DEK, so
                     # it consumes the same birthday budget. Record the count here (the worker thread
                     # holds no store) and charge it to the key's persisted bound after the run.
-                    encrypt_stream(src, dst, key, on_frames=self._frames.append, salt=salt)
+                    charge_id = charge_key_id or key_fingerprint(key)
+                    encrypt_stream(
+                        src,
+                        dst,
+                        key,
+                        on_frames=functools.partial(self._record_frames, charge_id),
+                        salt=salt,
+                    )
                 else:
                     # No key + allow_unencrypted: write the plaintext tar verbatim (synthetic/no-PHI box).
                     while True:
