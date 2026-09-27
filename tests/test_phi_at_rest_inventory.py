@@ -36,16 +36,26 @@ import ast
 import inspect
 import re
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from _cipher_registry import covered_pairs, string_pairs
 
 from messagefoundry.config.settings import ServiceSettings
 from messagefoundry.store.base import Store
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
+from tests._ast_sites import (
+    code_strings,
+    delete_keeping_a_mention,
+    find_funcs,
+    parse_source,
+    source_calls,
+    source_has_literal,
+    source_uses,
+)
+from tests._cipher_registry import covered_pairs, string_pairs
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "PHI.md"
@@ -61,6 +71,8 @@ _CIPHER_PASS_FUNCS = frozenset({"_encrypt_existing_rows", "reencrypt_to_active"}
 _CREATE_TABLE_RE = re.compile(
     r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?#?([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE
 )
+#: The SET list of a ``purge_message_bodies`` UPDATE, read from the SQL literal up to its WHERE.
+_PURGE_UPDATE_RE = re.compile(r"UPDATE messages SET (.+?)\s+WHERE\b", re.DOTALL)
 #: Maintenance calls the RetentionRunner makes through the Store protocol, beyond ``purge_*``.
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
 #: Maintenance calls…
@@ -166,6 +178,12 @@ _CITED_SETTINGS = (
     ("logging", "file"),
     ("logging", "on_write_failure"),
 )
+
+
+# The code probes below read engine source as CODE through tests._ast_sites' source_* helpers
+# (BACKLOG #2056). A substring scan of the file read a comment or docstring naming a construct
+# as the construct itself, so deleting the code left the probe green.
+# test_the_code_probes_fail_when_the_code_is_gone deletes each one and keeps a mention.
 
 
 # --- doc slicing ---------------------------------------------------------------------------------
@@ -348,28 +366,35 @@ def test_purge_surface_is_defined_on_every_backend_and_documented_per_backend() 
     assert "no-op (DBA-owned)" in section, "§8 no longer marks the server-backend no-ops"
 
 
+def _purge_blanked_columns(source: str) -> set[str]:
+    """The ``messages`` columns ``purge_message_bodies`` in ``source`` blanks, read from its SQL.
+
+    The literals the function runs, not its source lines: a comment or docstring quoting an UPDATE
+    used to count as one, and the line scan also stopped at the first quote inside the SQL, so it
+    never saw a column after ``raw=''`` (BACKLOG #2056).
+    """
+    return {
+        column
+        for func in find_funcs(parse_source(source), "purge_message_bodies")
+        for sql in code_strings(func)
+        for fragment in _PURGE_UPDATE_RE.findall(sql)
+        for column in re.findall(r"([a-z_]+)\s*=", fragment)
+    }
+
+
 def test_purge_message_bodies_blanked_columns_are_documented() -> None:
     """Whatever each backend's ``UPDATE messages SET …`` actually blanks must appear in §8."""
     section = _section(8)
-    seen = False
     for path in _BACKEND_MODULES:
-        src = path.read_text(encoding="utf-8")
-        lines = src.splitlines()
-        for node in ast.walk(ast.parse(src)):
-            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                continue
-            if node.name != "purge_message_bodies":
-                continue
-            body = "\n".join(lines[node.lineno - 1 : node.end_lineno])
-            for fragment in re.findall(r"UPDATE messages SET ([^\"']+)", body):
-                for column in re.findall(r"([a-z_]+)\s*=", fragment):
-                    seen = True
-                    token = f"messages.{column}"
-                    assert token in section, (
-                        f"{path.name}'s purge_message_bodies blanks {token} but docs/PHI.md §8 "
-                        "never names it"
-                    )
-    assert seen, "no 'UPDATE messages SET' fragment found — the extraction broke, not the doc"
+        columns = _purge_blanked_columns(path.read_text(encoding="utf-8"))
+        assert columns, (
+            f"no 'UPDATE messages SET' in {path.name} — the extraction broke, not the doc"
+        )
+        for column in sorted(columns):
+            token = f"messages.{column}"
+            assert token in section, (
+                f"{path.name}'s purge_message_bodies blanks {token} but docs/PHI.md §8 never names it"
+            )
 
 
 def _retired_claim_hits() -> list[str]:
@@ -605,11 +630,11 @@ def test_sql_server_pl5_row_is_pinned_to_the_code_that_makes_it_load_bearing() -
     """
     source = (_PKG / "store" / "sqlserver.py").read_text(encoding="utf-8")
     for pragma in ("READ_COMMITTED_SNAPSHOT", "ALLOW_SNAPSHOT_ISOLATION"):
-        assert f"ALTER DATABASE CURRENT SET {pragma}" in source, (
+        assert source_has_literal(source, f"ALTER DATABASE CURRENT SET {pragma}"), (
             f"the store no longer force-enables {pragma}; §2's SQL Server PL-5 row says it does, and "
             "that is the reason tempdb's version store holds PHI row images."
         )
-    assert "CREATE TABLE #eligible" in source, (
+    assert source_has_literal(source, "CREATE TABLE #eligible"), (
         "purge_message_bodies no longer materialises #eligible in tempdb; update the SQL Server "
         "PL-5 row's tempdb-object list."
     )
@@ -743,7 +768,7 @@ def test_pl1_encryption_rule_carves_out_the_backup_codec() -> None:
             "so vault_transit never applies), and allow_unencrypted writes a CLEARTEXT archive."
         )
     source = (_PKG / "pipeline" / "dr_backup.py").read_text(encoding="utf-8")
-    assert "resolve_active_key" in source, (
+    assert source_calls(source, "resolve_active_key"), (
         "dr_backup no longer resolves the archive key directly; the doc's `.mfbak` seal sentence "
         "rests on that — re-derive it."
     )
@@ -752,14 +777,14 @@ def test_pl1_encryption_rule_carves_out_the_backup_codec() -> None:
     # seal still does not. This used to assert `build_store_cipher not in source`, which read as "one
     # cipher here" and would now be a false premise under §11's compensating-control rule — so it pins
     # the distinction instead: if the module builds the store cipher, §3 must say which governs which.
-    if "build_store_cipher" in source:
+    if source_calls(source, "build_store_cipher"):
         assert "build_store_cipher" in section3, (
             "dr_backup builds the STORE cipher (the full restore-verify reads the snapshot's cells "
             "back through it), and §3's PL-1 rule does not name it. Left unstated, the `.mfbak` "
             "bullet's 'vault_transit never applies to a backup' reads as covering that read too, and "
             "it does not — under vault_transit the cell read runs in Transit."
         )
-    assert ".mfbak.plain" in source, (
+    assert source_has_literal(source, ".mfbak.plain"), (
         "the cleartext-archive path is gone; remove the carve-out from §3 in the same change."
     )
 
@@ -1134,9 +1159,13 @@ def test_owner_only_file_acl_is_always_qualified_to_the_sqlite_store() -> None:
     row — an unqualified claim in the scored posture is the defect itself.
     """
     sqlite_src = (_PKG / "store" / "store.py").read_text(encoding="utf-8")
-    assert "_secure_file" in sqlite_src, "the SQLite store no longer applies an owner-only ACL"
+    assert source_calls(sqlite_src, "_secure_file"), (
+        "the SQLite store no longer applies an owner-only ACL"
+    )
     for other in ("sqlserver.py", "postgres.py"):
         source = (_PKG / "store" / other).read_text(encoding="utf-8")
+        # Absence over text on purpose: a mention can only over-fire, and a text scan also sees
+        # an aliased import, which a name walk would not.
         assert "_secure_file" not in source, (
             f"{other} now applies a file ACL; the SQLite-only qualifiers in docs/PHI.md are stale."
         )
@@ -1263,7 +1292,7 @@ def test_per_backend_purge_verdicts_are_bound_to_the_method_bodies() -> None:
                 f"{backend}.{operation} is now a Store method; drop it from _NON_STORE_OPERATIONS "
                 "so its per-backend verdict is bound like every other row."
             )
-        assert operation in retention, (
+        assert source_uses(retention, operation), (
             f"{operation} is exempted as RetentionRunner-owned but no longer appears in "
             "pipeline/retention.py — the §8 row describes nothing."
         )
@@ -1402,7 +1431,7 @@ _UPLOAD_PRUNE_MARKERS = ("prune_expired", "UploadRetentionRunner")
 
 def _upload_prune_ships() -> bool:
     src = (_PKG / "uploads.py").read_text(encoding="utf-8")
-    return all(m in src for m in _UPLOAD_PRUNE_MARKERS)
+    return all(source_uses(src, m) for m in _UPLOAD_PRUNE_MARKERS)
 
 
 def _section_8_calls_uploads_a_no_retention_gap(section8: str) -> bool:
@@ -1438,3 +1467,79 @@ def test_uploads_retention_guard_self_test() -> None:
     assert _section_8_calls_uploads_a_no_retention_gap(planted)
     clean = "and uploaded_file pairs auto-prune after uploads_retention_days (default 30)."
     assert not _section_8_calls_uploads_a_no_retention_gap(clean)
+
+
+#: Delete-and-watch-it-fail for every code probe above (BACKLOG #2056): ``(module, the code to
+#: delete, what replaces it, the probe)``. Each case also appends a comment naming the deleted
+#: construct, the mention the old substring scan read as the code.
+_CODE_PROBE_DELETIONS: tuple[tuple[str, str, str, Callable[[str], bool]], ...] = (
+    (
+        "store/sqlserver.py",
+        '"ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"',
+        '"SELECT 1"',
+        lambda src: source_has_literal(src, "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT"),
+    ),
+    (
+        "store/sqlserver.py",
+        '"ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON"',
+        '"SELECT 1"',
+        lambda src: source_has_literal(src, "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION"),
+    ),
+    (
+        "store/sqlserver.py",
+        '"CREATE TABLE #eligible (id NVARCHAR(64) PRIMARY KEY)"',
+        '"SELECT 1"',
+        lambda src: source_has_literal(src, "CREATE TABLE #eligible"),
+    ),
+    (
+        "store/store.py",
+        "SET metadata=NULL, raw='', summary=NULL, error=NULL ",
+        "SET metadata=NULL, raw='' ",
+        lambda src: "summary" in _purge_blanked_columns(src),
+    ),
+    (
+        "store/store.py",
+        "        _secure_file(path)\n",
+        "        pass\n",
+        lambda src: source_calls(src, "_secure_file"),
+    ),
+    (
+        "pipeline/dr_backup.py",
+        "resolve_active_key(self._store_settings)",
+        "None",
+        lambda src: source_calls(src, "resolve_active_key"),
+    ),
+    (
+        "pipeline/dr_backup.py",
+        "build_store_cipher(settings)",
+        "None",
+        lambda src: source_calls(src, "build_store_cipher"),
+    ),
+    (
+        "pipeline/dr_backup.py",
+        '_PLAINTEXT_EXT = ".mfbak.plain"',
+        '_PLAINTEXT_EXT = ""',
+        lambda src: source_has_literal(src, ".mfbak.plain"),
+    ),
+    (
+        "pipeline/retention.py",
+        "app_log_days",
+        "other_days",
+        lambda src: source_uses(src, "app_log_days"),
+    ),
+    ("uploads.py", "prune_expired", "prune_other", lambda src: source_uses(src, "prune_expired")),
+)
+
+
+@pytest.mark.parametrize(
+    ("module", "code", "replacement", "probe"),
+    _CODE_PROBE_DELETIONS,
+    ids=[f"{m}:{c.strip()[:40]}" for m, c, _r, _p in _CODE_PROBE_DELETIONS],
+)
+def test_the_code_probes_fail_when_the_code_is_gone(
+    module: str, code: str, replacement: str, probe: Callable[[str], bool]
+) -> None:
+    source = (_PKG / module).read_text(encoding="utf-8")
+    assert probe(source), f"the probe does not see {code!r} in the real {module}"
+    mutated = delete_keeping_a_mention(source, code, replacement)
+    assert not probe(mutated), f"{module}: a comment naming {code.strip()!r} reads as the code"

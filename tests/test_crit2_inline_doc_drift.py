@@ -28,10 +28,10 @@ import warnings
 from pathlib import Path
 
 import pytest
-from _ast_sites import calls_to, find_funcs
 
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, inbound
+from tests._ast_sites import calls_to, find_funcs, named_func
 
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -233,7 +233,16 @@ def test_adr_0057_does_not_claim_unwired() -> None:
     assert "Grep confirms nothing in the live pipeline calls" not in adr  # the struck false claim
     assert "DO NOT PROMOTE" in adr  # the shipping-OFF banner still stands
     assert "wired-but-permanently-default-OFF" in adr  # the corrected framing
-    assert "wiring_runner.py:4084" in adr  # anchored to the real call site
+    # Anchored by SYMBOL, not by line: the `wiring_runner.py:4084` pin this replaced had drifted
+    # thousands of lines from the call (BACKLOG #2061). The named function must really await
+    # store.handoff, so a move that strands the ADR's anchor reds here.
+    assert "`_process_ingress_item` in `wiring_runner.py`" in adr
+    src = (_REPO / "messagefoundry" / "pipeline" / "wiring_runner.py").read_text(encoding="utf-8")
+    assert _awaits_store_handoff(named_func(ast.parse(src), "_process_ingress_item")), (
+        "ADR 0057 names _process_ingress_item as the function that calls .handoff(, and it no "
+        "longer does. Re-anchor the ADR to wherever the fused commit now lives."
+    )
+    assert "`InboundConnection.inline`" in adr  # the default-OFF knob, also by symbol
 
 
 def test_coverage_plan_reflects_wired_default_off() -> None:

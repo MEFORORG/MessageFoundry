@@ -49,6 +49,12 @@ _KEY_MATERIAL = frozenset(
         "DIRECT S/MIME",
         "OIDC IdP JWKS verification keys",
         "OIDC IdP TLS trust anchor",
+        # BACKLOG #1930: the OIDC anchor above mirrors this row's `ad_tls_ca_cert_file`, and the two
+        # were classified on opposite sides. An operator-supplied certificate or CA the ENGINE
+        # consumes to authenticate one of its own outbound hops is key material under this module's
+        # definition, so both are scoped. The console and tray client pins stay non-key: a client
+        # holds them, not the engine.
+        "AD transport",
         "Cert tooling",
         "Outbound SMTP transport TLS",
         "Inbound XML-DSig verification",
@@ -60,6 +66,9 @@ _KEY_MATERIAL = frozenset(
         "Anonymizer re-identification salt",
         "Alert webhook HTTPS hop",
         "TLS private keys",
+        # BACKLOG #1929: an operator-supplied certificate both server-DB backends honor, with a
+        # different meaning on each (a leaf pin on SQL Server, a CA bundle on PostgreSQL).
+        "Store server-certificate trust",
     }
 )
 
@@ -92,9 +101,9 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "secret, or a message authenticator, and unlike the corpus pin above nothing is gated on it",
     "Engine wheel attestation": "a keyless digest over the installed distribution, verified against "
     "a recorded value; no key is involved on either side",
-    "AD transport": "a TLS hop whose key material is the OS/directory trust store, not engine-held",
     "SQL Server transport": "a TLS hop trusted via the OS certificate store and the ODBC driver; the "
-    "engine holds no key for it",
+    "engine holds no key for it, and the optional operator pin (`[store].ssl_root_cert`) is scoped "
+    "in the Store server-certificate trust row",
     "Console → engine TLS": "a TLS hop configured from the engine's own listener cert (scoped in "
     "the Cert tooling row)",
     "Tray → engine TLS": "a tokenless local TLS probe; no engine-held key",

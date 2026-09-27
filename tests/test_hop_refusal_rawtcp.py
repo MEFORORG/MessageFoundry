@@ -479,14 +479,14 @@ def test_guard_disposition_precedence() -> None:
 
 @pytest.mark.parametrize("protocol", ["ftps", "sftp"])
 def test_anon_guard_none_for_encrypted_protocols(protocol: str) -> None:
-    assert _anon_ftp_guard(ftp_cfg(REMOTE, protocol=protocol).settings) is None
+    assert _anon_ftp_guard(ftp_cfg(REMOTE, protocol=protocol).settings, connection=None) is None
 
 
 def test_anon_guard_none_for_credentialed_ftp() -> None:
     settings = {"host": REMOTE, "remote_dir": "/in", "protocol": "ftp", "username": "u"}
     # Credentialed plain-ftp is covered by _validate_common's cleartext-credential refusal, not the
     # anonymous body-PHI guard.
-    assert _anon_ftp_guard(settings) is None
+    assert _anon_ftp_guard(settings, connection=None) is None
 
 
 # --- decision 5: do NOT loosen the already-shipped refusals in these files ----

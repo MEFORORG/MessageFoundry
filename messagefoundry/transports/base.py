@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import contextlib
 import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -44,6 +45,9 @@ __all__ = [
     "ConnectionEventSink",
     "IntakeAuditSink",
     "IntakeRateLimiter",
+    "IntakeGate",
+    "intake_open",
+    "wait_for_intake",
     "InboundReply",
     "ReplyOutcome",
     "SyncReplyResolver",
@@ -245,6 +249,109 @@ class IntakeRateLimiter(Protocol):
         authenticating correctly.
         """
         ...
+
+
+#: How often a paused connection re-checks its own stop signal. A resume wakes it at once through the
+#: gate's event, so this bounds only how long a paused connection takes to see ``stop()`` or its peer
+#: closing. It costs nothing while the gate is open, because an open gate is never waited on.
+INTAKE_PAUSE_POLL_SECONDS = 1.0
+
+
+class IntakeGate:
+    """The engine-wide intake pause a source consults before it READS (BACKLOG #290, slice 2).
+
+    Closed while any reason holds it: the staged backlog is over ``[inbound].max_staged_depth``, or
+    free disk on a SQLite store is below ``[retention].min_free_disk_mb``. ``pipeline/`` owns the
+    measuring and holds or releases a reason; a source only asks :attr:`is_open`. One gate is shared
+    by every inbound in the process, injected by the runner the same way as
+    :attr:`SourceConnector.on_connection_event`, so ``transports/`` gains no ``store``/``pipeline``
+    edge.
+
+    **The pause is backpressure, and only backpressure.** A source checks the gate BEFORE it reads
+    the next bytes, row or file, and never between reading a message and committing it. So a paused
+    source never NAKs, drops or skips the commit of anything already read. What it has not read yet
+    stays with the sender, which is what makes the pause lossless: a byte never read was never
+    received, so the count-and-log invariant has nothing to count. The DICOM SCP is the one source
+    that answers rather than stays silent: it refuses a NEW association as busy, before any object
+    is sent (``DicomScpSource._refuse_association_while_paused`` says why).
+
+    The gate is created before any event loop runs, so its ``asyncio.Event`` is made lazily, by the
+    first waiter, inside the loop that uses it. Holding and releasing are synchronous and never
+    await, so they are atomic on the loop."""
+
+    def __init__(self) -> None:
+        self._reasons: set[str] = set()
+        self._opened: asyncio.Event | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def is_open(self) -> bool:
+        """True when no reason holds the gate: sources read as normal."""
+        return not self._reasons
+
+    @property
+    def reasons(self) -> frozenset[str]:
+        """The reasons holding the gate now. Empty when it is open."""
+        return frozenset(self._reasons)
+
+    def hold(self, reason: str) -> bool:
+        """Close the gate for ``reason``. Returns True only when ``reason`` was not already held."""
+        if reason in self._reasons:
+            return False
+        self._reasons.add(reason)
+        if self._opened is not None:
+            self._opened.clear()
+        return True
+
+    def release(self, reason: str) -> bool:
+        """Drop ``reason``. Returns True only when it was held. The gate opens once no reason is left."""
+        if reason not in self._reasons:
+            return False
+        self._reasons.discard(reason)
+        if not self._reasons and self._opened is not None:
+            self._opened.set()
+        return True
+
+    def opened_event(self) -> asyncio.Event:
+        """The event set while the gate is open, created on first use inside the running loop.
+
+        Made afresh when the running loop changes, so an engine stopped and started again under a
+        new loop does not wait on an event bound to the old one."""
+        loop = asyncio.get_running_loop()
+        if self._opened is None or self._loop is not loop:
+            self._loop = loop
+            self._opened = asyncio.Event()
+            if self.is_open:
+                self._opened.set()
+        return self._opened
+
+
+def intake_open(gate: IntakeGate | None) -> bool:
+    """Whether a poll source may run this tick: True with no gate, or with an open one."""
+    return gate is None or gate.is_open
+
+
+async def wait_for_intake(
+    gate: IntakeGate | None,
+    *,
+    stopped: Callable[[], bool],
+    poll_seconds: float = INTAKE_PAUSE_POLL_SECONDS,
+) -> bool:
+    """Wait, without reading anything, until ``gate`` is open. Returns True to go on reading.
+
+    Returns False when ``stopped()`` turns True first: the source is stopping or the peer's socket is
+    closing, so the caller ends its read loop the way it would on EOF. Returns at once, with no
+    await, when there is no gate or it is open, so an unpaused read path pays one attribute read."""
+    if gate is None or gate.is_open:
+        return True
+    opened = gate.opened_event()
+    while not gate.is_open:
+        if stopped():
+            return False
+        # Woken at once by a release; the timeout only lets the stop signal be seen.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(opened.wait(), poll_seconds)
+    return True
 
 
 class ReplyOutcome(str, Enum):  # noqa: UP042 - matches MessageStatus/OutboxStatus house style
@@ -579,6 +686,14 @@ class SourceConnector(abc.ABC):
     #: vanish. A plain callable rather than the rendezvous object, so ``transports/`` gains no
     #: ``pipeline/`` import (AC-17). ``None`` on every inbound without ``reply_from``.
     reply_drain: Callable[[str], None] | None = None
+
+    #: Optional engine-wide intake pause (BACKLOG #290, slice 2), **injected by the runner after
+    #: build** -- one :class:`IntakeGate` shared by every inbound. A source that honours it checks it
+    #: BEFORE it reads (a listener before its next socket read, a poll source at the top of a tick)
+    #: and never between reading a message and committing it. ``None`` (the default) means no pause,
+    #: so a direct caller or test that never sets it is byte-identical. At least the listeners, the
+    #: poll sources and the timer consult it. The loopback and pass-through sources read nothing.
+    intake_gate: IntakeGate | None = None
 
     @abc.abstractmethod
     async def start(

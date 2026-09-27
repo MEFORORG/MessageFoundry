@@ -2664,10 +2664,17 @@ def test_every_ORDERED_string_field_lands_as_a_STRING_whatever_type_it_was_given
     not: it writes an int or a bool as that type, a dict as a JSON object TOML cannot parse, and DEL
     raw, which TOML forbids. The type guard in `main` excludes `_ORDERED` on the strength of this
     coercion, so a field that kept its non-string type would pass that guard unseen (#1884 limb 4
-    measured it on `residual`)."""
+    measured it on `residual`).
+
+    ONE EXCEPTION, BY DESIGN (BACKLOG #2168): a TABLE in `reviewed_by` is its structured form and
+    lands as a table. `main` refuses a malformed one before `render` sees it, and checks after the
+    re-parse that the table survived; both are pinned in the #2168 section below."""
     cell = _minimal_cell()
     cell[field] = value
     parsed = tomllib.loads(render(cell))["cell"][0]
+    if field == "reviewed_by" and isinstance(value, dict):
+        assert parsed[field] == value
+        return
     assert parsed[field] == str(value)
 
 
@@ -2990,3 +2997,222 @@ def test_a_payload_writing_one_cell_TWICE_is_refused(tmp_path: Path) -> None:
     rows = [_cell_111(residual="first"), _cell_111(residual="second")]
     assert main([str(_payload(tmp_path, rows)), "--scorecard", str(rec), "--apply"]) == 1
     assert rec.read_bytes() == before
+
+
+# --- BACKLOG #2168: a structured reviewed_by and a separate review_notes ---------------------------
+#
+# Owner ruling 2026-09-27: reviewed_by becomes { reviewer, ref, date } and its free text moves to
+# review_notes. The writer must carry both through a re-render without loss, refuse a table the
+# loader would refuse, and write the table in one key order so a re-render is byte-stable.
+
+_RB = {"reviewer": "pass-a", "ref": "5ccff7cb38cd", "date": "2026-09-24"}
+_RB_LINE = 'reviewed_by = { reviewer = "pass-a", ref = "5ccff7cb38cd", date = "2026-09-24" }'
+
+
+def _cell_after_apply(rec: Path) -> dict:
+    return {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}["1.1.1"]
+
+
+def test_a_structured_reviewed_by_is_written_as_a_table_in_key_order(tmp_path: Path) -> None:
+    """The payload states the keys in REVERSE order; the record gets them in `REVIEWED_BY_KEYS`
+    order, and the loader reads the result as the structured form."""
+    from scripts.asvs.scorecard import ReviewedBy, parse_reviewed_by
+
+    rec = _record(tmp_path)
+    reversed_rb = dict(reversed(list(_RB.items())))
+    cell = _cell_111(reviewed_by=reversed_rb, review_notes="fixture\nsecond line")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _RB_LINE in rec.read_text(encoding="utf-8")
+    got = _cell_after_apply(rec)
+    assert got["reviewed_by"] == _RB
+    assert got["review_notes"] == "fixture\nsecond line"
+    # The FIXTURE's closed cell is a writer fixture, not a loadable record, so the loader's own
+    # rule is applied to the written table directly.
+    assert parse_reviewed_by(got["reviewed_by"], "1.1.1") == ReviewedBy(**_RB)
+
+
+@pytest.mark.parametrize(
+    "reviewed_by", [_RB, "a legacy free-text value | with a pipe"], ids=["structured", "legacy"]
+)
+def test_a_re_render_of_the_record_is_byte_stable(tmp_path: Path, reviewed_by: object) -> None:
+    """Write once, then feed the record's own cell back as the payload: not one byte may move."""
+    rec = _record(tmp_path)
+    cell = _cell_111(reviewed_by=reviewed_by, review_notes="fixture\nline two")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+    before = rec.read_bytes()
+    echo = _cell_after_apply(rec)
+    assert main([str(_payload(tmp_path, [echo])), "--scorecard", str(rec), "--apply"]) == 0
+    assert rec.read_bytes() == before
+
+
+def test_review_notes_is_kept_when_a_payload_omits_it(tmp_path: Path) -> None:
+    rec = _record(tmp_path)
+    first = _cell_111(reviewed_by=_RB, review_notes="kept: fixture")
+    assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
+    second = _cell_111(reviewed_by=_RB, residual="an ordinary correction")
+    assert main([str(_payload(tmp_path, [second])), "--scorecard", str(rec), "--apply"]) == 0
+    got = _cell_after_apply(rec)
+    assert got["review_notes"] == "kept: fixture"
+    assert got["residual"] == "an ordinary correction"
+
+
+@pytest.mark.parametrize(
+    ("reviewed_by", "phrase"),
+    [
+        ({"reviewer": "a", "ref": "abcdef0"}, "missing ['date']"),
+        ({**_RB, "note": "x"}, "extra ['note']"),
+        ({**_RB, "ref": "not-a-sha"}, "`reviewed_by.ref`"),
+        ({**_RB, "date": "2026-02-30"}, "`reviewed_by.date`"),
+        ({**_RB, "reviewer": ""}, "`reviewed_by.reviewer`"),
+    ],
+    ids=["missing-key", "extra-key", "bad-ref", "bad-date", "blank-reviewer"],
+)
+def test_the_writer_refuses_a_malformed_structured_reviewed_by(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], reviewed_by: dict, phrase: str
+) -> None:
+    """The loader's own rule, so the writer cannot land what the next load would refuse. The
+    positive control is the key-order test above, which writes a well-formed table."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(reviewed_by=reviewed_by)
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "REFUSING TO APPLY" in out
+    assert "cell '1.1.1'" in out and phrase in out, out
+
+
+def test_the_writer_refuses_a_non_string_review_notes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(review_notes=["a", "list"])
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "1.1.1: review_notes must be a string, got list" in capsys.readouterr().out
+
+
+def test_a_structured_reviewed_by_that_does_not_survive_the_re_parse_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The type guard skips `_ORDERED` because `render` coerces those fields, and a table in
+    `reviewed_by` is no longer coerced. A writer that flattened it to a string must be caught."""
+    import scripts.asvs.apply as mod
+
+    real_render = mod.render
+
+    def flattening_render(cell: dict, live: dict | None = None) -> str:
+        return real_render(cell, live).replace(_RB_LINE, 'reviewed_by = "flattened"')
+
+    monkeypatch.setattr(mod, "render", flattening_render)
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(reviewed_by=_RB, review_notes="fixture")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "reviewed_by did not survive the re-parse as a table" in capsys.readouterr().out
+
+
+def test_the_writer_refuses_a_legacy_to_table_conversion_that_drops_the_free_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The key survives the conversion, so the key-set guard cannot see the text go."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(reviewed_by=_RB)
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "turns a legacy reviewed_by string into a table without carrying its text" in (
+        capsys.readouterr().out
+    )
+
+
+def test_the_writer_refuses_a_table_turned_back_into_a_legacy_string(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = _record(tmp_path)
+    first = _cell_111(reviewed_by=_RB, review_notes="moved: fixture")
+    assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
+    before = rec.read_bytes()
+    back = _cell_111(reviewed_by="free text again", review_notes="moved: fixture")
+    assert main([str(_payload(tmp_path, [back])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "back into a legacy string" in capsys.readouterr().out
+
+
+def test_a_migration_may_move_a_carried_glyph_into_review_notes_but_not_add_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The verbatim move writes; a SECOND copy of the glyph is still new vocabulary and refuses."""
+    rec, carried = _record_carrying_a_glyph_in(tmp_path, "reviewed_by")
+    assert _cell_after_apply(rec)["reviewed_by"] == carried, "the fixture splice did not land"
+    doubled = _cell_111(reviewed_by=_RB, review_notes=f"{carried} and {_GLYPH}")
+    assert main([str(_payload(tmp_path, [doubled])), "--scorecard", str(rec), "--apply"]) == 1
+    assert "review_notes INTRODUCES a banned glyph" in capsys.readouterr().out
+    moved = _cell_111(reviewed_by=_RB, review_notes=carried)
+    assert main([str(_payload(tmp_path, [moved])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _cell_after_apply(rec)["review_notes"] == carried
+
+
+_NOBODY_RB = {"reviewer": "unrecorded", "ref": "unrecorded", "date": "unrecorded"}
+
+
+def test_the_writer_refuses_a_table_naming_nobody_with_no_notes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The verifier refuses such a cell, so the writer must not land one. The record is first
+    moved to a table WITH notes, so the conversion guard is not what refuses here."""
+    rec = _record(tmp_path)
+    first = _cell_111(reviewed_by=_RB, review_notes="moved: fixture")
+    assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
+    before = rec.read_bytes()
+    emptied = _cell_111(reviewed_by=_NOBODY_RB, review_notes="  ")
+    assert main([str(_payload(tmp_path, [emptied])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "1.1.1: reviewed_by names no reviewer (reviewer is 'unrecorded') and review_notes " in (
+        capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
+    "notes", ["migrated: fixture", None], ids=["payload-notes", "record-notes"]
+)
+def test_the_writer_accepts_a_table_naming_nobody_backed_by_notes(
+    tmp_path: Path, notes: str | None
+) -> None:
+    """The positive control: notes from the payload, or kept from the record when omitted."""
+    rec = _record(tmp_path)
+    first = _cell_111(reviewed_by=_RB, review_notes="migrated: fixture")
+    assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
+    over: dict[str, object] = {"reviewed_by": _NOBODY_RB}
+    if notes is not None:
+        over["review_notes"] = notes
+    cell = _cell_111(**over)
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+    got = _cell_after_apply(rec)
+    assert got["reviewed_by"] == _NOBODY_RB and got["review_notes"] == "migrated: fixture"
+
+
+def test_a_conversion_whose_review_notes_do_not_carry_the_legacy_text_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Notes that are merely PRESENT are not enough: the legacy text must be in them."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(reviewed_by=_RB, review_notes="see history")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "without carrying its text into review_notes" in capsys.readouterr().out
+
+
+def test_a_migration_may_not_keep_a_glyph_in_the_table_and_copy_it_into_the_notes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One glyph in the record, two after the write: new vocabulary, refused."""
+    rec, carried = _record_carrying_a_glyph_in(tmp_path, "reviewed_by")
+    before = rec.read_bytes()
+    kept = _cell_111(reviewed_by={**_RB, "reviewer": f"pass {_GLYPH}"}, review_notes=carried)
+    assert main([str(_payload(tmp_path, [kept])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "reviewed_by+review_notes INTRODUCES a banned glyph" in capsys.readouterr().out

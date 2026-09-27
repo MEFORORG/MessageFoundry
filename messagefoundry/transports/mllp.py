@@ -57,8 +57,10 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
     harden_kex_groups,
     harden_verify_flags,
+    hop_name_prefix,
     insecure_hop_disposition,
     is_loopback_hop_host,
+    log_attested_crossing,
     relax_verify_expiry,
     resolve_trust_anchor,
 )
@@ -84,11 +86,13 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    intake_open,
     peer_ip_allowed,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
     register_source,
+    wait_for_intake,
 )
 from messagefoundry.transports.base import cap_setting as _cap_setting
 
@@ -335,7 +339,7 @@ class InsecureHopGuard:
         attested_reason: str | None,
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
-        connection: str | None = None,
+        connection: str | None,
     ) -> InsecureHopGuard:
         """Snapshot the decision inputs + the active hop posture for a cleartext outbound hop. ``cell`` is
         a short PHI-free label of the crossing; ``description`` explains the hop (scheme only — never a
@@ -388,16 +392,19 @@ class InsecureHopGuard:
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
-            logger.warning(
-                "insecure hop crossed on operator attestation — %s: %s (tls_hop_attested; reason: %s)",
-                self.cell,
-                self._detail(),
-                self.attested_reason or "(none provided)",
+            log_attested_crossing(
+                logger,
+                crossing="insecure hop crossed",
+                connection=self.connection,
+                detail=f"{self.cell}: {self._detail()}",
+                reason=self.attested_reason,
+                declaration="tls_hop_attested",
             )
         enforce_insecure_hop(
             disposition,
             message=self._detail(),
             cell=self.cell,
+            connection=self.connection,
             # ADR 0153 decision 2: an ACCEPTED cleartext hop is recorded at EVERY construction, not just
             # warned — an accepted risk that stops being visible has stopped being accepted. Only wired
             # when the acceptance is what produced the WARN, so a merely non-enforcing instance does not
@@ -419,7 +426,9 @@ class InsecureHopGuard:
         if posture is None:
             return
         if self._disposition(posture) is HopDisposition.REFUSE:
-            raise InsecureHopRefused(f"{self.cell}: {self._detail()}")
+            raise InsecureHopRefused(
+                f"{hop_name_prefix(self.connection)}{self.cell}: {self._detail()}"
+            )
 
 
 def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
@@ -2178,6 +2187,21 @@ class MLLPSource(SourceConnector):
                             # buffered could be closed BY the pacing, which is that promise broken
                             # and a partial frame discarded outside the count-and-log boundary.
                             frame_opened_at += time.monotonic() - paced_from
+                    # BACKLOG #290: the engine-wide intake pause, BEFORE the read for the
+                    # same reason as the pacer. Every frame already read was handled and ACKed
+                    # above, so nothing waits here un-committed; the peer's unread bytes stay its
+                    # own. The withheld time does not spend the peer's frame budget either.
+                    if not intake_open(self.intake_gate):
+                        paused_from = time.monotonic()
+                        if not await wait_for_intake(
+                            self.intake_gate,
+                            stopped=lambda: (
+                                self._stopping or writer.is_closing() or reader.at_eof()
+                            ),
+                        ):
+                            break  # stopping while paused: close as on EOF, nothing was read
+                        if frame_opened_at is not None:
+                            frame_opened_at += time.monotonic() - paused_from
                     frame_left = self._frame_seconds_left(frame_opened_at)
                     if frame_left is not None and frame_left <= 0.0:
                         # The budget went while we were NOT waiting on the socket — bytes arrived at

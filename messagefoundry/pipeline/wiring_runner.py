@@ -76,12 +76,14 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import (
     HOP_ATTESTATION_LEVER,
+    MIRRORED_CONNECTION_SETTING,
     HopPosture,
     TrustAnchorPolicy,
     active_hop_posture,
     current_hop_posture,
+    hop_name_prefix,
     is_loopback_hop_host,
-    log_revocation_attestation,
+    log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
     FhirLookupSpec,
@@ -99,6 +101,7 @@ from messagefoundry.config.wiring import (
     resolve_listener_binding,
     resolved_encoding_problems,
 )
+from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
 from messagefoundry.logging_guard import LogSinkEvent
@@ -182,6 +185,7 @@ from messagefoundry.transports import (
 from messagefoundry.transports.base import (
     ConnectionEventSink,
     IntakeAuditSink,
+    IntakeGate,
     IntakeRateLimiter,
     SyncReplyResolver,
 )
@@ -931,6 +935,7 @@ class RegistryRunner:
         saturation_default: SaturationThreshold | None = None,
         ack_after_default: AckAfter | None = None,
         stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: streaming-detach concurrency DoS guard (0=off)
+        intake_gate: IntakeGate | None = None,  # BACKLOG #290 slice 2: the engine-wide intake pause
         priority_default: Priority | None = None,
         dr_threshold: Priority | None = None,
         alert_sink: AlertSink | None = None,
@@ -1040,6 +1045,10 @@ class RegistryRunner:
         # threaded and the increment/refuse/decrement never awaits across the check).
         self._stream_inflight_budget = max(0, stream_inflight_budget_bytes)
         self._stream_inflight_bytes = 0
+        # BACKLOG #290 slice 2: the ONE engine-wide intake gate, owned by the Engine (whose
+        # IntakeBoundMonitor holds and releases it) and injected into every source this runner starts.
+        # None (embedding/tests) = no pause, so every source reads exactly as before.
+        self._intake_gate = intake_gate
         # DR run-profile (#61, ADR 0048). _priority_default is the global [delivery].priority a
         # connection inherits when it declares no priority= (resolution: per-connection override >
         # global default > built-in NORMAL). _dr_threshold is the THIS-RUN run-profile gate: when set
@@ -2972,6 +2981,11 @@ class RegistryRunner:
         # by a HASHED key. Every other source ignores it (byte-identical); transports/ stays store-agnostic
         # — the same runtime-injection shape as on_connection_event / content_type above.
         source.processed_ledger = _StoreProcessedLedger(self.store, ic.name)
+        # The engine-wide intake pause (BACKLOG #290 slice 2), injected the same runtime way: this is
+        # the ONE seam every inbound passes through, so every source shares one gate and one
+        # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
+        # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
+        source.intake_gate = self._intake_gate
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
         # free of any pipeline/cluster import. Only POLL sources act on it — they skip a scan when it
@@ -8127,16 +8141,15 @@ def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings
         settings["proxy_no_proxy"] = list(egress.proxy_no_proxy)
 
 
-#: The settings keys mirrored from a connection's top-level declarations (ADR 0153, ADR 0173). Only
-#: `_mirror_declarations` writes them, and it clears all six first, so the strip and the writes cannot
-#: drift apart between the outbound path and the FhirLookup path.
+#: The settings keys mirrored from a connection's typed declarations (ADR 0153, ADR 0173) and its
+#: name, by `_dest_config` for an outbound and `_fhir_lookup_settings` for a lookup. Named once so the
+#: strip and the writes cannot drift apart.
 _DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
     "cleartext_accepted",
     "cleartext_reason",
-    "cleartext_connection",
     "tls_revocation_attested",
     "tls_revocation_attested_reason",
-    "tls_revocation_attested_connection",
+    MIRRORED_CONNECTION_SETTING,
 )
 
 
@@ -8149,30 +8162,28 @@ def _mirror_declarations(
     tls_revocation_attested: bool,
     tls_revocation_attested_reason: str | None,
 ) -> None:
-    """Replace the declaration keys in resolved ``settings`` with a mirror of the typed declarations.
+    """Replace the declaration keys the settings-driven seams read with the typed declarations.
 
-    The connectors read typed fields, but the deep settings-driven seams -- the forward-proxy
-    credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers and the FhirLookup read
-    executor -- receive only a settings mapping. A code-first spec can carry these keys as raw
-    transport settings, and one of those seams would then cross its refusal with no reason check and
-    name whatever connection the spec chose in the audit line. So every raw copy is cleared first, and
-    a key is written back only from a declaration that passed load validation. Written only when
-    declared, so a connection that declared nothing carries no new keys. The connection name rides
-    with each pair so the audit record a deep seam emits names the declaration that produced it.
+    The seams -- the forward-proxy credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint
+    providers, the FhirLookup read executor -- receive only a settings mapping. Every key is stripped
+    first, because only a typed declaration may write one: a raw key in a spec's settings would
+    otherwise cross a refusal with no reason check and name whatever connection it chose.
+
+    The NAME is written always. A refusal needs it as much as an audit record does, and a refusal is
+    exactly the case where nothing was declared. The two declarations are written only when set.
 
     The one writer for both ``_dest_config`` and ``_fhir_lookup_settings`` (BACKLOG #2050): the
     lookup path once stripped only the revocation keys, so a hand-set ``cleartext_accepted`` crossed
     the read hop without the audited declaration."""
     for key in _DECLARATION_MIRROR_KEYS:
         settings.pop(key, None)
+    settings[MIRRORED_CONNECTION_SETTING] = connection
     if cleartext_accepted:
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
-        settings["cleartext_connection"] = connection
     if tls_revocation_attested:
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
-        settings["tls_revocation_attested_connection"] = connection
 
 
 def _fhir_lookup_settings(
@@ -8180,16 +8191,16 @@ def _fhir_lookup_settings(
 ) -> dict[str, Any]:
     """The resolved settings the read executor gets for one ``FhirLookup`` (ADR 0043).
 
-    Resolves ``env()``, merges the site-wide forward proxy (ADR 0126), and replaces the cleartext and
-    revocation keys with the mirror of the spec's typed declarations (ADR 0153, ADR 0173).
-    ``spec.settings`` is a mutable dict, so a raw key there would otherwise cross a refusal with no
-    reason check and name whatever connection it chose. The one builder for both the live executor
-    and the check build, so the two cannot differ. The egress allowlist check stays with each caller."""
+    Resolves ``env()``, merges the site-wide forward proxy (ADR 0126), and mirrors the spec's typed
+    declarations (see :func:`_mirror_declarations`). The name carries the ``fhir_lookup:`` prefix, so
+    a lookup's record cannot be mistaken for an outbound of the same name. The one builder for both
+    the live executor and the check build, so the two cannot differ. The egress allowlist check stays
+    with each caller."""
     settings = resolve_env_settings(spec.settings, env_values)
     _apply_egress_proxy_default(settings, egress)
     _mirror_declarations(
         settings,
-        connection=spec.name,
+        connection=fhir_lookup_record_name(spec.name),
         cleartext_accepted=spec.cleartext_accepted,
         cleartext_reason=spec.cleartext_reason,
         tls_revocation_attested=spec.tls_revocation_attested,
@@ -8221,11 +8232,8 @@ def _dest_config(
     # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
     # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
     _apply_egress_proxy_default(settings, egress)
-    # ADR 0153 / ADR 0173: clear any raw declaration keys, then MIRROR the typed cleartext-acceptance
-    # and revocation declarations into the resolved settings for the settings-driven seams (the proxy
-    # credential chain and the Digest / OAuth2 / SMART token-endpoint providers, the last through
-    # transports/smart.py:revocation_attestation_from_settings, BACKLOG #2112). The same writer the
-    # FhirLookup path uses, so the two cannot drift. An outbound that declared nothing gains no keys.
+    # ADR 0153 / ADR 0173: the connectors read the typed Destination fields below, but the deep
+    # settings-driven seams read a settings mapping, so the declarations and the name are mirrored.
     _mirror_declarations(
         settings,
         connection=oc.name,
@@ -8925,22 +8933,23 @@ def check_inbound_revocation(
         # condition RevocationHopGuard.enforce_construction audits on the outbound side. The Source
         # validator guarantees the reason is present.
         if posture is not None and posture.enforcing:
-            log_revocation_attestation(
+            log_attested_crossing(
                 log,
                 crossing="mTLS listener that checks no client-certificate revocation bound",
-                connection=name,
+                connection=inbound_record_name(name),
                 detail="inbound listener requires and verifies a client certificate",
                 reason=source.tls_revocation_attested_reason,
+                declaration="tls_revocation_attested",
             )
         return
     if _inbound_revocation_gap_permitted(posture=posture):
         log.warning(
-            "inbound %r requires and verifies a client certificate (mTLS) but checks NO revocation: "
+            "%sinbound requires and verifies a client certificate (mTLS) but checks NO revocation: "
             "a revoked partner certificate would keep authenticating until its notAfter. Set "
             "tls_crl_file (a PEM file holding the CA's CRL) on the connection, or "
             "tls_revocation_attested=true with a tls_revocation_attested_reason if your PKI checks "
             "revocation outside the engine.",
-            name,
+            hop_name_prefix(inbound_record_name(name)),
         )
         return
     raise WiringError(

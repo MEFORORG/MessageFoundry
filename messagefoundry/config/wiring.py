@@ -76,7 +76,12 @@ from messagefoundry.config.models import (
     _check_revocation_attestation,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
-from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
+from messagefoundry.connection_names import (
+    CONNECTION_NAME_PATTERN,
+    fhir_lookup_record_name,
+    inbound_record_name,
+    is_connection_name,
+)
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.secretscrub import scrub_credentials
@@ -843,8 +848,16 @@ class FhirLookupSpec:
             _check_revocation_attestation(
                 self.tls_revocation_attested, self.tls_revocation_attested_reason
             )
+            _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
         except ValueError as exc:
             raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
+        # The factory refuses both claims at once, and a spec built directly must not hold them either.
+        # `wiring_runner._fhir_lookup_settings` checks again, since `settings` is mutable (ADR 0092).
+        _refuse_attested_and_accepted(
+            f"fhir lookup {self.name!r}",
+            bool(self.settings.get("tls_hop_attested")),
+            self.cleartext_accepted,
+        )
 
 
 def FhirLookup(
@@ -942,24 +955,13 @@ def FhirLookup(
         "verify_tls": verify_tls,
         "encoding": encoding,
     }
-    if cleartext_accepted:
-        # A copy for code that renders spec.settings, written only when declared so an undeclared
-        # lookup's settings are byte-identical. No engine path trusts it: the executor gets the
-        # typed fields below, re-mirrored by wiring_runner._fhir_lookup_settings, and the loosening
-        # report reads the typed fields too (BACKLOG #2050).
-        settings["cleartext_accepted"] = True
-        settings["cleartext_reason"] = cleartext_reason
-        settings["cleartext_connection"] = name
+    # The cleartext and revocation declarations are NOT written into `settings`: they are the spec's
+    # typed fields, and `wiring_runner._fhir_lookup_settings` mirrors them for the executor. A copy here
+    # was a second source of truth that nothing but tests read.
     settings.update(
         _hop_attestation_entries(f"fhir lookup {name!r}", tls_hop_attested, tls_hop_attested_reason)
     )
     _refuse_attested_and_accepted(f"fhir lookup {name!r}", tls_hop_attested, cleartext_accepted)
-    if tls_revocation_attested:
-        # A copy for code that reads spec.settings. The executor never trusts it: it gets the typed
-        # fields below, re-mirrored by wiring_runner._fhir_lookup_settings.
-        settings["tls_revocation_attested"] = True
-        settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
-        settings["tls_revocation_attested_connection"] = name
     spec = FhirLookupSpec(
         name,
         settings,
@@ -4394,6 +4396,11 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     return problems
 
 
+def _outbound_record_name(name: str) -> str:
+    """An outbound renders bare; see :func:`~messagefoundry.connection_names.inbound_record_name`."""
+    return name
+
+
 def _require_connection_name(conn: InboundConnection | OutboundConnection, kind: str) -> None:
     """Refuse a connection name the operator API would refuse (BACKLOG #1107, ASVS 1.2.2).
 
@@ -4511,6 +4518,14 @@ class Registry:
         self._add(self.lookups, spec.name, spec, "database lookup")
 
     def add_fhir_lookup(self, spec: FhirLookupSpec) -> None:
+        # The same rule inbound and outbound names pass (BACKLOG #1107). A lookup name is rendered in
+        # its audit records and refusals, and a name holding a space, ":" or "=" is partly scrubbed by
+        # the log filters there, which leaves the record unable to name its declaration.
+        if not is_connection_name(spec.name):
+            raise WiringError(
+                f"invalid fhir lookup name {spec.name!r}: a lookup name must match "
+                f"{CONNECTION_NAME_PATTERN}"
+            )
         self._add(self.fhir_lookups, spec.name, spec, "fhir lookup")
 
     @staticmethod
@@ -4752,7 +4767,7 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     # A lookup's typed fields, not its settings: the read executor trusts only the typed declaration
     # (wiring_runner._fhir_lookup_settings strips a raw key), so this reports exactly what crosses.
     out.extend(
-        (f"fhir_lookup:{spec.name}", spec.cleartext_reason or "(none recorded)")
+        (fhir_lookup_record_name(spec.name), spec.cleartext_reason or "(none recorded)")
         for spec in registry.fhir_lookups.values()
         if spec.cleartext_accepted
     )
@@ -4778,7 +4793,7 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
         return str(value) if value else "(none recorded)"
 
     out = [
-        (f"inbound:{ic.name}", _reason(ic.tls_hop_attested_reason))
+        (inbound_record_name(ic.name), _reason(ic.tls_hop_attested_reason))
         for ic in registry.inbound.values()
         if ic.tls_hop_attested
     ]
@@ -4788,7 +4803,7 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
         if oc.tls_hop_attested
     ]
     settings_carriers: list[tuple[str, Mapping[str, Any]]] = [
-        *((f"fhir_lookup:{s.name}", s.settings) for s in registry.fhir_lookups.values()),
+        *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
         *((f"db_lookup:{s.name}", s.settings) for s in registry.lookups.values()),
         *((f"reference:{r.name}", r.source.settings) for r in registry.references.values()),
     ]
@@ -4957,13 +4972,16 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
         if oc.tls_revocation_attested
     ]
     out.extend(
-        (f"inbound:{ic.name}", ic.tls_revocation_attested_reason or "(none recorded)")
+        (inbound_record_name(ic.name), ic.tls_revocation_attested_reason or "(none recorded)")
         for ic in registry.inbound.values()
         if ic.tls_revocation_attested
     )
     # Typed fields, as for cleartext_accepted: the executor strips a raw key (BACKLOG #2050).
     out.extend(
-        (f"fhir_lookup:{spec.name}", spec.tls_revocation_attested_reason or "(none recorded)")
+        (
+            fhir_lookup_record_name(spec.name),
+            spec.tls_revocation_attested_reason or "(none recorded)",
+        )
         for spec in registry.fhir_lookups.values()
         if spec.tls_revocation_attested
     )
@@ -5014,16 +5032,18 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
         return generic_odbc_tls_unenforced(params) if isinstance(params, Mapping) else None
 
     out: list[tuple[str, str]] = []
-    for label, table in (
-        ("", registry.outbound),
-        ("inbound:", registry.inbound),
+    for record_name, table in (
+        (_outbound_record_name, registry.outbound),
+        (inbound_record_name, registry.inbound),
     ):
         for conn in table.values():
             if conn.spec.type is not ConnectorType.DATABASE:
                 continue
             reason = unenforced(conn.spec.settings)
             if reason is not None:
-                out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
+                out.append(
+                    (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")
+                )
     return sorted(out)
 
 
@@ -5104,13 +5124,18 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
         return "static SQL login (auth='sql')" if auth == "sql" else "static SQL login"
 
     out: list[tuple[str, str]] = []
-    for label, table in (("", registry.outbound), ("inbound:", registry.inbound)):
+    for record_name, table in (
+        (_outbound_record_name, registry.outbound),
+        (inbound_record_name, registry.inbound),
+    ):
         for conn in table.values():
             if conn.spec.type is not ConnectorType.DATABASE:
                 continue
             reason = kind(conn.spec.settings)
             if reason is not None:
-                out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
+                out.append(
+                    (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")
+                )
     for spec in registry.lookups.values():
         reason = kind(spec.settings)
         if reason is not None:
@@ -5215,7 +5240,7 @@ def overbroad_smart_scopes(registry: Registry) -> list[tuple[str, str]]:
     out += [
         hit
         for spec in registry.fhir_lookups.values()
-        if (hit := one(f"fhir_lookup:{spec.name}", spec.settings, None)) is not None
+        if (hit := one(fhir_lookup_record_name(spec.name), spec.settings, None)) is not None
     ]
     return sorted(out)
 

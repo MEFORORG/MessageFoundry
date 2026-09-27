@@ -72,13 +72,12 @@ import collections
 import pathlib
 import re
 
-from _ast_sites import find_funcs
-
 from messagefoundry.config.settings import (
     _RELOCATED_TO_SECURITY,
     _REMOVED_KEYS,
     SecuritySettings,
 )
+from tests._ast_sites import find_funcs
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _ENGINE = _ROOT / "messagefoundry"

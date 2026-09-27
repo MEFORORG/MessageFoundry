@@ -1819,9 +1819,9 @@ def create_app(
 
     @app.middleware("http")
     async def _security_headers(request: Request, call_next: Any) -> Any:
-        # Defense-in-depth response headers (ASVS 3.4.4 / 3.4.5 / 3.2.1). The shipped client is a
-        # desktop app, but these are mandatory the moment a browser/off-loopback client appears and
-        # cost nothing on a JSON API. HSTS is emitted over https OR when the operator declared the
+        # Defense-in-depth response headers (ASVS 3.4.4 / 3.4.5 / 3.2.1). The shipped operator client
+        # is the browser web console at /ui, so these bind today, and they cost nothing on a JSON
+        # API. HSTS is emitted over https OR when the operator declared the
         # browser-facing scheme https (exposure_protected — L5b, ADR 0068 §8: the per-request
         # scheme is unreliable behind a proxy that omits X-Forwarded-Proto).
         nonlocal xfp_tripwire_fired
@@ -2096,7 +2096,15 @@ def create_app(
         # resolved SecuritySettings the serve path stashed (defaults on the test/embedding path). No
         # secret material — these are booleans/ints only. The synthetic-relaxation notice this route
         # used to carry went with the declaration it described (BACKLOG #1279).
-        security = getattr(request.app.state, "security", None) or SecuritySettings()
+        # BACKLOG #1989: when serve stashed its resolved settings, [security] is read from THAT object,
+        # the one the static-credential hops below come from, so every part of this response reads one
+        # [security]. On the serve path the two stashes are the same object; off it they can differ.
+        cred_settings = getattr(request.app.state, "static_credential_settings", None)
+        security = (
+            cred_settings.security
+            if cred_settings is not None
+            else getattr(request.app.state, "security", None) or SecuritySettings()
+        )
         # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
         # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
         auth_settings = getattr(request.app.state, "auth_settings", None) or AuthSettings()
@@ -2162,8 +2170,9 @@ def create_app(
         ]
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
         # read live off the running graph, like the loosenings above; the settings half from the resolved
-        # service configuration `serve` stashed. Either may be missing, and the scope then says which.
-        cred_settings = getattr(request.app.state, "static_credential_settings", None)
+        # service configuration `serve` stashed (`cred_settings`, read above with `security`, so the
+        # opt-outs and the hops come from one object). Either may be missing, and the scope then says
+        # which.
         # An opt-out is honoured only while the refusal is on; with it off every entry is inert, and
         # reporting it as accepted would contradict security_loosenings(), which does not name it.
         opt_outs = (
@@ -6591,7 +6600,8 @@ def create_app(
 
     # --- /ui: read-only browser ops dashboard (ADR 0065, BACKLOG #75) ----------
     # Registered ONLY when [api].serve_ui is on (a JSON-only deployment is byte-identical otherwise).
-    # The web console — its /ui routes, rendering, the confined mf_session cookie auth, and the write-
+    # The web console — its /ui routes, rendering, the mf_session cookie auth (which the JSON API never
+    # reads; the cookie is set at Path=/ so the /ws/stats browser handshake carries it), and the write-
     # action registry — lives in the separately-versioned messagefoundry_webconsole package, mounted
     # same-origin in-process via one mount_ui(app, deps) call (Option B, ADR 0065). The /ui routes are
     # CLIENTS of the JSON handlers above — mount_ui wires them to the reused handlers through the typed
@@ -7069,6 +7079,7 @@ def create_managed_app(
     saturation_default: SaturationThreshold | None = None,
     ack_after_default: AckAfter | None = None,
     stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: [inbound].stream_inflight_budget_bytes
+    max_staged_depth: int = 0,  # BACKLOG #290 slice 2: [inbound].max_staged_depth (0 = off)
     max_correlation_depth: int = 8,
     per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
     claim_mode: str = "pooled",  # ADR 0066/#744: "pooled" (default) | "per_lane" (byte-identical opt-out)
@@ -7397,6 +7408,7 @@ def create_managed_app(
             saturation_default=saturation_default,
             ack_after_default=ack_after_default,
             stream_inflight_budget_bytes=stream_inflight_budget_bytes,
+            max_staged_depth=max_staged_depth,
             priority_default=priority_default,
             alert_sink=notifier,
             retention_settings=retention_settings,
@@ -7475,12 +7487,14 @@ def create_managed_app(
                     loaded = registry_filter(loaded)
                 # After the filter, as the reload path does: the anchors this process will load.
                 await engine.preflight_registry(loaded)
+                # Inside the span too (BACKLOG #1989): a raise from add_registry is past every check
+                # above and before the teardown span below, so nothing else would close the store.
+                engine.add_registry(loaded)
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()
                 await store.close()
                 raise
-            engine.add_registry(loaded)
         # #1257: hoisted above the try because the finally below now guards STARTUP too, and it
         # reaches these names before it reaches engine.stop(). Left in place inside the span, a
         # failure before they were bound raises UnboundLocalError IN THE TEARDOWN, which aborts it

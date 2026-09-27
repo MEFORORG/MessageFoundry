@@ -43,7 +43,6 @@ from typing import Any
 
 import ldap3
 import pytest
-from _ast_sites import call_sites, find_funcs
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -66,6 +65,7 @@ from messagefoundry.pipeline import alert_sinks
 from messagefoundry.store import crypto_transit, keyprovider_vault, postgres
 from messagefoundry.transports import build_destination, database, rest, soap
 from messagefoundry.transports.http_auth import with_http_digest
+from tests._ast_sites import call_sites, find_funcs
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 # Imported at module scope ON PURPOSE. `rest` and `alert_sinks` build their shared opener AT IMPORT,

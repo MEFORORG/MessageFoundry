@@ -33,7 +33,7 @@ import ast
 import re
 from pathlib import Path
 
-from _ast_sites import callee_name
+from tests._ast_sites import callee_name
 
 _ROOT = Path(__file__).resolve().parent.parent
 PKG = _ROOT / "messagefoundry"

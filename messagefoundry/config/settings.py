@@ -131,6 +131,7 @@ __all__ = [
     "KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION",
     "KEYLESS_REFUSED_BY_NO_OPT_OUT",
     "KEYLESS_REFUSED_BY_NO_STRICT_ACK",
+    "KEYLESS_REFUSED_BY_UNREAD_KEY",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -986,9 +987,13 @@ class ApiSettings(_Section):
     # EXECUTES Python from these, so list only admin-owned, trusted roots (e.g. an IDE staging dir).
     config_reload_roots: list[str] = []
 
-    # Browser Origins allowed to open the /ws/stats WebSocket (ASVS 4.4.2). The only shipped client
-    # is the PySide6 desktop console, which sends NO Origin header, so the secure default is empty:
-    # a request that carries an Origin (i.e. a browser) is rejected unless its Origin is listed here.
+    # Browser Origins allowed on the native (Authorization-header) path of the /ws/stats WebSocket
+    # (ASVS 4.4.2). The shipped client is the browser web console. When the console is mounted, its
+    # same-origin handshake is tried first with the session cookie through the console's own hook,
+    # which checks the Origin itself and does not read this list; a handshake that hook declines
+    # comes to the header path. A native client sends NO Origin header, so the secure default
+    # is empty: a request on the header path that carries an Origin (i.e. a browser) is rejected
+    # unless its Origin is listed here.
     ws_allowed_origins: list[str] = []
 
     # --- In-process API/WebSocket TLS (WP-13a, ADR 0002) --------------------
@@ -1408,6 +1413,27 @@ class InboundSettings(_Section):
     # load. What closes the visibility half is a start-time WARNING, keyed on the registry where the
     # streaming inbounds are actually in hand: pipeline/wiring_runner.warn_unbudgeted_streaming_inbound.
     stream_inflight_budget_bytes: int = 0
+
+    # Staged-backlog depth bound (BACKLOG #290 slice 2, ASVS 15.2.2). OPT-IN per owner ruling R1 of
+    # 2026-09-27: 0 (the default) = off. When positive, the engine PAUSES INTAKE while the not-done
+    # rows at the ingress + routed stages of the ONE unified store exceed it, and resumes once they
+    # drain to 90% of it, so the pause does not flap. Store-global, so N engine shards sharing a store
+    # share one budget. The pause is backpressure only: a source stops taking in new input before
+    # it reads it (docs/CONFIGURATION.md says how each one pauses, and what an open DICOM
+    # association still takes in). Nothing already read is NAKed, dropped or left uncommitted. The
+    # outbound stage is not counted, so one partner's down destination does not stop intake for
+    # every feed. A stalled router or transform on ONE feed does
+    # count, and can hold every feed paused: that is the cost of a shared budget. It lives
+    # in [inbound] because it governs intake; the low-disk floor that also pauses intake is
+    # [retention].min_free_disk_mb, because that one number also gates `serve`.
+    max_staged_depth: int = 0
+
+    @field_validator("max_staged_depth")
+    @classmethod
+    def _non_negative_depth(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_staged_depth must be >= 0 (0 = off)")
+        return value
 
 
 class DeliverySettings(_Section):
@@ -2169,8 +2195,10 @@ class RetentionSettings(_Section):
     # Low-disk storage floor (BACKLOG #290, ASVS 15.2.2), in MiB of FREE space on the volume that holds
     # the SQLite store file. DEFAULT-ON at 1024 MiB (1 GiB, the DR-backup preflight's low-space line),
     # per owner ruling 2026-09-27. `serve` REFUSES TO START (exit 2) when free space is below it, and
-    # the periodic retention pass logs a WARNING while free space stays below it. It never drops, NAKs
-    # or deletes anything: a full disk is what would. One number drives both, so the runtime WARNING
+    # the periodic retention pass logs a WARNING while free space stays below it. At runtime the engine
+    # also PAUSES INTAKE below it (slice 2, pipeline/intake_bound.py) and resumes at the floor plus a
+    # tenth: the same pause as [inbound].max_staged_depth, which says how sources honour it. It never
+    # drops, NAKs or deletes anything: a full disk is what would. One number drives both, so the runtime WARNING
     # starts at the same line a restart would be refused at; it is not an earlier notice.
     # SQLite only: on SQL Server and Postgres the store's disk is not this process's to stat, so serve
     # logs one INFO line and skips it. 0 = off. Unlike `max_db_mb` this measures the VOLUME, not the
@@ -4882,11 +4910,10 @@ class SecuritySettings(_Section):
     # static_credential_accepted below; the refuse/warn split is [security].enforcement, exactly like
     # [store].require_managed_identity. The settings half (six sections: [store], [secrets],
     # [alerts], [ai], [auth] and [logging]) is checked before anything starts; the graph half at every
-    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
-    # (among them the alert webhook, DICOMweb, Tcp, X12, a File alternate-share credential, a
-    # forward-proxy credential, FTP, SMTP AUTH, a Postgres store, Vault tokens, the AI broker key, OIDC
-    # client_secret and the LDAP bind; each hop's compliant_kind field is the source of record), so
-    # with this on they can only run under an opt-out. Not a loosening (it tightens).
+    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant
+    # credential kind in the product today, so with this on they can only run under an opt-out. The
+    # one list of them is the table in docs/CONNECTIONS.md, "Static credentials on every backend hop";
+    # each hop's compliant_kind field is the source of record. Not a loosening (it tightens).
     # DIRECT-READ by the serve gate, not desugared: there is no legacy field it replaces.
     require_nonstatic_credentials: bool = False
     # The audited per-hop opt-outs: hop name -> the operator's reason, e.g.
@@ -6197,6 +6224,11 @@ def load_settings(
 KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION = "[store].require_encryption"
 KEYLESS_REFUSED_BY_NO_OPT_OUT = "[security].allow_unencrypted_phi"
 KEYLESS_REFUSED_BY_NO_STRICT_ACK = "[security].allow_unencrypted_phi_under_strict_enforcement"
+#: A key IS set, but the pinned built-in ``[store].key_provider`` does not read it (BACKLOG #2077).
+#: Not an opt-out question, so no opt-out waives it: the settings name a key and the store would not
+#: use it. ``keyless_opt_out_refusal`` never returns this; ``__main__._keyless_store_gate`` does, and
+#: ``store.base._checked_active_key`` refuses the same case at open for every other command.
+KEYLESS_REFUSED_BY_UNREAD_KEY = "[store].key_provider"
 
 
 def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) -> str | None:
@@ -6208,8 +6240,10 @@ def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) ->
 
     It does not ask whether a key is CONFIGURED, on purpose. A key named in the settings that the key
     provider does not resolve still opens the store keyless, and that must be refused exactly as an
-    absent key is. ``[store].require_encryption`` wins over the opt-out; under
-    ``[security].enforcement = enforce`` the opt-out needs its second acknowledgment (ADR 0140)."""
+    absent key is. (A pinned built-in provider that ignores the key that is set is refused earlier,
+    when the key resolves, since BACKLOG #2077; this rule stays the backstop for anything else.)
+    ``[store].require_encryption`` wins over the opt-out; under ``[security].enforcement = enforce``
+    the opt-out needs its second acknowledgment (ADR 0140)."""
     if store.require_encryption:
         return KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION
     if not store.allow_unencrypted_phi:

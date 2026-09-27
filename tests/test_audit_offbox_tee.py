@@ -309,9 +309,8 @@ def test_tee_docstring_and_cipher_registry_agree_about_audit_log() -> None:
     into the docstring from it would recreate the false statement this guard exists to prevent
     (BACKLOG #1198).
     """
-    from _cipher_registry import covered_tables
-
     from messagefoundry.store.store import MessageStore
+    from tests._cipher_registry import covered_tables
 
     narrow = {table for table, _column in MessageStore._CIPHER_COLUMNS}
     covered = covered_tables()

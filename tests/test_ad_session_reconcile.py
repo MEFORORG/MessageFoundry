@@ -26,11 +26,12 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.auth import reconcile
+from messagefoundry.auth import channel_scope, reconcile
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe, LdapError
+from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL, MessageStore
 
 PW = "Sup3rSecret!!"
 
@@ -1471,5 +1472,541 @@ async def test_an_unchanged_name_plans_no_rename() -> None:
         assert not [
             a for a in await store.list_audit() if a["action"] == "auth.ad_username_refreshed"
         ], "an unchanged name audited a refresh"
+    finally:
+        await store.close()
+
+
+# --- ADR 0198: the scope re-diff ----------------------------------------------
+#
+# The owner's 2026-09-26 ruling (BACKLOG #1957): the pass ends a principal's sessions when the
+# directory would withdraw or narrow its channel scope, and never writes the scope itself. The next
+# login writes it, through the SAME decision the planner used.
+
+_GRP_A = "cn=grp-a,dc=test,dc=invalid"
+_GRP_B = "cn=grp-b,dc=test,dc=invalid"
+_GRP_ALL = "cn=grp-all,dc=test,dc=invalid"
+
+
+async def _scope_of(store: MessageStore, username: str) -> tuple[str | None, str | None]:
+    user = await store.get_user_by_username(username)
+    assert user is not None
+    return user.channel_scope, user.channel_scope_source
+
+
+async def _scoped_service(
+    *groups: str, names: tuple[str, ...] = ("jdoe",)
+) -> tuple[MessageStore, _FakeLdap, AuthService, dict[str, str]]:
+    """A service whose accounts signed in holding ``groups``, under a map giving grp-a IB_A and
+    IB_B, grp-b IB_B, and grp-all every channel. The map is written through the STORE, not the
+    service: the service's map edit revokes every session, and these tests model a change made in
+    the directory."""
+    store = await MessageStore.open(":memory:")
+    await store.set_ad_group_scope_map(
+        [(_GRP_A, "IB_A"), (_GRP_A, "IB_B"), (_GRP_B, "IB_B"), (_GRP_ALL, "*")]
+    )
+    try:
+        ldap = _FakeLdap({n: _principal(n, *groups) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        tokens: dict[str, str] = {}
+        for name in names:
+            token = await _signed_in_ad_user(service, store, name)
+            assert token is not None
+            tokens[name] = token
+    except BaseException:
+        # The caller's try/finally starts only once this returns, so close here on a failed setup.
+        await store.close()
+        raise
+    return store, ldap, service, tokens
+
+
+def _scope_input(
+    stored: list[str] | None,
+    mapped: set[str],
+    *,
+    source: str | None = "ad",
+    administrator: bool = False,
+) -> channel_scope.ScopeInput:
+    return channel_scope.ScopeInput(
+        stored_scope=None if stored is None else json.dumps(stored, sort_keys=True),
+        stored_source=source,
+        mapped=frozenset(mapped),
+        administrator=administrator,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stored", "source", "mapped", "administrator", "write", "narrows"),
+    [
+        (["IB_A"], "ad", set(), False, True, True),  # withdrawn
+        (["IB_A", "IB_B"], "ad", {"IB_B"}, False, True, True),  # narrowed
+        (["*"], "ad", {"IB_A"}, False, True, True),  # all channels to a list narrows
+        (["IB_A"], "ad", {"IB_B"}, False, True, True),  # a swap drops IB_A, so it narrows
+        (["IB_A"], "ad", {"IB_A"}, False, False, False),  # unchanged
+        (["IB_A"], "ad", {"IB_A", "IB_B"}, False, True, False),  # widened: login writes, no revoke
+        (["IB_A"], "ad", {"*"}, False, True, False),  # widened to all
+        (["IB_A"], "manual", set(), False, False, False),  # an administrator's scope survives
+        (["IB_A"], "manual", {"IB_A"}, False, True, False),  # provenance moves, access does not
+        (["IB_A"], None, set(), False, True, True),  # unvouched: withdrawn (BACKLOG #1927)
+        (None, "ad", set(), False, False, False),  # already denies
+        ([], "ad", set(), False, False, False),  # already denies
+        (["IB_A"], "ad", set(), True, False, False),  # an Administrator keeps what is stored
+    ],
+)
+def test_login_and_the_planner_share_one_scope_decision(
+    stored: list[str] | None,
+    source: str | None,
+    mapped: set[str],
+    administrator: bool,
+    write: bool,
+    narrows: bool,
+) -> None:
+    """AC-9. ONE rule decides login's write and the pass's revocation, and ``narrows`` implies a
+    write that changes the value. That implication is the #1532 loop guard in one line: whatever the
+    pass revokes for, the next login writes, so the pass after it has nothing left to revoke."""
+    scope = _scope_input(stored, mapped, source=source, administrator=administrator)
+    decision = channel_scope.decide_ad_channel_scope(scope)
+    assert (decision.write, decision.narrows) == (write, narrows)
+    if decision.narrows:
+        assert decision.write and decision.changes
+    # The planner reads the very same answer.
+    plan = reconcile.plan_pass(
+        [reconcile.Probe("u1", "jdoe", P)],
+        prior_strikes={},
+        current_roles={},
+        target_roles={},
+        strike_threshold=2,
+        max_absolute=5,
+        max_fraction=0.34,
+        scopes={"u1": scope},
+    )
+    expected = [("jdoe", reconcile.SCOPE_CHANGED)] if narrows else []
+    assert [(r.username, r.reason) for r in plan.revocations] == expected
+
+
+async def test_requests_parse_a_stored_scope_with_the_planners_parser() -> None:
+    """The planner decides "narrowed" by parsing the stored value, and every request's scope comes
+    from ``_allowed_channels``. One parser, so a malformed value cannot read as a deny to one and a
+    grant to the other."""
+    from messagefoundry.auth.service import _allowed_channels
+
+    store = await MessageStore.open(":memory:")
+    try:
+        await store.create_user(user_id="u", username="u", auth_provider="ad")
+        user = await store.get_user("u")
+        assert user is not None
+        cases: list[tuple[str | None, frozenset[str] | None]] = [
+            (None, frozenset()),  # absent denies (BACKLOG #1152)
+            ("not json", frozenset()),  # malformed denies
+            ('{"a": 1}', frozenset()),  # not a list denies
+            ("[]", frozenset()),
+            ('["*"]', None),  # the deliberate all-channels grant
+            ('["IB_A","IB_B"]', frozenset({"IB_A", "IB_B"})),
+        ]
+        for raw, expected in cases:
+            assert channel_scope.scope_channels(raw) == expected, raw
+            got = _allowed_channels(replace(user, channel_scope=raw), frozenset())
+            assert got == expected, raw
+    finally:
+        await store.close()
+
+
+async def _login_writes(
+    stored: list[str] | None,
+    source: str,
+    mapped: set[str],
+    administrator: bool,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Seed one account's scope, run the LOGIN sync against groups mapping to ``mapped``, and return
+    (scope before, source before, scope after, source after).
+
+    ``source`` is ``"ad"`` or ``"manual"``. An unvouched (NULL-source) scope cannot be written
+    through the store's API, which requires a source; ``tests/test_ad_group_scope.py`` drives that
+    login case, and the pure test above covers its decision."""
+    assert source in (SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL)
+    store = await MessageStore.open(":memory:")
+    try:
+        # One group per channel, so any ``mapped`` set is reachable from a group set.
+        await store.set_ad_group_scope_map([(f"cn=ch-{c}", c) for c in ("IB_A", "IB_B", "*")])
+        await store.create_user(user_id="u", username="u", auth_provider="ad")
+        if stored is not None:
+            await store.set_user_channel_scope(
+                "u",
+                None if stored is None else json.dumps(stored, sort_keys=True),
+                source=SCOPE_SOURCE_MANUAL if source == "manual" else SCOPE_SOURCE_AD,
+            )
+        service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
+        await service.initialize()
+        user = await store.get_user("u")
+        assert user is not None
+        roles = frozenset({Role.ADMINISTRATOR}) if administrator else frozenset()
+        after = await service._sync_ad_channel_scope(user, roles, [f"cn=ch-{c}" for c in mapped])
+        return (
+            user.channel_scope,
+            user.channel_scope_source,
+            after.channel_scope,
+            (after.channel_scope_source),
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("stored", "source", "mapped", "administrator"),
+    [
+        (["IB_A"], "ad", set(), False),
+        (["IB_A", "IB_B"], "ad", {"IB_B"}, False),
+        (["*"], "ad", {"IB_A"}, False),
+        (["IB_A"], "ad", {"IB_B"}, False),
+        (["IB_A"], "ad", {"IB_A"}, False),
+        (["IB_A"], "ad", {"IB_A", "IB_B"}, False),
+        (["IB_A"], "ad", {"*"}, False),
+        (["IB_A"], "manual", set(), False),
+        (["IB_A"], "manual", {"IB_A"}, False),
+        ([], "ad", set(), False),
+        (["IB_A"], "ad", set(), True),
+    ],
+)
+async def test_login_writes_exactly_what_the_shared_decision_says(
+    stored: list[str] | None, source: str, mapped: set[str], administrator: bool
+) -> None:
+    """AC-9, from the LOGIN side. The pure test above cannot see login drift from the rule, since it
+    never runs login. This one does, for each case: login writes the decision's value or nothing,
+    and the decision on what login left is KEEP. That last step is the #1532 loop guard for every
+    case, not only the two the service-level loop test drives."""
+    before, source_before, after, source_after = await _login_writes(
+        stored, source, mapped, administrator
+    )
+    decision = channel_scope.decide_ad_channel_scope(
+        channel_scope.ScopeInput(before, source_before, frozenset(mapped), administrator)
+    )
+    if decision.write:
+        assert (after, source_after) == (decision.scope_json, "ad")
+    else:
+        assert (after, source_after) == (before, source_before)
+    settled = channel_scope.decide_ad_channel_scope(
+        channel_scope.ScopeInput(after, source_after, frozenset(mapped), administrator)
+    )
+    assert settled == channel_scope.KEEP_SCOPE, "login left a scope the decision would change again"
+
+
+def test_a_role_and_scope_delta_count_once_against_the_breaker() -> None:
+    """AC-5. Four of twelve principals lose a role AND a scope channel. One count each is four,
+    under the floor of five, so the pass applies. Two counts each would be eight, past both the
+    floor and 0.34 of twelve, and would abort a pass the owner ruled must apply."""
+    probes = [reconcile.Probe(f"u{i:02d}", f"user{i:02d}", P) for i in range(12)]
+    changed = {f"u{i:02d}" for i in range(4)}
+    plan = reconcile.plan_pass(
+        probes,
+        prior_strikes={},
+        current_roles={p.user_id: frozenset({"operator"}) for p in probes},
+        target_roles={
+            p.user_id: frozenset() if p.user_id in changed else frozenset({"operator"})
+            for p in probes
+        },
+        strike_threshold=2,
+        max_absolute=5,
+        max_fraction=0.34,
+        scopes={
+            p.user_id: _scope_input(
+                ["IB_A", "IB_B"], {"IB_B"} if p.user_id in changed else {"IB_A", "IB_B"}
+            )
+            for p in probes
+        },
+    )
+    assert plan.aborted is None
+    assert sorted((r.user_id, r.reason, r.scope_changed) for r in plan.revocations) == [
+        (uid, "roles_changed", True) for uid in sorted(changed)
+    ]
+
+
+def test_an_aborted_pass_drops_scope_revocations_and_writes_nothing() -> None:
+    """AC-6. A pass whose scope revocations trip the breaker plans no write at all, so ADR 0079's
+    byte-identical abort holds with the scope re-diff in it."""
+    probes = [reconcile.Probe(f"u{i:02d}", f"user{i:02d}", P) for i in range(12)]
+    plan = reconcile.plan_pass(
+        probes,
+        prior_strikes={},
+        current_roles={},
+        target_roles={},
+        strike_threshold=2,
+        max_absolute=5,
+        max_fraction=0.34,
+        scopes={p.user_id: _scope_input(["IB_A"], set()) for p in probes},
+    )
+    assert plan.aborted == "mass_revoke_breaker"
+    assert plan.revocations == () and plan.renames == ()
+
+
+async def test_a_withdrawn_directory_scope_revokes_on_the_next_pass() -> None:
+    """AC-1. The user leaves their last scope-mapped group in the directory. The pass revokes, with
+    ``scope_changed``, and leaves the scope exactly as it was: the reconciler is not a scope writer."""
+    store, ldap, service, tokens = await _scoped_service(_GRP_A)
+    try:
+        before = await _scope_of(store, "jdoe")
+        assert before == (json.dumps(["IB_A", "IB_B"]), "ad")
+
+        ldap.present["jdoe"] = _principal("jdoe")  # removed from grp-a
+        plan = await service.reconcile_directory_sessions()
+
+        assert [(r.username, r.reason) for r in plan.revocations] == [
+            ("jdoe", reconcile.SCOPE_CHANGED)
+        ]
+        assert await service.identity_for_token(tokens["jdoe"]) is None
+        assert await _scope_of(store, "jdoe") == before, "the reconciler wrote channel_scope"
+        rows = [a for a in await store.list_audit() if a["action"] == "auth.ad_session_revoked"]
+        assert [json.loads(r["detail"])["reason"] for r in rows] == [reconcile.SCOPE_CHANGED]
+    finally:
+        await store.close()
+
+
+async def test_a_narrowed_directory_scope_revokes() -> None:
+    """AC-2. grp-a (IB_A and IB_B) is swapped for grp-b (IB_B alone): IB_A is taken away."""
+    store, ldap, service, tokens = await _scoped_service(_GRP_A)
+    try:
+        ldap.present["jdoe"] = _principal("jdoe", _GRP_B)
+        plan = await service.reconcile_directory_sessions()
+        assert [(r.username, r.reason) for r in plan.revocations] == [
+            ("jdoe", reconcile.SCOPE_CHANGED)
+        ]
+        assert await service.identity_for_token(tokens["jdoe"]) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("start", "now"),
+    [((_GRP_A,), (_GRP_A,)), ((_GRP_B,), (_GRP_A,)), ((_GRP_B,), (_GRP_ALL,))],
+    ids=["unchanged", "widened", "widened-to-all"],
+)
+async def test_an_unchanged_or_wider_directory_scope_does_not_revoke(
+    start: tuple[str, ...], now: tuple[str, ...]
+) -> None:
+    """AC-3. THE MUST-NOT-FIRE ARM. A pass that revoked on every PRESENT probe would pass every
+    revoking test above; this is what catches it. A wider scope leaves the live token
+    under-privileged, which is safe, and waits for the next login."""
+    store, ldap, service, tokens = await _scoped_service(*start)
+    try:
+        ldap.present["jdoe"] = _principal("jdoe", *now)
+        for _ in range(3):
+            plan = await service.reconcile_directory_sessions()
+            assert plan.revocations == ()
+        assert await service.identity_for_token(tokens["jdoe"]) is not None
+    finally:
+        await store.close()
+
+
+async def test_a_manual_scope_with_no_mapped_group_survives() -> None:
+    """AC-4. An administrator's scope on a user in no scope-mapped group is kept by login, so the
+    pass must not revoke for it either. Otherwise it would revoke on every pass: login never
+    withdraws a manual scope, which is exactly the #1532 loop."""
+    store, _ldap, service, _ = await _scoped_service()
+    try:
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await service.set_channel_scope(user.id, ["MANUAL"], actor="admin")
+        token = await _signed_in_ad_user(service, store, "jdoe")
+        assert token is not None
+        for _ in range(3):
+            plan = await service.reconcile_directory_sessions()
+            assert plan.revocations == ()
+        assert await service.identity_for_token(token) is not None
+        assert await _scope_of(store, "jdoe") == (json.dumps(["MANUAL"]), "manual")
+    finally:
+        await store.close()
+
+
+async def test_a_lost_memberof_read_trips_the_breaker_rather_than_revoking_everyone() -> None:
+    """AC-7, the hazard the owner's ruling names. A bind account that loses read on ``memberOf``
+    returns every principal PRESENT with no groups, so each one's scope reads as withdrawn on the
+    same pass. The breaker is the brake: the pass aborts, nobody is signed out, nothing is written."""
+    names = tuple(f"user{i:02d}" for i in range(12))
+    store, ldap, service, tokens = await _scoped_service(_GRP_A, names=names)
+    try:
+        users_before = [
+            (u.id, u.channel_scope, u.channel_scope_source) for u in await store.list_users()
+        ]
+        for name in names:
+            ldap.present[name] = _principal(name)  # PRESENT, but every group is gone
+        plan = await service.reconcile_directory_sessions()
+
+        assert plan.aborted == "mass_revoke_breaker"
+        assert plan.revocations == ()
+        for token in tokens.values():
+            assert await service.identity_for_token(token) is not None
+        users_after = [
+            (u.id, u.channel_scope, u.channel_scope_source) for u in await store.list_users()
+        ]
+        assert users_after == users_before
+        assert not [a for a in await store.list_audit() if a["action"] == "auth.ad_session_revoked"]
+    finally:
+        await store.close()
+
+
+def test_a_lost_memberof_read_below_the_breakers_fraction_still_revokes() -> None:
+    """The breaker is only a PARTIAL brake on a memberOf read loss, and this pins the part it does
+    not cover so the documents cannot claim more. It aborts only past BOTH its floor (5) and its
+    fraction (0.34 of the judged probes). Here 9 of 30 principals hold a directory scope; the rest
+    hold an administrator's scope, which a group loss does not touch. 9 is past the floor but under
+    0.34 x 30 = 10.2, so the pass applies all 9. Their next logins read the same empty groups and
+    withdraw the scope, which is what login would have done without this ADR."""
+    probes = [reconcile.Probe(f"u{i:02d}", f"user{i:02d}", P) for i in range(30)]
+    plan = reconcile.plan_pass(
+        probes,
+        prior_strikes={},
+        current_roles={},
+        target_roles={},
+        strike_threshold=2,
+        max_absolute=5,
+        max_fraction=0.34,
+        scopes={
+            p.user_id: _scope_input(["IB_A"], set(), source="ad" if i < 9 else "manual")
+            for i, p in enumerate(probes)
+        },
+    )
+    assert plan.aborted is None
+    assert len(plan.revocations) == 9
+
+
+async def test_a_scope_revocation_audits_what_the_directory_took_away() -> None:
+    """The reconciler writes no scope, so the audit row is the only record of the withdrawn grant
+    until the next login. It carries the stored scope and the directory's, on a scope-only
+    revocation and on a role revocation that carried a scope delta too."""
+    store, ldap, service, _ = await _scoped_service(_GRP_A, names=("jdoe", "asmith"))
+    try:
+        await store.set_ad_group_role_map([(_GRP_A, "operator")])
+        await _signed_in_ad_user(service, store, "asmith")  # picks up the operator role
+        ldap.present["jdoe"] = _principal("jdoe")  # scope only: jdoe held no mapped role
+        ldap.present["asmith"] = _principal("asmith")  # role AND scope
+        plan = await service.reconcile_directory_sessions()
+        assert sorted((r.username, r.reason) for r in plan.revocations) == [
+            ("asmith", "roles_changed"),
+            ("jdoe", reconcile.SCOPE_CHANGED),
+        ]
+        rows = {
+            r["actor"]: json.loads(r["detail"])
+            for r in await store.list_audit()
+            if r["action"] == "auth.ad_session_revoked"
+        }
+        wide = json.dumps(["IB_A", "IB_B"])
+        for name in ("jdoe", "asmith"):
+            assert rows[name]["scope_changed"] is True
+            assert (rows[name]["scope_from"], rows[name]["scope_to"]) == (wide, None)
+        assert rows["asmith"]["roles"] == []
+    finally:
+        await store.close()
+
+
+async def test_a_principal_becoming_an_administrator_is_not_revoked_for_scope() -> None:
+    """The Administrator short-circuit reads the TARGET roles, as login does. jdoe held grp-a's scope,
+    then moves in the directory to an administrator-mapped group and out of grp-a. Read from the
+    CURRENT roles, the scope would look withdrawn; read from the target, as login will, the
+    Administrator keeps what is stored. So the one revocation is the role change, with no scope
+    delta on it."""
+    store, ldap, service, _ = await _scoped_service(_GRP_A)
+    try:
+        admins = "cn=mf-admins,dc=test,dc=invalid"
+        await store.set_ad_group_role_map([(admins, "administrator")])
+        ldap.present["jdoe"] = _principal("jdoe", admins)
+        plan = await service.reconcile_directory_sessions()
+        assert [(r.reason, r.scope_changed) for r in plan.revocations] == [("roles_changed", False)]
+    finally:
+        await store.close()
+
+
+async def test_the_pass_judges_the_scope_stored_after_its_probes() -> None:
+    """ADR 0198 Decision item 6. A login that lands while the pass is probing has already written
+    the new scope. Judging the row listed before the probes would revoke the session that login just
+    minted. The pass re-reads the row after probing, so it finds nothing to revoke."""
+    store, ldap, service, _ = await _scoped_service(_GRP_A)
+    try:
+        ldap.present["jdoe"] = _principal("jdoe", _GRP_B)
+        probe = service._probe_principal
+
+        async def probe_then_login(user: Any) -> reconcile.Probe:
+            result = await probe(user)
+            # The login's own write, landing between the candidate listing and the re-read.
+            await store.set_user_channel_scope(
+                user.id, json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD
+            )
+            return result
+
+        service._probe_principal = probe_then_login  # type: ignore[method-assign]
+        # The apply-time check would also stop this revocation, so watch the PLAN, not the result:
+        # a revocation planned from the stale row reaches the apply step, and none may.
+        planned: list[reconcile.SessionRevocation] = []
+        apply = service._apply_reconcile_revocation
+
+        async def spy(revocation: reconcile.SessionRevocation) -> bool:
+            planned.append(revocation)
+            return await apply(revocation)
+
+        service._apply_reconcile_revocation = spy  # type: ignore[method-assign]
+        plan = await service.reconcile_directory_sessions()
+        assert planned == [], "the pass planned from the row listed before its probes"
+        assert plan.revocations == ()
+    finally:
+        await store.close()
+
+
+async def test_a_scope_revocation_is_skipped_when_the_scope_moved_before_it_applied() -> None:
+    """ADR 0198 Decision item 6, the apply half. A login can also land after the re-read, while
+    earlier revocations in the pass await their audit writes. The apply step re-reads the row and
+    skips a scope revocation whose stored scope has moved. The returned plan says what the pass did,
+    so the skipped revocation is not alerted either. A role revocation is never skipped."""
+    store, ldap, service, _ = await _scoped_service(_GRP_A)
+    try:
+        ldap.present["jdoe"] = _principal("jdoe", _GRP_B)
+        apply = service._apply_reconcile_revocation
+
+        async def login_then_apply(revocation: reconcile.SessionRevocation) -> bool:
+            await store.set_user_channel_scope(
+                revocation.user_id, json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD
+            )
+            return await apply(revocation)
+
+        service._apply_reconcile_revocation = login_then_apply  # type: ignore[method-assign]
+        plan = await service.reconcile_directory_sessions()
+        assert plan.revocations == ()
+        assert not [a for a in await store.list_audit() if a["action"] == "auth.ad_session_revoked"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("now", [(), (_GRP_B,)], ids=["withdrawn", "narrowed"])
+async def test_after_the_next_login_writes_the_new_scope_the_pass_does_not_revoke_again(
+    now: tuple[str, ...],
+) -> None:
+    """AC-8, the #1532 loop guard. The pass revokes once; the user signs in again and login writes
+    the scope the pass revoked for; every later pass finds nothing to revoke."""
+    store, ldap, service, _ = await _scoped_service(_GRP_A)
+    try:
+        ldap.present["jdoe"] = _principal("jdoe", *now)
+        first = await service.reconcile_directory_sessions()
+        assert [r.reason for r in first.revocations] == [reconcile.SCOPE_CHANGED]
+
+        token = await _signed_in_ad_user(service, store, "jdoe")
+        assert token is not None
+        expected = (json.dumps(["IB_B"]), "ad") if now else (None, "ad")
+        assert await _scope_of(store, "jdoe") == expected
+        for _ in range(3):
+            plan = await service.reconcile_directory_sessions()
+            assert plan.revocations == (), "the pass revoked again after login wrote the scope"
+        assert await service.identity_for_token(token) is not None
+    finally:
+        await store.close()
+
+
+async def test_a_scope_revocation_sends_no_account_disabled_notice() -> None:
+    """The account is not disabled, so the notice that says it is would be false. Login's own scope
+    re-sync sends no notice either; the audit row and the alert carry the event."""
+    store, ldap, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        ldap.present["jdoe"] = _principal("jdoe")
+        plan = await service.reconcile_directory_sessions()
+        assert [r.reason for r in plan.revocations] == [reconcile.SCOPE_CHANGED]
+        assert notifier.sent == []
     finally:
         await store.close()

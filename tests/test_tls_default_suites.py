@@ -41,7 +41,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _ast_sites import call_sites
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -71,6 +70,7 @@ from messagefoundry.transports.base import build_source
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.tray import probe as tray_probe
 from messagefoundry.verify.smoke import live_smoke_ssl_context
+from tests._ast_sites import call_sites
 
 _ROOT = Path(__file__).resolve().parent.parent
 

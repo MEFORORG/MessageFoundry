@@ -55,6 +55,7 @@ from messagefoundry.config.models import (
     hop_attestation_from_settings,
 )
 from messagefoundry.config.tls_policy import InsecureHopRefused, TrustAnchorPolicy
+from messagefoundry.connection_names import fhir_lookup_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
@@ -464,7 +465,11 @@ class FhirDestination(DestinationConnector):
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
-                scheme, self.base_url, connector="FHIR destination", attested=attested
+                scheme,
+                self.base_url,
+                connector="FHIR destination",
+                connection=config.name,
+                attested=attested,
             )
             if guard is not None:
                 self._hop_guard = guard
@@ -975,6 +980,10 @@ class FhirLookupExecutor:
         self._abandoned_lock = threading.Lock()
         for cname, raw in connections.items():
             s = dict(raw)
+            # The name every audit record and refusal for this lookup renders. Prefixed because lookups
+            # are their own namespace: an outbound and a lookup may share a name, and the records must
+            # still tell them apart. The same prefix the loosening reports use (accepted_cleartext_hops).
+            label = fhir_lookup_record_name(cname)
             url = s.get("url")
             if not isinstance(url, str) or not url:
                 raise ValueError(
@@ -997,8 +1006,8 @@ class FhirLookupExecutor:
             # reason is refused here rather than crossing unexplained.
             attested = hop_attestation_from_settings(s)
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
-            # rides the resolved settings. The runner's _fhir_lookup_settings writes it only from the
-            # spec's load-validated typed fields and strips a raw key first (BACKLOG #2050).
+            # arrives in these settings, mirrored from the spec's typed fields by
+            # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
             lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
             # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND
             # the SMART token endpoint (None → byte-identical). Bypass resolved per target host (#128).
@@ -1008,7 +1017,7 @@ class FhirLookupExecutor:
                 attested=attested,
                 cleartext_accepted=lk_accepted,
                 cleartext_reason=lk_reason,
-                connection=cname,
+                connection=label,
             )
             base_host = urllib.parse.urlsplit(url).hostname or ""
             proxy_dest = proxy.for_host(base_host) if proxy is not None else None
@@ -1030,7 +1039,7 @@ class FhirLookupExecutor:
                 attested=attested,
                 cleartext_accepted=lk_accepted,
                 cleartext_reason=lk_reason,
-                connection=cname,
+                connection=label,
             )
             # ASVS 12.2.1: a cleartext read pulls the PHI resource/searchset back over the wire, so a
             # cleartext http read to a non-loopback host is refused too (loopback stays byte-identical).
@@ -1040,7 +1049,7 @@ class FhirLookupExecutor:
                 attested=attested,
                 cleartext_accepted=lk_accepted,
                 cleartext_reason=lk_reason,
-                connection=cname,
+                connection=label,
             )
             # ASVS 4.2.5: this executor never called the construction gate at all -- fhir.py's only
             # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
@@ -1063,7 +1072,11 @@ class FhirLookupExecutor:
             else:
                 # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
                 guard = refuse_verify_off(
-                    scheme, url, connector=f"FhirLookup {cname!r}", attested=attested
+                    scheme,
+                    url,
+                    connector=f"FhirLookup {cname!r}",
+                    connection=label,
+                    attested=attested,
                 )
                 if guard is not None:
                     self._hop_guard[cname] = guard

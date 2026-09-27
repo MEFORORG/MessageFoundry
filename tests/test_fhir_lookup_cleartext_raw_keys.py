@@ -48,12 +48,12 @@ _REASON = "legacy on-prem FHIR facade has no TLS"
 _RAW: dict[str, object] = {
     "cleartext_accepted": True,
     "cleartext_reason": "spoofed",
-    "cleartext_connection": "OB_OTHER",
+    "connection_name": "OB_OTHER",
 }
 _RAW_REVOCATION: dict[str, object] = {
     "tls_revocation_attested": True,
     "tls_revocation_attested_reason": "spoofed",
-    "tls_revocation_attested_connection": "OB_OTHER",
+    "connection_name": "OB_OTHER",
 }
 
 
@@ -119,7 +119,7 @@ def test_a_declared_lookup_crosses_and_its_audit_line_ignores_the_raw_keys(
     audit = " ".join(
         r.getMessage() for r in caplog.records if "cleartext_accepted" in r.getMessage()
     )
-    assert "'epic'" in audit and _REASON in audit
+    assert "'fhir_lookup:epic'" in audit and _REASON in audit
     assert "OB_OTHER" not in audit and "spoofed" not in audit
 
 
@@ -127,6 +127,7 @@ def test_fhir_lookup_settings_strips_every_raw_declaration_key() -> None:
     spec = FhirLookupSpec("epic", {"url": _CLEARTEXT_URL, **_RAW, **_RAW_REVOCATION})
     settings = _fhir_lookup_settings(spec, {}, None)
     assert not any(k.startswith(("cleartext_", "tls_revocation_attested")) for k in settings)
+    assert settings["connection_name"] == "fhir_lookup:epic"  # its own name, not the raw one
     assert settings["url"] == _CLEARTEXT_URL  # control: only the declaration keys went
 
 
@@ -140,7 +141,7 @@ def test_fhir_lookup_settings_mirrors_only_the_typed_declaration() -> None:
     settings = _fhir_lookup_settings(spec, {}, None)
     assert settings["cleartext_accepted"] is True
     assert settings["cleartext_reason"] == _REASON
-    assert settings["cleartext_connection"] == "epic"
+    assert settings["connection_name"] == "fhir_lookup:epic"
 
 
 def test_a_directly_built_spec_cannot_accept_without_a_reason() -> None:
@@ -205,14 +206,11 @@ def test_a_raw_hop_attestation_cannot_pair_with_the_typed_acceptance() -> None:
     # audit record while the loosening report listed it as accepted. The factory refuses the pair;
     # a raw attestation written into settings afterwards is refused at the one settings builder.
     spec = FhirLookupSpec(
-        "epic",
-        {
-            "url": _CLEARTEXT_URL,
-            "tls_hop_attested": True,
-            "tls_hop_attested_reason": "sidecar terminates TLS",
-        },
-        cleartext_accepted=True,
-        cleartext_reason=_REASON,
+        "epic", {"url": _CLEARTEXT_URL}, cleartext_accepted=True, cleartext_reason=_REASON
+    )
+    # Written AFTER construction, which refuses the pair outright; `settings` stays mutable.
+    spec.settings.update(
+        {"tls_hop_attested": True, "tls_hop_attested_reason": "sidecar terminates TLS"}
     )
     with pytest.raises(WiringError, match="opposite claims"):
         _fhir_lookup_settings(spec, {}, None)

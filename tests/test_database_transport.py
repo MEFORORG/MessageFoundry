@@ -435,7 +435,8 @@ def test_generic_source_warning_names_the_connection(caplog: pytest.LogCaptureFi
             )
         )
     warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any("'IB_DB_GEN'" in m and "no TLS keyword" in m for m in warned), warned
+    # `inbound:` prefixed, as every inbound record and the loosening reports spell it.
+    assert any("'inbound:IB_DB_GEN'" in m and "no TLS keyword" in m for m in warned), warned
 
 
 def test_sqlserver_destination_still_requires_database() -> None:
