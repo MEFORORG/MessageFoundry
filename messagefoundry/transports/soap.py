@@ -84,6 +84,7 @@ from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     build_strict_opener,
     drain_bounded,
+    hop_identity,
     read_bounded_text,
 )
 
@@ -311,6 +312,8 @@ class SoapDestination(DestinationConnector):
             raise ValueError(f"SOAP destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "SOAP destination 'url'")
         self.url = url
+        # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
+        self._hop = hop_identity("SOAP", config.name)
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = s.get("encoding", "utf-8")
         self.version: str = str(s.get("soap_version", "1.1"))
@@ -799,7 +802,7 @@ class SoapDestination(DestinationConnector):
                 # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion. Unlike the length gate this
                 # method deliberately omits, this bound CAN fire: the peer chooses the body.
-                drain_bounded(resp, connector=f"SOAP {_redact_url(self.url)} probe")
+                drain_bounded(resp, connector=f"{self._hop} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -872,9 +875,7 @@ class SoapDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
                 # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
-                body = read_bounded_text(
-                    resp, connector=f"SOAP {_redact_url(self.url)}", encoding=self.encoding
-                )
+                body = read_bounded_text(resp, connector=self._hop, encoding=self.encoding)
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers = capture_response_headers(
@@ -889,15 +890,15 @@ class SoapDestination(DestinationConnector):
                 # failure for an unclassified one.
                 body = read_bounded_text(
                     exc,
-                    connector=f"SOAP {_redact_url(self.url)} fault body",
+                    connector=f"{self._hop} fault body",
                     encoding=self.encoding,
                 )
             except EgressReplyError:
                 # The FAMILY, not just the byte bound -- see the twin arm in fhir.py.
                 logger.warning(
-                    "SOAP %s returned an HTTP %s fault body the engine could not read whole; "
+                    "%s returned an HTTP %s fault body the engine could not read whole; "
                     "classifying on the status alone",
-                    _redact_url(self.url),
+                    self._hop,
                     exc.code,
                 )
                 body = ""

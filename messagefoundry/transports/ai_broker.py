@@ -209,13 +209,13 @@ class AiBroker:
                 # off-premises, so its reply is the least-trusted body the engine buffers on egress.
                 body = read_bounded_text(
                     resp,
-                    connector=f"AI endpoint {_redact_url(self.endpoint)}",
+                    connector="AI endpoint",
                     encoding="utf-8",
                 )
         except EgressReplyError as exc:
             # Mapped onto this module's single error type: the API route handles AiBrokerError, and a
             # DeliveryError escaping here would be unmapped. The message already names only the
-            # redacted host, the bound and the class.
+            # fixed label "AI endpoint" and the refusal, never the URL (BACKLOG #2060).
             #
             # Caught as the FAMILY, not as ResponseTooLargeError: a refusal added beside it later
             # shares this reason exactly, and catching the member is how #1575's first cut let

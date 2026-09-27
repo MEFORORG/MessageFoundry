@@ -118,6 +118,7 @@ __all__ = [
     "TruncatedResponseError",
     "build_strict_opener",
     "drain_bounded",
+    "hop_identity",
     "read_bounded",
     "read_bounded_text",
     "read_reply_body",
@@ -151,6 +152,20 @@ DEFAULT_MAX_RESPONSE_BYTES = DEFAULT_MAX_MESSAGE_BYTES
 #: separate on purpose, because ``transports/`` must not grow an import edge into ``auth/``;
 #: ``tests/test_bounded_egress_reads.py`` pins them equal so they cannot drift apart unnoticed.
 MAX_TOKEN_RESPONSE_BYTES = 256 * 1024
+
+
+def hop_identity(kind: str, connection: str) -> str:
+    """The name a refusal here gives a connection's hop: its connector kind and connection name.
+
+    Pass it, or a fixed label, as ``connector`` to the reads below. Never pass a URL, redacted or
+    not (BACKLOG #2060). Each refusal lands in an error message, a WARNING line or a message's
+    stored error. A redacted URL drops the query and the user-info but keeps the path, and a
+    scanner that tracks the configured URL as sensitive cannot tell a redacted one from a raw one.
+    The connection name names the hop just as well, because an operator chose it. Where the caller
+    already prefixes its own error with the connection, a fixed label is enough. Nothing here
+    parses the result.
+    """
+    return f"{kind} connection {connection!r}"
 
 
 class EgressReplyError(DeliveryError):
@@ -272,8 +287,9 @@ def read_bounded(
     Use :func:`drain_bounded` instead where the body is DISCARDED.
 
     ``connector`` names the hop in the error text and MUST already be PHI-safe and secret-safe. Every
-    call site passes a redacted URL or a connection name, never a body, a token, or a query. The
-    byte counts in the messages below are framing metadata, not content.
+    call site passes a :func:`hop_identity` or a fixed label, never a URL, a body, a token, or a
+    query (BACKLOG #2060). The byte counts in the messages below are framing metadata, not
+    content.
     """
     fault = reply_framing_fault(reader)
     if fault is not None:
@@ -327,9 +343,9 @@ def drain_bounded(
     cannot parse and does not raise. It logs a WARNING instead, so the stop is recorded rather than
     silent. The WARNING carries a fixed reason, the request method and the status code, and nothing
     else. It leaves ``connector`` out on purpose. Callers build it from configuration, at least a
-    redacted URL or a webhook host, and this log line should not depend on each caller's redaction
-    being complete. The cost is that the line does not name the hop. The exceptions this module
-    raises still carry ``connector``, and so rely on the caller's redaction.
+    connection name or a webhook host, and this log line should not depend on each caller's choice
+    being safe. The cost is that the line does not name the hop. The exceptions this module raises
+    still carry ``connector``, and so rely on the caller passing no URL.
     """
     try:
         _read_capped(reader, limit, connector)

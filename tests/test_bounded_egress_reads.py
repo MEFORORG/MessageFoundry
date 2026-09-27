@@ -32,6 +32,7 @@ Synthetic data only.
 
 from __future__ import annotations
 
+import ast
 import email.message
 import http.client
 import io
@@ -39,7 +40,9 @@ import json
 import logging
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -291,7 +294,7 @@ def test_rest_post_refuses_an_unbounded_reply() -> None:
     dest = _rest()
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
-    with pytest.raises(ResponseTooLargeError, match="api.example.com"):
+    with pytest.raises(ResponseTooLargeError):
         dest._post("<payload/>")
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
@@ -729,7 +732,7 @@ def test_rest_post_does_not_report_success_on_a_truncated_reply() -> None:
     delivered. It now raises a retryable DeliveryError instead."""
     dest = _rest()
     dest._opener = _FakeOpener(_wire(_FIXED_TRUNCATED))  # type: ignore[assignment]
-    with pytest.raises(TruncatedResponseError, match="api.example.com"):
+    with pytest.raises(TruncatedResponseError, match="REST connection 'OB_REST'"):
         dest._post("<payload/>")
 
 
@@ -861,3 +864,164 @@ def test_a_truncated_reply_never_carries_the_partial_body_on_the_exception_chain
     assert err.value.__cause__ is None
     assert err.value.__context__ is None
     assert "hello" not in str(err.value)
+
+
+# --- a refusal names the connection, not the URL (BACKLOG #2060) -----------------------------------
+#
+# A redacted URL still carries the path, and every refusal here lands in an error message, a
+# WARNING line or a message's stored error. So each call site names its hop by connection instead.
+# The hosts below are the synthetic ones each connector was built with.
+
+#: The readers, plus the helpers that pass a ``connector`` label on to one unchanged.
+_READERS = frozenset(
+    {
+        "read_bounded",
+        "read_bounded_text",
+        "drain_bounded",
+        "read_reply_body",
+        "request_token",
+        "_read_token_reply",
+        "mount_strict_reply_adapter",
+        "StrictReplyAdapter",
+    }
+)
+
+
+def _url_bearing_connectors(source: str) -> list[int]:
+    """Line numbers of reader calls whose ``connector`` argument mentions a URL.
+
+    A URL reaches the argument through ``_redact_url``, through a name or attribute ending in
+    ``url`` or ``endpoint``, such as ``base_url`` or ``token_url``, or through one named ``base``.
+    A bare host, as the alert webhook passes, is not a URL and is not flagged."""
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name not in _READERS:
+            continue
+        for kw in node.keywords:
+            if kw.arg != "connector":
+                continue
+            for sub in ast.walk(kw.value):
+                if isinstance(sub, ast.Name):
+                    ident = sub.id
+                elif isinstance(sub, ast.Attribute):
+                    ident = sub.attr
+                else:
+                    continue
+                if ident in ("_redact_url", "base") or ident.endswith(("url", "endpoint")):
+                    lines.append(node.lineno)
+    return lines
+
+
+def test_no_reader_call_site_names_its_hop_by_url() -> None:
+    offenders = [
+        f"{path.relative_to(_REPO_ROOT)}:{line}"
+        for path in sorted((_REPO_ROOT / "messagefoundry").rglob("*.py"))
+        if any(reader in (source := path.read_text(encoding="utf-8")) for reader in _READERS)
+        for line in _url_bearing_connectors(source)
+    ]
+    assert offenders == []
+
+
+def test_the_url_scan_can_still_find_one() -> None:
+    """Positive control for the gate above: the shapes the call sites used before #2060."""
+    assert _url_bearing_connectors(
+        'drain_bounded(resp, connector=f"REST {_redact_url(self.url)} probe")'
+    )
+    assert _url_bearing_connectors("read_bounded_text(r, connector=endpoint, encoding='utf-8')")
+    assert _url_bearing_connectors("br.read_bounded(r, connector=self.base_url)")
+    assert _url_bearing_connectors('drain_bounded(r, connector=f"FHIR {base} lookup probe")')
+    assert not _url_bearing_connectors('drain_bounded(resp, connector=f"{self._hop} probe")')
+
+
+def test_each_destination_names_its_connection_and_not_its_host() -> None:
+    rest, soap, fhir, dicomweb = _rest(), _soap(), _fhir(), _dicomweb()
+    cases: list[tuple[object, Callable[[], object], str, str]] = [
+        (rest, lambda: rest._post("<payload/>"), "REST connection 'OB_REST'", "api.example.com"),
+        (rest, rest._probe, "REST connection 'OB_REST' probe", "api.example.com"),
+        (soap, lambda: soap._post("<env:Envelope/>"), "SOAP connection 'OB_SOAP'", "api.example"),
+        (soap, soap._probe, "SOAP connection 'OB_SOAP' probe", "api.example"),
+        (
+            fhir,
+            lambda: fhir._post("{}", "POST", f"{FHIR_BASE}/Patient", {}),
+            "FHIR connection 'OB_FHIR'",
+            "fhir.example.org",
+        ),
+        (fhir, fhir._probe, "FHIR connection 'OB_FHIR' probe", "fhir.example.org"),
+        (
+            dicomweb,
+            lambda: dicomweb._post(b"\x00" * 128 + b"DICM"),
+            "DICOMweb connection 'OB_DCMWEB'",
+            "pacs.example.org",
+        ),
+        (dicomweb, dicomweb._probe, "DICOMweb connection 'OB_DCMWEB' probe", "pacs.example.org"),
+    ]
+    for dest, call, identity, host in cases:
+        dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[attr-defined]
+        with pytest.raises(ResponseTooLargeError) as err:
+            call()
+        assert str(err.value).startswith(identity + " returned")
+        assert host not in str(err.value)
+
+
+def test_the_lookup_the_token_endpoint_and_the_ai_broker_name_no_host(ec_pem: str) -> None:
+    ex = FhirLookupExecutor({"epic": {"url": FHIR_BASE}})
+    ex._opener["epic"] = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
+    for call, expected in (
+        (
+            lambda: ex._get("epic", f"{FHIR_BASE}/Patient/123"),
+            "fhir_lookup on 'epic': FHIR lookup ",
+        ),
+        (lambda: ex._probe("epic"), "FhirLookup 'epic': FHIR lookup probe "),
+    ):
+        with pytest.raises(FhirLookupError) as err:
+            call()
+        assert str(err.value).startswith(expected)
+        assert "fhir.example.org" not in str(err.value)
+    provider = SmartBackendTokenProvider(
+        token_url=TOKEN_URL,
+        client_id="cid",
+        private_key=ec_pem,
+        algorithm=SignatureAlgorithm.ES256,
+        scope="system/*.rs",
+    )
+    provider._opener = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
+    with pytest.raises(ResponseTooLargeError) as token_err:
+        provider.access_token()
+    assert str(token_err.value).startswith("SMART token endpoint returned")
+    assert "auth.example.com" not in str(token_err.value)
+    broker = AiBroker(endpoint=AI_ENDPOINT, api_key="sk-x", allowed_endpoints=["ai.internal"])
+    broker._opener = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
+    with pytest.raises(AiBrokerError) as ai_err:
+        broker.chat("def handle(msg): ...")
+    assert str(ai_err.value).startswith("AI endpoint returned")
+    assert "ai.internal" not in str(ai_err.value)
+
+
+def test_the_unreadable_error_body_warning_names_the_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    soap, fhir = _soap(), _fhir()
+    cases: list[tuple[object, Callable[[], object], str, str]] = [
+        (soap, lambda: soap._post("<env:Envelope/>"), "SOAP connection 'OB_SOAP'", SOAP_URL),
+        (
+            fhir,
+            lambda: fhir._post("{}", "POST", f"{FHIR_BASE}/Patient", {}),
+            "FHIR connection 'OB_FHIR'",
+            FHIR_BASE,
+        ),
+    ]
+    for dest, call, identity, url in cases:
+        dest._opener = _RaisingOpener(_UnboundedHTTPError(url, 500))  # type: ignore[attr-defined]
+        caplog.clear()
+        with caplog.at_level(logging.WARNING), pytest.raises(DeliveryError):
+            call()
+        warned = [
+            r.getMessage() for r in caplog.records if "could not read whole" in r.getMessage()
+        ]
+        assert len(warned) == 1
+        assert warned[0].startswith(identity + " returned")
+        assert urllib.parse.urlsplit(url).hostname not in warned[0]
