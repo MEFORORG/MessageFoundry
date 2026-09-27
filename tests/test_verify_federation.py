@@ -165,6 +165,7 @@ def test_the_username_rows_say_the_claim_selects_no_account() -> None:
         ]
         assert "(issuer, sub) pair" in row.detail, strip
         assert "account name" not in row.detail, strip
+        assert "name an on-prem account" not in row.detail, strip
 
 
 def test_a_disabled_mfa_gate_is_reported_not_hidden() -> None:
@@ -225,6 +226,8 @@ def test_replay_all_rungs_pass_with_the_real_nonce(
         assert rows[rid].status is Status.PASS, rid
     assert rows["fed.replay.principal"].status is Status.MANUAL
     assert "jdoe" in rows["fed.replay.principal"].evidence
+    # The username is a hint only; the bound pair selects the account (ADR 0184, BACKLOG #2155).
+    assert "(issuer, sub) pair" in rows["fed.replay.principal"].detail
 
 
 def test_without_a_nonce_the_binding_rung_skips_and_later_rungs_are_not_claimed_passed(

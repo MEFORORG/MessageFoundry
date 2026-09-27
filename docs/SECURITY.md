@@ -1859,10 +1859,11 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
 
 - **Hybrid-only.** A principal with no on-prem AD object is refused (`not_in_directory`).
 - **The username is bound to an allow-listed UPN suffix** (`[auth].oidc_allowed_username_domains`,
-  defaulting to `ad_domain`). This is load-bearing, not hygiene: `preferred_username` is neither
-  unique nor stable (OIDC Core §5.7) and is self-editable on several IdPs, so without it the claim's
-  *local part alone* would decide which AD account is resolved — letting a federated principal pick a
-  privileged one. Stripping a suffix with no allow-list configured is refused at startup.
+  defaulting to `ad_domain`). Since ADR 0184 this is defence in depth: the bound (issuer, sub) pair
+  selects the account, and the username claim selects none. Before ADR 0184 it was the control,
+  because `preferred_username` is neither unique nor stable (OIDC Core §5.7) and is self-editable on
+  several IdPs, so the claim's *local part alone* decided which AD account was resolved. Stripping a
+  suffix with no allow-list configured is refused at startup.
 - **MFA is an assertion, not a proof.** `oidc_require_mfa_claim` (default **on**) refuses a login
   whose verified token carries no configured `amr`/`acr` value. The engine verifies what the IdP
   **asserts**, cryptographically; it cannot prove the IdP *enforced* MFA, and this documentation will

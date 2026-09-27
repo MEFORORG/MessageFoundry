@@ -375,7 +375,8 @@ hashed resolution lives in the committed **`uv.lock`** / **`requirements.lock`**
   Driver 18 for SQL Server, which is not pip-installable; lazy-imported so SQLite-only installs skip it)
 - `dicom` → `pydicom` + `pynetdicom` (DICOM codec — headers/SR only, no numpy — and the C-STORE SCP
   inbound connector; ADR 0025; lazy-imported so non-DICOM installs skip it)
-- `dev` → `pytest`, `pytest-asyncio`, `httpx` (ASGI test client for the API), `ruff`, `mypy`
+- `dev` → `pytest`, `pytest-asyncio`, `ruff`, `mypy` (`httpx`, the ASGI test client, is a base
+  dependency)
 
 **Build / tooling** — `hatchling` (build backend), Ruff (format + lint, no Black), mypy (strict),
 pytest.

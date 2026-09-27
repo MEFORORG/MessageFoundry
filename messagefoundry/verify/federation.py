@@ -596,8 +596,9 @@ def _replay_rows(
                 "fed.replay.principal",
                 "Resolved federated principal",
                 Status.MANUAL,
-                "confirm this is the on-prem account the token's holder should map to (roles come "
-                "from AD, never from the token)",
+                "confirm this sub is bound to the on-prem account the token's holder should reach: "
+                "the bound (issuer, sub) pair selects it and the username is only a hint (ADR "
+                "0184); roles come from AD, never from the token",
                 evidence=(
                     f"username={principal.username}; sub={principal.subject}; "
                     f"amr={list(principal.amr)}; acr={principal.acr}; "
