@@ -74,7 +74,11 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
 )
-from messagefoundry.transports.bounded_read import drain_bounded, read_bounded_text
+from messagefoundry.transports.bounded_read import (
+    build_strict_opener,
+    drain_bounded,
+    read_bounded_text,
+)
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = [
@@ -341,10 +345,11 @@ def _no_redirect_opener(
     already covers), so there is never a competing double-proxy.
 
     ``trust_anchor`` (#1180) narrows the client trust store to a resolved internal CA. An anchor that
-    narrows nothing — the default — leaves the opener handler-for-handler what it was, which is why a
+    narrows nothing — the default — leaves the opener handler-for-handler what it was (apart from the
+    strict reply class every opener gets, BACKLOG #2052), which is why a
     connection needs one of these openers only when it carries an extra handler OR an anchor that
     ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`."""
-    return urllib.request.build_opener(
+    return build_strict_opener(
         _NoRedirectHandler,
         build_anchored_https_handler(anchor=trust_anchor, connector=_HTTP_FAMILY_CELL),
         *extra_handlers,
@@ -355,7 +360,8 @@ def _no_redirect_opener(
 # no extra handler. Built through _no_redirect_opener with no extras rather than repeating the
 # expression, so there is exactly ONE construction of this opener to keep asserted. Handler-for-handler
 # identical to the previous `build_opener(_NoRedirectHandler)`: build_opener would have added an
-# HTTPSHandler of its own, and this supplies the same class built the same way.
+# HTTPSHandler of its own, and this supplies the same class built the same way. build_strict_opener
+# then swaps both HTTP handlers for strict subclasses on the same context (BACKLOG #2052).
 _NO_REDIRECT_OPENER = _no_redirect_opener()
 
 
@@ -371,7 +377,7 @@ def _insecure_opener(
     # Verification is off, but the traffic is still encrypted, so the suite list still matters: assert
     # forward secrecy here too (ASVS 12.1.2), after the verify-off configuration is applied.
     harden_cipher_suites(ctx, connector="HTTP-family destination (TLS verification disabled)")
-    return urllib.request.build_opener(
+    return build_strict_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
     )
 
@@ -397,7 +403,7 @@ def _expiry_relaxed_opener(
     relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="HTTP-family destination (expired-certificate tolerance)")
-    return urllib.request.build_opener(
+    return build_strict_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
     )
 

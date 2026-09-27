@@ -54,6 +54,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
     EgressReplyError,
+    build_strict_opener,
     read_reply_body,
     reply_framing_fault,
 )
@@ -146,7 +147,7 @@ def build_idp_opener(
     # compromise could decrypt is an authentication-material exposure, not just a confidentiality one.
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="OIDC identity provider (token + JWKS)")
-    return urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx))
+    return build_strict_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx))
 
 
 def jwks_fetcher(
