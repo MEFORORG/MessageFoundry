@@ -67,6 +67,7 @@ from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AlertInstance,
     AlertSummary,
+    AuditAppend,
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
@@ -1307,6 +1308,18 @@ class QueueStore(StoreLifecycle, Protocol):
         the outbound stage. Lets a consumer tell a true drain from a stalled router/transform."""
         ...
 
+    async def staged_intake_depth(self, *, limit: int | None = None) -> int:
+        """Count of NOT-DONE rows (``pending``|``inflight``) at the **ingress and routed** stages only,
+        across every lane of this ONE store -- the staged backlog the ``[inbound].max_staged_depth``
+        intake pause bounds (BACKLOG #290, slice 2). The outbound stage is left out on purpose: one
+        partner's down destination must not pause intake for every other feed. Store-global, so every
+        engine shard sharing a unified store reads the same number.
+
+        ``limit`` caps the count: the result is ``min(count, limit)``, and the read stops scanning at
+        ``limit`` rows. The pause only needs to know "over the bound or not", and an uncapped COUNT
+        would cost the most exactly when the backlog is largest."""
+        ...
+
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
 
@@ -1745,6 +1758,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
+        audit: AuditAppend | None = None,
     ) -> None:
         """Insert one account row.
 
@@ -1753,7 +1767,10 @@ class AuthStore(Protocol):
         mirror. The directory birth passes ``False`` for a ``mail`` the address form would not
         suggest (BACKLOG #2014); every other caller keeps the default. ``notify_email``, when given,
         is bound as the notification address instead: an administrator's checked address for a
-        directory account created without a sign-in (BACKLOG #2021)."""
+        directory account created without a sign-in (BACKLOG #2021).
+
+        ``audit``, when given, is appended to the audit chain in the SAME transaction as the INSERT,
+        so the two commit or roll back together, then teed off-box (BACKLOG #2100)."""
         ...
 
     async def get_user(self, user_id: str) -> UserRecord | None: ...
@@ -2294,20 +2311,33 @@ def resolve_active_key(settings: StoreSettings) -> str | None:
     An EXTERNAL provider that returns no key raises too (BACKLOG #1998). The keyless at-rest gate
     counts a configured external provider as keyed before it resolves, so "no key" from one must
     never mean the identity cipher. Every shipped provider already raises; this holds the next one
-    to the same contract."""
+    to the same contract.
+
+    So does a pinned built-in provider that ignores the key the settings name (BACKLOG #2077):
+    ``dpapi`` with only ``MEFOR_STORE_ENCRYPTION_KEY``, or ``env`` with only a key file."""
     return _checked_active_key(resolve_key_provider(settings).active_key(), settings)
 
 
 def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
-    """``key`` (a provider's ``active_key()``), refusing "no key" from an EXTERNAL provider (BACKLOG
-    #1998). The one check both :func:`resolve_active_key` and :func:`resolve_decrypt_keys` pass."""
-    from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS, KeyProviderError
+    """``key`` (a provider's ``active_key()``), refusing "no key" wherever the settings promised one:
+    from an EXTERNAL provider (BACKLOG #1998), or from a pinned built-in provider that ignores the
+    local key that is set (BACKLOG #2077). The one check both :func:`resolve_active_key` and
+    :func:`resolve_decrypt_keys` pass, so every command that opens a store gets it."""
+    from messagefoundry.store.keyprovider import (
+        _EXTERNAL_PROVIDERS,
+        KeyProviderError,
+        unread_key_refusal,
+    )
 
-    if not key and settings.key_provider in _EXTERNAL_PROVIDERS:
+    if key:
+        return key
+    if settings.key_provider in _EXTERNAL_PROVIDERS:
         raise KeyProviderError(
             f"[store].key_provider={settings.key_provider!r} resolved no key; refusing to use "
             "the identity (plaintext) cipher in its place."
         )
+    if (unread := unread_key_refusal(settings)) is not None:
+        raise KeyProviderError(f"resolved no key, refusing to continue: {unread}")
     return key
 
 

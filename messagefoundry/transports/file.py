@@ -55,6 +55,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
+    intake_open,
     positive_cap,
     register_destination,
     register_source,
@@ -615,7 +616,9 @@ class FileSource(SourceConnector):
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                if self._may_poll():
+                # BACKLOG #290 slice 2: a paused engine skips the whole tick, so no file is listed,
+                # read, moved or deleted; it stays in the drop directory for the next open tick.
+                if intake_open(self.intake_gate) and self._may_poll():
                     await self._scan_once()
             except asyncio.CancelledError:
                 raise

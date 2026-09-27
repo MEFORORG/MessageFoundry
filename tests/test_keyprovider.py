@@ -200,6 +200,49 @@ def test_an_external_provider_that_returns_no_key_fails_closed(
     ]
 
 
+@pytest.mark.parametrize(
+    "settings",
+    [
+        pytest.param(
+            StoreSettings(key_provider="dpapi", encryption_key=KEY_A), id="dpapi-key-only"
+        ),
+        pytest.param(
+            StoreSettings(key_provider="env", encryption_key_file="C:/x/k.dpapi"),
+            id="env-file-only",
+        ),
+    ],
+)
+def test_a_pinned_provider_that_ignores_the_set_key_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, settings: StoreSettings
+) -> None:
+    # BACKLOG #2077: the provider returns no key, and the settings name one, so "no key" must never
+    # mean the identity cipher. The DR keyring must not let a retired key stand in either.
+    def _boom(_path: object) -> str:
+        raise AssertionError("the pinned provider must not read the source it ignores")
+
+    monkeypatch.setattr("messagefoundry.secrets_dpapi.load_protected_key", _boom)
+    with pytest.raises(KeyProviderError, match="reads only"):
+        resolve_active_key(settings)
+    retired = settings.model_copy(update={"encryption_keys_retired": KEY_B})
+    with pytest.raises(KeyProviderError, match="reads only"):
+        resolve_decrypt_keys(retired)
+
+
+def test_every_pinned_builtin_provider_names_the_source_it_reads() -> None:
+    # A new built-in provider missing from the table would fall into the "either source counts" arm,
+    # which is exactly the #2077 defect. So the table must name every built-in except `auto`.
+    from messagefoundry.store.keyprovider import _BUILTIN_PROVIDERS, _PINNED_KEY_SOURCE
+
+    assert set(_PINNED_KEY_SOURCE) | {"auto"} == set(_BUILTIN_PROVIDERS)
+
+
+def test_a_pinned_provider_with_no_key_at_all_is_still_keyless() -> None:
+    # The control: with nothing named the refusal does not fire, so the audited keyless opt-out still
+    # decides, as it always has.
+    assert resolve_active_key(StoreSettings(key_provider="env")) is None
+    assert resolve_active_key(StoreSettings(key_provider="dpapi")) is None
+
+
 def test_unknown_provider_fails_closed() -> None:
     with pytest.raises(KeyProviderError, match="unknown"):
         resolve_key_provider(StoreSettings(key_provider="not-a-provider"))

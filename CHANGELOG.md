@@ -348,6 +348,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
+  `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
+  `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as
+  keyed, the provider returned no key, and the store would open under the plaintext cipher: under
+  the audited opt-out, or on an existing store. Now `serve`, `supervise` and `provision-admin`
+  refuse that pairing before they open anything, whatever the opt-out says, and name the source the
+  provider reads. `open_store` refuses it for every other command. The keyless refusal texts now
+  also name an external `[store].key_provider` such as `vault` as a remedy. (`BACKLOG #2077`)
 - **Confirming TOTP enrolment no longer turns MFA on when its recovery codes are lost.** The
   confirm enabled MFA, then rotated the session, and only the rotation handed the one-time
   recovery codes back. A session revoked between the two steps left MFA on with codes nobody

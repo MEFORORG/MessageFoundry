@@ -89,6 +89,7 @@ from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AuditAppend,
     FederatedUnbind,
     SessionRecord,
     UserRecord,
@@ -3206,16 +3207,35 @@ class AuthService:
                 # incoming value is the only reachable party and there is no earlier holder to
                 # protect -- it is the target rather than announcing a first set to nobody.
                 #
-                # THE OTHER IS AN ACCOUNT WHOSE BIRTH REFUSED THE DIRECTORY'S ``mail`` (BACKLOG
-                # #2014), which keeps that value in the mirror only. Until the holder fills an
-                # address, its next repoint is announced to the refused value, with ``new_email``.
-                # That is a known cost, left open on purpose. Reading the mirror through the birth
-                # test would close it, but would also skip a legitimate non-ASCII profile address an
-                # administrator typed, and tell the new value instead of the old holder.
+                # THE MIRROR IS READ THROUGH THE BIRTH TEST, SO A VALUE IT REFUSES IS NO HOLDER
+                # (BACKLOG #2100). A refused value reaches the mirror of an account with no
+                # ``notify_email`` in at least two ways. The birth refused the directory's ``mail``
+                # (#2014), or the account was born with none and the directory filled the mirror
+                # later, unchecked. Announcing to that value would hand the corrected address, in
+                # ``new_email``, to whoever planted it, on a first deployment. So the chain falls
+                # through to the new value, which learns only its own address.
+                #
+                # WHY NOT THE OTHER FORMS THE ITEM NAMED. Dropping ``new_email`` still sends a
+                # notice to the planted address, and the renderer reads an EMAIL_CHANGED with no
+                # ``new_email`` as a REMOVAL (``pipeline/security_notify.py``), which is false.
+                # Skipping only a mirror the birth refused needs a marker read on each such
+                # repoint, and still misses the filled-later case, which leaves no marker.
+                #
+                # THE COST, STATED: an administrator's non-ASCII, Punycode or malformed profile
+                # address on a directory account with no ``notify_email`` is also read as no
+                # holder. That address is not told of the repoint; the new value is.
+                #
+                # WHAT THIS DOES NOT CLOSE: the test refuses only non-ASCII, Punycode and
+                # malformed values. An all-ASCII lookalike such as ``examp1e`` passes it, as it
+                # passes the birth, so a planted one of those in the mirror is still told the
+                # corrected address. No shape test can tell it from a real address.
+                #
+                # The same test the address form's suggestion applies, so the two cannot drift.
+                prior_holder = self.suggested_notify_email(existing.email)
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=principal.username,
-                    email=existing.notify_email or existing.email or email,
+                    email=existing.notify_email or prior_holder or email,
                     client=client,
                     detail={"new_email": email, "source": "directory"},
                 )
@@ -3252,6 +3272,20 @@ class AuthService:
         # until the holder chooses one (`notify_email_required`). Refused in the same INSERT
         # rather than cleared after, so no crash can leave the lookalike seeded.
         adopt = _adopts_directory_mail(principal)
+        # The address stays out of the audit row and the log. It is directory-supplied and may be a
+        # lookalike of someone's real one. The row is written IN THE INSERT'S TRANSACTION (BACKLOG
+        # #2100): as a second write, a crash between the two kept the account and lost the record.
+        refusal = (
+            None
+            if adopt
+            else AuditAppend(
+                "auth.ad_notify_email_not_adopted",
+                # The sign-in's own holder, or the administrator whose create this is (#2021).
+                actor=actor or principal.username,
+                detail=_json({"user_id": user_id, "source": "directory"}),
+                client=client,
+            )
+        )
         await self._store.create_user(
             user_id=user_id,
             username=principal.username,
@@ -3264,11 +3298,9 @@ class AuthService:
             directory_object_id=principal.directory_object_id,
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
+            audit=refusal,
         )
         if not adopt:
-            # The address stays out of the row and the log. It is directory-supplied and may be
-            # a lookalike of someone's real one. The audit row is a second write after the
-            # INSERT, so a crash between them loses the record but never seeds the address.
             if typed_notify_email is None:
                 _log.warning(
                     "directory account %s created without a notification address: the directory "
@@ -3281,13 +3313,6 @@ class AuthService:
                     "no Punycode label, so an administrator gave its notification address",
                     user_id,
                 )
-            await self._audit(
-                "auth.ad_notify_email_not_adopted",
-                # The sign-in's own holder, or the administrator whose create this is (#2021).
-                actor=actor or principal.username,
-                detail=_json({"user_id": user_id, "source": "directory"}),
-                client=client,
-            )
         return user_id
 
     async def create_directory_account(
