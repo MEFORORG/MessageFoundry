@@ -6,8 +6,8 @@ When ``[auth].admin_new_ip_step_up`` is on, a step-up (sensitive admin) request 
 address the session has not verified from is treated as higher-risk: it audits + notifies and FORCES a
 fresh step-up, which a successful ``POST /me/reauth`` from that address clears (re-anchoring the
 session). It is advisory + step-up-forcing only — it never changes an authz decision and never blocks
-the non-admin request path. Default off, and a single-host loopback deployment, are byte-identical
-no-ops (the request and the session share one address).
+the non-admin request path. It defaults ON since BACKLOG #288; turning it off, and a single-host
+loopback deployment, are no-ops (the request and the session share one address).
 """
 
 from __future__ import annotations
@@ -74,11 +74,18 @@ async def _enabled_admin(service: AuthService, *, client: str) -> tuple[str, Ide
 
 
 # --- service / store unit ----------------------------------------------------
-async def test_disabled_by_default_is_a_noop() -> None:
+def test_on_by_default() -> None:
+    """BACKLOG #288 (owner ruling 2026-09-26): the signal ships ON; off is a named loosening."""
+    assert AuthSettings().admin_new_ip_step_up is True
+
+
+async def test_explicitly_disabled_is_a_noop() -> None:
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
-        service = AuthService(store, AuthSettings(), security_notifier=notifier)  # default off
+        service = AuthService(
+            store, AuthSettings(admin_new_ip_step_up=False), security_notifier=notifier
+        )
         await service.initialize()
         token, _ = await _enabled_admin(service, client="10.1.1.1")
         notifier.events.clear()  # setup's ACCOUNT_CREATED notice (BACKLOG #315), not under test
@@ -340,8 +347,8 @@ async def test_known_ip_with_feature_on_is_unobtrusive(engine: Engine) -> None:
         assert (await a.post("/users", headers=_auth(token), json=NEW_USER)).status_code == 201
 
 
-async def test_disabled_by_default_new_ip_does_not_force_step_up(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))  # admin_new_ip default off
+async def test_explicitly_disabled_new_ip_does_not_force_step_up(engine: Engine) -> None:
+    service = AuthService(engine.store, AuthSettings(admin_new_ip_step_up=False, require_mfa=False))
     await service.initialize()
     await _add_admin(service, "boss")
     async with _client_at(engine, service, "10.0.0.1") as a:

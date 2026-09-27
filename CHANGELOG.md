@@ -7,6 +7,20 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A sign-in from an address the account has not used recently is now challenged and reported.**
+  At every session mint, on the local, Kerberos and OIDC legs, the engine compares the sign-in's
+  client address with the addresses the account finished authenticating from: its own
+  `auth.login_success` rows that owed no second factor, plus its `auth.mfa_verified` and
+  `auth.webauthn_verified` rows, the newest 200 of each from the last 90 days. There is no schema
+  change. A first-seen address writes `auth.login_new_ip` and sends the holder a `login_new_ip`
+  notice (at most one per account and address per 15 minutes). On a sign-in that owes no second
+  factor it also mints the session without step-up freshness. A sign-in that owes a factor, which
+  is every local sign-in under the shipped `require_mfa` scope, and every directory sign-in, is born
+  unseeded anyway, so there the signal only audits and notifies. The login itself is never refused. An account's
+  first sign-in ever, a sign-in with no client address, and a failed history read fail open and
+  write `auth.login_address_unevaluated` with the reason. There is no setting. A typical-hours signal was
+  ruled out, because it would challenge night staff on a 24-hour clinical service.
+  (`BACKLOG #288`, owner ruling 2026-09-26, ASVS 8.2.4)
 - **A session signed in through the identity provider now steps up there, not with a password.**
   Each session records how it was minted, in a new `sessions.auth_mechanism` column on all three
   store backends: `password`, `kerberos` or `oidc`. Rotation keeps it. For an `oidc` session the
@@ -149,6 +163,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **`[auth].admin_new_ip_step_up` now defaults to `true`.** A sensitive admin action from a client
+  address the session has not verified from now forces a fresh step-up, writes
+  `auth.admin_action_new_ip` and notifies the account holder, with no setting needed. It never
+  denies a request, and it cannot fire on a single-host loopback bind. Setting it `false` is a named
+  loosening: `security_loosenings()`, the `serve` warning and `GET /security/posture` report it while
+  auth is on. The exposed-console advisory now fires only on that opt-out. ADR 0068 carries a dated
+  amendment. (`BACKLOG #288`, owner ruling 2026-09-26, ASVS 8.2.4)
 - **BREAKING: `[api].trusted_proxies` now needs `[api].tls_terminated_upstream` or an operator
   `[api].tls_cert_file`, and is refused at load without one.** uvicorn takes the request scheme from
   a trusted proxy's `X-Forwarded-Proto`. With neither key, a proxy that forwarded `http` made the

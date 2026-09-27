@@ -189,6 +189,44 @@ def test_recheck_at_the_default_with_ad_enabled_is_not_a_loosening() -> None:
     assert "ad_session_recheck_seconds" not in _names(auth=_ad())
 
 
+# --- [auth].admin_new_ip_step_up (BACKLOG #288) ----------------------------------------------
+
+
+def test_new_ip_step_up_defaults_on() -> None:
+    """BACKLOG #288 (owner ruling 2026-09-26): the mid-session new-address step-up ships ON."""
+    assert AuthSettings().admin_new_ip_step_up is True
+    assert "admin_new_ip_step_up" not in _names()
+
+
+def test_new_ip_step_up_off_is_a_named_loosening() -> None:
+    named = dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(admin_new_ip_step_up=False),
+            AlertsSettings(),
+            SecretRotationSettings(),
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+        )
+    )
+    assert "admin_new_ip_step_up" in named
+    assert "new client address" in named["admin_new_ip_step_up"].lower()
+
+
+def test_new_ip_step_up_off_with_auth_off_is_NOT_a_loosening() -> None:
+    """CONDITIONAL on sign-in: with auth off there is no session for the signal to guard, and the
+    auth-off posture is refused or reported by its own gate."""
+    assert "admin_new_ip_step_up" not in _names(
+        auth=AuthSettings(enabled=False, admin_new_ip_step_up=False)
+    )
+
+
 # --- the cross-field refusal, keyed on model_fields_set ---------------------------------------
 #
 # These go through load_settings, NOT the constructor. Constructing AuthSettings(...) in Python marks
@@ -1056,7 +1094,6 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
     exempt_auth = {
         # HARDENINGS / topology choices — a flip is not a weakening of the shipped posture.
         "require_action_step_up",
-        "admin_new_ip_step_up",
         "ad_enabled",
         "ad_use_nested_groups",
         "kerberos_enabled",
