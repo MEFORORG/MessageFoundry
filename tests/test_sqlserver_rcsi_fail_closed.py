@@ -217,7 +217,9 @@ async def test_an_external_open_runs_no_probe_and_no_alter(monkeypatch: pytest.M
     """Under the external default the runtime login issues no ALTER DATABASE, so the open-time probe
     connection is never made. The RCSI refusal moves to the pooled read, which
     tests/test_sqlserver_schema_init.py pins."""
-    cursor, _conn, pools = _install(monkeypatch, row=(0, 0))
+    # connect_fails: any probe connection would raise before the pool, so reaching the pool proves
+    # none was made.
+    cursor, _conn, pools = _install(monkeypatch, row=(0, 0), connect_fails=True)
     external = _settings().model_copy(update={"schema_management": SchemaManagement.EXTERNAL})
     with pytest.raises(_PoolCreated):
         await SqlServerStore.open(external)
@@ -239,8 +241,13 @@ async def test_provisioning_logs_rather_than_refuses(
     """``provision-schema`` is not an open. It passes ``fail_closed=False`` so the schema batch still
     runs, then reads the state back and exits 3 on an RCSI still off. The default stays fail-closed,
     which the tests above pin through ``open``."""
-    _cursor, conn, _pools = _install(monkeypatch, row=row, denied=denied)
+    cursor, conn, _pools = _install(monkeypatch, row=row, denied=denied)
     with caplog.at_level(logging.WARNING):
         await SqlServerStore._ensure_database_options(_settings(), fail_closed=False)
     assert "READ_COMMITTED_SNAPSHOT" in caplog.text
     assert conn.closed
+    # No concurrent opener to wait for: provisioning runs with the engines stopped.
+    assert conn.rereads == []
+    if row is not None:
+        # The online snapshot step is still tried after the RCSI ALTER was denied.
+        assert _ALTER_SNAPSHOT in cursor.executed

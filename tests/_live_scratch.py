@@ -123,12 +123,38 @@ class SqlServerAdmin:
         logins: Sequence[str] = (),
     ) -> None:
         """Drop what a live leg created: sessions first, then users in this connection's database,
-        then scratch databases, then logins. Each statement runs even when an earlier one failed."""
-        # Each step is BOUNDED as well as suppressed: a teardown that waits forever on a stalled
-        # session turns one red into a whole-leg timeout that reports nothing.
+        then scratch databases, then logins. Each statement runs even when an earlier one failed.
+
+        It runs on a FRESH admin connection. A step :func:`bounded` gave up on is still running on
+        this one's worker thread, since cancelling a coroutine does not stop a pyodbc call, so this
+        connection may be busy for as long as the stall lasts. Each step is also bounded: the first
+        one that stalls writes the blocking report and ends the teardown, so a stalled teardown costs
+        one bound rather than one per statement, and says why."""
+        try:
+            async with sqlserver_admin(self.settings) as fresh:
+                await fresh._teardown_steps(databases=databases, users=users, logins=logins)
+        except TimeoutError:
+            report = await sqlserver_blocking_report(self.settings)
+            _emit(f"\n[live-leg] teardown stalled; leaving the rest behind\n{report}\n")
+            for kind, names in (("database", databases), ("login", logins)):
+                for name in names:
+                    _leak_warning(kind, name, "teardown stalled before reaching it")
+        except Exception as exc:  # noqa: BLE001 - a failed teardown connect must not mask the test
+            _leak_warning("scratch objects", ", ".join([*databases, *logins]), repr(exc))
+
+    async def _teardown_steps(
+        self, *, databases: Sequence[str], users: Sequence[str], logins: Sequence[str]
+    ) -> None:
+        async def step(awaitable: Awaitable[None]) -> None:
+            try:
+                await asyncio.wait_for(awaitable, _TEARDOWN_STEP_S)
+            except TimeoutError:
+                raise  # a stall ends the teardown; see teardown()
+            except Exception:  # noqa: BLE001, S110 - read back below; one failure skips nothing
+                pass
+
         for login in logins:
-            with contextlib.suppress(Exception):  # read back below; one failure skips nothing
-                await asyncio.wait_for(self.kill_sessions(login), _TEARDOWN_STEP_S)
+            await step(self.kill_sessions(login))
         drops = [f"IF USER_ID('{user}') IS NOT NULL DROP USER [{user}]" for user in users]
         drops += [
             f"IF DB_ID('{db}') IS NOT NULL BEGIN ALTER DATABASE [{db}] SET SINGLE_USER WITH "
@@ -137,8 +163,7 @@ class SqlServerAdmin:
         ]
         drops += [f"IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]" for login in logins]
         for drop in drops:
-            with contextlib.suppress(Exception):  # read back below; one failure skips nothing
-                await asyncio.wait_for(self.run(drop), _TEARDOWN_STEP_S)
+            await step(self.run(drop))
         for user in users:
             await self._report_leak("database user", user, f"SELECT USER_ID('{user}')")
         for db in databases:
@@ -149,6 +174,8 @@ class SqlServerAdmin:
     async def _report_leak(self, kind: str, name: str, probe: str) -> None:
         try:
             left = await asyncio.wait_for(self.scalar(probe), _TEARDOWN_STEP_S)
+        except TimeoutError:
+            raise  # a stall ends the teardown; see teardown()
         except Exception as exc:  # noqa: BLE001 - the read-back itself failing is also worth saying
             _leak_warning(kind, name, f"could not read it back ({exc})")
             return
@@ -202,9 +229,9 @@ def _blocking_report_sync(settings: StoreSettings) -> str:
 
     from messagefoundry.store.sqlserver import connection_string
 
-    conn = pyodbc.connect(connection_string(settings), autocommit=True, timeout=10)
+    conn = pyodbc.connect(connection_string(settings), autocommit=True, timeout=5)
     try:
-        conn.timeout = 10  # the per-statement bound: a report must not stall on what it reports
+        conn.timeout = 4  # the per-statement bound: a report must not stall on what it reports
         lines: list[str] = []
         for title, sql in _BLOCKING_QUERIES:
             cur = conn.cursor()
@@ -230,7 +257,7 @@ async def sqlserver_blocking_report(settings: StoreSettings) -> str:
         future = asyncio.get_running_loop().run_in_executor(
             executor, _blocking_report_sync, settings
         )
-        return await asyncio.wait_for(future, 30)
+        return await asyncio.wait_for(future, 20)
     except Exception as exc:  # noqa: BLE001 - the report is best-effort by design
         return f"(blocking report unavailable: {exc!r})"
     finally:
@@ -247,17 +274,18 @@ def _emit(text: str) -> None:
 
 
 async def bounded[T](
-    settings: StoreSettings, step: str, awaitable: Awaitable[T], *, seconds: float = 20.0
+    settings: StoreSettings, step: str, awaitable: Awaitable[T], *, seconds: float = 15.0
 ) -> T:
-    """Await one live step with a bound. On a timeout or an error, write the server's blocking report
-    to stderr at once, then re-raise, so a stall names what it waited on instead of running into the
-    whole-test timeout with nothing said. ``settings`` names the principal the report connects as."""
+    """Await one live step with a bound. On a TIMEOUT, name the step on stderr at once, then write the
+    server's blocking report and re-raise, so a stall says what it waited on instead of running into
+    the whole-test timeout with nothing said. Any other error propagates untouched: some steps are
+    expected to raise. ``settings`` names the principal the report connects as."""
     try:
         return await asyncio.wait_for(awaitable, seconds)
-    except Exception as exc:
-        what = f"did not finish within {seconds:g}s" if isinstance(exc, TimeoutError) else repr(exc)
-        report = await sqlserver_blocking_report(settings)
-        _emit(f"\n[live-leg] {step}: {what}\n{report}\n")
+    except TimeoutError:
+        # The step line first: if the report itself runs into the whole-test timeout, this survives.
+        _emit(f"\n[live-leg] {step}: did not finish within {seconds:g}s\n")
+        _emit(await sqlserver_blocking_report(settings) + "\n")
         raise
 
 

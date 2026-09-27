@@ -31,7 +31,7 @@ from typing import Any
 import pytest
 
 import messagefoundry.store.sqlserver as sqlserver_module
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.store.sqlserver import SqlServerStore
 
 
@@ -109,8 +109,14 @@ def _install_fake_aioodbc_that_never_connects(monkeypatch: pytest.MonkeyPatch) -
 
 
 def _settings() -> StoreSettings:
+    # AUTO: the open-time RCSI probe the fake answers runs only there (#305); the external default
+    # makes no probe connection, and the leak paths below are the same in both modes.
     return StoreSettings(
-        backend=StoreBackend.SQLSERVER, server="localhost", database="mefor_test", username="sa"
+        backend=StoreBackend.SQLSERVER,
+        server="localhost",
+        database="mefor_test",
+        username="sa",
+        schema_management=SchemaManagement.AUTO,
     )
 
 
