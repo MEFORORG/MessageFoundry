@@ -538,12 +538,9 @@ def credential_id_from_response(response_json: str) -> bytes:
     raw_id = parsed["rawId"] if isinstance(parsed, dict) else None
     if not isinstance(raw_id, str) or not raw_id:
         raise WebAuthnVerificationError("ceremony response has no rawId")
-    credential_id: bytes | None = None
     with contextlib.suppress(ValueError, TypeError):
-        credential_id = base64url_to_bytes(raw_id)
-    if credential_id is None:
-        raise WebAuthnVerificationError("malformed ceremony response")
-    return credential_id
+        return base64url_to_bytes(raw_id)
+    raise WebAuthnVerificationError("malformed ceremony response")
 
 
 def _transports_from_response(response_json: str) -> list[str] | None:

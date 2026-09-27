@@ -572,13 +572,10 @@ async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
     on to become an ingress row and a 202, understating what the sender actually declared."""
     if n == 0:
         return b""
-    body: bytes | None = None
     # Refused outside the handler: IncompleteReadError.partial holds the body read so far (#2085).
     with contextlib.suppress(asyncio.IncompleteReadError):
-        body = await reader.readexactly(n)
-    if body is None:
-        raise HttpRequestError(400, "incomplete request body", kind="framing_error")
-    return body
+        return await reader.readexactly(n)
+    raise HttpRequestError(400, "incomplete request body", kind="framing_error")
 
 
 # The runner injects an HTTP receipt handler that commits the body to ingress and returns the engine

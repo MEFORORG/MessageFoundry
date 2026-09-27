@@ -164,12 +164,9 @@ class TransitCipher(_UnmarkedPolicy):
             ) from exc
         # Refused OUTSIDE the handler: a UnicodeDecodeError's .object is the decrypted plaintext, so
         # chaining it would put the PHI this cipher protects on the error (BACKLOG #2085).
-        plaintext: str | None = None
         with contextlib.suppress(ValueError):  # binascii.Error and UnicodeDecodeError are both
-            plaintext = base64.b64decode(plaintext_b64).decode("utf-8")
-        if plaintext is None:
-            raise CipherError(f"Transit returned malformed plaintext (key={self._key!r})")
-        return plaintext
+            return base64.b64decode(plaintext_b64).decode("utf-8")
+        raise CipherError(f"Transit returned malformed plaintext (key={self._key!r})")
 
     def is_encrypted(self, stored: str) -> bool:
         return stored.startswith(MARKER_PREFIX)

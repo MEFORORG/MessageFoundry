@@ -46,7 +46,8 @@ gate's) are not new chains and are skipped. The fix is the same safe shape as ab
 ``json_loads_or_refusal`` in ``messagefoundry/redaction.py`` for a JSON decode.
 
 **What neither gate covers, on purpose.** A caught type outside that set whose text or attributes
-happen to hold content is invisible to a name-keyed scan, and so is a body-holding error that
+happen to hold content is invisible to a name-keyed scan. So is a JSON decode the ``try`` reaches
+only through a helper, ``model_validate_json`` or another library, and so is a body-holding error that
 propagates unwrapped (``RawMessage.json`` let json's own error out until #2085). Frame locals are also
 out of scope: the raised exception's own
 ``__traceback__`` reaches the same frame whether or not the chain is cut, so ``from None`` could never

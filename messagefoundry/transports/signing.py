@@ -118,12 +118,9 @@ def _b64u_or_refusal(segment: str, refusal: str) -> bytes:
 
     A decode error can hold the segment, and a JWS payload is an id_token's claims, so the refusal
     must not chain it (BACKLOG #2085)."""
-    decoded: bytes | None = None
     with contextlib.suppress(ValueError):  # binascii.Error, and a non-ASCII str
-        decoded = _b64u_decode(segment)
-    if decoded is None:
-        raise SigningError(refusal)
-    return decoded
+        return _b64u_decode(segment)
+    raise SigningError(refusal)
 
 
 def _b64u_json_or_refusal(segment: str, refusal: str) -> Any:

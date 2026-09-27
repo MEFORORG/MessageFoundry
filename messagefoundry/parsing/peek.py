@@ -269,14 +269,13 @@ class Peek:
         # <the whole segment>" -- and every HL7PeekError text reaches the sender in MSA-3 and the
         # stored ERROR reason. So the refusal names only the parser's error CLASS, and is raised after
         # the handler so python-hl7's error is not on its chain either (BACKLOG #2085).
-        refused: str | None = None
         try:
             message = hl7.parse(text)
         except Exception as exc:  # python-hl7 raises a variety of ValueErrors
             refused = type(exc).__name__
-        if refused is not None:
-            raise HL7PeekError(f"could not parse HL7 message ({refused})")
-        return cls(message=message, raw=norm)
+        else:
+            return cls(message=message, raw=norm)
+        raise HL7PeekError(f"could not parse HL7 message ({refused})")
 
     # --- generic field access (for filters) ----------------------------------
 
