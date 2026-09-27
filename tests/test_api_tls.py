@@ -654,22 +654,35 @@ def _rp_for(public_origin: str | None, from_request: bool) -> tuple[str, str] | 
 
 
 @pytest.mark.parametrize(
-    ("api_extra", "from_request", "rp"),
+    ("top_extra", "api_extra", "from_request", "rp", "warns"),
     [
-        ('trusted_proxies = ["127.0.0.1"]\n', False, None),
+        ("", 'trusted_proxies = ["127.0.0.1"]\n', False, None, True),
         # Control: the fix is keyed on the proxy, not on the certificate. A direct loopback browser
         # keeps the dev flow ADR 0068 section 7 allows, so the None above is the proxy's doing.
-        ("", True, (_FORWARDED_HOST, f"https://{_FORWARDED_HOST}")),
+        ("", "", True, (_FORWARDED_HOST, f"https://{_FORWARDED_HOST}"), False),
+        # The recovery the warning names: with the external origin set the rp_id is that origin and
+        # serve is quiet. The console is explicit, or a set origin would degrade the default-on
+        # console to JSON-only and the warning would be silent for that reason instead.
+        (
+            "security.serve_web_console = true\n"
+            f'security.web_console_public_address = "{_PUBLIC_ORIGIN}"\n',
+            'trusted_proxies = ["127.0.0.1"]\n',
+            False,
+            ("ops.example.test", _PUBLIC_ORIGIN),
+            False,
+        ),
     ],
-    ids=["operator-cert-proxy", "operator-cert-direct"],
+    ids=["operator-cert-proxy", "operator-cert-direct", "operator-cert-proxy-public-origin"],
 )
 def test_serve_keys_the_request_derived_rp_id_on_a_configured_proxy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    top_extra: str,
     api_extra: str,
     from_request: bool,
     rp: tuple[str, str] | None,
+    warns: bool,
 ) -> None:
     """BACKLOG #2116. A loopback bind with an operator certificate and ``trusted_proxies`` set is an
     accepted posture since #2055, and nothing in it declares a terminator. The Host such a proxy
@@ -681,21 +694,16 @@ def test_serve_keys_the_request_derived_rp_id_on_a_configured_proxy(
     cert, key = _self_signed(tmp_path)
     toml = (
         _SYNTHETIC_LOOPBACK_TOML
+        + top_extra
         + f'[api]\ntls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n'
         + api_extra
     )
     handed, _ = _serve_capturing(tmp_path, monkeypatch, toml)
+    assert handed["serve_ui"] is True  # the warning's silence below is not a console switched off
     assert handed["webauthn_rp_from_request"] is from_request
     assert _rp_for(handed["public_origin"], handed["webauthn_rp_from_request"]) == rp
     warned = "[api].trusted_proxies is set without" in capsys.readouterr().err
-    assert warned is not from_request
-
-
-@pytest.mark.parametrize("from_request", [False, True])
-def test_a_public_origin_is_the_rp_id_whatever_the_posture(from_request: bool) -> None:
-    # The recovery the fail-closed notice names: set the external origin and passkeys work behind any
-    # proxy, anchored to it rather than to the forwarded Host.
-    assert _rp_for(_PUBLIC_ORIGIN, from_request) == ("ops.example.test", _PUBLIC_ORIGIN)
+    assert warned is warns
 
 
 @pytest.mark.parametrize(

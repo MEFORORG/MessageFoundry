@@ -3911,7 +3911,7 @@ def _serve(args: argparse.Namespace) -> int:
         serve_ui=settings.api.serve_ui,  # read-only browser ops dashboard under /ui (ADR 0065)
         public_origin=settings.api.public_origin,  # /ui external origin for off-loopback same-origin
         # WebAuthn rp_id may derive from the request URL ONLY on a loopback bind with no reverse
-        # proxy in front (ADR 0068 §7) — behind one, declared or merely trusted, the Host header is
+        # proxy declared or trusted in config (ADR 0068 §7) — behind one, the Host header is
         # client-forwardable, so ceremonies fail closed unless public_origin is set (BACKLOG #2116).
         webauthn_rp_from_request=settings.api.webauthn_rp_from_request,
         # L5b (ADR 0068 §8): exposure_protected forces the session cookie's Secure flag + HSTS
