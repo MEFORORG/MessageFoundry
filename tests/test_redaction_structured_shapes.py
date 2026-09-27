@@ -49,6 +49,12 @@ CITY = "Zendaport"
 DICOM_NAME = "Zqxdoe^Janex"
 DICOM_ID = "PID9988776"
 ISSUER = "Qorvelhosp"
+#: Group 0010 values above element ``00xx`` (BACKLOG #2079): Other Patient IDs, Other and Birth and
+#: Mother's Birth names, Address, Telephone Numbers.
+OTHER_ID = "PIDX7766554"
+OTHER_NAME = "Vornb^Qorv"
+BIRTH_NAME = "Zqxborn^Ula"
+MOTHER_NAME = "Qorvmom^Ilse"
 
 
 @dataclass(frozen=True)
@@ -146,6 +152,41 @@ SHAPES = (
         kept=("no match for PatientName=", "PatientID=", "Modality=CT"),
     ),
     Shape(
+        # The rest of group 0010: the tag pass used to stop at element 00xx.
+        "dcmdump-group-0010-beyond-00xx",
+        "(0010,1000) LO [PIDX7766554]                           #  12, 1 OtherPatientIDs\n"
+        "(0010,1001) PN [Vornb^Qorv]                            #  10, 1 OtherPatientNames\n"
+        "(0010,1005) PN [Zqxborn^Ula]                           #  12, 1 PatientBirthName\n"
+        "(0010,1040) LO [4411 qorvelway]                        #  14, 1 PatientAddress\n"
+        "(0010,1060) PN [Qorvmom^Ilse]                          #  12, 1 PatientMotherBirthName\n"
+        "(0010,2154) SH [555-201-3344]                          #  12, 1 PatientTelephoneNumbers\n"
+        "(0008,0060) CS [CT]                                    #   2, 1 Modality",
+        (OTHER_ID, OTHER_NAME, BIRTH_NAME, STREET, MOTHER_NAME, PHONE),
+        "_redact_dicom_tags",
+        kept=("(0010,1000)", "(0010,2154)", "(0008,0060) CS [CT]"),
+    ),
+    Shape(
+        "dicom-json-model-beyond-00xx",
+        '{"00101000": {"vr": "LO", "Value": ["PIDX7766554"]}, '
+        '"00101040": {"vr": "LO", "Value": ["4411 qorvelway"]}, '
+        '"00102154": {"vr": "SH", "Value": ["555-201-3344"]}, '
+        '"00080060": {"vr": "CS", "Value": ["CT"]}}',
+        (OTHER_ID, STREET, PHONE),
+        "_redact_json_fields",
+        kept=('"00080060": {"vr": "CS", "Value": ["CT"]}', '"00101040"'),
+    ),
+    Shape(
+        "dicom-keyword-labels-beyond-00xx",
+        "no match for OtherPatientIDs=PIDX7766554 PatientAddress='4411 qorvelway' "
+        "PatientTelephoneNumbers=555-201-3344 OtherPatientNames=Vornb^Qorv "
+        # The `;` keeps `Ilse Modality` from reading as a two-token name run, which would cover the
+        # value for another pass and blind this fixture's positive control.
+        "PatientBirthName: Zqxborn^Ula; PatientMotherBirthName=Qorvmom^Ilse; Modality=CT",
+        (OTHER_ID, STREET, PHONE, OTHER_NAME, BIRTH_NAME, MOTHER_NAME),
+        "_redact_dicom_labels",
+        kept=("no match for OtherPatientIDs=", "PatientAddress=", "Modality=CT"),
+    ),
+    Shape(
         "dicom-keyword-dict-repr",
         "query {'PatientName': 'Zqxdoe^Janex', 'PatientID': 'PID9988776', 'Modality': 'CT'}",
         (DICOM_NAME, DICOM_ID),
@@ -191,10 +232,11 @@ NEGATIVE_CONTROLS = (
     "(0020,000D) UI [1.2.840.10008.5.1.4.1.1.2]",
     "    name = ds.PatientName",
     "set the identifier and telecom mappings in the address book",
-    # `name` and `address` are operator vocabulary too; a plain STRING under them is kept in JSON.
-    'preset.create {"id": "p1", "name": "ED triage view", "replaced": false}',
+    # `name` and `address` are operator vocabulary too; a plain STRING an operator configured -- a
+    # connection name, an address -- is kept in JSON by its shape (BACKLOG #2079).
     "validation error input_value={'name': 'IB_ACME_ADT', 'type': 'mllp'}",
     "connect failed {'address': '10.1.2.3', 'port': 2575}",
+    '{"name": "IB_ACME_ADT", "address": "mllp.example.org:2575", "path": "C:/drops/in"}',
     # Two placeholders side by side: a child tag after a SPACE is not markup evidence.
     "Usage: tool <name> <address> then more words here",
     # A label that ends its line has no value; the next line is not its value.
@@ -304,6 +346,7 @@ _HOSTILE = {
     "xml-open-evidenced": ("", "<name><a>b"),
     "xml-closed-elements": ("", "<family>a</family> "),
     "dicom-tags-one-line": ("", "(0010,0010) PN [a] "),
+    "dicom-tags-beyond-00xx": ("", "(0010,1040) LO [a] "),
     "dicom-labels": ("", "PatientName=a "),
     "dicom-labels-unterminated-quote": ("", "PatientName='a "),
     # A start tag with a long run that is not a quoted attribute. The first draft stepped one
@@ -534,13 +577,85 @@ def test_second_round_shapes_do_not_leak(text: str, value: str) -> None:
     assert redact(out) == out
 
 
-def test_a_plain_string_name_in_json_is_a_stated_residual() -> None:
-    """``name`` and ``address`` scrub a STRUCTURE only (``_PHI_STRUCTURE_ONLY_KEYS``), so an
-    operator's ``{"name": "IB_ACME_ADT"}`` survives -- and so does a single-token patient name in
-    non-FHIR JSON. Pinned so a change to that trade is deliberate. A FHIR ``name`` is an array or an
-    object and is scrubbed (the fixtures above), and a two-token string is caught by the name run."""
-    assert FAMILY in redact('{"name": "Zqxdoe"}')
+# --- a plain string under JSON `name` / `address` (BACKLOG #2079) -----------------------------------
+#
+# BACKLOG #1711 kept every plain string under these two keys, so a one-word patient name walked
+# through. The choice now: scrub it unless its shape says an operator configured it. Both halves are
+# pinned here so a change to the trade is deliberate.
+
+#: ``(text, value)``: a person-shaped plain string, which must be gone.
+_PERSON_SHAPED_STRINGS = (
+    ('{"name": "Zqxdoe"}', FAMILY),
+    ("bad {'name': 'Zqxdoe'}", FAMILY),
+    ('{"name": "zqxdoe janex"}', "zqxdoe"),
+    ('{"name": "O\'Zqxdoe-Janex"}', "Zqxdoe"),
+    ('{"address": "4411 qorvelway"}', "qorvelway"),
+    ('{"address": "Zendaport"}', CITY),
+    ('invalid "name": Zqxdoe', FAMILY),
+)
+
+#: Plain strings an operator configured, each kept byte-identical.
+_OPERATOR_SHAPED_STRINGS = (
+    '{"name": "IB_ACME_ADT"}',
+    "{'address': '10.1.2.3', 'port': 2575}",
+    '{"address": "mllp.example.org:2575"}',
+    '{"name": "ob-lab-results_2"}',
+)
+
+
+@pytest.mark.parametrize(("text", "value"), _PERSON_SHAPED_STRINGS)
+def test_a_person_shaped_plain_string_under_name_or_address_is_scrubbed(
+    text: str, value: str
+) -> None:
+    out = redact(text)
+    assert value not in out, out
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(("text", "value"), _PERSON_SHAPED_STRINGS)
+def test_the_shape_rule_is_what_scrubs_it(
+    text: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROL: with the rule answering "keep" -- the pre-#2079 behaviour -- each value
+    leaks, so the green above is the rule's work."""
+    monkeypatch.setattr(redaction, "_kept_under_structure_only", lambda value: True)
+    assert value in redact(text)
+
+
+@pytest.mark.parametrize("text", [*_OPERATOR_SHAPED_STRINGS, '{"name": ""}'])
+def test_an_operator_shaped_plain_string_is_kept(text: str) -> None:
+    assert redact(text) == text
+
+
+@pytest.mark.parametrize("text", _OPERATOR_SHAPED_STRINGS)
+def test_the_shape_rule_is_what_keeps_it(text: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mirror control: with the rule answering "scrub", each operator value is lost, so the arm
+    above is the rule's work and not a pass that never looked."""
+    monkeypatch.setattr(redaction, "_kept_under_structure_only", lambda value: False)
+    assert redact(text) != text
+
+
+def test_a_typed_preset_name_in_the_audit_detail_is_over_redacted_by_decision() -> None:
+    """The measured cost of closing the leak: the ``preset.create`` audit detail carries a name a user
+    typed, and the off-box tee runs it through ``safe_text``. A person-shaped name there is scrubbed in
+    that copy; the stored audit row is untouched and the other fields survive."""
+    detail = '{"id": "p1", "name": "ED triage view", "replaced": false, "needle_shape": "mrn"}'
+    out = safe_text(detail)
+    assert "ED triage view" not in out
+    assert '"id": "p1"' in out and '"replaced": false' in out and '"needle_shape": "mrn"' in out
+
+
+def test_a_two_token_string_name_is_still_caught_either_way() -> None:
+    """The name run catches a two-token string whatever the shape rule says."""
     assert "Zqxdoe Janex" not in redact('{"name": "Zqxdoe Janex"}')
+
+
+def test_every_dicom_keyword_holds_patient_so_the_prefilter_cannot_skip_one() -> None:
+    """``_redact_dicom_labels`` skips a line with no ``Patient`` in it. A keyword without that word
+    would be skipped whenever it stood alone on its line."""
+    keywords = _keyword_alternation(redaction._DICOM_PHI_LABEL)
+    assert len(keywords) > 5
+    assert all("Patient" in keyword for keyword in keywords), sorted(keywords)
 
 
 def _keyword_alternation(pattern: re.Pattern[str]) -> set[str]:

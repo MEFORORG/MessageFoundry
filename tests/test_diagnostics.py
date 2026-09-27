@@ -32,7 +32,12 @@ def test_log_note_redacts_every_value_by_default(caplog: pytest.LogCaptureFixtur
 def test_log_note_reveals_only_under_the_dev_flag(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """The flag is what this measures, so caplog must be the only handler that sees the record. An
+    earlier test can leave a root handler carrying the PHI filter chain, which rewrites the shared
+    LogRecord; since BACKLOG #2079 that chain scrubs ``MRN 100``, so this arm went red whenever such
+    a test ran first in the same process (``tests/test_asvs_phase0.py`` does)."""
     monkeypatch.setattr(diag, "_reveal", True)
+    monkeypatch.setattr(logging.getLogger(), "handlers", [caplog.handler])
     with caplog.at_level(logging.DEBUG, logger=_LOGGER):
         log_note("MRN {}", "100")
     assert "100" in caplog.text
