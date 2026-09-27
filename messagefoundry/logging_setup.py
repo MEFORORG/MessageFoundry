@@ -839,7 +839,7 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             self._collector_failed()
 
     def dequeue(self, block: bool) -> Any:
-        if self.spool is None:
+        if self.spool is None or not block:
             record = super().dequeue(block)
         else:
             # Wake up now and then with nothing queued, so a spooled backlog is retried even when

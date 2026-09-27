@@ -180,11 +180,21 @@ class LogSpool:
                 f"log spool directory {self.directory} is in use by another process"
             )
         self._lock_fd = fd
-        for path in self.directory.iterdir():
-            seq = _segment_seq(path)
-            if seq is not None:
-                self._segments.append(seq)
-                self._sizes[seq] = path.stat().st_size
+        try:
+            for path in self.directory.iterdir():
+                seq = _segment_seq(path)
+                if seq is not None:
+                    self._segments.append(seq)
+                    self._sizes[seq] = path.stat().st_size
+        except OSError as exc:
+            # Unreadable leftovers make the spool unusable, not the process: the caller runs
+            # spool-less. A bare OSError here would reach serve's [logging].file refusal instead.
+            self.close()
+            self._segments.clear()
+            self._sizes.clear()
+            raise SpoolUnavailable(
+                f"log spool directory {self.directory} is not readable: {exc}"
+            ) from exc
         self._segments.sort()
 
     def close(self) -> None:
@@ -274,7 +284,16 @@ class LogSpool:
                 return None
             seq = self._segments[0]
             if self._reader is None or self._read_seq != seq:
-                self._open_reader(seq)
+                try:
+                    self._open_reader(seq)
+                except OSError:
+                    # A segment removed or locked from outside. Skipping it is the only move that
+                    # keeps the listener thread alive; an exception here would end it for good.
+                    self.unreadable += 1
+                    if seq == self._write_seq:
+                        self._close_writer()
+                    self._retire(seq)
+                    continue
             assert self._reader is not None
             start = self._reader.tell()
             raw = self._reader.readline()
