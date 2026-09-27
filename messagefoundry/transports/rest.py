@@ -1302,6 +1302,19 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     return bool(user and password)
 
 
+def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
+    """Does a ``proxy_no_proxy`` value send ``host`` direct, past the proxy (BACKLOG #1989)?
+
+    The predicate :meth:`ProxyConfig.for_host` applies, public so the static-credential hop reader
+    decides a bypass the way the transport does rather than restating it. ``host=None`` is a target
+    whose host cannot be read before the connector is built (an ``env()`` reference): only a
+    bypass-everything ``*`` entry is certain to cover it, so nothing else does."""
+    bypass = _normalize_no_proxy(no_proxy)
+    if host is None:
+        return "*" in bypass
+    return _proxy_bypasses(host, bypass)
+
+
 def proxy_config_from_settings(
     s: Mapping[str, Any],
     *,

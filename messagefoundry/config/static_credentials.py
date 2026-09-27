@@ -73,7 +73,8 @@ names the SETTING that holds it, never the value."""
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Mapping
+import urllib.parse
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -167,8 +168,9 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
         out.append("HTTP Digest")
     if ctype is ConnectorType.SOAP:
         ws_user = settings.get("ws_username") or settings.get("basic_user")
-        ws_password = settings.get("ws_password") or settings.get("basic_password")
-        if settings.get("ws_security") and (ws_user or ws_password):
+        # The connector stamps a UsernameToken only when it has a user (``_build_wsse_header``); a
+        # password with no user puts nothing on the wire.
+        if settings.get("ws_security") and ws_user:
             out.append("WS-Security UsernameToken")
         if settings.get("body_secret_tokens"):
             out.append("body secrets")
@@ -204,8 +206,45 @@ def _proxy_url_sends_userinfo(url: object) -> bool:
     return proxy_url_sends_userinfo(url)
 
 
+def _proxy_bypasses(target: object, no_proxy: object) -> bool:
+    # Lazy, like ``_smart``: the transport owns its bypass rule, and this reads it rather than
+    # restating it.
+    from messagefoundry.transports.rest import proxy_bypasses_host
+
+    host: str | None
+    if isinstance(target, str):
+        try:
+            # The transport reads the target host the same way: ``urlsplit(url).hostname or ""``.
+            host = urllib.parse.urlsplit(target).hostname or ""
+        except ValueError:
+            host = None
+    else:
+        host = None  # an env() reference, resolved only when the connector is built
+    return proxy_bypasses_host(host, no_proxy)
+
+
+def _proxy_targets(
+    ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
+) -> list[object]:
+    """Every address a connection sends through its forward proxy: its own ``url``, and the token
+    endpoint of a SMART or OAuth2 provider, which the transport routes through the same proxy with its
+    own bypass decision. DICOMweb builds no token provider, and a ``FhirLookup`` builds SMART only."""
+    targets: list[object] = [settings.get("url")]
+    if ctype is not ConnectorType.DICOMWEB:
+        if _smart(settings):
+            targets.append(settings.get("smart_token_url"))
+        elif not lookup and _oauth2(settings):
+            targets.append(settings.get("oauth2_token_url"))
+    return targets
+
+
 def _proxy_hop(
-    name: str, settings: Mapping[str, Any], site_proxy: str | None
+    name: str,
+    settings: Mapping[str, Any],
+    site_proxy: str | None,
+    site_no_proxy: Sequence[str] | None = None,
+    *,
+    targets: Sequence[object] = (),
 ) -> StaticCredentialHop | None:
     """The forward-proxy hop an HTTP-family connection dials through, when it carries a credential.
 
@@ -216,6 +255,12 @@ def _proxy_hop(
     caller has no settings to read; the hop is then reported, because a credential written on a
     connection is written to be used. A proxy with no credential has nothing presented to it.
 
+    A proxy the connection never dials is not a hop either. ``targets`` are the addresses it sends
+    through the proxy (:func:`_proxy_targets`); when ``proxy_no_proxy`` bypasses every one of them the
+    credential never leaves the engine. The bypass list is the connection's own, else the inherited
+    ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
+    ``targets`` the hop is reported, because nothing says it is bypassed.
+
     The credential is the ``proxy_user``/``proxy_password`` pair, or a user and password in the
     proxy URL itself (:func:`_proxy_url_sends_userinfo`). The label is built from parsed parts, so the
     userinfo never reaches it."""
@@ -225,6 +270,9 @@ def _proxy_hop(
         return None
     if site_proxy is not None and not proxy_url:
         return None  # no proxy at all: the credential is never sent
+    no_proxy = settings.get("proxy_no_proxy") or site_no_proxy
+    if targets and all(_proxy_bypasses(target, no_proxy) for target in targets):
+        return None  # every address bypasses the proxy: the credential is never sent
     # From a closed set, not echoed: only a known scheme name reaches the detail. URL userinfo is
     # always Basic: the handler sends it pre-emptively and it replaces the engine's own header,
     # whatever proxy_auth_type says. Otherwise the type is read the way the transport reads it.
@@ -300,7 +348,9 @@ def _connection_hop(
 _DIALLED_INBOUND = frozenset({ConnectorType.REMOTEFILE, ConnectorType.FILE})
 
 
-def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCredentialHop]:
+def _graph_hops(
+    registry: Registry, site_proxy: str | None, site_no_proxy: Sequence[str] | None
+) -> list[StaticCredentialHop]:
     undeployed = {oc.name for oc in registry.outbound.values() if not oc.deployed} | {
         f"inbound:{ic.name}" for ic in registry.inbound.values() if not ic.deployed
     }
@@ -320,7 +370,15 @@ def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCreden
         hop = _connection_hop(name, spec.type, spec.settings)
         if hop is not None:
             out.append(hop)
-        if spec.type in _HTTP_FAMILY and (proxy := _proxy_hop(name, spec.settings, site_proxy)):
+        if spec.type in _HTTP_FAMILY and (
+            proxy := _proxy_hop(
+                name,
+                spec.settings,
+                site_proxy,
+                site_no_proxy,
+                targets=_proxy_targets(spec.type, spec.settings),
+            )
+        ):
             out.append(proxy)
     for lk in registry.fhir_lookups.values():
         name = f"fhir_lookup:{lk.name}"
@@ -329,7 +387,13 @@ def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCreden
         )
         if hop is not None:
             out.append(hop)
-        if proxy := _proxy_hop(name, lk.settings, site_proxy):
+        if proxy := _proxy_hop(
+            name,
+            lk.settings,
+            site_proxy,
+            site_no_proxy,
+            targets=_proxy_targets(ConnectorType.FHIR, lk.settings, lookup=True),
+        ):
             out.append(proxy)
     return out
 
@@ -359,9 +423,17 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
     elif store.key_provider == "vault":
         add("vault.store_key", "static", "Vault token from MEFOR_STORE_VAULT_TOKEN", False)
     auth, alerts = settings.auth, settings.alerts
-    # The connector secret provider is consulted only for a credential whose *_secret reference is set.
+    # AuthService, which binds to AD and requests the OIDC token, is built only with [auth] enabled.
+    ad_on = auth.enabled and auth.ad_enabled
+    oidc_on = auth.enabled and auth.oidc_enabled
+    # The connector secret provider is consulted only for a *_secret reference whose credential is
+    # resolved: the AD bind password with AD on, the OIDC client secret with OIDC on. The SMTP
+    # password's reference is resolved whenever [alerts] is read, with or without an SMTP transport,
+    # because notifier_from_settings resolves it before it decides which transports to build.
     if settings.secrets.provider == "vault" and (
-        auth.ad_bind_password_secret or auth.oidc_client_secret_ref or alerts.email_password_secret
+        (ad_on and auth.ad_bind_password_secret)
+        or (oidc_on and auth.oidc_client_secret_ref)
+        or alerts.email_password_secret
     ):
         add("vault.secrets", "static", "Vault token from MEFOR_SECRETS_VAULT_TOKEN", False)
     if alerts.webhook_url:
@@ -374,9 +446,9 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
             add("alerts.smtp", "none", "alert SMTP relay, no AUTH", False)
     if settings.ai.mode is AiMode.MANAGED_ENDPOINT:
         add("ai.broker", "static", "AI broker x-api-key from [ai].api_key", False)
-    if auth.ad_enabled:
+    if ad_on:
         add("auth.ad_bind", "static", "LDAP SIMPLE bind with a static ad_bind_password", False)
-    if auth.oidc_enabled:
+    if oidc_on:
         add("auth.oidc", "static", "OIDC token request with a static client_secret", False)
     # The syslog/SIEM forwarder dials the collector. Only TLS with a client certificate authenticates
     # the engine to it; UDP, TCP and server-only TLS present nothing.
@@ -400,12 +472,13 @@ def static_credential_hops(
     The SINGLE reader of the set; the module docstring says what it counts and what it leaves out.
     Pass ``None`` for a half the caller cannot see: ``registry=None`` reads the service settings only,
     and ``settings=None`` reads the connection graph only. A caller that passes ``None`` must say so in
-    its own output. With both, the graph half also reads ``[egress].proxy_url`` to decide whether a
-    connection's proxy credential is ever sent."""
+    its own output. With both, the graph half also reads ``[egress].proxy_url`` and
+    ``[egress].proxy_no_proxy`` to decide whether a connection's proxy credential is ever sent."""
     out: list[StaticCredentialHop] = []
     if registry is not None:
         site_proxy = None if settings is None else (settings.egress.proxy_url or "")
-        out += _graph_hops(registry, site_proxy)
+        site_no_proxy = None if settings is None else list(settings.egress.proxy_no_proxy)
+        out += _graph_hops(registry, site_proxy, site_no_proxy)
     if settings is not None:
         out += _settings_hops(settings)
     return sorted(out, key=lambda hop: hop.name)

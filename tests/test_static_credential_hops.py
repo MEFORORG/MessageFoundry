@@ -734,3 +734,157 @@ def test_url_userinfo_is_basic_whatever_proxy_auth_type_says() -> None:
     }
     hop = _proxy_hop("OB", keyed, "")
     assert hop is not None and "forward-proxy digest credential" in hop.detail
+
+
+# --- BACKLOG #1989 part b: a hop the engine never dials is not reported ----------------------------
+#
+# Each case has a control: the dialled form of the same configuration is still reported, so a reader
+# that stopped reporting the hop altogether would fail the control rather than pass the quiet half.
+
+
+def _with(**sections: dict[str, object]) -> ServiceSettings:
+    """Settings built without validation: the validators demand a whole AD or OIDC setup, and only
+    the keys the settings half reads are under test here."""
+    from pydantic import BaseModel
+
+    from messagefoundry.config.settings import AlertsSettings, AuthSettings, SecretsSettings
+
+    classes: dict[str, type[BaseModel]] = {
+        "auth": AuthSettings,
+        "alerts": AlertsSettings,
+        "secrets": SecretsSettings,
+    }
+    update = {name: classes[name]().model_copy(update=values) for name, values in sections.items()}
+    return ServiceSettings().model_copy(update=update)
+
+
+def _settings_names(settings: ServiceSettings) -> set[str]:
+    return {h.name for h in static_credential_hops(registry=None, settings=settings)}
+
+
+_VAULT: dict[str, object] = {"provider": "vault"}
+
+
+@pytest.mark.parametrize(
+    ("auth", "enable", "hop"),
+    [
+        ({"ad_bind_password_secret": "kv/mf#ad"}, "ad_enabled", "settings:auth.ad_bind"),
+        ({"oidc_client_secret_ref": "kv/mf#oidc"}, "oidc_enabled", "settings:auth.oidc"),
+    ],
+)
+def test_an_auth_secret_reference_dials_vault_only_while_its_feature_is_on(
+    auth: dict[str, object], enable: str, hop: str
+) -> None:
+    """``AuthService`` resolves the AD bind password only with AD on and the OIDC client secret only
+    with OIDC on, and the service is built only with ``[auth]`` enabled."""
+    off = _settings_names(_with(secrets=_VAULT, auth=auth))
+    assert "settings:vault.secrets" not in off and hop not in off
+    auth_off = _settings_names(_with(secrets=_VAULT, auth={**auth, enable: True, "enabled": False}))
+    assert "settings:vault.secrets" not in auth_off and hop not in auth_off
+    # The control: the feature on, so the reference is resolved and both hops are dialled.
+    on = _settings_names(_with(secrets=_VAULT, auth={**auth, enable: True}))
+    assert {"settings:vault.secrets", hop} <= on
+
+
+def test_an_smtp_secret_reference_dials_vault_even_with_smtp_off() -> None:
+    """Not a never-dialled hop, measured: ``notifier_from_settings`` resolves the SMTP password's
+    reference before it decides which transports to build, so the reference reaches the provider
+    with no SMTP transport configured. The reader reports what the engine does."""
+    from messagefoundry.config.settings import AlertsSettings
+    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+
+    asked: list[str] = []
+
+    class _Recorder:
+        def resolve(self, ref: str) -> str:
+            asked.append(ref)
+            return "value"
+
+    alerts = AlertsSettings().model_copy(update={"email_password_secret": "kv/mf#smtp"})
+    assert notifier_from_settings(alerts, secret_provider=_Recorder()) is None  # no transport
+    assert asked == ["kv/mf#smtp"]
+    names = _settings_names(_with(secrets=_VAULT, alerts={"email_password_secret": "kv/mf#smtp"}))
+    assert "settings:vault.secrets" in names
+
+
+_BYPASS_MODULE = """
+from messagefoundry import Rest, env, outbound
+from messagefoundry.transports.http_auth import with_oauth2_client_credentials
+
+_PROXY = dict(proxy="http://proxy.example.invalid:3128", proxy_user="pu", proxy_password=env("ppw"))
+outbound("OB_BYPASSED", Rest(url="https://a.example.invalid/x", proxy_no_proxy=["a.example.invalid"],
+                             **_PROXY))
+outbound("OB_SUFFIX", Rest(url="https://b.corp.invalid/x", proxy_no_proxy=[".corp.invalid"], **_PROXY))
+outbound("OB_OTHER_HOST", Rest(url="https://c.example.invalid/x",
+                               proxy_no_proxy=["elsewhere.invalid"], **_PROXY))
+outbound("OB_TOKEN_PROXIED", with_oauth2_client_credentials(
+    Rest(url="https://d.example.invalid/x", proxy_no_proxy=["d.example.invalid"], **_PROXY),
+    token_url="https://idp.example.invalid/token", client_id="c", client_secret=env("cs")))
+outbound("OB_TOKEN_BYPASSED", with_oauth2_client_credentials(
+    Rest(url="https://e.example.invalid/x",
+         proxy_no_proxy=["e.example.invalid", "idp2.example.invalid"], **_PROXY),
+    token_url="https://idp2.example.invalid/token", client_id="c", client_secret=env("cs")))
+outbound("OB_SITE_BYPASS", Rest(url="https://f.site.invalid/x", **_PROXY))
+"""
+
+
+@pytest.fixture(scope="module")
+def bypass_registry(tmp_path_factory: pytest.TempPathFactory) -> Registry:
+    cfg = tmp_path_factory.mktemp("proxy_bypass") / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(_BYPASS_MODULE, encoding="utf-8")
+    return load_config(cfg, allow_empty=True)
+
+
+def test_a_proxy_every_address_bypasses_is_not_a_hop(bypass_registry: Registry) -> None:
+    site = _settings(
+        egress={
+            "proxy_url": "http://site.example.invalid:3128",
+            "allowed_proxy": ["site.example.invalid", "proxy.example.invalid"],
+            "proxy_no_proxy": [".site.invalid"],
+        }
+    )
+    names = {h.name for h in static_credential_hops(registry=bypass_registry, settings=site)}
+    assert "proxy:OB_BYPASSED" not in names  # its one address is bypassed: exact host
+    assert "proxy:OB_SUFFIX" not in names  # a .suffix entry, matched as the transport matches it
+    assert "proxy:OB_TOKEN_BYPASSED" not in names  # destination and token host both bypassed
+    assert "proxy:OB_SITE_BYPASS" not in names  # the inherited [egress].proxy_no_proxy
+    # The controls: the same proxy credential, dialled.
+    assert "proxy:OB_OTHER_HOST" in names  # the bypass list names another host
+    # The destination is bypassed, but the OAuth2 token request still goes through the proxy.
+    assert "proxy:OB_TOKEN_PROXIED" in names
+
+
+def test_a_bypass_the_reader_cannot_see_is_not_assumed(bypass_registry: Registry) -> None:
+    """With no settings the inherited bypass list is unknown, so a connection relying on it is
+    reported; its own list is still read."""
+    names = {h.name for h in static_credential_hops(registry=bypass_registry, settings=None)}
+    assert "proxy:OB_SITE_BYPASS" in names
+    assert "proxy:OB_BYPASSED" not in names
+
+
+def test_an_address_read_only_at_build_is_bypassed_only_by_a_wildcard() -> None:
+    from messagefoundry.config.static_credentials import _proxy_hop
+    from messagefoundry.config.wiring import EnvRef
+
+    settings = {
+        "proxy_url": "http://proxy.example.invalid:3128",
+        "proxy_user": "pu",
+        "proxy_password": "pp",
+    }
+    target = [EnvRef("dest_url")]
+    assert _proxy_hop("OB", {**settings, "proxy_no_proxy": ["*"]}, "", targets=target) is None
+    assert _proxy_hop("OB", {**settings, "proxy_no_proxy": ["a.invalid"]}, "", targets=target)
+
+
+def test_a_ws_security_password_with_no_user_stamps_no_token() -> None:
+    """The connector stamps a UsernameToken only when it has a user."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.static_credentials import _http_static
+
+    base = {"ws_security": True, "ws_password": "pw"}
+    assert "WS-Security UsernameToken" not in _http_static(ConnectorType.SOAP, base, False)
+    # The control: with a user the token is on the wire.
+    assert "WS-Security UsernameToken" in _http_static(
+        ConnectorType.SOAP, {**base, "ws_username": "u"}, False
+    )
