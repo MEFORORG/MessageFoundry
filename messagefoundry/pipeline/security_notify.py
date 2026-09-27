@@ -276,10 +276,12 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # account carrying no address loses every later notice, not one. CLAUDE.md §6: never
             # swallow silently.
             #
-            # WHAT THIS COVERS THAT THE STARTUP GATE CANNOT, and the first-run bootstrap
-            # administrator is NOT the example to reach for. ``_assert_security_notice_is_deliverable``
+            # WHAT THIS COVERS THAT THE STARTUP GATE CANNOT, and an addressless sole administrator
+            # is NOT the example to reach for. ``_assert_security_notice_is_deliverable``
             # (``api/app.py``) refuses to start a PHI instance under ``enforce`` over exactly that
-            # account, so this line never runs there. It runs where that gate returns early or cannot
+            # account, so this line never runs there. (The engine creates no account on its own
+            # since ADR 0183 Amendment A; an administrator comes from ``provision-admin`` or the
+            # console.) It runs where that gate returns early or cannot
             # see: a non-PHI instance, a non-administrator account, administrators 2..N once one of
             # them carries an address, and any account born without an address after startup. The
             # gate asks once whether SOMEBODY can receive; this names the account that did not.

@@ -105,16 +105,16 @@ class BreachCorpusUnavailable(RuntimeError):
     *change* paths screen a password, so this never touches login, never invalidates a session, and
     never stops message flow.
 
-    **A FIRST RUN IS NO LONGER A STARTUP FAILURE, AND IT IS STILL NOT THE NARROW CASE ABOVE**
-    (BACKLOG #1447). The bootstrap generator used to raise out of an unguarded lifespan call, so the
-    engine did not start at all; it now suppresses this screen on its own candidate, for the reason
-    given at its call to :meth:`PasswordPolicy.violations`. The engine therefore starts and carries
-    messages. What does NOT follow is the paragraph above: the minted credential is born
-    ``must_change_password=True``, and that forced rotation is an operator-chosen password, which this
-    still refuses. So a first deployment on an unusable corpus would reach a console holding one
-    account that cannot complete its own rotation until the corpus is repaired. That is deliberate --
-    screening an operator's password is what #1438 exists for -- and much narrower than refusing to
-    start, but it is not "never touches login".
+    **AN UNUSABLE CORPUS IS NOT A STARTUP FAILURE, AND IT IS STILL NOT THE NARROW CASE ABOVE**
+    (BACKLOG #1447). The engine's own password generator suppresses this screen on its own
+    candidate, for the reason given at its call to :meth:`PasswordPolicy.violations`; it once minted
+    the first-run account (retired by ADR 0183) from an unguarded lifespan call. The engine starts.
+    What does NOT follow is the paragraph above. ``provision-admin`` screens the operator's chosen
+    password, so a first deployment on an unusable corpus cannot create its first administrator. And
+    an admin-issued temporary credential is born ``must_change_password=True``; that forced
+    rotation is a chosen password this still refuses. Both hold until the corpus is repaired. It is
+    deliberate -- screening a chosen password is what #1438 exists for -- and much narrower than
+    refusing to start, but it is not "never touches login".
     ``AuthService`` also loads the corpus eagerly at startup and logs the same defect as an error, so
     an operator learns about it from the log rather than from a user's failed password change.
     """
@@ -226,7 +226,7 @@ class PasswordPolicy:
         acceptable. Order: length → opt-in character classes → breach → username → context.
 
         ``username`` enables the 6.2.11 own-username check (omit it where there is no user context,
-        e.g. generating the bootstrap password).
+        e.g. generating a temporary password).
 
         Raises :class:`BreachCorpusUnavailable` when ``check_breached`` is on and the bundled corpus is
         unusable (BACKLOG #1438) -- a refusal, not a silent pass. Callers get a list or an exception,
