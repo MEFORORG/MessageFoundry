@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 import subprocess
-import time
+import sys
 from datetime import UTC, datetime, timedelta
 from itertools import permutations
 from pathlib import Path
@@ -49,6 +49,77 @@ def _threshold(name: str) -> int:
 MIN_TOOLS = _threshold("MinToolUses")
 COOLDOWN = _threshold("CooldownMinutes")
 WIKI_MARKER = re.search(r"\$WIKI_MARKER\s*=\s*\"([^\"]+)\"", _SRC).group(1)  # type: ignore[union-attr]
+HOOK_CMD = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK)]
+
+
+def _run_counting_cpu(
+    cmd: list[str], payload: str, env: dict[str, str]
+) -> tuple[subprocess.CompletedProcess[str], float]:
+    """Run ``cmd`` like ``subprocess.run`` and also return the child's own CPU seconds.
+
+    CPU time, not the wall clock, because a busy runner stretches the wall clock far more. On
+    windows-2025 one hook run has taken 19 to 31 s of wall clock in tests that send it nothing
+    unusual, while the same run takes about 0.4 s of wall clock and CPU on an idle machine.
+    The CPU time is the child's user plus kernel time from ``GetProcessTimes``. It excludes the
+    ``git`` the hook starts, which costs the same in any two runs this file compares. A regex
+    timeout counts WALL time, so a match starved of CPU times out having burned less than its
+    timeout; that case is the hook's stderr count, not this reading.
+    """
+    if sys.platform != "win32":
+        raise NotImplementedError("GetProcessTimes is Windows-only, and so is this module")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    ft_ptr = ctypes.POINTER(wintypes.FILETIME)
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ft_ptr, ft_ptr, ft_ptr, ft_ptr]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    process_query_limited_information = 0x1000
+
+    def seconds(ft: wintypes.FILETIME) -> float:
+        # A FILETIME duration counts 100 ns ticks.
+        return ((ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 1e7
+
+    with subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    ) as child:
+        # Popen holds its own handle to the child, so the process object outlives the child's exit
+        # and its pid cannot be reused. Opening a second handle by pid is therefore safe even if the
+        # child has already finished.
+        handle = kernel32.OpenProcess(process_query_limited_information, False, child.pid)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            try:
+                out, err = child.communicate(payload, timeout=TIMEOUT)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                raise
+            created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+            ok = kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            )
+            if not ok:
+                raise ctypes.WinError(ctypes.get_last_error())
+            cpu = seconds(kernel) + seconds(user)
+        finally:
+            kernel32.CloseHandle(handle)
+    return subprocess.CompletedProcess(cmd, child.returncode, out, err), cpu
 
 
 # --------------------------------------------------------------------------------------------------
@@ -127,6 +198,40 @@ class Env:
         """``session`` is the CLAUDE_* set Claude Code would pass. The default is an attended
         session; pass ``{}`` for a hook that sees none of them. ``cwd`` is the hook process's
         working directory; the default inherits the suite's."""
+        payload, full_env = self._request(
+            active=active, stdin=stdin, env=env, session=session, transcript=transcript
+        )
+        proc = subprocess.run(
+            HOOK_CMD,
+            input=payload,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=TIMEOUT,
+            env=full_env,
+            cwd=cwd,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc
+
+    def run_counting_cpu(self) -> tuple[subprocess.CompletedProcess[str], float]:
+        """``run`` with the defaults, also returning the hook process's own CPU seconds."""
+        payload, full_env = self._request()
+        proc, cpu = _run_counting_cpu(HOOK_CMD, payload, full_env)
+        assert proc.returncode == 0, proc.stderr
+        return proc, cpu
+
+    def _request(
+        self,
+        *,
+        active: bool = False,
+        stdin: str | None = None,
+        env: dict[str, str] | None = None,
+        session: dict[str, str] | None = None,
+        transcript: str | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        """The hook's stdin payload and environment. ``run`` documents the parameters."""
         payload = stdin
         if payload is None:
             payload = json.dumps(
@@ -144,19 +249,7 @@ class Env:
         full_env = _clean_env()
         full_env.update(ATTENDED if session is None else session)
         full_env.update(env or {})
-        proc = subprocess.run(
-            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK)],
-            input=payload,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=TIMEOUT,
-            env=full_env,
-            cwd=cwd,
-            check=False,
-        )
-        assert proc.returncode == 0, proc.stderr
-        return proc
+        return payload, full_env
 
     @property
     def state_path(self) -> Path:
@@ -531,6 +624,29 @@ def test_a_commit_in_a_compound_or_optioned_command_triggers(env: Env, command: 
     blocked(env.run())
 
 
+# Enough plain commands to make the hook fire, as the option-heavy runs do, so the two runs take
+# the same path through the hook.
+STALL_COMMANDS = max(30, MIN_TOOLS)
+
+
+@pytest.fixture(scope="module")
+def plain_run_cpu(tmp_path_factory: pytest.TempPathFactory) -> float:
+    """The hook's CPU seconds over STALL_COMMANDS plain commands. Measured once per module, and the
+    lower of two runs, so a cold first start cannot inflate the baseline."""
+    readings: list[float] = []
+    for _ in range(2):
+        env = Env(tmp_path_factory.mktemp("plain"))
+        env.append([tool_use("Bash", "git status")] * STALL_COMMANDS)
+        proc, cpu = env.run_counting_cpu()
+        blocked(proc)
+        assert "timed out" not in proc.stderr, proc.stderr
+        readings.append(cpu)
+    # A pwsh start alone costs a few tenths of a second of CPU. Near zero means the pid measured is
+    # not the one doing the work, such as a launcher shim, and every comparison below would pass.
+    assert min(readings) > 0.05, f"measured {readings} CPU seconds for pwsh; is pwsh a shim?"
+    return min(readings)
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -539,16 +655,60 @@ def test_a_commit_in_a_compound_or_optioned_command_triggers(env: Env, command: 
         "git " + '-C "x" ' * 40 + "status",
     ],
 )
-def test_a_long_run_of_options_does_not_stall_the_hook(env: Env, command: str) -> None:
+def test_a_long_run_of_options_does_not_stall_the_hook(
+    env: Env, plain_run_cpu: float, command: str
+) -> None:
     """Options that could be matched two ways made the commit regex exponential. The regex has a
-    1 s timeout as well, so one command would hide the defect; thirty of them would not."""
-    env.append([tool_use("Bash", command)] * 30)
-    start = time.monotonic()
-    proc = env.run()
-    elapsed = time.monotonic() - start
+    timeout as well, so one command would hide the defect; thirty of them would not.
+
+    Neither check reads the wall clock, which a busy runner stretches: windows-2025 once took 16.7 s
+    and 19.7 s here with no stall at all (run 36295057955), against a 15 s bound.
+    1. A timed-out match. The hook reports its count on stderr.
+    2. A slow match that finishes inside its timeout. The CPU it burns does not depend on how busy
+       the machine is, so the bound is on CPU seconds above a run of plain commands."""
+    env.append([tool_use("Bash", command)] * STALL_COMMANDS)
+    proc, cpu = env.run_counting_cpu()
     blocked(proc)
     assert env.logs()[-1]["trigger"] == "tools"
-    assert elapsed < 15, f"hook took {elapsed:.1f}s over 30 option-heavy commands"
+    assert "timed out" not in proc.stderr, proc.stderr
+    # A quarter of a second per command, on average, over the plain run. Fixed, not derived from the
+    # hook's $RegexTimeout, so loosening that timeout cannot loosen this test.
+    bound = STALL_COMMANDS * 0.25
+    assert cpu - plain_run_cpu < bound, (
+        f"the hook used {cpu:.1f}s of CPU over {STALL_COMMANDS} option-heavy commands, against "
+        f"{plain_run_cpu:.1f}s over {STALL_COMMANDS} plain ones; the bound is {bound:.1f}s more"
+    )
+
+
+def test_a_timed_out_match_is_reported_on_stderr(env: Env) -> None:
+    """The positive control for the stall test's stderr check, which otherwise only ever asserts an
+    absence. A copy of the hook with a one-tick regex timeout times out on plain commands."""
+    src = HOOK.read_text(encoding="utf-8")
+    pattern = r"^\$RegexTimeout\s*=.*$"
+    assert len(re.findall(pattern, src, re.MULTILINE)) == 1, f"no single $RegexTimeout in {HOOK}"
+    hook = env.base / "wiki-write-prompt.ps1"
+    hook.write_text(
+        re.sub(pattern, "$RegexTimeout = [TimeSpan]::FromTicks(1)", src, flags=re.MULTILINE),
+        encoding="utf-8",
+    )
+    env.append([tool_use("Bash", "git status")] * MIN_TOOLS)
+    payload, full_env = env._request()
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(hook)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=TIMEOUT,
+        env=full_env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert re.search(r"wiki-write-prompt: [1-9]\d* regex match\(es\) timed out", proc.stderr), (
+        proc.stderr
+    )
+    # The report is a diagnostic, not a decision: the prompt still fires on the tool count.
+    blocked(proc)
 
 
 @pytest.mark.parametrize(
