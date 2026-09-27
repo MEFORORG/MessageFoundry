@@ -814,9 +814,11 @@ async def test_a_satisfied_session_changes_the_password_as_before(
 #: A session id no route resolves. The refusal runs in the gate, before the body looks at it.
 _SOME_SESSION_ID = "0" * 64
 
-#: Every POST whose gate lets a pending session through ``require_ui`` and refuses it later,
-#: paired with where that refusal sends it. The password route refuses before rotating (#1954);
-#: the rest are the ``require_ui_reauth_only_action`` lanes (#1951).
+#: The POSTs that refuse a pending session through ``require_ui``'s ``pending_refusal``, paired with
+#: where that refusal sends it. The password route refuses before rotating (#1954); the rest are the
+#: ``require_ui_reauth_only_action`` lanes (#1951). NOT every pending-exempt POST:
+#: ``POST /ui/account/webauthn/verify`` rides ``require_ui_reauth_only``, which has no such hook and
+#: still charges before its step-up check refuses. #1973 left it out of scope.
 _PENDING_REFUSED_POSTS = (
     pytest.param(_PASSWORD, "/ui/mfa", id="password"),
     pytest.param(
@@ -854,6 +856,19 @@ def _spy_admin_write(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> l
 
     monkeypatch.setattr(service, "allow_admin_write", spy)
     return calls
+
+
+def _assert_past_the_gate(path: str, refused_to: str, r: httpx.Response) -> None:
+    """A control's POST got past the pending refusal and was answered by what follows it.
+
+    The password handler answers the mismatched form with a 400. Each reauth-only lane holds no
+    step-up grant, so its step-up check sends it to the same ``/ui/reauth`` location the pending
+    refusal uses; there the zero ``auth.mfa_denied`` rows the controls assert are what tell the two
+    apart."""
+    if path == _PASSWORD:
+        assert r.status_code == 400, r.text
+    else:
+        assert r.status_code == 303 and r.headers["location"] == refused_to, r.text
 
 
 async def _denials_for(engine: Engine, path: str) -> int:
@@ -909,7 +924,9 @@ async def test_a_satisfied_session_is_still_charged_on_the_same_posts(
             await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
         ).status_code == 303
         calls = _spy_admin_write(service, monkeypatch)
-        await c.post(path, data=_NO_ROTATION, headers=SAME_ORIGIN)
+        _assert_past_the_gate(
+            path, refused_to, await c.post(path, data=_NO_ROTATION, headers=SAME_ORIGIN)
+        )
 
     assert len(calls) == 1, f"allow_admin_write calls: {calls}"
     assert await _denials_for(engine, path) == 0
@@ -933,10 +950,9 @@ async def test_a_pending_session_with_no_factor_is_charged_and_not_refused(
         tok = c.cookies.get("mf_session")
         assert tok is not None and await service.mfa_satisfied(tok) is False
         calls = _spy_admin_write(service, monkeypatch)
-        r = await c.post(path, data=_NO_ROTATION, headers=SAME_ORIGIN)
-        if path == _PASSWORD:
-            # Past the gate, the handler answers the mismatched form itself.
-            assert r.status_code == 400, r.text
+        _assert_past_the_gate(
+            path, refused_to, await c.post(path, data=_NO_ROTATION, headers=SAME_ORIGIN)
+        )
 
     assert len(calls) == 1, f"allow_admin_write calls: {calls}"
     assert await _denials_for(engine, path) == 0
