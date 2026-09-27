@@ -2761,8 +2761,9 @@ def provenance_from(sc: RepoStamp, en: RepoStamp, *, label: str) -> list[str]:
 
 
 def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
-    """How many GRADED cells carry no recorded reviewer, split by absent key and blank value, and
-    how many of those the gate covers or would refuse. See :func:`audit_reviewers`.
+    """How many GRADED cells carry no recorded reviewer, split by absent key, blank value and (only
+    when there is one) a structured table naming nobody, and how many of those the gate covers or
+    would refuse. See :func:`audit_reviewers`.
 
     The line is printed even when every count is zero, so "none missing" and "the line was dropped"
     cannot look alike. Every id is named, uncapped, because a truncated list reads as a complete one.
@@ -2772,9 +2773,10 @@ def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
     def named(ids: tuple[str, ...]) -> str:
         return f" ({', '.join(ids)})" if ids else ""
 
+    # Printed only when non-zero, so a record with no such cell reads byte-for-byte as before.
     unnamed = (
-        f"{len(a.unnamed)} with a structured value naming no reviewer and no review_notes"
-        f"{named(a.unnamed)}, "
+        f", {len(a.unnamed)} with a structured value naming no reviewer and no review_notes"
+        f"{named(a.unnamed)}"
         if a.unnamed
         else ""
     )
@@ -2782,8 +2784,7 @@ def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
         f"reviewer {len(a.absent) + len(a.blank) + len(a.unnamed)} of {a.graded} graded cells "
         "record no reviewer: "
         f"{len(a.absent)} with no reviewed_by key{named(a.absent)}, "
-        f"{unnamed}"
-        f"{len(a.blank)} with it blank{named(a.blank)}. "
+        f"{len(a.blank)} with it blank{named(a.blank)}{unnamed}. "
         "Unrecorded is not unreviewed; the record cannot say which. "
         f"Covered: {len(a.by_decision)} by an owner closure{named(a.by_decision)}, "
         f"{len(a.by_exception)} by the record's [[reviewer_exception]] list{named(a.by_exception)}; "

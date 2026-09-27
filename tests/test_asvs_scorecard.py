@@ -4084,8 +4084,8 @@ def test_status_names_a_table_naming_nobody_in_the_reviewer_line(tmp_path: Path)
     text = "\n".join(status_lines(load_scorecard(_scorecard_file(tmp_path, body))))
     assert (
         "reviewer 2 of 3 graded cells record no reviewer: 1 with no reviewed_by key (1.1.3), "
-        "1 with a structured value naming no reviewer and no review_notes (1.1.1), "
-        "0 with it blank. " in text
+        "0 with it blank, "
+        "1 with a structured value naming no reviewer and no review_notes (1.1.1). " in text
     ), text
     assert "2 verify would refuse (1.1.1, 1.1.3)" in text, text
 

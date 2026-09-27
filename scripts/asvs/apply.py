@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # rule is a second place for it to drift.
 from scorecard import (  # noqa: E402
     REVIEWED_BY_KEYS,
+    UNRECORDED,
     ScorecardError,
     _git,
     parse_reviewed_by,
@@ -844,6 +845,21 @@ def main(argv: list[str] | None = None) -> int:
                     "carrying its text into review_notes, which would drop it. Put the legacy "
                     "text in review_notes"
                 )
+        # A TABLE NAMING NOBODY, WITH NO NOTES BEHIND IT, RECORDS NO REVIEWER: the rule
+        # `Cell.records_reviewer` applies (BACKLOG #2168). The required-field check above passes any
+        # non-empty table, so without this the writer lands a cell the next verify refuses. `notes`
+        # is the payload's, or the record's when the payload omits it, as the loader will see it.
+        if (
+            not anchor_repair
+            and isinstance(now_rb, dict)
+            and now_rb.get("reviewer") == UNRECORDED
+            and not (isinstance(notes, str) and notes.strip())
+        ):
+            problems.append(
+                f"{c.get('id')}: reviewed_by names no reviewer (reviewer is {UNRECORDED!r}) and "
+                "review_notes is empty, so the cell records no reviewer. Name who reviewed it, or "
+                "keep the review's text in review_notes"
+            )
         # ...and the migration only runs one way. A string over a table is a structured record
         # quietly going back to free text, which nothing downstream would notice.
         if isinstance(was_rb, dict) and isinstance(now_rb, str):

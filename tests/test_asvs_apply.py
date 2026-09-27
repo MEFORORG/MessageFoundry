@@ -3155,6 +3155,45 @@ def test_a_migration_may_move_a_carried_glyph_into_review_notes_but_not_add_one(
     assert _cell_after_apply(rec)["review_notes"] == carried
 
 
+_NOBODY_RB = {"reviewer": "unrecorded", "ref": "unrecorded", "date": "unrecorded"}
+
+
+def test_the_writer_refuses_a_table_naming_nobody_with_no_notes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The verifier refuses such a cell, so the writer must not land one. The record is first
+    moved to a table WITH notes, so the conversion guard is not what refuses here."""
+    rec = _record(tmp_path)
+    first = _cell_111(reviewed_by=_RB, review_notes="moved: fixture")
+    assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
+    before = rec.read_bytes()
+    emptied = _cell_111(reviewed_by=_NOBODY_RB, review_notes="  ")
+    assert main([str(_payload(tmp_path, [emptied])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "1.1.1: reviewed_by names no reviewer (reviewer is 'unrecorded') and review_notes " in (
+        capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
+    "notes", ["migrated: fixture", None], ids=["payload-notes", "record-notes"]
+)
+def test_the_writer_accepts_a_table_naming_nobody_backed_by_notes(
+    tmp_path: Path, notes: str | None
+) -> None:
+    """The positive control: notes from the payload, or kept from the record when omitted."""
+    rec = _record(tmp_path)
+    first = _cell_111(reviewed_by=_RB, review_notes="migrated: fixture")
+    assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
+    over: dict[str, object] = {"reviewed_by": _NOBODY_RB}
+    if notes is not None:
+        over["review_notes"] = notes
+    cell = _cell_111(**over)
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+    got = _cell_after_apply(rec)
+    assert got["reviewed_by"] == _NOBODY_RB and got["review_notes"] == "migrated: fixture"
+
+
 def test_a_conversion_whose_review_notes_do_not_carry_the_legacy_text_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
