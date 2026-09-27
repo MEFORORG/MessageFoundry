@@ -607,3 +607,84 @@ def test_the_check_reports_the_settings_half_on_an_empty_graph(tmp_path: Path) -
     detail = str(result.detail)
     assert "settings:store" in detail
     assert _SECRET not in detail
+
+
+# --- serve: the settings half's audit lines reach the configured handlers (BACKLOG #1989 part c) ---
+
+_SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
+
+_SERVE_SECURITY = (
+    "[security]\n"
+    "block_unlisted_outbound = true\n"  # clears the egress gate, which is not under test
+    "require_nonstatic_credentials = true\n"
+    "[security.static_credential_accepted]\n"
+    '"settings:alerts.webhook" = "the sink has no credential field"\n'
+    '"settings:ai.broker" = "stale entry"\n'
+)
+_SERVE_ALERTS = (
+    '[alerts]\nwebhook_url = "https://hook.example.invalid/x"\n'
+    "security_notifications_required = false\n"  # clears a gate that is not under test
+)
+
+
+def _serve_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str
+) -> tuple[int, list[tuple[str, bool]]]:
+    """Run ``serve`` with the server mocked, recording each record the ``__main__`` logger emits and
+    whether ``configure_logging`` had run when it did."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # passes the keyless gate
+    (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    configured = [False]
+
+    def _configure(*args: Any, **kwargs: Any) -> bool:
+        configured[0] = True
+        return False
+
+    monkeypatch.setattr(cli, "configure_logging", _configure)
+    seen: list[tuple[str, bool]] = []
+
+    class _Recorder(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            seen.append((record.getMessage(), configured[0]))
+
+    logger = logging.getLogger(cli.__name__)
+    handler = _Recorder(level=logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        rc = cli.main(["serve", "--config", str(_SAMPLES_CONFIG), "--env", "dev"])
+    finally:
+        logger.removeHandler(handler)
+    return rc, seen
+
+
+def test_serve_logs_the_opt_out_audit_after_logging_is_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc, seen = _serve_recording(tmp_path, monkeypatch, _SERVE_ALERTS + _SERVE_SECURITY)
+    assert rc == 0
+    audit = [(msg, after) for msg, after in seen if "static_credential_accepted" in msg]
+    # The control: both lines ARE logged, so "none before configure_logging" is not an empty list.
+    assert any("settings:alerts.webhook" in msg for msg, _ in audit)
+    assert any("settings:ai.broker" in msg and "does nothing" in msg for msg, _ in audit)
+    assert all(after for _, after in audit), audit
+
+
+def test_a_serve_refusal_still_prints_the_opt_out_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal exits before configure_logging, so the held lines go to stderr with the error."""
+    toml = (
+        _SERVE_ALERTS
+        + '[ai]\nmode = "managed_endpoint"\n'
+        + _SERVE_SECURITY.replace('"settings:ai.broker" = "stale entry"\n', "")
+    )
+    rc, _ = _serve_recording(tmp_path, monkeypatch, toml)
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "settings:ai.broker" in err and "refusing to start" in err
+    assert "warning: [security].static_credential_accepted: hop settings:alerts.webhook" in err

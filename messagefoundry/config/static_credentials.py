@@ -95,11 +95,13 @@ from messagefoundry.config.wiring import (
 
 __all__ = [
     "SETTINGS_PREFIX",
+    "StaticCredentialGateOutcome",
     "StaticCredentialHop",
     "StaticCredentialVerdict",
     "apply_static_credential_gate",
     "evaluate_static_credential_gate",
     "make_static_credential_guard",
+    "run_static_credential_gate",
     "static_credential_hops",
 ]
 
@@ -530,18 +532,31 @@ def evaluate_static_credential_gate(
     return StaticCredentialVerdict(tuple(refused), tuple(taken), tuple(unmatched))
 
 
-def apply_static_credential_gate(
-    settings: ServiceSettings, *, registry: Registry | None, log: logging.Logger
-) -> str | None:
-    """Run the opt-in ``[security].require_nonstatic_credentials`` gate over one half of the set.
+@dataclass(frozen=True, slots=True)
+class StaticCredentialGateOutcome:
+    """What one run of the opt-in gate over one half of the set produced.
 
-    ``registry=None`` judges the settings half, which ``serve`` does before anything starts; a
-    registry judges that graph's hops only, which is what the registry guard does at every load.
-    Returns the refusal message when a hop in that half has no opt-out, else ``None``; the caller
-    refuses or warns on ``[security].enforcement``. Logs, at WARNING, one line per honoured opt-out
-    (hop name and the operator's reason: this is the startup audit of every opt-out) and one line per
-    opt-out that matches no hop in this half. The lines carry hop names, the operator's own reasons
-    and details, and a detail cannot carry a secret (see the module docstring). Returns ``None`` without reading or logging anything when the gate is off."""
+    ``audit`` holds the WARNING lines the gate owes the log: one per honoured opt-out (hop name and
+    the operator's reason: this is the startup audit of every opt-out) and one per opt-out that
+    matches no hop in the half. ``refusal`` is the refusal message when a hop in the half has no
+    opt-out, else ``None``. The lines carry hop names, the operator's own reasons and details, and a
+    detail cannot carry a secret (see the module docstring)."""
+
+    audit: tuple[str, ...]
+    refusal: str | None
+
+
+def run_static_credential_gate(
+    settings: ServiceSettings, *, registry: Registry | None
+) -> StaticCredentialGateOutcome | None:
+    """Run the opt-in ``[security].require_nonstatic_credentials`` gate over one half of the set,
+    logging nothing: the caller decides when the audit lines are logged.
+
+    ``serve`` needs that choice (BACKLOG #1989). It judges the settings half before
+    ``configure_logging`` has installed any handler, so a line logged then reaches stderr only and
+    never the log file or the forwarder; it holds the lines and logs them once logging is configured.
+    ``registry=None`` judges the settings half; a registry judges that graph's hops only. Returns
+    ``None`` without reading anything when the gate is off."""
     security = settings.security
     if not security.require_nonstatic_credentials:
         return None
@@ -550,30 +565,43 @@ def apply_static_credential_gate(
         security.static_credential_accepted,
         settings_half=registry is None,
     )
-    for hop, reason in verdict.accepted:
-        log.warning(
-            "[security].static_credential_accepted: hop %s runs on a %s credential by opt-out "
-            "(compliant kind available: %s): %s",
-            hop.name,
-            hop.credential,
-            "yes" if hop.compliant_kind else "no",
-            reason,
+    audit = [
+        f"[security].static_credential_accepted: hop {hop.name} runs on a {hop.credential} "
+        f"credential by opt-out (compliant kind available: {'yes' if hop.compliant_kind else 'no'}): "
+        f"{reason}"
+        for hop, reason in verdict.accepted
+    ]
+    audit += [
+        f"[security].static_credential_accepted names {name}, which is not a static-credential hop "
+        "of this instance; the opt-out does nothing"
+        for name in verdict.unmatched
+    ]
+    refusal = None
+    if verdict.refused:
+        listed = "; ".join(f"{hop.name} ({hop.detail})" for hop in verdict.refused)
+        refusal = (
+            f"[security].require_nonstatic_credentials is set but {len(verdict.refused)} backend "
+            f"hop(s) present an unchanging credential or none, with no opt-out: {listed}. Move each "
+            "to a compliant credential kind where one exists, or name it in "
+            "[security].static_credential_accepted with the reason (see docs/SECURITY.md)"
         )
-    for name in verdict.unmatched:
-        log.warning(
-            "[security].static_credential_accepted names %s, which is not a static-credential hop "
-            "of this instance; the opt-out does nothing",
-            name,
-        )
-    if not verdict.refused:
+    return StaticCredentialGateOutcome(tuple(audit), refusal)
+
+
+def apply_static_credential_gate(
+    settings: ServiceSettings, *, registry: Registry | None, log: logging.Logger
+) -> str | None:
+    """:func:`run_static_credential_gate`, logging its audit lines at WARNING straight away.
+
+    For a caller whose logging is already configured, such as the registry guard, which runs at every
+    graph load. Returns the refusal message, or ``None``; the caller refuses or warns on
+    ``[security].enforcement``."""
+    outcome = run_static_credential_gate(settings, registry=registry)
+    if outcome is None:
         return None
-    listed = "; ".join(f"{hop.name} ({hop.detail})" for hop in verdict.refused)
-    return (
-        f"[security].require_nonstatic_credentials is set but {len(verdict.refused)} backend hop(s) "
-        f"present an unchanging credential or none, with no opt-out: {listed}. Move each to a "
-        "compliant credential kind where one exists, or name it in "
-        "[security].static_credential_accepted with the reason (see docs/SECURITY.md)"
-    )
+    for line in outcome.audit:
+        log.warning("%s", line)
+    return outcome.refusal
 
 
 def make_static_credential_guard(
