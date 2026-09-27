@@ -364,7 +364,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to act on the absolute expiry alone, so a session the engine already refused still showed on
   the user's own session list. Ending a prior session at sign-in now counts as ending a live one
   only when the engine would still accept it, clock-step checks included. The engine checks
-  liveness with one rule in Python and one in SQL, and a test holds the two equal.
+  liveness with one rule in Python and one shared SQL clause, and a test holds those two equal
+  on SQLite; the Postgres spelling is covered by the cross-backend contract cases.
   (`BACKLOG #2096`, ASVS 7.3.1)
 - **The `serve` warning for a public web console address with no declared proxy posture no longer
   says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a

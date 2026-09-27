@@ -165,8 +165,8 @@ async def _assert_idle_rows_hidden_and_purged(store: Any, user_id: str) -> None:
     Every stamp sits near a fixed instant far in the past. The purge spans every user, so this
     keeps it off rows stamped at the real clock (``base - last_used_at`` is negative for them). It
     would still reach another test's fake-clock rows stamped before ``base - IDLE``. None are
-    there today because the live Postgres fixture truncates at the start of each test and pytest
-    runs that suite serially; the SQL Server suite was not checked for the same."""
+    there today because the live Postgres and SQL Server fixtures clear the sessions table at the
+    start of each test."""
     base = 1_000_000.0
     u = f"{user_id}-idle"
     await _user(store, u, base)
