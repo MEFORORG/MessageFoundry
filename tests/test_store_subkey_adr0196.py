@@ -612,6 +612,40 @@ async def test_AC6_a_run_that_fails_after_sealing_still_charges_its_frames(
         await store.close()
 
 
+async def test_AC6_frames_whose_charge_fails_stay_queued_for_the_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed charge puts its frames back rather than dropping them, so the key's persisted count
+    never under-reads by them; the next charge lands them on their own key."""
+    key = generate_key()
+    db = tmp_path / "live.db"
+    store, cipher = await _live_store(db, key)
+    try:
+        runner = BackupRunner(
+            store,
+            BackupSettings(enabled=True, destination=str(tmp_path / "backups")),
+            store_settings=_store_settings(db, key),
+            config_dir=None,
+            instance="dev",
+        )
+        key_id = cipher.invocation_key_id
+        before = await store.cipher_invocations(key_id)
+        runner._record_frames(key_id, 7)
+
+        async def _down(_key_id: str, _count: int) -> int:
+            raise sqlite3.OperationalError("database is locked")
+
+        with monkeypatch.context() as m:
+            m.setattr(store, "add_cipher_invocations", _down)
+            await runner._charge_archive_invocations()
+        assert runner._frames == [(key_id, 7)]
+        await runner._charge_archive_invocations()
+        assert runner._frames == []
+        assert await store.cipher_invocations(key_id) - before == 7
+    finally:
+        await store.close()
+
+
 async def test_AC3_a_restored_store_seals_under_a_new_key(tmp_path: Path) -> None:
     key = generate_key()
     dek = base64.b64decode(key)

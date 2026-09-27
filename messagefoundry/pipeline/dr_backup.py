@@ -434,12 +434,10 @@ class BackupRunner:
             )
         key_id = key_fingerprint(key) if key is not None else None
         # ADR 0196: seal the frames under the live store's data sub-key (the header records the salt,
-        # so the DR site derives it from the DEK alone), and charge them to THAT key's row -- the key
-        # the frames are sealed under (AC-6). A store on the frozen v1 writer has no salt: the frames
-        # are then sealed under the DEK and charged to the DEK's row, which is where that store's own
-        # values are counted too.
+        # so the DR site derives it from the DEK alone). The build charges them to THAT key's row (AC-6).
+        # A store on the frozen v1 writer has no salt: the frames are then sealed under the DEK and
+        # charged to the DEK's row, which is where that store's own values are counted too.
         salt = self._store_salt() if key is not None else None
-        charge_key_id = store_data_key_id(key, salt) if key is not None and salt else key_id
 
         # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
         # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
@@ -494,7 +492,6 @@ class BackupRunner:
                     key=key,
                     key_id=key_id,
                     salt=salt,
-                    charge_key_id=charge_key_id,
                     config_only=config_only,
                     now=now,
                 )
@@ -592,8 +589,13 @@ class BackupRunner:
             try:
                 await self._store.add_cipher_invocations(key_id, frames)
             except Exception:  # noqa: BLE001 — advisory accounting; never fail a good backup
+                # Put them back: dropped, the key's persisted count would under-read by every frame,
+                # the one direction the bound must not drift. The next run's charge retries them.
+                with self._frames_lock:
+                    self._frames.append((key_id, frames))
                 log.warning(
-                    "DR backup: could not charge %d archive frame(s) to the AES-GCM invocation bound",
+                    "DR backup: could not charge %d archive frame(s) to the AES-GCM invocation "
+                    "bound; they stay queued for the next run",
                     frames,
                     exc_info=True,
                 )
@@ -664,7 +666,6 @@ class BackupRunner:
         config_only: bool,
         now: float,
         salt: bytes | None = None,
-        charge_key_id: str | None = None,
     ) -> tuple[str, dict[str, int], int]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
@@ -715,10 +716,12 @@ class BackupRunner:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(tar_path, "rb") as src, open(out_path, "wb") as dst:
                 if key is not None:
-                    # ASVS 11.3.4: every DR frame is an AES-GCM invocation under the SAME store DEK, so
-                    # it consumes the same birthday budget. Record the count here (the worker thread
-                    # holds no store) and charge it to the key's persisted bound after the run.
-                    charge_id = charge_key_id or key_fingerprint(key)
+                    # ASVS 11.3.4: every DR frame is an AES-GCM invocation under the key it is sealed
+                    # under -- the store data sub-key for a salted archive, the DEK for an unsalted one
+                    # (ADR 0196 AC-6) -- so it spends that key's budget. The id is derived here from the
+                    # same (key, salt) the codec seals under, so the two cannot disagree. Record the
+                    # count (the worker thread holds no store) and charge it after the run.
+                    charge_id = store_data_key_id(key, salt) if salt else key_fingerprint(key)
                     encrypt_stream(
                         src,
                         dst,
