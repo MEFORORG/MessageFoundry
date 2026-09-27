@@ -23,15 +23,16 @@ import a transport), and the attachment detach/download paths (``pipeline/wiring
   Handler-facing archive reader, so members reach Handler code already checked (BACKLOG #1128).
 
 Kept in ``parsing/`` (not ``transports/``) so a leaf like ``uploads.py`` can reuse them without importing
-a transport. The one config dependency is :class:`~messagefoundry.config.models.ContentType`; these stay
-pure functions with no I/O, engine state, or DB (the CLAUDE.md §4 ``parsing/`` carve-out)."""
+a transport. :class:`~messagefoundry.content_type.ContentType` comes from its stdlib-only leaf, not
+``config.models``, so this module loads no config (BACKLOG #1596); these stay pure functions with no
+I/O, engine state, or DB (the CLAUDE.md §4 ``parsing/`` carve-out)."""
 
 from __future__ import annotations
 
 import base64
 import binascii
 
-from messagefoundry.config.models import ContentType
+from messagefoundry.content_type import ContentType
 from messagefoundry.controlchars import has_control_char
 
 # Segment ids a valid HL7 v2 payload (single message or batch file) may start with.

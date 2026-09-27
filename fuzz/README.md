@@ -16,7 +16,7 @@ So a target feeds a parser arbitrary bytes and lets every **other** exception pr
 body and then broke its own contract on a path the inbound pipeline already relies on.
 
 Each target parses **and then reads the accessors the inbound path reads**. Fuzzing `parse` alone
-would have missed the finding already registered in `KNOWN_FINDINGS`.
+would have missed the one finding it has produced: an empty segment, fixed under BACKLOG #1594.
 
 ## Run it
 
@@ -148,6 +148,9 @@ Each entry is narrow: it matches one named structural condition, never a bare ex
 each is pinned from the outside by `tests/test_fuzz_targets.py`, which asserts the reproducer still
 provokes the violation. When the defect is fixed that test fails, and the failure is the instruction
 to delete the entry. A carve-out cannot quietly outlive its defect and become a blanket suppression.
+
+The register is empty today. Its one entry, the empty-segment finding, was fixed under BACKLOG #1594
+and came out with its carve-out. Its reproducer stays on as the `hl7_peek` seed `BLANK_SEGMENT_HL7`.
 
 ## Not covered
 

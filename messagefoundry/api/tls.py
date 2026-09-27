@@ -27,6 +27,7 @@ from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api
 from messagefoundry.auth.trust_anchors import api_client_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import (
+    apply_operator_tls_ciphers,
     harden_cipher_suites,
     harden_crl_check,
     harden_kex_groups,
@@ -84,7 +85,7 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         password=pw_arg,
     )
     if api.tls_ciphers:
-        ctx.set_ciphers(api.tls_ciphers)
+        apply_operator_tls_ciphers(ctx, api.tls_ciphers)  # validated at settings load
     else:
         # Unset is no longer "whatever the interpreter enables": the approved AEAD names are the
         # default on every context the engine builds (BACKLOG #300, the ADR 0188 amendment).

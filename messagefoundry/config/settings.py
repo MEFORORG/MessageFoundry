@@ -4379,9 +4379,9 @@ class ApprovalsSettings(_Section):
 
 
 #: The two snapshot mechanisms for the SQLite store backup (ADR 0049). ``vacuum_into`` (default) writes
-#: a fresh, fully-checkpointed, defragmented single-file copy under the store write lock — mandatory
-#: off-peak. ``online_backup`` uses SQLite's page-batched Online Backup API (low-contention) for a
-#: large/busy store.
+#: a fresh, fully-checkpointed, defragmented single-file copy. ``online_backup`` uses SQLite's Online
+#: Backup API for a page-for-page copy. Neither holds the store write lock for the copy (BACKLOG #1937);
+#: what the copy still costs is stated once, on ``MessageStore.snapshot_to``.
 _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 
 #: Cloud-URL schemes the destination must NEVER be (ADR 0049 — local/UNC only, no new egress surface).
@@ -4414,8 +4414,8 @@ class BackupSettings(_Section):
     # the destination. 0 = keep all (never prune). A verify-FAILED archive is never counted as a good
     # backup when pruning (so a failing run can't evict the last good one).
     retention_keep: int = 7
-    # "vacuum_into" (default; writer-lock under the off-peak schedule) | "online_backup" (low-contention,
-    # page-batched). See ADR 0049 §"New store surface".
+    # "vacuum_into" (default; defragmented copy) | "online_backup" (page-for-page copy). Neither holds
+    # the store write lock for the copy (BACKLOG #1937). See ADR 0049 §"New store surface".
     snapshot_method: str = "vacuum_into"
     # Bundle the loaded --config dir into the archive (so the cold seed is self-sufficient — store + the
     # config that interprets it — without assuming the DR box can reach the org git repo, ADR 0048).
