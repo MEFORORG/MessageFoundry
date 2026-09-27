@@ -63,6 +63,7 @@ __all__ = [
     "SQLSERVER_DOCUMENTED_DATABASE_ROLES",
     "SQLSERVER_FIXED_DATABASE_ROLES",
     "SQLSERVER_FIXED_SERVER_ROLES",
+    "SQLSERVER_RUNTIME_DATABASE_ROLES",
     "PostgresRoleFacts",
     "PrivilegeProbeStore",
     "StorePrivilegeError",
@@ -108,12 +109,18 @@ SQLSERVER_FIXED_DATABASE_ROLES: tuple[str, ...] = (
     "db_denydatawriter",
 )
 
-#: The grant both runbooks prescribe (``docs/DEPLOY-SERVER-DB.md`` §1.1) and the engine's store
-#: actually needs: row CRUD plus the schema DDL the ADR 0064 bootstrap issues on a moved schema.
-#: The documented SERVER-role set is EMPTY — the engine needs no fixed server role at all.
+#: The grant the runbooks prescribe (``docs/DEPLOY-SERVER-DB.md`` §1.1) for an engine login that runs
+#: its OWN schema DDL (``[store].schema_management = auto``): row CRUD plus the schema DDL the ADR 0064
+#: bootstrap issues on a moved schema. The documented SERVER-role set is EMPTY — the engine needs no
+#: fixed server role at all.
 SQLSERVER_DOCUMENTED_DATABASE_ROLES: frozenset[str] = frozenset(
     {"db_datareader", "db_datawriter", "db_ddladmin"}
 )
+
+#: The RUNTIME login's grant under ``[store].schema_management = external`` (#305, the server-DB
+#: default): row CRUD only. ``provision-schema`` runs the DDL as a separate principal, so here
+#: ``db_ddladmin`` is a standing schema-change right the runtime never uses, and it counts as excess.
+SQLSERVER_RUNTIME_DATABASE_ROLES: frozenset[str] = frozenset({"db_datareader", "db_datawriter"})
 
 #: ``db_deny*`` memberships REMOVE access. They are reported as observed but are never "excess" — a
 #: control that flagged a restriction as an over-grant would train an operator to ignore it.
@@ -127,8 +134,18 @@ def sqlserver_excess(
     control_server: bool,
     control_database: bool,
     database: str,
+    external: bool = False,
+    create_table: bool = False,
+    alter_schema: str | None = None,
 ) -> tuple[str, ...]:
     """What an observed SQL Server principal holds BEYOND the documented least-privilege grant.
+
+    ``external`` selects the grant for ``[store].schema_management = external`` (#305), under which
+    the runtime login holds row CRUD only, so ``db_ddladmin`` is reported as excess, and so are the
+    same rights granted directly rather than by role: ``create_table`` (``CREATE TABLE`` on the
+    database) and ``alter_schema`` (the name of the default schema, when the login holds ``ALTER`` on
+    it). Both are suppressed when ``db_ddladmin`` or ``db_owner`` is already named, since that role
+    carries them. ``False`` keeps the auto-mode grant, where the login runs its own schema DDL.
 
     Pure — no I/O — so both directions (over-granted and correctly-granted) are unit-testable without
     a database, and the live server legs assert the same function against a real login.
@@ -136,17 +153,26 @@ def sqlserver_excess(
     A membership that IMPLIES a permission suppresses the implied one, so the list reads as a set of
     distinct grants rather than one grant restated: ``sysadmin`` already carries ``CONTROL SERVER``,
     and ``db_owner`` already carries ``CONTROL`` on the database."""
+    documented = (
+        SQLSERVER_RUNTIME_DATABASE_ROLES if external else SQLSERVER_DOCUMENTED_DATABASE_ROLES
+    )
     out: list[str] = []
     for role in server_roles:
         out.append(f"server role {role}")
     for role in database_roles:
-        if role in SQLSERVER_DOCUMENTED_DATABASE_ROLES or role in _SQLSERVER_DENY_ROLES:
+        if role in documented or role in _SQLSERVER_DENY_ROLES:
             continue
         out.append(f"database role {role}")
     if control_server and "sysadmin" not in server_roles:
         out.append("CONTROL SERVER")
     if control_database and "db_owner" not in database_roles:
         out.append(f"CONTROL on database {database}")
+    ddl_role_named = bool({"db_ddladmin", "db_owner"} & set(database_roles)) or bool(server_roles)
+    if external and not ddl_role_named and not control_database:
+        if create_table:
+            out.append(f"CREATE TABLE on database {database}")
+        if alter_schema:
+            out.append(f"ALTER on schema {alter_schema}")
     return tuple(out)
 
 
@@ -212,10 +238,19 @@ def postgres_excess(
     owns_database: bool,
     create_on_database: bool,
     database: str,
+    external: bool = False,
+    schema: str = "",
+    create_on_schema: bool = False,
+    owned_in_schema: int = 0,
 ) -> tuple[str, ...]:
     """What an observed Postgres principal holds BEYOND the documented least-privilege grant.
 
     Pure, like :func:`sqlserver_excess`.
+
+    ``external`` (``[store].schema_management = external``, #305) adds the schema-DDL rights to the
+    excess: ``CREATE`` on the store's schema, and OWNERSHIP of objects in it (an owner may ``ALTER`` and
+    ``DROP`` its tables whatever the schema ACL says). Under auto mode the role runs its own DDL, so
+    both are prescribed and neither is reported.
 
     **Every attribute is read across every assumable role, not only the principal's own row** — see
     :class:`PostgresRoleFacts` for the measurement that settles why membership is enough. Reading the
@@ -252,6 +287,11 @@ def postgres_excess(
         # Only when it is NOT the owner: ownership already carries CREATE, so reporting both would
         # restate one grant as two.
         out.append(f"CREATE on database {database}")
+    if external:
+        if create_on_schema:
+            out.append(f"CREATE on schema {schema}")
+        if owned_in_schema:
+            out.append(f"OWNER of {owned_in_schema} object(s) in schema {schema}")
     return tuple(out)
 
 

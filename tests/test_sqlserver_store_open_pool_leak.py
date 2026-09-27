@@ -31,7 +31,7 @@ from typing import Any
 import pytest
 
 import messagefoundry.store.sqlserver as sqlserver_module
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.store.sqlserver import SqlServerStore
 
 
@@ -109,8 +109,14 @@ def _install_fake_aioodbc_that_never_connects(monkeypatch: pytest.MonkeyPatch) -
 
 
 def _settings() -> StoreSettings:
+    # AUTO: the open-time RCSI probe the fake answers runs only there (#305); the external default
+    # makes no probe connection, and the leak paths below are the same in both modes.
     return StoreSettings(
-        backend=StoreBackend.SQLSERVER, server="localhost", database="mefor_test", username="sa"
+        backend=StoreBackend.SQLSERVER,
+        server="localhost",
+        database="mefor_test",
+        username="sa",
+        schema_management=SchemaManagement.AUTO,
     )
 
 
@@ -129,7 +135,9 @@ async def test_open_closes_pool_and_shuts_down_executor_when_ensure_schema_raise
     monkeypatch.setattr(SqlServerStore, "_ensure_schema", _boom_ensure_schema)
 
     fake_executor = _FakeExecutor()
-    monkeypatch.setattr(sqlserver_module, "_build_pool_executor", lambda settings: fake_executor)
+    monkeypatch.setattr(
+        sqlserver_module, "_build_pool_executor", lambda settings, maxsize=None: fake_executor
+    )
 
     with pytest.raises(RuntimeError, match="schema boom"):
         await SqlServerStore.open(_settings())
@@ -151,7 +159,9 @@ async def test_open_still_shuts_down_the_executor_when_wait_closed_hangs(
     monkeypatch.setattr(SqlServerStore, "_ensure_schema", _boom_ensure_schema)
 
     fake_executor = _FakeExecutor()
-    monkeypatch.setattr(sqlserver_module, "_build_pool_executor", lambda settings: fake_executor)
+    monkeypatch.setattr(
+        sqlserver_module, "_build_pool_executor", lambda settings, maxsize=None: fake_executor
+    )
 
     with pytest.raises(RuntimeError, match="wait_closed wedged"):
         await SqlServerStore.open(_settings())
@@ -171,7 +181,9 @@ async def test_open_shuts_down_the_executor_when_create_pool_itself_fails(
     no ``pool`` local to close."""
     _install_fake_aioodbc_that_never_connects(monkeypatch)
     fake_executor = _FakeExecutor()
-    monkeypatch.setattr(sqlserver_module, "_build_pool_executor", lambda settings: fake_executor)
+    monkeypatch.setattr(
+        sqlserver_module, "_build_pool_executor", lambda settings, maxsize=None: fake_executor
+    )
 
     with pytest.raises(RuntimeError, match="connect boom"):
         await SqlServerStore.open(_settings())
