@@ -159,7 +159,16 @@ class UploadQuotaError(UploadError):
     ``asyncio.Lock``, so N engine shards over one dir used to hold N of them and each could overshoot
     by one file while another scanned. :meth:`UploadStore._reserve_across_shards` now takes an atomic
     reservation on the ONE unified store every shard shares before the write and pays it back after,
-    so a shard mid-upload is visible to its siblings and the decision is exclusive across processes.
+    so a shard mid-upload is visible to its siblings.
+
+    **The reservation alone did not make the decision exclusive, and this paragraph used to say it
+    did (BACKLOG #1942).** The reserve checked headroom from a scan taken before it, so two shards
+    could both pass on stale headroom (BACKLOG #1941). What holds now is narrower and is an ordering
+    argument, not a lock: each upload reserves, then reads the ledger's in-flight total, then scans
+    the disk, and is refused unless all three fit. Of any set of concurrent uploads, the last to read
+    counts every other one, either still reserved or already landed.
+    :meth:`UploadStore._reserve_across_shards` carries the argument. It can also refuse an upload
+    that would have fit, while a sibling's landed file is not yet released.
 
     Residual, stated precisely, and there are three:
 
@@ -179,8 +188,9 @@ class UploadQuotaError(UploadError):
       for longer than that window, the staleness reset zeroes a row that was legitimately non-zero,
       which restores the N-1 bound above for that window. Never worse than the pre-#1112 behaviour.
 
-    Still open, and out of scope here: the ledger is checked and paid back around the write, not in
-    the same transaction as it, because the body lives on the filesystem rather than in the store."""
+    The ledger is checked and paid back around the write, not in the same transaction as it, because
+    the body lives on the filesystem rather than in the store. The ordering above is what stands in
+    for that transaction, so the three residuals are the limits of the cross-process bound."""
 
 
 class UploadUnreadableError(UploadError, CipherError):
@@ -401,12 +411,13 @@ class PruneResult:
 
 
 class UploadQuotaLedger(Protocol):
-    """The ONE thing :class:`UploadStore` needs from the message store: an atomic, cross-process
-    reservation of an uploader's in-flight upload budget (ASVS 2.3.4).
+    """What :class:`UploadStore` needs from the message store: an atomic, cross-process reservation
+    of an uploader's in-flight upload budget (ASVS 2.3.4), and a read of it taken after reserving.
 
     Declared here as a structural protocol rather than importing ``store.base.Store``, so this module
     stays a leaf (see the module docstring). Every backend's ``Store`` satisfies it structurally —
-    see :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the full contract."""
+    see :meth:`messagefoundry.store.base.Store.reserve_upload_quota` and
+    :meth:`~messagefoundry.store.base.Store.upload_quota_in_flight` for the full contract."""
 
     async def reserve_upload_quota(
         self,
@@ -417,6 +428,8 @@ class UploadQuotaLedger(Protocol):
         max_files: int = 0,
         max_total_bytes: int = 0,
     ) -> bool: ...
+
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]: ...
 
 
 class UploadStore:
@@ -665,24 +678,39 @@ class UploadStore:
         ctype = content_type or content_type_for(display)
         file_id = secrets.token_hex(16)
 
-        def _build_and_write() -> UploadedFileMeta:
+        def _build_and_write(in_flight: tuple[int, int] | None) -> UploadedFileMeta:
             # Per-uploader quota (ASVS 5.2.4): scan the uploader's existing sidecars and refuse BEFORE
             # writing when this file would exceed their file-count or aggregate-byte cap. Runs in the same
             # off-loop thread as the write, and the caller holds _quota_lock across BOTH, so no second
             # upload in this process can read this count before the write consumes it (ASVS 2.3.4).
             # The scan is uncached, so shards sharing a dir enforce one budget rather than one each.
-            # The residual the lock alone cannot cover — a sibling shard between ITS scan and ITS
-            # write, invisible to this one — is covered by the ledger reservation the caller holds
-            # around this whole call. See _reserve_across_shards and _on_disk_refusal.
+            # What the lock cannot cover is a sibling shard's upload that is reserved but has not
+            # landed. `in_flight` is the ledger total the caller read AFTER reserving, so this scan
+            # plus that read count every such upload (BACKLOG #1941; _reserve_across_shards says why).
             mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
+            disk_files, disk_bytes = len(mine), sum(m.size for m in mine)
             refusal = self._on_disk_refusal(
                 uploader=uploader,
-                observed_files=len(mine),
-                observed_bytes=sum(m.size for m in mine),
+                observed_files=disk_files,
+                observed_bytes=disk_bytes,
                 size=len(data),
             )
             if refusal is not None:
                 raise refusal
+            if in_flight is not None and (
+                self._on_disk_refusal(
+                    uploader=uploader,
+                    # The ledger total includes this upload's own reservation; it is counted by
+                    # `size` below, so only the siblings' share is added to the disk figures.
+                    observed_files=disk_files + max(0, in_flight[0] - 1),
+                    observed_bytes=disk_bytes + max(0, in_flight[1] - len(data)),
+                    size=len(data),
+                )
+                is not None
+            ):
+                raise self._shard_refusal(
+                    uploader=uploader, observed_files=disk_files, observed_bytes=disk_bytes
+                )
             meta = UploadedFileMeta(
                 file_id=file_id,
                 filename=display,
@@ -719,40 +747,53 @@ class UploadStore:
 
         # One critical section per process: quota check + write. See _quota_lock in __init__.
         # Inside it, one cross-PROCESS reservation around the same window (ASVS 2.3.4): the sidecar
-        # scan below already sees every shard's files, so the only thing it CANNOT see is an upload
-        # in flight on another shard — reserved but not yet landed. The reservation is what the other
-        # shards see instead, and it is released the moment the file is on disk (or the write fails),
-        # so a completed upload is counted by the scan and by nothing else.
+        # scan in _build_and_write already sees every shard's files, so the only thing it CANNOT see
+        # is an upload in flight on another shard — reserved but not yet landed. The reservation is
+        # what the other shards see instead, and it is released only once the file is on disk (or the
+        # write fails), so a completed upload is always visible to at least one of the two reads.
         async with self._quota_lock:
-            reserved = await self._reserve_across_shards(
+            in_flight = await self._reserve_across_shards(
                 uploader_id=uploader_id, uploader=uploader, size=len(data)
             )
             try:
-                return await asyncio.to_thread(_build_and_write)
+                return await asyncio.to_thread(_build_and_write, in_flight)
             finally:
-                if reserved:
+                if in_flight is not None:
                     await self._release_across_shards(uploader_id=uploader_id, size=len(data))
 
-    async def _reserve_across_shards(self, *, uploader_id: str, uploader: str, size: int) -> bool:
-        """Take this uploader's cross-shard in-flight reservation; return whether one is held.
-
-        ``False`` means there is no ledger bound (the store-less construction path) — not that the
-        reservation was refused. A refusal raises :class:`UploadQuotaError`, the same TYPE the
+    async def _reserve_across_shards(
+        self, *, uploader_id: str, uploader: str, size: int
+    ) -> tuple[int, int] | None:
+        """Take this uploader's cross-shard in-flight reservation, then read the ledger's in-flight
+        ``(files, bytes)`` total back. Returns that total, which includes this reservation, or
+        ``None`` when there is no ledger (the store-less construction path). ``None`` does not mean
+        the reservation was refused. A refusal raises :class:`UploadQuotaError`, the same TYPE the
         in-process check raises, so the API's 409 + ``upload.reject_quota`` audit is unchanged; the
         message differs on purpose, so an operator can tell the two causes apart. A ledger error is
         NOT swallowed: the store being unreachable fails the upload closed.
 
-        The headroom handed to the ledger is the cap minus what the (fleet-visible, uncached) sidecar
-        scan observed, so the ledger only ever holds the in-flight remainder. That is a second scan
-        per save — bounded by the uploader's own file count, off the event loop, and on the operator
-        diagnostic surface rather than the data plane."""
+        **The quota decision is made AFTER this returns, not here (BACKLOG #1941).** This used to
+        hand the ledger ``cap - observed`` as headroom, where ``observed`` came from a sidecar scan
+        taken BEFORE the reserve. A sibling shard's file could land in between, so two shards could
+        each pass on stale headroom, and the later disk scan never read the ledger. Measured shape:
+        cap 3, one file on disk, two shards, four files landed.
+
+        The fix is ordering. This reserves, then reads the in-flight total, and ``_build_and_write``
+        then scans the disk and refuses unless disk plus the siblings' in-flight share plus this file
+        fits. Take the last of any set of concurrent uploads to do its read: every other one has
+        reserved by then, and is either still reserved, so the read counts it, or released, which
+        happens only after its file landed, so the scan counts it. A file that has landed but is not
+        yet released is counted twice, which can refuse an upload that would have fit. That errs
+        toward refusing and clears when the sibling releases.
+
+        The ledger is still handed ``cap - observed`` as headroom, but only as a first filter. It lets
+        the second of two same-moment uploads be refused at the ledger, rather than both reserving and
+        each then refusing the other. An uploader already over budget on disk is refused before the
+        reserve, with the on-disk wording, rather than by a zero-headroom ledger that would blame
+        uploads on another shard that do not exist."""
         if self._ledger is None:
-            return False
+            return None
         observed_files, observed_bytes = await asyncio.to_thread(self._observed_sync, uploader_id)
-        # Refuse an already-over-budget uploader HERE, with the on-disk wording, before consulting
-        # the ledger. Otherwise the ledger (handed zero headroom) refuses first and its message
-        # blames in-flight uploads on another shard that do not exist — a 409 that sends an operator
-        # hunting a phantom. Same helper as the under-lock check, so the text is one string.
         refusal = self._on_disk_refusal(
             uploader=uploader,
             observed_files=observed_files,
@@ -769,15 +810,28 @@ class UploadStore:
             max_total_bytes=self._max_total_bytes_per_user - observed_bytes,
         )
         if not ok:
-            # Headroom was positive, so the only thing that can have consumed it is an upload in
-            # flight on another shard. That is exactly the double-book this control exists to refuse.
-            raise UploadQuotaError(
-                f"uploader {uploader!r} has {observed_files} uploaded files holding "
-                f"{observed_bytes} bytes, and another engine shard is mid-upload against the same "
-                f"budget; the limits are {self._max_files_per_user} files / "
-                f"{self._max_total_bytes_per_user} bytes"
+            raise self._shard_refusal(
+                uploader=uploader, observed_files=observed_files, observed_bytes=observed_bytes
             )
-        return True
+        try:
+            return await self._ledger.upload_quota_in_flight(uploader_id)
+        except BaseException:
+            # The reservation is held and the caller will never see it, so pay it back here.
+            await self._release_across_shards(uploader_id=uploader_id, size=size)
+            raise
+
+    def _shard_refusal(
+        self, *, uploader: str, observed_files: int, observed_bytes: int
+    ) -> UploadQuotaError:
+        """The refusal when what is on disk fits but uploads in flight on other engine shards take
+        the rest of the budget. Worded apart from :meth:`_on_disk_refusal` so an operator can tell
+        the two causes apart."""
+        return UploadQuotaError(
+            f"uploader {uploader!r} has {observed_files} uploaded files holding "
+            f"{observed_bytes} bytes, and another engine shard is mid-upload against the same "
+            f"budget; the limits are {self._max_files_per_user} files / "
+            f"{self._max_total_bytes_per_user} bytes"
+        )
 
     def _on_disk_refusal(
         self, *, uploader: str, observed_files: int, observed_bytes: int, size: int

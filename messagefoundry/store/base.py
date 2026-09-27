@@ -1356,7 +1356,9 @@ class QueueStore(StoreLifecycle, Protocol):
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
         """Atomically reserve (or release) an uploader's IN-FLIGHT upload budget; return whether the
-        reserve applied. The one cross-process decision point behind the per-uploader upload quota.
+        reserve applied. The cross-process half of the per-uploader upload quota, and not the whole
+        decision: the caller reads :meth:`upload_quota_in_flight` after reserving and decides from
+        that read plus a fresh disk scan (BACKLOG #1941).
 
         **Why the store owns this.** ``UploadStore._quota_lock`` is an ``asyncio.Lock``, so it is
         per-event-loop and therefore per-process. Engine sharding is the built, shipped, default
@@ -1381,6 +1383,19 @@ class QueueStore(StoreLifecycle, Protocol):
         has been CONTINUOUSLY outstanding for longer than ``stale_after`` seconds is reset to zero
         before the add. The reset can only restore today's behaviour (an overshoot bounded by the
         number of concurrent writers), never something worse."""
+        ...
+
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """``(files, bytes)`` currently reserved in flight for ``uploader_id``, as stored; ``(0, 0)``
+        when the uploader has no row. A plain read that writes nothing.
+
+        **Why the caller needs it after reserving (BACKLOG #1941).** The headroom a reserve checks
+        against comes from a sidecar scan the caller took BEFORE reserving, so a sibling shard's file
+        can land in between and two shards can each pass on stale headroom. The fix is ordering: the
+        caller reserves, THEN reads this, THEN scans the disk. Any other upload is then either still
+        reserved when this runs, or released, which happens only after its file has landed, so the
+        later disk scan sees it. Read raw on purpose: the caller has just reserved, so the row is not
+        stale, and resetting it here could only drop reservations and let an upload through."""
         ...
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------

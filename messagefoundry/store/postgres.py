@@ -6949,6 +6949,14 @@ class PostgresStore:
         )
         return row is not None
 
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
+        row = await self._fetchone(
+            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = $1",
+            uploader_id,
+        )
+        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
         row = await self._fetchone("SELECT invocations FROM cipher_meta WHERE key_id = $1", key_id)
