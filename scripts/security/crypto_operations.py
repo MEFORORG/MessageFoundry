@@ -686,8 +686,9 @@ def discover_operations_in_modules(modules: list[ParsedModule]) -> list[Operatio
     # * Within a module, always. A public entry point over a private helper is followed.
     # * Across modules, only into a CRYPTO MODULE, one that performs at least one direct operation of
     #   its own. ``transports/rest._no_redirect_opener`` builds its opener through ``tls_policy``, and
-    #   ``rest.py`` is a crypto module, so the OAuth token hop in ``transports/http_auth.py`` that calls
-    #   it is found two hops from the ``ssl`` call. Without the rule it was invisible.
+    #   ``rest.py`` is a crypto module, so the token-hop base in ``transports/smart.py`` that calls it
+    #   is found two hops from the ``ssl`` call. Without the rule it was invisible. (That call sat in
+    #   ``transports/http_auth.py`` until BACKLOG #2115 moved both token hops onto the one base.)
     # * Never into a module with no direct operation of its own. Following every chain to its root
     #   marks the app factory, the verifier's entry point and every load-harness runner as crypto
     #   (measured on this tree, with the opaque providers below already applied: 301 seam sites with

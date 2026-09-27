@@ -536,9 +536,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/soap.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
     ),
-    # BACKLOG #300: the Vault clients' strict reply adapter gives each new connection a context from
-    # the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows and asserts it.
-    # The adapter decides nothing; `ssl` is the factory's return type.
+    # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
+    # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
+    # and asserts it. Its one decision, leaving CERT_NONE hops alone, is on its IMPORT_ONLY row.
     "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
@@ -793,9 +793,16 @@ IMPORT_ONLY: dict[str, str] = {
         "to a DSN string and refuses an insecure hop: a first-party TLS posture decision with no "
         "crypto-shaped expression for any pattern instrument to match"
     ),
+    "messagefoundry/transports/http_auth.py": (
+        "carries a trust anchor and a hop posture to the refusal checks; the OAuth2 token hop's "
+        "opener is built by the shared base in transports/smart.py (BACKLOG #2115), which is "
+        "inventoried"
+    ),
     "messagefoundry/transports/strict_requests.py": (
-        "gives each Vault connection a context from a factory config/tls_policy.py returns, which "
-        "builds and narrows it there; decides nothing itself (BACKLOG #300)"
+        "INSTRUMENT LIMIT. Gives each verifying Vault https connection a context from a factory "
+        "config/tls_policy.py returns, which builds and narrows it there, and leaves a CERT_NONE "
+        "connection (the TLS hop to an https proxy) on urllib3's own context: a TLS posture "
+        "decision with no crypto-shaped call in it (BACKLOG #300)"
     ),
     "tee/mefor_api.py": (
         "accepts an ssl context as a parameter and hands it to urlopen; tee/__main__.py builds it"
@@ -1163,12 +1170,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/transports/file.py": frozenset({"hash:hashlib.sha256"}),
-    "messagefoundry/transports/http_auth.py": frozenset(
-        {
-            "key_cert:via messagefoundry.transports.rest",
-            "tls_context:via messagefoundry.transports.rest",
-        }
-    ),
     "messagefoundry/transports/http_listener.py": frozenset(
         {
             "compare:via messagefoundry.credential",

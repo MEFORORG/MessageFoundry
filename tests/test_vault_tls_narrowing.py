@@ -399,29 +399,54 @@ def test_a_wrong_host_name_is_refused(pki: _Pki, monkeypatch: pytest.MonkeyPatch
             client.adapter.get(_PATH)
 
 
+def _recording_adapter(factory: Any) -> Any:
+    from messagefoundry.transports.strict_requests import StrictReplyAdapter
+
+    return StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
+
+
+def test_an_https_pool_that_is_not_narrowed_is_refused_before_sending(vault: _TlsVault) -> None:
+    """The pre-send check holds the narrowing the way it holds the strict head reader: an https
+    pool whose class lacks the narrowing is refused, and nothing reaches the listener. Mutation:
+    drop that check; the request then handshakes on urllib3's own context."""
+    import requests
+
+    from messagefoundry.transports.bounded_read import EgressReplyError
+
+    adapter = _recording_adapter(ssl.create_default_context)
+    classes = dict(adapter.poolmanager.pool_classes_by_scheme)
+    # The narrowed class's own base: a strict-head https pool that is NOT narrowed.
+    classes["https"] = classes["https"].__mro__[1]
+    adapter.poolmanager.pool_classes_by_scheme = classes
+    session = requests.Session()
+    session.mount("https://", adapter)
+    with pytest.raises(EgressReplyError, match="did not narrow"):
+        session.get(f"{vault.url}/{_PATH}", timeout=5)
+    assert vault.negotiated == [], "a handshake reached the listener"
+
+
 def test_a_hop_through_a_proxy_is_narrowed_too(vault: _TlsVault) -> None:
     """With HTTPS_PROXY set, requests takes the pools from a proxy manager, not the adapter's own.
     Mutation: delete ``StrictReplyAdapter.proxy_manager_for``; red. Structural rather than on the
     wire, because driving a real proxy is out of scope here: it checks that the proxy manager's
-    https connections take their context from the same factory."""
-    client = _kv_client(vault.url)
-    adapter = client.adapter.session.get_adapter(vault.url)
-    manager = adapter.proxy_manager_for("http://127.0.0.1:9")
-    conn_cls = manager.pool_classes_by_scheme["https"].ConnectionCls
+    https connections take their context from the same factory, and that a cached manager keeps
+    the same classes on every call, so it is never briefly un-narrowed or re-wrapped."""
     made: list[ssl.SSLContext] = []
 
     def factory() -> ssl.SSLContext:
         made.append(ssl.create_default_context())
         return made[-1]
 
-    adapter._ssl_context_factory = factory
-    manager = adapter.proxy_manager_for("http://127.0.0.2:9")
-    conn = manager.pool_classes_by_scheme["https"].ConnectionCls("127.0.0.1", vault.port)
+    adapter = _recording_adapter(factory)
+    manager = adapter.proxy_manager_for("http://127.0.0.1:9")
+    classes = manager.pool_classes_by_scheme
+    assert adapter.proxy_manager_for("http://127.0.0.1:9") is manager
+    assert manager.pool_classes_by_scheme is classes, "a cached proxy manager was re-wrapped"
+    conn = classes["https"].ConnectionCls("127.0.0.1", vault.port)
     with contextlib.suppress(Exception):  # only the context the connect took matters
         conn.connect()
     conn.close()
     assert made and conn.ssl_context is made[0], "the proxied connection skipped the factory"
-    assert conn_cls.__name__ == "NarrowedHTTPSConnection"
 
 
 def test_a_connection_that_will_not_verify_keeps_urllib3s_own_context(vault: _TlsVault) -> None:
@@ -429,16 +454,13 @@ def test_a_connection_that_will_not_verify_keeps_urllib3s_own_context(vault: _Tl
     TLS hop is to the proxy. The factory's context checks host names, so handing it to urllib3
     there raised ValueError on every call. Such a connection is left to urllib3, as before. Driven
     against the local listener with CERT_NONE, which is exactly that connection's shape."""
-    client = _kv_client(vault.url)
-    adapter = client.adapter.session.get_adapter(vault.url)
     made: list[ssl.SSLContext] = []
 
     def factory() -> ssl.SSLContext:
         made.append(ssl.create_default_context())
         return made[-1]
 
-    adapter._ssl_context_factory = factory
-    manager = adapter.proxy_manager_for("https://127.0.0.3:9")
+    manager = _recording_adapter(factory).proxy_manager_for("https://127.0.0.3:9")
     conn = manager.pool_classes_by_scheme["https"].ConnectionCls(
         "127.0.0.1", vault.port, cert_reqs="CERT_NONE"
     )

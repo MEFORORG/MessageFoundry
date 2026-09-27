@@ -15,7 +15,7 @@ the suite assertion checked (``tls_policy.assert_hvac_tls_suites``) are still th
 uses. The adapter subclasses ``HTTPAdapter``. Since BACKLOG #300 it also gives each new verifying
 https connection a fresh context from the factory that assertion returned, so every TLS handshake
 with Vault runs on a narrowed, asserted context; urllib3 still applies requests' ``verify`` to it.
-:func:`_narrow_https_pools` names the proxy hops it leaves alone. It also changes how the reply BODY
+:func:`_narrowed_pool_classes` names the proxy hops it leaves alone. It also changes how the reply BODY
 is read:
 
 * The body is read eagerly, in :meth:`StrictReplyAdapter.build_response`, from the
@@ -43,6 +43,30 @@ that the hop does not already concede.
 been.** ``requests`` calls ``build_response`` outside the ``try`` that translates socket errors, so
 a stall or reset mid-body would otherwise escape as a bare :class:`TimeoutError` or
 :class:`OSError`.
+
+**The reply HEAD is read strictly too (BACKLOG #2123).** By the time ``build_response`` runs,
+``http.client`` has already parsed the status line and headers, so the body read above cannot see a
+bare CR there. ``urllib3``'s connection builds its ``http.client`` response from the connection's
+``response_class``, so the adapter's pools open connections whose ``response_class`` is #2052's
+:class:`~messagefoundry.transports.bounded_read.StrictHTTPResponse`. That class refuses a bare CR as
+the head is read. ``urllib3`` reports the refusal as a lost connection and closes that connection
+rather than pooling it. :meth:`StrictReplyAdapter.send` finds the refusal inside the ``requests``
+error and raises it as a
+:class:`~messagefoundry.transports.bounded_read.MalformedReplyHeadError` naming the hop, so the
+providers name the refusal and not a generic connection error. The connection classes subclass
+``urllib3``'s own, so the constructor is unchanged. The https connection's TLS context is the
+BACKLOG #300 one above: :func:`_narrowed_pool_classes` subclasses the strict-head class, so a
+narrowed connection still reads its head strictly.
+
+A pool whose connections would read the head with the stock class is refused before anything is
+sent. The one such pool ``requests`` can build is a SOCKS proxy's, and that needs the PySocks
+package, which the engine does not install. Without it ``requests`` refuses a SOCKS proxy itself.
+
+**Not covered: an HTTP proxy's own CONNECT reply.** For an ``https`` target through an HTTP proxy,
+``http.client`` reads the proxy's reply to ``CONNECT`` with ``_read_status`` and ``_read_headers``
+and never calls ``begin``, so a bare CR there is not refused. That head frames no body the engine
+reads, and the Vault reply that follows inside the tunnel is read strictly. #2052's urllib openers
+have the same gap.
 """
 
 from __future__ import annotations
@@ -54,11 +78,16 @@ from typing import Any
 
 import requests
 import requests.adapters
+import urllib3.connection
+import urllib3.connectionpool
+import urllib3.poolmanager
 from urllib3.util.ssl_ import resolve_cert_reqs
 
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     EgressReplyError,
+    MalformedReplyHeadError,
+    StrictHTTPResponse,
     read_bounded,
 )
 
@@ -81,18 +110,41 @@ __all__ = [
 MAX_VAULT_REPLY_BYTES = 64 * 1024 * 1024
 
 
-#: Marks an https pool class :func:`_narrow_https_pools` already made, so a cached proxy manager
-#: handed back again is not wrapped a second time.
+class _StrictHeadHTTPConnection(urllib3.connection.HTTPConnection):
+    response_class = StrictHTTPResponse
+
+
+class _StrictHeadHTTPSConnection(urllib3.connection.HTTPSConnection):
+    response_class = StrictHTTPResponse
+
+
+class _StrictHeadHTTPConnectionPool(urllib3.connectionpool.HTTPConnectionPool):
+    ConnectionCls = _StrictHeadHTTPConnection
+
+
+class _StrictHeadHTTPSConnectionPool(urllib3.connectionpool.HTTPSConnectionPool):
+    ConnectionCls = _StrictHeadHTTPSConnection
+
+
+_STRICT_CONNECTIONS = (_StrictHeadHTTPConnection, _StrictHeadHTTPSConnection)
+
+#: Set on the https pool class :func:`_narrowed_pool_classes` makes. The pre-send check in
+#: :meth:`StrictReplyAdapter.get_connection_with_tls_context` refuses an https pool without it.
 _NARROWED_POOL_MARK = "_mefor_narrowed_tls"
 
 
-def _narrow_https_pools(manager: Any, factory: Callable[[], ssl.SSLContext]) -> None:
-    """Make ``manager``'s verifying https connections handshake on a fresh ``factory()`` context.
+def _narrowed_pool_classes(
+    factory: Callable[[], ssl.SSLContext],
+) -> dict[str, type[urllib3.connectionpool.HTTPConnectionPool]]:
+    """The pool classes one adapter's managers use, replacing ``urllib3``'s module-level map.
 
-    BACKLOG #300. The context is set per CONNECTION, in ``connect``, not per pool, for the reasons
-    ``tls_policy.assert_hvac_tls_suites`` gives. It subclasses the https pool class the manager
-    already uses, not a fixed one, so a SOCKS proxy manager keeps its SOCKS connections. The dict is
-    replaced, never changed in place, because a ``PoolManager`` shares urllib3's module-level dict.
+    Strict heads on both schemes (#2123), and a narrowed context on https.
+
+    BACKLOG #300 on top of #2123. The https connection subclasses the strict-head one, so it keeps
+    :class:`StrictHTTPResponse`, and sets a fresh ``factory()`` context in ``connect``. It is per
+    CONNECTION, not per pool, for the reasons ``tls_policy.assert_hvac_tls_suites`` gives. Built
+    ONCE per adapter and assigned whole, so a manager's classes are never briefly un-narrowed while
+    another thread builds a pool from them.
 
     **A connection that will not verify is left alone.** requests sets ``CERT_NONE`` on one case
     only here, since the Vault clients refuse ``verify=False``: an ``http://`` Vault reached through
@@ -103,28 +155,50 @@ def _narrow_https_pools(manager: Any, factory: Callable[[], ssl.SSLContext]) -> 
     **Not narrowed, at least: the TLS hop to an ``https://`` proxy in front of an ``https://``
     Vault.** urllib3 builds that context itself, from the proxy settings. The hop to Vault inside
     the tunnel is narrowed."""
-    classes = dict(manager.pool_classes_by_scheme)
-    base_pool = classes["https"]
-    if getattr(base_pool, _NARROWED_POOL_MARK, False):
-        return
-    base_conn = base_pool.ConnectionCls
 
-    def connect(self: Any) -> None:
-        if resolve_cert_reqs(self.cert_reqs) != ssl.CERT_NONE:
-            self.ssl_context = factory()
-        base_conn.connect(self)
+    class NarrowedHTTPSConnection(_StrictHeadHTTPSConnection):
+        def connect(self) -> None:
+            if resolve_cert_reqs(self.cert_reqs) != ssl.CERT_NONE:
+                self.ssl_context = factory()
+            super().connect()
 
-    conn_cls = type("NarrowedHTTPSConnection", (base_conn,), {"connect": connect})
-    classes["https"] = type(
-        "NarrowedHTTPSConnectionPool",
-        (base_pool,),
-        {"ConnectionCls": conn_cls, _NARROWED_POOL_MARK: True},
-    )
-    manager.pool_classes_by_scheme = classes
+    class NarrowedHTTPSConnectionPool(_StrictHeadHTTPSConnectionPool):
+        ConnectionCls = NarrowedHTTPSConnection
+
+    setattr(NarrowedHTTPSConnectionPool, _NARROWED_POOL_MARK, True)
+    return {"http": _StrictHeadHTTPConnectionPool, "https": NarrowedHTTPSConnectionPool}
+
+
+def _head_refusal_in(exc: BaseException) -> MalformedReplyHeadError | None:
+    """The head refusal ``urllib3`` and ``requests`` wrapped, if ``exc`` carries one.
+
+    ``urllib3`` wraps it in a ``ProtocolError``'s arguments, and ``requests`` wraps that in a
+    ``ConnectionError``'s. ``__cause__`` is walked as well, so a later release that moves it from
+    the arguments to an explicit cause is still found. ``__context__`` is NOT walked: a request sent
+    while the caller handles an earlier refusal carries that refusal as its context, and an
+    unrelated failure would then be relabelled as a head refusal.
+    """
+    seen: set[int] = set()
+    pending: list[object] = [exc]
+    while pending:
+        item = pending.pop()
+        if not isinstance(item, BaseException) or id(item) in seen:
+            continue
+        if isinstance(item, MalformedReplyHeadError):
+            return item
+        seen.add(id(item))
+        pending.extend(item.args)
+        pending.append(item.__cause__)
+    return None
 
 
 class StrictReplyAdapter(requests.adapters.HTTPAdapter):
-    """A ``requests`` adapter that reads every reply body through ``bounded_read``.
+    """A ``requests`` adapter that reads every reply head and body strictly.
+
+    The head is read by ``StrictHTTPResponse`` on every connection the adapter's pools open, and a
+    pool that would read it any other way is refused before sending. A bare CR in the head raises
+    ``MalformedReplyHeadError`` from :meth:`send`, not the ``requests.ConnectionError`` that
+    ``requests`` wraps it in. The body is read through ``bounded_read``.
 
     ``connector`` names the hop in every refusal. It must be a fixed, operator-facing label, never a
     URL, a token or a body, because it is carried into exception text.
@@ -142,6 +216,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
     __attrs__ = [
         *requests.adapters.HTTPAdapter.__attrs__,
         "_ssl_context_factory",
+        "_pool_classes",
         "_connector",
         "_limit",
     ]
@@ -155,6 +230,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
     ) -> None:
         # Set BEFORE super().__init__(), which builds the pool manager through init_poolmanager.
         self._ssl_context_factory = ssl_context_factory
+        self._pool_classes = _narrowed_pool_classes(ssl_context_factory)
         super().__init__()
         self._connector = connector
         self._limit = limit
@@ -167,15 +243,58 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         **pool_kwargs: Any,
     ) -> None:
         super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
-        _narrow_https_pools(self.poolmanager, self._ssl_context_factory)
+        # The strict-head classes (#2123), with the https one narrowed on top (#300).
+        self.poolmanager.pool_classes_by_scheme = self._pool_classes
 
     def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
-        # A hop reached through a proxy takes its pools from the proxy manager instead. Without
-        # this, an HTTPS_PROXY in the environment would take the hop back to urllib3's own wider
-        # suite list.
         manager = super().proxy_manager_for(proxy, **proxy_kwargs)
-        _narrow_https_pools(manager, self._ssl_context_factory)
+        # Only a plain proxy manager's pools are the stock ones. A SOCKS manager's pools open SOCKS
+        # connections, and swapping them would send around the proxy, so those are left alone and
+        # refused below.
+        # The same dict every call, so a cached manager is never re-wrapped (BACKLOG #300).
+        if type(manager) is urllib3.poolmanager.ProxyManager:
+            manager.pool_classes_by_scheme = self._pool_classes
         return manager
+
+    def get_connection_with_tls_context(
+        self,
+        request: requests.PreparedRequest,
+        verify: Any,
+        proxies: dict[str, str] | None = None,
+        cert: Any = None,
+    ) -> urllib3.connectionpool.HTTPConnectionPool:
+        pool = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
+        # Both halves: the class is one of ours, and nothing below it put the stock reader back.
+        if not (
+            issubclass(pool.ConnectionCls, _STRICT_CONNECTIONS)
+            and issubclass(pool.ConnectionCls.response_class, StrictHTTPResponse)
+        ):
+            raise EgressReplyError(
+                f"{self._connector} would read its reply head with a connection the engine cannot "
+                "make strict; refusing to send"
+            )
+        # BACKLOG #300, the same fail-closed shape: an https pool must be the narrowed one.
+        if pool.scheme == "https" and not getattr(type(pool), _NARROWED_POOL_MARK, False):
+            raise EgressReplyError(
+                f"{self._connector} would handshake on a TLS context the engine did not narrow; "
+                "refusing to send"
+            )
+        return pool
+
+    def send(
+        self, request: requests.PreparedRequest, *args: Any, **kwargs: Any
+    ) -> requests.Response:
+        try:
+            return super().send(request, *args, **kwargs)
+        except requests.exceptions.ConnectionError as exc:
+            refusal = _head_refusal_in(exc)
+            if refusal is None:
+                raise
+            raise MalformedReplyHeadError(
+                f"{self._connector} framed its reply head ambiguously ({refusal.reason}); "
+                "refusing to read it",
+                reason=refusal.reason,
+            ) from exc
 
     def add_headers(self, request: requests.PreparedRequest, **kwargs: Any) -> None:
         # The hook requests documents for exactly this, called on every send before the request is

@@ -1163,6 +1163,44 @@ def test_the_bare_cr_refusal_is_both_a_framing_error_and_an_http_exception() -> 
     assert clone.reason == "r"
 
 
+def _token_provider(which: str, url: str) -> object:
+    """One of the two bearer-token providers, pointed at ``url``, on its own shipped opener."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from messagefoundry.config.models import SignatureAlgorithm
+    from messagefoundry.transports.http_auth import OAuth2ClientCredentialsProvider
+    from messagefoundry.transports.smart import SmartBackendTokenProvider
+
+    if which == "oauth2":
+        return OAuth2ClientCredentialsProvider(token_url=url, client_id="c", client_secret="s")
+    key = (
+        ec.generate_private_key(ec.SECP384R1())
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+    return SmartBackendTokenProvider(
+        token_url=url, client_id="c", private_key=key, algorithm=SignatureAlgorithm.ES384
+    )
+
+
+@pytest.mark.parametrize("which", ["smart", "oauth2"])
+def test_a_token_request_keeps_the_bare_cr_refusal_as_it_is(which: str) -> None:
+    """The shared token reader has an ``HTTPException`` arm, and the refusal is an
+    ``HTTPException`` too. It must pass through that arm unchanged, reason and all, rather than be
+    retyped as a plain malformed-reply ``DeliveryError`` (the Lander's review of PR 1662)."""
+    raw = _json_reply(b"X-A: a\rContent-Length: %d\r\n" % len(_TOKEN_JSON))
+    with _serve(raw) as url:
+        provider = _token_provider(which, url)
+        with pytest.raises(DeliveryError) as raised:
+            provider.access_token()  # type: ignore[attr-defined]
+    _assert_bare_cr_refusal(raised.value)
+
+
 def test_oidc_jwks_fetch_refuses_a_bare_cr_as_an_http_exception() -> None:
     from messagefoundry.auth.oidc.jwks import JwksError
     from messagefoundry.auth.oidc_http import build_idp_opener, jwks_fetcher

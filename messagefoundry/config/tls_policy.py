@@ -1318,7 +1318,7 @@ def assert_hvac_tls_suites(
     a CA the operator removed from the file would stay trusted until restart. Several threads would
     also be changing one context while others handshake on it. So every TLS handshake with Vault
     runs on a context narrowed and asserted one step before use. The adapter's
-    ``_narrow_https_pools`` names the proxy hops it leaves to urllib3.
+    ``_narrowed_pool_classes`` names the proxy hops it leaves to urllib3.
     ``tests/test_tls_cipher_assertion_sites.py`` captures the context at ``ssl_wrap_socket`` and
     requires it to be one the assertion ran on.
 
