@@ -181,6 +181,7 @@ from messagefoundry.transports import (
 from messagefoundry.transports.base import (
     ConnectionEventSink,
     IntakeAuditSink,
+    IntakeGate,
     IntakeRateLimiter,
     SyncReplyResolver,
 )
@@ -930,6 +931,7 @@ class RegistryRunner:
         saturation_default: SaturationThreshold | None = None,
         ack_after_default: AckAfter | None = None,
         stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: streaming-detach concurrency DoS guard (0=off)
+        intake_gate: IntakeGate | None = None,  # BACKLOG #290 slice 2: the engine-wide intake pause
         priority_default: Priority | None = None,
         dr_threshold: Priority | None = None,
         alert_sink: AlertSink | None = None,
@@ -1039,6 +1041,10 @@ class RegistryRunner:
         # threaded and the increment/refuse/decrement never awaits across the check).
         self._stream_inflight_budget = max(0, stream_inflight_budget_bytes)
         self._stream_inflight_bytes = 0
+        # BACKLOG #290 slice 2: the ONE engine-wide intake gate, owned by the Engine (whose
+        # IntakeBoundMonitor holds and releases it) and injected into every source this runner starts.
+        # None (embedding/tests) = no pause, so every source reads exactly as before.
+        self._intake_gate = intake_gate
         # DR run-profile (#61, ADR 0048). _priority_default is the global [delivery].priority a
         # connection inherits when it declares no priority= (resolution: per-connection override >
         # global default > built-in NORMAL). _dr_threshold is the THIS-RUN run-profile gate: when set
@@ -2971,6 +2977,11 @@ class RegistryRunner:
         # by a HASHED key. Every other source ignores it (byte-identical); transports/ stays store-agnostic
         # — the same runtime-injection shape as on_connection_event / content_type above.
         source.processed_ledger = _StoreProcessedLedger(self.store, ic.name)
+        # The engine-wide intake pause (BACKLOG #290 slice 2), injected the same runtime way: this is
+        # the ONE seam every inbound passes through, so every source shares one gate and one
+        # measurement. A source consults it BEFORE it reads; one that does not yet (at least the MLLP
+        # listener, the DICOM SCP and the timer) keeps reading, which is a coverage gap and never a loss.
+        source.intake_gate = self._intake_gate
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
         # free of any pipeline/cluster import. Only POLL sources act on it — they skip a scan when it

@@ -42,6 +42,7 @@ from messagefoundry.transports.base import (
     probe_tcp_reachable,
     register_destination,
     register_source,
+    wait_for_intake,
 )
 from messagefoundry.transports.framing import FrameCodec, FrameError, codec_for
 from messagefoundry.transports.mllp import (
@@ -605,6 +606,13 @@ class TcpSource(SourceConnector):
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     if pacer is not None:
                         await pacer.pace()
+                    # BACKLOG #290 slice 2: the engine-wide intake pause, BEFORE the read. Every
+                    # frame already read was handled above, so nothing waits here un-committed. A
+                    # peer that closed with nothing left unread also ends the wait, freeing its slot.
+                    if not await wait_for_intake(
+                        self.intake_gate, stopped=lambda: writer.is_closing() or reader.at_eof()
+                    ):
+                        break  # stopping or closed while paused: close as on EOF, nothing was read
                     if self.receive_timeout:
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)

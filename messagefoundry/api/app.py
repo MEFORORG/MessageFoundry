@@ -7066,6 +7066,7 @@ def create_managed_app(
     saturation_default: SaturationThreshold | None = None,
     ack_after_default: AckAfter | None = None,
     stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: [inbound].stream_inflight_budget_bytes
+    max_staged_depth: int = 0,  # BACKLOG #290 slice 2: [inbound].max_staged_depth (0 = off)
     max_correlation_depth: int = 8,
     per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
     claim_mode: str = "pooled",  # ADR 0066/#744: "pooled" (default) | "per_lane" (byte-identical opt-out)
@@ -7392,6 +7393,7 @@ def create_managed_app(
             saturation_default=saturation_default,
             ack_after_default=ack_after_default,
             stream_inflight_budget_bytes=stream_inflight_budget_bytes,
+            max_staged_depth=max_staged_depth,
             priority_default=priority_default,
             alert_sink=notifier,
             retention_settings=retention_settings,

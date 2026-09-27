@@ -1297,6 +1297,18 @@ class QueueStore(StoreLifecycle, Protocol):
         the outbound stage. Lets a consumer tell a true drain from a stalled router/transform."""
         ...
 
+    async def staged_intake_depth(self, *, limit: int | None = None) -> int:
+        """Count of NOT-DONE rows (``pending``|``inflight``) at the **ingress and routed** stages only,
+        across every lane of this ONE store -- the staged backlog the ``[inbound].max_staged_depth``
+        intake pause bounds (BACKLOG #290, slice 2). The outbound stage is left out on purpose: one
+        partner's down destination must not pause intake for every other feed. Store-global, so every
+        engine shard sharing a unified store reads the same number.
+
+        ``limit`` caps the count: the result is ``min(count, limit)``, and the read stops scanning at
+        ``limit`` rows. The pause only needs to know "over the bound or not", and an uncapped COUNT
+        would cost the most exactly when the backlog is largest."""
+        ...
+
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
 

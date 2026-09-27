@@ -97,6 +97,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     SourceStartupError,
+    intake_open,
     positive_cap,
     register_destination,
     register_source,
@@ -1464,7 +1465,9 @@ class RemoteFileSource(SourceConnector):
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                if self._may_poll():
+                # BACKLOG #290 slice 2: a paused engine skips the whole tick, so no remote file is
+                # listed, retrieved, moved or deleted; it stays on the share for the next open tick.
+                if intake_open(self.intake_gate) and self._may_poll():
                     await self._poll_once()
             except asyncio.CancelledError:
                 raise

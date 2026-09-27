@@ -45,7 +45,13 @@ from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store, StripResult
 
-__all__ = ["DiskFloorReading", "RetentionRunner", "RetentionPass", "read_disk_floor"]
+__all__ = [
+    "DiskFloorReading",
+    "RetentionRunner",
+    "RetentionPass",
+    "read_disk_floor",
+    "sqlite_store_file",
+]
 
 log = logging.getLogger(__name__)
 
@@ -168,6 +174,22 @@ class DiskFloorReading:
     @property
     def floor_mib(self) -> int:
         return self.floor_bytes // _BYTES_PER_MIB
+
+
+def sqlite_store_file(store: object) -> str | None:
+    """The absolute path of a file-backed SQLite store, or ``None`` when the low-disk floor cannot
+    apply to ``store``. Shared by the retention warning and the runtime intake pause (BACKLOG #290),
+    so those two cannot disagree. ``serve``'s startup refusal works from settings rather than an
+    open store and keeps its own backend check in ``__main__``.
+
+    On SQL Server and Postgres the store's disk belongs to the database server, not to this process,
+    so there is nothing here to stat; ``:memory:`` has no disk at all. A store with no ``backend``
+    attribute is SQLite, as in ``store/privilege.py``. Made absolute NOW, because a relative path
+    means whatever the working directory is at probe time."""
+    if getattr(store, "backend", StoreBackend.SQLITE) is not StoreBackend.SQLITE:
+        return None
+    store_path = str(getattr(store, "path", ":memory:"))
+    return None if store_path == ":memory:" else os.path.abspath(store_path)
 
 
 def read_disk_floor(store_path: str, min_free_disk_mb: int) -> DiskFloorReading | None:
@@ -301,13 +323,9 @@ class RetentionRunner:
     ) -> None:
         self._store = store
         self._settings = settings
-        # The SQLite store file the low-disk floor measures (BACKLOG #290), made absolute NOW, because
-        # a relative path means whatever the working directory is at probe time. `:memory:` has no
-        # disk, so it gets no path and the floor does not apply to it.
-        store_path = str(getattr(store, "path", ":memory:"))
-        self._floor_path: str | None = (
-            None if store_path == ":memory:" else os.path.abspath(store_path)
-        )
+        # The SQLite store file the low-disk floor measures (BACKLOG #290); None when the floor
+        # cannot apply to this store. See sqlite_store_file for the rule.
+        self._floor_path: str | None = sqlite_store_file(store)
         # The configured `[logging].log_dir` for application-log-file retention (#120). None (the
         # default; embedding/tests, or a stdout-only deployment) → the app-log sweep is a no-op.
         self._log_dir = log_dir
@@ -777,23 +795,18 @@ class RetentionRunner:
         }
 
     def _disk_floor_applies(self) -> bool:
-        """The low-disk floor (BACKLOG #290) is on AND this is a file-backed SQLite store. On SQL
-        Server and Postgres the store's disk belongs to the database server, not to this process, so
-        there is nothing here to stat; an in-memory store has no disk at all. A store with no
-        ``backend`` attribute is SQLite, as in ``store/privilege.py``."""
-        backend = getattr(self._store, "backend", StoreBackend.SQLITE)
-        return (
-            self._settings.min_free_disk_mb > 0
-            and backend is StoreBackend.SQLITE
-            and self._floor_path is not None
-        )
+        """The low-disk floor (BACKLOG #290) is on AND this is a file-backed SQLite store
+        (:func:`sqlite_store_file` decides the second half)."""
+        return self._settings.min_free_disk_mb > 0 and self._floor_path is not None
 
     async def _check_disk_floor(self) -> bool:
         """Log a WARNING when free space on the SQLite store's volume is below
         ``min_free_disk_mb``. Returns True only for a measured shortfall.
 
-        Advisory at runtime, by scope: this slice warns and changes nothing. It never pauses intake
-        and never drops, NAKs or deletes a message; the startup refusal lives in ``serve``. A failed
+        Advisory, by scope: this check warns and changes nothing, and never drops, NAKs or deletes a
+        message. The startup refusal lives in ``serve``, and the runtime intake pause on the same
+        floor lives in ``pipeline/intake_bound.py`` (slice 2), which measures far more often than
+        a retention pass runs. A failed
         probe logs at DEBUG and returns False, because an unmeasured disk is not a low one.
 
         This check runs before every purge in the pass, so it must never be what stops one. It
